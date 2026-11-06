@@ -82,7 +82,8 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 - `GET /v1/tasks?board=&status=&owner=&ready=&mine=&limit=` → `[Task]` list, sorted by
   priority, then id number. `mine=true` uses the `X-Board-Agent` header.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`.
-- `GET /v1/tasks/{id}` → `[TaskDetail]`.
+- `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
+  first; when it was cut, it does not start with the `task_created` event.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
@@ -122,7 +123,8 @@ be on the same board and must not form a cycle.
 ### Leases and touches
 
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
-  peers are returned as `conflicts` and raise alerts; nothing is refused.
+  peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
+  `globs` is leased once.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour.

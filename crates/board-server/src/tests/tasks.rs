@@ -789,3 +789,32 @@ async fn titles_and_text_are_checked() {
     let (s, _) = t.call("GET", "/v1/tasks/factory-404", None, None).await;
     assert_eq!(s.as_u16(), 404);
 }
+
+#[tokio::test]
+async fn task_history_shows_the_newest_events_oldest_first() {
+    let t = setup().await;
+    let id = t.task(A, "factory", "Busy task").await;
+    for n in 0..210 {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{id}/notes"),
+            Some(A),
+            Some(json!({ "agent": A, "kind": "note", "text": format!("step {n}") })),
+        )
+        .await;
+    }
+    t.patch(A, &id, json!({ "title": "Busy task, renamed" }))
+        .await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let history = detail["history"].as_array().unwrap();
+    assert_eq!(history.len(), crate::store::TASK_HISTORY_LIMIT as usize);
+    let seqs: Vec<i64> = history.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "ascending");
+    assert_eq!(
+        history.last().unwrap()["type"],
+        "task_updated",
+        "newest kept"
+    );
+    // Cut: the oldest event, task_created, is gone.
+    assert_ne!(history[0]["type"], "task_created");
+}

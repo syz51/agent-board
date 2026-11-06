@@ -64,7 +64,9 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
             ));
         }
     }
-    req.globs.dedup();
+    // Drop repeats anywhere in the list, keeping the first of each.
+    let mut seen = std::collections::HashSet::new();
+    req.globs.retain(|glob| seen.insert(glob.clone()));
     if let Some(ttl) = req.ttl_secs
         && (ttl == 0 || ttl > MAX_LEASE_SECS)
     {
