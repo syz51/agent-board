@@ -16,8 +16,9 @@ standalone) on several machines read and write one board:
 - on boards switched to autopilot, a coordinator thread per project works off the ready
   queue and asks you only for decisions, which reach your phone.
 
-Status: early development. The design is in [`docs/DESIGN.md`](docs/DESIGN.md) and the
-HTTP contract in [`docs/API.md`](docs/API.md).
+Status: early development. The design is in [`docs/DESIGN.md`](docs/DESIGN.md), the
+HTTP contract in [`docs/API.md`](docs/API.md) and deployment in
+[`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## How it fits together
 
@@ -40,7 +41,10 @@ talks to it with its own token.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+(cd web && bun install && bun run check)   # web view: type check, tests, build
 ```
+
+Build the web view before a release build of `board`, which embeds `web/dist`.
 
 ## License
 
