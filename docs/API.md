@@ -84,7 +84,8 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 ### Tasks
 
 - `GET /v1/tasks?board=&status=&owner=&ready=&mine=&limit=` → `[Task]` list, sorted by
-  priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+  priority, then id number. `mine=true` uses the `X-Board-Agent` header. `limit` defaults
+  to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event.
@@ -175,7 +176,8 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `doing_minutes_median` (minutes, `null` when nothing was measured) and
   `done_without_check_evidence`. Without `--json` it prints a three-line summary.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
-  example `board ls --board board-feedback --json` for the feedback tasks.
+  example `board ls --board board-feedback --json` for the feedback tasks. It returns at
+  most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
 
 Both exit 1 with the error on stderr when the server refuses or cannot be reached.
 

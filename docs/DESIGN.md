@@ -85,10 +85,12 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   session is nested (`hook -> claude -> zsh -> claude -> T3 Code` against `hook -> claude
   -> T3 Code`). A nested session ignores the T3 thread id and is identified as it would be
   outside T3 (`claude:<session id>`, or `codex:<session id>` from a hook's input). The
-  check reads the process table once (`ps -A`; `/proc` on Linux) and only when the T3
-  thread id would decide the identity: hooks decide at `SessionStart` and cache the answer
-  per session in `$BOARD_HOME/state/sessions/` until `SessionEnd`, `board mcp` decides at
-  start-up, and CLI commands decide per run. An explicit `--agent` skips it.
+  check reads the process table (one `ps -A` on macOS; on Linux only the ancestors'
+  `/proc/<pid>` entries) and only when the T3 thread id would decide the identity: hooks
+  decide at `SessionStart` and cache the answer per session in `$BOARD_HOME/state/sessions/`
+  until `SessionEnd` (entries untouched for 7 days are pruned at `SessionStart`), `board
+  mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
+  it.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
   24 hours unseen the owner is stale and another agent may take the task (logged). File
   leases (45 minutes, renewed by heartbeats) are advisory: they warn, never block.
@@ -192,7 +194,9 @@ on one of the board's home devices.
   reports a coordinator that is stuck or paused. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
-  <code>` is stored as the chat. Everything else from other chats is ignored.
+  <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
+  moves the pairing to another chat once redeemed; message ids from the old chat are
+  forgotten then. Everything else from other chats is ignored.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

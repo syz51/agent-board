@@ -331,7 +331,7 @@ pub enum AdminCommand {
     /// `/start <code>` in a private chat. Not needed when server.toml sets `[telegram]
     /// chat_id`, which always wins.
     TelegramPair {
-        /// Unpair the paired chat first, to pair another one.
+        /// Allow the code to replace the paired chat; it stays paired until the code is used.
         #[arg(long)]
         replace: bool,
         /// The server's database file.

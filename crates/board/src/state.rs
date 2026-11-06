@@ -119,6 +119,31 @@ pub fn remove_session(home: &Home, runtime: Runtime, session: &str) -> Result<()
     }
 }
 
+/// Removes the cached decisions of sessions not written for `age`: sessions that ended
+/// without a SessionEnd hook. A session that comes back decides again.
+pub fn prune_sessions(home: &Home, age: std::time::Duration) -> Result<()> {
+    let dir = home.state_dir().join("sessions");
+    let entries = match std::fs::read_dir(&dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries {
+        let entry = entry?;
+        let modified = entry.metadata()?.modified()?;
+        if now
+            .duration_since(modified)
+            .is_ok_and(|elapsed| elapsed > age)
+        {
+            match std::fs::remove_file(entry.path()) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Until when this device's hooks skip the server after it failed to answer.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Offline {
@@ -185,5 +210,17 @@ mod tests {
         remove_session(&home, Runtime::Claude, "s/1").unwrap();
         remove_session(&home, Runtime::Claude, "s/1").unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "s/1"), None);
+
+        // Pruning keeps recent sessions and removes those older than the age.
+        prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
+        save_session(&home, Runtime::Claude, "old", &nested).unwrap();
+        save_session(&home, Runtime::Codex, "new", &nested).unwrap();
+        let old = session_path(&home, Runtime::Claude, "old");
+        let file = std::fs::File::options().write(true).open(&old).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(load_session(&home, Runtime::Claude, "old"), None);
+        assert_eq!(load_session(&home, Runtime::Codex, "new"), Some(nested));
     }
 }

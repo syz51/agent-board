@@ -40,12 +40,16 @@ docker compose -f /opt/agent-board/deploy/compose.yaml exec board \
 
 It prints a one-time code, valid for 15 minutes. In Telegram, open a private chat with the
 bot and send `/start <code>`; the bot answers "Paired", and from then on only that chat
-receives asks and may answer them. Messages from other chats are ignored. To move to
-another chat, run the command again with `--replace`. Setting `[telegram] chat_id` in
-`server.toml` instead skips pairing and always wins over a paired chat.
+receives asks and may answer them. Asks created before pairing are sent then. Messages from
+other chats are ignored. To move to another chat, run the command again with `--replace`
+and send the new code from that chat; the paired chat keeps working until then, and open
+asks are sent again to the new one. Setting `[telegram] chat_id` in `server.toml` instead
+skips pairing and always wins over a paired chat.
 
 Upgrade: `git -C /opt/agent-board pull` and run the `docker compose ... up -d --build`
-line again. Migrations run on start.
+line again. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
+starts the notifier, without a `[telegram]` table; it sends nothing until a chat is paired
+or configured.
 
 ## 3. Devices
 

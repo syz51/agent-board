@@ -387,7 +387,6 @@ pub fn lease_result(result: &LeaseResult) -> String {
     lines.join("\n")
 }
 
-/// One warning line per overlap, or nothing.
 /// `board stats`: the feedback-loop counts, one topic per line.
 pub fn stats(stats: &Stats) -> String {
     let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
@@ -411,6 +410,7 @@ pub fn stats(stats: &Stats) -> String {
     )
 }
 
+/// One warning line per overlap, or nothing.
 pub fn overlaps(result: &TouchResult) -> Vec<String> {
     result
         .overlaps

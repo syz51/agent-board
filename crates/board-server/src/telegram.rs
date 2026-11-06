@@ -3,8 +3,9 @@
 //! from that chat only. No public endpoint is needed.
 //!
 //! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
-//! while none is, the first private chat that sends `/start <code>` with a live code from
-//! `board admin telegram-pair` becomes it. Until then asks are not sent.
+//! the first private chat that sends `/start <code>` with a live code from `board admin
+//! telegram-pair` becomes it (a `--replace` code takes over from a paired chat). Asks
+//! created while no chat is paired are sent when one is, with every other open ask.
 //!
 //! The bot token is part of every Bot API URL, so request errors are logged without their
 //! URL and the token never reaches the log.
@@ -233,9 +234,17 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
         return Ok(());
     };
     let Some(chat) = bot.chat(state).await? else {
-        tracing::warn!(ask = id, "telegram: no chat paired; ask not sent");
+        tracing::warn!(
+            ask = id,
+            "telegram: no chat paired; the ask is sent once one is"
+        );
         return Ok(());
     };
+    send_ask_to(state, bot, chat, id).await
+}
+
+/// Sends ask `id` to `chat` and records the message, so replies to it answer the ask.
+async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<()> {
     let (ask, board, task, handle) = state
         .read(move |cx| {
             let ask = get_ask(cx, id)?;
@@ -370,7 +379,7 @@ fn start_code(text: &str) -> Option<&str> {
     words.next().is_none().then_some(code)
 }
 
-/// Pairs the chat of a private `/start <code>` message while no chat is paired. Anything
+/// Pairs the chat of a private `/start <code>` message that redeems a live code. Anything
 /// else, a wrong or expired code included, gets no answer.
 async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> {
     if message.chat.kind.as_deref() != Some("private") {
@@ -391,8 +400,15 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
         "chat_id": chat,
         "text": "Paired: this chat now receives board asks and may answer them.",
     }))
-    .await
-    .map(|_| ())
+    .await?;
+    // Open asks, including those created while no chat was paired, go to the new chat.
+    let open = state
+        .read(|cx| asks::list(cx, Some(board_proto::AskStatus::Open), None))
+        .await?;
+    for ask in open {
+        send_ask_to(state, bot, chat, ask.id).await?;
+    }
+    Ok(())
 }
 
 async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()> {
@@ -418,10 +434,12 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
         return Ok(());
     };
     let Some(chat) = chat.filter(|c| *c == message.chat.id) else {
-        return match chat {
-            None => try_pair(state, bot, &message).await,
-            Some(_) => Ok(()),
-        };
+        // Another chat may pair (or, with a `--replace` code, re-pair) unless the chat is
+        // configured.
+        if bot.configured.is_none() {
+            try_pair(state, bot, &message).await?;
+        }
+        return Ok(());
     };
     let (Some(text), Some(original)) = (message.text, message.reply_to_message) else {
         return Ok(());

@@ -363,7 +363,7 @@ async fn a_one_time_code_pairs_the_first_private_chat() {
         .expect("a token alone starts the notifier");
 
     // Unpaired: asks are not sent, and no code is accepted before one exists.
-    ask(&t, "Before pairing").await;
+    let before = ask(&t, "Before pairing").await;
     fake.handle(start(1, PHONE, "private", "/start nothing"))
         .await;
     let code = t.state.create_telegram_pairing(false).unwrap();
@@ -375,7 +375,7 @@ async fn a_one_time_code_pairs_the_first_private_chat() {
     fake.handle(start(4, PHONE, "private", &code)).await;
     assert!(fake.calls("sendMessage").is_empty());
 
-    // The code pairs the chat and is used up.
+    // The code pairs the chat and is used up; the ask created while unpaired follows.
     fake.handle(start(
         5,
         PHONE,
@@ -383,38 +383,90 @@ async fn a_one_time_code_pairs_the_first_private_chat() {
         &format!("/start {}", code.to_uppercase()),
     ))
     .await;
-    let sent = fake.wait("sendMessage", 1).await;
+    let sent = fake.wait("sendMessage", 2).await;
     assert_eq!(sent[0]["chat_id"], PHONE);
     assert!(sent[0]["text"].as_str().unwrap().starts_with("Paired"));
+    assert_eq!(sent[1]["chat_id"], PHONE);
+    assert!(sent[1]["text"].as_str().unwrap().contains("Before pairing"));
 
     // From then on only that chat receives asks and may answer.
     let id = ask(&t, "After pairing").await;
-    let sent = fake.wait("sendMessage", 2).await;
-    assert_eq!(sent[1]["chat_id"], PHONE);
-    assert!(sent[1]["text"].as_str().unwrap().contains("After pairing"));
+    let sent = fake.wait("sendMessage", 3).await;
+    assert_eq!(sent[2]["chat_id"], PHONE);
+    assert!(sent[2]["text"].as_str().unwrap().contains("After pairing"));
     fake.handle(start(6, 777, "private", &format!("/start {code}")))
         .await;
     fake.handle(json!({
         "update_id": 7,
         "message": {
             "message_id": 90, "chat": { "id": 777, "type": "private" }, "text": "done",
-            "reply_to_message": { "message_id": 1002, "chat": { "id": PHONE } },
+            "reply_to_message": { "message_id": 1003, "chat": { "id": PHONE } },
         },
     }))
     .await;
-    assert_eq!(fake.calls("sendMessage").len(), 2);
+    assert_eq!(fake.calls("sendMessage").len(), 3);
     fake.push(json!({
         "update_id": 8,
         "message": {
             "message_id": 91, "chat": { "id": PHONE, "type": "private" }, "text": "done",
-            "reply_to_message": { "message_id": 1002, "chat": { "id": PHONE } },
+            "reply_to_message": { "message_id": 1003, "chat": { "id": PHONE } },
         },
     }));
     assert_eq!(wait_for_answer(&t, id).await["answer"], "done");
+    let sent = fake.wait("sendMessage", 4).await;
+    assert!(sent[3]["text"].as_str().unwrap().starts_with("Answered"));
 
-    // A second code needs --replace while a chat is paired.
+    // A second code needs --replace while a chat is paired, and the paired chat keeps
+    // receiving asks until another chat redeems it.
     assert!(t.state.create_telegram_pairing(false).is_err());
-    t.state.create_telegram_pairing(true).unwrap();
+    let code = t.state.create_telegram_pairing(true).unwrap();
+    let still = ask(&t, "Still paired").await;
+    let sent = fake.wait("sendMessage", 5).await;
+    assert_eq!(sent[4]["chat_id"], PHONE);
+    assert!(sent[4]["text"].as_str().unwrap().contains("Still paired"));
+
+    // Redeeming it moves the chat: the open asks are sent again, and replies to the old
+    // chat's messages no longer answer anything.
+    fake.handle(start(9, 777, "private", &format!("/start {code}")))
+        .await;
+    let sent = fake.wait("sendMessage", 8).await;
+    assert!(sent[5..].iter().all(|m| m["chat_id"] == 777));
+    assert!(sent[5]["text"].as_str().unwrap().starts_with("Paired"));
+    let resent: Vec<&str> = sent[6..]
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert!(resent.iter().any(|t| t.contains("Before pairing")));
+    assert!(resent.iter().any(|t| t.contains("Still paired")));
+    fake.handle(json!({
+        "update_id": 10,
+        "message": {
+            "message_id": 92, "chat": { "id": 777, "type": "private" }, "text": "stale",
+            "reply_to_message": { "message_id": 1002, "chat": { "id": PHONE } },
+        },
+    }))
+    .await;
+    fake.handle(json!({
+        "update_id": 11,
+        "message": {
+            "message_id": 93, "chat": { "id": PHONE, "type": "private" }, "text": "old chat",
+            "reply_to_message": { "message_id": 1005, "chat": { "id": PHONE } },
+        },
+    }))
+    .await;
+    assert_eq!(
+        fake.calls("sendMessage").len(),
+        8,
+        "neither reply is answered"
+    );
+    let open = t.ok("GET", "/v1/asks?status=open", None, None).await;
+    let open: Vec<i64> = open
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_i64().unwrap())
+        .collect();
+    assert!(open.contains(&before) && open.contains(&still));
 
     t.state.shutdown();
     tokio::time::timeout(Duration::from_secs(10), notifier)

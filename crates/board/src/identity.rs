@@ -17,7 +17,8 @@ pub const CLAUDE_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// `CLAUDE_CODE_SESSION_ID` (`claude:<id>`), and last the session id from a hook's input
 /// (`codex:<id>` or `claude:<id>` by the hook's runtime). A `nested` session (see
 /// [`is_nested`]) inherited the T3 thread id from the thread it runs inside, so it is
-/// identified as it would be outside T3.
+/// identified as it would be outside T3, and the hook's own session id comes before
+/// `CLAUDE_CODE_SESSION_ID`, which a Codex session inherits from a Claude Code parent.
 pub fn resolve_agent(
     explicit: Option<&str>,
     env: impl Fn(&str) -> Option<String>,
@@ -28,18 +29,24 @@ pub fn resolve_agent(
         return Ok(Some(id.parse().context("--agent")?));
     }
     let non_empty = |name: &str| env(name).filter(|v| !v.trim().is_empty());
-    let thread = non_empty(T3_THREAD_ENV).filter(|_| !nested);
-    let raw = if let Some(thread) = thread {
-        format!("t3:{}", thread.trim())
-    } else if let Some(session) = non_empty(CLAUDE_SESSION_ENV) {
-        format!("claude:{}", session.trim())
-    } else if let Some((runtime, session)) = hook_session.filter(|(_, s)| !s.is_empty()) {
-        let source = match runtime {
-            Runtime::Claude => "claude",
-            Runtime::Codex => "codex",
-        };
-        format!("{source}:{session}")
-    } else {
+    let claude = || non_empty(CLAUDE_SESSION_ENV).map(|s| format!("claude:{}", s.trim()));
+    let hook = || {
+        hook_session
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(runtime, session)| {
+                let source = match runtime {
+                    Runtime::Claude => "claude",
+                    Runtime::Codex => "codex",
+                };
+                format!("{source}:{session}")
+            })
+    };
+    let raw = match non_empty(T3_THREAD_ENV).filter(|_| !nested) {
+        Some(thread) => Some(format!("t3:{}", thread.trim())),
+        None if nested => hook().or_else(claude),
+        None => claude().or_else(hook),
+    };
+    let Some(raw) = raw else {
         return Ok(None);
     };
     raw.parse()
@@ -126,41 +133,16 @@ pub fn nested_here() -> bool {
     }
 }
 
-/// The process table: `/proc` on Linux, one `ps -A` elsewhere.
-pub struct SystemProcesses(std::collections::HashMap<u32, ProcessEntry>);
+/// The process table: one `ps -A` read, or on Linux `/proc/<pid>` read for each process
+/// asked about.
+pub struct SystemProcesses(
+    #[cfg(not(target_os = "linux"))] std::collections::HashMap<u32, ProcessEntry>,
+);
 
 impl SystemProcesses {
     #[cfg(target_os = "linux")]
     pub fn read() -> Result<Self> {
-        let mut table = std::collections::HashMap::new();
-        for dir in std::fs::read_dir("/proc").context("reading /proc")? {
-            let Ok(dir) = dir else { continue };
-            let Some(pid) = dir.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-                continue;
-            };
-            // Processes may exit while the table is read.
-            let Ok(stat) = std::fs::read_to_string(dir.path().join("stat")) else {
-                continue;
-            };
-            // `pid (comm) state ppid ...`; comm may contain spaces and parentheses.
-            let Some((comm_part, rest)) = stat.rsplit_once(')') else {
-                continue;
-            };
-            let comm = comm_part.split_once('(').map_or("", |(_, c)| c);
-            let Some(ppid) = rest.split_whitespace().nth(1).and_then(|p| p.parse().ok()) else {
-                continue;
-            };
-            let argv0 = std::fs::read(dir.path().join("cmdline"))
-                .ok()
-                .and_then(|c| {
-                    let first = c.split(|b| *b == 0).next()?.to_vec();
-                    String::from_utf8(first).ok()
-                })
-                .filter(|a| !a.is_empty());
-            let name = argv0.unwrap_or_else(|| comm.to_owned());
-            table.insert(pid, ProcessEntry { ppid, name });
-        }
-        Ok(Self(table))
+        Ok(Self())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -177,8 +159,25 @@ impl SystemProcesses {
 }
 
 impl ProcessTable for SystemProcesses {
+    #[cfg(not(target_os = "linux"))]
     fn entry(&self, pid: u32) -> Option<ProcessEntry> {
         self.0.get(&pid).cloned()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn entry(&self, pid: u32) -> Option<ProcessEntry> {
+        let dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+        // `pid (comm) state ppid ...`; comm may contain spaces and parentheses.
+        let (comm_part, rest) = stat.rsplit_once(')')?;
+        let comm = comm_part.split_once('(').map_or("", |(_, c)| c);
+        let ppid = rest.split_whitespace().nth(1)?.parse().ok()?;
+        let argv0 = std::fs::read(dir.join("cmdline"))
+            .ok()
+            .and_then(|c| String::from_utf8(c.split(|b| *b == 0).next()?.to_vec()).ok())
+            .filter(|a| !a.is_empty());
+        let name = argv0.unwrap_or_else(|| comm.to_owned());
+        Some(ProcessEntry { ppid, name })
     }
 }
 
@@ -342,9 +341,14 @@ mod tests {
                 .map(String::from)
         };
         assert_eq!(nested(&all, None).as_deref(), Some("claude:sess-2"));
+        // A Codex session started from a Claude Code thread inherits its session id.
         assert_eq!(
-            nested(&all[..1], Some((Runtime::Codex, "codex-sess"))).as_deref(),
+            nested(&all, Some((Runtime::Codex, "codex-sess"))).as_deref(),
             Some("codex:codex-sess")
+        );
+        assert_eq!(
+            nested(&all, Some((Runtime::Claude, "sess-2"))).as_deref(),
+            Some("claude:sess-2")
         );
         assert_eq!(nested(&all[..1], None), None);
         // An explicit id still wins.

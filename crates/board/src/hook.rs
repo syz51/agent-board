@@ -241,6 +241,9 @@ async fn handle(
 /// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
 /// first hook of a session without one) and cached for the session's later hooks;
 /// `SessionEnd` drops the cache.
+/// How long a session's cached decisions outlive its last SessionStart.
+const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 async fn nested_session(
     home: &Home,
     event: HookEvent,
@@ -260,7 +263,17 @@ async fn nested_session(
         }
         return Ok(cached.nested);
     }
-    let nested = tokio::task::spawn_blocking(nested_here).await?;
+    let prune = (event == HookEvent::SessionStart).then(|| home.clone());
+    let nested = tokio::task::spawn_blocking(move || {
+        // Before this session's file is written, so it is never the one removed.
+        if let Some(home) = prune
+            && let Err(err) = state::prune_sessions(&home, SESSION_CACHE_AGE)
+        {
+            tracing::debug!("pruning cached sessions: {err:#}");
+        }
+        nested_here()
+    })
+    .await?;
     // Nothing to remember at the end of a session.
     if let Some(session) = session.filter(|_| event != HookEvent::SessionEnd) {
         state::save_session(home, runtime, session, &state::SessionLocal { nested })?;

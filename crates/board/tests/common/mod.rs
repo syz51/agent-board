@@ -263,6 +263,12 @@ pub fn board(home: &Path, cwd: &Path, env: &[(&str, &str)], args: &[&str], stdin
     for (k, v) in env {
         command.env(k, v);
     }
+    // The T3 identity applies only outside a nested session, which depends on the
+    // processes above this test; detached, it depends on nothing else.
+    #[cfg(unix)]
+    if env.iter().any(|(k, _)| *k == "T3CODE_THREAD_ID") {
+        return detached(&command, stdin);
+    }
     let mut child = command.spawn().unwrap();
     child
         .stdin
@@ -271,6 +277,59 @@ pub fn board(home: &Path, cwd: &Path, env: &[(&str, &str)], args: &[&str], stdin
         .write_all(stdin.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+/// Runs `command` with no `claude` or `codex` above it, whatever runs the tests: a shell
+/// starts it in the background and exits, and it starts only once init (or a subreaper)
+/// has adopted it. Its streams go through files, and `stdin` is its input.
+#[cfg(unix)]
+pub fn detached(command: &Command, stdin: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in"), stdin).unwrap();
+    let script = r#"outer=$$
+(
+    while kill -0 "$outer" 2>/dev/null; do sleep 0.01; done
+    "$@" <"$DETACHED/in" >"$DETACHED/out" 2>"$DETACHED/err"
+    echo $? >"$DETACHED/code.tmp" && mv "$DETACHED/code.tmp" "$DETACHED/code"
+) </dev/null >/dev/null 2>&1 &"#;
+    let mut sh = Command::new("/bin/sh");
+    sh.arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(command.get_program())
+        .args(command.get_args())
+        .env("DETACHED", dir.path());
+    if let Some(cwd) = command.get_current_dir() {
+        sh.current_dir(cwd);
+    }
+    for (k, v) in command.get_envs() {
+        match v {
+            Some(v) => sh.env(k, v),
+            None => sh.env_remove(k),
+        };
+    }
+    // Waiting reaps the shell, so the loop above sees it gone.
+    assert!(sh.status().unwrap().success());
+    let code = dir.path().join("code");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !code.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached command did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let code: i32 = std::fs::read_to_string(&code)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: std::fs::read(dir.path().join("out")).unwrap(),
+        stderr: std::fs::read(dir.path().join("err")).unwrap(),
+    }
 }
 
 pub fn stdout(out: &Output) -> String {

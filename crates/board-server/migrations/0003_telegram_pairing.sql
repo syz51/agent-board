@@ -1,9 +1,11 @@
 -- Telegram pairing: `board admin telegram-pair` stores a one-time code (hashed); the first
 -- private chat that sends the bot `/start <code>` before it expires becomes the chat the
--- notifier uses, unless server.toml names one.
+-- notifier uses, unless server.toml names one. A `replaces` code (`--replace`) may take
+-- over from a paired chat; any other code pairs only while no chat is paired.
 
 CREATE TABLE telegram_pairing_codes (
     code_hash TEXT PRIMARY KEY,
+    replaces INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 ) STRICT;

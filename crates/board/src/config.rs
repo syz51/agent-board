@@ -158,10 +158,13 @@ fn load_token_from(
     {
         return Ok(Some(token));
     }
-    if store == TokenStore::Keychain
-        && let Some(token) = keychain.read(&keychain_account_for(home))?
-    {
-        return Ok(Some(token));
+    if store == TokenStore::Keychain {
+        match keychain.read(&keychain_account_for(home)) {
+            Ok(Some(token)) => return Ok(Some(token)),
+            Ok(None) => {}
+            // Locked, or no user interaction (SSH, launchd): the file may hold the token.
+            Err(err) => tracing::debug!("reading the Keychain: {err:#}"),
+        }
     }
     match std::fs::read_to_string(home.token_path()) {
         Ok(text) => Ok(Some(text.trim().to_owned()).filter(|t| !t.is_empty())),
@@ -200,18 +203,32 @@ fn store_token_in(
     if store == TokenStore::Keychain {
         let account = keychain_account_for(home);
         let Err(err) = keychain.write(&account, token) else {
+            // A token file from an earlier fallback would be read when the Keychain is not.
+            remove_if_present(&home.token_path())?;
             return Ok(StoredToken { store, note });
         };
         // An older token for this home would still be read before the file.
         keychain.delete(&account);
-        let stale = matches!(keychain.read(&account), Ok(Some(old)) if old != token);
+        let remove = format!(
+            "remove it from a desktop session with `security delete-generic-password -s \
+             {KEYCHAIN_SERVICE} -a {account}`"
+        );
+        let stale = match keychain.read(&account) {
+            Ok(Some(old)) if old != token => Some(format!(
+                "an older token for this home is still in the Keychain and is read before \
+                 the file: {remove}"
+            )),
+            Ok(_) => None,
+            Err(_) => Some(format!(
+                "the Keychain could not be checked for an older token for this home, which \
+                 would be read before the file in a desktop session; if `board` then fails \
+                 with unauthorized, {remove}"
+            )),
+        };
         let mut text = format!("the Keychain refused the token ({err:#})");
-        if stale {
-            text.push_str(&format!(
-                "; an older token for this home is still in the Keychain and is read first: \
-                 remove it with `security delete-generic-password -s {KEYCHAIN_SERVICE} -a \
-                 {account}` from a desktop session"
-            ));
+        if let Some(stale) = stale {
+            text.push_str("; ");
+            text.push_str(&stale);
         }
         note = Some(text);
     }
@@ -224,8 +241,18 @@ fn store_token_in(
     })
 }
 
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The Keychain operations the token store needs; tests use a fake.
 trait Keychain {
+    /// `Ok(None)` when the account has no item; an error when the Keychain cannot be read.
     fn read(&self, account: &str) -> Result<Option<String>>;
     fn write(&self, account: &str, token: &str) -> Result<()>;
     /// Best effort: removes the account's item if it can.
@@ -303,14 +330,16 @@ fn keychain_read(account: &str) -> Result<Option<String>> {
         .args(["-a", account, "-w"])
         .stderr(Stdio::null())
         .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            let token = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            Ok(Some(token).filter(|t| !t.is_empty()))
-        }
-        // Not found (exit 44) or no `security` binary: fall back to the file.
-        Ok(_) | Err(_) => Ok(None),
+    let out = output.context("running `security`")?;
+    if out.status.success() {
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Ok(Some(token).filter(|t| !t.is_empty()));
     }
+    // errSecItemNotFound.
+    if out.status.code() == Some(44) {
+        return Ok(None);
+    }
+    bail!("`security find-generic-password` failed: {}", out.status)
 }
 
 /// Writes through `security -i` so the token never appears in a process's arguments.
@@ -438,12 +467,16 @@ mod tests {
     #[derive(Default)]
     struct FakeKeychain {
         items: std::cell::RefCell<BTreeMap<String, String>>,
+        refuse_read: bool,
         refuse_write: bool,
         refuse_delete: bool,
     }
 
     impl Keychain for FakeKeychain {
         fn read(&self, account: &str) -> Result<Option<String>> {
+            if self.refuse_read {
+                bail!("User interaction is not allowed.");
+            }
             Ok(self.items.borrow().get(account).cloned())
         }
 
@@ -469,6 +502,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().join("home"));
         let keychain = FakeKeychain::default();
+        // A token file left by an earlier fallback goes once the Keychain has the token.
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(home.token_path(), "revoked").unwrap();
         let stored = store_token_in(&home, "tok-1", TokenStore::Keychain, &keychain).unwrap();
         assert_eq!(
             stored,
@@ -547,6 +583,26 @@ mod tests {
             .unwrap();
         assert!(note.contains("still in the Keychain"), "{note}");
         assert!(note.contains(&format!("-a {account}")), "{note}");
+
+        // A locked Keychain refuses reads too: the token is still found in the file, and
+        // the note says an older Keychain token could not be ruled out.
+        let locked = FakeKeychain {
+            refuse_read: true,
+            refuse_write: true,
+            refuse_delete: true,
+            ..FakeKeychain::default()
+        };
+        let note = store_token_in(&home, "locked-tok", TokenStore::Keychain, &locked)
+            .unwrap()
+            .note
+            .unwrap();
+        assert!(note.contains("could not be checked"), "{note}");
+        assert_eq!(
+            load_token_from(&home, None, TokenStore::Keychain, &locked)
+                .unwrap()
+                .as_deref(),
+            Some("locked-tok")
+        );
     }
 
     #[cfg(unix)]

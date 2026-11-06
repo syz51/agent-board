@@ -81,6 +81,7 @@ fn serve_admin_and_client_work_together() {
         Command::new(env!("CARGO_BIN_EXE_board"))
             .args(["serve", "--config", config.to_str().unwrap()])
             .env("BOARD_LOG", "warn")
+            .env_remove("BOARD_TELEGRAM_TOKEN")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -110,7 +111,7 @@ fn serve_admin_and_client_work_together() {
             .env_remove("BOARD_TOKEN")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env("T3CODE_THREAD_ID", "thread-e2e");
-        run_with_stdin(command, "")
+        detached(&command, "")
     };
     let out = client(&["board", "create", "e2e", "--title", "End to end"]);
     assert!(out.status.success(), "{}", stderr(&out));

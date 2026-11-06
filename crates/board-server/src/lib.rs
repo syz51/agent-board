@@ -132,7 +132,7 @@ pub fn create_device(db_path: &Path, name: &DeviceName, user: bool) -> Result<St
 }
 
 /// Creates a one-time Telegram pairing code in the database at `db_path` and returns it,
-/// shown once; `replace` unpairs a paired chat first. For `board admin` on the host.
+/// shown once; with `replace` the code may take over from a paired chat. For `board admin` on the host.
 pub fn telegram_pair(db_path: &Path, replace: bool) -> Result<String, Error> {
     let db = Db::open(db_path)?;
     db.create_telegram_pairing(replace, SystemClock.now())
