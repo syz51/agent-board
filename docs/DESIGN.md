@@ -262,6 +262,15 @@ notes start with their kind and cite evidence; handoff `next` is the first concr
 The format is a starting point: the `json` and `yaml` renderings exist so the formats can be
 benchmarked against each other on real tasks.
 
+The first benchmark (2026-11-07; Claude Code sessions on a subscription, 20 runs in each of
+nine cells) compared tagged lines, compact JSON and TOON with three framings of
+agent-written text: quoted, bare and spotlighted with `^` for whitespace. It kept these
+defaults. Every cell claimed before editing and reacted to the overlap alert; planted
+instructions in peer text ran once in 180 runs, in a framing without quotes. Resuming from
+the handoff after a compaction was 63% [51–74] with quoted text against 37% [26–49]
+spotlighted, and the formats tied while tagged lines took about 35% fewer tokens. The
+switches it used, and the harness, stay on the `bench/formats` branch for reruns.
+
 ## Feedback loop
 
 Rules, defaults and prompts are expected to change with use:
