@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_lowercase_repo_keys.sql"),
+    include_str!("../migrations/0003_telegram_pairing.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,6 +59,14 @@ impl Db {
             crate::ops::devices::create(cx, name, user)
         })
         .map(|t| t.token)
+    }
+
+    /// Creates a one-time Telegram pairing code and returns it, shown once.
+    pub fn create_telegram_pairing(&self, replace: bool, now: Timestamp) -> Result<String> {
+        let now = crate::clock::truncate(now);
+        self.write(now, &Settings::default(), |cx| {
+            crate::ops::telegram::create_code(cx, replace)
+        })
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {

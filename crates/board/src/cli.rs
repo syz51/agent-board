@@ -134,6 +134,12 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// Feedback-loop counts for the last N days: claims, takeovers, leases, asks, done.
+    Stats {
+        /// Days to count back from now, 1 to 365.
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
+        days: u32,
+    },
     /// Print your board snapshot.
     Snapshot {
         #[arg(long, default_value = "full", value_parser = parse_enum::<SnapshotKind>)]
@@ -321,6 +327,17 @@ pub enum AdminCommand {
         #[arg(long, env = "BOARD_DB")]
         db: std::path::PathBuf,
     },
+    /// Create a one-time code (valid 15 minutes) that pairs a Telegram chat: send the bot
+    /// `/start <code>` in a private chat. Not needed when server.toml sets `[telegram]
+    /// chat_id`, which always wins.
+    TelegramPair {
+        /// Allow the code to replace the paired chat; it stays paired until the code is used.
+        #[arg(long)]
+        replace: bool,
+        /// The server's database file.
+        #[arg(long, env = "BOARD_DB")]
+        db: std::path::PathBuf,
+    },
     /// Write a consistent copy of the database (`VACUUM INTO`) to a new file.
     Backup {
         /// The server's database file.
@@ -356,6 +373,14 @@ fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
             eprintln!(
                 "board: device {name} created; this token is shown once. On the device run \
                  `board login --server <url> --device {name}` and paste it."
+            );
+        }
+        AdminCommand::TelegramPair { replace, db } => {
+            let code = board_server::telegram_pair(&db, replace)?;
+            println!("{code}");
+            eprintln!(
+                "board: pairing code created; it works once, within 15 minutes. In Telegram, \
+                 open a private chat with your bot and send: /start {code}"
             );
         }
         AdminCommand::Backup { db, out } => {
@@ -577,6 +602,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             since,
         } => ops::snapshot(&ctx()?, kind, format, since).await?,
         Command::Feedback { text } => ops::feedback(&ctx()?, text).await?,
+        Command::Stats { days } => ops::stats(&ctx()?, days).await?,
         Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")
         }
@@ -614,10 +640,14 @@ fn login(home: &Home, server: String, device: DeviceName) -> Result<()> {
     config.server = Some(server.clone());
     config.device = Some(device.clone());
     config.save(home)?;
-    let place = match store_token(home, token)? {
+    let stored = store_token(home, token)?;
+    let place = match stored.store {
         TokenStore::Keychain => "the macOS Keychain".to_owned(),
-        TokenStore::File => home.token_path().display().to_string(),
+        TokenStore::File => format!("{} (mode 0600)", home.token_path().display()),
     };
+    if let Some(note) = stored.note {
+        eprintln!("board: {note}");
+    }
     println!("logged in to {server} as device {device}; token stored in {place}");
     Ok(())
 }

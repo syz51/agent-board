@@ -8,8 +8,8 @@
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Task, TaskDetail, Timestamp,
-    TouchResult,
+    Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task, TaskDetail,
+    Timestamp, TouchResult,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -385,6 +385,29 @@ pub fn lease_result(result: &LeaseResult) -> String {
         return "no leases".into();
     }
     lines.join("\n")
+}
+
+/// `board stats`: the feedback-loop counts, one topic per line.
+pub fn stats(stats: &Stats) -> String {
+    let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
+    let day = if stats.days == 1 { "day" } else { "days" };
+    format!(
+        "stats, last {} {day}\n\
+         tasks: {} created · {} done ({} without a check) · median {} in doing\n\
+         claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
+         asks: {} created · {} answered · median {} to answer",
+        stats.days,
+        stats.tasks_created,
+        stats.tasks_done,
+        stats.done_without_check_evidence,
+        minutes(stats.doing_minutes_median),
+        stats.claims_refused,
+        stats.tasks_taken_stale,
+        stats.lease_conflicts,
+        stats.asks_created,
+        stats.asks_answered,
+        minutes(stats.ask_answer_minutes_median),
+    )
 }
 
 /// One warning line per overlap, or nothing.

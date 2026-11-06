@@ -441,3 +441,48 @@ fn an_unregistered_agent_is_registered_before_acting() {
     e.run(&["ls"]);
     assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
 }
+
+#[test]
+fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
+    let e = env();
+    let stats = board_proto::Stats {
+        days: 7,
+        tasks_created: 5,
+        tasks_done: 3,
+        claims_refused: 2,
+        tasks_taken_stale: 1,
+        lease_conflicts: 4,
+        asks_created: 2,
+        asks_answered: 1,
+        ask_answer_minutes_median: Some(4.0),
+        doing_minutes_median: None,
+        done_without_check_evidence: 1,
+    };
+    e.stub.on("GET /v1/stats", &stats);
+
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        "stats, last 7 days\n\
+         tasks: 5 created · 3 done (1 without a check) · median n/a in doing\n\
+         claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
+         asks: 2 created · 1 answered · median 4m to answer"
+    );
+    assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
+
+    // `--json` prints the server's `Stats` unchanged: the weekly review reads it.
+    let out = e.run(&["stats", "--days", "30", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed: board_proto::Stats = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(printed, stats);
+    let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["doing_minutes_median"], Value::Null);
+    assert_eq!(e.stub.requests_to("GET /v1/stats")[1].query, "days=30");
+
+    // Out-of-range days fail before any request; stats do not register the agent.
+    let out = e.run(&["stats", "--days", "0"]);
+    assert!(!out.status.success());
+    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 2);
+    assert!(e.stub.requests_to("POST /v1/agents").is_empty());
+}

@@ -31,12 +31,25 @@ the server trusts for the logins in `users` (`trust_identity_header`). Do not pu
 port another way while that setting is on.
 
 Telegram (optional): create a bot with @BotFather, put `BOARD_TELEGRAM_TOKEN=<token>` in
-`/etc/agent-board/secrets.env` (mode 0600), send the bot a message, read your chat id
-from `https://api.telegram.org/bot<token>/getUpdates`, set `[telegram] chat_id`, and
-restart the container.
+`/etc/agent-board/secrets.env` (mode 0600) and restart the container. Then pair your chat:
+
+```sh
+docker compose -f /opt/agent-board/deploy/compose.yaml exec board \
+    board admin telegram-pair --db /var/lib/agent-board/board.db
+```
+
+It prints a one-time code, valid for 15 minutes. In Telegram, open a private chat with the
+bot and send `/start <code>`; the bot answers "Paired", and from then on only that chat
+receives asks and may answer them. Asks created before pairing are sent then. Messages from
+other chats are ignored. To move to another chat, run the command again with `--replace`
+and send the new code from that chat; the paired chat keeps working until then, and open
+asks are sent again to the new one. Setting `[telegram] chat_id` in `server.toml` instead
+skips pairing and always wins over a paired chat.
 
 Upgrade: `git -C /opt/agent-board pull` and run the `docker compose ... up -d --build`
-line again. Migrations run on start.
+line again. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
+starts the notifier, without a `[telegram]` table; it sends nothing until a chat is paired
+or configured.
 
 ## 3. Devices
 
@@ -57,6 +70,12 @@ board install launchd                                   # or systemd: runs `boar
 ```
 
 `board install codex` prints the Codex `hooks.json` and `config.toml` entries.
+
+On macOS the token goes to the login Keychain. Where the Keychain cannot be used without
+a desktop session (a login over SSH, or a locked Keychain), `board login` stores it in
+`$BOARD_HOME/token` (mode 0600) instead and prints that path; `board` reads it from there.
+Each `$BOARD_HOME` keeps its own token, so a second login with another `BOARD_HOME` (for
+the `--user` token you answer asks with) does not replace the device's token.
 
 ## 4. Backups
 

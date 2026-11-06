@@ -56,6 +56,11 @@ impl AppState {
         self.inner.db.create_device(name, user, self.now())
     }
 
+    /// Creates a one-time Telegram pairing code and returns it, shown once.
+    pub fn create_telegram_pairing(&self, replace: bool) -> Result<String> {
+        self.inner.db.create_telegram_pairing(replace, self.now())
+    }
+
     /// Ends event streams and background tasks; called on server shutdown.
     pub fn shutdown(&self) {
         self.inner.shutdown.send_replace(true);

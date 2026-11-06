@@ -1,8 +1,8 @@
 //! agent-board server: storage, rules, the `/v1` HTTP API with its event stream,
 //! snapshot rendering, the embedded web view and the Telegram notifier.
 //!
-//! The binary (`board serve`, `board admin`) uses [`serve`], [`create_device`] and
-//! [`backup`]; tests build [`app`] over [`Db::open_in_memory`] with a [`ManualClock`].
+//! The binary (`board serve`, `board admin`) uses [`serve`], [`create_device`],
+//! [`telegram_pair`] and [`backup`]; tests build [`app`] over [`Db::open_in_memory`] with a [`ManualClock`].
 
 mod api;
 mod auth;
@@ -56,13 +56,14 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     let listener = TcpListener::bind(config.listen).await?;
     tracing::info!(addr = %config.listen, "board server listening");
     let mut tasks = vec![spawn_sweeper(state.clone())];
-    if let Some(telegram) = config.telegram.clone() {
-        match spawn_telegram(state.clone(), telegram)? {
-            Some(task) => tasks.push(task),
-            None => tracing::warn!(
-                "telegram is configured without a token; set {TELEGRAM_TOKEN_ENV} or bot_token"
-            ),
-        }
+    // A token alone starts the notifier; the chat is then paired (`board admin telegram-pair`).
+    let telegram = config.telegram.clone().unwrap_or_default();
+    match spawn_telegram(state.clone(), telegram)? {
+        Some(task) => tasks.push(task),
+        None if config.telegram.is_some() => tracing::warn!(
+            "telegram is configured without a token; set {TELEGRAM_TOKEN_ENV} or bot_token"
+        ),
+        None => {}
     }
     let stopping = state.clone();
     let served = axum::serve(listener, app(state.clone()))
@@ -128,6 +129,13 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
 pub fn create_device(db_path: &Path, name: &DeviceName, user: bool) -> Result<String, Error> {
     let db = Db::open(db_path)?;
     db.create_device(name, user, SystemClock.now())
+}
+
+/// Creates a one-time Telegram pairing code in the database at `db_path` and returns it,
+/// shown once; with `replace` the code may take over from a paired chat. For `board admin` on the host.
+pub fn telegram_pair(db_path: &Path, replace: bool) -> Result<String, Error> {
+    let db = Db::open(db_path)?;
+    db.create_telegram_pairing(replace, SystemClock.now())
 }
 
 /// Writes a consistent copy of the database at `db_path` to `out_path` (`VACUUM INTO`),

@@ -9,6 +9,7 @@ trust_identity_header = true
 # The tailnet URL of the web view, for links in notifications.
 public_url = "https://board-host.your-tailnet.ts.net"
 
-# Optional. The bot token goes in /etc/agent-board/secrets.env as BOARD_TELEGRAM_TOKEN.
+# Optional. The bot token goes in /etc/agent-board/secrets.env as BOARD_TELEGRAM_TOKEN;
+# then pair your chat with `board admin telegram-pair` (docs/DEPLOY.md), or name it here:
 # [telegram]
 # chat_id = 123456789

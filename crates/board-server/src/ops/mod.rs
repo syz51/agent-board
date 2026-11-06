@@ -8,6 +8,7 @@ pub(crate) mod devices;
 pub(crate) mod leases;
 pub(crate) mod stats;
 pub(crate) mod tasks;
+pub(crate) mod telegram;
 
 use board_proto::{AgentId, BoardSlug, EventType};
 use rusqlite::params;

@@ -18,7 +18,7 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 /// public_url = "https://board.example.ts.net"
 ///
 /// [telegram]
-/// chat_id = 123456789          # token from BOARD_TELEGRAM_TOKEN or bot_token
+/// chat_id = 123456789          # optional; else paired with `board admin telegram-pair`
 ///
 /// [defaults]
 /// owner_stale_after_secs = 86400
@@ -42,7 +42,8 @@ pub struct ServerConfig {
     /// Base URL of the web view, for links in notifications (no trailing slash needed).
     #[serde(default)]
     pub public_url: Option<String>,
-    /// Telegram notifier; off when absent.
+    /// Telegram notifier settings. The notifier runs whenever a token is set
+    /// (`BOARD_TELEGRAM_TOKEN`), with or without this table.
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
     /// Overrides of the rule and rendering defaults (`docs/API.md`, "Defaults").
@@ -131,8 +132,10 @@ impl fmt::Debug for ServerConfig {
 pub struct TelegramConfig {
     #[serde(default)]
     pub bot_token: Option<String>,
-    /// The only chat that receives asks and whose answers are accepted.
-    pub chat_id: i64,
+    /// The only chat that receives asks and whose answers are accepted. When absent, the
+    /// chat paired with a `board admin telegram-pair` code is used.
+    #[serde(default)]
+    pub chat_id: Option<i64>,
     /// Bot API base URL; tests point it at a local fake.
     #[serde(default = "default_telegram_api")]
     pub api_base: String,
@@ -142,12 +145,23 @@ fn default_telegram_api() -> String {
     "https://api.telegram.org".to_owned()
 }
 
-impl TelegramConfig {
-    pub fn new(chat_id: i64) -> Self {
+impl Default for TelegramConfig {
+    /// No token and no chat: the chat is paired.
+    fn default() -> Self {
         Self {
             bot_token: None,
-            chat_id,
+            chat_id: None,
             api_base: default_telegram_api(),
+        }
+    }
+}
+
+impl TelegramConfig {
+    /// Settings with a configured chat.
+    pub fn new(chat_id: i64) -> Self {
+        Self {
+            chat_id: Some(chat_id),
+            ..Self::default()
         }
     }
 
@@ -313,7 +327,9 @@ mod tests {
         assert_eq!(full.defaults.owner_stale_after_secs, 60);
         assert_eq!(full.defaults.snapshot_full_chars, 1500);
         assert_eq!(full.defaults.lease_ttl_secs, 2700);
-        assert_eq!(full.telegram.as_ref().unwrap().chat_id, -100);
+        assert_eq!(full.telegram.as_ref().unwrap().chat_id, Some(-100));
+        let paired = ServerConfig::from_toml("db = \"b\"\n[telegram]\n").unwrap();
+        assert_eq!(paired.telegram.unwrap().chat_id, None);
         assert!(!format!("{full:?}").contains("secret-token"));
     }
 

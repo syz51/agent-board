@@ -571,3 +571,99 @@ fn t3_thread_id_wins_over_the_hook_session() {
     );
     assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(t3));
 }
+
+/// Runs a hook two `claude` processes deep, as a `claude -p` started from a T3 thread's
+/// shell runs it: board <- claude <- claude <- this test. Both `claude`s are bash under
+/// that name, so the real process table shows the chain.
+#[cfg(unix)]
+fn nested_hook(e: &Env, event: &str, payload: &Value) -> String {
+    use std::io::Write as _;
+    let bin = e.home.parent().unwrap().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    if !claude.exists() {
+        std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
+    }
+    // `; exit $?` keeps bash from replacing itself with the last command.
+    let inner = r#""$BOARD_BIN" hook "$EVENT" --runtime claude; exit $?"#;
+    let mut child = std::process::Command::new(&claude)
+        .args(["-c", r#""$CLAUDE_BIN" -c "$INNER"; exit $?"#])
+        .current_dir(&e.repo)
+        .env("CLAUDE_BIN", &claude)
+        .env("INNER", inner)
+        .env("BOARD_BIN", env!("CARGO_BIN_EXE_board"))
+        .env("EVENT", event)
+        .env("BOARD_HOME", &e.home)
+        .env("BOARD_TOKEN", TOKEN)
+        .env("BOARD_KEYCHAIN", "0")
+        .env("T3CODE_THREAD_ID", "thread-7")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("BOARD_LOG")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    stdout(&out)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
+    let e = env();
+    let t3 = "t3:thread-7";
+    for agent in [CLAUDE_AGENT, t3] {
+        e.stub.on(
+            &format!("POST /v1/agents/{}/state", enc(agent)),
+            agent_fixture(agent, DEVICE, AgentState::Running),
+        );
+    }
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    let t3_env = [("T3CODE_THREAD_ID", "thread-7")];
+    let cache = e
+        .home
+        .join(format!("state/sessions/claude-{}.json", SESSION));
+
+    // Nested: the session registers as itself, without the thread it runs inside.
+    nested_hook(&e, "session-start", &e.base("SessionStart"));
+    let register = &e.stub.requests_to("POST /v1/agents")[0];
+    assert_eq!(register.body["id"], CLAUDE_AGENT);
+    assert!(register.body["native_ids"].get("t3_thread").is_none());
+    assert_eq!(register.body["native_ids"]["claude_session"], SESSION);
+    let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(cached, json!({"nested": true}));
+
+    // Later hooks of the session use the cached decision, wherever they run.
+    e.stub.clear();
+    e.hook_env("stop", "claude", e.base("Stop"), &t3_env);
+    assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(CLAUDE_AGENT));
+
+    // SessionEnd drops the cache.
+    e.stub.clear();
+    e.hook_env("session-end", "claude", e.base("SessionEnd"), &t3_env);
+    assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(CLAUDE_AGENT));
+    assert!(!cache.exists());
+
+    // SessionStart decides again: run directly, the session is the T3 thread.
+    e.stub.clear();
+    e.hook_env("session-start", "claude", e.base("SessionStart"), &t3_env);
+    let register = &e.stub.requests_to("POST /v1/agents")[0];
+    assert_eq!(register.body["id"], t3);
+    assert_eq!(register.body["native_ids"]["t3_thread"], "thread-7");
+    let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(cached, json!({"nested": false}));
+}

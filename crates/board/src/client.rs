@@ -8,8 +8,8 @@ use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateLeases, CreateTask, DoneTask,
     ErrorCode, EventsPage, Handoff, JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent,
-    Snapshot, SnapshotFormat, SnapshotKind, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
-    TouchResult, Touches, UpdateBoard, UpdateTask,
+    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -332,6 +332,12 @@ impl Client {
         };
         self.with_body(Method::POST, &format!("/v1/asks/{id}/answer"), &body)
             .await
+    }
+
+    // Stats
+
+    pub async fn stats(&self, days: u32) -> Result<Stats> {
+        self.get_query("/v1/stats", &[("days", days)]).await
     }
 
     // Snapshots and events
