@@ -1,7 +1,7 @@
 use chrono::TimeDelta;
 use serde_json::{Value, json};
 
-use super::{REPO, T};
+use super::{REPO, T, defaults};
 
 const DESIGN: &str = include_str!("../../../../docs/DESIGN.md");
 
@@ -28,6 +28,21 @@ async fn snapshot(t: &T, agent: &str, query: &str) -> Value {
 
 fn text(snapshot: &Value) -> &str {
     snapshot["text"].as_str().unwrap()
+}
+
+/// A server with the settings the DESIGN.md example was written for, so the example keeps
+/// its shape when a default changes.
+fn design_server() -> T {
+    T::with(|c| {
+        let d = &mut c.defaults;
+        d.touch_window_secs = 3600;
+        d.snapshot_full_chars = 2000;
+        d.snapshot_delta_chars = 600;
+        d.snapshot_alerts_chars = 400;
+        d.snapshot_ready_items = 3;
+        d.snapshot_recent_items = 3;
+        d.snapshot_peer_items = 8;
+    })
 }
 
 /// Builds the scenario of the DESIGN.md example; returns with the clock at "now".
@@ -155,7 +170,7 @@ async fn design_scenario(t: &T) {
 
 #[tokio::test]
 async fn full_snapshot_matches_the_design_example() {
-    let t = T::new();
+    let t = design_server();
     design_scenario(&t).await;
     let full = snapshot(&t, ME, "since=806").await;
     assert_eq!(full["seq"], 812);
@@ -167,7 +182,7 @@ async fn full_snapshot_matches_the_design_example() {
 
 #[tokio::test]
 async fn delta_and_alerts_render_the_same_alerts() {
-    let t = T::new();
+    let t = design_server();
     design_scenario(&t).await;
     let delta = snapshot(&t, ME, "kind=delta&since=806").await;
     let expected = "\
@@ -321,9 +336,10 @@ async fn snapshots_respect_their_caps() {
         )
         .await;
     }
+    let caps = defaults();
     let full = text(&snapshot(&t, me, "since=0").await).to_owned();
     assert!(
-        full.chars().count() <= 2000,
+        full.chars().count() <= caps.snapshot_full_chars,
         "{} chars",
         full.chars().count()
     );
@@ -334,14 +350,14 @@ async fn snapshots_respect_their_caps() {
     assert!(full.contains("Claim before working"));
     let delta = text(&snapshot(&t, me, "kind=delta&since=0").await).to_owned();
     assert!(
-        delta.chars().count() <= 600,
+        delta.chars().count() <= caps.snapshot_delta_chars,
         "{} chars:\n{delta}",
         delta.chars().count()
     );
     assert!(delta.contains("! "));
     let alerts = text(&snapshot(&t, me, "kind=alerts&since=0").await).to_owned();
     assert!(
-        alerts.chars().count() <= 400,
+        alerts.chars().count() <= caps.snapshot_alerts_chars,
         "{} chars:\n{alerts}",
         alerts.chars().count()
     );
@@ -384,7 +400,7 @@ async fn hostile_titles_stay_inside_the_block() {
 
 #[tokio::test]
 async fn json_and_yaml_carry_the_same_model() {
-    let t = T::new();
+    let t = design_server();
     design_scenario(&t).await;
     let json_text = text(&snapshot(&t, ME, "since=806&format=json").await).to_owned();
     let body: String = json_text

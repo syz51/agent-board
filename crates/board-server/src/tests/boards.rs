@@ -1,7 +1,7 @@
 use chrono::TimeDelta;
 use serde_json::json;
 
-use super::{T, check};
+use super::{T, check, coordinator_ttl};
 
 #[tokio::test]
 async fn boards_are_created_updated_and_counted() {
@@ -146,8 +146,10 @@ async fn one_device_holds_the_coordinator_lease() {
         )
         .await;
     assert_eq!(board["coordinator"], "t3:coord");
+    // Each step is inside the lease, two are past an unrenewed one.
+    let step = TimeDelta::seconds(coordinator_ttl().num_seconds() * 2 / 3);
     // Renewal without an agent keeps the coordinator.
-    t.advance(TimeDelta::minutes(30));
+    t.advance(step);
     let board = t
         .ok(
             "POST",
@@ -158,7 +160,7 @@ async fn one_device_holds_the_coordinator_lease() {
         .await;
     assert_eq!(board["coordinator"], "t3:coord");
     // The coordinator's heartbeat renews the lease too.
-    t.advance(TimeDelta::minutes(30));
+    t.advance(step);
     t.ok(
         "POST",
         "/v1/agents/t3:coord/state",
@@ -166,10 +168,10 @@ async fn one_device_holds_the_coordinator_lease() {
         Some(json!({ "state": "running" })),
     )
     .await;
-    t.advance(TimeDelta::minutes(40));
+    t.advance(coordinator_ttl() - TimeDelta::minutes(1));
     let (s, _) = as_laptop("POST", Some(json!({ "device": "laptop" }))).await;
     assert_eq!(s.as_u16(), 409, "renewed by the heartbeat");
-    t.advance(TimeDelta::minutes(6));
+    t.advance(TimeDelta::minutes(2));
     assert_eq!(
         t.ok("GET", "/v1/boards/auto", None, None).await["coordinator"],
         json!(null)

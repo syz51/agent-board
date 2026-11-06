@@ -2,7 +2,7 @@ use chrono::TimeDelta;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::{REPO, T};
+use super::{REPO, T, defaults};
 use crate::auth::hex;
 
 #[tokio::test]
@@ -135,7 +135,11 @@ async fn handoffs_are_replaced_whole_with_versions() {
             "PUT",
             &path,
             Some(a),
-            Some(json!({ "now": "x".repeat(201), "next": "y", "version": 2 })),
+            Some(json!({
+                "now": "x".repeat(defaults().handoff_field_chars + 1),
+                "next": "y",
+                "version": 2,
+            })),
         )
         .await;
     assert_eq!(s.as_u16(), 400);
