@@ -25,6 +25,9 @@ export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
 const seg = encodeURIComponent;
 
+/** Largest `limit` `GET /v1/tasks` accepts. */
+export const MAX_TASKS = 1000;
+
 function query(params: Record<string, string | number | boolean | undefined>): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -87,8 +90,9 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
     board: (slug: string) => get(`/v1/boards/${seg(slug)}`, s.board),
     setAutopilot: (slug: string, autopilot: boolean) =>
       request("PATCH", `/v1/boards/${seg(slug)}`, s.board, { autopilot }),
-    tasks: (params: { board?: string; status?: string; owner?: string }) =>
-      get(`/v1/tasks${query(params)}`, array(s.task)),
+    // The server defaults to 200 tasks; screens ask for its maximum so a busy board is complete.
+    tasks: (params: { board?: string; status?: string; owner?: string; limit?: number }) =>
+      get(`/v1/tasks${query({ ...params, limit: params.limit ?? MAX_TASKS })}`, array(s.task)),
     task: (id: string) => get(`/v1/tasks/${seg(id)}`, s.taskDetail),
     agents: (params: { board?: string; state?: string } = {}) =>
       get(`/v1/agents${query(params)}`, array(s.agent)),

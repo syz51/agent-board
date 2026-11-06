@@ -70,10 +70,12 @@ describe("api client parsing", () => {
   test("builds same-origin URLs, encodes path segments and drops empty params", async () => {
     const { api, calls } = fakeFetch(() => json([]));
     await api.tasks({ board: "web view/x", status: "" });
+    await api.tasks({ status: "doing", limit: 5 });
     await api.asks({ status: "open" });
     await api.handoff("t3:7f3a").catch(() => {});
     expect(calls.map((call) => call.url)).toEqual([
-      "/v1/tasks?board=web+view%2Fx",
+      "/v1/tasks?board=web+view%2Fx&limit=1000",
+      "/v1/tasks?status=doing&limit=5",
       "/v1/asks?status=open",
       "/v1/agents/t3%3A7f3a/handoff",
     ]);
