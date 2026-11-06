@@ -73,6 +73,12 @@ const CLAUDE_HOOKS: &[HookSpec] = &[
         matcher: None,
         timeout: 5,
     },
+    // Marks when each shell call starts, so PostToolUse can tell the files it changed.
+    HookSpec {
+        event: HookEvent::PreToolUse,
+        matcher: Some("Bash"),
+        timeout: 5,
+    },
     HookSpec {
         event: HookEvent::PostToolUse,
         matcher: Some("*"),
@@ -111,6 +117,11 @@ const CODEX_HOOKS: &[HookSpec] = &[
     HookSpec {
         event: HookEvent::UserPromptSubmit,
         matcher: None,
+        timeout: 5,
+    },
+    HookSpec {
+        event: HookEvent::PreToolUse,
+        matcher: Some("Bash"),
         timeout: 5,
     },
     HookSpec {

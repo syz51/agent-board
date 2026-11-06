@@ -8,6 +8,7 @@
 //! - Stop: `{"decision": "block", "reason": <text>}` continues the turn with the reason;
 //!   Codex requires JSON on stdout, so it gets `{}` otherwise.
 //! - PreCompact (Claude Code): plain stdout becomes compaction instructions.
+//! - PreToolUse (shell calls only): prints nothing, which lets the call run.
 //! - StopFailure and SessionEnd: output is ignored.
 
 use std::io::Read as _;
@@ -19,7 +20,7 @@ use board_proto::{
     AgentId, AgentState, AgentStateUpdate, Runtime, Snapshot, SnapshotFormat, SnapshotKind,
     TaskStatus, Timestamp, Touches,
 };
-use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
@@ -45,6 +46,8 @@ pub enum HookEvent {
     SessionStart,
     #[value(alias = "UserPromptSubmit")]
     UserPromptSubmit,
+    #[value(alias = "PreToolUse")]
+    PreToolUse,
     #[value(alias = "PostToolUse")]
     PostToolUse,
     #[value(alias = "Stop")]
@@ -63,6 +66,7 @@ impl HookEvent {
         match self {
             Self::SessionStart => "SessionStart",
             Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::Stop => "Stop",
             Self::StopFailure => "StopFailure",
@@ -76,6 +80,7 @@ impl HookEvent {
         match self {
             Self::SessionStart => "session-start",
             Self::UserPromptSubmit => "user-prompt-submit",
+            Self::PreToolUse => "pre-tool-use",
             Self::PostToolUse => "post-tool-use",
             Self::Stop => "stop",
             Self::StopFailure => "stop-failure",
@@ -171,6 +176,15 @@ async fn handle(
     started: Instant,
 ) -> Result<Reply> {
     let home = Home::from_env()?;
+    if event == HookEvent::PreToolUse {
+        // Runs before every shell call: local only, no login, token or server.
+        if input["tool_name"] == SHELL_TOOL
+            && let Some(tool_use) = input["tool_use_id"].as_str().filter(|s| !s.is_empty())
+        {
+            state::save_tool_start(&home, runtime, tool_use, Utc::now())?;
+        }
+        return Ok(Reply::Nothing);
+    }
     let config = Config::load(&home)?;
     let Ok((server, device)) = config.require_login() else {
         return Ok(Reply::Nothing);
@@ -243,6 +257,8 @@ async fn handle(
 /// `SessionEnd` drops the cache.
 /// How long a session's cached decisions outlive its last SessionStart.
 const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// How long the start mark of a shell call that never reached PostToolUse is kept.
+const TOOL_START_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 async fn nested_session(
     home: &Home,
@@ -266,10 +282,13 @@ async fn nested_session(
     let prune = (event == HookEvent::SessionStart).then(|| home.clone());
     let nested = tokio::task::spawn_blocking(move || {
         // Before this session's file is written, so it is never the one removed.
-        if let Some(home) = prune
-            && let Err(err) = state::prune_sessions(&home, SESSION_CACHE_AGE)
-        {
-            tracing::debug!("pruning cached sessions: {err:#}");
+        if let Some(home) = prune {
+            if let Err(err) = state::prune_sessions(&home, SESSION_CACHE_AGE) {
+                tracing::debug!("pruning cached sessions: {err:#}");
+            }
+            if let Err(err) = state::prune_tool_starts(&home, TOOL_START_AGE) {
+                tracing::debug!("pruning tool start marks: {err:#}");
+            }
         }
         nested_here()
     })
@@ -294,6 +313,8 @@ impl Hook<'_> {
         match self.event {
             HookEvent::SessionStart => self.session_start().await,
             HookEvent::UserPromptSubmit => self.user_prompt_submit().await,
+            // Handled before login (`handle`).
+            HookEvent::PreToolUse => Ok(Reply::Nothing),
             HookEvent::PostToolUse => self.post_tool_use().await,
             HookEvent::Stop => self.stop().await,
             HookEvent::StopFailure => self.stop_failure().await,
@@ -461,11 +482,24 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
-        let paths = edited_paths(tool, &self.input["tool_input"]);
-        if !paths.is_empty() {
+        let mut paths = edited_paths(tool, &self.input["tool_input"]);
+        let shell_start = match self.input["tool_use_id"].as_str() {
+            Some(tool_use) if tool == SHELL_TOOL => {
+                state::take_tool_start(&self.home, self.runtime, tool_use)?
+            }
+            _ => None,
+        };
+        if !paths.is_empty() || shell_start.is_some() {
             let repo = detect_repo(self.cwd()).await?;
+            if let (Some(since), Some(root)) = (shell_start, repo.root.clone()) {
+                match tokio::task::spawn_blocking(move || changed_since(&root, since)).await? {
+                    Ok(changed) => paths.extend(changed),
+                    Err(err) => tracing::debug!("files changed by the shell call: {err:#}"),
+                }
+            }
             if let Some(key) = repo.key.clone() {
-                let rel: Vec<String> = paths.iter().filter_map(|p| repo.relative(p)).collect();
+                let mut rel: Vec<String> = paths.iter().filter_map(|p| repo.relative(p)).collect();
+                rel.truncate(MAX_TOUCH_PATHS);
                 if !rel.is_empty() {
                     let result = self
                         .client
@@ -588,6 +622,46 @@ pub fn heartbeat_due(last: Option<Timestamp>, now: Timestamp) -> bool {
             .to_std()
             .map_or(true, |since| since >= HEARTBEAT_EVERY)
     })
+}
+
+/// The shell tool's name on both runtimes.
+const SHELL_TOOL: &str = "Bash";
+/// Paths one `POST /v1/touches` accepts.
+const MAX_TOUCH_PATHS: usize = 100;
+
+/// Files under the work tree `root` that `git status` lists as changed or untracked and
+/// that were modified at or after `since`: what a shell call that started then wrote.
+/// Files the call deleted, or changed and committed, are not seen.
+pub fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    anyhow::ensure!(out.status.success(), "git status failed: {}", out.status);
+    // Whole seconds: some file systems keep modification times to the second.
+    let since = since.trunc_subsecs(0);
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        // Each entry is `XY <path>`; paths are relative to the work tree.
+        .filter_map(|entry| std::str::from_utf8(entry.get(3..)?).ok())
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(path))
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| DateTime::<Utc>::from(modified) >= since)
+        })
+        .collect())
 }
 
 /// Files a tool call edited: Claude Code's `Edit`, `Write`, `MultiEdit` and

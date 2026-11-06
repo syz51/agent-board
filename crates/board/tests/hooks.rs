@@ -320,6 +320,136 @@ fn codex_apply_patch_records_each_patched_file() {
     assert_eq!(touch.body["paths"], json!(["src/a.rs", "docs/b.md"]));
 }
 
+/// Sets a file's modification time well before any hook in the test ran.
+fn backdate(path: &std::path::Path) {
+    let ok = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "touch -t {}", path.display());
+}
+
+#[test]
+fn shell_calls_record_the_files_they_changed() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub.on(
+        "POST /v1/touches",
+        TouchResult {
+            overlaps: vec![Overlap {
+                path: "src/lib.rs".into(),
+                agent: "t3:a91c".parse().unwrap(),
+                handle: "t3:a91c".into(),
+                via: "touch".into(),
+                at: chrono::Utc::now() - chrono::Duration::minutes(3),
+            }],
+        },
+    );
+    // Changed before the call: dirty in git, but not by this call.
+    std::fs::write(e.repo.join("README.md"), "old\n").unwrap();
+    backdate(&e.repo.join("README.md"));
+    std::fs::write(e.repo.join(".gitignore"), "target/\n").unwrap();
+    backdate(&e.repo.join(".gitignore"));
+    let command = "sed -i.bak s/a/b/ src/lib.rs && rm src/lib.rs.bak";
+    let call = |event: &str, id: &str| {
+        e.with(
+            event,
+            json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "description": "Edit lib.rs"},
+                "tool_use_id": id,
+            }),
+        )
+    };
+
+    let (reply, text) = e.hook("pre-tool-use", "claude", call("PreToolUse", "toolu_sh1"));
+    assert_eq!(
+        (reply, text.as_str()),
+        (None, ""),
+        "PreToolUse lets the call run"
+    );
+    assert!(
+        e.stub.requests().is_empty(),
+        "PreToolUse never calls the server"
+    );
+    // What the command does: edits one file, adds another, writes an ignored one.
+    std::fs::write(e.repo.join("src/lib.rs"), "b\n").unwrap();
+    std::fs::create_dir_all(e.repo.join("src/new")).unwrap();
+    std::fs::write(e.repo.join("src/new/mod.rs"), "x\n").unwrap();
+    std::fs::create_dir_all(e.repo.join("target")).unwrap();
+    std::fs::write(e.repo.join("target/out"), "x\n").unwrap();
+
+    let mut post = call("PostToolUse", "toolu_sh1");
+    post["tool_response"] = json!({"stdout": "", "stderr": "", "interrupted": false});
+    let (reply, _) = e.hook("post-tool-use", "claude", post.clone());
+    let text = context(&reply, "PostToolUse");
+    assert!(
+        text.contains("! t3:a91c edited \"src/lib.rs\" 3m ago -> re-read before editing"),
+        "the same alert as an Edit: {text}"
+    );
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(
+        touches[0].body,
+        json!({
+            "agent": CLAUDE_AGENT,
+            "repo": "github.com/syz51/agent-board",
+            "paths": ["src/lib.rs", "src/new/mod.rs"],
+        })
+    );
+
+    // The start mark is used once; a shell call without one records nothing.
+    e.hook("post-tool-use", "claude", post);
+    e.hook("post-tool-use", "claude", call("PostToolUse", "toolu_sh2"));
+    assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 1);
+}
+
+#[test]
+fn codex_shell_calls_record_the_files_they_changed() {
+    let e = env();
+    let codex_agent = "codex:thr_123";
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(codex_agent)),
+        agent_fixture(codex_agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    let payload = |event: &str| {
+        json!({
+            "session_id": "thr_123",
+            "transcript_path": null,
+            "cwd": e.repo,
+            "hook_event_name": event,
+            "model": "gpt-5.5-codex",
+            "turn_id": "turn_1",
+            "permission_mode": "default",
+            "tool_name": "Bash",
+            "tool_use_id": "call_7",
+            "tool_input": {"command": "printf x > docs/notes.md"},
+        })
+    };
+    let (_, text) = e.hook("pre-tool-use", "codex", payload("PreToolUse"));
+    assert_eq!(text, "");
+    std::fs::create_dir_all(e.repo.join("docs")).unwrap();
+    std::fs::write(e.repo.join("docs/notes.md"), "x").unwrap();
+    let mut post = payload("PostToolUse");
+    post["tool_response"] = json!("x");
+    let (_, text) = e.hook("post-tool-use", "codex", post);
+    assert_eq!(text, "");
+    let touch = &e.stub.requests_to("POST /v1/touches")[0];
+    assert_eq!(touch.agent.as_deref(), Some(codex_agent));
+    assert_eq!(touch.body["paths"], json!(["docs/notes.md"]));
+}
+
 #[test]
 fn stop_reminds_once_about_a_stale_handoff() {
     let e = env();

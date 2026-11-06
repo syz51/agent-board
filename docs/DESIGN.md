@@ -154,7 +154,9 @@ stdin, answers within 1.5 seconds and never fails the turn.
 |---|---|
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
+| `PreToolUse` on `Bash` (both runtimes) | Mark when the call started, in a local file; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
+| `PostToolUse` on `Bash` with a start mark | The same, for files `git status` lists as changed or untracked with a modification time since the mark (at most 100; a file deleted, or changed and committed, by the call is not seen) |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
 | `Stop` | Mark idle; remind once if a task in `doing` has a handoff older than the turn |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |

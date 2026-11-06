@@ -59,6 +59,13 @@ fn install_claude_merges_into_existing_settings_without_losing_keys() {
         v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "guard.sh"
     );
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "the user's hook is kept: {pre:?}");
+    assert_eq!(pre[1]["matcher"], "Bash");
+    assert_eq!(
+        pre[1]["hooks"][0]["command"],
+        "/opt/bin/board hook pre-tool-use --runtime claude"
+    );
     let stop = v["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(stop.len(), 2);
     assert_eq!(stop[0]["hooks"][0]["command"], "afplay done.aiff");
@@ -141,6 +148,7 @@ fn install_codex_writes_hooks_and_prints_the_mcp_snippet() {
         "Codex has no StopFailure"
     );
     assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+    assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash");
     assert_eq!(
         v["hooks"]["SessionStart"][0]["matcher"],
         "startup|resume|clear|compact|fork"
