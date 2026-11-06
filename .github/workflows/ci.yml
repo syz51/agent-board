@@ -27,7 +27,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+      # Only main saves: a pull request's cache is readable by that pull request alone,
+      # so saving there only evicts main's entries.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -71,6 +75,7 @@ jobs:
           load: true
           tags: agent-board:ci
           cache-from: type=gha,scope=ci
-          cache-to: type=gha,mode=max,scope=ci
+          # Pull requests read main's layers; only main writes them.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=ci' || '' }}
       - name: Smoke test the image
         run: docker run --rm agent-board:ci --version
