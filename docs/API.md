@@ -24,6 +24,13 @@ runtime's environment. Every request body field named `agent`, `RegisterAgent.id
 every agent id in a path must equal the header. Agent ids in paths are percent-encoded
 (`:` as `%3A`, `%` as `%25`).
 
+Every `repo` field (boards' `repos`, agents, leases, touches) takes an origin URL in any
+common form (`https://host/owner/repo.git`, `git@host:owner/repo`, `ssh://git@host:22/owner/repo`)
+or a key, and is stored and returned as the key `board_proto::normalize_repo` makes:
+`host/owner/repo`, lowercased as a whole, without user, port or `.git`. In scp form
+(`git@host:12345/repo`) the part after the colon is always the path, never a port. Local
+paths and `file://` URLs are `invalid`.
+
 ## Errors
 
 Every error is `[ApiError]` `{code, message, next}` with these statuses:

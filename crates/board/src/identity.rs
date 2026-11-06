@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use board_proto::{AgentId, Runtime};
+use board_proto::{AgentId, Runtime, normalize_repo};
 
 /// Environment variable T3 Code sets in its threads.
 pub const T3_THREAD_ENV: &str = "T3CODE_THREAD_ID";
@@ -46,42 +46,6 @@ pub fn resolve_agent(
 /// Resolves the agent from the process environment.
 pub fn agent_from_env(explicit: Option<&str>) -> Result<Option<AgentId>> {
     resolve_agent(explicit, |name| std::env::var(name).ok(), None)
-}
-
-/// Normalizes a git remote URL to a repo key such as `github.com/owner/repo`.
-///
-/// Accepts scp-like ssh (`git@host:owner/repo.git`), `ssh://`, `git://`, `http(s)://`,
-/// with or without user, port, `.git` suffix and trailing slash. The key is lowercase.
-/// Local paths and `file://` remotes have no key.
-pub fn normalize_repo(url: &str) -> Option<String> {
-    let url = url.trim();
-    let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
-        if scheme.eq_ignore_ascii_case("file") {
-            return None;
-        }
-        let (authority, path) = rest.split_once('/')?;
-        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        // Drop a port; scp-style `host:path` inside ssh:// is also tolerated.
-        let host = host.split_once(':').map_or(host, |(h, _)| h);
-        (host, path)
-    } else {
-        // scp-like: [user@]host:path. A path without a colon is a local path.
-        let (authority, path) = url.split_once(':')?;
-        if authority.contains('/') || authority.is_empty() {
-            return None;
-        }
-        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        (host, path)
-    };
-    let path = path.trim_matches('/');
-    let path = path
-        .strip_suffix(".git")
-        .unwrap_or(path)
-        .trim_end_matches('/');
-    if host.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some(format!("{host}/{path}").to_lowercase())
 }
 
 /// The working copy the agent runs in.
@@ -216,35 +180,6 @@ mod tests {
         );
         assert!(resolve_agent(None, env(&[(T3_THREAD_ENV, "a b")]), None).is_err());
         assert!(resolve_agent(Some("gpt:1"), env(&[]), None).is_err());
-    }
-
-    #[test]
-    fn repo_urls_normalize_to_host_owner_repo() {
-        for url in [
-            "git@github.com:syz51/agent-board.git",
-            "git@github.com:syz51/agent-board",
-            "ssh://git@github.com/syz51/agent-board.git",
-            "ssh://git@github.com:22/syz51/agent-board.git",
-            "https://github.com/syz51/agent-board.git",
-            "https://github.com/syz51/agent-board/",
-            "https://user:pw@github.com/Syz51/Agent-Board",
-            "http://github.com:443/syz51/agent-board.git",
-            "git://github.com/syz51/agent-board.git",
-            "  git@github.com:syz51/agent-board.git\n",
-        ] {
-            assert_eq!(
-                normalize_repo(url).as_deref(),
-                Some("github.com/syz51/agent-board"),
-                "{url}"
-            );
-        }
-        assert_eq!(
-            normalize_repo("git@gitlab.com:group/sub/repo.git").as_deref(),
-            Some("gitlab.com/group/sub/repo")
-        );
-        for local in ["/srv/git/repo.git", "./repo", "file:///srv/repo.git", ""] {
-            assert_eq!(normalize_repo(local), None, "{local}");
-        }
     }
 
     #[test]

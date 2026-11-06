@@ -13,7 +13,10 @@ use crate::config::Settings;
 use crate::error::{Error, Result};
 
 /// Numbered schema migrations; `PRAGMA user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_lowercase_repo_keys.sql"),
+];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -287,6 +290,43 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn migration_lowercases_stored_repo_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 't', '', 'active', \
+             '[\"github.com/MyOrg/Repo\",\"github.com/o/x\",\"github.com/myorg/repo\"]', \
+             0, '[]', 0, 0); \
+             INSERT INTO agents (id, handle, runtime, device, role, repo, state, last_seen, \
+             created_at) VALUES ('claude:a', 'claude:a', 'claude', 'd', 'worker', \
+             'github.com/MyOrg/Repo', 'idle', 0, 0); \
+             INSERT INTO leases (agent, repo, glob, expires_at, created_at) \
+             VALUES ('claude:a', 'github.com/MyOrg/Repo', 'src/**', 1, 0); \
+             INSERT INTO touches (agent, repo, path, at) VALUES \
+             ('claude:a', 'github.com/MyOrg/Repo', 'a.rs', 5), \
+             ('claude:a', 'github.com/myorg/repo', 'a.rs', 3), \
+             ('claude:a', 'github.com/MyOrg/Repo', 'b.rs', 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(
+            one("SELECT repos FROM boards"),
+            r#"["github.com/myorg/repo","github.com/o/x"]"#
+        );
+        assert_eq!(one("SELECT repo FROM agents"), "github.com/myorg/repo");
+        assert_eq!(one("SELECT repo FROM leases"), "github.com/myorg/repo");
+        assert_eq!(
+            one("SELECT group_concat(repo || ' ' || path || ' ' || at, '; ') FROM \
+                 (SELECT * FROM touches ORDER BY path)"),
+            "github.com/myorg/repo a.rs 5; github.com/myorg/repo b.rs 1"
+        );
     }
 
     #[test]
