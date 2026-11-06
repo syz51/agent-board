@@ -254,7 +254,7 @@ async fn delta_reports_changed_counts_once_and_new_alerts() {
     let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
     assert!(text(&delta).contains("alerts:\n  ! "), "{}", text(&delta));
     assert!(text(&delta).contains("src/**"), "{}", text(&delta));
-    assert!(text(&delta).chars().count() <= 600);
+    assert!(text(&delta).chars().count() <= defaults().snapshot_delta_chars);
 
     // The user looks without moving the agent's cursor.
     t.task("t3:beta", "factory", "Another").await;
@@ -297,7 +297,7 @@ async fn answered_asks_alert_the_asker() {
         alerts.contains("-> read the answer (board_status)"),
         "{alerts}"
     );
-    assert!(alerts.chars().count() <= 400);
+    assert!(alerts.chars().count() <= defaults().snapshot_alerts_chars);
 }
 
 #[tokio::test]
