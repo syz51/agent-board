@@ -26,7 +26,7 @@ env:
   PUBLISH: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
 
 jobs:
-  web:
+  web-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -50,7 +50,7 @@ jobs:
           if-no-files-found: error
 
   binaries:
-    needs: web
+    needs: web-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
