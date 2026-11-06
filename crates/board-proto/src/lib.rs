@@ -7,10 +7,12 @@
 mod api;
 mod ids;
 mod model;
+mod repo;
 
 pub use api::*;
 pub use ids::*;
 pub use model::*;
+pub use repo::{REPO_KEY_MAX, normalize_repo};
 
 /// Version prefix of every API path.
 pub const API_PREFIX: &str = "/v1";

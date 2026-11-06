@@ -1,0 +1,8 @@
+[Unit]
+Description=Back up the agent-board database with restic
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/agent-board/deploy/backup.sh

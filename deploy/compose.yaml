@@ -1,0 +1,16 @@
+# Runs the server on the host network, listening on loopback only, so nothing but
+# `tailscale serve` on this host can reach it (see docs/DEPLOY.md).
+services:
+  board:
+    build: ..
+    image: agent-board:local
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      BOARD_LOG: info
+    env_file:
+      - path: /etc/agent-board/secrets.env
+        required: false
+    volumes:
+      - /etc/agent-board/server.toml:/etc/agent-board/server.toml:ro
+      - /var/lib/agent-board:/var/lib/agent-board

@@ -1,0 +1,176 @@
+// Wire types of `crates/board-proto` (model.rs, api.rs), as decoders. The TypeScript types
+// are derived from the decoders so the two cannot drift apart.
+
+import {
+  array,
+  boolean,
+  type Decoded,
+  integer,
+  json,
+  nullable,
+  object,
+  oneOf,
+  record,
+  string,
+  timestamp,
+} from "./decode.ts";
+
+export const TASK_STATUSES = ["open", "doing", "blocked", "review", "done", "dropped"] as const;
+export const PRIORITIES = ["p1", "p2", "p3"] as const;
+
+const boardStatus = oneOf("active", "paused", "closed");
+const taskStatus = oneOf(...TASK_STATUSES);
+const priority = oneOf(...PRIORITIES);
+
+export const statusCounts = object({
+  open: integer,
+  doing: integer,
+  blocked: integer,
+  review: integer,
+  done: integer,
+  dropped: integer,
+  ready: integer,
+});
+
+export const board = object({
+  slug: string,
+  title: string,
+  goal: string,
+  status: boardStatus,
+  repos: array(string),
+  autopilot: boolean,
+  coordinator: nullable(string),
+  home_devices: array(string),
+  counts: statusCounts,
+  open_asks: integer,
+  created_at: timestamp,
+  updated_at: timestamp,
+});
+
+export const task = object({
+  id: string,
+  board: string,
+  parent: nullable(string),
+  title: string,
+  body: string,
+  acceptance: string,
+  status: taskStatus,
+  priority,
+  blocked_reason: nullable(string),
+  owner: nullable(string),
+  owner_stale: boolean,
+  blockers: array(string),
+  ready: boolean,
+  auto: boolean,
+  created_by: string,
+  version: integer,
+  created_at: timestamp,
+  updated_at: timestamp,
+});
+
+/**
+ * Event types are kept as plain strings: the server may add types within `/v1`, and the
+ * web view shows unknown ones generically instead of failing.
+ */
+export const event = object({
+  seq: integer,
+  at: timestamp,
+  board: nullable(string),
+  actor: string,
+  type: string,
+  task: nullable(string),
+  payload: json,
+});
+
+export const note = object({
+  id: integer,
+  task: string,
+  agent: string,
+  kind: oneOf("note", "finding", "decision", "feedback"),
+  text: string,
+  at: timestamp,
+});
+
+export const evidence = object({
+  kind: oneOf("check", "commit", "pr", "artifact"),
+  value: string,
+  exit_code: nullable(integer),
+  agent: string,
+  at: timestamp,
+});
+
+export const taskDetail = object({
+  task,
+  notes: array(note),
+  evidence: array(evidence),
+  blocks: array(string),
+  children: array(string),
+  history: array(event),
+});
+
+export const agent = object({
+  id: string,
+  handle: string,
+  runtime: oneOf("claude", "codex"),
+  device: string,
+  role: oneOf("worker", "coordinator"),
+  title: nullable(string),
+  repo: nullable(string),
+  branch: nullable(string),
+  cwd: nullable(string),
+  native_ids: record(string),
+  forked_from: nullable(string),
+  state: oneOf("running", "idle", "paused", "ended"),
+  paused_until: nullable(timestamp),
+  boards: array(string),
+  last_seen: timestamp,
+  created_at: timestamp,
+});
+
+export const handoff = object({
+  agent: string,
+  now: string,
+  next: string,
+  blockers: string,
+  version: integer,
+  updated_at: timestamp,
+});
+
+export const ask = object({
+  id: integer,
+  board: string,
+  task: nullable(string),
+  agent: string,
+  kind: oneOf("decision", "action"),
+  question: string,
+  options: array(string),
+  status: oneOf("open", "answered", "withdrawn"),
+  answer: nullable(string),
+  answered_via: nullable(string),
+  created_at: timestamp,
+  answered_at: nullable(timestamp),
+});
+
+export const eventsPage = object({ events: array(event), next_since: integer });
+
+export const health = object({ ok: boolean, seq: integer });
+
+/** `ErrorCode` is kept open for the same reason as event types. */
+export const apiError = object({ code: string, message: string, next: nullable(string) });
+
+
+export type Board = Decoded<typeof board>;
+export type StatusCounts = Decoded<typeof statusCounts>;
+export type Task = Decoded<typeof task>;
+export type TaskStatus = Task["status"];
+export type Priority = Task["priority"];
+export type TaskDetail = Decoded<typeof taskDetail>;
+export type Note = Decoded<typeof note>;
+export type Evidence = Decoded<typeof evidence>;
+export type Agent = Decoded<typeof agent>;
+export type Handoff = Decoded<typeof handoff>;
+export type Ask = Decoded<typeof ask>;
+/** One entry of the event log. Named to avoid the DOM's `Event`. */
+export type BoardEvent = Decoded<typeof event>;
+export type EventsPage = Decoded<typeof eventsPage>;
+export type Health = Decoded<typeof health>;

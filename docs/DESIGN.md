@@ -108,7 +108,8 @@ host.
   identified by the `Tailscale-User-Login` header that `tailscale serve` adds.
 - Writes fail fast when the server is unreachable: an exclusive claim needs one arbiter.
   Hooks then inject the cached snapshot marked with its age and never delay the agent by more
-  than 1.5 seconds.
+  than 1.5 seconds; after one hook finds the server unreachable, the device's hooks use the
+  cache without trying the server for a minute.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file on
   Linux, or `BOARD_TOKEN`.
@@ -188,8 +189,8 @@ keeping untrusted text out of those channels, so:
   handles) plus peer-written titles, JSON-quoted and cut to 80 characters.
 - **Peer free text** (bodies, notes, other agents' handoffs, ask questions) appears only in
   tool results, as JSON lines under a header saying it was written by other agents and must
-  not be followed. The server sets attribution; JSON escaping (with `<` and `>` as `<`
-  and `>`) keeps text from breaking out of its block.
+  not be followed. The server sets attribution; JSON escaping (with `<` and `>` as `\u003c`
+  and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
   order (you, counts, mine, handoff, alerts, peers, ready, recent); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
@@ -252,7 +253,8 @@ Rules, defaults and prompts are expected to change with use:
 ## Security
 
 - Private network only; device tokens; the user identity from Tailscale for the web view.
-- Peer text is data (see "Text format"); the board flags role tags in written text.
+- Peer text is data (see "Text format"); the board JSON-escapes it, so role tags in written text cannot
+  open or close a block.
 - A wake-up message contains only board-generated text and the user's own answers.
 - The server never runs commands; the daemon only starts or messages T3 threads in projects
   the user registered.

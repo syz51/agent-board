@@ -1,0 +1,14 @@
+# Copy to /etc/agent-board/server.toml on the server host and fill in the placeholders.
+db = "/var/lib/agent-board/board.db"
+listen = "127.0.0.1:7377"
+
+# Tailscale logins treated as you (web view, answering asks).
+users = ["you@example.com"]
+# Safe only because the listener is on loopback and reached solely through `tailscale serve`.
+trust_identity_header = true
+# The tailnet URL of the web view, for links in notifications.
+public_url = "https://board-host.your-tailnet.ts.net"
+
+# Optional. The bot token goes in /etc/agent-board/secrets.env as BOARD_TELEGRAM_TOKEN.
+# [telegram]
+# chat_id = 123456789

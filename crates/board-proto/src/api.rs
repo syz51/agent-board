@@ -290,6 +290,16 @@ pub struct DeviceToken {
     pub token: String,
 }
 
+/// A device as listed by `GET /v1/admin/devices`; never carries its token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub name: DeviceName,
+    /// The token acts as the user.
+    pub user: bool,
+    pub created_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {

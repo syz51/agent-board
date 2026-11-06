@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in agent-board doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is public. Replace hostnames, tokens, Telegram ids and board
+        contents with placeholders. Report security problems privately instead (see SECURITY.md).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Server (board serve)
+        - CLI
+        - MCP server (board mcp)
+        - Hooks (board hook)
+        - Daemon (board watch)
+        - Installers (board install)
+        - Web view
+        - Container image or deployment
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. board ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `board --version`, or the commit you built.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS 26 arm64, Claude Code 3.1 inside T3 Code; server in the container image
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output, with `BOARD_LOG=debug` if you can. Check it for secrets first.
+      render: text
