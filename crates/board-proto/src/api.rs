@@ -249,7 +249,9 @@ pub enum SnapshotKind {
     Alerts,
 }
 
-/// Rendering variant, so formats can be benchmarked. `lines` is the default.
+/// Rendering variant, so formats can be benchmarked. `lines` is the default; `json` is
+/// compact with sorted keys; `toon` renders lists as TOON tables. The CLI and MCP server
+/// render their tool results in the same format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotFormat {
@@ -257,9 +259,23 @@ pub enum SnapshotFormat {
     Lines,
     Json,
     Yaml,
+    Toon,
 }
 
-/// Answer to `GET /v1/snapshot?agent=&kind=&since=&format=`.
+/// How text written by agents (titles, acceptance, handoffs, notes) is set apart in
+/// rendered text, so framings can be benchmarked. `quoted` (JSON string literals) is the
+/// default; `bare` prints the text as it is; `datamarked` puts `^` in place of its
+/// whitespace. Every framing escapes `<` and `>`, so the text cannot open or close a tag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerFraming {
+    #[default]
+    Quoted,
+    Bare,
+    Datamarked,
+}
+
+/// Answer to `GET /v1/snapshot?agent=&kind=&since=&format=&framing=`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub kind: SnapshotKind,

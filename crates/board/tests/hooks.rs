@@ -135,6 +135,10 @@ fn session_start_registers_injects_and_caches_the_snapshot() {
         (q["kind"].as_str(), q["format"].as_str()),
         ("full", "lines")
     );
+    assert!(
+        !q.contains_key("framing"),
+        "the default framing is not sent"
+    );
 
     let cached = std::fs::read_dir(e.home.join("cache")).unwrap().count();
     assert_eq!(cached, 1, "the full snapshot is cached for offline use");
@@ -543,4 +547,29 @@ fn t3_thread_id_wins_over_the_hook_session() {
         &[("T3CODE_THREAD_ID", "thread-7")],
     );
     assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(t3));
+}
+
+#[test]
+fn experimental_style_reaches_the_snapshot_request() {
+    let e = env();
+    let config = e.home.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[experimental]\ntext_format = \"toon\"\npeer_framing = \"datamarked\"\n");
+    std::fs::write(&config, text).unwrap();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    let payload = e.with("SessionStart", json!({"source": "compact"}));
+    let (reply, _) = e.hook("session-start", "claude", payload);
+    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    let q = e.stub.requests_to("GET /v1/snapshot")[0].query_pairs();
+    assert_eq!(
+        (q["format"].as_str(), q["framing"].as_str()),
+        ("toon", "datamarked")
+    );
 }

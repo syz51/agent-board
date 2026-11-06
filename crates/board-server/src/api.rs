@@ -12,8 +12,8 @@ use board_proto::{
     AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, Ask, AskStatus, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice, CreateLeases, CreateTask,
     DeviceInfo, DeviceName, DeviceToken, DoneTask, ErrorCode, Handoff, LeaseResult, Note,
-    PutHandoff, RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction,
-    TaskDetail, TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
+    PeerFraming, PutHandoff, RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task,
+    TaskAction, TaskDetail, TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -24,6 +24,7 @@ use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{agents, asks, boards, devices, leases, stats, tasks};
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
+use crate::style::Style;
 use crate::{events, snapshot, web};
 
 /// A JSON body whose rejection is an [`ApiError`](board_proto::ApiError).
@@ -585,6 +586,7 @@ struct SnapshotQuery {
     kind: Option<SnapshotKind>,
     since: Option<i64>,
     format: Option<SnapshotFormat>,
+    framing: Option<PeerFraming>,
 }
 
 async fn show_snapshot(
@@ -612,7 +614,7 @@ async fn show_snapshot(
         agent,
         kind: q.kind.unwrap_or(SnapshotKind::Full),
         since: q.since,
-        format: q.format.unwrap_or_default(),
+        style: Style::new(q.format.unwrap_or_default(), q.framing.unwrap_or_default()),
         advance,
     };
     Ok(Json(

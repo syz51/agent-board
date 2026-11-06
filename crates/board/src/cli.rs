@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    AskKind, BoardSlug, BoardStatus, CreateBoard, DeviceName, NoteKind, Priority, SnapshotFormat,
-    SnapshotKind, TaskId, TaskStatus, UpdateBoard,
+    AskKind, BoardSlug, BoardStatus, CreateBoard, DeviceName, NoteKind, PeerFraming, Priority,
+    SnapshotFormat, SnapshotKind, TaskId, TaskStatus, UpdateBoard,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -138,8 +138,12 @@ pub enum Command {
     Snapshot {
         #[arg(long, default_value = "full", value_parser = parse_enum::<SnapshotKind>)]
         kind: SnapshotKind,
-        #[arg(long, default_value = "lines", value_parser = parse_enum::<SnapshotFormat>)]
-        format: SnapshotFormat,
+        /// lines, json, yaml or toon; default from `[experimental]` in config.toml, else lines.
+        #[arg(long, value_parser = parse_enum::<SnapshotFormat>)]
+        format: Option<SnapshotFormat>,
+        /// quoted, bare or datamarked; default from `[experimental]`, else quoted.
+        #[arg(long, value_parser = parse_enum::<PeerFraming>)]
+        framing: Option<PeerFraming>,
         #[arg(long)]
         since: Option<i64>,
     },
@@ -574,8 +578,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Snapshot {
             kind,
             format,
+            framing,
             since,
-        } => ops::snapshot(&ctx()?, kind, format, since).await?,
+        } => ops::snapshot(&ctx()?, kind, format, framing, since).await?,
         Command::Feedback { text } => ops::feedback(&ctx()?, text).await?,
         Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")

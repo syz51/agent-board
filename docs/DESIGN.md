@@ -235,8 +235,21 @@ Writing conventions, enforced where possible: titles are imperative, at most 72 
 without status or ids; bodies stand alone; acceptance is one observable check per line;
 notes start with their kind and cite evidence; handoff `next` is the first concrete action.
 
-The format is a starting point: the `json` and `yaml` renderings exist so the formats can be
-benchmarked against each other on real tasks.
+The format is a starting point: the `json`, `yaml` and `toon` renderings and the `bare` and
+`datamarked` framings exist so they can be benchmarked against each other on real tasks. A
+client opts in through `config.toml`; hook text and tool results then use that style:
+
+```toml
+[experimental]
+text_format = "toon"        # lines (default), json, yaml or toon
+peer_framing = "datamarked" # quoted (default), bare or datamarked
+```
+
+`json` is compact with sorted keys; `toon` writes lists as TOON tables. Tool results render
+tasks, task lists, task details and handoffs as one `json` or `toon` document (`yaml` keeps
+lines there); other results keep lines with the framing applied. `bare` prints agent-written
+text without quotes on one line; `datamarked` puts `^` in place of its whitespace
+(spotlighting); every framing replaces or escapes `<` and `>`.
 
 ## Feedback loop
 

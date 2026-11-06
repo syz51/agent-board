@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    AgentId, AskKind, BoardSlug, NoteKind, Priority, SnapshotFormat, SnapshotKind, TaskId,
-    TaskStatus,
+    AgentId, AskKind, BoardSlug, NoteKind, Priority, SnapshotKind, TaskId, TaskStatus,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
@@ -367,7 +366,7 @@ impl BoardMcp {
                     SnapshotKind::Full => None,
                     _ => crate::state::load_agent(&ctx.home, ctx.agent()?).seq,
                 };
-                let out = ops::snapshot(&ctx, kind, SnapshotFormat::Lines, since).await?;
+                let out = ops::snapshot(&ctx, kind, None, None, since).await?;
                 if let Some(seq) = out.json["seq"].as_i64() {
                     let agent = ctx.agent()?;
                     let mut local = crate::state::load_agent(&ctx.home, agent);

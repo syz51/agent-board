@@ -15,6 +15,7 @@ mod ops;
 mod snapshot;
 mod state;
 mod store;
+mod style;
 mod telegram;
 mod text;
 mod web;
@@ -36,6 +37,7 @@ pub use db::Db;
 pub use error::Error;
 pub use ops::devices::DeviceInfo;
 pub use state::AppState;
+pub use style::{DATAMARK, Node, ObjBuilder, Style, bare, datamark};
 pub use telegram::spawn_telegram;
 pub use text::frame_peer_text;
 

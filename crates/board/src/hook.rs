@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, Runtime, Snapshot, SnapshotFormat, SnapshotKind,
-    TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, Runtime, Snapshot, SnapshotKind, TaskStatus, Timestamp,
+    Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
 use clap::ValueEnum;
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, SnapshotQuery, TaskQuery};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, resolve_agent};
-use crate::render;
+use crate::render::{self, Render};
 use crate::state::{self, AgentLocal};
 
 /// Hard limit for the whole hook, start to output.
@@ -152,6 +152,8 @@ struct Hook<'a> {
     home: Home,
     device: board_proto::DeviceName,
     client: Client,
+    /// Style of the injected text (`[experimental]` in config.toml).
+    style: board_server::Style,
     agent: AgentId,
     input: &'a Value,
     local: AgentLocal,
@@ -191,6 +193,7 @@ async fn handle(
         runtime,
         device: device.clone(),
         client,
+        style: config.style(),
         local: state::load_agent(&home, &agent),
         home,
         agent,
@@ -291,7 +294,8 @@ impl Hook<'_> {
                 agent: self.agent.clone(),
                 kind,
                 since,
-                format: SnapshotFormat::Lines,
+                format: self.style.format,
+                framing: self.style.framing,
             })
             .await
     }
@@ -409,7 +413,7 @@ impl Hook<'_> {
                             paths: rel,
                         })
                         .await?;
-                    lines.extend(render::overlaps(&result));
+                    lines.extend(Render::new(self.style).overlaps(&result));
                 }
             }
         }

@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateLeases, CreateTask, DoneTask,
-    ErrorCode, EventsPage, Handoff, JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent,
-    Snapshot, SnapshotFormat, SnapshotKind, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
-    TouchResult, Touches, UpdateBoard, UpdateTask,
+    ErrorCode, EventsPage, Handoff, JoinBoard, LeaseResult, Note, PeerFraming, PutHandoff,
+    RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -73,6 +73,12 @@ pub struct SnapshotQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
     pub format: SnapshotFormat,
+    #[serde(skip_serializing_if = "is_quoted")]
+    pub framing: PeerFraming,
+}
+
+fn is_quoted(framing: &PeerFraming) -> bool {
+    *framing == PeerFraming::Quoted
 }
 
 #[derive(Clone)]

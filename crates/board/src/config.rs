@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use board_proto::{BoardSlug, DeviceName};
+use board_proto::{BoardSlug, DeviceName, PeerFraming, SnapshotFormat};
+use board_server::Style;
 use serde::{Deserialize, Serialize};
 
 /// Keychain service name for the device token.
@@ -70,6 +71,27 @@ pub struct Config {
     /// Local T3 project folders by repo key, for starting coordinator threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,
+    /// Settings that exist only to be benchmarked; off unless set.
+    #[serde(default, skip_serializing_if = "Experimental::is_unset")]
+    pub experimental: Experimental,
+}
+
+/// `[experimental]`: the text format and framing of hook text and tool results, for the
+/// format benchmark (`docs/DESIGN.md`, "Text format"). Unset means the production format,
+/// lines with quoted strings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Experimental {
+    /// `lines`, `json`, `yaml` or `toon`.
+    pub text_format: Option<SnapshotFormat>,
+    /// `quoted`, `bare` or `datamarked`.
+    pub peer_framing: Option<PeerFraming>,
+}
+
+impl Experimental {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Config {
@@ -90,6 +112,14 @@ impl Config {
             .with_context(|| format!("creating {}", home.root().display()))?;
         let text = toml::to_string_pretty(self).context("serializing config")?;
         write_atomic(&home.config_path(), text.as_bytes())
+    }
+
+    /// The style of hook text and tool results.
+    pub fn style(&self) -> Style {
+        Style::new(
+            self.experimental.text_format.unwrap_or_default(),
+            self.experimental.peer_framing.unwrap_or_default(),
+        )
     }
 
     pub fn feedback_board(&self) -> BoardSlug {
@@ -259,6 +289,35 @@ mod tests {
         };
         config.save(&home).unwrap();
         assert_eq!(Config::load(&home).unwrap(), config);
+    }
+
+    #[test]
+    fn experimental_style_is_off_unless_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        assert_eq!(Config::default().style(), Style::default());
+        Config::default().save(&home).unwrap();
+        let saved = std::fs::read_to_string(home.config_path()).unwrap();
+        assert!(!saved.contains("experimental"), "{saved}");
+
+        std::fs::write(
+            home.config_path(),
+            "[experimental]\ntext_format = \"json\"\npeer_framing = \"bare\"\n",
+        )
+        .unwrap();
+        let style = Config::load(&home).unwrap().style();
+        assert_eq!(
+            (style.format, style.framing),
+            (SnapshotFormat::Json, PeerFraming::Bare)
+        );
+        std::fs::write(
+            home.config_path(),
+            "[experimental]\ntext_format = \"xml\"\n",
+        )
+        .unwrap();
+        assert!(Config::load(&home).is_err());
+        std::fs::write(home.config_path(), "[experimental]\nframing = \"bare\"\n").unwrap();
+        assert!(Config::load(&home).is_err(), "unknown keys are refused");
     }
 
     #[cfg(unix)]

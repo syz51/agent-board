@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AskKind, Board, BoardSlug, BoardStatus, CreateAsk,
     CreateBoard, CreateLeases, CreateTask, DeviceName, DoneTask, ErrorCode, EvidenceKind,
-    NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent, Runtime, SnapshotFormat,
-    SnapshotKind, TaskId, TaskStatus, UpdateBoard, UpdateTask,
+    NewEvidence, NoteKind, PeerFraming, Priority, PutHandoff, RegisterAgent, Runtime,
+    SnapshotFormat, SnapshotKind, TaskId, TaskStatus, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, SnapshotQuery, TaskQuery, error_code};
 use crate::config::{Config, Home, load_token};
 use crate::identity::RepoInfo;
-use crate::render;
+use crate::render::{self, Render};
 
 /// Everything a command needs: configuration, a client and where it runs.
 #[derive(Debug, Clone)]
@@ -30,6 +30,11 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// Renders tool results in the configured style.
+    pub fn render(&self) -> Render {
+        Render::new(self.config.style())
+    }
+
     /// Loads the configuration and token from `home` and builds a client for `agent`.
     pub fn load(home: Home, agent: Option<AgentId>, timeout: Option<Duration>) -> Result<Self> {
         let config = Config::load(&home)?;
@@ -172,19 +177,23 @@ pub fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T, String> {
         .map_err(|_| format!("unknown value {value:?}"))
 }
 
+/// The snapshot in `format` and `framing`, each the configured one when `None`.
 pub async fn snapshot(
     ctx: &Ctx,
     kind: SnapshotKind,
-    format: SnapshotFormat,
+    format: Option<SnapshotFormat>,
+    framing: Option<PeerFraming>,
     since: Option<i64>,
 ) -> Result<Output> {
+    let style = ctx.config.style();
     let snap = ctx
         .client
         .snapshot(&SnapshotQuery {
             agent: ctx.agent()?.clone(),
             kind,
             since,
-            format,
+            format: format.unwrap_or(style.format),
+            framing: framing.unwrap_or(style.framing),
         })
         .await?;
     if kind == SnapshotKind::Full {
@@ -219,12 +228,12 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
         Some(slug) => {
             let b = ctx.client.board(&slug).await?;
             let agents = ctx.client.agents(Some(&slug)).await?;
-            lines.push(render::board_detail(&b, &agents, detailed));
+            lines.push(ctx.render().board_detail(&b, &agents, detailed));
             json!({"board": b, "agents": agents})
         }
         None => {
             let boards = ctx.client.boards().await?;
-            lines.push(render::board_list(&boards));
+            lines.push(ctx.render().board_list(&boards));
             json!({"boards": boards})
         }
     };
@@ -237,16 +246,19 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
 pub async fn task_list(ctx: &Ctx, query: &TaskQuery, detailed: bool) -> Result<Output> {
     let tasks = ctx.client.tasks(query).await?;
     let text = if detailed {
-        render::task_list_detailed(&tasks)
+        ctx.render().task_list_detailed(&tasks)
     } else {
-        render::task_list(&tasks)
+        ctx.render().task_list(&tasks)
     };
     Ok(Output::new(text, &tasks))
 }
 
 pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {
     let detail = ctx.client.task(id).await?;
-    Ok(Output::new(render::task_detail(&detail, detailed), &detail))
+    Ok(Output::new(
+        ctx.render().task_detail(&detail, detailed),
+        &detail,
+    ))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -281,7 +293,7 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
         })
         .await?;
     Ok(Output::new(
-        format!("added {}", render::task_line(&task)),
+        format!("added {}", ctx.render().task_line(&task)),
         &task,
     ))
 }
@@ -295,7 +307,7 @@ pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output>
         _ => "took",
     };
     Ok(Output::new(
-        format!("{verb} {}", render::task_line(&task)),
+        format!("{verb} {}", ctx.render().task_line(&task)),
         &task,
     ))
 }
@@ -334,7 +346,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
         )
         .await?;
     Ok(Output::new(
-        format!("updated {}", render::task_line(&task)),
+        format!("updated {}", ctx.render().task_line(&task)),
         &task,
     ))
 }
@@ -399,7 +411,7 @@ pub async fn task_done(ctx: &Ctx, id: &TaskId, evidence: Evidence) -> Result<Out
         )
         .await?;
     Ok(Output::new(
-        format!("done {}", render::task_line(&task)),
+        format!("done {}", ctx.render().task_line(&task)),
         &task,
     ))
 }
@@ -452,7 +464,7 @@ pub async fn handoff_show(ctx: &Ctx, of: Option<AgentId>) -> Result<Output> {
     };
     match ctx.client.handoff(&agent).await? {
         Some(h) => Ok(Output::new(
-            render::handoff(&h, me.as_ref() == Some(&agent)),
+            ctx.render().handoff(&h, me.as_ref() == Some(&agent)),
             &h,
         )),
         None => Ok(Output {
@@ -483,7 +495,7 @@ pub async fn lease_paths(
             ttl_secs,
         })
         .await?;
-    Ok(Output::new(render::lease_result(&result), &result))
+    Ok(Output::new(ctx.render().lease_result(&result), &result))
 }
 
 pub struct NewAsk {
@@ -521,7 +533,7 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
 
 pub async fn asks(ctx: &Ctx, status: Option<&str>, board: Option<&BoardSlug>) -> Result<Output> {
     let asks = ctx.client.asks(status, board).await?;
-    Ok(Output::new(render::ask_list(&asks), &asks))
+    Ok(Output::new(ctx.render().ask_list(&asks), &asks))
 }
 
 pub async fn answer(ctx: &Ctx, id: i64, text: &str) -> Result<Output> {
@@ -536,20 +548,20 @@ pub async fn join(ctx: &Ctx, board: Option<BoardSlug>) -> Result<Output> {
     let slug = ctx.resolve_board(board).await?;
     let board = ctx.client.join(&slug).await?;
     Ok(Output::new(
-        format!("joined {}", render::board_line(&board)),
+        format!("joined {}", ctx.render().board_line(&board)),
         &board,
     ))
 }
 
 pub async fn boards(ctx: &Ctx) -> Result<Output> {
     let boards = ctx.client.boards().await?;
-    Ok(Output::new(render::board_list(&boards), &boards))
+    Ok(Output::new(ctx.render().board_list(&boards), &boards))
 }
 
 pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
     let board = ctx.client.create_board(&body).await?;
     Ok(Output::new(
-        format!("created {}", render::board_line(&board)),
+        format!("created {}", ctx.render().board_line(&board)),
         &board,
     ))
 }
@@ -557,7 +569,7 @@ pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
 pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Result<Output> {
     let board = ctx.client.update_board(slug, &body).await?;
     Ok(Output::new(
-        format!("updated {}", render::board_line(&board)),
+        format!("updated {}", ctx.render().board_line(&board)),
         &board,
     ))
 }

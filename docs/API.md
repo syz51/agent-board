@@ -145,11 +145,13 @@ be on the same board and must not form a cycle.
 
 ### Snapshots and events
 
-- `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml` →
-  `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
+- `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml|toon&framing=quoted|bare|datamarked`
+  → `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
   `text`. The server also advances the agent's cursor to the returned `seq`. `json` is
-  compact, so all three formats share the same size caps.
+  compact with sorted keys, so every format shares the same size caps. `format` other than
+  `lines` and `framing` other than `quoted` (the defaults) are experimental, for the
+  format benchmark.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
   resuming from `Last-Event-ID`, else from `since`.
