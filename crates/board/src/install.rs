@@ -319,35 +319,145 @@ fn codex_mcp_toml(bin: &Path) -> String {
     )
 }
 
-fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
+/// Parses a settings file's text; empty text is an empty object.
+fn parse_json_object(path: &Path, text: &str) -> Result<Map<String, Value>> {
+    if text.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    match serde_json::from_str(text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?
+    {
+        Value::Object(map) => Ok(map),
+        _ => bail!("{} is not a JSON object", path.display()),
+    }
+}
+
+/// The file's text, or `None` when it does not exist.
+fn read_text(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
-        Ok(text) if text.trim().is_empty() => Ok(Map::new()),
-        Ok(text) => match serde_json::from_str(&text)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?
-        {
-            Value::Object(map) => Ok(map),
-            _ => bail!("{} is not a JSON object", path.display()),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
     }
 }
 
-fn write_json_object(path: &Path, map: Map<String, Value>) -> Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+/// The file a path names once symlinks are followed (the link target may not exist yet), so a
+/// settings file linked into a dotfiles repository stays a link.
+fn resolve_links(path: &Path) -> Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)
+                    .with_context(|| format!("reading the link {}", path.display()))?;
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        }
     }
-    let mut text = serde_json::to_string_pretty(&Value::Object(map))?;
-    text.push('\n');
-    write_atomic(path, text.as_bytes())
+    bail!("{}: too many levels of symbolic links", path.display())
+}
+
+/// How many times a merge is redone when another program rewrites the file meanwhile.
+const MERGE_ATTEMPTS: usize = 5;
+
+/// Applies `edit` to the JSON object in `path` and writes the result back in place of the file
+/// a symlink points to, keeping that file's permissions (0600 for a new file: `~/.claude.json`
+/// holds OAuth and MCP secrets) and replacing it by an atomic rename in its own directory.
+///
+/// Claude Code rewrites these files while it runs. The file is read again just before the
+/// rename and the merge redone on the newer text when it changed, which narrows the window
+/// but cannot close it: a write landing between that last read and the rename is lost.
+/// No lock is shared with Claude Code; quitting it first avoids the race.
+fn update_json_file(
+    path: &Path,
+    mut edit: impl FnMut(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    let target = resolve_links(path)?;
+    if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    for _ in 0..MERGE_ATTEMPTS {
+        let before = read_text(&target)?;
+        let mut root = parse_json_object(&target, before.as_deref().unwrap_or_default())?;
+        edit(&mut root)?;
+        let mut text = serde_json::to_string_pretty(&Value::Object(root))?;
+        text.push('\n');
+        let tmp = write_temp_beside(&target, text.as_bytes())?;
+        let committed = (|| -> Result<bool> {
+            if read_text(&target)? != before {
+                return Ok(false);
+            }
+            std::fs::rename(&tmp, &target)
+                .with_context(|| format!("writing {}", target.display()))?;
+            Ok(true)
+        })();
+        if !matches!(committed, Ok(true)) {
+            // Best effort: the temporary file is ours and holds nothing new.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        if committed? {
+            return Ok(());
+        }
+    }
+    bail!(
+        "{} kept changing while it was merged; quit Claude Code and run this again",
+        target.display()
+    )
+}
+
+/// Writes `bytes` to a new temporary file next to `target`, with `target`'s permissions, or
+/// 0600 when `target` does not exist.
+fn write_temp_beside(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    use std::io::Write as _;
+    let permissions = match std::fs::metadata(target) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("reading {}", target.display())),
+    };
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target.file_name().unwrap_or_default());
+    name.push(format!(".board-{}.tmp", std::process::id()));
+    let tmp = target.with_file_name(name);
+    // A leftover from an interrupted run would keep its own mode: start from a new file.
+    match std::fs::remove_file(&tmp) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("removing {}", tmp.display()));
+        }
+        _ => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let written = (|| -> Result<()> {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.context(format!("writing {}", tmp.display())));
+    }
+    Ok(tmp)
 }
 
 /// Merges `ours` (`{"hooks": {...}}`) into the file: previous board hook entries are
 /// replaced, every other key and hook is kept, and running it twice changes nothing.
 pub fn merge_hooks_file(path: &Path, ours: &Value) -> Result<()> {
-    let mut root = read_json_object(path)?;
-    merge_hooks(&mut root, ours)?;
-    write_json_object(path, root)
+    update_json_file(path, |root| merge_hooks(root, ours))
 }
 
 fn merge_hooks(root: &mut Map<String, Value>, ours: &Value) -> Result<()> {
@@ -386,13 +496,14 @@ fn merge_hooks(root: &mut Map<String, Value>, ours: &Value) -> Result<()> {
 
 /// Sets `mcpServers.board` in the file, keeping everything else.
 pub fn merge_mcp_file(path: &Path, server: Value) -> Result<()> {
-    let mut root = read_json_object(path)?;
-    root.entry("mcpServers")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .context("\"mcpServers\" is not an object")?
-        .insert("board".into(), server);
-    write_json_object(path, root)
+    update_json_file(path, |root| {
+        root.entry("mcpServers")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .context("\"mcpServers\" is not an object")?
+            .insert("board".into(), server.clone());
+        Ok(())
+    })
 }
 
 fn xml(text: &str) -> String {
@@ -517,6 +628,32 @@ mod tests {
         );
         assert_eq!(root["hooks"]["StopFailure"][0]["matcher"], "rate_limit");
         assert_eq!(root["hooks"]["PreCompact"][0]["matcher"], "manual|auto");
+    }
+
+    #[test]
+    fn a_file_changed_during_a_merge_is_merged_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(&path, r#"{"a": 1}"#).unwrap();
+        let mut calls = 0;
+        update_json_file(&path, |root| {
+            calls += 1;
+            if calls == 1 {
+                // Claude Code rewrites the file between our read and our rename.
+                std::fs::write(&path, r#"{"a": 1, "b": 2}"#).unwrap();
+            }
+            root.insert("board".into(), json!(true));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(merged, json!({"a": 1, "b": 2, "board": true}));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["claude.json"], "no temporary file is left");
     }
 
     #[test]

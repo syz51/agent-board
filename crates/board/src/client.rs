@@ -255,7 +255,8 @@ impl Client {
         self.with_body(Method::POST, &path, body).await
     }
 
-    pub async fn release_coordinator(&self, slug: &BoardSlug) -> Result<()> {
+    /// Releases the coordinator lease; the server answers with the board.
+    pub async fn release_coordinator(&self, slug: &BoardSlug) -> Result<Board> {
         let path = format!("/v1/boards/{slug}/coordinator");
         self.send(self.request(Method::DELETE, &path)).await
     }
