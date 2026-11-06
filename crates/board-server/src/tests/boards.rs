@@ -274,7 +274,9 @@ async fn the_named_coordinator_keeps_its_role_when_it_registers_again() {
 async fn html_carries_security_headers() {
     use tower::ServiceExt as _;
     let t = T::new();
-    for path in ["/", "/asks/3"] {
+    // `/index.html` is the file itself when `web/dist` is built, else a 404; both carry
+    // the headers.
+    for path in ["/", "/asks/3", "/index.html"] {
         let req = axum::http::Request::get(path)
             .body(axum::body::Body::empty())
             .unwrap();

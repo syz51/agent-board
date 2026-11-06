@@ -152,8 +152,9 @@ be on the same board and must not form a cycle.
 
 Every `GET` outside `/v1` and `/healthz` serves the embedded web view: files under
 `/assets/` with immutable caching, any other path without a file extension as
-`index.html` (`no-cache`), with a Content-Security-Policy that allows only this origin and
-forbids framing.
+`index.html` (`no-cache`). Every web view response, `/index.html` included, carries a
+Content-Security-Policy that allows only this origin and forbids framing, plus
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
 ## Defaults
 

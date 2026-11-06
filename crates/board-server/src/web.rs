@@ -25,7 +25,9 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
 img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
 form-action 'self'; frame-ancestors 'none'";
 
-fn html_headers(mut response: Response) -> Response {
+/// Security headers for every web view response: the CSP matters for HTML (whether served
+/// as a client route or as `/index.html`); `nosniff` and the referrer policy for all.
+fn security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -63,20 +65,61 @@ fn asset(path: &str) -> Option<Response> {
 
 /// Serves the web view for every GET outside `/v1`.
 pub(crate) async fn serve(method: Method, uri: Uri) -> Response {
+    route(&method, uri.path(), asset)
+}
+
+/// The response for `path`, with files looked up by `asset`.
+fn route(method: &Method, path: &str, asset: impl Fn(&str) -> Option<Response>) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return not_found("no such endpoint", "the API is under /v1; see docs/API.md")
             .into_response();
     }
-    let path = uri.path().trim_start_matches('/');
-    if !path.is_empty()
-        && let Some(response) = asset(path)
-    {
-        return response;
+    let path = path.trim_start_matches('/');
+    let response = if let Some(response) = (!path.is_empty()).then(|| asset(path)).flatten() {
+        response
+    } else if path.rsplit('/').next().unwrap_or("").contains('.') {
+        // A missing file with an extension is a real 404, not a client route.
+        (StatusCode::NOT_FOUND, "not found").into_response()
+    } else {
+        asset("index.html").unwrap_or_else(|| Html(PLACEHOLDER).into_response())
+    };
+    security_headers(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake(path: &str) -> Option<Response> {
+        let mime = match path {
+            "index.html" => "text/html",
+            "assets/app.js" => "text/javascript",
+            _ => return None,
+        };
+        Some(([(header::CONTENT_TYPE, mime)], "x").into_response())
     }
-    // A missing file with an extension is a real 404, not a client route.
-    let last = path.rsplit('/').next().unwrap_or("");
-    if last.contains('.') {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+
+    #[test]
+    fn every_web_response_carries_security_headers() {
+        for (path, status, mime) in [
+            ("/", 200, Some("text/html")),
+            ("/index.html", 200, Some("text/html")),
+            ("/asks/3", 200, Some("text/html")),
+            ("/assets/app.js", 200, Some("text/javascript")),
+            ("/missing.js", 404, None),
+        ] {
+            let response = route(&Method::GET, path, fake);
+            assert_eq!(response.status().as_u16(), status, "{path}");
+            let headers = response.headers();
+            if let Some(mime) = mime {
+                assert_eq!(headers[header::CONTENT_TYPE], mime, "{path}");
+            }
+            let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.contains("frame-ancestors 'none'"), "{path}: {csp}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
+            assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "{path}");
+        }
+        let post = route(&Method::POST, "/", fake);
+        assert_eq!(post.status(), StatusCode::NOT_FOUND);
     }
-    html_headers(asset("index.html").unwrap_or_else(|| Html(PLACEHOLDER).into_response()))
 }
