@@ -204,3 +204,33 @@ fn run_with_stdin(mut command: Command, stdin: &str) -> std::process::Output {
         .unwrap();
     child.wait_with_output().unwrap()
 }
+
+#[test]
+fn admin_telegram_pair_prints_a_one_time_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("board.db");
+    let db_arg = db.to_str().unwrap();
+    let home = dir.path().join("board-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pair = |args: &[&str]| {
+        let mut all = vec!["admin", "telegram-pair", "--db", db_arg];
+        all.extend(args);
+        board(&home, dir.path(), &[], &all, "")
+    };
+    let out = pair(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let code = stdout(&out).trim().to_owned();
+    assert_eq!(code.len(), 12);
+    assert!(
+        code.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    );
+    assert!(stderr(&out).contains(&format!("/start {code}")));
+    // Only its hash is stored.
+    let stored = std::fs::read(&db).unwrap();
+    assert!(!stored.windows(code.len()).any(|w| w == code.as_bytes()));
+    // Another code may be created while no chat is paired.
+    let out = pair(&["--replace"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_ne!(stdout(&out).trim(), code);
+}

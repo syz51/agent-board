@@ -1,6 +1,10 @@
-//! Telegram notifier: sends each new ask to the configured chat, with its options as
-//! buttons, and long-polls the Bot API for answers (a button press, or a reply to the ask's
-//! message) from that chat only. No public endpoint is needed.
+//! Telegram notifier: sends each new ask to the chat, with its options as buttons, and
+//! long-polls the Bot API for answers (a button press, or a reply to the ask's message)
+//! from that chat only. No public endpoint is needed.
+//!
+//! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
+//! while none is, the first private chat that sends `/start <code>` with a live code from
+//! `board admin telegram-pair` becomes it. Until then asks are not sent.
 //!
 //! The bot token is part of every Bot API URL, so request errors are logged without their
 //! URL and the token never reaches the log.
@@ -17,6 +21,7 @@ use crate::config::TelegramConfig;
 use crate::error::{Error, Result};
 use crate::events;
 use crate::ops::asks;
+use crate::ops::telegram as telegram_ops;
 use crate::state::AppState;
 use crate::store::{find_task, get_agent, get_ask, get_board};
 
@@ -29,7 +34,8 @@ struct Bot {
     http: reqwest::Client,
     /// `<api_base>/bot<token>`: secret, never logged.
     base: String,
-    chat_id: i64,
+    /// `[telegram] chat_id`, which wins over a paired chat.
+    configured: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +63,9 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +104,14 @@ impl Bot {
     async fn send(&self, body: Value) -> Result<Message> {
         self.call("sendMessage", &body).await
     }
+
+    /// The chat to notify and accept answers from: the configured one, else the paired one.
+    async fn chat(&self, state: &AppState) -> Result<Option<i64>> {
+        if let Some(chat) = self.configured {
+            return Ok(Some(chat));
+        }
+        state.read(telegram_ops::paired_chat).await
+    }
 }
 
 /// Starts the notifier when a token is configured (`BOARD_TELEGRAM_TOKEN` or
@@ -127,8 +144,19 @@ pub(crate) fn spawn_with(
     let bot = Bot {
         http,
         base: format!("{}/bot{token}", config.api_base.trim_end_matches('/')),
-        chat_id: config.chat_id,
+        configured: config.chat_id,
     };
+    if config.chat_id.is_none()
+        && state
+            .db()
+            .read(state.now(), state.settings(), telegram_ops::paired_chat)?
+            .is_none()
+    {
+        tracing::info!(
+            "telegram: no chat yet; run `board admin telegram-pair --db <file>` on the host \
+             and send the bot `/start <code>` in a private chat"
+        );
+    }
     let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
     let poll = tokio::spawn(poll_loop(state, bot));
     Ok(Some(tokio::spawn(async move {
@@ -204,6 +232,10 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
     let Some(id) = event.payload.get("id").and_then(Value::as_i64) else {
         return Ok(());
     };
+    let Some(chat) = bot.chat(state).await? else {
+        tracing::warn!(ask = id, "telegram: no chat paired; ask not sent");
+        return Ok(());
+    };
     let (ask, board, task, handle) = state
         .read(move |cx| {
             let ask = get_ask(cx, id)?;
@@ -240,7 +272,7 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
     if let Some(url) = state.public_url() {
         text.push_str(&format!("\n{url}/asks/{}", ask.id));
     }
-    let mut body = json!({ "chat_id": bot.chat_id, "text": text });
+    let mut body = json!({ "chat_id": chat, "text": text });
     if !ask.options.is_empty() {
         let rows: Vec<Value> = ask
             .options
@@ -270,6 +302,9 @@ async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()>
     if agent.role != AgentRole::Coordinator {
         return Ok(());
     }
+    let Some(chat) = bot.chat(state).await? else {
+        return Ok(());
+    };
     let until = agent
         .paused_until
         .map_or_else(|| "further notice".to_owned(), |t| t.to_rfc3339());
@@ -279,7 +314,7 @@ async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()>
         agent.handle,
         boards.join(", ")
     );
-    bot.send(json!({ "chat_id": bot.chat_id, "text": text }))
+    bot.send(json!({ "chat_id": chat, "text": text }))
         .await
         .map(|_| ())
 }
@@ -324,9 +359,46 @@ fn parse_callback(data: &str) -> Option<(i64, usize)> {
     parts.next().is_none().then_some((id, index))
 }
 
+/// The code in `/start <code>` (or `/start@<bot> <code>`); `None` for anything else.
+fn start_code(text: &str) -> Option<&str> {
+    let mut words = text.split_whitespace();
+    let command = words.next()?;
+    if command != "/start" && !command.starts_with("/start@") {
+        return None;
+    }
+    let code = words.next()?;
+    words.next().is_none().then_some(code)
+}
+
+/// Pairs the chat of a private `/start <code>` message while no chat is paired. Anything
+/// else, a wrong or expired code included, gets no answer.
+async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> {
+    if message.chat.kind.as_deref() != Some("private") {
+        return Ok(());
+    }
+    let Some(code) = message.text.as_deref().and_then(start_code) else {
+        return Ok(());
+    };
+    let (code, chat) = (code.to_owned(), message.chat.id);
+    if !state
+        .write(move |cx| telegram_ops::redeem(cx, &code, chat))
+        .await?
+    {
+        return Ok(());
+    }
+    tracing::info!("telegram: paired a chat; asks go there from now on");
+    bot.send(json!({
+        "chat_id": chat,
+        "text": "Paired: this chat now receives board asks and may answer them.",
+    }))
+    .await
+    .map(|_| ())
+}
+
 async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()> {
+    let chat = bot.chat(state).await?;
     if let Some(query) = update.callback_query {
-        let from_chat = query.message.as_ref().map(|m| m.chat.id) == Some(bot.chat_id);
+        let from_chat = chat.is_some() && query.message.as_ref().map(|m| m.chat.id) == chat;
         let reply = if !from_chat {
             "Not accepted from this chat.".to_owned()
         } else if let Some((id, index)) = query.data.as_deref().and_then(parse_callback) {
@@ -345,9 +417,12 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
     let Some(message) = update.message else {
         return Ok(());
     };
-    if message.chat.id != bot.chat_id {
-        return Ok(());
-    }
+    let Some(chat) = chat.filter(|c| *c == message.chat.id) else {
+        return match chat {
+            None => try_pair(state, bot, &message).await,
+            Some(_) => Ok(()),
+        };
+    };
     let (Some(text), Some(original)) = (message.text, message.reply_to_message) else {
         return Ok(());
     };
@@ -360,7 +435,7 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
     };
     let reply = answer(state, id, Answer::Text(text)).await?;
     bot.send(json!({
-        "chat_id": bot.chat_id,
+        "chat_id": chat,
         "text": reply,
         "reply_parameters": { "message_id": message.message_id },
     }))
@@ -409,7 +484,17 @@ async fn answer(state: &AppState, id: i64, answer: Answer) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_callback;
+    use super::{parse_callback, start_code};
+
+    #[test]
+    fn start_commands_carry_one_code() {
+        assert_eq!(start_code("/start abc123"), Some("abc123"));
+        assert_eq!(start_code("  /start@board_bot  abc123 "), Some("abc123"));
+        assert_eq!(start_code("/start"), None);
+        assert_eq!(start_code("/start a b"), None);
+        assert_eq!(start_code("/starts abc"), None);
+        assert_eq!(start_code("abc123"), None);
+    }
 
     #[test]
     fn callback_data() {

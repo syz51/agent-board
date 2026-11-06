@@ -12,7 +12,7 @@ RFC 3339 UTC timestamps.
 | Device (CLI, MCP server, hooks, daemon) | `Authorization: Bearer <device token>` | everything except "user only" endpoints |
 | User in the browser | Identity header set by `tailscale serve` (`Tailscale-User-Login`), matched against the server's `users` setting | everything, including "user only" |
 | User on the CLI | A device token created with `--user` | everything, including "user only" |
-| Telegram | Not an HTTP caller: the server long-polls the Bot API and accepts answers only from the configured chat id | answering asks |
+| Telegram | Not an HTTP caller: the server long-polls the Bot API and accepts answers only from the user's chat: `[telegram] chat_id`, else the chat paired with `/start <code>` | answering asks |
 
 The server listens on loopback only and is published on the tailnet by `tailscale serve`,
 so the identity header can only come from Tailscale. Tokens are random 32-byte values,
@@ -79,7 +79,7 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
   thread, then claims again with the thread's `agent` id, which makes that agent's role
   `coordinator`. `DELETE` releases it; only the holding device or the user may. Both emit
   `board_updated` with `coordinator` and the lease's `device` in the payload.
-- `GET /v1/stats?days=7` → `[Stats]`.
+- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
 
 ### Tasks
 
@@ -160,8 +160,24 @@ be on the same board and must not form a cycle.
 - `GET /v1/admin/devices` → `[DeviceInfo]` list, never with tokens.
   `DELETE /v1/admin/devices/{name}` revokes; a revoked name may be created again.
 - On the server host, `board admin device <name> [--user] --db <file>` creates a device
-  without HTTP (the first user token comes from here), and `board admin backup --db <file>
-  --out <new file>` writes a consistent copy.
+  without HTTP (the first user token comes from here), `board admin telegram-pair
+  [--replace] --db <file>` prints a one-time Telegram pairing code (see `DEPLOY.md`), and
+  `board admin backup --db <file> --out <new file>` writes a consistent copy.
+
+### CLI output for scripts
+
+`--json` prints the server's answer unchanged, pretty-printed. Scripts, such as a weekly
+review, may rely on these shapes, which follow `/v1`'s compatibility rules:
+
+- `board stats [--days N] --json` → `[Stats]` from `GET /v1/stats?days=N` (default 7):
+  `days`, `tasks_created`, `tasks_done`, `claims_refused`, `tasks_taken_stale`,
+  `lease_conflicts`, `asks_created`, `asks_answered`, `ask_answer_minutes_median`,
+  `doing_minutes_median` (minutes, `null` when nothing was measured) and
+  `done_without_check_evidence`. Without `--json` it prints a three-line summary.
+- `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
+  example `board ls --board board-feedback --json` for the feedback tasks.
+
+Both exit 1 with the error on stderr when the server refuses or cannot be reached.
 
 ### Web view
 

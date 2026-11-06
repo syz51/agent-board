@@ -572,6 +572,11 @@ pub async fn log(
     Ok(Output::new(render::event_list(&page.events), &page))
 }
 
+pub async fn stats(ctx: &Ctx, days: u32) -> Result<Output> {
+    let stats = ctx.client.stats(days).await?;
+    Ok(Output::new(render::stats(&stats), &stats))
+}
+
 /// Files feedback about the board as a task on the feedback board.
 pub async fn feedback(ctx: &Ctx, text: String) -> Result<Output> {
     let text = text.trim().to_owned();

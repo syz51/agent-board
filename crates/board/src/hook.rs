@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, SnapshotQuery, TaskQuery};
 use crate::config::{Config, Home, load_token};
-use crate::identity::{RepoInfo, T3_THREAD_ENV, resolve_agent};
+use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
 use crate::state::{self, AgentLocal};
 
@@ -152,6 +152,8 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
 struct Hook<'a> {
     event: HookEvent,
     runtime: Runtime,
+    /// The session runs inside another agent session (`identity::is_nested`).
+    nested: bool,
     home: Home,
     device: board_proto::DeviceName,
     client: Client,
@@ -173,18 +175,18 @@ async fn handle(
     let Ok((server, device)) = config.require_login() else {
         return Ok(Reply::Nothing);
     };
-    let session = input["session_id"].as_str();
-    let Some(agent) = resolve_agent(
-        explicit_agent,
-        |name| std::env::var(name).ok(),
-        session.map(|s| (runtime, s)),
-    )?
+    let session = input["session_id"].as_str().filter(|s| !s.is_empty());
+    let env = |name: &str| std::env::var(name).ok();
+    // The Keychain lookup runs a process: keep it off the async threads. It runs while
+    // the process table is read below.
+    let token_home = home.clone();
+    let token = tokio::task::spawn_blocking(move || load_token(&token_home));
+    let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
+    let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
         return Ok(Reply::Nothing);
     };
-    // The Keychain lookup runs a process: keep it off the async threads.
-    let token_home = home.clone();
-    let Some(token) = tokio::task::spawn_blocking(move || load_token(&token_home)).await?? else {
+    let Some(token) = token.await?? else {
         return Ok(Reply::Nothing);
     };
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
@@ -192,6 +194,7 @@ async fn handle(
     let mut hook = Hook {
         event,
         runtime,
+        nested,
         device: device.clone(),
         client,
         local: state::load_agent(&home, &agent),
@@ -232,6 +235,37 @@ async fn handle(
     };
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// Whether this session runs inside another agent session, which matters only when the
+/// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
+/// first hook of a session without one) and cached for the session's later hooks;
+/// `SessionEnd` drops the cache.
+async fn nested_session(
+    home: &Home,
+    event: HookEvent,
+    runtime: Runtime,
+    session: Option<&str>,
+    explicit_agent: Option<&str>,
+) -> Result<bool> {
+    if !t3_identity_applies(explicit_agent, |name| std::env::var(name).ok()) {
+        return Ok(false);
+    }
+    if event != HookEvent::SessionStart
+        && let Some(session) = session
+        && let Some(cached) = state::load_session(home, runtime, session)
+    {
+        if event == HookEvent::SessionEnd {
+            state::remove_session(home, runtime, session)?;
+        }
+        return Ok(cached.nested);
+    }
+    let nested = tokio::task::spawn_blocking(nested_here).await?;
+    // Nothing to remember at the end of a session.
+    if let Some(session) = session.filter(|_| event != HookEvent::SessionEnd) {
+        state::save_session(home, runtime, session, &state::SessionLocal { nested })?;
+    }
+    Ok(nested)
 }
 
 impl Hook<'_> {
@@ -337,7 +371,9 @@ impl Hook<'_> {
             };
             native.insert(key.to_owned(), session.to_owned());
         }
-        if let Ok(thread) = std::env::var(T3_THREAD_ENV) {
+        if let Ok(thread) = std::env::var(T3_THREAD_ENV)
+            && !self.nested
+        {
             native.insert("t3_thread".to_owned(), thread);
         }
         self.client

@@ -78,6 +78,17 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.
+- **Nested sessions**: a `claude -p` or `codex exec` started from a thread's shell inherits
+  `T3CODE_THREAD_ID` (and Claude Code's session variables), so the environment cannot tell
+  it from the thread. Process ancestry can: walking up from the client's parent, the first
+  `claude` or `codex` executable is its own runtime, and another one above it means the
+  session is nested (`hook -> claude -> zsh -> claude -> T3 Code` against `hook -> claude
+  -> T3 Code`). A nested session ignores the T3 thread id and is identified as it would be
+  outside T3 (`claude:<session id>`, or `codex:<session id>` from a hook's input). The
+  check reads the process table once (`ps -A`; `/proc` on Linux) and only when the T3
+  thread id would decide the identity: hooks decide at `SessionStart` and cache the answer
+  per session in `$BOARD_HOME/state/sessions/` until `SessionEnd`, `board mcp` decides at
+  start-up, and CLI commands decide per run. An explicit `--agent` skips it.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
   24 hours unseen the owner is stale and another agent may take the task (logged). File
   leases (45 minutes, renewed by heartbeats) are advisory: they warn, never block.
@@ -111,8 +122,13 @@ host.
   than 1.5 seconds; after one hook finds the server unreachable, the device's hooks use the
   cache without trying the server for a minute.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
-  `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file on
-  Linux, or `BOARD_TOKEN`.
+  `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
+  (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
+  Keychain, file). Each `$BOARD_HOME` has its own Keychain account: the default home uses
+  `device-token`, any other `device-token-<hash of its canonical path>`, so a second login
+  with another home (a `--user` token, say) leaves the device's token alone. When the
+  Keychain refuses the token (locked, or no user interaction, as over SSH or under
+  launchd), `board login` writes the 0600 file instead and says so.
 
 ## Agent interface
 
@@ -170,10 +186,13 @@ on one of the board's home devices.
 
 ## Notifications and the web view
 
-- **Telegram**: when an ask is created the server sends it to the configured chat, with the
+- **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
-  public endpoint is needed; answers are accepted only from the configured chat. The same
-  channel reports a coordinator that is stuck or paused.
+  public endpoint is needed; answers are accepted only from that chat. The same channel
+  reports a coordinator that is stuck or paused. The chat is `[telegram] chat_id` when set;
+  otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
+  (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
+  <code>` is stored as the chat. Everything else from other chats is ignored.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

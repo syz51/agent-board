@@ -313,9 +313,14 @@ pub fn tools() -> Vec<Tool> {
 
 /// Runs the MCP server on stdin and stdout until the client disconnects.
 pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
+    // Decided once: whether this server's session runs inside another agent session.
+    let default_agent = tokio::task::spawn_blocking(move || {
+        agent_from_env(explicit_agent.as_deref()).map_err(|e| format!("{e:#}"))
+    })
+    .await?;
     let server = BoardMcp {
         home,
-        explicit_agent,
+        default_agent,
         ctx: Mutex::new(None),
         registered: Mutex::default(),
     };
@@ -329,7 +334,9 @@ pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
 
 struct BoardMcp {
     home: Home,
-    explicit_agent: Option<String>,
+    /// The agent this server acts as unless a tool call names one, resolved at start-up;
+    /// an error is reported on each call that needs it.
+    default_agent: std::result::Result<Option<AgentId>, String>,
     /// Built on first use, so a server started before `board login` still works after it.
     ctx: Mutex<Option<Ctx>>,
     /// Agents known to be registered, checked once per process.
@@ -340,7 +347,7 @@ impl BoardMcp {
     async fn ctx(&self, agent: Option<&str>) -> Result<Ctx> {
         let mut cached = self.ctx.lock().await;
         if cached.is_none() {
-            let default = agent_from_env(self.explicit_agent.as_deref())?;
+            let default = self.default_agent.clone().map_err(anyhow::Error::msg)?;
             *cached = Some(Ctx::load(self.home.clone(), default, None)?);
         }
         let base = cached.as_ref().expect("set above");
