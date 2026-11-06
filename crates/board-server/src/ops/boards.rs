@@ -18,7 +18,7 @@ fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
             "split the work into several boards",
         ));
     }
-    let mut out = Vec::with_capacity(repos.len());
+    let mut out = Vec::new();
     for repo in repos {
         let key = normalize_repo(&repo)?;
         if !out.contains(&key) {
@@ -35,7 +35,7 @@ fn check_devices(devices: Vec<DeviceName>) -> Result<Vec<DeviceName>> {
             "list the devices that should host the coordinator, in order of preference",
         ));
     }
-    let mut out: Vec<DeviceName> = Vec::with_capacity(devices.len());
+    let mut out: Vec<DeviceName> = Vec::new();
     for device in devices {
         if !out.contains(&device) {
             out.push(device);
