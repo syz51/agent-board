@@ -62,6 +62,17 @@ impl Caller {
         }
     }
 
+    /// Checks that a device token acts for its own device; the user may name any device.
+    pub fn act_for_device(&self, device: &DeviceName) -> Result<()> {
+        match self.device() {
+            Some(own) if own != device && !self.is_user() => Err(forbidden(
+                format!("this token belongs to device {own}, not {device}"),
+                format!("send your own device: device={own}"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The agent from `X-Board-Agent`, required.
     pub fn agent(&self) -> Result<&AgentId> {
         self.agent.as_ref().ok_or_else(|| {

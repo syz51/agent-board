@@ -115,8 +115,10 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
         )?;
     } else {
         cx.db.execute(
-            "UPDATE agents SET runtime = ?2, device = ?3, role = ?4, title = ?5, repo = ?6, \
-             branch = ?7, cwd = ?8, native_ids = ?9, \
+            // A title or native id left out keeps the stored one; repo, branch and cwd say
+            // where the agent runs now, so they are replaced.
+            "UPDATE agents SET runtime = ?2, device = ?3, role = ?4, title = COALESCE(?5, title), \
+             repo = ?6, branch = ?7, cwd = ?8, native_ids = json_patch(native_ids, ?9), \
              forked_from = COALESCE(?10, forked_from), state = 'running', paused_until = NULL, \
              last_seen = ?11 WHERE id = ?1",
             params![

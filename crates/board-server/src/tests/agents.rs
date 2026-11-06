@@ -199,3 +199,74 @@ async fn ended_agents_release_leases_and_coordinator() {
         .await;
     assert_eq!(s.as_u16(), 400);
 }
+
+#[tokio::test]
+async fn re_registration_keeps_the_title_and_native_ids_it_leaves_out() {
+    let t = T::new();
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some("t3:lead"),
+        Some(json!({
+            "id": "t3:lead", "runtime": "claude", "device": "mac", "title": "factory coordinator",
+            "repo": REPO, "native_ids": { "t3_thread": "thread-1" },
+        })),
+    )
+    .await;
+    // The session-start hook sends no title and only the session id.
+    let again = t
+        .ok(
+            "POST",
+            "/v1/agents",
+            Some("t3:lead"),
+            Some(json!({
+                "id": "t3:lead", "runtime": "claude", "device": "mac", "repo": REPO,
+                "native_ids": { "claude_session": "session-1" },
+            })),
+        )
+        .await;
+    assert_eq!(again["title"], "factory coordinator");
+    assert_eq!(
+        again["native_ids"],
+        json!({ "claude_session": "session-1", "t3_thread": "thread-1" })
+    );
+    // A sent title replaces it; repo, branch and cwd describe the present, so they clear.
+    let renamed = t
+        .ok(
+            "POST",
+            "/v1/agents",
+            Some("t3:lead"),
+            Some(json!({ "id": "t3:lead", "runtime": "claude", "device": "mac", "title": "renamed" })),
+        )
+        .await;
+    assert_eq!(renamed["title"], "renamed");
+    assert_eq!(renamed["repo"], json!(null));
+}
+
+#[tokio::test]
+async fn devices_register_agents_only_as_themselves() {
+    let t = T::new();
+    let body = json!({ "id": "t3:alpha", "runtime": "claude", "device": "laptop" });
+    let (code, kind, v) = t
+        .fail("POST", "/v1/agents", Some("t3:alpha"), Some(body.clone()))
+        .await;
+    assert_eq!((code, kind.as_str()), (403, "forbidden"), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("device=mac"), "{v}");
+    assert_eq!(t.count("SELECT count(*) FROM agents"), 0);
+
+    // The user may register an agent for any device.
+    let bearer = format!("Bearer {}", t.user_token);
+    let (s, v) = t
+        .send(
+            "POST",
+            "/v1/agents",
+            &[
+                ("authorization", bearer.as_str()),
+                ("x-board-agent", "t3:alpha"),
+            ],
+            Some(body),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["device"], "laptop");
+}

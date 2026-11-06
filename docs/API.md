@@ -54,8 +54,11 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 
 ### Agents
 
-- `POST /v1/agents` `[RegisterAgent]` → `[Agent]`. Idempotent; refreshes repo, branch, cwd,
-  title and `last_seen`; a new id with `forked_from` starts with no tasks. An agent named
+- `POST /v1/agents` `[RegisterAgent]` → `[Agent]`. Idempotent; refreshes `last_seen` and
+  replaces repo, branch and cwd (where the agent runs now; one left out is cleared). A
+  `title` or `forked_from` left out keeps the stored one, and `native_ids` are merged into
+  the stored ones. A new id with `forked_from` starts with no tasks. A device token
+  registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
 - `GET /v1/agents?board=&state=` → `[Agent]` list.
