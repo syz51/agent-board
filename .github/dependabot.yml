@@ -1,0 +1,36 @@
+# Weekly version updates; minor and patch updates arrive as one PR per ecosystem, major
+# updates one by one. When a Dependabot PR bumps `oven/bun` in the Dockerfile, bump
+# `packageManager` in web/package.json in the same PR (CI checks they match).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: bun
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      web:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        update-types: [minor, patch]
