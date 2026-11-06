@@ -187,7 +187,7 @@ fn service_files_print_for_launchd_and_systemd() {
 
 #[cfg(unix)]
 #[test]
-fn install_claude_keeps_file_modes_and_symlinks() {
+fn install_claude_keeps_file_modes_and_links() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     let dir = tempfile::tempdir().unwrap();
@@ -243,6 +243,43 @@ fn install_claude_keeps_file_modes_and_symlinks() {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
     assert_eq!(v["mcpServers"]["board"]["command"], "/opt/bin/board");
     assert_eq!(v["oauthAccount"]["emailAddress"], "user@example.com");
+
+    // A settings file hard-linked from a dotfiles checkout stays one file under both names.
+    let linked_dir = dir.path().join("hard");
+    std::fs::create_dir_all(&linked_dir).unwrap();
+    let original = linked_dir.join("dotfiles-settings.json");
+    std::fs::write(&original, r#"{"model": "opus"}"#).unwrap();
+    std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let hard = linked_dir.join("settings.json");
+    std::fs::hard_link(&original, &hard).unwrap();
+    let args = [
+        "install",
+        "claude",
+        "--bin",
+        "/opt/bin/board",
+        "--write",
+        hard.to_str().unwrap(),
+        "--mcp-config",
+        claude_json.to_str().unwrap(),
+    ];
+    let out = board(&home, dir.path(), &[], &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (a, b) = (
+            std::fs::metadata(&original).unwrap(),
+            std::fs::metadata(&hard).unwrap(),
+        );
+        assert_eq!(a.ino(), b.ino(), "the hard link is kept");
+        assert_eq!(a.nlink(), 2);
+    }
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&original).unwrap()).unwrap();
+    assert!(
+        v["hooks"]["Stop"].is_array(),
+        "the other name sees the hooks"
+    );
+    assert_eq!(v["model"], "opus");
+    assert_eq!(mode(&original), 0o644);
 
     // A config file that does not exist yet is created private.
     let fresh = dir.path().join("new/claude.json");

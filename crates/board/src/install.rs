@@ -388,6 +388,16 @@ fn update_json_file(
         edit(&mut root)?;
         let mut text = serde_json::to_string_pretty(&Value::Object(root))?;
         text.push('\n');
+        if has_other_links(&target)? {
+            // A rename would give this name a new inode and cut it off from the other names
+            // (a dotfiles checkout hard-linked into ~/.claude), so rewrite the file in place.
+            if read_text(&target)? != before {
+                continue;
+            }
+            std::fs::write(&target, text.as_bytes())
+                .with_context(|| format!("writing {}", target.display()))?;
+            return Ok(());
+        }
         let tmp = write_temp_beside(&target, text.as_bytes())?;
         let committed = (|| -> Result<bool> {
             if read_text(&target)? != before {
@@ -409,6 +419,24 @@ fn update_json_file(
         "{} kept changing while it was merged; quit Claude Code and run this again",
         target.display()
     )
+}
+
+/// Whether the file has hard links besides `path`.
+fn has_other_links(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(meta.nlink() > 1),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
 }
 
 /// Writes `bytes` to a new temporary file next to `target`, with `target`'s permissions, or
