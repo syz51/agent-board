@@ -205,7 +205,15 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         "SELECT id FROM tasks WHERE parent = ?1 ORDER BY number",
         id,
     )?;
-    let history = load_events(cx, "task = :task", &vec![(":task", &id.as_str())], 0, 200)?;
+    // The newest events, oldest first; a cut history no longer starts with task_created.
+    let mut history = latest_events(
+        cx,
+        "task = :task",
+        &vec![(":task", &id.as_str())],
+        0,
+        TASK_HISTORY_LIMIT,
+    )?;
+    history.reverse();
     Ok(TaskDetail {
         task,
         notes,
@@ -215,6 +223,9 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         history,
     })
 }
+
+/// Events a task's detail shows at most.
+pub(crate) const TASK_HISTORY_LIMIT: u32 = 200;
 
 fn task_ids(cx: &Ctx<'_>, sql: &str, id: &TaskId) -> Result<Vec<TaskId>> {
     Ok(cx

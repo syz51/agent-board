@@ -98,66 +98,10 @@ pub fn frame_peer_text<T: Serialize>(header: &str, items: &[T]) -> String {
     out
 }
 
-/// Normalizes a repo key: an origin URL in any common form (`https://host/o/r.git`,
-/// `git@host:o/r`, `ssh://git@host:22/o/r`) becomes `host/o/r` with the host lowercased.
+/// Normalizes a repo key with [`board_proto::normalize_repo`], refusing what is not a
+/// remote.
 pub(crate) fn normalize_repo(raw: &str) -> Result<String> {
-    let mut s = raw.trim();
-    let had_scheme = if let Some((scheme, rest)) = s.split_once("://") {
-        if scheme.is_empty()
-            || !scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+')
-        {
-            return Err(bad_repo(raw));
-        }
-        s = rest;
-        true
-    } else {
-        false
-    };
-    if let Some((user, rest)) = s.split_once('@')
-        && !user.contains('/')
-    {
-        s = rest;
-    }
-    let (host, path) = match s.find('/') {
-        Some(slash) => (&s[..slash], &s[slash + 1..]),
-        None => (s, ""),
-    };
-    let host = match host.split_once(':') {
-        // scp-like `host:owner/repo`
-        Some((h, rest)) if !had_scheme && path.is_empty() => {
-            let joined = format!("{}/{}", h.to_ascii_lowercase(), rest);
-            return finish_repo(raw, &joined);
-        }
-        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
-        Some((h, rest)) => {
-            let joined = format!("{}/{}/{}", h.to_ascii_lowercase(), rest, path);
-            return finish_repo(raw, &joined);
-        }
-        None => host,
-    };
-    let joined = if path.is_empty() {
-        host.to_ascii_lowercase()
-    } else {
-        format!("{}/{}", host.to_ascii_lowercase(), path)
-    };
-    finish_repo(raw, &joined)
-}
-
-fn finish_repo(raw: &str, joined: &str) -> Result<String> {
-    let mut key = joined.trim_end_matches('/');
-    key = key.strip_suffix(".git").unwrap_or(key);
-    let key = key.trim_end_matches('/');
-    if key.is_empty()
-        || key.len() > 200
-        || key.starts_with('/')
-        || key.contains("//")
-        || key.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err(bad_repo(raw));
-    }
-    Ok(key.to_owned())
+    board_proto::normalize_repo(raw).ok_or_else(|| bad_repo(raw))
 }
 
 fn bad_repo(raw: &str) -> crate::Error {
@@ -215,31 +159,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_keys_normalize() {
-        for (raw, want) in [
-            (
-                "https://github.com/syz51/agent-board.git",
-                "github.com/syz51/agent-board",
-            ),
-            (
-                "git@github.com:syz51/agent-board.git",
-                "github.com/syz51/agent-board",
-            ),
-            (
-                "ssh://git@GitHub.com:22/syz51/agent-board/",
-                "github.com/syz51/agent-board",
-            ),
-            (
-                "github.com/syz51/agent-board",
-                "github.com/syz51/agent-board",
-            ),
-            ("http://user@example.com/a/b", "example.com/a/b"),
-        ] {
-            assert_eq!(normalize_repo(raw).unwrap(), want, "{raw}");
-        }
-        for bad in ["", "   ", "https://", "a b/c", "/abs/path"] {
-            assert!(normalize_repo(bad).is_err(), "{bad:?}");
-        }
+    fn repo_keys_normalize_or_are_refused() {
+        assert_eq!(
+            normalize_repo("git@github.com:MyOrg/Repo.git").unwrap(),
+            "github.com/myorg/repo"
+        );
+        let err = normalize_repo("/abs/path").unwrap_err().to_string();
+        assert!(err.contains("not a repository URL"), "{err}");
     }
 
     #[test]

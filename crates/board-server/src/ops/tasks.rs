@@ -362,6 +362,19 @@ fn open_blockers(cx: &Ctx<'_>, task: &TaskId) -> Result<Vec<(String, String)>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Refuses to start `task` while a blocker is not done.
+fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
+    let waiting = open_blockers(cx, task)?;
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
+    Err(bad_transition(
+        format!("{task} waits on {}", list.join(", ")),
+        "pick a ready task (task_list ready=true), or help finish its blockers",
+    ))
+}
+
 /// Claims an open task: one conditional update, so concurrent claims have one winner.
 pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
     touch_agent(cx, agent)?;
@@ -395,14 +408,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
             next,
         ));
     }
-    let waiting = open_blockers(cx, id)?;
-    if !waiting.is_empty() {
-        let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
-        return Err(bad_transition(
-            format!("{id} waits on {}", list.join(", ")),
-            "pick a ready task (task_list ready=true), or help finish its blockers",
-        ));
-    }
+    check_blockers_done(cx, id)?;
     check_doing_limit(cx, agent, id)?;
     let now = cx.now_ms();
     let previous = task.owner.clone();
@@ -470,6 +476,9 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
         TaskStatus::Blocked => TaskStatus::Blocked,
         _ => TaskStatus::Doing,
     };
+    if task.status == TaskStatus::Open {
+        check_blockers_done(cx, id)?;
+    }
     if status == TaskStatus::Doing {
         check_doing_limit(cx, agent, id)?;
     }
@@ -511,10 +520,38 @@ fn require_owner(task: &Task, agent: &AgentId, action: &str) -> Result<()> {
     }
 }
 
-pub(crate) fn release(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
+/// Who may change the status of `task` (`docs/API.md`, "Tasks"): anyone while it has no
+/// owner or is closed; otherwise its owner, the board's coordinator or the user. Others
+/// take a stale owner's task first, which is logged.
+fn require_status_rights(
+    cx: &Ctx<'_>,
+    task: &Task,
+    agent: &AgentId,
+    by_user: bool,
+    action: &str,
+) -> Result<()> {
+    if task.owner.is_none() || task.status.is_closed() || by_user {
+        return Ok(());
+    }
+    if get_board(cx, &task.board)?.coordinator.as_ref() == Some(agent) {
+        return Ok(());
+    }
+    require_owner(task, agent, action)
+}
+
+pub(crate) fn release(
+    cx: &mut Ctx<'_>,
+    id: &TaskId,
+    agent: &AgentId,
+    by_user: bool,
+) -> Result<Task> {
     touch_agent(cx, agent)?;
     let task = get_task(cx, id)?;
-    require_owner(&task, agent, "release")?;
+    if task.owner.is_none() {
+        // Nothing to release: refused with the "claim it first" hint.
+        require_owner(&task, agent, "release")?;
+    }
+    require_status_rights(cx, &task, agent, by_user, "release")?;
     if task.status.is_closed() {
         return Err(bad_transition(
             format!("{id} is {}", status_str(task.status)),
@@ -536,7 +573,12 @@ pub(crate) fn release(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<
     get_task(cx, id)
 }
 
-pub(crate) fn update(cx: &mut Ctx<'_>, id: &TaskId, req: UpdateTask) -> Result<Task> {
+pub(crate) fn update(
+    cx: &mut Ctx<'_>,
+    id: &TaskId,
+    req: UpdateTask,
+    by_user: bool,
+) -> Result<Task> {
     touch_agent(cx, &req.agent)?;
     let task = get_task(cx, id)?;
     if req.version != task.version {
@@ -570,27 +612,21 @@ pub(crate) fn update(cx: &mut Ctx<'_>, id: &TaskId, req: UpdateTask) -> Result<T
                 next,
             ));
         }
-        match (from, to) {
-            (TaskStatus::Doing, TaskStatus::Open) => {
-                require_owner(&task, agent, "release")?;
-                owner = None;
-            }
-            (TaskStatus::Blocked, TaskStatus::Doing) => {
-                require_owner(&task, agent, "resume")?;
+        require_status_rights(cx, &task, agent, by_user, "move")?;
+        match to {
+            // Open means unowned, whatever it was before.
+            TaskStatus::Open => owner = None,
+            // Whoever moves a task to doing works on it, as with claim and take.
+            TaskStatus::Doing => {
                 check_doing_limit(cx, agent, id)?;
+                owner = Some(agent.clone());
             }
-            (TaskStatus::Review, TaskStatus::Doing) => match &task.owner {
-                Some(o) if o == agent => check_doing_limit(cx, agent, id)?,
-                Some(_) => {}
-                None => {
-                    check_doing_limit(cx, agent, id)?;
-                    owner = Some(agent.clone());
-                }
-            },
-            (TaskStatus::Done | TaskStatus::Dropped, TaskStatus::Open) => owner = None,
             _ => {}
         }
         fields.push("status");
+    }
+    if owner != task.owner {
+        fields.push("owner");
     }
 
     let blockers = match &req.blockers {
@@ -694,6 +730,9 @@ pub(crate) fn update(cx: &mut Ctx<'_>, id: &TaskId, req: UpdateTask) -> Result<T
     if fields.contains(&"blockers") {
         set_blockers(cx, id, &blockers)?;
     }
+    if let Some(new_owner) = owner.as_ref().filter(|o| task.owner.as_ref() != Some(*o)) {
+        join_board(cx, &task.board, new_owner)?;
+    }
     let mut payload = serde_json::json!({ "fields": fields });
     if to != from {
         payload["from"] = serde_json::json!(from);
@@ -701,6 +740,10 @@ pub(crate) fn update(cx: &mut Ctx<'_>, id: &TaskId, req: UpdateTask) -> Result<T
     }
     if fields.contains(&"title") {
         payload["title"] = serde_json::json!(title);
+    }
+    if fields.contains(&"owner") {
+        payload["owner"] = serde_json::json!(owner);
+        payload["previous_owner"] = serde_json::json!(task.owner);
     }
     cx.emit(
         Some(&task.board),

@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::TelegramConfig;
 use crate::error::{Error, Result};
+use crate::events;
 use crate::ops::asks;
 use crate::state::AppState;
 use crate::store::{find_task, get_agent, get_ask, get_board};
@@ -97,8 +98,25 @@ impl Bot {
 }
 
 /// Starts the notifier when a token is configured (`BOARD_TELEGRAM_TOKEN` or
-/// `bot_token`); `Ok(None)` otherwise. Runs until the state shuts down.
+/// `bot_token`); `Ok(None)` otherwise. Runs until the state shuts down. Events committed
+/// before it starts are not notified.
 pub fn spawn_telegram(state: AppState, config: TelegramConfig) -> Result<Option<JoinHandle<()>>> {
+    // Subscribe first, so every event after `since` is either received or replayed.
+    let events = state.db().subscribe();
+    let since = state
+        .db()
+        .read(state.now(), state.settings(), |cx| cx.max_seq())?;
+    spawn_with(state, config, events, since)
+}
+
+/// [`spawn_telegram`] notifying from `events`, starting after event `since`; tests pass a
+/// small channel here to make the notifier lag.
+pub(crate) fn spawn_with(
+    state: AppState,
+    config: TelegramConfig,
+    events: broadcast::Receiver<Event>,
+    since: i64,
+) -> Result<Option<JoinHandle<()>>> {
     let Some(token) = config.token() else {
         return Ok(None);
     };
@@ -111,35 +129,74 @@ pub fn spawn_telegram(state: AppState, config: TelegramConfig) -> Result<Option<
         base: format!("{}/bot{token}", config.api_base.trim_end_matches('/')),
         chat_id: config.chat_id,
     };
-    let events = state.db().subscribe();
-    let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events));
+    let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
     let poll = tokio::spawn(poll_loop(state, bot));
     Ok(Some(tokio::spawn(async move {
         let _ = tokio::join!(notify, poll);
     })))
 }
 
-async fn notify_loop(state: AppState, bot: Bot, mut events: broadcast::Receiver<Event>) {
+/// Notifies each event after `last` once. When the live feed lags, the missed events are
+/// replayed from the database, as the SSE stream does.
+async fn notify_loop(
+    state: AppState,
+    bot: Bot,
+    mut events: broadcast::Receiver<Event>,
+    mut last: i64,
+) {
     loop {
-        let event = tokio::select! {
+        let received = tokio::select! {
             () = state.stopped() => return,
-            received = events.recv() => match received {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(missed = n, "telegram notifier fell behind the event feed");
+            received = events.recv() => received,
+        };
+        match received {
+            Ok(event) => {
+                if event.seq <= last {
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
-            },
-        };
-        let result = match event.event_type {
-            EventType::AskCreated => send_ask(&state, &bot, &event).await,
-            EventType::AgentStateChanged => report_paused(&state, &bot, &event).await,
-            _ => Ok(()),
-        };
-        if let Err(error) = result {
-            tracing::error!(%error, seq = event.seq, "telegram notification failed");
+                last = event.seq;
+                notify(&state, &bot, &event).await;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    missed = n,
+                    "telegram notifier fell behind the event feed; replaying"
+                );
+                if let Err(error) = replay(&state, &bot, &mut last).await {
+                    tracing::error!(%error, after = last, "telegram replay failed");
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+/// Notifies the stored events after `last`, advancing it.
+async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
+    loop {
+        let since = *last;
+        let page = state
+            .read(move |cx| events::page(cx, since, None, events::MAX_LIMIT))
+            .await?;
+        let full = page.events.len() == events::MAX_LIMIT as usize;
+        for event in &page.events {
+            *last = event.seq;
+            notify(state, bot, event).await;
+        }
+        if !full {
+            return Ok(());
+        }
+    }
+}
+
+async fn notify(state: &AppState, bot: &Bot, event: &Event) {
+    let result = match event.event_type {
+        EventType::AskCreated => send_ask(state, bot, event).await,
+        EventType::AgentStateChanged => report_paused(state, bot, event).await,
+        _ => Ok(()),
+    };
+    if let Err(error) = result {
+        tracing::error!(%error, seq = event.seq, "telegram notification failed");
     }
 }
 

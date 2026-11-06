@@ -210,3 +210,18 @@ async fn touches_report_peer_leases_and_recent_touches() {
         .await;
     assert_eq!(status, 400);
 }
+
+#[tokio::test]
+async fn repeated_globs_are_leased_once() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    let result = lease(&t, A, &["src/**", "docs/**", "src/**"]).await;
+    let globs: Vec<&str> = result["leases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["glob"].as_str().unwrap())
+        .collect();
+    assert_eq!(globs, ["src/**", "docs/**"]);
+    assert_eq!(t.count("SELECT count(*) FROM leases"), 2);
+}

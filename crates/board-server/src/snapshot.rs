@@ -701,7 +701,10 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
             }
             EventType::TaskUpdated | EventType::TaskReleased | EventType::NoteAdded => {
                 let Some(task) = &event.task else { continue };
-                if !mine_ids.contains(task) {
+                // A task moved away from me still concerns me.
+                let was_mine =
+                    event.payload.get("previous_owner").and_then(|o| o.as_str()) == Some(me);
+                if !mine_ids.contains(task) && !was_mine {
                     continue;
                 }
                 let what = match event.event_type {

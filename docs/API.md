@@ -24,6 +24,13 @@ runtime's environment. Every request body field named `agent`, `RegisterAgent.id
 every agent id in a path must equal the header. Agent ids in paths are percent-encoded
 (`:` as `%3A`, `%` as `%25`).
 
+Every `repo` field (boards' `repos`, agents, leases, touches) takes an origin URL in any
+common form (`https://host/owner/repo.git`, `git@host:owner/repo`, `ssh://git@host:22/owner/repo`)
+or a key, and is stored and returned as the key `board_proto::normalize_repo` makes:
+`host/owner/repo`, lowercased as a whole, without user, port or `.git`. In scp form
+(`git@host:12345/repo`) the part after the colon is always the path, never a port. Local
+paths and `file://` URLs are `invalid`.
+
 ## Errors
 
 Every error is `[ApiError]` `{code, message, next}` with these statuses:
@@ -47,8 +54,11 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 
 ### Agents
 
-- `POST /v1/agents` `[RegisterAgent]` → `[Agent]`. Idempotent; refreshes repo, branch, cwd,
-  title and `last_seen`; a new id with `forked_from` starts with no tasks. An agent named
+- `POST /v1/agents` `[RegisterAgent]` → `[Agent]`. Idempotent; refreshes `last_seen` and
+  replaces repo, branch and cwd (where the agent runs now; one left out is cleared). A
+  `title` or `forked_from` left out keeps the stored one, and `native_ids` are merged into
+  the stored ones. A new id with `forked_from` starts with no tasks. A device token
+  registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
 - `GET /v1/agents?board=&state=` → `[Agent]` list.
@@ -75,16 +85,18 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 - `GET /v1/tasks?board=&status=&owner=&ready=&mine=&limit=` → `[Task]` list, sorted by
   priority, then id number. `mine=true` uses the `X-Board-Agent` header.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`.
-- `GET /v1/tasks/{id}` → `[TaskDetail]`.
+- `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
+  first; when it was cut, it does not start with the `task_created` event.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
-- `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner
-  only.
+- `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
+  board coordinator or user only (as status changes below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`; records a
-  `task_taken` event naming the previous owner.
+  `task_taken` event naming the previous owner. Taking an `open` task moves it to `doing`,
+  so it is refused like a claim while a blocker is not done.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only; 400
   `evidence_required` without evidence, or with `check` evidence missing `exit_code`. The
   `task_done` event carries the evidence.
@@ -96,9 +108,17 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 |---|---|
 | `open` | `blocked`, `dropped` (claiming moves it to `doing`) |
 | `doing` | `blocked`, `review`, `open` (same as release), `dropped` |
-| `blocked` | `open`, `doing` (owner only), `dropped` |
+| `blocked` | `open`, `doing`, `dropped` |
 | `review` | `doing`, `dropped` (`done` only through `/done`) |
-| `done`, `dropped` | `open` (reopen; clears the owner) |
+| `done`, `dropped` | `open` (reopen) |
+
+Who may change the status: anyone while the task has no owner or is `done` or `dropped`;
+otherwise only its owner, the board's coordinator or the user (a `--user` token or the
+browser), else 403 `forbidden`. Another agent takes a stale owner's task first
+(`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
+Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
+that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
+`owner` and `previous_owner`.
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
 be on the same board and must not form a cycle.
@@ -106,7 +126,8 @@ be on the same board and must not form a cycle.
 ### Leases and touches
 
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
-  peers are returned as `conflicts` and raise alerts; nothing is refused.
+  peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
+  `globs` is leased once.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour.
@@ -145,8 +166,9 @@ be on the same board and must not form a cycle.
 
 Every `GET` outside `/v1` and `/healthz` serves the embedded web view: files under
 `/assets/` with immutable caching, any other path without a file extension as
-`index.html` (`no-cache`), with a Content-Security-Policy that allows only this origin and
-forbids framing.
+`index.html` (`no-cache`). Every web view response, `/index.html` included, carries a
+Content-Security-Policy that allows only this origin and forbids framing, plus
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
 ## Defaults
 

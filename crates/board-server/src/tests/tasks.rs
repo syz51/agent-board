@@ -101,7 +101,7 @@ async fn every_status_change_follows_the_table() {
             if allowed {
                 assert!(status.is_success(), "{from:?} -> {to:?}: {value}");
                 assert_eq!(value["status"], json!(to));
-                if to == Open && matches!(from, Doing | Done | Dropped) {
+                if to == Open {
                     assert_eq!(
                         value["owner"],
                         Value::Null,
@@ -163,6 +163,205 @@ async fn owner_only_transitions() {
         .await;
     assert_eq!(released["status"], "open");
     assert_eq!(released["owner"], Value::Null);
+}
+
+const C: &str = "t3:coord";
+const U: &str = "claude:user-session";
+
+/// PATCHes `task` to `status` as `agent`, through the user token when `user`.
+async fn move_as(t: &T, agent: &str, user: bool, task: &str, status: &str) -> (u16, Value) {
+    let version = t.get_task(task).await["version"].clone();
+    let mut body = json!({ "agent": agent, "version": version, "status": status });
+    if status == "blocked" {
+        body["blocked_reason"] = json!("waiting");
+    }
+    let path = format!("/v1/tasks/{task}");
+    let (s, v) = if user {
+        let bearer = format!("Bearer {}", t.user_token);
+        t.send(
+            "PATCH",
+            &path,
+            &[("authorization", bearer.as_str()), ("x-board-agent", agent)],
+            Some(body),
+        )
+        .await
+    } else {
+        t.call("PATCH", &path, Some(agent), Some(body)).await
+    };
+    (s.as_u16(), v)
+}
+
+#[tokio::test]
+async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+    t.register(C, Some(REPO), None).await;
+    t.register(U, None, None).await;
+
+    // Another agent may not drop, block, review, resume or reopen A's task.
+    for (from, to) in [
+        (TaskStatus::Doing, "dropped"),
+        (TaskStatus::Doing, "blocked"),
+        (TaskStatus::Doing, "review"),
+        (TaskStatus::Doing, "open"),
+        (TaskStatus::Blocked, "open"),
+        (TaskStatus::Blocked, "doing"),
+        (TaskStatus::Blocked, "dropped"),
+        (TaskStatus::Review, "doing"),
+        (TaskStatus::Review, "dropped"),
+    ] {
+        let id = task_in(&t, from).await;
+        let (s, v) = move_as(&t, B, false, &id, to).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{from:?} -> {to}: {v}"
+        );
+        assert!(v["message"].as_str().unwrap().contains(A), "{v}");
+        assert_eq!(t.get_task(&id).await["owner"], A);
+    }
+    // Before the coordinator is named, C is just another agent.
+    let review = task_in(&t, TaskStatus::Review).await;
+    assert_eq!(move_as(&t, C, false, &review, "doing").await.0, 403);
+
+    // Anyone may change an unowned or closed task.
+    let open = task_in(&t, TaskStatus::Open).await;
+    assert_eq!(move_as(&t, B, false, &open, "blocked").await.0, 200);
+    let done = task_in(&t, TaskStatus::Done).await;
+    let (s, v) = move_as(&t, B, false, &done, "open").await;
+    assert_eq!((s, &v["owner"]), (200, &Value::Null), "{v}");
+
+    // The board's coordinator may; moving to doing makes it the owner.
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(C),
+        Some(json!({ "device": "mac", "agent": C })),
+    )
+    .await;
+    let (s, v) = move_as(&t, C, false, &review, "doing").await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(C)), "{v}");
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{review}"), None, None)
+        .await;
+    let moved = detail["history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            &moved["payload"]["previous_owner"],
+            &moved["payload"]["owner"]
+        ),
+        (&json!(A), &json!(C)),
+        "{moved}"
+    );
+    assert!(
+        moved["payload"]["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("owner")),
+        "{moved}"
+    );
+    // A hears that its task moved away.
+    let alerts = t
+        .ok(
+            "GET",
+            &format!("/v1/snapshot?agent={A}&kind=alerts"),
+            Some(A),
+            None,
+        )
+        .await;
+    assert!(
+        alerts["text"].as_str().unwrap().contains(&review),
+        "{alerts}"
+    );
+
+    let doing = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = move_as(&t, C, false, &doing, "dropped").await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
+    let blocked = task_in(&t, TaskStatus::Blocked).await;
+    let released = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{blocked}/release"),
+            Some(C),
+            Some(json!({ "agent": C })),
+        )
+        .await;
+    assert_eq!(released["owner"], Value::Null);
+
+    // So may the user, acting through a user token.
+    let blocked = task_in(&t, TaskStatus::Blocked).await;
+    let (s, v) = move_as(&t, U, true, &blocked, "doing").await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(U)), "{v}");
+    let doing = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = move_as(&t, U, true, &doing, "review").await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
+
+    // A stale owner's task is taken first, which is logged.
+    let doing = task_in(&t, TaskStatus::Doing).await;
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let (s, v) = move_as(&t, B, false, &doing, "dropped").await;
+    assert_eq!(s, 403, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("task_take"), "{v}");
+}
+
+#[tokio::test]
+async fn take_refuses_an_open_task_while_a_blocker_is_open() {
+    let t = setup().await;
+    let blocker = t.task(A, "factory", "Blocker").await;
+    let waiting = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Waiting", "blockers": [blocker] }),
+        )
+        .await;
+    // An open task with a stale owner, as rows from before open cleared the owner.
+    t.exec(&format!(
+        "UPDATE tasks SET owner = '{A}' WHERE id = '{waiting}'"
+    ));
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let take = |task: String| {
+        let t = &t;
+        async move {
+            t.call(
+                "POST",
+                &format!("/v1/tasks/{task}/take"),
+                Some(B),
+                Some(json!({ "agent": B })),
+            )
+            .await
+        }
+    };
+    let (s, v) = take(waiting.clone()).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains(&blocker), "{v}");
+    assert_eq!(t.get_task(&waiting).await["status"], "open");
+
+    t.exec(&format!(
+        "UPDATE tasks SET status = 'done' WHERE id = '{blocker}'"
+    ));
+    let (s, v) = take(waiting.clone()).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(B))
+    );
 }
 
 #[tokio::test]
@@ -437,7 +636,7 @@ async fn ready_is_computed_from_blockers_and_owners() {
     assert_eq!(ready.as_array().unwrap().len(), 1);
     assert_eq!(ready[0]["id"], waiting.as_str());
 
-    // An open task whose owner is live is not ready; once the owner is stale it is.
+    // Moving a blocked task back to open clears its owner, so it is ready again.
     assert!(t.claim(B, &waiting).await.0.is_success());
     t.patch(
         B,
@@ -446,8 +645,15 @@ async fn ready_is_computed_from_blockers_and_owners() {
     )
     .await;
     let reopened = t.patch(B, &waiting, json!({ "status": "open" })).await.1;
-    assert_eq!(reopened["owner"], B);
-    assert_eq!(reopened["ready"], false);
+    assert_eq!(reopened["owner"], json!(null));
+    assert_eq!(reopened["ready"], true);
+
+    // An open task whose owner is live (a row from before that rule) is not ready; once
+    // the owner is stale it is.
+    t.exec(&format!(
+        "UPDATE tasks SET owner = '{B}' WHERE id = '{waiting}'"
+    ));
+    assert_eq!(t.get_task(&waiting).await["ready"], false);
     t.advance(TimeDelta::hours(25));
     t.register(A, Some(REPO), Some("main")).await;
     assert_eq!(t.get_task(&waiting).await["ready"], true);
@@ -582,4 +788,33 @@ async fn titles_and_text_are_checked() {
     assert_eq!(s.as_u16(), 404);
     let (s, _) = t.call("GET", "/v1/tasks/factory-404", None, None).await;
     assert_eq!(s.as_u16(), 404);
+}
+
+#[tokio::test]
+async fn task_history_shows_the_newest_events_oldest_first() {
+    let t = setup().await;
+    let id = t.task(A, "factory", "Busy task").await;
+    for n in 0..210 {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{id}/notes"),
+            Some(A),
+            Some(json!({ "agent": A, "kind": "note", "text": format!("step {n}") })),
+        )
+        .await;
+    }
+    t.patch(A, &id, json!({ "title": "Busy task, renamed" }))
+        .await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let history = detail["history"].as_array().unwrap();
+    assert_eq!(history.len(), crate::store::TASK_HISTORY_LIMIT as usize);
+    let seqs: Vec<i64> = history.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "ascending");
+    assert_eq!(
+        history.last().unwrap()["type"],
+        "task_updated",
+        "newest kept"
+    );
+    // Cut: the oldest event, task_created, is gone.
+    assert_ne!(history[0]["type"], "task_created");
 }

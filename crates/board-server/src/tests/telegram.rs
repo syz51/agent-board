@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use super::T;
+use crate::telegram::spawn_with;
 use crate::{TelegramConfig, spawn_telegram};
 
 const CHAT: i64 = 4242;
@@ -93,8 +94,8 @@ async fn wait_for_answer(t: &T, id: i64) -> Value {
     .unwrap_or_else(|_| panic!("ask {id} was not answered"))
 }
 
-#[tokio::test]
-async fn asks_round_trip_through_telegram() {
+/// Serves a fake Bot API; returns it and its base URL.
+async fn fake_api() -> (Fake, String) {
     let fake = Fake::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", listener.local_addr().unwrap());
@@ -102,6 +103,12 @@ async fn asks_round_trip_through_telegram() {
         .route("/{bot}/{method}", post(bot_api))
         .with_state(fake.clone());
     tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    (fake, api_base)
+}
+
+#[tokio::test]
+async fn asks_round_trip_through_telegram() {
+    let (fake, api_base) = fake_api().await;
 
     let t = T::with(|c| c.public_url = Some("https://board.example".to_owned()));
     let mut config = TelegramConfig::new(CHAT);
@@ -220,6 +227,78 @@ async fn asks_round_trip_through_telegram() {
         polls[0]["allowed_updates"],
         json!(["message", "callback_query"])
     );
+
+    t.state.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), notifier)
+        .await
+        .expect("the notifier stops on shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_lagging_notifier_replays_missed_asks_once() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let since = t.ok("GET", "/healthz", None, None).await["seq"]
+        .as_i64()
+        .unwrap();
+    let mut asks = Vec::new();
+    for n in 0..3 {
+        let ask = t
+            .ok("POST", "/v1/asks", Some(A), Some(json!({
+                "agent": A, "board": "factory", "kind": "action", "question": format!("Step {n}"),
+            })))
+            .await;
+        asks.push(ask["id"].as_i64().unwrap());
+    }
+    let page = t
+        .ok("GET", &format!("/v1/events?since={since}"), None, None)
+        .await;
+    let events: Vec<board_proto::Event> = serde_json::from_value(page["events"].clone()).unwrap();
+    assert_eq!(events.len(), 3);
+
+    // A one-slot feed that already overflowed: the notifier sees a lag first, then the
+    // last event again.
+    let (feed, events_rx) = tokio::sync::broadcast::channel(1);
+    for event in events {
+        feed.send(event).unwrap();
+    }
+    let mut config = TelegramConfig::new(CHAT);
+    config.bot_token = Some(TOKEN.to_owned());
+    config.api_base = api_base;
+    let notifier = spawn_with(t.state.clone(), config, events_rx, since)
+        .unwrap()
+        .expect("a token is set");
+
+    let sent = fake.wait("sendMessage", 3).await;
+    for (message, n) in sent.iter().zip(0..) {
+        let text = message["text"].as_str().unwrap();
+        assert!(text.contains(&format!("Step {n}")), "{text}");
+    }
+    // Later live events still arrive, and nothing is sent twice.
+    let before = t.ok("GET", "/healthz", None, None).await["seq"]
+        .as_i64()
+        .unwrap();
+    t.ok(
+        "POST",
+        "/v1/asks",
+        Some(A),
+        Some(json!({
+            "agent": A, "board": "factory", "kind": "action", "question": "Step 3",
+        })),
+    )
+    .await;
+    let page = t
+        .ok("GET", &format!("/v1/events?since={before}"), None, None)
+        .await;
+    let live: Vec<board_proto::Event> = serde_json::from_value(page["events"].clone()).unwrap();
+    feed.send(live.last().unwrap().clone()).unwrap();
+    let sent = fake.wait("sendMessage", 4).await;
+    assert!(sent[3]["text"].as_str().unwrap().contains("Step 3"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fake.calls("sendMessage").len(), 4);
 
     t.state.shutdown();
     tokio::time::timeout(Duration::from_secs(10), notifier)

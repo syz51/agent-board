@@ -11,7 +11,7 @@ async fn boards_are_created_updated_and_counted() {
             "slug": "factory", "title": "Factory", "repos": ["https://github.com/Example/App.git"],
         })))
         .await;
-    assert_eq!(board["repos"], json!(["github.com/Example/App"]));
+    assert_eq!(board["repos"], json!(["github.com/example/app"]));
     assert_eq!(board["status"], "active");
     let (s, _) = t
         .call(
@@ -274,7 +274,9 @@ async fn the_named_coordinator_keeps_its_role_when_it_registers_again() {
 async fn html_carries_security_headers() {
     use tower::ServiceExt as _;
     let t = T::new();
-    for path in ["/", "/asks/3"] {
+    // `/index.html` is the file itself when `web/dist` is built, else a 404; both carry
+    // the headers.
+    for path in ["/", "/asks/3", "/index.html"] {
         let req = axum::http::Request::get(path)
             .body(axum::body::Body::empty())
             .unwrap();
@@ -285,4 +287,25 @@ async fn html_carries_security_headers() {
         assert!(csp.contains("script-src 'self'"), "{csp}");
         assert_eq!(headers["x-content-type-options"], "nosniff");
     }
+}
+
+#[tokio::test]
+async fn mixed_case_board_repos_match_agents_from_any_url_form() {
+    let t = T::new();
+    let board = t.board("mixed", &["github.com/MyOrg/Repo"]).await;
+    assert_eq!(board["repos"], json!(["github.com/myorg/repo"]));
+    t.board("digits", &["git@github.com:12345/Repo.git"]).await;
+    let agent = t
+        .register("t3:alpha", Some("git@github.com:MyOrg/Repo.git"), None)
+        .await;
+    assert_eq!(agent["repo"], "github.com/myorg/repo");
+    t.register("t3:beta", Some("https://github.com/12345/repo"), None)
+        .await;
+    assert_eq!(
+        t.count(
+            "SELECT count(*) FROM board_members WHERE \
+             (board = 'mixed' AND agent = 't3:alpha') OR (board = 'digits' AND agent = 't3:beta')"
+        ),
+        2
+    );
 }
