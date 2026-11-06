@@ -184,3 +184,81 @@ fn service_files_print_for_launchd_and_systemd() {
     assert!(unit.contains("ExecStart=\"/opt/bin/board\" watch"));
     assert!(unit.contains("Restart=always"));
 }
+
+#[cfg(unix)]
+#[test]
+fn install_claude_keeps_file_modes_and_symlinks() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("board-home");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    // settings.json is a relative link into a dotfiles checkout; ~/.claude.json is private.
+    let dotfiles = dir.path().join("dotfiles/claude");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let real_settings = dotfiles.join("settings.json");
+    std::fs::write(&real_settings, r#"{"model": "opus"}"#).unwrap();
+    std::fs::set_permissions(&real_settings, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings = claude_dir.join("settings.json");
+    symlink("../dotfiles/claude/settings.json", &settings).unwrap();
+    let claude_json = dir.path().join("claude.json");
+    std::fs::write(
+        &claude_json,
+        r#"{"oauthAccount": {"emailAddress": "user@example.com"}}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude_json, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let args = [
+        "install",
+        "claude",
+        "--bin",
+        "/opt/bin/board",
+        "--write",
+        settings.to_str().unwrap(),
+        "--mcp-config",
+        claude_json.to_str().unwrap(),
+    ];
+    let out = board(&home, dir.path(), &[], &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    assert!(
+        std::fs::symlink_metadata(&settings)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the settings link is kept"
+    );
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&real_settings).unwrap()).unwrap();
+    assert_eq!(v["model"], "opus");
+    assert!(
+        v["hooks"]["Stop"].is_array(),
+        "the link target got the hooks"
+    );
+    assert_eq!(mode(&real_settings), 0o640);
+    assert_eq!(mode(&claude_json), 0o600);
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+    assert_eq!(v["mcpServers"]["board"]["command"], "/opt/bin/board");
+    assert_eq!(v["oauthAccount"]["emailAddress"], "user@example.com");
+
+    // A config file that does not exist yet is created private.
+    let fresh = dir.path().join("new/claude.json");
+    let settings2 = dir.path().join("new/settings.json");
+    let args = [
+        "install",
+        "claude",
+        "--bin",
+        "/opt/bin/board",
+        "--write",
+        settings2.to_str().unwrap(),
+        "--mcp-config",
+        fresh.to_str().unwrap(),
+    ];
+    let out = board(&home, dir.path(), &[], &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(mode(&fresh), 0o600);
+    assert_eq!(mode(&settings2), 0o600);
+}
