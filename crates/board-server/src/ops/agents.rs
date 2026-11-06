@@ -1,6 +1,6 @@
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, AgentStateUpdate, EventType, Handoff, PutHandoff,
-    RegisterAgent,
+    Agent, AgentId, AgentRole, AgentSource, AgentState, AgentStateUpdate, EventType, Handoff,
+    PutHandoff, RegisterAgent,
 };
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -77,6 +77,16 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    // The session-start hook registers every agent as a worker; an agent named as a
+    // board's coordinator keeps that role.
+    let role = if cx.exists(
+        "SELECT 1 FROM boards WHERE coordinator = ?1",
+        [req.id.as_str()],
+    )? {
+        AgentRole::Coordinator
+    } else {
+        req.role
+    };
     let now = cx.now_ms();
     let is_new = previous.is_none();
     if is_new {
@@ -92,7 +102,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 handle,
                 enum_str(&req.runtime),
                 req.device.as_str(),
-                enum_str(&req.role),
+                enum_str(&role),
                 req.title,
                 repo,
                 req.branch,
@@ -113,7 +123,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 req.id.as_str(),
                 enum_str(&req.runtime),
                 req.device.as_str(),
-                enum_str(&req.role),
+                enum_str(&role),
                 req.title,
                 repo,
                 req.branch,

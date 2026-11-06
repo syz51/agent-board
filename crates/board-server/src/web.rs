@@ -20,6 +20,28 @@ max-width: 40rem; margin: 3rem auto; padding: 0 1rem\"><h1>agent-board</h1>\
 (<code>bun run build</code>) and rebuild the server to embed it.</p>\
 <p>The API is under <code>/v1</code>; <code>/healthz</code> reports status.</p></body></html>\n";
 
+/// The policy `web/build.ts` also puts in `index.html`, plus what only a header can say.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+form-action 'self'; frame-ancestors 'none'";
+
+fn html_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 fn asset(path: &str) -> Option<Response> {
     let file = Assets::get(path)?;
     let cache = if path.starts_with("assets/") {
@@ -56,5 +78,5 @@ pub(crate) async fn serve(method: Method, uri: Uri) -> Response {
     if last.contains('.') {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    asset("index.html").unwrap_or_else(|| Html(PLACEHOLDER).into_response())
+    html_headers(asset("index.html").unwrap_or_else(|| Html(PLACEHOLDER).into_response()))
 }

@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    AddNote, AgentId, AgentRole, AskKind, Board, BoardSlug, BoardStatus, CreateAsk, CreateBoard,
-    CreateLeases, CreateTask, DeviceName, DoneTask, EvidenceKind, NewEvidence, NoteKind, Priority,
-    PutHandoff, RegisterAgent, Runtime, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
-    UpdateBoard, UpdateTask,
+    AddNote, AgentId, AgentRole, AgentSource, AskKind, Board, BoardSlug, BoardStatus, CreateAsk,
+    CreateBoard, CreateLeases, CreateTask, DeviceName, DoneTask, ErrorCode, EvidenceKind,
+    NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent, Runtime, SnapshotFormat,
+    SnapshotKind, TaskId, TaskStatus, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, SnapshotQuery, TaskQuery};
+use crate::client::{Client, SnapshotQuery, TaskQuery, error_code};
 use crate::config::{Config, Home, load_token};
 use crate::identity::RepoInfo;
 use crate::render;
@@ -78,6 +78,25 @@ impl Ctx {
             })
             .await?;
         Ok(())
+    }
+
+    /// Registers the calling agent when the server does not know it yet: a CLI or MCP
+    /// call from a session whose start hook did not run. A known agent is left as it is.
+    pub async fn ensure_registered(&self) -> Result<()> {
+        let Some(agent) = self.client.agent() else {
+            return Ok(());
+        };
+        match self.client.agent_info(agent).await {
+            Ok(_) => Ok(()),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                let runtime = match agent.source() {
+                    AgentSource::Codex => Runtime::Codex,
+                    AgentSource::T3 | AgentSource::Claude => Runtime::Claude,
+                };
+                self.register(runtime, Vec::new()).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// The board to act on: the explicit one, else the agent's only board (or its board

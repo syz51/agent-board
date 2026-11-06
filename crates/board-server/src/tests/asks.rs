@@ -154,3 +154,28 @@ async fn ask_fields_are_validated() {
         .await;
     assert_eq!(s.as_u16(), 404);
 }
+
+#[tokio::test]
+async fn one_ask_is_read_by_id_in_any_status() {
+    let t = T::new();
+    let id = ask(&t, "Ship it?").await;
+    let path = format!("/v1/asks/{id}");
+    let v = t.ok("GET", &path, None, None).await;
+    assert_eq!(
+        (v["id"].as_i64(), v["status"].as_str()),
+        (Some(id), Some("open"))
+    );
+    t.as_user(
+        "POST",
+        &format!("{path}/answer"),
+        Some(json!({ "answer": "yes" })),
+    )
+    .await;
+    let v = t.ok("GET", &path, None, None).await;
+    assert_eq!(
+        (v["status"].as_str(), v["answer"].as_str()),
+        (Some("answered"), Some("yes"))
+    );
+    let (status, code, _) = t.fail("GET", "/v1/asks/999", None, None).await;
+    assert_eq!((status, code.as_str()), (404, "not_found"));
+}

@@ -11,20 +11,19 @@ use axum::{Json, Router};
 use board_proto::{
     AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, Ask, AskStatus, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice, CreateLeases, CreateTask,
-    DeviceName, DeviceToken, DoneTask, ErrorCode, Handoff, LeaseResult, Note, PutHandoff,
-    RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
-    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
+    DeviceInfo, DeviceName, DeviceToken, DoneTask, ErrorCode, Handoff, LeaseResult, Note,
+    PutHandoff, RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction,
+    TaskDetail, TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::auth::Caller;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
-use crate::ops::devices::DeviceInfo;
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{agents, asks, boards, devices, leases, stats, tasks};
 use crate::state::AppState;
-use crate::store::{find_handoff, get_agent, get_board, list_boards, task_detail};
+use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
 use crate::{events, snapshot, web};
 
 /// A JSON body whose rejection is an [`ApiError`](board_proto::ApiError).
@@ -82,6 +81,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/leases/{id}", delete(release_lease))
         .route("/touches", post(touches))
         .route("/asks", get(list_asks).post(create_ask))
+        .route("/asks/{id}", get(show_ask))
         .route("/asks/{id}/answer", post(answer_ask))
         .route("/asks/{id}/withdraw", post(withdraw_ask))
         .route("/snapshot", get(show_snapshot))
@@ -529,6 +529,14 @@ async fn list_asks(
             .read(move |cx| asks::list(cx, q.status, q.board.as_ref()))
             .await?,
     ))
+}
+
+async fn show_ask(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Path(id): Path<i64>,
+) -> Result<Json<Ask>> {
+    Ok(Json(state.read(move |cx| get_ask(cx, id)).await?))
 }
 
 async fn create_ask(

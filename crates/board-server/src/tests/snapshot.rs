@@ -408,13 +408,13 @@ async fn json_and_yaml_carry_the_same_model() {
     assert_eq!(model["counts"]["ready"], 4);
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
-    // Pretty JSON is longer, so the cap cut the bottom sections first.
+    // Compact JSON fits the same cap as lines, so no section is cut and the formats
+    // compare fairly in the benchmark.
     assert!(json_text.chars().count() <= 2000);
+    assert!(!body.contains("\n  "), "JSON is compact");
     assert_eq!(model["peers"].as_array().unwrap().len(), 2);
-    assert!(
-        model.get("ready").is_none() && model.get("recent").is_none(),
-        "{json_text}"
-    );
+    assert_eq!(model["ready"]["total"], 4);
+    assert_eq!(model["recent"].as_array().unwrap().len(), 3);
 
     let yaml = text(&snapshot(&t, ME, "since=806&format=yaml").await).to_owned();
     assert!(yaml.contains("you:\n"), "{yaml}");

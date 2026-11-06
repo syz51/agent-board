@@ -162,9 +162,13 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
-    /// Run the board server (not wired into this binary yet).
-    Serve,
-    /// Server administration (not wired into this binary yet).
+    /// Run the board server (on the server host).
+    Serve {
+        /// Server configuration (TOML; see docs/DEPLOY.md).
+        #[arg(long, env = "BOARD_SERVER_CONFIG")]
+        config: std::path::PathBuf,
+    },
+    /// Server administration on the server host, against the database file.
     #[command(subcommand)]
     Admin(AdminCommand),
 }
@@ -306,16 +310,83 @@ pub enum BoardCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
-    /// Create, list or revoke device tokens.
+    /// Create a device and print its token once. List and revoke devices through
+    /// `/v1/admin/devices` as the user.
     Device {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        name: DeviceName,
+        /// The token acts as the user (answers asks, administers devices).
+        #[arg(long)]
+        user: bool,
+        /// The server's database file.
+        #[arg(long, env = "BOARD_DB")]
+        db: std::path::PathBuf,
     },
-    /// Write a consistent database snapshot.
+    /// Write a consistent copy of the database (`VACUUM INTO`) to a new file.
     Backup {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// The server's database file.
+        #[arg(long, env = "BOARD_DB")]
+        db: std::path::PathBuf,
+        /// The copy to write; must not exist.
+        #[arg(long)]
+        out: std::path::PathBuf,
     },
+}
+
+fn report(result: anyhow::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("board: {err:#}");
+            1
+        }
+    }
+}
+
+async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
+    let config = board_server::ServerConfig::load(path)?;
+    board_server::serve(config).await?;
+    Ok(())
+}
+
+fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
+    match cmd {
+        AdminCommand::Device { name, user, db } => {
+            let token = board_server::create_device(&db, &name, user)?;
+            println!("{token}");
+            eprintln!(
+                "board: device {name} created; this token is shown once. On the device run \
+                 `board login --server <url> --device {name}` and paste it."
+            );
+        }
+        AdminCommand::Backup { db, out } => {
+            board_server::backup(&db, &out)?;
+            eprintln!("board: wrote {}", out.display());
+        }
+    }
+    Ok(())
+}
+
+impl Command {
+    /// Commands that act as the calling agent, which must then be registered.
+    fn acts_as_agent(&self) -> bool {
+        matches!(
+            self,
+            Self::Status { .. }
+                | Self::Add(_)
+                | Self::Claim { .. }
+                | Self::Release { .. }
+                | Self::Take { .. }
+                | Self::Update(_)
+                | Self::Done(_)
+                | Self::Note { .. }
+                | Self::Handoff { .. }
+                | Self::Lease { .. }
+                | Self::Ask { .. }
+                | Self::Join { .. }
+                | Self::Snapshot { .. }
+                | Self::Feedback { .. }
+        )
+    }
 }
 
 /// Runs the CLI and returns the process exit code.
@@ -326,12 +397,10 @@ pub async fn run(cli: Cli) -> i32 {
             crate::hook::run(event, runtime.into(), cli.agent.as_deref()).await;
             return 0;
         }
-        Command::Serve | Command::Admin(_) => {
-            eprintln!(
-                "board: `serve` and `admin` are not wired into this build yet (they come with the board-server library)"
-            );
-            return 2;
+        Command::Serve { config } => {
+            return report(serve(&config).await);
         }
+        Command::Admin(cmd) => return report(admin(cmd)),
         _ => {}
     }
     match dispatch(cli).await {
@@ -347,7 +416,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
     let home = Home::from_env()?;
     let json = cli.json;
     let agent = || agent_from_env(cli.agent.as_deref());
-    let ctx = || -> Result<Ctx> { Ctx::load(home.clone(), agent()?, None) };
+    let loaded = std::cell::OnceCell::new();
+    let ctx = || -> Result<Ctx> {
+        if let Some(ctx) = loaded.get() {
+            return Ok(Ctx::clone(ctx));
+        }
+        let ctx = Ctx::load(home.clone(), agent()?, None)?;
+        Ok(loaded.get_or_init(|| ctx).clone())
+    };
+    if cli.command.acts_as_agent() {
+        ctx()?.ensure_registered().await?;
+    }
     let out: Output = match cli.command {
         Command::Login { server, device } => return login(&home, server, device),
         Command::Install(cmd) => return crate::install::run(cmd),
@@ -498,7 +577,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             since,
         } => ops::snapshot(&ctx()?, kind, format, since).await?,
         Command::Feedback { text } => ops::feedback(&ctx()?, text).await?,
-        Command::Hook { .. } | Command::Serve | Command::Admin(_) => {
+        Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")
         }
     };

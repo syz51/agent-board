@@ -232,6 +232,10 @@ pub(crate) fn claim_coordinator(
     if let Some(agent) = &req.agent {
         touch_agent(cx, agent)?;
         join_board(cx, slug, agent)?;
+        cx.db.execute(
+            "UPDATE agents SET role = 'coordinator' WHERE id = ?1",
+            [agent.as_str()],
+        )?;
     }
     // A renewal by the same device keeps the coordinator it named before.
     let agent = match (&req.agent, held) {

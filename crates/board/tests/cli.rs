@@ -18,6 +18,11 @@ struct Env {
 fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
+    // Registered already, as the session-start hook would have done.
+    stub.on(
+        &format!("GET /v1/agents/{}", enc(ME)),
+        agent_fixture(ME, DEVICE, board_proto::AgentState::Running),
+    );
     let home = home_for(dir.path(), &stub.url);
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -155,8 +160,11 @@ fn done_reads_the_version_and_sends_paired_evidence() {
     let out = e.run(&["done", "factory-12"]);
     assert!(stderr(&out).contains("done needs evidence"));
     assert!(
-        e.stub.requests().is_empty(),
-        "nothing is sent without evidence"
+        e.stub
+            .requests()
+            .iter()
+            .all(|r| r.path.starts_with("/v1/agents")),
+        "no task request is sent without evidence"
     );
 }
 
@@ -400,15 +408,36 @@ fn login_stores_config_and_a_private_token_without_printing_it() {
 }
 
 #[test]
-fn serve_and_admin_are_marked_stubs() {
+fn an_unregistered_agent_is_registered_before_acting() {
     let e = env();
-    for args in [
-        &["serve"][..],
-        &["admin", "device", "create", "x"],
-        &["admin", "backup"],
-    ] {
-        let out = e.run(args);
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
-        assert!(stderr(&out).contains("not wired into this build"));
-    }
+    let path = format!("GET /v1/agents/{}", enc(ME));
+    e.stub.on_status(
+        &path,
+        404,
+        json!({"code": "not_found", "message": "no such agent", "next": "register first"}),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(ME, DEVICE, board_proto::AgentState::Running),
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "x"),
+    );
+
+    let out = e.run(&["claim", "factory-12"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let reg = &e.stub.requests_to("POST /v1/agents")[0];
+    assert_eq!(reg.body["id"], ME);
+    assert_eq!(reg.body["device"], DEVICE);
+    assert_eq!(reg.body["runtime"], "claude");
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-12/claim").len(),
+        1
+    );
+
+    // Reads never register.
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    e.run(&["ls"]);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
 }

@@ -203,6 +203,7 @@ dependencies = [
  "anyhow",
  "axum",
  "board-proto",
+ "board-server",
  "chrono",
  "clap",
  "dirs",

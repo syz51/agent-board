@@ -98,6 +98,13 @@ fn text(result: &Value) -> &str {
 fn tools_are_listed_and_called_with_framed_peer_text() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
+    // Registered already, as the session-start hook would have done.
+    for agent in ["t3:thread-1", "claude:other"] {
+        stub.on(
+            &format!("GET /v1/agents/{}", enc(agent)),
+            agent_fixture(agent, DEVICE, board_proto::AgentState::Running),
+        );
+    }
     let home = home_for(dir.path(), &stub.url);
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();

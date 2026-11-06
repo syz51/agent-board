@@ -914,8 +914,7 @@ fn render(m: &Model, format: SnapshotFormat) -> String {
     let body = match format {
         SnapshotFormat::Lines => render_lines(m),
         SnapshotFormat::Json => {
-            let mut json =
-                escape_json_text(&serde_json::to_string_pretty(m).expect("model serializes"));
+            let mut json = escape_json_text(&serde_json::to_string(m).expect("model serializes"));
             json.push('\n');
             json
         }

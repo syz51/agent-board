@@ -317,6 +317,7 @@ pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
         home,
         explicit_agent,
         ctx: Mutex::new(None),
+        registered: Mutex::default(),
     };
     let running = server
         .serve(rmcp::transport::stdio())
@@ -331,6 +332,8 @@ struct BoardMcp {
     explicit_agent: Option<String>,
     /// Built on first use, so a server started before `board login` still works after it.
     ctx: Mutex<Option<Ctx>>,
+    /// Agents known to be registered, checked once per process.
+    registered: Mutex<std::collections::HashSet<AgentId>>,
 }
 
 impl BoardMcp {
@@ -350,6 +353,12 @@ impl BoardMcp {
     async fn call(&self, name: &str, args: Value) -> Result<String> {
         let agent = args.get("agent").and_then(Value::as_str).map(str::to_owned);
         let ctx = self.ctx(agent.as_deref()).await?;
+        if let Some(agent) = ctx.client.agent()
+            && !self.registered.lock().await.contains(agent)
+        {
+            ctx.ensure_registered().await?;
+            self.registered.lock().await.insert(agent.clone());
+        }
         let out: Output = match name {
             "board_snapshot" => {
                 let a: SnapshotArgs = parse(args)?;

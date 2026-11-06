@@ -1,20 +1,11 @@
-use board_proto::{DeviceName, DeviceToken, Timestamp};
+use board_proto::{DeviceName, DeviceToken};
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 
 use crate::auth::{hash_token, new_token};
 use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, invalid, not_found};
 
-/// A device as listed by `GET /v1/admin/devices` (never with its token).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub name: DeviceName,
-    /// The token acts as the user.
-    pub user: bool,
-    pub created_at: Timestamp,
-    pub revoked_at: Option<Timestamp>,
-}
+pub use board_proto::DeviceInfo;
 
 /// Creates a device and returns its token, shown once. A revoked name may be reused.
 pub(crate) fn create(cx: &mut Ctx<'_>, name: &DeviceName, user: bool) -> Result<DeviceToken> {

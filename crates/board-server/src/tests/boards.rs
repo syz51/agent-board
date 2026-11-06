@@ -237,3 +237,52 @@ async fn web_view_falls_back_to_index() {
     let (s, v) = t.send("POST", "/boards", &[], None).await;
     assert_eq!((s.as_u16(), v["code"].as_str()), (404, Some("not_found")));
 }
+
+#[tokio::test]
+async fn the_named_coordinator_keeps_its_role_when_it_registers_again() {
+    let t = T::new();
+    let lead = "t3:lead";
+    let worker = "t3:worker";
+    t.register(lead, None, None).await;
+    t.register(worker, None, None).await;
+    t.board("auto", &[]).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(lead),
+        Some(json!({ "device": "mac", "agent": lead })),
+    )
+    .await;
+    let role = |v: serde_json::Value| v["role"].as_str().unwrap().to_owned();
+    assert_eq!(
+        role(t.ok("GET", "/v1/agents/t3:lead", None, None).await),
+        "coordinator"
+    );
+    // The session-start hook registers every agent as a worker.
+    assert_eq!(role(t.register(lead, None, None).await), "coordinator");
+    assert_eq!(role(t.register(worker, None, None).await), "worker");
+}
+
+#[tokio::test]
+async fn html_carries_security_headers() {
+    use tower::ServiceExt as _;
+    let t = T::new();
+    for path in ["/", "/asks/3"] {
+        let req = axum::http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = t.app.clone().oneshot(req).await.unwrap();
+        let headers = response.headers();
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+}

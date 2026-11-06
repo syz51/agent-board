@@ -12,6 +12,7 @@ repository = "https://github.com/syz51/agent-board"
 # Shared by every crate. Crate-specific dependencies go in that crate's own manifest.
 [workspace.dependencies]
 board-proto = { path = "crates/board-proto" }
+board-server = { path = "crates/board-server" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
