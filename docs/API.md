@@ -88,10 +88,11 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
-- `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner
-  only.
+- `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
+  board coordinator or user only (as status changes below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`; records a
-  `task_taken` event naming the previous owner.
+  `task_taken` event naming the previous owner. Taking an `open` task moves it to `doing`,
+  so it is refused like a claim while a blocker is not done.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only; 400
   `evidence_required` without evidence, or with `check` evidence missing `exit_code`. The
   `task_done` event carries the evidence.
@@ -103,9 +104,17 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 |---|---|
 | `open` | `blocked`, `dropped` (claiming moves it to `doing`) |
 | `doing` | `blocked`, `review`, `open` (same as release), `dropped` |
-| `blocked` | `open`, `doing` (owner only), `dropped` |
+| `blocked` | `open`, `doing`, `dropped` |
 | `review` | `doing`, `dropped` (`done` only through `/done`) |
-| `done`, `dropped` | `open` (reopen; clears the owner) |
+| `done`, `dropped` | `open` (reopen) |
+
+Who may change the status: anyone while the task has no owner or is `done` or `dropped`;
+otherwise only its owner, the board's coordinator or the user (a `--user` token or the
+browser), else 403 `forbidden`. Another agent takes a stale owner's task first
+(`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
+Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
+that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
+`owner` and `previous_owner`.
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
 be on the same board and must not form a cycle.

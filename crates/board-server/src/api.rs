@@ -390,8 +390,11 @@ async fn update_task(
     let id = parse_task_id(&id)?;
     caller.act_as(&req.agent)?;
     tasks::validate_update(&req, state.settings())?;
+    let by_user = caller.is_user();
     Ok(Json(
-        state.write(move |cx| tasks::update(cx, &id, req)).await?,
+        state
+            .write(move |cx| tasks::update(cx, &id, req, by_user))
+            .await?,
     ))
 }
 
@@ -423,9 +426,10 @@ async fn release_task(
 ) -> Result<Json<Task>> {
     let id = parse_task_id(&id)?;
     caller.act_as(&req.agent)?;
+    let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| tasks::release(cx, &id, &req.agent))
+            .write(move |cx| tasks::release(cx, &id, &req.agent, by_user))
             .await?,
     ))
 }

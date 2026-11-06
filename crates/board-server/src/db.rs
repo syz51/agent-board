@@ -323,8 +323,10 @@ mod tests {
         assert_eq!(one("SELECT repo FROM agents"), "github.com/myorg/repo");
         assert_eq!(one("SELECT repo FROM leases"), "github.com/myorg/repo");
         assert_eq!(
-            one("SELECT group_concat(repo || ' ' || path || ' ' || at, '; ') FROM \
-                 (SELECT * FROM touches ORDER BY path)"),
+            one(
+                "SELECT group_concat(repo || ' ' || path || ' ' || at, '; ') FROM \
+                 (SELECT * FROM touches ORDER BY path)"
+            ),
             "github.com/myorg/repo a.rs 5; github.com/myorg/repo b.rs 1"
         );
     }
