@@ -14,11 +14,20 @@ COPY prompts/ prompts/
 COPY --from=web /src/web/dist web/dist
 RUN cargo build --release --locked -p board
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/board /usr/local/bin/board
 USER 10001:10001
 ENTRYPOINT ["board"]
 CMD ["serve", "--config", "/etc/agent-board/server.toml"]
+
+# The published image (`--target release`): the static binaries from the release workflow,
+# unpacked to dist/linux-<arch>/board, so the image runs the same binary as the archives.
+FROM runtime AS release
+ARG TARGETARCH
+COPY dist/linux-${TARGETARCH}/board /usr/local/bin/board
+
+# The default target: built from source, as `deploy/compose.yaml` does.
+FROM runtime
+COPY --from=build /src/target/release/board /usr/local/bin/board

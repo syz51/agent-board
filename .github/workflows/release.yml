@@ -1,0 +1,217 @@
+# On a `v*` tag: build `board` with the web view embedded for Linux (static musl) and
+# macOS, publish checksummed archives to a GitHub Release, and push a multi-arch image made
+# from the same Linux binaries to ghcr.io, all with build provenance.
+#
+# A pull request that changes this workflow or the Dockerfile runs it as a dry run: every
+# build, nothing published.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Publish only from a version tag; pull requests stop after building.
+  PUBLISH: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+
+jobs:
+  web-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: web/package.json
+      - name: Check and build the web view
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: web/dist/
+          if-no-files-found: error
+
+  binaries:
+    needs: web-build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          # Cross-compiled on Apple silicon; the smoke test runs under Rosetta.
+          - target: x86_64-apple-darwin
+            os: macos-15
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - name: Install the musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # No build cache: a release is built from scratch, so nothing cached by another ref
+      # can reach it.
+      - name: Build
+        run: cargo build --release --locked -p board --target "$TARGET"
+      - name: Smoke test and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/board"
+          if [[ "$RUNNER_OS" == Linux ]] && ! file "$bin" | grep -Eq 'static(-pie|ally) linked'; then
+            echo "::error::$bin is not statically linked"
+            exit 1
+          fi
+          version="$("$bin" --version | awk '{print $2}')"
+          if [[ "$PUBLISH" == true && "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+          name="board-$version-$TARGET"
+          mkdir -p "staging/$name" out
+          cp "$bin" LICENSE README.md "staging/$name/"
+          COPYFILE_DISABLE=1 tar -czf "out/$name.tar.gz" -C staging "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: board-${{ matrix.target }}
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  image:
+    needs: binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: board-*-linux-musl
+          path: archives
+          merge-multiple: true
+      # The release stage of the Dockerfile copies dist/linux-<arch>/board.
+      - name: Unpack the Linux binaries
+        run: |
+          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+            arch="${pair%%:*}" target="${pair#*:}"
+            mkdir -p "dist/linux-$arch"
+            tar -xzf archives/board-*-"$target".tar.gz -C "dist/linux-$arch" --strip-components=1
+          done
+      # Emulation only runs the runtime stage's apt-get for arm64; nothing is compiled.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+      - if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    needs: [binaries, image]
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: board-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          [[ "$TAG" != *-* ]] || prerelease=(--prerelease)
+          notes="Container image: \`$IMAGE:${TAG#v}\`
+
+          Verify a download with \`shasum -a 256 --check --ignore-missing SHA256SUMS\` and
+          \`gh attestation verify <archive> --repo $GH_REPO\`."
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "$TAG" --generate-notes --notes "$notes" "${prerelease[@]}"
