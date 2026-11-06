@@ -108,7 +108,8 @@ host.
   identified by the `Tailscale-User-Login` header that `tailscale serve` adds.
 - Writes fail fast when the server is unreachable: an exclusive claim needs one arbiter.
   Hooks then inject the cached snapshot marked with its age and never delay the agent by more
-  than 1.5 seconds.
+  than 1.5 seconds; after one hook finds the server unreachable, the device's hooks use the
+  cache without trying the server for a minute.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file on
   Linux, or `BOARD_TOKEN`.

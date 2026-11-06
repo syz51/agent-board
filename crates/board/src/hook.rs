@@ -33,6 +33,9 @@ use crate::state::{self, AgentLocal};
 const BUDGET: Duration = Duration::from_millis(1500);
 /// Kept free after the network work for writing state and output.
 const MARGIN: Duration = Duration::from_millis(200);
+/// After the server fails to answer, hooks on this device use the cache for this long
+/// instead of waiting on it again.
+const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 /// Heartbeats and alert checks from `PostToolUse` happen at most this often.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
@@ -197,9 +200,23 @@ async fn handle(
         input,
         now: Utc::now(),
     };
+    let offline_until = state::load_offline_until(&hook.home);
+    if offline_until.is_some_and(|until| until > hook.now) {
+        let reply = hook.offline();
+        state::save_agent(&hook.home, &hook.agent, &hook.local)?;
+        return Ok(reply);
+    }
+    let unreachable = |hook: &mut Hook<'_>| -> Result<Reply> {
+        let backoff = chrono::Duration::from_std(OFFLINE_BACKOFF)?;
+        state::save_offline_until(&hook.home, Some(hook.now + backoff))?;
+        Ok(hook.offline())
+    };
     let reply = match tokio::time::timeout(remaining, hook.online()).await {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
+            if offline_until.is_some() {
+                state::save_offline_until(&hook.home, None)?;
+            }
             reply
         }
         // The server answered with an error: it is reachable, so the cache is no better.
@@ -209,9 +226,9 @@ async fn handle(
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            hook.offline()
+            unreachable(&mut hook)?
         }
-        Err(_) => hook.offline(),
+        Err(_) => unreachable(&mut hook)?,
     };
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)

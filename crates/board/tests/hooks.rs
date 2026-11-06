@@ -489,7 +489,34 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
         "{text}"
     );
 
+    // Later hooks on this device skip the server for a while instead of waiting again.
+    let began = Instant::now();
+    let (reply, _) = e.hook("session-start", "claude", start.clone());
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "waited again: {elapsed:?}"
+    );
+    assert!(context(&reply, "SessionStart").contains("cached snapshot"));
+    let marked: Value =
+        serde_json::from_slice(&std::fs::read(e.home.join("state/offline.json")).unwrap()).unwrap();
+    assert!(marked["until"].is_string(), "{marked}");
+
+    // Once the backoff has passed, the server is tried again.
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        r#"{"until":"2000-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let began = Instant::now();
+    e.hook("session-start", "claude", start.clone());
+    assert!(
+        began.elapsed() >= Duration::from_millis(900),
+        "an expired backoff waits on the server again"
+    );
+
     // A closed port fails fast and falls back the same way.
+    std::fs::remove_file(e.home.join("state/offline.json")).unwrap();
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
