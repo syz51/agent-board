@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -39,6 +40,8 @@ enum Call {
 struct FakeT3 {
     calls: Arc<Mutex<Vec<Call>>>,
     threads: Arc<Mutex<BTreeMap<String, ThreadInfo>>>,
+    /// `t3 thread start` fails while set.
+    fail_start: Arc<AtomicBool>,
 }
 
 impl FakeT3 {
@@ -74,6 +77,9 @@ impl T3 for FakeT3 {
             title: title.to_owned(),
             message: message.to_owned(),
         });
+        if self.fail_start.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread start failed: no such project");
+        }
         self.live(NEW_THREAD);
         Ok(NEW_THREAD.to_owned())
     }
@@ -99,13 +105,17 @@ struct Env {
 }
 
 fn env() -> Env {
+    env_with_projects([(REPO.to_owned(), PathBuf::from("/src/agent-board"))].into())
+}
+
+fn env_with_projects(projects: BTreeMap<String, PathBuf>) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
     let home = Home::at(dir.path().join("home"));
     let config = Config {
         server: Some(stub.url.clone()),
         device: Some(DEVICE.parse().unwrap()),
-        projects: [(REPO.to_owned(), PathBuf::from("/src/agent-board"))].into(),
+        projects,
         ..Config::default()
     };
     let ctx = Ctx {
@@ -326,6 +336,7 @@ fn coordinator_env(
             started_at: at(),
             renewed_at: at(),
             resumed_after: None,
+            registered: true,
         },
     );
     e.stub
@@ -582,4 +593,324 @@ async fn a_refused_renewal_hands_the_coordinator_over() {
             .len(),
         1
     );
+}
+
+fn factory() -> board_proto::BoardSlug {
+    "factory".parse().unwrap()
+}
+
+fn starts(t3: &FakeT3) -> usize {
+    t3.calls()
+        .iter()
+        .filter(|c| matches!(c, Call::Start { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn releasing_the_coordinator_reads_the_board_the_server_returns() {
+    let stub = Stub::start();
+    stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    let client = Client::new(&stub.url, TOKEN.into(), None, None).unwrap();
+    let board = client.release_coordinator(&factory()).await.unwrap();
+    assert_eq!(board.slug, factory());
+    assert_eq!(board.coordinator, None);
+}
+
+#[tokio::test]
+async fn a_device_without_the_project_never_claims_the_lease() {
+    let mut e = env_with_projects(BTreeMap::new());
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    for minutes in [0, 1, 5, 60] {
+        e.daemon
+            .reconcile(at() + chrono::Duration::minutes(minutes))
+            .await
+            .unwrap();
+    }
+    assert!(
+        e.stub
+            .requests()
+            .iter()
+            .all(|r| r.method == "GET" && r.path == "/v1/boards"),
+        "only board reads: {:?}",
+        e.stub.requests()
+    );
+    assert!(e.t3.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_start_backs_off_instead_of_looping() {
+    let mut e = env();
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    let claims = |e: &Env| {
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .len()
+    };
+    let secs = |s: i64| at() + chrono::Duration::seconds(s);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!((claims(&e), starts(&e.t3)), (1, 1));
+    assert_eq!(
+        e.stub
+            .requests_to("DELETE /v1/boards/factory/coordinator")
+            .len(),
+        1,
+        "the lease is released after the failed start"
+    );
+
+    // The daemon's own claim does not ask for another reconcile.
+    let mut claimed = event(40, EventType::BoardUpdated, None, "user");
+    claimed.payload = json!({"fields": ["coordinator"], "coordinator": null, "device": DEVICE});
+    assert!(!e.daemon.on_event(&claimed, secs(1)).await.unwrap());
+    let mut patched = event(41, EventType::BoardUpdated, None, "user");
+    patched.payload = json!({"fields": ["repos"]});
+    assert!(e.daemon.on_event(&patched, secs(1)).await.unwrap());
+
+    // Reconciling again (the release event, the flush tick) waits out the delay.
+    for s in [3, 6, 30, 59] {
+        e.daemon.reconcile(secs(s)).await.unwrap();
+    }
+    assert_eq!(claims(&e), 1, "no retry inside the first minute");
+    e.daemon.reconcile(secs(61)).await.unwrap();
+    assert_eq!((claims(&e), starts(&e.t3)), (2, 2));
+    // The delay doubles.
+    e.daemon.reconcile(secs(61 + 90)).await.unwrap();
+    assert_eq!(claims(&e), 2);
+    e.daemon.reconcile(secs(61 + 121)).await.unwrap();
+    assert_eq!(claims(&e), 3);
+
+    // A change to the board's hosting settings retries at once, from the first delay.
+    e.stub
+        .on("GET /v1/boards", [autopilot(None, &[DEVICE, "mac-air"])]);
+    e.t3.fail_start.store(false, Ordering::SeqCst);
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(secs(61 + 122)).await.unwrap();
+    assert_eq!(
+        (claims(&e), starts(&e.t3)),
+        (5, 4),
+        "claim, start, claim as the agent"
+    );
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+}
+
+#[tokio::test]
+async fn a_lapsed_lease_is_claimed_again_for_the_live_thread() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    // The device slept past the 45-minute lease: the board names no coordinator.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    let later = at() + chrono::Duration::minutes(50);
+    e.daemon.reconcile(later).await.unwrap();
+
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body, json!({"device": DEVICE, "agent": agent}));
+    assert!(
+        e.stub.requests_to("POST /v1/agents").is_empty(),
+        "already registered"
+    );
+    assert!(e.t3.calls().is_empty(), "no second thread");
+    let local = &e.daemon.state.coordinators[&factory()];
+    assert_eq!((local.thread.as_str(), local.renewed_at), ("coord", later));
+
+    // Its thread is gone: a new one replaces it.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.t3.threads.lock().unwrap().clear();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+}
+
+#[tokio::test]
+async fn a_failed_registration_is_retried_with_the_same_thread() {
+    let mut e = env();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.stub
+        .once_error("POST /v1/agents", 503, "internal", "restarting");
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    assert!(
+        e.stub
+            .requests_to("DELETE /v1/boards/factory/coordinator")
+            .is_empty(),
+        "the lease is kept for the started thread"
+    );
+    let local = &e.daemon.state.coordinators[&factory()];
+    assert_eq!(
+        (local.thread.as_str(), local.registered),
+        (NEW_THREAD, false)
+    );
+    let saved: board::daemon::WatchState =
+        board::state::load_named(&Home::at(e._dir.path().join("home")), "watch");
+    assert_eq!(saved.coordinators[&factory()].thread, NEW_THREAD, "saved");
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1, "no second thread");
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 2);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[1].body["agent"], format!("t3:{NEW_THREAD}"));
+    assert!(e.daemon.state.coordinators[&factory()].registered);
+}
+
+#[tokio::test]
+async fn an_event_that_failed_on_a_transient_error_is_retried() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.state.last_seq = Some(9);
+    let page = |events: Vec<Event>, next_since: i64| board_proto::EventsPage { events, next_since };
+    e.stub.on(
+        "GET /v1/events",
+        page(
+            vec![event(10, EventType::TaskCreated, Some("factory-4"), "user")],
+            10,
+        ),
+    );
+    e.stub.on_error(
+        "GET /v1/tasks/factory-4",
+        503,
+        "internal",
+        "restarting",
+        "retry",
+    );
+    e.daemon.catch_up(at()).await.unwrap();
+    assert_eq!(e.daemon.state.last_seq, Some(10));
+    assert_eq!(e.daemon.state.retry.len(), 1);
+    e.daemon.flush().await;
+    assert!(e.t3.sends().is_empty());
+
+    // The server is back: the wake-up goes out.
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .retry_failed(at() + chrono::Duration::minutes(1))
+        .await;
+    assert!(e.daemon.state.retry.is_empty());
+    e.daemon.flush().await;
+    assert_eq!(e.t3.sends().len(), 1);
+
+    // A refused request is not retried.
+    e.stub.on(
+        "GET /v1/events",
+        page(
+            vec![event(11, EventType::TaskCreated, Some("factory-5"), "user")],
+            11,
+        ),
+    );
+    e.daemon.catch_up(at()).await.unwrap();
+    assert_eq!(e.daemon.state.last_seq, Some(11));
+    assert!(e.daemon.state.retry.is_empty(), "a 404 is final");
+
+    // A failure that outlasts the retry window is dropped.
+    e.stub.on_error(
+        "GET /v1/tasks/factory-4",
+        503,
+        "internal",
+        "restarting",
+        "retry",
+    );
+    e.daemon.state.retry = vec![event(10, EventType::TaskCreated, Some("factory-4"), "user")];
+    e.stub.clear();
+    e.daemon
+        .retry_failed(at() + chrono::Duration::minutes(31))
+        .await;
+    assert!(e.daemon.state.retry.is_empty());
+    assert!(e.stub.requests().is_empty(), "dropped without a request");
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    // Not an event stream: every connection ends at once.
+    stub.on(
+        "GET /v1/events",
+        board_proto::EventsPage {
+            events: vec![],
+            next_since: 5,
+        },
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_board"))
+        .arg("watch")
+        .env("BOARD_HOME", &home)
+        .env("BOARD_TOKEN", TOKEN)
+        .env("BOARD_KEYCHAIN", "0")
+        .env_remove("T3CODE_THREAD_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let streams = || stub.requests_to("GET /v1/events").len();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while streams() == 0 {
+        assert!(Instant::now() < deadline, "the daemon never connected");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    let reconnects = streams();
+    assert!(reconnects <= 3, "reconnects back off: {reconnects} in 2.5s");
+
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the daemon ignored SIGTERM");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
+    assert_eq!(saved.last_seq, Some(5), "state saved on the way out");
 }

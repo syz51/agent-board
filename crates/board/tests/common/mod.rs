@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -60,6 +60,8 @@ struct Canned {
 #[derive(Default)]
 struct StubState {
     routes: BTreeMap<String, Canned>,
+    /// One-off answers per route, used before `routes`.
+    once: BTreeMap<String, VecDeque<Canned>>,
     requests: Vec<Recorded>,
     /// Delay applied to every request (an overloaded or hanging server).
     hang: Option<Duration>,
@@ -126,6 +128,23 @@ impl Stub {
         )
     }
 
+    /// Answers the next request to `route` with an `ApiError`, then falls back to the route's
+    /// usual answer.
+    pub fn once_error(&self, route: &str, status: u16, code: &str, message: &str) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .once
+            .entry(route.to_owned())
+            .or_default()
+            .push_back(Canned {
+                status,
+                body: json!({"code": code, "message": message, "next": null}),
+                delay: Duration::ZERO,
+            });
+        self
+    }
+
     /// Delays every answer, as a hanging server would.
     pub fn hang(&self, delay: Duration) {
         self.state.lock().unwrap().hang = Some(delay);
@@ -181,7 +200,8 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             accept,
             body,
         });
-        (st.routes.get(&route).cloned(), st.hang)
+        let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
+        (once.or_else(|| st.routes.get(&route).cloned()), st.hang)
     };
     if let Some(delay) = hang {
         tokio::time::sleep(delay).await;
