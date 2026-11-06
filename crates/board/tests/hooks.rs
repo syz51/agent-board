@@ -322,13 +322,34 @@ fn codex_apply_patch_records_each_patched_file() {
 
 /// Sets a file's modification time well before any hook in the test ran.
 fn backdate(path: &std::path::Path) {
-    let ok = std::process::Command::new("touch")
-        .args(["-t", "202001010000"])
-        .arg(path)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "touch -t {}", path.display());
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+}
+
+/// Commits everything in `repo`.
+fn commit_all(repo: &std::path::Path) {
+    for args in [
+        &["add", "-A"][..],
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "base",
+        ],
+    ] {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
 }
 
 #[test]
@@ -351,11 +372,13 @@ fn shell_calls_record_the_files_they_changed() {
             }],
         },
     );
+    // Tracked and clean before the call.
+    std::fs::write(e.repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(e.repo.join(".gitignore"), "target/\n").unwrap();
+    commit_all(&e.repo);
     // Changed before the call: dirty in git, but not by this call.
     std::fs::write(e.repo.join("README.md"), "old\n").unwrap();
     backdate(&e.repo.join("README.md"));
-    std::fs::write(e.repo.join(".gitignore"), "target/\n").unwrap();
-    backdate(&e.repo.join(".gitignore"));
     let command = "sed -i.bak s/a/b/ src/lib.rs && rm src/lib.rs.bak";
     let call = |event: &str, id: &str| {
         e.with(
@@ -378,12 +401,17 @@ fn shell_calls_record_the_files_they_changed() {
         e.stub.requests().is_empty(),
         "PreToolUse never calls the server"
     );
-    // What the command does: edits one file, adds another, writes an ignored one.
+    // What the command does: adds files, edits a tracked one, writes an ignored one and
+    // one whose path the server would refuse (over 300 characters).
     std::fs::write(e.repo.join("src/lib.rs"), "b\n").unwrap();
     std::fs::create_dir_all(e.repo.join("src/new")).unwrap();
     std::fs::write(e.repo.join("src/new/mod.rs"), "x\n").unwrap();
+    std::fs::write(e.repo.join("src/main.rs"), "fn main() { run() }\n").unwrap();
     std::fs::create_dir_all(e.repo.join("target")).unwrap();
     std::fs::write(e.repo.join("target/out"), "x\n").unwrap();
+    let deep: PathBuf = (0..4).map(|i| format!("{i}{}", "d".repeat(80))).collect();
+    std::fs::create_dir_all(e.repo.join(&deep)).unwrap();
+    std::fs::write(e.repo.join(&deep).join("f.txt"), "x\n").unwrap();
 
     let mut post = call("PostToolUse", "toolu_sh1");
     post["tool_response"] = json!({"stdout": "", "stderr": "", "interrupted": false});
@@ -399,7 +427,7 @@ fn shell_calls_record_the_files_they_changed() {
         json!({
             "agent": CLAUDE_AGENT,
             "repo": "github.com/syz51/agent-board",
-            "paths": ["src/lib.rs", "src/new/mod.rs"],
+            "paths": ["src/main.rs", "src/lib.rs", "src/new/mod.rs"],
         })
     );
 
@@ -407,6 +435,102 @@ fn shell_calls_record_the_files_they_changed() {
     e.hook("post-tool-use", "claude", post);
     e.hook("post-tool-use", "claude", call("PostToolUse", "toolu_sh2"));
     assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 1);
+
+    // A command that fails after writing a file: Claude Code sends PostToolUseFailure.
+    // (The first call's files are moved out of this call's second.)
+    for path in ["src/main.rs", "src/new/mod.rs"] {
+        backdate(&e.repo.join(path));
+    }
+    e.hook("pre-tool-use", "claude", call("PreToolUse", "toolu_sh3"));
+    std::fs::write(e.repo.join("src/lib.rs"), "c\n").unwrap();
+    let mut failed = call("PostToolUseFailure", "toolu_sh3");
+    failed["error"] = json!("Exit code 1");
+    let (reply, _) = e.hook("post-tool-use-failure", "claude", failed);
+    assert!(
+        context(&reply, "PostToolUseFailure").contains("! t3:a91c edited"),
+        "{reply:?}"
+    );
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 2);
+    assert_eq!(touches[1].body["paths"], json!(["src/lib.rs"]));
+}
+
+#[test]
+fn shell_calls_send_many_changed_files_in_batches() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    let call = |event: &str| {
+        e.with(
+            event,
+            json!({"tool_name": "Bash", "tool_input": {"command": "gen"}, "tool_use_id": "toolu_gen"}),
+        )
+    };
+    e.hook("pre-tool-use", "claude", call("PreToolUse"));
+    for i in 0..101 {
+        std::fs::write(e.repo.join(format!("src/gen_{i:03}.rs")), "x\n").unwrap();
+    }
+    e.hook("post-tool-use", "claude", call("PostToolUse"));
+    let touches = e.stub.requests_to("POST /v1/touches");
+    let sizes: Vec<usize> = touches
+        .iter()
+        .map(|t| t.body["paths"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [100, 1]);
+}
+
+#[test]
+fn session_start_prunes_old_shell_marks_outside_t3_and_without_login() {
+    let e = env();
+    let marks = e.home.join("state/tool-starts");
+    let call = |id: &str| {
+        e.with(
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": id}),
+        )
+    };
+    e.hook("pre-tool-use", "claude", call("toolu_old"));
+    e.hook("pre-tool-use", "claude", call("toolu_new"));
+    let mut names: Vec<_> = std::fs::read_dir(&marks)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    let old = names
+        .iter()
+        .find(|p| p.to_string_lossy().contains("toolu_5fold"))
+        .unwrap();
+    let file = std::fs::File::options().write(true).open(old).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600))
+        .unwrap();
+    // Logged out: the hook stops before the server, after pruning.
+    std::fs::remove_file(e.home.join("config.toml")).unwrap();
+    let (reply, _) = e.hook(
+        "session-start",
+        "claude",
+        e.with("SessionStart", json!({"source": "startup"})),
+    );
+    assert_eq!(reply, None);
+    let left: Vec<_> = std::fs::read_dir(&marks)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].to_string_lossy().contains("toolu_5fnew"));
+}
+
+#[test]
+fn unknown_hook_events_are_ignored() {
+    let e = env();
+    let (reply, text) = e.hook("some-future-event", "claude", json!({}));
+    assert_eq!((reply, text.as_str()), (None, ""));
+    assert!(e.stub.requests().is_empty());
 }
 
 #[test]

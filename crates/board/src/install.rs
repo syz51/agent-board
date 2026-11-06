@@ -84,6 +84,12 @@ const CLAUDE_HOOKS: &[HookSpec] = &[
         matcher: Some("*"),
         timeout: 5,
     },
+    // A shell command that exits non-zero may still have changed files.
+    HookSpec {
+        event: HookEvent::PostToolUseFailure,
+        matcher: Some("Bash"),
+        timeout: 5,
+    },
     HookSpec {
         event: HookEvent::Stop,
         matcher: None,

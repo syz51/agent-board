@@ -78,6 +78,7 @@ fn install_claude_merges_into_existing_settings_without_losing_keys() {
     assert_eq!(start[0]["matcher"], "startup|resume|clear|compact");
     for (event, matcher) in [
         ("PostToolUse", Some("*")),
+        ("PostToolUseFailure", Some("Bash")),
         ("StopFailure", Some("rate_limit")),
         ("PreCompact", Some("manual|auto")),
         ("UserPromptSubmit", None),

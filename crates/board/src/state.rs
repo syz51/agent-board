@@ -176,7 +176,11 @@ fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
     let now = std::time::SystemTime::now();
     for entry in entries {
         let entry = entry?;
-        let modified = entry.metadata()?.modified()?;
+        // Removed by another hook since the listing.
+        let modified = match entry.metadata() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            metadata => metadata?.modified()?,
+        };
         if now
             .duration_since(modified)
             .is_ok_and(|elapsed| elapsed > age)
@@ -268,5 +272,50 @@ mod tests {
         prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "old"), None);
         assert_eq!(load_session(&home, Runtime::Codex, "new"), Some(nested));
+    }
+
+    #[test]
+    fn tool_starts_are_taken_once_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let at = chrono::Utc::now();
+        // Nothing to prune or take before the first mark.
+        prune_tool_starts(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            None
+        );
+
+        save_tool_start(&home, Runtime::Claude, "toolu_1", at).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Codex, "toolu_1").unwrap(),
+            None
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            Some(at)
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            None
+        );
+
+        save_tool_start(&home, Runtime::Claude, "old/1", at).unwrap();
+        save_tool_start(&home, Runtime::Codex, "new", at).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(tool_start_path(&home, Runtime::Claude, "old/1"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        prune_tool_starts(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "old/1").unwrap(),
+            None
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Codex, "new").unwrap(),
+            Some(at)
+        );
     }
 }

@@ -3,7 +3,8 @@
 //!
 //! Output shapes (Claude Code: code.claude.com/docs/en/hooks; Codex:
 //! learn.chatgpt.com/docs/hooks.md):
-//! - SessionStart, UserPromptSubmit, PostToolUse: `{"hookSpecificOutput": {"hookEventName":
+//! - SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure (Claude Code):
+//!   `{"hookSpecificOutput": {"hookEventName":
 //!   <event>, "additionalContext": <text>}}` on both runtimes.
 //! - Stop: `{"decision": "block", "reason": <text>}` continues the turn with the reason;
 //!   Codex requires JSON on stdout, so it gets `{}` otherwise.
@@ -17,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, Runtime, Snapshot, SnapshotFormat, SnapshotKind,
-    TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat,
+    SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -50,6 +51,9 @@ pub enum HookEvent {
     PreToolUse,
     #[value(alias = "PostToolUse")]
     PostToolUse,
+    /// Claude Code: a tool call failed, such as a shell command exiting non-zero.
+    #[value(alias = "PostToolUseFailure")]
+    PostToolUseFailure,
     #[value(alias = "Stop")]
     Stop,
     #[value(alias = "StopFailure")]
@@ -68,6 +72,7 @@ impl HookEvent {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
             Self::Stop => "Stop",
             Self::StopFailure => "StopFailure",
             Self::SessionEnd => "SessionEnd",
@@ -82,6 +87,7 @@ impl HookEvent {
             Self::UserPromptSubmit => "user-prompt-submit",
             Self::PreToolUse => "pre-tool-use",
             Self::PostToolUse => "post-tool-use",
+            Self::PostToolUseFailure => "post-tool-use-failure",
             Self::Stop => "stop",
             Self::StopFailure => "stop-failure",
             Self::SessionEnd => "session-end",
@@ -185,6 +191,13 @@ async fn handle(
         }
         return Ok(Reply::Nothing);
     }
+    if event == HookEvent::SessionStart {
+        // In every session, logged in or not: marks of shell calls that never reached
+        // PostToolUse (failed to start, denied, interrupted, or hooks offline).
+        if let Err(err) = state::prune_tool_starts(&home, TOOL_START_AGE) {
+            tracing::debug!("pruning tool start marks: {err:#}");
+        }
+    }
     let config = Config::load(&home)?;
     let Ok((server, device)) = config.require_login() else {
         return Ok(Reply::Nothing);
@@ -251,15 +264,15 @@ async fn handle(
     Ok(reply)
 }
 
-/// Whether this session runs inside another agent session, which matters only when the
-/// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
-/// first hook of a session without one) and cached for the session's later hooks;
-/// `SessionEnd` drops the cache.
 /// How long a session's cached decisions outlive its last SessionStart.
 const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// How long the start mark of a shell call that never reached PostToolUse is kept.
 const TOOL_START_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
+/// Whether this session runs inside another agent session, which matters only when the
+/// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
+/// first hook of a session without one) and cached for the session's later hooks;
+/// `SessionEnd` drops the cache.
 async fn nested_session(
     home: &Home,
     event: HookEvent,
@@ -282,13 +295,10 @@ async fn nested_session(
     let prune = (event == HookEvent::SessionStart).then(|| home.clone());
     let nested = tokio::task::spawn_blocking(move || {
         // Before this session's file is written, so it is never the one removed.
-        if let Some(home) = prune {
-            if let Err(err) = state::prune_sessions(&home, SESSION_CACHE_AGE) {
-                tracing::debug!("pruning cached sessions: {err:#}");
-            }
-            if let Err(err) = state::prune_tool_starts(&home, TOOL_START_AGE) {
-                tracing::debug!("pruning tool start marks: {err:#}");
-            }
+        if let Some(home) = prune
+            && let Err(err) = state::prune_sessions(&home, SESSION_CACHE_AGE)
+        {
+            tracing::debug!("pruning cached sessions: {err:#}");
         }
         nested_here()
     })
@@ -315,7 +325,8 @@ impl Hook<'_> {
             HookEvent::UserPromptSubmit => self.user_prompt_submit().await,
             // Handled before login (`handle`).
             HookEvent::PreToolUse => Ok(Reply::Nothing),
-            HookEvent::PostToolUse => self.post_tool_use().await,
+            // A failed shell command may still have changed files.
+            HookEvent::PostToolUse | HookEvent::PostToolUseFailure => self.post_tool_use().await,
             HookEvent::Stop => self.stop().await,
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
@@ -491,22 +502,30 @@ impl Hook<'_> {
         };
         if !paths.is_empty() || shell_start.is_some() {
             let repo = detect_repo(self.cwd()).await?;
-            if let (Some(since), Some(root)) = (shell_start, repo.root.clone()) {
-                match tokio::task::spawn_blocking(move || changed_since(&root, since)).await? {
-                    Ok(changed) => paths.extend(changed),
-                    Err(err) => tracing::debug!("files changed by the shell call: {err:#}"),
+            if let (Some(since), Some(root)) = (shell_start, repo.root.as_deref()) {
+                // Bounded on its own, so a slow work tree never eats the server's budget.
+                match tokio::time::timeout(SHELL_SCAN_BUDGET, changed_since(root, since)).await {
+                    Ok(Ok(changed)) => paths.extend(changed),
+                    Ok(Err(err)) => tracing::debug!("files changed by the shell call: {err:#}"),
+                    Err(_) => tracing::debug!("files changed by the shell call: over budget"),
                 }
             }
             if let Some(key) = repo.key.clone() {
-                let mut rel: Vec<String> = paths.iter().filter_map(|p| repo.relative(p)).collect();
-                rel.truncate(MAX_TOUCH_PATHS);
-                if !rel.is_empty() {
+                // A path the server would refuse would fail the whole request.
+                let rel: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| repo.relative(p))
+                    .filter(|p| {
+                        p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control)
+                    })
+                    .collect();
+                for chunk in rel.chunks(TOUCH_PATHS_MAX) {
                     let result = self
                         .client
                         .touches(&Touches {
                             agent: self.agent.clone(),
-                            repo: key,
-                            paths: rel,
+                            repo: key.clone(),
+                            paths: chunk.to_vec(),
                         })
                         .await?;
                     lines.extend(render::overlaps(&result));
@@ -626,14 +645,18 @@ pub fn heartbeat_due(last: Option<Timestamp>, now: Timestamp) -> bool {
 
 /// The shell tool's name on both runtimes.
 const SHELL_TOOL: &str = "Bash";
-/// Paths one `POST /v1/touches` accepts.
-const MAX_TOUCH_PATHS: usize = 100;
+/// Time for listing the files a shell call changed; past it the call records none.
+const SHELL_SCAN_BUDGET: Duration = Duration::from_millis(500);
 
 /// Files under the work tree `root` that `git status` lists as changed or untracked and
 /// that were modified at or after `since`: what a shell call that started then wrote.
-/// Files the call deleted, or changed and committed, are not seen.
-pub fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>> {
-    let out = std::process::Command::new("git")
+/// Not seen: files the call deleted, changed and committed, or wrote keeping an older
+/// modification time (`mv`, `cp -p`, archives). Seen as well: files another writer in the
+/// same work tree changed during the call. Dropping the future stops `git`.
+pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>> {
+    let out = tokio::process::Command::new("git")
+        // A read-only scan: no index refresh, so no `index.lock` to collide with.
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
         .args([
@@ -645,7 +668,9 @@ pub fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>> {
         ])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()?;
+        .kill_on_drop(true)
+        .output()
+        .await?;
     anyhow::ensure!(out.status.success(), "git status failed: {}", out.status);
     // Whole seconds: some file systems keep modification times to the second.
     let since = since.trunc_subsecs(0);

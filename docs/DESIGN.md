@@ -148,7 +148,8 @@ operations with `--json` for scripts. Errors say what to do next.
 ## Runtime integration
 
 All hooks call `board hook <event> --runtime claude|codex`, which reads the hook's JSON from
-stdin, answers within 1.5 seconds and never fails the turn.
+stdin, answers within 1.5 seconds and never fails the turn. An event the binary does not know
+exits 0 without output, so a configuration newer than the binary never blocks a tool call.
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
@@ -156,7 +157,7 @@ stdin, answers within 1.5 seconds and never fails the turn.
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started, in a local file; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
-| `PostToolUse` on `Bash` with a start mark | The same, for files `git status` lists as changed or untracked with a modification time since the mark (at most 100; a file deleted, or changed and committed, by the call is not seen) |
+| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call. Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
 | `Stop` | Mark idle; remind once if a task in `doing` has a handoff older than the turn |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |

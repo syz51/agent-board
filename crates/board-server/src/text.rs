@@ -113,7 +113,7 @@ fn bad_repo(raw: &str) -> crate::Error {
 
 /// Checks a repo-relative path or glob.
 pub(crate) fn check_path(field: &str, value: &str) -> Result<()> {
-    check_line(field, value, 300)?;
+    check_line(field, value, board_proto::PATH_CHARS_MAX)?;
     if value.starts_with('/') || value.split('/').any(|part| part == "..") {
         return Err(invalid(
             format!("{field} {value:?} is not relative to the repo root"),
