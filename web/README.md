@@ -1,0 +1,101 @@
+# agent-board web view
+
+A phone-friendly, read-mostly operations view for one user. `board-server` embeds the built
+`dist/` and serves it at `/` on the tailnet. All calls are same-origin `/v1/...` requests. The
+user is identified by the `Tailscale-User-Login` header that `tailscale serve` adds, so the
+page sends no credentials of its own.
+
+## Screens
+
+| Path | Shows |
+|---|---|
+| `/` | Boards: counts, open asks, autopilot switch (confirmed before `PATCH /v1/boards/{slug}`), coordinator handle, state and paused-until time |
+| `/boards/<slug>` | Tasks grouped as open (ready first), doing, blocked, review, and done in the last 30 days, with owner, priority, unfinished blockers and blocked reason; filters for text, priority, owner and ready-only, kept in the URL |
+| `/tasks/<id>` | Body (sanitized markdown), acceptance, blockers, blocks, parent and subtasks, evidence, notes, history |
+| `/agents` | State, device, runtime, role, repo and branch, current task, handoff, last seen; filter by state |
+| `/asks` | Needs you: open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`) |
+| `/asks/<id>` | One ask; the deep link that Telegram messages carry |
+| `/events` | The live event feed, filterable by board, with older pages on demand |
+
+Every screen has a loading state, an empty state, and an error state that shows the server's
+`ApiError.message` and `next`. When a refresh fails, the error appears above the last good data.
+A pill in the header and a banner show when the view is connecting, offline or reconnecting.
+
+## Stack
+
+- **Preact 11 with preact-iso**: React's component model and JSX, plus a small router, in a
+  few kilobytes. The whole app, markdown parser included, is 36 KB of gzipped JavaScript, which matters on a phone over the tailnet. A
+  framework with server rendering would add nothing here, since the Rust server only serves
+  static files.
+- **marked, lexer only**: agent markdown is parsed into tokens and rendered as Preact
+  elements in `src/text/markdown.tsx`. No HTML string is ever produced, so there is
+  nothing to sanitize after the fact and no DOMPurify dependency.
+- **Hand-written decoders** (`src/api/decode.ts`, about 100 lines) check every response
+  against the `board-proto` shapes, without a schema library. The TypeScript types are
+  derived from the decoders.
+- **Bun** as package manager, bundler (`Bun.build` with an HTML entry point), test runner
+  and dev server; no Vite.
+- **TypeScript 7** (`tsc`) for type checking only.
+- Effect is not used: the logic is a small fetch layer, a cache and a reconnecting stream,
+  and an effect runtime would add more weight than it removes.
+
+All versions are pinned exactly in `package.json`.
+
+## Scripts
+
+| Command | Does |
+|---|---|
+| `bun install` | Install dependencies |
+| `bun run dev` | The app with hot reload against fixtures and a fake event stream, on http://localhost:5173 |
+| `bun run preview` | Build, then serve `dist/` against the same fixtures (checks the production bundle and its CSP) |
+| `bun run build` | Production build into `dist/` |
+| `bun run typecheck` | `tsc --noEmit` over `src/`, `dev/` and `build.ts` |
+| `bun test` | Unit tests |
+| `bun run check` | Type check, tests and build |
+
+`dev/server.ts` takes `--port`, `--events <ms>` (interval of simulated events; `0` turns
+them off), `--latency <ms>` and `--dist`. While it runs, these URLs control it:
+
+- `/__dev/outage?on=1` (or `on=0`): every API call answers 500 with an `ApiError`, and live
+  streams drop. Use it to see the error and reconnecting states.
+- `/__dev/latency?ms=3000`: slow every answer down, to see the loading states.
+- `/__dev/emit`: produce one simulated event now.
+
+The fixtures (`dev/fixtures.ts`) include hostile agent text: `<script>`, `javascript:` links,
+`</board>` and remote images. They show up on `factory-20` and ask #9.
+
+## How live updates work
+
+- `src/live/stream.ts` opens an `EventSource` on `/v1/events?since=<seq>`. The first `seq`
+  comes from `/healthz`. After an error it closes the source and reconnects with backoff
+  (1, 2, 5, 10, then 15 s), passing the last `seq` it saw, and drops replayed duplicates.
+  It also reacts to the browser's `offline` and `online` events.
+- `src/live/refresh.ts` maps each event to cache tags (`board:<slug>`, `task:<id>`,
+  `agents`, `asks`, and so on). Events in a 150 ms burst are batched.
+- `src/live/cache.ts` refetches the shown queries that carry an invalidated tag. Queries
+  that are not shown are marked stale and refetched when they are next shown. After a
+  reconnect, or an event the view cannot read, everything shown is refetched. No replica of
+  server state is kept.
+
+## Untrusted text
+
+Everything agents write (titles, bodies, acceptance, notes, handoffs, questions, options and
+event payloads) is untrusted:
+
+- Short fields render as text. Bodies and questions render as markdown through tokens:
+  raw HTML shows as literal text, and headings start at `h3`.
+- Links work only for absolute `http`, `https` and `mailto` targets. They always show their
+  target, and open in a new tab with `noopener noreferrer`. Other links show what they
+  pointed to, struck through. Images are never loaded; they become a link.
+- `build.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
+  styles and connections only, no remote images. The server should also send it as a
+  header with `frame-ancestors 'none'`.
+- `src/text/markdown.test.tsx` pins this down. It also fails if any source file starts
+  injecting HTML strings.
+
+## Serving `dist/`
+
+- `dist/index.html` references `/assets/<name>-<hash>.{js,css}` by absolute path, so it works
+  from any route.
+- Serve `index.html` for every path that is not `/v1/...`, `/healthz` or `/assets/...`.
+  Send `Cache-Control: no-cache` for `index.html`, and `immutable` for `/assets/*`.
