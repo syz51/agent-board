@@ -178,6 +178,16 @@ async fn one_device_holds_the_coordinator_lease() {
     assert_eq!(s.as_u16(), 200, "expired lease: {v}");
     let (s, v) = as_laptop("DELETE", None).await;
     assert_eq!(s.as_u16(), 200, "{v}");
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let released = page["events"].as_array().unwrap().last().unwrap();
+    assert_eq!(released["type"], "board_updated");
+    assert_eq!(released["payload"]["coordinator"], json!(null));
+    assert_eq!(
+        released["payload"]["device"], "laptop",
+        "names the releasing device"
+    );
 }
 
 #[tokio::test]

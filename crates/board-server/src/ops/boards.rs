@@ -305,7 +305,8 @@ pub(crate) fn release_coordinator(
         actor,
         EventType::BoardUpdated,
         None,
-        serde_json::json!({ "fields": ["coordinator"], "coordinator": null }),
+        // The device that held the lease, so its daemon can recognize its own release.
+        serde_json::json!({ "fields": ["coordinator"], "coordinator": null, "device": lease.device }),
     )?;
     get_board(cx, slug)
 }

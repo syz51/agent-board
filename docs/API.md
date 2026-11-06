@@ -77,7 +77,8 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
   the daemon and by the coordinator's heartbeats). The device claims first, starts the
   thread, then claims again with the thread's `agent` id, which makes that agent's role
-  `coordinator`. `DELETE` releases it; only the holding device or the user may.
+  `coordinator`. `DELETE` releases it; only the holding device or the user may. Both emit
+  `board_updated` with `coordinator` and the lease's `device` in the payload.
 - `GET /v1/stats?days=7` → `[Stats]`.
 
 ### Tasks

@@ -459,7 +459,7 @@ impl<T: T3> Daemon<T> {
         };
         match event.event_type {
             EventType::BoardCreated => return Ok((true, wakes)),
-            // This device's own lease claims change nothing a reconcile would act on.
+            // This device's own lease claims and releases change nothing a reconcile would act on.
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
             EventType::TaskCreated | EventType::TaskReleased | EventType::TaskUpdated => {
                 if let Some(task) = &event.task
