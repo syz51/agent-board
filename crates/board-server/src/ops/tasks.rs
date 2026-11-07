@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType, EvidenceKind, Note,
-    Priority, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    Priority, SUMMARY_CHARS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -108,6 +108,15 @@ pub(crate) fn validate_done(req: &DoneTask, id: &TaskId) -> Result<()> {
             "at most 20 evidence items",
             "send the checks and commits that show the acceptance is met",
         ));
+    }
+    if let Some(summary) = &req.summary {
+        if summary.trim().is_empty() {
+            return Err(invalid(
+                "summary is empty",
+                "send what changed and what the user should know, or leave summary out",
+            ));
+        }
+        check_text("summary", summary, SUMMARY_CHARS_MAX)?;
     }
     for item in &req.evidence {
         check_line("evidence value", &item.value, 500)?;
@@ -790,7 +799,8 @@ pub(crate) fn update(
          not_before = ?11, \
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \
-         done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END \
+         done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END, \
+         summary = CASE WHEN ?2 = 'done' THEN summary ELSE NULL END \
          WHERE id = ?1",
         params![
             id.as_str(),
@@ -876,9 +886,9 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
         )?;
     }
     cx.db.execute(
-        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, \
+        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
          version = version + 1, updated_at = ?2 WHERE id = ?1",
-        params![id.as_str(), now],
+        params![id.as_str(), now, req.summary],
     )?;
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",

@@ -64,7 +64,7 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
-     t.updated_at, t.not_before";
+     t.updated_at, t.not_before, t.summary";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -94,6 +94,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: ts(r.get(13)?),
         updated_at: ts(r.get(14)?),
         feedback: None,
+        summary: r.get(16)?,
     })
 }
 

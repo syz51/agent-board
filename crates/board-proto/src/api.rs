@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
+    AgentId, AgentRole, AgentState, AskKind, BoardSlug, BoardStatus, DeviceName, Event, Evidence,
     EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind, Runtime,
-    Task, TaskId, TaskStatus, Timestamp,
+    Said, Task, TaskId, TaskStatus, Timestamp,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -243,6 +243,65 @@ pub struct DoneTask {
     pub agent: AgentId,
     pub version: i64,
     pub evidence: Vec<NewEvidence>,
+    /// For the user: what changed and what they should know, at most `SUMMARY_CHARS_MAX`
+    /// characters. Shown in the web view's updates; servers that predate it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// Longest `DoneTask.summary`, in characters.
+pub const SUMMARY_CHARS_MAX: usize = 600;
+
+/// `POST /v1/agents/{id}/said`: the last message of a turn (`Said`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PostSaid {
+    pub text: String,
+}
+
+/// Longest `Said.text`, in characters; clients cut longer messages to fit.
+pub const SAID_CHARS_MAX: usize = 4000;
+
+/// `GET /v1/updates`: what finished and what coordinators said since the user last looked,
+/// newest first, at most `UPDATES_MAX` of each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Updates {
+    /// The user's seen cursor; absent until the user first marks updates seen.
+    pub seen_at: Option<Timestamp>,
+    /// The time the lists start after: `since` when given, else `seen_at`.
+    pub since: Option<Timestamp>,
+    pub done: Vec<DoneUpdate>,
+    pub said: Vec<Said>,
+    /// True when either list was cut at `UPDATES_MAX`.
+    pub more: bool,
+}
+
+/// Most items of each kind in `Updates`.
+pub const UPDATES_MAX: usize = 100;
+
+/// A task that was done, with what its agent told the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoneUpdate {
+    pub task: TaskId,
+    pub board: BoardSlug,
+    pub parent: Option<TaskId>,
+    pub title: String,
+    pub summary: Option<String>,
+    /// The agent that completed it.
+    pub owner: Option<AgentId>,
+    pub done_at: Timestamp,
+    pub evidence: Vec<Evidence>,
+}
+
+/// `PUT /v1/updates/seen`: everything up to `at` has been seen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkSeen {
+    pub at: Timestamp,
+}
+
+/// The user's seen cursor after `PUT /v1/updates/seen`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeenCursor {
+    pub seen_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

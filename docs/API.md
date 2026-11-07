@@ -85,6 +85,15 @@ server's minute sweep.
   registration or state change), on the same clock as `updated_at`; a handoff older than it
   is stale. It is absent when the agent has made no change.
 - `PUT /v1/agents/{id}/handoff` `[PutHandoff]` → `[Handoff]`; 409 on a version mismatch.
+- `POST /v1/agents/{id}/said` `[PostSaid]` → `[Said]` list: the last message of one of the
+  agent's turns, kept for the user (see "Updates"). The hooks send it at `Stop` for an
+  agent whose role is `coordinator`. One `Said` is stored per board the agent coordinates
+  now; an agent that coordinates none gets an empty list and nothing is stored. `text` is
+  1 to 4,000 characters (`SAID_CHARS_MAX`); clients cut longer messages. The newest 50 per
+  agent and board are kept. No event is recorded: the web view refreshes updates when the
+  coordinator's state changes, which the same `Stop` reports.
+- `GET /v1/agents/{id}/said?limit=` → `[Said]` list, newest first, `limit` 1 to 50
+  (default 20). User only: agents never read what another agent told the user.
 
 ### Boards
 
@@ -160,7 +169,10 @@ Reopening a closed board, or any change on it, starts the period again.
   so it is refused like a claim while a blocker is not done or `not_before` has not passed.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only; 400
   `evidence_required` without evidence, or with `check` evidence missing `exit_code`. The
-  `task_done` event carries the evidence.
+  `task_done` event carries the evidence. An optional `summary` (1 to 600 characters,
+  `SUMMARY_CHARS_MAX`) tells the user what changed and what they should know; it is stored
+  on the task (`Task.summary`, absent without one) and listed in "Updates". It is not in the
+  event. Reopening the task clears it.
 - `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`. Kind `feedback` is still accepted;
   agents report feedback through `POST /v1/feedback` instead.
 - A task filed through `POST /v1/feedback` carries `feedback` (see "Feedback"); other tasks
@@ -219,6 +231,25 @@ be on the same board and must not form a cycle.
   buttons. The CLI (`board withdraw <id>`) and MCP (`ask_withdraw`) call it. After `ask_user`
   makes an ask on a task, it lists the task's other open asks and names them, with who
   asked, in a warning, so the agent can withdraw its own duplicates.
+
+### Updates (user only)
+
+What finished and what coordinators said, for the user, apart from the threads: a
+coordinator's closing message can be followed at once by a wake-up that starts its next
+turn, so the thread is not where the user reads it. One seen cursor is kept for the user
+(every login in `users` and every `--user` token share it).
+
+- `GET /v1/updates?since=&board=` → `[Updates]`: tasks done after `since` (`done`, as
+  `[DoneUpdate]` with summary and evidence) and coordinators' turn endings after it
+  (`said`), each newest first, at most 100 (`UPDATES_MAX`; `more` is true when one was
+  cut). `since` defaults to the seen cursor; with neither, everything kept is listed.
+  `board` limits both lists to one board. A task reopened since it was done is not listed.
+- `PUT /v1/updates/seen` `[MarkSeen]` `{at}` → `[SeenCursor]`. Moves the cursor forward to
+  `at` (a later `at` than the server's clock counts as now; an earlier one than the cursor
+  leaves it). Clients send the time of the newest update they showed, so updates that
+  arrived after the page loaded stay unseen.
+
+Neither records an event; agent tokens get 403 `forbidden`.
 
 ### Feedback
 

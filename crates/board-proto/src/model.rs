@@ -120,6 +120,11 @@ pub struct Task {
     /// servers that predate feedback items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<Feedback>,
+    /// What the agent that finished the task told the user (`DoneTask.summary`); untrusted
+    /// for readers. Absent until the task is done with one, after it is reopened, and from
+    /// servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// What the reporter was doing when a setup cost it a step.
@@ -259,6 +264,21 @@ pub struct Agent {
     pub boards: Vec<BoardSlug>,
     pub last_seen: Timestamp,
     pub created_at: Timestamp,
+}
+
+/// The last message of one turn of a board's coordinator, kept for the user
+/// (`POST /v1/agents/{id}/said`): what it said may be followed at once by a wake-up that
+/// starts the next turn, so the user reads it here instead of in the thread. Written by the
+/// agent, so untrusted for readers; never shown to agents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Said {
+    pub id: i64,
+    pub agent: AgentId,
+    /// The board the agent was coordinating when it said it.
+    pub board: BoardSlug,
+    /// At most `SAID_CHARS_MAX` characters.
+    pub text: String,
+    pub at: Timestamp,
 }
 
 /// An agent's working memory: replaced as a whole, read first after a restart.

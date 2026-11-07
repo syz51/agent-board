@@ -23,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_board_temporary.sql"),
     include_str!("../migrations/0008_touch_modified.sql"),
     include_str!("../migrations/0009_feedback.sql"),
+    include_str!("../migrations/0010_user_updates.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
