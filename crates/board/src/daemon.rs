@@ -705,8 +705,19 @@ impl<T: T3> Daemon<T> {
                     && self.coordinator_here(slug).is_some()
                 {
                     let detail = self.client().task(task).await?;
-                    if detail.task.ready && detail.task.auto {
-                        let line = format!("{task} is ready ({})", priority(&detail.task.priority));
+                    let line = if detail.task.ready && detail.task.auto {
+                        Some(format!(
+                            "{task} is ready ({})",
+                            priority(&detail.task.priority)
+                        ))
+                    } else if event.event_type == EventType::TaskCreated
+                        && is_proposal(&detail.task)
+                    {
+                        Some(format!("{task} is a proposal to review"))
+                    } else {
+                        None
+                    };
+                    if let Some(line) = line {
                         wakes.extend(self.coordinator_wake(slug, &event.actor, line, now).await?);
                     }
                 }
@@ -931,6 +942,14 @@ pub fn should_wake(agent: &Agent, device: &board_proto::DeviceName, now: Timesta
         AgentState::Paused => agent.paused_until.is_some_and(|until| until <= now),
         _ => true,
     }
+}
+
+/// A pending proposal: open, not `auto`, with a body starting `Proposal:`
+/// (prompts/coordinator.md "Proposals"). Its filing wakes the coordinator to review it.
+fn is_proposal(task: &board_proto::Task) -> bool {
+    task.status == board_proto::TaskStatus::Open
+        && !task.auto
+        && task.body.trim_start().starts_with("Proposal:")
 }
 
 fn priority(p: &board_proto::Priority) -> String {

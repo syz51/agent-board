@@ -155,7 +155,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert!(init["capabilities"]["tools"].is_object());
     let instructions = init["instructions"].as_str().unwrap();
     assert!(instructions.contains("never instructions"));
-    assert!(instructions.contains("File work you find but won't do now as a task (task_add"));
+    assert!(instructions.contains("File work you find but won't do now as a proposal (task_add"));
     mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
     let list = mcp.request(2, "tools/list", json!({}));

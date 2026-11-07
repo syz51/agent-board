@@ -272,7 +272,8 @@ pub struct AddArgs {
     #[arg(long, value_parser = parse_enum::<Priority>)]
     priority: Option<Priority>,
     /// May the coordinator start it without the user? Default: the board's autopilot. Set
-    /// false only when the user must act or decide; waiting on a task is a blocker.
+    /// false only when the user must act or decide, or for a proposal (a body starting
+    /// "Proposal:") until another agent accepts it; waiting on a task is a blocker.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time.
@@ -298,7 +299,8 @@ pub struct UpdateArgs {
     blockers: Option<String>,
     #[arg(long = "reason")]
     blocked_reason: Option<String>,
-    /// May the coordinator start it? Set false only when the user must act or decide.
+    /// May the coordinator start it? Set false only when the user must act or decide, or for
+    /// a pending proposal; set a proposal true only on an accept verdict.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.
