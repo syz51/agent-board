@@ -12,8 +12,8 @@ use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
     AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
-    CreateFeedback, CreateLeases, CreateTask, DeviceInfo, DeviceName, DeviceToken, DoneTask,
-    ErrorCode, FeedbackResult, Handoff, LeaseResult, Note, PutHandoff, RegisterAgent,
+    CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
+    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, Note, PutHandoff, RegisterAgent,
     ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
     TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
@@ -644,7 +644,7 @@ async fn create_ask(
     State(state): State<AppState>,
     caller: Caller,
     Body(req): Body<CreateAsk>,
-) -> Result<Json<Ask>> {
+) -> Result<Json<CreatedAsk>> {
     caller.act_as(&req.agent)?;
     asks::validate_create(&req, state.settings())?;
     Ok(Json(state.write(move |cx| asks::create(cx, req)).await?))

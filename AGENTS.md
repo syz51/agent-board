@@ -14,3 +14,13 @@
   --all-targets -- -D warnings`, `cargo test --workspace`; for `web/`, its type check and
   build. Add tests with every behavior change.
 - Time comes from an injectable clock so expiry and staleness are testable.
+
+## Merging
+
+- `main` takes changes only through a PR whose `rust`, `web` and `docker` checks pass on a
+  branch that is up to date with `main`, with every review thread resolved. Keep that rule.
+- When a PR is ready, run `gh pr merge <N> --merge --auto`; GitHub merges it once the checks
+  pass. When it is behind `main`, run `gh pr update-branch <N>` too, so GitHub merges `main`
+  into it and reruns the checks, instead of merging `main` by hand and waiting on CI.
+- Merge `main` locally only when `gh pr update-branch` reports a conflict; resolve it, run the
+  checks above, and push.
