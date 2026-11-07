@@ -386,6 +386,69 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
 }
 
 #[test]
+fn lease_paths_prints_the_servers_warning_above_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let lease = board_proto::Lease {
+        id: 7,
+        agent: "t3:thread-1".parse().unwrap(),
+        task: Some("factory-12".parse().unwrap()),
+        repo: "github.com/acme/dotfiles".to_owned(),
+        glob: "src/**".into(),
+        expires_at: at(),
+    };
+    stub.on(
+        "POST /v1/leases",
+        json!({"leases": [lease], "conflicts": [], "warning": "task factory-12 is on board factory, which lists github.com/acme/app"}),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = git_repo(dir.path(), "git@github.com:acme/dotfiles.git");
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let warned = mcp.call(
+        2,
+        "lease_paths",
+        json!({"globs": ["src/**"], "task": "factory-12"}),
+    );
+    assert!(
+        text(&warned).starts_with(
+            "warning: task factory-12 is on board factory, which lists github.com/acme/app\n\
+             lease #7 github.com/acme/dotfiles \"src/**\""
+        ),
+        "{warned}"
+    );
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/dotfiles"
+    );
+
+    // An answer without a warning, as servers before it send: only the lease, with its repo.
+    stub.on(
+        "POST /v1/leases",
+        json!({"leases": [lease], "conflicts": []}),
+    );
+    let kept = mcp.call(
+        3,
+        "lease_paths",
+        json!({"globs": ["src/**"], "task": "factory-12"}),
+    );
+    assert!(
+        text(&kept).starts_with("lease #7 github.com/acme/dotfiles \"src/**\""),
+        "{kept}"
+    );
+}
+
+#[test]
 fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
