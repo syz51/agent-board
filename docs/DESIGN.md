@@ -185,14 +185,20 @@ on one of the board's home devices.
   coordinator (switch autopilot off first), when T3 on that device does not know the
   thread or has archived it, when the device is not a home device, and when it has no
   `[projects]` path for the board's repos. Otherwise it saves the adoption in
-  `$BOARD_HOME/state/adopt-<board>.json` and only then switches autopilot on, so the daemon
-  never starts a thread for the board in between. The next time the board needs a
-  coordinator, the daemon takes the lease and briefs that thread with the coordinator
-  prompt (a board task the thread already owns counts as the task in progress). It then
-  drops the adoption and names the thread coordinator. From then on the daemon renews,
-  wakes and, after a lapsed lease, re-claims the thread like one it started. A failed brief
-  releases the lease and is retried with the start back-off. An adopted thread that T3 no
-  longer has, or has archived, is dropped, and a new thread is started.
+  `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
+  device's daemon never starts a thread for the board in between, and then takes the
+  coordinator lease for this device, so no other home device does either. If another
+  device took the lease first (it reacted to autopilot going on), the command undoes the
+  adoption and says so. The next time the board needs a coordinator, the daemon takes the
+  lease, checks the thread with T3, and briefs it with the coordinator prompt (a board task
+  the thread already owns counts as the task in progress). It then drops the adoption and
+  names the thread coordinator. An agent the board already knows (the thread's hooks
+  registered it) keeps its record: where it works and any usage-limit pause. From then on
+  the daemon renews, wakes and, after a lapsed lease, re-claims the thread like one it
+  started. A failed brief releases the lease and is retried with the start back-off; an
+  adoption newer than the last failed start is tried at once. An adopted thread that T3 no
+  longer has, or has archived, is dropped, and a new thread is started. So is an adoption
+  not acted on within an hour, so an old request never replaces a thread later.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
   or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
   briefs so the children claim them; review the result against the acceptance checks; mark

@@ -118,7 +118,12 @@ pub fn save_session(
 
 /// Forgets an ended session; a missing file is fine.
 pub fn remove_session(home: &Home, runtime: Runtime, session: &str) -> Result<()> {
-    match std::fs::remove_file(session_path(home, runtime, session)) {
+    remove_if_exists(&session_path(home, runtime, session))
+}
+
+/// Removes a file; a missing one is fine.
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
         _ => Ok(()),
     }
@@ -155,10 +160,8 @@ pub fn save_tool_start(home: &Home, runtime: Runtime, tool_use: &str, at: Timest
 pub fn take_tool_start(home: &Home, runtime: Runtime, tool_use: &str) -> Result<Option<Timestamp>> {
     let path = tool_start_path(home, runtime, tool_use);
     let start = read_json::<ToolStart>(&path).map(|s| s.at);
-    match std::fs::remove_file(&path) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-        _ => Ok(start),
-    }
+    remove_if_exists(&path)?;
+    Ok(start)
 }
 
 /// Removes start marks of tool calls that never reached `PostToolUse` (failed or
@@ -185,10 +188,7 @@ fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
             .duration_since(modified)
             .is_ok_and(|elapsed| elapsed > age)
         {
-            match std::fs::remove_file(entry.path()) {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
-                _ => {}
-            }
+            remove_if_exists(&entry.path())?;
         }
     }
     Ok(())
@@ -219,10 +219,7 @@ pub fn save_named<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()
 
 /// Removes a named state file; a missing file is fine.
 pub fn remove_named(home: &Home, name: &str) -> Result<()> {
-    match std::fs::remove_file(home.state_dir().join(format!("{name}.json"))) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-        _ => Ok(()),
-    }
+    remove_if_exists(&home.state_dir().join(format!("{name}.json")))
 }
 
 #[cfg(test)]

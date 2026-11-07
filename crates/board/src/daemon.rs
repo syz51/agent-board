@@ -98,6 +98,10 @@ pub struct Adoption {
     pub requested_at: Timestamp,
 }
 
+/// An adoption not acted on for this long is dropped: by then a new thread is what the
+/// user expects. It outlasts a coordinator lease, which an adoption may wait out.
+pub const ADOPTION_TTL: TimeDelta = TimeDelta::hours(1);
+
 fn adoption_name(slug: &BoardSlug) -> String {
     format!("adopt-{slug}")
 }
@@ -111,8 +115,16 @@ pub fn save_adoption(home: &Home, slug: &BoardSlug, adoption: &Adoption) -> Resu
     state::save_named(home, &adoption_name(slug), &Some(adoption))
 }
 
-fn remove_adoption(home: &Home, slug: &BoardSlug) -> Result<()> {
+pub fn remove_adoption(home: &Home, slug: &BoardSlug) -> Result<()> {
     state::remove_named(home, &adoption_name(slug))
+}
+
+/// Removes `adoption` unless a newer request replaced it in the meantime.
+fn drop_adoption(home: &Home, slug: &BoardSlug, adoption: &Adoption) -> Result<()> {
+    if load_adoption(home, slug).as_ref() == Some(adoption) {
+        remove_adoption(home, slug)?;
+    }
+    Ok(())
 }
 
 /// The coordinators this device's daemon runs, as it last saved them.
@@ -169,7 +181,7 @@ pub struct Daemon<T: T3> {
 impl<T: T3> Daemon<T> {
     /// A daemon acting as the device of `ctx` (whose client must carry no agent id).
     pub fn new(ctx: Ctx, t3: T) -> Self {
-        let state = state::load_named(&ctx.home, STATE_NAME);
+        let state = load_watch_state(&ctx.home);
         Self {
             ctx,
             t3,
@@ -243,7 +255,11 @@ impl<T: T3> Daemon<T> {
             // The board names someone else, or the thread is gone.
             self.state.coordinators.remove(slug);
         }
-        if let Some(agent) = board.coordinator.as_ref().filter(|_| !ours_gone) {
+        if ours_gone {
+            // A renewal keeps the coordinator named, so the gone thread would stay named
+            // until its replacement claims; releasing first means no one is named meanwhile.
+            self.release(slug).await;
+        } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
                 Ok(info) if info.state != AgentState::Ended => return Ok(()),
                 Ok(_) => {}
@@ -251,13 +267,29 @@ impl<T: T3> Daemon<T> {
                 Err(err) => return Err(err),
             }
         }
+        let adoption = match load_adoption(&self.ctx.home, slug) {
+            Some(adoption) if now - adoption.requested_at >= ADOPTION_TTL => {
+                tracing::warn!(
+                    "coordinator of {slug}: dropped the adoption of thread {}, requested {} and never acted on",
+                    adoption.thread,
+                    adoption.requested_at
+                );
+                drop_adoption(&self.ctx.home, slug, &adoption)?;
+                None
+            }
+            adoption => adoption,
+        };
+        // An adoption requested after the last failed start is new intent: tried at once.
         if let Some(failure) = self.failures.get(slug)
             && failure.config == HostingConfig::of(board)
             && now < failure.retry_at
+            && adoption
+                .as_ref()
+                .is_none_or(|a| a.requested_at <= failure.retry_at - failure.delay)
         {
             return Ok(());
         }
-        let started = match load_adoption(&self.ctx.home, slug) {
+        let started = match adoption {
             Some(adoption) => self.adopt_thread(board, adoption, now).await,
             None => self.start_coordinator(board, now).await,
         };
@@ -452,13 +484,11 @@ impl<T: T3> Daemon<T> {
                 return Err(err);
             }
         };
-        let agent = match format!("t3:{thread}").parse::<AgentId>() {
+        let agent = match thread_agent(&thread) {
             Ok(agent) => agent,
             Err(err) => {
                 self.release(slug).await;
-                return Err(anyhow::Error::new(err).context(format!(
-                    "t3 started thread {thread:?}, whose id is no agent id; archive it in T3"
-                )));
+                return Err(err.context(format!("t3 started thread {thread:?}; archive it in T3")));
             }
         };
         tracing::info!("started coordinator thread {thread} for {slug}");
@@ -479,7 +509,9 @@ impl<T: T3> Daemon<T> {
     /// Makes the existing thread named by `board board adopt` the board's coordinator: like
     /// [`Self::start_coordinator`], but it briefs that thread instead of starting one. From
     /// then on the thread is this device's coordinator like any other. A thread T3 no longer
-    /// has drops the adoption, and a new thread is started.
+    /// has drops the adoption, and a new thread is started. An agent the thread's own hooks
+    /// registered keeps its record (where it works, a usage-limit pause); only one the board
+    /// has never seen is registered here.
     async fn adopt_thread(
         &mut self,
         board: &Board,
@@ -493,23 +525,11 @@ impl<T: T3> Daemon<T> {
         let agent = match thread_agent(&adoption.thread) {
             Ok(agent) => agent,
             Err(err) => {
-                remove_adoption(&self.ctx.home, slug)?;
+                drop_adoption(&self.ctx.home, slug, &adoption)?;
                 return Err(err.context(format!("dropped the adoption for {slug}")));
             }
         };
-        let live = self
-            .t3
-            .thread_info(&adoption.thread)
-            .await?
-            .is_some_and(|t| !t.archived);
-        if !live {
-            tracing::warn!(
-                "coordinator of {slug}: thread {} to adopt is gone or archived; starting a new thread",
-                adoption.thread
-            );
-            remove_adoption(&self.ctx.home, slug)?;
-            return self.start_coordinator(board, now).await;
-        }
+        // Claimed before asking T3, which is slow: meanwhile no other device starts a thread.
         match self.claim(slug, None).await {
             Ok(updated) => {
                 self.boards.insert(slug.clone(), updated);
@@ -518,6 +538,37 @@ impl<T: T3> Daemon<T> {
             Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => return Ok(()),
             Err(err) => return Err(err),
         }
+        let checked = async {
+            let live = self
+                .t3
+                .thread_info(&adoption.thread)
+                .await?
+                .is_some_and(|t| !t.archived);
+            if !live {
+                return Ok(None);
+            }
+            match self.client().agent_info(&agent).await {
+                Ok(_) => Ok(Some(true)),
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(Some(false)),
+                Err(err) => Err(err),
+            }
+        }
+        .await;
+        let registered = match checked {
+            Ok(Some(registered)) => registered,
+            Ok(None) => {
+                tracing::warn!(
+                    "coordinator of {slug}: thread {} to adopt is gone or archived; starting a new thread",
+                    adoption.thread
+                );
+                drop_adoption(&self.ctx.home, slug, &adoption)?;
+                return self.start_coordinator(board, now).await;
+            }
+            Err(err) => {
+                self.release(slug).await;
+                return Err(err);
+            }
+        };
         if let Err(err) = self
             .t3
             .send(&adoption.thread, &adoption_message(slug))
@@ -531,17 +582,17 @@ impl<T: T3> Daemon<T> {
             adoption.thread
         );
         let local = Coordinator {
-            thread: adoption.thread,
+            thread: adoption.thread.clone(),
             agent,
             started_at: now,
             renewed_at: now,
             resumed_after: None,
-            registered: false,
+            registered,
         };
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.save()?;
-        remove_adoption(&self.ctx.home, slug)?;
+        drop_adoption(&self.ctx.home, slug, &adoption)?;
         self.adopt(board, local, now).await
     }
 
