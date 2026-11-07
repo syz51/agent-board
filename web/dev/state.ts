@@ -271,6 +271,7 @@ export class DevState {
       version: 1,
       created_at: at,
       updated_at: at,
+      feedback: null,
     });
     return this.emit({ board: "factory", actor: coordinator.id, type: "task_created", task: id, payload: {} });
   }

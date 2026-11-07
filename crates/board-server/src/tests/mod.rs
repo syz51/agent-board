@@ -5,6 +5,7 @@ mod asks;
 mod auth;
 mod boards;
 mod events;
+mod feedback;
 mod leases;
 mod snapshot;
 mod tasks;

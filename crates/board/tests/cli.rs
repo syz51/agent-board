@@ -199,16 +199,73 @@ fn show_frames_peer_text_and_escapes_tags() {
 #[test]
 fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
     let e = env();
+    e.stub
+        .on("POST /v1/tasks", task_fixture("factory-12", "Write docs"));
+    let item = task_fixture("board-feedback-1", "Claims are slow");
     e.stub.on(
-        "POST /v1/tasks",
-        task_fixture("board-feedback-1", "Claims are slow"),
+        "POST /v1/feedback",
+        board_proto::FeedbackResult {
+            task: item,
+            duplicate: true,
+            reports: 2,
+        },
     );
-    let out = e.run(&["feedback", "Claims are slow\nDetails here"]);
+    let out = e.run(&["feedback", "--about", "x", "Claims are slow\nDetails here"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    let body = &e.stub.requests_to("POST /v1/tasks")[0].body;
-    assert_eq!(body["board"], "board-feedback");
-    assert_eq!(body["title"], "Claims are slow");
-    assert_eq!(body["body"], "Claims are slow\nDetails here");
+    assert!(
+        stdout(&out).contains("added your report to board-feedback-1 (2 reports)"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/feedback")[0].body,
+        json!({"about": "x", "text": "Claims are slow\nDetails here"})
+    );
+    assert!(e.stub.requests_to("POST /v1/tasks").is_empty());
+
+    // Without --about it is `other`; an activity and source pass through.
+    let out = e.run(&[
+        "feedback",
+        "--activity",
+        "build",
+        "--source",
+        "capture",
+        "Hooks are slow",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("POST /v1/feedback")[1].body,
+        json!({"about": "other", "text": "Hooks are slow", "activity": "build", "source": "capture"})
+    );
+
+    // Resolving names exactly one resolution.
+    let mut done = task_fixture("board-feedback-1", "Claims are slow");
+    done.status = board_proto::TaskStatus::Done;
+    e.stub
+        .on("POST /v1/feedback/board-feedback-1/resolve", &done);
+    let out = e.run(&["resolve", "board-feedback-1", "--routed", "factory-3"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/feedback/board-feedback-1/resolve")[0]
+            .body,
+        json!({"kind": "routed", "task": "factory-3"})
+    );
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--declined",
+        "works as designed",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/feedback/board-feedback-1/resolve")[1]
+            .body,
+        json!({"kind": "declined", "reason": "works as designed"})
+    );
+    let out = e.run(&["resolve", "board-feedback-1"]);
+    assert!(!out.status.success(), "a resolution is required");
 
     let out = e.run(&[
         "add",
@@ -223,7 +280,7 @@ fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
         "factory-3",
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
-    let body = &e.stub.requests_to("POST /v1/tasks")[1].body;
+    let body = &e.stub.requests_to("POST /v1/tasks")[0].body;
     assert_eq!(body["acceptance"], "docs build");
     assert_eq!(body["priority"], "p1");
     assert_eq!(body["blockers"], json!(["factory-3"]));
@@ -563,6 +620,16 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
         ask_answer_minutes_median: Some(4.0),
         doing_minutes_median: None,
         done_without_check_evidence: 1,
+        feedback: board_proto::FeedbackStats {
+            reported: 6,
+            filed: 2,
+            resolved: board_proto::ResolvedCounts {
+                routed: 1,
+                duplicate: 0,
+                forwarded: 0,
+                declined: 1,
+            },
+        },
     };
     e.stub.on("GET /v1/stats", &stats);
 
@@ -573,7 +640,8 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
         "stats, last 7 days\n\
          tasks: 5 created · 3 done (1 without a check) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
-         asks: 2 created · 1 answered · median 4m to answer"
+         asks: 2 created · 1 answered · median 4m to answer\n\
+         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined"
     );
     assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
 

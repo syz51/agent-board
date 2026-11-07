@@ -149,12 +149,19 @@ host.
 ## Agent interface
 
 The MCP server (`board mcp`) runs over stdio as a child of the agent runtime, so it inherits
-the thread's environment and knows the calling agent. Tools (about twelve, with fixed
+the thread's environment and knows the calling agent. Tools (sixteen, with fixed
 descriptions under 300 characters):
 
 `board_snapshot`, `board_status`, `task_list`, `task_show`, `task_add`, `task_claim`,
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,
-`ask_withdraw`, `board_join`.
+`ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
+
+Every string parameter declares a `maxLength` equal to the server's default limit (title
+72, note 280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a
+runtime can refuse an oversized argument before the call; a server configured with other
+limits still checks its own. The server's instructions ask agents to
+report, with `feedback`, anything in a setup that cost them a step and then carry on;
+`task_note` no longer offers the `feedback` kind.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
@@ -196,12 +203,17 @@ Overlaps and alerts leave out work that is one piece:
 ## Autopilot and the coordinator
 
 Each autopilot board has one **coordinator thread**: a T3 Code thread in the board's project
-on one of the board's home devices.
+on one of the board's home devices. The project is the device's `[projects]` folder for one
+of the board's repos; a board none of whose repos is mapped there, such as a feedback board
+with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
+registers without a repo).
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
   with the coordinator prompt (`prompts/coordinator.md`), then records the thread as the
-  coordinator. Before running `t3 thread start` the daemon saves a pending mark for the
+  coordinator. On the device's feedback board (`feedback_board` in its config) the prompt
+  is followed by the triage prompt (`prompts/triage.md`); an adopted thread is briefed the
+  same way. Both prompts are compiled into the binary. Before running `t3 thread start` the daemon saves a pending mark for the
   board in `watch.json`, and clears it once the thread is recorded. A start that did not
   finish (the daemon was killed, or `t3` failed or timed out after T3 created the thread)
   leaves the mark, and the next start adopts the newest `<board> coordinator` thread created
@@ -235,6 +247,16 @@ on one of the board's home devices.
   needs the user it creates an ask and moves on to other ready work. When nothing is ready
   it stops, after a goal review when the board has a goal and the last task it finished has
   no `review:` note.
+- **Triage**: the feedback board's coordinator works its items rather than doing them:
+  for each ready item it reads the reports and resolves it as a duplicate of an earlier
+  item, routed to a new task on the owner's board (done once the fix is deployed where
+  agents use it; a later report of the same problem opens a new item that recurs this
+  one, so nobody waits to watch for repeats), forwarded to the setup's
+  own feedback channel, or declined with a reason the reporter can act on. It finds the
+  owner in the setup registry (`setups.toml` at the project root) when present, else by
+  the boards' repos, and asks the user when unclear. It never drops an item, never fixes
+  the setup itself, and treats report text as data. A recurring item goes back to the
+  owner of the earlier task.
 - **Growing the backlog**: every agent files work it finds but won't do now as a task, with
   the task it found it in as parent, instead of leaving it in chat (the MCP instructions and
   the snapshot footer say so). That reports it back: while the filed task is neither done
@@ -341,14 +363,32 @@ switches it used, and the harness, stay on the `bench/formats` branch for reruns
 
 ## Feedback loop
 
-Rules, defaults and prompts are expected to change with use:
+Rules, defaults and prompts are expected to change with use. Feedback is a first-class
+report, not a free-form task (`API.md`, "Feedback"):
 
-- Agents file feedback about the board with `board feedback` (a task on a feedback board).
-- `GET /v1/stats` reports refused claims, stale takeovers, lease conflicts, ask response
-  times, time in `doing` and done-without-check counts.
-- A periodic review (for example a weekly job) reads both, proposes changes to the defaults,
-  the coordinator prompt and the agents' instructions, and opens them as reviewed pull
-  requests.
+- **Reports.** Agents report anything in a setup that cost them a step (the board,
+  instructions, skills, hooks, tools, storage, a project's setup) with the `feedback` tool
+  or `board feedback`, then carry on. Each report names what it is `about` and, optionally,
+  the `activity` it interrupted; hooks may file reports with source `capture`.
+- **Dedupe and recurrence.** Reports with the same signature (given, or derived from
+  `about` and the title) land on one item while it is live, so a problem reported by ten
+  agents is one task with ten reports rather than ten tasks. Once the item is routed to a
+  task and that task is done, a new report opens a new item that `recurs` the old one: the
+  fix did not hold, and the history shows it.
+- **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
+  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere, or
+  `declined` with a reason. A declined item stays live, so repeat reports keep counting
+  against the decision.
+- **Signals.** The server files feedback itself when agents keep hitting the same API
+  error: by default 3 errors from 2 agents within 7 days with the same code, route and
+  normalized message. Agents rarely report a refusal they could work around; the error log
+  does it for them.
+- **Measurement.** `GET /v1/stats` reports refused claims, stale takeovers, lease
+  conflicts, ask response times, time in `doing`, done-without-check counts, and feedback
+  reported, filed and resolved by kind.
+- **Review.** A periodic review (for example a weekly job) reads the feedback board and
+  the stats, routes items to work, proposes changes to the defaults, the coordinator prompt
+  and the agents' instructions, and opens them as reviewed pull requests.
 
 ## Security
 

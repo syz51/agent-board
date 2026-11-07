@@ -6,10 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
-    BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateLeases, CreateTask, DoneTask,
-    ErrorCode, EventsPage, Handoff, JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent,
-    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
+    BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
+    DoneTask, ErrorCode, EventsPage, FeedbackResult, Handoff, JoinBoard, LeaseResult, Note,
+    PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats,
+    Task, TaskAction, TaskDetail, TaskId, TaskStatus, TouchResult, Touches, UpdateBoard,
+    UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -302,6 +303,18 @@ impl Client {
 
     pub async fn add_note(&self, id: &TaskId, body: &AddNote) -> Result<Note> {
         self.with_body(Method::POST, &format!("/v1/tasks/{id}/notes"), body)
+            .await
+    }
+
+    // Feedback
+
+    pub async fn feedback(&self, body: &CreateFeedback) -> Result<FeedbackResult> {
+        self.require_agent()?;
+        self.with_body(Method::POST, "/v1/feedback", body).await
+    }
+
+    pub async fn resolve_feedback(&self, id: &TaskId, body: &ResolveFeedback) -> Result<Task> {
+        self.with_body(Method::POST, &format!("/v1/feedback/{id}/resolve"), body)
             .await
     }
 

@@ -78,6 +78,10 @@ pub struct Config {
     /// Local T3 project folders by repo key, for starting coordinator threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,
+    /// Local T3 project folders by board slug, for a board none of whose repos is under
+    /// `projects` (such as a feedback board with no repo).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub board_projects: BTreeMap<BoardSlug, PathBuf>,
 }
 
 impl Config {
@@ -416,10 +420,16 @@ mod tests {
             server: Some("http://127.0.0.1:1".into()),
             device: Some("mac-air".parse().unwrap()),
             projects: [("github.com/o/r".into(), PathBuf::from("/src/r"))].into(),
+            board_projects: [("board-feedback".parse().unwrap(), PathBuf::from("/src/fb"))].into(),
             ..Config::default()
         };
         config.save(&home).unwrap();
         assert_eq!(Config::load(&home).unwrap(), config);
+        let text = std::fs::read_to_string(home.config_path()).unwrap();
+        assert!(
+            text.contains("[board_projects]\nboard-feedback = \"/src/fb\""),
+            "{text}"
+        );
     }
 
     #[test]

@@ -809,6 +809,10 @@ pub(crate) fn update(
     if fields.contains(&"blockers") {
         set_blockers(cx, id, &blockers)?;
     }
+    if from.is_closed() && to == TaskStatus::Open {
+        // A reopened feedback item is live again.
+        crate::ops::feedback::reopen(cx, id)?;
+    }
     if let Some(new_owner) = owner.as_ref().filter(|o| task.owner.as_ref() != Some(*o)) {
         join_board(cx, &task.board, new_owner)?;
     }

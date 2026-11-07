@@ -146,6 +146,31 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         let _ = write!(out, " · parent {parent}");
     }
     let _ = write!(out, " · created by {}", task.created_by);
+    if let Some(fb) = &task.feedback {
+        // `about` is a validated slug; the signature is agent-written, so quoted.
+        let _ = write!(
+            out,
+            "\nfeedback about {} · {} · {} reports, last {} · signature {}",
+            fb.about,
+            enum_str(&fb.source),
+            fb.reports,
+            ago(fb.last_reported_at),
+            title(&fb.signature)
+        );
+        if let Some(activity) = &fb.activity {
+            let _ = write!(out, " · while {}", enum_str(activity));
+        }
+        if let Some(res) = &fb.resolution {
+            let _ = write!(out, "\nresolved {}", enum_str(&res.kind));
+            if let Some(task) = &res.task {
+                let _ = write!(out, " to {task}");
+            }
+            let _ = write!(out, " by {} {}", res.by, ago(res.at));
+        }
+        if let Some(recurs) = &fb.recurs {
+            let _ = write!(out, "\nrecurs {recurs}");
+        }
+    }
     if !detail.blocks.is_empty() {
         let ids: Vec<&str> = detail.blocks.iter().map(|b| b.as_str()).collect();
         let _ = write!(out, "\nblocks {}", ids.join(","));
@@ -188,6 +213,14 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     }
     if !task.acceptance.is_empty() {
         peer.push(json!({"task": task.id, "field": "acceptance", "text": task.acceptance}));
+    }
+    if let Some(reason) = task
+        .feedback
+        .as_ref()
+        .and_then(|f| f.resolution.as_ref())
+        .and_then(|r| r.reason.as_ref())
+    {
+        peer.push(json!({"task": task.id, "field": "resolution_reason", "text": reason}));
     }
     for note in notes {
         peer.push(json!({
@@ -396,7 +429,8 @@ pub fn lease_result(result: &LeaseResult) -> String {
     lines.join("\n")
 }
 
-/// `board stats`: the feedback-loop counts, one topic per line.
+/// `board stats`: the feedback-loop counts, one topic per line. A server that predates
+/// feedback items reports zero feedback.
 pub fn stats(stats: &Stats) -> String {
     let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
     let day = if stats.days == 1 { "day" } else { "days" };
@@ -404,7 +438,8 @@ pub fn stats(stats: &Stats) -> String {
         "stats, last {} {day}\n\
          tasks: {} created · {} done ({} without a check) · median {} in doing\n\
          claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
-         asks: {} created · {} answered · median {} to answer",
+         asks: {} created · {} answered · median {} to answer\n\
+         feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined",
         stats.days,
         stats.tasks_created,
         stats.tasks_done,
@@ -416,6 +451,12 @@ pub fn stats(stats: &Stats) -> String {
         stats.asks_created,
         stats.asks_answered,
         minutes(stats.ask_answer_minutes_median),
+        stats.feedback.reported,
+        stats.feedback.filed,
+        stats.feedback.resolved.routed,
+        stats.feedback.resolved.duplicate,
+        stats.feedback.resolved.forwarded,
+        stats.feedback.resolved.declined,
     )
 }
 
