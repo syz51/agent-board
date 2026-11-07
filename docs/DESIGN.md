@@ -118,8 +118,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Handoff**: one per agent: `now`, `next`, `blockers`. Replaced as a whole.
 - **Ask**: a decision or action only the user can provide. Creating one notifies the user;
   answering it wakes the asking agent.
-- **Event**: append-only log with a sequence number; it is the change feed, the source of
-  alerts and the history.
+- **Event**: log with a sequence number; it is the change feed, the source of alerts and
+  the history. Events are only appended; they go with a deleted board, and the minute
+  sweeper deletes those older than 365 days (the stats window), in batches, always keeping
+  the newest so the sequence holds. Refused claims are kept as long.
 
 ## Storage and server
 

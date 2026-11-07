@@ -198,3 +198,73 @@ async fn task_created_names_the_parent_when_set() {
     assert_eq!(created[1].0, sub);
     assert_eq!(created[1].1["parent"], json!(root));
 }
+
+#[tokio::test]
+async fn history_past_the_stats_window_is_pruned_in_batches_keeping_the_newest_event() {
+    use chrono::TimeDelta;
+
+    use crate::ops::stats::{MAX_DAYS, PRUNE_BATCH};
+
+    const B: &str = "t3:beta";
+    let t = T::new();
+    // A backlog of old events, more than two batches, and a refused claim.
+    t.state
+        .write(|cx| {
+            cx.db.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2500) \
+                 INSERT INTO events (at, board, actor, type, task, payload) \
+                 SELECT ?1, NULL, 'user', 'board_created', NULL, '{}' FROM n",
+                [cx.now_ms()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    t.register(A, None, None).await;
+    t.register(B, None, None).await;
+    t.board("factory", &[]).await;
+    let task = t.task(A, "factory", "Old").await;
+    assert!(t.claim(A, &task).await.0.is_success());
+    assert_eq!(t.claim(B, &task).await.0.as_u16(), 409);
+
+    t.advance(TimeDelta::days(200));
+    let recent = t.count("SELECT MAX(seq) FROM events") + 1;
+    t.task(A, "factory", "Recent").await;
+    let max_seq = t.count("SELECT MAX(seq) FROM events");
+    let kept = t.count(&format!(
+        "SELECT COUNT(*) FROM events WHERE seq >= {recent}"
+    ));
+
+    // Inside the window nothing goes.
+    t.advance(TimeDelta::days(i64::from(MAX_DAYS) - 200));
+    assert_eq!(crate::prune_history(&t.state).await.unwrap(), (0, 0));
+
+    // Past it, one transaction takes one batch, and a sweep takes the whole backlog.
+    t.advance(TimeDelta::days(1));
+    let old = t.count(&format!("SELECT COUNT(*) FROM events WHERE seq < {recent}"));
+    assert!(old > 2 * PRUNE_BATCH as i64, "{old}");
+    let batch = t
+        .state
+        .write(|cx| crate::ops::stats::prune_history(cx))
+        .await
+        .unwrap();
+    assert_eq!(batch, (PRUNE_BATCH, 1));
+    let (events, refusals) = crate::prune_history(&t.state).await.unwrap();
+    assert_eq!((events as i64 + PRUNE_BATCH as i64, refusals), (old, 0));
+    assert_eq!(t.count("SELECT COUNT(*) FROM events"), kept);
+    assert_eq!(t.count("SELECT COUNT(*) FROM claim_refusals"), 0);
+    assert_eq!(t.count("SELECT MAX(seq) FROM events"), max_seq);
+
+    // Long after the last change, only the newest event stays, so the feed's position holds.
+    t.advance(TimeDelta::days(400));
+    crate::prune_history(&t.state).await.unwrap();
+    assert_eq!(t.count("SELECT COUNT(*) FROM events"), 1);
+    let health = t.ok("GET", "/healthz", None, None).await;
+    assert_eq!(health["seq"], max_seq);
+    let page = t
+        .ok("GET", &format!("/v1/events?since={max_seq}"), None, None)
+        .await;
+    assert_eq!(page["events"], json!([]));
+    t.task(A, "factory", "Next").await;
+    assert!(t.count("SELECT MAX(seq) FROM events") > max_seq);
+}
