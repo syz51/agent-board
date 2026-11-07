@@ -234,7 +234,8 @@ pub struct AddArgs {
     blockers: Vec<TaskId>,
     #[arg(long, value_parser = parse_enum::<Priority>)]
     priority: Option<Priority>,
-    /// May the coordinator start it without the user? Default: the board's autopilot.
+    /// May the coordinator start it without the user? Default: the board's autopilot. Set
+    /// false only when the user must act or decide; waiting on a task is a blocker.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
 }
@@ -257,6 +258,7 @@ pub struct UpdateArgs {
     blockers: Option<String>,
     #[arg(long = "reason")]
     blocked_reason: Option<String>,
+    /// May the coordinator start it? Set false only when the user must act or decide.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
 }
