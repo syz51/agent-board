@@ -179,6 +179,20 @@ on one of the board's home devices.
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
   with the coordinator prompt (`prompts/coordinator.md`), then records the thread as the
   coordinator.
+- **Adopting a thread instead**: when a thread already does a board's work,
+  `board board adopt <board> <thread>`, run on a home device, makes that thread the
+  coordinator instead of a new one. The command refuses when the board has a live
+  coordinator (switch autopilot off first), when T3 on that device does not know the
+  thread or has archived it, when the device is not a home device, and when it has no
+  `[projects]` path for the board's repos. Otherwise it saves the adoption in
+  `$BOARD_HOME/state/adopt-<board>.json` and only then switches autopilot on, so the daemon
+  never starts a thread for the board in between. The next time the board needs a
+  coordinator, the daemon takes the lease and briefs that thread with the coordinator
+  prompt (a board task the thread already owns counts as the task in progress). It then
+  drops the adoption and names the thread coordinator. From then on the daemon renews,
+  wakes and, after a lapsed lease, re-claims the thread like one it started. A failed brief
+  releases the lease and is retried with the start back-off. An adopted thread that T3 no
+  longer has, or has archived, is dropped, and a new thread is started.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
   or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
   briefs so the children claim them; review the result against the acceptance checks; mark

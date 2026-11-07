@@ -217,6 +217,14 @@ pub fn save_named<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()
     write_json(&home.state_dir().join(format!("{name}.json")), value)
 }
 
+/// Removes a named state file; a missing file is fine.
+pub fn remove_named(home: &Home, name: &str) -> Result<()> {
+    match std::fs::remove_file(home.state_dir().join(format!("{name}.json"))) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

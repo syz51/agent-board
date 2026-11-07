@@ -121,8 +121,7 @@ impl T3 for T3Cli {
             )
             .await?;
         if !ok {
-            let lower = stderr.to_ascii_lowercase();
-            if lower.contains("not found") || lower.contains("unknown thread") {
+            if is_unknown_thread(&stderr) {
                 return Ok(None);
             }
             bail!("t3 thread show failed: {}", stderr.trim());
@@ -144,6 +143,15 @@ pub fn parse_thread_id(stdout: &str) -> Option<String> {
         Err(_) => stdout.lines().next().map(|l| l.trim().to_owned()),
     }?;
     (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+/// Whether `t3 thread show` failed because T3 does not know the thread: older versions say
+/// "not found" or "unknown thread", 0.1.8 says "Thread <id> is no longer available."
+pub fn is_unknown_thread(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("unknown thread")
+        || lower.contains("no longer available")
 }
 
 /// Reads `{"thread": {"archived": …, "providerInstanceId": …}}` from `t3 thread show --json`.
@@ -179,6 +187,14 @@ mod tests {
         assert_eq!(parse_thread_id("t-3\n").as_deref(), Some("t-3"));
         assert_eq!(parse_thread_id("{}"), None);
         assert_eq!(parse_thread_id(""), None);
+    }
+
+    #[test]
+    fn unknown_threads_are_recognised_in_every_wording() {
+        assert!(is_unknown_thread("Thread x is no longer available.\n"));
+        assert!(is_unknown_thread("error: thread not found"));
+        assert!(is_unknown_thread("Unknown thread x"));
+        assert!(!is_unknown_thread("connection refused"));
     }
 
     #[test]
