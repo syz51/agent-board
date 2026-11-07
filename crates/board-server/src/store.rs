@@ -4,13 +4,13 @@
 use std::collections::BTreeMap;
 
 use board_proto::{
-    Agent, AgentId, Ask, Board, BoardSlug, Event, Evidence, Handoff, Lease, Note, StatusCounts,
-    Task, TaskDetail, TaskId, TaskStatus,
+    Agent, AgentId, Ask, Board, BoardSlug, Event, EventType, Evidence, Handoff, Lease, Note,
+    StatusCounts, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
 };
 use rusqlite::types::ToSql;
 use rusqlite::{OptionalExtension, Row, named_params, params};
 
-use crate::db::{Ctx, parse_enum, parse_id, parse_json, ready_sql, ts};
+use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ready_sql, ts};
 use crate::error::{Result, not_found};
 
 pub(crate) type NamedParams<'a> = Vec<(&'a str, &'a dyn ToSql)>;
@@ -407,7 +407,7 @@ pub(crate) fn agent_missing(id: &AgentId) -> crate::Error {
 }
 
 pub(crate) fn find_handoff(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Handoff>> {
-    Ok(cx
+    let Some(mut handoff) = cx
         .db
         .query_row(
             "SELECT now, next, blockers, version, updated_at FROM handoffs WHERE agent = ?1",
@@ -420,10 +420,38 @@ pub(crate) fn find_handoff(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Hando
                     blockers: r.get(2)?,
                     version: r.get(3)?,
                     updated_at: ts(r.get(4)?),
+                    last_change_at: None,
                 })
             },
         )
-        .optional()?)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    handoff.last_change_at = last_change(cx, agent)?;
+    Ok(Some(handoff))
+}
+
+/// Events that are not a change to the board's work: the handoff itself and presence.
+const NOT_CHANGES: [EventType; 3] = [
+    EventType::HandoffUpdated,
+    EventType::AgentRegistered,
+    EventType::AgentStateChanged,
+];
+
+/// When the agent last changed the board or touched a file: its newest other event.
+fn last_change(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Timestamp>> {
+    let [a, b, c] = NOT_CHANGES.map(|t| enum_str(&t));
+    Ok(cx
+        .db
+        .query_row(
+            "SELECT at FROM events WHERE actor = ?1 AND type NOT IN (?2, ?3, ?4) \
+             ORDER BY seq DESC LIMIT 1",
+            params![agent.as_str(), a, b, c],
+            |r| r.get(0),
+        )
+        .optional()?
+        .map(ts))
 }
 
 // ---------------------------------------------------------------------------------------

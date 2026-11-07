@@ -311,6 +311,7 @@ fn handoff_creates_then_replaces_with_the_version_read() {
         blockers: String::new(),
         version: 1,
         updated_at: at(),
+        last_change_at: None,
     };
     e.stub.on(&format!("PUT {path}"), &handoff);
     let out = e.run(&["handoff", "--now", "a", "--next", "b"]);

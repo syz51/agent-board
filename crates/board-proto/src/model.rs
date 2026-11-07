@@ -177,6 +177,12 @@ pub struct Handoff {
     pub blockers: String,
     pub version: i64,
     pub updated_at: Timestamp,
+    /// When the agent last changed the board or touched a file, on the server's clock: its
+    /// newest event other than a handoff, registration or state change. A handoff older
+    /// than this is stale. Absent when the agent has changed nothing, and from servers that
+    /// predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
