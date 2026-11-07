@@ -63,11 +63,16 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
         .collect::<rusqlite::Result<_>>()?;
     let mut doing_minutes = Vec::new();
     let mut without_check = 0;
+    let mut under_a_minute = 0;
     for payload in done_payloads {
         let done: DonePayload = parse_json(&payload)?;
+        // Feedback items (with a resolution) are routed, not worked: neither count applies.
         if done.resolution.is_none() && !done.evidence.iter().any(|e| e.kind == EvidenceKind::Check)
         {
             without_check += 1;
+        }
+        if done.resolution.is_none() && done.doing_ms.is_some_and(|ms| ms < 60_000) {
+            under_a_minute += 1;
         }
         if let Some(ms) = done.doing_ms {
             doing_minutes.push(ms as f64 / 60_000.0);
@@ -103,6 +108,7 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
         ask_answer_minutes_median: median(answer_minutes),
         doing_minutes_median: median(doing_minutes),
         done_without_check_evidence: without_check,
+        done_under_a_minute: under_a_minute,
         feedback: crate::ops::feedback::stats(cx, from)?,
     })
 }

@@ -218,7 +218,8 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         .as_ref()
         .map(|b| counts(cx, b).map(Counts::from))
         .transpose()?;
-    let alerts = alerts(cx, &agent, since, seq)?;
+    let mut alerts = alerts(cx, &agent, since, seq)?;
+    alerts.extend(quiet_reviews(cx, &agent)?);
 
     let mut model = Model {
         kind: req.kind,
@@ -648,6 +649,9 @@ const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
 const FILED: u8 = 6;
+const QUIET_REVIEW: u8 = 7;
+/// How long a task may sit in review with no note before its owner is reminded.
+const REVIEW_QUIET_MS: i64 = 86_400_000;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -1019,6 +1023,38 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
     let mut alerts: Vec<Alert> = out.into_values().collect();
     alerts.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.alert.cmp(&b.alert)));
     Ok(alerts)
+}
+
+/// The agent's tasks in review with no note and no change for a day. Review is the wait
+/// on CI or a review: one that quiet should be checked, or noted with what it waits on.
+/// Unlike the event alerts these hold until the owner acts, so a delta shows them too.
+fn quiet_reviews(cx: &Ctx<'_>, agent: &Agent) -> Result<Vec<Alert>> {
+    let cutoff = cx.now_ms() - REVIEW_QUIET_MS;
+    let quiet: Vec<(String, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, last FROM (SELECT t.id, t.number, t.board, MAX(t.updated_at, \
+             COALESCE((SELECT MAX(n.at) FROM notes n WHERE n.task = t.id), 0)) AS last \
+             FROM tasks t WHERE t.owner = ?1 AND t.status = 'review') \
+             WHERE last < ?2 ORDER BY board, number",
+        )?
+        .query_map(params![agent.id.as_str(), cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(quiet
+        .into_iter()
+        .map(|(task, last)| Alert {
+            alert: format!(
+                "{task} has sat in review for {} with no note",
+                ago(TimeDelta::milliseconds(cx.now_ms() - last))
+            ),
+            action: format!(
+                "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
+            ),
+            rank: (QUIET_REVIEW, last),
+        })
+        .collect())
 }
 
 fn record_change(

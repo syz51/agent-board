@@ -231,6 +231,14 @@ async fn stats_count_the_feedback_signals() {
     assert_eq!(stats["asks_created"], 1);
     assert_eq!(stats["asks_answered"], 1);
     assert_eq!(stats["ask_answer_minutes_median"], 4.0);
+    assert_eq!(stats["done_under_a_minute"], 0);
+    // Work done off the board and claimed afterwards shows as a quick done.
+    let quick = t.task(a, "factory", "Retro-claimed").await;
+    assert!(t.claim(a, &quick).await.0.is_success());
+    t.advance(TimeDelta::seconds(20));
+    assert!(t.done(a, &quick, check(0)).await.0.is_success());
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    assert_eq!(stats["done_under_a_minute"], 1);
     let (s, _) = t.call("GET", "/v1/stats?days=0", None, None).await;
     assert_eq!(s.as_u16(), 400);
 }

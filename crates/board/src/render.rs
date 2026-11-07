@@ -439,7 +439,7 @@ pub fn stats(stats: &Stats) -> String {
     let day = if stats.days == 1 { "day" } else { "days" };
     format!(
         "stats, last {} {day}\n\
-         tasks: {} created · {} done ({} without a check) · median {} in doing\n\
+         tasks: {} created · {} done ({} without a check, {} under a minute in doing) · median {} in doing\n\
          claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
          asks: {} created · {} answered · median {} to answer\n\
          feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined, {} fixed",
@@ -447,6 +447,7 @@ pub fn stats(stats: &Stats) -> String {
         stats.tasks_created,
         stats.tasks_done,
         stats.done_without_check_evidence,
+        stats.done_under_a_minute,
         minutes(stats.doing_minutes_median),
         stats.claims_refused,
         stats.tasks_taken_stale,

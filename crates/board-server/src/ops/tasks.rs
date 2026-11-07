@@ -494,7 +494,7 @@ fn check_doing_limit(cx: &Ctx<'_>, agent: &AgentId, task: &TaskId) -> Result<()>
         return Err(refused(
             format!("you already have {} in doing", doing.join(", ")),
             format!(
-                "finish {0} (task_done), move it to review or blocked, or release it before taking {task}",
+                "finish {0} (task_done), or park it before taking {task}: review while it waits on CI or a review, blocked while it waits on a task, the user or a date (task_update {0} status=..., with a note on what it waits on), or release it",
                 doing[0]
             ),
         ));

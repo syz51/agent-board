@@ -90,6 +90,13 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
+- **Waiting states**: `review` is where a task waits on CI or a reviewer, with a note naming
+  the PR; `blocked` is where it waits on another task, the user (an ask) or a date. Both free
+  the owner's one `doing` slot, and the doing-limit refusal says which fits which wait. A
+  task in `review` with no note and no change for a day raises an alert to its owner on
+  every snapshot until the owner notes what it still waits on or moves it on. Stats count
+  dones that spent under a minute in `doing`, which shows work done off the board and
+  claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
@@ -371,7 +378,8 @@ keeping untrusted text out of those channels, so:
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, recent; `waiting` lists
   open tasks held by a `not_before`, soonest first); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
-  grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
+  grammar, alerts and changed counts only, empty when nothing changed (a task left quiet in
+  `review` is a standing alert, so it shows until its owner acts). **Alerts** (≤ 400):
   one line each.
 - Tool descriptions and server instructions never change at run time, so they do not break
   prompt caching.
@@ -486,7 +494,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   normalized message. Agents rarely report a refusal they could work around; the error log
   does it for them.
 - **Measurement.** `GET /v1/stats` reports refused claims, stale takeovers, lease
-  conflicts, ask response times, time in `doing`, done-without-check counts, and feedback
+  conflicts, ask response times, time in `doing`, done-without-check counts, dones under a
+  minute in `doing`, and feedback
   reported, filed and resolved by kind.
 - **Review.** A periodic review (for example a weekly job) reads the feedback board and
   the stats, routes items to work, proposes changes to the defaults, the coordinator prompt

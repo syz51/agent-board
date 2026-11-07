@@ -582,3 +582,57 @@ async fn a_new_peer_on_the_branch_alerts_only_when_it_shares_files() {
         text(&alerts)
     );
 }
+
+#[tokio::test]
+async fn a_review_left_a_day_without_a_note_reminds_its_owner() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task("t3:alpha", "factory", "Wait on CI").await;
+    assert!(t.claim("t3:alpha", &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch("t3:alpha", &id, review).await.0.is_success());
+    let quiet = |s: &Value| text(s).contains(&format!("{id} has sat in review"));
+
+    t.advance(TimeDelta::hours(23));
+    assert!(!quiet(&snapshot(&t, "t3:alpha", "kind=delta").await));
+    t.advance(TimeDelta::hours(2));
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(quiet(&delta), "{}", text(&delta));
+    assert!(
+        text(&delta).contains("for 25h with no note"),
+        "{}",
+        text(&delta)
+    );
+    assert!(
+        text(&delta).contains(&format!("task_note {id}")),
+        "{}",
+        text(&delta)
+    );
+    // It holds until the owner acts, unlike event alerts.
+    assert!(quiet(&snapshot(&t, "t3:alpha", "kind=alerts").await));
+
+    // A note saying what it still waits on quiets it for another day.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some("t3:alpha"),
+        Some(json!({ "agent": "t3:alpha", "kind": "note", "text": "note: CI queued" })),
+    )
+    .await;
+    assert!(!quiet(&snapshot(&t, "t3:alpha", "kind=alerts").await));
+    t.advance(TimeDelta::hours(25));
+    assert!(quiet(&snapshot(&t, "t3:alpha", "kind=alerts").await));
+
+    // Only the owner is reminded, and only of tasks still in review.
+    t.register("t3:beta", Some(REPO), None).await;
+    assert!(!quiet(&snapshot(&t, "t3:beta", "kind=alerts").await));
+    assert!(
+        t.patch("t3:alpha", &id, json!({ "status": "doing" }))
+            .await
+            .0
+            .is_success()
+    );
+    t.advance(TimeDelta::hours(25));
+    assert!(!quiet(&snapshot(&t, "t3:alpha", "kind=alerts").await));
+}

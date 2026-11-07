@@ -473,6 +473,13 @@ async fn claims_follow_ownership_blockers_and_the_doing_limit() {
         (409, Some("claim_refused"))
     );
     assert!(v["message"].as_str().unwrap().contains(&first), "{v}");
+    // The refusal says which parked state fits which wait.
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("review while it waits on CI or a review")
+            && next.contains("blocked while it waits on a task, the user or a date"),
+        "{v}"
+    );
 
     let (s, v) = t.claim(B, &waiting).await;
     assert_eq!(

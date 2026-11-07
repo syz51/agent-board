@@ -398,7 +398,8 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 - `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml` →
   `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
-  `text`. The server also advances the agent's cursor to the returned `seq`. `json` is
+  `text`. Alerts come from events since the cursor, plus one standing alert per task of the
+  agent that has sat in `review` for a day with no note and no change. The server also advances the agent's cursor to the returned `seq`. `json` is
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
@@ -425,7 +426,9 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `days`, `tasks_created`, `tasks_done`, `claims_refused`, `tasks_taken_stale`,
   `lease_conflicts`, `asks_created`, `asks_answered`, `ask_answer_minutes_median`,
   `doing_minutes_median` (minutes, `null` when nothing was measured),
-  `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
+  `done_without_check_evidence`, `done_under_a_minute` (tasks done after under a minute in
+  `doing`, not counting feedback items; 0 from servers that predate it) and `feedback`
+  `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
   it), each within the period. Without `--json` it prints
