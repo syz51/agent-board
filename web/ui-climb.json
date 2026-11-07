@@ -30,7 +30,7 @@
     { "model": "claude-sonnet-5-5", "effort": "medium", "samples": 2 },
     { "model": "claude-opus-5-5", "effort": "high", "samples": 2 }
   ],
-  "pass": { "min": 8.5, "gain": 0.5 },
+  "pass": { "min": 9, "gain": 0.5 },
   "budgetUsd": { "call": 3, "round": 10, "run": 60 },
   "baseline": "origin/main"
 }
