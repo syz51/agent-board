@@ -16,8 +16,11 @@ and are upgraded separately from the server:
 - New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`) and
   `EventType` (`Event.type`): clients read a value they do not know as `unknown`
   (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
-  so the item or event still reads and renders. The server never stores or returns `unknown`
-  and refuses it in a request (400 `invalid`).
+  so the item or event still reads and renders. The server never stores `unknown` and
+  refuses it in a request (400 `invalid`); a server rolled back past a kind it stored reads
+  that kind as `unknown` too. `ResolutionKind` became open in the same release that added
+  `fixed`, so clients from before that release fail to read an item resolved `fixed`:
+  restart `board mcp` processes and daemons after upgrading.
 
 Every other enum is closed: a new value would fail every read that carries it in a client
 that predates it. Add one only after making the enum open as above and waiting until running
@@ -320,7 +323,9 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 
 ### CLI output for scripts
 
-`--json` prints the server's answer unchanged, pretty-printed. Scripts, such as a weekly
+`--json` prints the server's answer as this `board` read it, pretty-printed: fields it does
+not know are left out, fields an older server lacks get their defaults, and values of open
+enums it does not know read `unknown` (see "Compatibility"). Scripts, such as a weekly
 review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 
 - `board stats [--days N] --json` → `[Stats]` from `GET /v1/stats?days=N` (default 7):
@@ -329,7 +334,7 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `doing_minutes_median` (minutes, `null` when nothing was measured),
   `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
-  `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` is absent from servers that predate
+  `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
   it), each within the period. Without `--json` it prints
   a four-line summary.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for

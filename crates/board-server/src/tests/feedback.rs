@@ -372,7 +372,7 @@ async fn resolve_is_for_the_owner_or_the_user() {
 #[tokio::test]
 async fn a_fixed_item_names_the_fix_and_a_later_report_recurs_it() {
     let t = setup().await;
-    let text = json!({ "about": "dotfiles", "text": "ui-climb skill is ignored by git" });
+    let text = json!({ "about": "tools", "text": "The example tool is missing from PATH" });
     let item = report(&t, A, text.clone()).await["task"]["id"]
         .as_str()
         .unwrap()
@@ -416,7 +416,7 @@ async fn a_fixed_item_names_the_fix_and_a_later_report_recurs_it() {
     assert_eq!(code, 400);
     assert!(v["next"].as_str().unwrap().contains("fixed"), "{v}");
 
-    let fix = ".gitignore:48 now has !/claude/skills/ui-climb/";
+    let fix = "config.toml:12 now adds the tool's folder to PATH";
     let (s, done) = resolve(
         &t,
         Some(A),

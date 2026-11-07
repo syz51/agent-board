@@ -297,14 +297,39 @@ fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
         "resolve",
         "board-feedback-1",
         "--fixed",
-        ".gitignore:48 whitelists the skill",
+        "config.toml:12 sets the path",
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         e.stub
             .requests_to("POST /v1/feedback/board-feedback-1/resolve")[2]
             .body,
-        json!({"kind": "fixed", "reason": ".gitignore:48 whitelists the skill"})
+        json!({"kind": "fixed", "reason": "config.toml:12 sets the path"})
+    );
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--forwarded",
+        "filed upstream",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--duplicate",
+        "board-feedback-2",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = e
+        .stub
+        .requests_to("POST /v1/feedback/board-feedback-1/resolve");
+    assert_eq!(
+        sent[3].body,
+        json!({"kind": "forwarded", "reason": "filed upstream"})
+    );
+    assert_eq!(
+        sent[4].body,
+        json!({"kind": "duplicate", "task": "board-feedback-2"})
     );
     let out = e.run(&["resolve", "board-feedback-1"]);
     assert!(!out.status.success(), "a resolution is required");

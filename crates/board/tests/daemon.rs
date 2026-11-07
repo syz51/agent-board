@@ -1566,6 +1566,35 @@ async fn an_event_that_failed_on_a_transient_error_is_retried() {
     assert!(e.stub.requests().is_empty(), "dropped without a request");
 }
 
+/// An event type a newer server added is read as unknown and passed over: the daemon keeps
+/// its place in the feed and still handles the events after it.
+#[tokio::test]
+async fn an_event_type_from_a_newer_server_is_passed_over() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.state.last_seq = Some(9);
+    let mut newer =
+        serde_json::to_value(event(10, EventType::TaskCreated, Some("factory-4"), "user")).unwrap();
+    newer["type"] = json!("board_renamed");
+    let known =
+        serde_json::to_value(event(11, EventType::TaskCreated, Some("factory-5"), "user")).unwrap();
+    e.stub.on(
+        "GET /v1/events",
+        json!({ "events": [newer, known], "next_since": 11 }),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-5", detail("factory-5", true, &[]));
+    e.daemon.catch_up(at()).await.unwrap();
+    assert_eq!(e.daemon.state.last_seq, Some(11));
+    assert!(e.stub.requests_to("GET /v1/tasks/factory-4").is_empty());
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends().len(),
+        1,
+        "the known event still wakes the coordinator"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn watch_backs_off_reconnecting_and_stops_on_sigterm() {

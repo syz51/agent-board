@@ -531,32 +531,31 @@ pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()
                 ),
             ));
         }
-        ResolutionKind::Forwarded | ResolutionKind::Declined | ResolutionKind::Fixed => {
-            if req.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
-                return Err(invalid(
-                    format!("{kind} needs a reason"),
-                    format!(
-                        "send reason (at most {} characters): {}",
-                        s.note_chars,
-                        match req.kind {
-                            ResolutionKind::Forwarded => "where it went",
-                            ResolutionKind::Fixed => "what changed, such as the file and line",
-                            _ => "why it is not acted on",
-                        }
-                    ),
-                ));
-            }
-            if req.task.is_some() {
-                return Err(invalid(
-                    format!("{kind} takes no task"),
-                    "route it (kind routed) to name the task that does the work",
-                ));
-            }
-        }
-        _ => {}
+        ResolutionKind::Routed | ResolutionKind::Duplicate => {}
+        ResolutionKind::Forwarded => needs_reason(req, s, "where it went")?,
+        ResolutionKind::Declined => needs_reason(req, s, "why it is not acted on")?,
+        ResolutionKind::Fixed => needs_reason(req, s, "what changed, such as the file and line")?,
     }
     if let Some(reason) = &req.reason {
         check_line("reason", reason, s.note_chars)?;
+    }
+    Ok(())
+}
+
+/// Checks a kind that takes a reason (`hint` says what it gives) and no task.
+fn needs_reason(req: &ResolveFeedback, s: &Settings, hint: &str) -> Result<()> {
+    let kind = enum_str(&req.kind);
+    if req.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+        return Err(invalid(
+            format!("{kind} needs a reason"),
+            format!("send reason (at most {} characters): {hint}", s.note_chars),
+        ));
+    }
+    if req.task.is_some() {
+        return Err(invalid(
+            format!("{kind} takes no task"),
+            "route it (kind routed) to name the task that does the work",
+        ));
     }
     Ok(())
 }
