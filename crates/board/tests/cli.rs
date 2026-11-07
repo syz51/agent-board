@@ -196,6 +196,35 @@ fn show_frames_peer_text_and_escapes_tags() {
     assert!(text.contains("\\u003c/board\\u003e"));
 }
 
+/// An item resolved with a kind a newer server added still shows, as `unknown`.
+#[test]
+fn show_reads_resolution_kinds_from_newer_servers() {
+    let e = env();
+    let detail = TaskDetail {
+        task: task_fixture("board-feedback-3", "Slow claims"),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        history: vec![],
+    };
+    let mut detail = serde_json::to_value(&detail).unwrap();
+    detail["task"]["feedback"] = json!({
+        "about": "board", "source": "agent", "signature": "board:slow claims",
+        "reports": 1, "reporters": ["t3:a"], "last_reported_at": "2026-11-07T12:00:00Z",
+        "resolution": { "kind": "superseded", "reason": "x", "at": "2026-11-07T12:00:00Z",
+                        "by": "t3:a" },
+    });
+    e.stub.on("GET /v1/tasks/board-feedback-3", &detail);
+    let out = e.run(&["show", "board-feedback-3"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("resolved unknown by t3:a"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
     let e = env();
@@ -264,8 +293,30 @@ fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
             .body,
         json!({"kind": "declined", "reason": "works as designed"})
     );
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--fixed",
+        ".gitignore:48 whitelists the skill",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/feedback/board-feedback-1/resolve")[2]
+            .body,
+        json!({"kind": "fixed", "reason": ".gitignore:48 whitelists the skill"})
+    );
     let out = e.run(&["resolve", "board-feedback-1"]);
     assert!(!out.status.success(), "a resolution is required");
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--fixed",
+        "x",
+        "--declined",
+        "y",
+    ]);
+    assert!(!out.status.success(), "only one resolution");
 
     let out = e.run(&[
         "add",
@@ -628,6 +679,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
                 duplicate: 0,
                 forwarded: 0,
                 declined: 1,
+                fixed: 2,
             },
         },
     };
@@ -641,7 +693,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
          tasks: 5 created · 3 done (1 without a check) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
          asks: 2 created · 1 answered · median 4m to answer\n\
-         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined"
+         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed"
     );
     assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
 

@@ -2,8 +2,9 @@
 
 This board is the feedback board. Its tasks are feedback items: reports from agents
 (`board feedback`), captures and signals about a setup (a tool, skill, prompt, config or
-service). For each item you decide where it goes and close it with `feedback_resolve`. You
-never fix the setup yourself: its owner's board does.
+service). For each item you decide where it goes and close it with `feedback_resolve`. As a
+rule you do not fix the setup yourself: its owner's board does. The exception is `fixed`
+below.
 
 ## Loop
 
@@ -30,6 +31,11 @@ never fix the setup yourself: its owner's board does.
 - **forwarded**: the setup has its own feedback channel, such as a skill's
   `references/feedback.md` notes. File the report there as that channel describes, then
   `feedback_resolve` with kind `forwarded` and `reason` saying where it went.
+- **fixed**: the cause is already gone because you fixed it directly, when the user asked you
+  to or the fix is a small change to a setup you may edit (a config line, an alias), made,
+  committed and in place where agents meet it. Check it there first. `feedback_resolve` with
+  kind `fixed` and a `reason` naming what changed, such as the file and line or the setting.
+  Do not use `declined` for a fix. A later report opens a new item that recurs this one.
 - **declined**: working as intended, or not actionable. `feedback_resolve` with kind
   `declined` and a `reason` the reporter can act on: what to do instead, or what
   information would make it actionable.

@@ -226,7 +226,7 @@ fn prior(cx: &Ctx<'_>, signature: &str) -> Result<Prior> {
 
 /// The item that takes reports for feedback item `id`, if it is live: unresolved and not
 /// done or dropped, declined, a duplicate of a live item, or routed to a task that is not
-/// done or dropped.
+/// done or dropped. Forwarded and fixed items are not live.
 fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> {
     let row: Option<(Option<String>, Option<String>)> = cx
         .db
@@ -512,6 +512,12 @@ pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
 pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()> {
     let kind = enum_str(&req.kind);
     match req.kind {
+        ResolutionKind::Unknown => {
+            return Err(invalid(
+                "unknown resolution kind",
+                "send kind routed, duplicate, forwarded, declined or fixed",
+            ));
+        }
         ResolutionKind::Routed | ResolutionKind::Duplicate if req.task.is_none() => {
             return Err(invalid(
                 format!("{kind} needs the task"),
@@ -525,17 +531,17 @@ pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()
                 ),
             ));
         }
-        ResolutionKind::Forwarded | ResolutionKind::Declined => {
+        ResolutionKind::Forwarded | ResolutionKind::Declined | ResolutionKind::Fixed => {
             if req.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
                 return Err(invalid(
                     format!("{kind} needs a reason"),
                     format!(
                         "send reason (at most {} characters): {}",
                         s.note_chars,
-                        if req.kind == ResolutionKind::Forwarded {
-                            "where it went"
-                        } else {
-                            "why it is not acted on"
+                        match req.kind {
+                            ResolutionKind::Forwarded => "where it went",
+                            ResolutionKind::Fixed => "what changed, such as the file and line",
+                            _ => "why it is not acted on",
                         }
                     ),
                 ));
@@ -837,6 +843,9 @@ pub(crate) fn stats(cx: &Ctx<'_>, from: i64) -> Result<FeedbackStats> {
             ResolutionKind::Duplicate => resolved.duplicate = n,
             ResolutionKind::Forwarded => resolved.forwarded = n,
             ResolutionKind::Declined => resolved.declined = n,
+            ResolutionKind::Fixed => resolved.fixed = n,
+            // The server never stores it.
+            ResolutionKind::Unknown => {}
         }
     }
     Ok(FeedbackStats {

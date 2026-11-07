@@ -429,9 +429,10 @@ report, not a free-form task (`API.md`, "Feedback"):
   task and that task is done, a new report opens a new item that `recurs` the old one: the
   fix did not hold, and the history shows it.
 - **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
-  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere, or
-  `declined` with a reason. A declined item stays live, so repeat reports keep counting
-  against the decision.
+  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere,
+  `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
+  changed. A declined item stays live, so repeat reports keep counting against the
+  decision; a fixed one does not, so a repeat opens a new item that recurs it.
 - **Signals.** The server files feedback itself when agents keep hitting the same API
   error: by default 3 errors from 2 agents within 7 days with the same code, route and
   normalized message. Agents rarely report a refusal they could work around; the error log

@@ -5,6 +5,24 @@ daemon and the web view all use it. Bodies are JSON; their types are in
 `crates/board-proto` (named in brackets below), with `snake_case` fields and enum values and
 RFC 3339 UTC timestamps.
 
+## Compatibility
+
+Within `/v1`, changes are additive, because clients run for hours (`board mcp`, the daemon)
+and are upgraded separately from the server:
+
+- New endpoints, and new request fields that are optional.
+- New response fields: clients ignore fields they do not know, and a field a client expects
+  but an older server lacks gets a default (`#[serde(default)]`).
+- New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`) and
+  `EventType` (`Event.type`): clients read a value they do not know as `unknown`
+  (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
+  so the item or event still reads and renders. The server never stores or returns `unknown`
+  and refuses it in a request (400 `invalid`).
+
+Every other enum is closed: a new value would fail every read that carries it in a client
+that predates it. Add one only after making the enum open as above and waiting until running
+clients have been restarted on a version that reads it.
+
 ## Authentication
 
 | Caller | How | May call |
@@ -250,8 +268,8 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   link is followed), or routed to a task that is not done or dropped.
 - Otherwise a new item is filed (`task_created` with a `feedback` payload). When the newest
   item with the signature is no longer live (its routed task is done or dropped, it was
-  forwarded, or it was closed without a resolution), the new item's `recurs` names it: the
-  fix did not hold, or it came back.
+  forwarded or fixed, or it was closed without a resolution), the new item's `recurs` names
+  it: the fix did not hold, or it came back.
 - `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
   The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
   next step. `kind` is one of:
@@ -260,9 +278,13 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   - `duplicate`: `task` is the original item, which takes later reports.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
+  - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the
+    file and line, or the setting). It is not live: a later report opens a new item that
+    `recurs` this one.
 
   `task` is required for routed and duplicate and refused for the others; `reason` (one
-  line, at most 280 characters) is required for forwarded and declined. The item moves to
+  line, at most 280 characters) is required for forwarded, declined and fixed. Any other
+  `kind` is 400 `invalid`. The item moves to
   `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
   its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
   already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
@@ -307,7 +329,8 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `doing_minutes_median` (minutes, `null` when nothing was measured),
   `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
-  `duplicate`, `forwarded`, `declined`), each within the period. Without `--json` it prints
+  `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` is absent from servers that predate
+  it), each within the period. Without `--json` it prints
   a four-line summary.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
@@ -315,7 +338,7 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
-  --declined <reason>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
+  --declined <reason> | --fixed <what changed>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
 
 All exit 1 with the error on stderr when the server refuses or cannot be reached.
 
