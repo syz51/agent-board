@@ -1,17 +1,16 @@
-// Wires the event stream to the cache for the running page, and exposes Preact hooks.
+// The running page's live wiring: the event stream invalidates query tags and feeds the
+// event list; React reads the connection state and the clock through hooks.
 
-import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
-import { api } from "../api/client.ts";
-import type { BoardEvent } from "../api/schema.ts";
-import { type ResourceState, ResourceCache } from "./cache.ts";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { api } from "@/api/client.ts";
+import { addToFeed, createQueryClient, invalidateTags } from "./query.ts";
 import { browserTimers, TagBatcher, tagsForEvent } from "./refresh.ts";
 import { type ConnectionState, EventStream, openEventSource } from "./stream.ts";
 
-export const cache = new ResourceCache();
+export const queryClient = createQueryClient();
 
-const batcher = new TagBatcher((batch) => cache.invalidate(batch));
-const eventListeners = new Set<(event: BoardEvent) => void>();
-const stateListeners = new Set<(state: ConnectionState) => void>();
+const batcher = new TagBatcher((batch) => void invalidateTags(queryClient, batch));
+const connectionListeners = new Set<() => void>();
 let connection: ConnectionState = { kind: "connecting" };
 
 export const stream = new EventStream(
@@ -25,13 +24,14 @@ export const stream = new EventStream(
   {
     onEvent(event) {
       batcher.add(tagsForEvent(event));
-      for (const listener of eventListeners) listener(event);
+      addToFeed(queryClient, event);
     },
     onState(state) {
       connection = state;
-      for (const listener of stateListeners) listener(state);
+      for (const listener of connectionListeners) listener();
     },
-    onResync: () => cache.invalidateAll(),
+    // Events may have been missed: refetch everything shown, mark the rest stale.
+    onResync: () => void queryClient.invalidateQueries(),
   },
 );
 
@@ -41,57 +41,15 @@ export function startLive(): void {
   stream.start();
 }
 
-export interface Resource<T> extends ResourceState<T> {
-  retry(): void;
+function subscribeConnection(listener: () => void): () => void {
+  connectionListeners.add(listener);
+  return () => connectionListeners.delete(listener);
 }
 
-/**
- * Read a query through the cache. `key` identifies the query; `queryTags` say which events
- * make it stale. Returns the last good data while refreshing or after a failed refresh.
- */
-export function useResource<T>(
-  key: string | null,
-  queryTags: readonly string[],
-  fetcher: () => Promise<T>,
-): Resource<T> {
-  const [, setTick] = useState(0);
-  const rerender = useCallback(() => setTick((n) => n + 1), []);
-  const tagKey = queryTags.join("|");
-
-  useEffect(() => {
-    if (key === null) return;
-    return cache.subscribe(key, queryTags, fetcher, rerender);
-    // The key names the query; fetcher and tags follow from it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, tagKey]);
-
-  const state = key === null
-    ? { data: undefined, error: undefined, loading: false }
-    : cache.read<T>(key);
-  // Before the first subscribe runs, a query with no data counts as loading.
-  const loading = state.loading || (key !== null && state.data === undefined && !state.error);
-  return useMemo(
-    () => ({ ...state, loading, retry: () => key !== null && cache.refresh(key) }),
-    [state, loading, key],
-  );
-}
+const readConnection = () => connection;
 
 export function useConnection(): ConnectionState {
-  const [state, setState] = useState(connection);
-  useEffect(() => {
-    stateListeners.add(setState);
-    setState(connection);
-    return () => void stateListeners.delete(setState);
-  }, []);
-  return state;
-}
-
-/** Live events as they arrive, for the feed. */
-export function useLiveEvents(listener: (event: BoardEvent) => void): void {
-  useEffect(() => {
-    eventListeners.add(listener);
-    return () => void eventListeners.delete(listener);
-  }, [listener]);
+  return useSyncExternalStore(subscribeConnection, readConnection, readConnection);
 }
 
 /** The current time, updated every `ms`, for relative times. */

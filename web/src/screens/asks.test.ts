@@ -11,7 +11,9 @@ const candidates = () => [
 ];
 const openAsks = () => state.asks(new URLSearchParams({ status: "open" }));
 const ids = (tasks: Task[], asks = openAsks(), at = now) =>
-  Object.fromEntries(waitingTasks(tasks, asks, at).map((group) => [group.board, group.tasks.map((task) => task.id)]));
+  Object.fromEntries(
+    waitingTasks(tasks, asks, at).map((group) => [group.board, group.tasks.map((task) => task.id)]),
+  );
 
 describe("waitingTasks", () => {
   test("lists blocked and non-auto open tasks without an open ask, grouped by board", () => {
@@ -60,17 +62,21 @@ describe("needsYouCount", () => {
     const asks = openAsks().filter((ask) => ask.id !== 7);
     // Ask #7 goes, factory-17 (blocked, no ask now) comes.
     expect(needsYouCount(asks, candidates(), now)).toBe(7);
-    expect(needsYouCount(asks.filter((ask) => ask.id !== 8), candidates(), now)).toBe(6);
+    expect(
+      needsYouCount(
+        asks.filter((ask) => ask.id !== 8),
+        candidates(),
+        now,
+      ),
+    ).toBe(6);
   });
 
   test("tasks on closed boards are left out", () => {
     expect(ids(candidates()).docs).toEqual(["docs-5"]);
     const closed = new Set(["docs"]);
-    expect(waitingTasks(candidates(), openAsks(), now, closed).map((group) => group.board)).toEqual([
-      "factory",
-      "release-engineering",
-      "web-view",
-    ]);
+    expect(waitingTasks(candidates(), openAsks(), now, closed).map((group) => group.board)).toEqual(
+      ["factory", "release-engineering", "web-view"],
+    );
     expect(needsYouCount(openAsks(), candidates(), now, closed)).toBe(6);
   });
 

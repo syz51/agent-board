@@ -1,22 +1,31 @@
-import { Fragment } from "preact";
-import { useLocation } from "preact-iso";
-import { api } from "../api/client.ts";
-import type { Agent, Task } from "../api/schema.ts";
-import { tags } from "../live/refresh.ts";
-import { useNow, useResource } from "../live/runtime.ts";
-import { PlainText } from "../text/markdown.tsx";
+import { useQuery } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
+import { Fragment, type ReactNode, useMemo } from "react";
+import type { Agent, Task } from "@/api/schema.ts";
+import { Badge } from "@/components/ui/badge.tsx";
+import { NativeSelectOption } from "@/components/ui/native-select.tsx";
+import { queries } from "@/live/query.ts";
+import { useNow } from "@/live/runtime.ts";
+import type { BoardSearch } from "@/router.tsx";
+import { PlainText } from "@/text/markdown.tsx";
 import {
   AbsTime,
   agentIndex,
+  Crumbs,
   Empty,
   Owner,
+  PageHeader,
   PriorityBadge,
-  Query,
+  QueryFrame,
   RelTime,
   useAgents,
   useTitle,
-} from "../ui/common.tsx";
-import { Icon, StatusIcon } from "../ui/icons.tsx";
+} from "@/ui/common.tsx";
+import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
+import { Icon, StatusIcon } from "@/ui/icons.tsx";
+
+const route = getRouteApi("/boards/$slug");
 
 const DONE_WINDOW_MS = 30 * 86_400_000;
 
@@ -44,7 +53,9 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     if (task.status === "dropped") return false;
     if (task.status === "done" && now - Date.parse(task.updated_at) > DONE_WINDOW_MS) return false;
     if (filters.priority && task.priority !== filters.priority) return false;
-    if (filters.owner === "none" ? task.owner !== null : filters.owner && task.owner !== filters.owner) {
+    if (
+      filters.owner === "none" ? task.owner !== null : filters.owner && task.owner !== filters.owner
+    ) {
       return false;
     }
     if (filters.readyOnly && !task.ready) return false;
@@ -63,136 +74,146 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
   ];
 }
 
-export function BoardScreen({ slug }: { slug: string }) {
-  const location = useLocation();
+/** The filters a board's URL holds. */
+export function filtersOf(search: BoardSearch): TaskFilters {
+  return {
+    q: search.q ?? "",
+    priority: search.priority ?? "",
+    owner: search.owner ?? "",
+    readyOnly: search.ready === "1",
+  };
+}
+
+export function BoardScreen() {
+  const { slug } = route.useParams();
+  const search = route.useSearch();
+  const navigate = route.useNavigate();
   const now = useNow(60_000);
   // The board comes from the list the sidebar already holds: one request for both.
-  const boards = useResource("boards", [tags.boards], api.boards);
-  const board = { data: boards.data?.find((item) => item.slug === slug) };
-  const tasks = useResource(`tasks:${slug}`, [tags.board(slug)], () => api.tasks({ board: slug }));
+  const boards = useQuery(queries.boards());
+  const board = boards.data?.find((item) => item.slug === slug);
+  const tasks = useQuery(queries.boardTasks(slug));
   const agentList = useAgents().data;
-  const agents = agentIndex(agentList);
-  useTitle(board.data?.title ?? slug);
+  const agents = useMemo(() => agentIndex(agentList), [agentList]);
+  useTitle(board?.title ?? slug);
 
-  const filters: TaskFilters = {
-    q: location.query.q ?? "",
-    priority: location.query.priority ?? "",
-    owner: location.query.owner ?? "",
-    readyOnly: location.query.ready === "1",
-  };
-  const setFilter = (key: string, value: string) => {
-    const params = new URLSearchParams(location.query);
-    if (value) params.set(key, value);
-    else params.delete(key);
-    const search = params.toString();
-    location.route(`${location.path}${search ? `?${search}` : ""}`, true);
-  };
+  const filters = filtersOf(search);
+  const setFilter = (key: keyof BoardSearch, value: string) =>
+    void navigate({
+      search: { ...search, [key]: value || undefined },
+      replace: true,
+    });
   const filtered = filters.q || filters.priority || filters.owner || filters.readyOnly;
 
   return (
     <>
-      <nav class="crumbs" aria-label="Breadcrumb">
-        <a href="/">Boards</a>
-        <Icon name="chevron" />
-        <span aria-current="page">{board.data?.title ?? slug}</span>
-      </nav>
-      <header class="page-head">
-        <div class="page-title">
-          <div class="title-line">
-            <h1>{board.data?.title ?? slug}</h1>
-            {board.data && board.data.title !== slug && <span class="slug ident">{slug}</span>}
-            {board.data?.autopilot && <span class="tag tag-accent"><Icon name="bolt" />Autopilot</span>}
-            {board.data?.temporary && <span class="tag">Temporary</span>}
-          </div>
-          {board.data?.goal && <p class="page-sub"><PlainText text={board.data.goal} /></p>}
-        </div>
-      </header>
-      {board.data?.temporary && (
-        <p class="hint">
-          Temporary: the server closes this board once it is idle, and deletes it some time
-          after that.
+      <Crumbs current={board?.title ?? slug}>
+        <Link to="/">Boards</Link>
+      </Crumbs>
+      <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
+        {board && board.title !== slug && (
+          <span className="ident text-meta text-muted-foreground">{slug}</span>
+        )}
+        {board?.autopilot && (
+          <Badge variant="accent" shape="tag">
+            <Icon name="bolt" />
+            Autopilot
+          </Badge>
+        )}
+        {board?.temporary && (
+          <Badge variant="outline" shape="tag">
+            Temporary
+          </Badge>
+        )}
+      </PageHeader>
+      {board?.temporary && (
+        <p className="-mt-3 mb-5 text-meta text-muted-foreground">
+          Temporary: the server closes this board once it is idle, and deletes it some time after
+          that.
         </p>
       )}
 
-      <form class="toolbar" role="search" onSubmit={(event) => event.preventDefault()}>
-        <label class="search">
-          <Icon name="search" />
-          <span class="sr-only">Search tasks</span>
-          <input
-            type="search"
-            value={filters.q}
-            placeholder="Search by title or id"
-            onInput={(event) => setFilter("q", event.currentTarget.value)}
-          />
-        </label>
-        <label class="select">
-          <span class="select-label">Priority</span>
-          <select
-            value={filters.priority}
-            onChange={(event) => setFilter("priority", event.currentTarget.value)}
-          >
-            <option value="">Any</option>
-            <option value="p1">P1</option>
-            <option value="p2">P2</option>
-            <option value="p3">P3</option>
-          </select>
-        </label>
-        <label class="select">
-          <span class="select-label">Owner</span>
-          <select
-            value={filters.owner}
-            onChange={(event) => setFilter("owner", event.currentTarget.value)}
-          >
-            <option value="">Anyone</option>
-            <option value="none">Unowned</option>
-            {ownerOptions(tasks.data ?? [], agents).map((agent) => (
-              <option key={agent.id} value={agent.id}>{agent.label}</option>
-            ))}
-          </select>
-        </label>
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={filters.readyOnly}
-            onChange={(event) => setFilter("ready", event.currentTarget.checked ? "1" : "")}
-          />
+      <form
+        className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+        role="search"
+        onSubmit={(event) => event.preventDefault()}
+      >
+        <SearchField
+          label="Search tasks"
+          placeholder="Search by title or id"
+          value={filters.q}
+          onChange={(value) => setFilter("q", value)}
+          className="max-md:col-span-2"
+        />
+        <FilterSelect
+          label="Priority"
+          value={filters.priority}
+          onChange={(value) => setFilter("priority", value)}
+        >
+          <NativeSelectOption value="">Any</NativeSelectOption>
+          <NativeSelectOption value="p1">P1</NativeSelectOption>
+          <NativeSelectOption value="p2">P2</NativeSelectOption>
+          <NativeSelectOption value="p3">P3</NativeSelectOption>
+        </FilterSelect>
+        <FilterSelect
+          label="Owner"
+          value={filters.owner}
+          onChange={(value) => setFilter("owner", value)}
+          className="max-md:col-span-2"
+        >
+          <NativeSelectOption value="">Anyone</NativeSelectOption>
+          <NativeSelectOption value="none">Unowned</NativeSelectOption>
+          {ownerOptions(tasks.data ?? [], agents).map((agent) => (
+            <NativeSelectOption key={agent.id} value={agent.id}>
+              {agent.label}
+            </NativeSelectOption>
+          ))}
+        </FilterSelect>
+        <FilterToggle
+          checked={filters.readyOnly}
+          onChange={(checked) => setFilter("ready", checked ? "1" : "")}
+          className="max-md:col-start-3 max-md:row-start-1"
+        >
           Ready only
-        </label>
+        </FilterToggle>
       </form>
 
-      <Query resource={tasks} label="Loading tasks">
+      <QueryFrame query={tasks} label="Loading tasks">
         {(list) => {
-          const done = new Set(list.filter((task) => task.status === "done").map((task) => task.id));
+          const done = new Set(
+            list.filter((task) => task.status === "done").map((task) => task.id),
+          );
           const groups = groupTasks(list, filters, now).filter((group) => group.tasks.length > 0);
           if (groups.length === 0) {
-            return filtered
-              ? <Empty title="No tasks match these filters" icon="search" />
-              : (
-                <Empty title="No tasks on this board yet" icon="task">
-                  Agents add tasks with <code>task_add</code>; they appear here as they do.
-                </Empty>
-              );
+            return filtered ? (
+              <Empty title="No tasks match these filters" icon="search" />
+            ) : (
+              <Empty title="No tasks on this board yet" icon="task">
+                Agents add tasks with <code>task_add</code>; they appear here as they do.
+              </Empty>
+            );
           }
           return (
-            <div class="task-board">
+            <TaskBoard>
               {groups.map((group) => (
-                <section key={group.key} class="task-group" aria-labelledby={`group-${group.key}`}>
-                  <h2 id={`group-${group.key}`} class="group-head">
-                    <StatusIcon status={group.key} />
-                    {group.title}
-                    <span class="group-count">{group.tasks.length}</span>
-                  </h2>
-                  <ul class="task-list">
-                    {group.tasks.map((task) => (
-                      <TaskRow key={task.id} task={task} agents={agents} done={done} now={now} />
-                    ))}
-                  </ul>
-                </section>
+                <TaskGroupSection
+                  key={group.key}
+                  id={`group-${group.key}`}
+                  heading={
+                    <>
+                      <StatusIcon status={group.key} />
+                      {group.title}
+                    </>
+                  }
+                  count={group.tasks.length}
+                >
+                  <TaskList tasks={group.tasks} agents={agents} done={done} now={now} />
+                </TaskGroupSection>
               ))}
-            </div>
+            </TaskBoard>
           );
         }}
-      </Query>
+      </QueryFrame>
     </>
   );
 }
@@ -204,63 +225,189 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-/**
- * One task as a row: priority, status, id, title with its tags, owner and last update.
- * `done` holds the ids of done tasks, so finished blockers drop out; without it, as on
- * Needs you where done tasks are not loaded, blockers are not listed.
- */
-export function TaskRow(
-  { task, agents, done, now }: {
-    task: Task;
-    agents: Map<string, Agent>;
-    done?: ReadonlySet<string>;
-    now: number;
-  },
-) {
+/** The frame around task groups: one card, groups divided by rules. */
+export function TaskBoard({ children }: { children: ReactNode }) {
+  return (
+    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+      {children}
+    </div>
+  );
+}
+
+/** A group of tasks under a shaded heading with its count. */
+export function TaskGroupSection({
+  id,
+  heading,
+  count,
+  level = 2,
+  children,
+}: {
+  id: string;
+  heading: ReactNode;
+  count: number;
+  level?: 2 | 3;
+  children: ReactNode;
+}) {
+  const Heading = level === 2 ? "h2" : "h3";
+  return (
+    <section aria-labelledby={id}>
+      <Heading
+        id={id}
+        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+      >
+        {heading}
+        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+      </Heading>
+      {children}
+    </section>
+  );
+}
+
+interface TaskRowData {
+  task: Task;
+  agents: Map<string, Agent>;
+  /** Ids of done tasks, so finished blockers drop out; unset where done tasks are not loaded. */
+  done: ReadonlySet<string> | undefined;
+  now: number;
+}
+
+const features = tableFeatures({});
+const column = createColumnHelper<typeof features, TaskRowData>();
+
+/** One task per row: priority, status, id, title with its tags, owner and last update. */
+const columns = column.columns([
+  column.display({
+    id: "priority",
+    cell: ({ row }) => <PriorityBadge priority={row.original.task.priority} />,
+  }),
+  column.display({
+    id: "status",
+    cell: ({ row }) => {
+      const { task } = row.original;
+      return (
+        <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
+      );
+    },
+  }),
+  column.display({
+    id: "id",
+    cell: ({ row }) => row.original.task.id,
+  }),
+  column.display({ id: "main", cell: ({ row }) => <TaskMain {...row.original} /> }),
+  column.display({
+    id: "owner",
+    cell: ({ row }) => <Owner task={row.original.task} agents={row.original.agents} />,
+  }),
+  column.display({
+    id: "updated",
+    cell: ({ row }) => <RelTime at={row.original.task.updated_at} />,
+  }),
+]);
+
+// Desktop rows share the list's columns (subgrid), so the id column fits the longest id.
+// On a phone a row stacks: status and title, then id, priority, owner and update.
+const CELL_CLASS: Record<string, string> = {
+  priority: "max-md:[grid-area:prio] max-md:self-center",
+  status: "max-md:[grid-area:status] max-md:mt-0.75",
+  id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center",
+  main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
+  owner:
+    "min-w-0 overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
+  updated:
+    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+};
+
+export function TaskList({
+  tasks,
+  agents,
+  done,
+  now,
+}: {
+  tasks: Task[];
+  agents: Map<string, Agent>;
+  done?: ReadonlySet<string>;
+  now: number;
+}) {
+  const data = useMemo(
+    () => tasks.map((task) => ({ task, agents, done, now })),
+    [tasks, agents, done, now],
+  );
+  const table = useTable({ features, columns, data, getRowId: (row) => row.task.id });
+  return (
+    <ul className="grid grid-cols-[54px_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_88px] gap-x-3 divide-y max-md:block">
+      {table.getRowModel().rows.map((row) => (
+        <li
+          key={row.id}
+          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+        >
+          {row.getAllCells().map((cell) => (
+            <div key={cell.id} className={CELL_CLASS[cell.column.id]}>
+              <table.FlexRender cell={cell} />
+            </div>
+          ))}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TaskMain({ task, done, now }: TaskRowData) {
   // Blockers already done no longer hold the task up.
   const blockers = done ? task.blockers.filter((id) => !done.has(id)) : [];
   // Only a date still ahead holds an open task up.
-  const waitsUntil = task.status === "open" && task.not_before !== null &&
-      Date.parse(task.not_before) > now
-    ? task.not_before
-    : null;
+  const waitsUntil =
+    task.status === "open" && task.not_before !== null && Date.parse(task.not_before) > now
+      ? task.not_before
+      : null;
   return (
-    <li class="task-row">
-      <PriorityBadge priority={task.priority} />
-      <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
-      <span class="task-id ident">{task.id}</span>
-      <div class="task-main">
-        <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
-          <PlainText text={task.title} />
-        </a>
-        {blockers.length > 0 && (
-          <span class="tag">
-            blocked by{" "}
-            {blockers.map((id, index) => (
-              <Fragment key={id}>
-                {index > 0 && ", "}
-                <a href={`/tasks/${encodeURIComponent(id)}`}>{id}</a>
-              </Fragment>
-            ))}
-          </span>
-        )}
-        {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
-        {!task.auto && <span class="tag tag-manual" title="Autopilot leaves this task for you to start">manual</span>}
-        {waitsUntil && (
-          <span class="tag">
-            waits until <AbsTime at={waitsUntil} />
-          </span>
-        )}
-        {task.blocked_reason && (
-          <p class="blocked-reason">
-            <span class="blocked-label">Blocked:</span> <PlainText text={task.blocked_reason} />
-          </p>
-        )}
-      </div>
-      <span class="task-owner"><Owner task={task} agents={agents} /></span>
-      <span class="task-updated" title="Updated">
-        <RelTime at={task.updated_at} />
-      </span>
-    </li>
+    <>
+      {/* The whole row opens the task; tags and blocker links sit above the link's cover. */}
+      <Link
+        className="min-w-0 py-0.5 font-medium text-foreground after:absolute after:inset-0"
+        to="/tasks/$id"
+        params={{ id: task.id }}
+      >
+        <PlainText className="whitespace-normal" text={task.title} />
+      </Link>
+      {blockers.length > 0 && (
+        <Badge variant="outline" shape="tag" className="relative z-1">
+          blocked by{" "}
+          {blockers.map((id, index) => (
+            <Fragment key={id}>
+              {index > 0 && ", "}
+              <Link
+                className="inline-flex min-h-6 items-center tabular-nums"
+                to="/tasks/$id"
+                params={{ id }}
+              >
+                {id}
+              </Link>
+            </Fragment>
+          ))}
+        </Badge>
+      )}
+      {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
+      {!task.auto && (
+        <Badge
+          variant="outline"
+          shape="tag"
+          className="relative z-1"
+          title="Autopilot leaves this task for you to start"
+          data-tag="manual"
+        >
+          manual
+        </Badge>
+      )}
+      {waitsUntil && (
+        <Badge variant="outline" shape="tag" className="relative z-1">
+          waits until <AbsTime at={waitsUntil} />
+        </Badge>
+      )}
+      {task.blocked_reason && (
+        <p className="basis-full text-meta text-status-blocked">
+          <span className="font-semibold">Blocked:</span> <PlainText text={task.blocked_reason} />
+        </p>
+      )}
+    </>
   );
 }
