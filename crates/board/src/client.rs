@@ -345,6 +345,11 @@ impl Client {
         self.get_query("/v1/asks", &q).await
     }
 
+    /// Ask `id`, in any status.
+    pub async fn ask(&self, id: i64) -> Result<Ask> {
+        self.get(&format!("/v1/asks/{id}")).await
+    }
+
     pub async fn answer(&self, id: i64, answer: &str) -> Result<Ask> {
         let body = AnswerAsk {
             answer: answer.to_owned(),

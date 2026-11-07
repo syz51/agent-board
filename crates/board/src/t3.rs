@@ -66,6 +66,19 @@ pub struct T3Cli {
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A `t3` command stopped after its time ran out. It may have done its work first, so a
+/// caller does not repeat what must happen at most once.
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} timed out", self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
 impl T3Cli {
     /// `t3` from the configuration, else `~/.t3/bin/t3` when it exists, else from `PATH`.
     pub fn locate(configured: Option<&Path>) -> Self {
@@ -101,7 +114,7 @@ impl T3Cli {
         }
         let out = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output())
             .await
-            .with_context(|| format!("t3 {} timed out", args.join(" ")))??;
+            .map_err(|_| TimedOut(format!("t3 {}", args.join(" "))))??;
         Ok((
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),

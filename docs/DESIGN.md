@@ -258,18 +258,28 @@ registers without a repo).
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes) or a blocker clears. An answered ask wakes the agent that asked,
-  worker or coordinator, and no one else. Wake-ups are queued as what they are about and
-  sent every few seconds, one message per agent:
+  worker or coordinator; the coordinator gets it instead when the asker cannot be woken
+  (no T3 thread on this device, ended, unknown, gone from T3, or paused with no reset
+  time), and as well while the asker waits for a usage-limit reset. Wake-ups are queued
+  as what they are about and sent every few seconds, one message per agent:
   - **Re-check**: at send time each line is checked again; a task no longer ready and
-    `auto` (claimed, blocked, done), an ask no longer answered, or a coordinator no longer
-    named drops its line, and an agent paused before its reset or on another device gets
-    nothing.
-  - **Hold**: lines for an agent whose state is running are held and sent together once it
-    is idle; after 30 minutes held they are sent anyway, since T3 gives a busy thread the
-    message as its next turn and a missed Stop hook must not silence it. Held lines are saved
-    with the daemon's state, so a restart keeps them.
-  - **Retry**: a failed `t3 send` keeps its lines for the next flush, which checks them
-    again first; a line not delivered within an hour is dropped.
+    `auto` (claimed, blocked, done), or an agent no longer the board's coordinator, drops
+    its task lines. An answer stays answered, so only its text is read then.
+  - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
+    its `agent_state_changed` events. Lines for a running agent are held and sent together
+    on the first flush after it stops running, or after 3 minutes held, since T3 gives a
+    busy thread the message as its next turn and a turn that ended on an API error, an
+    interrupt or a Codex error leaves the thread marked running. Lines for an agent paused
+    on a usage limit are kept until its reset. Held lines are saved with the daemon's
+    state, so a restart keeps them; one entry a version cannot read is skipped, never the
+    whole state.
+  - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
+    failure up to 10 minutes, then checks them again before sending. A thread T3 no
+    longer has, or has archived, drops them. A send gets 20 seconds and all agents' sends
+    run side by side; one that runs out of time is not sent again, since T3 may have
+    delivered it.
+  - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
+    paused agent waited for, is dropped before any send.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
