@@ -111,7 +111,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
   it.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
-  24 hours unseen the owner is stale and another agent may take the task (logged). File
+  24 hours unseen the owner is stale and another agent may take the task (logged). The
+  owner, the board's coordinator or the user may hand a task to another agent, such as the
+  child doing it, or back from a child that is gone (logged as an owner change). File
   leases (45 minutes, renewed by heartbeats) are advisory: they warn, never block.
 - **Handoff**: one per agent: `now`, `next`, `blockers`. Replaced as a whole.
 - **Ask**: a decision or action only the user can provide. Creating one notifies the user;

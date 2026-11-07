@@ -8,7 +8,7 @@ use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
     DoneTask, ErrorCode, EvidenceKind, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
-    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TaskId, TaskStatus, Timestamp,
+    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, Task, TaskId, TaskStatus, Timestamp,
     UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
@@ -428,11 +428,14 @@ pub struct TaskChanges {
     pub auto: Option<bool>,
     /// `Some(None)` clears it.
     pub not_before: Option<Option<Timestamp>>,
+    /// Hand the task to this agent.
+    pub owner: Option<AgentId>,
 }
 
 /// Reads the task's version, then applies the changes.
 pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result<Output> {
     let version = ctx.client.task(id).await?.task.version;
+    let wanted_owner = changes.owner.clone();
     let task = ctx
         .client
         .update_task(
@@ -449,9 +452,11 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 blocked_reason: changes.blocked_reason,
                 auto: changes.auto,
                 not_before: changes.not_before,
+                owner: changes.owner,
             },
         )
         .await?;
+    check_owner(&task, wanted_owner.as_ref())?;
     Ok(Output::new(
         format!("updated {}", render::task_line(&task)),
         &task,
@@ -745,6 +750,22 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
         format!("updated {}", render::board_line(&board)),
         &board,
     ))
+}
+
+/// A server that predates handovers ignores `owner` and answers with the owner unchanged,
+/// so the new owner's `task_done` would be refused later.
+fn check_owner(task: &Task, wanted: Option<&AgentId>) -> Result<()> {
+    if let Some(wanted) = wanted
+        && task.owner.as_ref() != Some(wanted)
+    {
+        bail!(
+            "updated {id}, but the server ignored owner={wanted}: it predates handovers, so \
+             {owner} still owns it. Upgrade the server, then hand it over again",
+            id = task.id,
+            owner = task.owner.as_ref().map_or("nobody", AgentId::as_str),
+        );
+    }
+    Ok(())
 }
 
 /// A server that predates temporary boards ignores the flag, so a board meant to be
