@@ -190,6 +190,20 @@ export function createFixtures(now: number): Fixtures {
       created_at: ago(5 * day),
       updated_at: ago(14),
     },
+    // A long slug, so task ids are long enough to test the id column.
+    {
+      slug: "release-engineering",
+      title: "Release engineering",
+      goal: "Ship signed builds from one pipeline.",
+      status: "active",
+      temporary: false,
+      repos: ["github.com/example/release"],
+      autopilot: true,
+      coordinator: null,
+      home_devices: ["desktop"],
+      created_at: ago(4 * day),
+      updated_at: ago(3 * 60),
+    },
     {
       slug: "sandbox",
       title: "Sandbox",
@@ -364,6 +378,15 @@ export function createFixtures(now: number): Fixtures {
       auto: false,
       not_before: new Date(now + 3 * day * 60_000).toISOString(),
     }, day, day),
+    // Not auto, with a long id: shown in Needs you.
+    task({
+      id: "release-engineering-112",
+      title: "Choose the signing key's custody",
+      status: "open",
+      priority: "p2",
+      auto: false,
+    }, 4 * day, 3 * 60),
+    task({ id: "release-engineering-7", title: "Cache the release toolchain", status: "open" }, 4 * day, 4 * day),
     task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
     task(
       {
