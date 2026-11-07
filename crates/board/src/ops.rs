@@ -283,6 +283,8 @@ pub struct NewTask {
     pub priority: Option<Priority>,
     pub auto: Option<bool>,
     pub not_before: Option<Timestamp>,
+    /// Create it in doing, owned by this agent.
+    pub claim: bool,
 }
 
 pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
@@ -303,10 +305,32 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             priority: new.priority.unwrap_or(Priority::P2),
             auto: new.auto,
             not_before: new.not_before,
+            claim: new.claim,
         })
         .await?;
+    if !new.claim {
+        return Ok(Output::new(
+            format!("added {}", render::task_line(&task)),
+            &task,
+        ));
+    }
+    // A server that predates `claim` ignores it and creates the task open: claim it now,
+    // which another agent may win in between.
+    let task = if task.status == TaskStatus::Open {
+        ctx.client
+            .task_action(&task.id, "claim")
+            .await
+            .with_context(|| {
+                format!(
+                    "added {} but could not claim it; the server predates claim on create",
+                    task.id
+                )
+            })?
+    } else {
+        task
+    };
     Ok(Output::new(
-        format!("added {}", render::task_line(&task)),
+        format!("added and claimed {}", render::task_line(&task)),
         &task,
     ))
 }
