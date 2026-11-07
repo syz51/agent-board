@@ -9,13 +9,20 @@
 import { rm } from "node:fs/promises";
 import tailwind from "bun-plugin-tailwind";
 
+// Where the style nonce goes in index.html. board-server (crates/board-server/src/web.rs)
+// and the dev server replace it with a fresh nonce on every page response. Braces are not
+// valid in a nonce, so a page served without the replacement allows no `<style>` at all.
+export const NONCE_PLACEHOLDER = "{{CSP_NONCE}}";
+
 // Defence in depth for agent-written text: only this origin's scripts, styles and API, no
-// remote images. The server can send the same policy as a header, which also allows
-// `frame-ancestors`.
+// remote images. `<style>` elements need the page's nonce: Radix adds them for its scroll
+// lock and Select, and src/lib/csp-nonce.ts hands them the nonce from the `csp-nonce` meta,
+// whose `nonce` attribute the browser hides from selectors and `getAttribute`.
+// The server sends the same policy as a header, which also allows `frame-ancestors`.
 const CSP = [
   "default-src 'self'",
   "script-src 'self'",
-  "style-src 'self'",
+  `style-src 'self' 'nonce-${NONCE_PLACEHOLDER}'`,
   "img-src 'self' data:",
   "connect-src 'self'",
   "object-src 'none'",
@@ -56,7 +63,9 @@ export async function buildApp({
 
   const indexFile = Bun.file(`${outdir}/index.html`);
   const html = await indexFile.text();
-  const meta = `<meta http-equiv="Content-Security-Policy" content="${CSP}" />`;
+  const meta =
+    `<meta http-equiv="Content-Security-Policy" content="${CSP}" />\n    ` +
+    `<meta property="csp-nonce" nonce="${NONCE_PLACEHOLDER}" />`;
   if (!html.includes('<meta charset="utf-8" />')) {
     throw new Error("index.html lost its charset meta");
   }

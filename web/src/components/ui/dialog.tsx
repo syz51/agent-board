@@ -2,8 +2,8 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 // shadcn/ui's Dialog styling on the native <dialog>: showModal() gives focus trapping,
-// Escape, inert background and the top layer without a portal. Radix's Dialog is not used
-// because its scroll lock injects a <style> element, which the page's CSP refuses.
+// Escape, inert background and the top layer without a portal. It predates the page's style
+// nonce (src/lib/csp-nonce.ts), with which Radix's Dialog also runs under the CSP.
 
 function Dialog({
   open,
