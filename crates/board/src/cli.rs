@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    AskKind, BoardSlug, BoardStatus, CreateBoard, DeviceName, NoteKind, Priority, SnapshotFormat,
+    AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName, FeedbackActivity,
+    FeedbackSource, NoteKind, Priority, ResolutionKind, ResolveFeedback, SnapshotFormat,
     SnapshotKind, TaskId, TaskStatus, UpdateBoard,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -151,8 +152,42 @@ pub enum Command {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// File feedback about the board on the feedback board.
-    Feedback { text: String },
+    /// Report something in a setup that cost a step: the server files a feedback item, or
+    /// adds the report to the live one with the same signature.
+    Feedback {
+        /// The setup it is about, such as board, skills:rust or t3.
+        #[arg(long, default_value = "other")]
+        about: String,
+        /// What you were doing: explore, research, design, plan, build, review, operate or
+        /// other.
+        #[arg(long, value_parser = parse_enum::<FeedbackActivity>)]
+        activity: Option<FeedbackActivity>,
+        /// agent (default) or capture.
+        #[arg(long, value_parser = parse_enum::<FeedbackSource>)]
+        source: Option<FeedbackSource>,
+        /// Reports with equal signatures are one item (default: from about and the title).
+        #[arg(long)]
+        signature: Option<String>,
+        /// The first line becomes the title.
+        text: String,
+    },
+    /// Resolve a feedback item you own (or as the user); it moves to done.
+    #[command(group(clap::ArgGroup::new("resolution").required(true)))]
+    Resolve {
+        id: TaskId,
+        /// A task now does the work.
+        #[arg(long, group = "resolution", value_name = "TASK")]
+        routed: Option<TaskId>,
+        /// The same as an earlier item, which takes later reports.
+        #[arg(long, group = "resolution", value_name = "TASK")]
+        duplicate: Option<TaskId>,
+        /// Handed on outside the board: say where.
+        #[arg(long, group = "resolution", value_name = "REASON")]
+        forwarded: Option<String>,
+        /// Not acted on: say why.
+        #[arg(long, group = "resolution", value_name = "REASON")]
+        declined: Option<String>,
+    },
     /// Run the MCP server on stdio.
     Mcp,
     /// Handle a Claude Code or Codex hook event (reads its JSON from stdin).
@@ -441,6 +476,7 @@ impl Command {
                 | Self::Join { .. }
                 | Self::Snapshot { .. }
                 | Self::Feedback { .. }
+                | Self::Resolve { .. }
         )
     }
 }
@@ -648,7 +684,39 @@ async fn dispatch(cli: Cli) -> Result<()> {
             format,
             since,
         } => ops::snapshot(&ctx()?, kind, format, since).await?,
-        Command::Feedback { text } => ops::feedback(&ctx()?, text).await?,
+        Command::Feedback {
+            about,
+            activity,
+            source,
+            signature,
+            text,
+        } => {
+            let req = CreateFeedback {
+                about,
+                text,
+                activity,
+                source,
+                signature,
+            };
+            ops::feedback(&ctx()?, req).await?
+        }
+        Command::Resolve {
+            id,
+            routed,
+            duplicate,
+            forwarded,
+            declined,
+        } => {
+            let (kind, task, reason) = match (routed, duplicate, forwarded, declined) {
+                (Some(task), ..) => (ResolutionKind::Routed, Some(task), None),
+                (_, Some(task), ..) => (ResolutionKind::Duplicate, Some(task), None),
+                (_, _, Some(reason), _) => (ResolutionKind::Forwarded, None, Some(reason)),
+                (.., Some(reason)) => (ResolutionKind::Declined, None, Some(reason)),
+                _ => unreachable!("clap requires one resolution"),
+            };
+            let req = ResolveFeedback { kind, task, reason };
+            ops::resolve(&ctx()?, &id, req).await?
+        }
         Command::Stats { days } => ops::stats(&ctx()?, days).await?,
         Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")

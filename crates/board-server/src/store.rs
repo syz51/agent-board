@@ -93,6 +93,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         version: r.get(12)?,
         created_at: ts(r.get(13)?),
         updated_at: ts(r.get(14)?),
+        feedback: None,
     })
 }
 
@@ -144,6 +145,7 @@ fn complete_task(cx: &Ctx<'_>, mut task: Task) -> Result<Task> {
     task.owner_stale = task.owner.is_some() && !owner_live;
     let waiting = task.not_before.is_some_and(|at| at > cx.now);
     task.ready = task.status == TaskStatus::Open && all_done && !owner_live && !waiting;
+    task.feedback = crate::ops::feedback::load(cx, &task.id)?;
     Ok(task)
 }
 

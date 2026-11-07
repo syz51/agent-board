@@ -98,7 +98,10 @@ impl IntoResponse for Error {
                 }
             }
         };
-        (status_of(body.code), axum::Json(body)).into_response()
+        let mut response = (status_of(body.code), axum::Json(body.clone())).into_response();
+        // For the error-signal middleware (`api::record_errors`).
+        response.extensions_mut().insert(body);
+        response
     }
 }
 

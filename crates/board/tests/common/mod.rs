@@ -403,6 +403,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         auto: true,
         created_by: "t3:creator".parse().unwrap(),
         version: 3,
+        feedback: None,
         created_at: at(),
         updated_at: at(),
     }

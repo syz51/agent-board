@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use board_proto::{Note, NoteKind, TaskDetail};
+use board_proto::{FeedbackResult, Note, NoteKind, TaskDetail};
 use common::*;
 use serde_json::{Value, json};
 
@@ -177,12 +177,28 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
             "lease_paths",
             "ask_user",
             "ask_withdraw",
+            "feedback",
+            "feedback_resolve",
             "board_join",
         ]
     );
     for tool in tools {
         assert!(tool["description"].as_str().unwrap().chars().count() < 300);
         assert!(tool.get("outputSchema").is_none());
+        for (name, param) in tool["inputSchema"]["properties"].as_object().unwrap() {
+            let param = if param["type"] == "array" {
+                &param["items"]
+            } else {
+                param
+            };
+            if param["type"] == "string" {
+                assert!(
+                    param["maxLength"].as_u64().is_some(),
+                    "{}.{name} has no maxLength",
+                    tool["name"]
+                );
+            }
+        }
     }
 
     let shown = mcp.call(3, "task_show", json!({"id": "factory-12"}));
@@ -262,6 +278,44 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(
         stub.requests_to("POST /v1/asks/5/withdraw")[0].body,
         json!({"agent": "t3:thread-1"})
+    );
+
+    // Feedback goes to its own endpoint and thanks the agent.
+    stub.on(
+        "POST /v1/feedback",
+        FeedbackResult {
+            task: task_fixture("board-feedback-1", "Hooks print twice"),
+            duplicate: false,
+            reports: 1,
+        },
+    );
+    let filed = mcp.call(
+        8,
+        "feedback",
+        json!({"about": "hooks", "text": "Hooks print twice", "activity": "build"}),
+    );
+    assert_ne!(filed["isError"], true, "{filed}");
+    assert!(
+        text(&filed).starts_with("filed board-feedback-1"),
+        "{filed}"
+    );
+    assert_eq!(
+        stub.requests_to("POST /v1/feedback")[0].body,
+        json!({"about": "hooks", "text": "Hooks print twice", "activity": "build"})
+    );
+    stub.on(
+        "POST /v1/feedback/board-feedback-1/resolve",
+        task_fixture("board-feedback-1", "Hooks print twice"),
+    );
+    let resolved = mcp.call(
+        9,
+        "feedback_resolve",
+        json!({"id": "board-feedback-1", "kind": "routed", "task": "factory-12"}),
+    );
+    assert_ne!(resolved["isError"], true, "{resolved}");
+    assert_eq!(
+        stub.requests_to("POST /v1/feedback/board-feedback-1/resolve")[0].body,
+        json!({"kind": "routed", "task": "factory-12"})
     );
 
     let bad = mcp.call(6, "task_show", json!({"id": "not an id"}));

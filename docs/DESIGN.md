@@ -149,12 +149,19 @@ host.
 ## Agent interface
 
 The MCP server (`board mcp`) runs over stdio as a child of the agent runtime, so it inherits
-the thread's environment and knows the calling agent. Tools (about twelve, with fixed
+the thread's environment and knows the calling agent. Tools (sixteen, with fixed
 descriptions under 300 characters):
 
 `board_snapshot`, `board_status`, `task_list`, `task_show`, `task_add`, `task_claim`,
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,
-`ask_withdraw`, `board_join`.
+`ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
+
+Every string parameter declares a `maxLength` equal to the server's default limit (title
+72, note 280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a
+runtime can refuse an oversized argument before the call; a server configured with other
+limits still checks its own. The server's instructions ask agents to
+report, with `feedback`, anything in a setup that cost them a step and then carry on;
+`task_note` no longer offers the `feedback` kind.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
@@ -370,14 +377,33 @@ agrees, after checking it.
 
 ## Feedback loop
 
-Rules, defaults and prompts are expected to change with use:
+Rules, defaults and prompts are expected to change with use. Feedback is a first-class
+report, not a free-form task (`API.md`, "Feedback"):
 
-- Agents file feedback about the board with `board feedback` (a task on a feedback board).
-- `GET /v1/stats` reports refused claims, stale takeovers, lease conflicts, ask response
-  times, time in `doing` and done-without-check counts.
-- A periodic review (for example a weekly job) reads both, proposes changes to the defaults,
-  the coordinator prompt and the agents' instructions, and files them as proposals (see
-  "Proposals and triage") before they become reviewed pull requests.
+- **Reports.** Agents report anything in a setup that cost them a step (the board,
+  instructions, skills, hooks, tools, storage, a project's setup) with the `feedback` tool
+  or `board feedback`, then carry on. Each report names what it is `about` and, optionally,
+  the `activity` it interrupted; hooks may file reports with source `capture`.
+- **Dedupe and recurrence.** Reports with the same signature (given, or derived from
+  `about` and the title) land on one item while it is live, so a problem reported by ten
+  agents is one task with ten reports rather than ten tasks. Once the item is routed to a
+  task and that task is done, a new report opens a new item that `recurs` the old one: the
+  fix did not hold, and the history shows it.
+- **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
+  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere, or
+  `declined` with a reason. A declined item stays live, so repeat reports keep counting
+  against the decision.
+- **Signals.** The server files feedback itself when agents keep hitting the same API
+  error: by default 3 errors from 2 agents within 7 days with the same code, route and
+  normalized message. Agents rarely report a refusal they could work around; the error log
+  does it for them.
+- **Measurement.** `GET /v1/stats` reports refused claims, stale takeovers, lease
+  conflicts, ask response times, time in `doing`, done-without-check counts, and feedback
+  reported, filed and resolved by kind.
+- **Review.** A periodic review (for example a weekly job) reads the feedback board and
+  the stats, routes items to work, proposes changes to the defaults, the coordinator prompt
+  and the agents' instructions, and files them as proposals (see "Proposals and triage")
+  before they become reviewed pull requests.
 
 ## Security
 
