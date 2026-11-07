@@ -201,6 +201,22 @@
   --breakpoint-lg: 56.25rem;
 }
 
+@property --column-fade {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@keyframes column-fade {
+  from,
+  92% {
+    --column-fade: 72px;
+  }
+  to {
+    --column-fade: 0px;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -325,6 +341,17 @@
   }
   .md a {
     @apply underline decoration-current/35;
+  }
+
+  /* The board's row of task columns fades at its right edge while more columns lie off
+     screen, and stops fading once scrolled to the end. With no overflow the scroll timeline
+     is inactive and --column-fade stays 0, so nothing fades. */
+  @media (min-width: 45rem) {
+    .column-row {
+      mask-image: linear-gradient(to right, #000 calc(100% - var(--column-fade)), transparent);
+      animation: column-fade linear both;
+      animation-timeline: scroll(self inline);
+    }
   }
 
   /* Long agent text, collapsed until opened. */

@@ -235,12 +235,13 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 
 /**
  * Task groups as columns in one row that scrolls sideways, so the board reads left to right;
- * stacked on a phone. The row takes focus so the keyboard can scroll it.
+ * stacked on a phone. The row takes focus so the keyboard can scroll it, and fades at the right
+ * edge while more columns lie off screen.
  */
 export function TaskBoard({ children }: { children: ReactNode }) {
   return (
     <div
-      className="grid items-start gap-3 md:auto-cols-[284px] md:grid-flow-col md:overflow-x-auto md:pb-2"
+      className="column-row grid items-start gap-3 md:auto-cols-[284px] md:grid-flow-col md:overflow-x-auto md:pb-2"
       role="region"
       aria-label="Task columns"
       tabIndex={0}
