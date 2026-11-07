@@ -286,6 +286,33 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let sent: Vec<Option<&Value>> = patches.iter().map(|p| p.body.get("not_before")).collect();
     assert_eq!(sent, [Some(&Value::Null), Some(&Value::Null), None]);
 
+    // owner hands the task over; a server that ignores it is reported, not trusted.
+    let mut handed = task_fixture("factory-12", "Fix the parser");
+    handed.status = board_proto::TaskStatus::Doing;
+    handed.owner = Some("t3:child".parse().unwrap());
+    stub.on("PATCH /v1/tasks/factory-12", &handed);
+    let updated = mcp.call(
+        30,
+        "task_update",
+        json!({"id": "factory-12", "owner": "t3:child"}),
+    );
+    assert_ne!(updated["isError"], true, "{updated}");
+    assert_eq!(
+        stub.requests_to("PATCH /v1/tasks/factory-12")[3].body["owner"],
+        "t3:child"
+    );
+    stub.on(
+        "PATCH /v1/tasks/factory-12",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    let ignored = mcp.call(
+        31,
+        "task_update",
+        json!({"id": "factory-12", "owner": "t3:child"}),
+    );
+    assert_eq!(ignored["isError"], true, "{ignored}");
+    assert!(text(&ignored).contains("predates handovers"), "{ignored}");
+
     stub.on_error(
         "POST /v1/asks/5/withdraw",
         403,

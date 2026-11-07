@@ -313,7 +313,7 @@ async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
     t.register(B, Some(REPO), None).await;
     let (s, v) = move_as(&t, B, false, &doing, "dropped").await;
     assert_eq!(s, 403, "{v}");
-    assert!(v["next"].as_str().unwrap().contains("task_take"), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
 }
 
 #[tokio::test]
@@ -564,7 +564,7 @@ async fn stale_owners_can_be_taken_over() {
     // A plain claim points at take.
     let (s, v) = t.claim(B, &id).await;
     assert_eq!(s.as_u16(), 400);
-    assert!(v["next"].as_str().unwrap().contains("task_take"), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
 
     let taken = t
         .ok(
@@ -1459,5 +1459,128 @@ async fn a_handover_from_a_stale_owner_says_to_take_it_first() {
     t.register(B, Some(REPO), Some("main")).await;
     let (s, v) = patch_as(&t, B, false, &id, json!({ "owner": B })).await;
     assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    assert!(v["next"].as_str().unwrap().contains("task_take"), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+}
+
+#[tokio::test]
+async fn a_handover_needs_an_owned_task_and_a_live_target() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+    t.register(U, None, None).await;
+
+    // An unowned task is not handed over through a status change either.
+    let open = task_in(&t, TaskStatus::Open).await;
+    let (s, v) = patch_as(
+        &t,
+        U,
+        true,
+        &open,
+        json!({ "status": "blocked", "blocked_reason": "x", "owner": B }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    let task = t.get_task(&open).await;
+    assert_eq!(
+        (&task["status"], &task["owner"]),
+        (&json!("open"), &Value::Null)
+    );
+
+    // Naming the current owner while releasing does not keep it.
+    let doing = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &doing,
+        json!({ "status": "open", "owner": A }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("leave owner out"),
+        "{v}"
+    );
+    // Dropping and handing over at once says what the task is moving to.
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &doing,
+        json!({ "status": "dropped", "owner": B }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().contains("moves to dropped"),
+        "{v}"
+    );
+    // A status change the table refuses is reported as such.
+    let review = task_in(&t, TaskStatus::Review).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &review,
+        json!({ "status": "open", "owner": B }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["next"].as_str().unwrap().contains("doing, dropped"),
+        "{v}"
+    );
+
+    // A target whose session ended, or that is stale, would never finish it.
+    t.register("t3:gone", Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/agents/t3:gone/state",
+        Some("t3:gone"),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    let (s, v) = patch_as(&t, A, false, &doing, json!({ "owner": "t3:gone" })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("not live"), "{v}");
+    assert_eq!(t.get_task(&doing).await["owner"], A);
+}
+
+#[tokio::test]
+async fn the_previous_owner_is_told_to_stop_and_peers_see_the_handover() {
+    let t = setup().await;
+    t.register(U, None, None).await;
+    let id = task_in(&t, TaskStatus::Doing).await;
+    t.ok("GET", &format!("/v1/snapshot?agent={A}"), Some(A), None)
+        .await;
+
+    let (s, v) = patch_as(&t, U, true, &id, json!({ "owner": B })).await;
+    assert_eq!(s, 200, "{v}");
+    let alerts = t
+        .ok(
+            "GET",
+            &format!("/v1/snapshot?agent={A}&kind=alerts"),
+            Some(A),
+            None,
+        )
+        .await;
+    let text = alerts["text"].as_str().unwrap();
+    assert!(text.contains(&format!("{id} was handed to")), "{text}");
+    assert!(text.contains("stop work on it"), "{text}");
+
+    let (s, v) = patch_as(&t, B, false, &id, json!({ "owner": A })).await;
+    assert_eq!(s, 200, "{v}");
+    let full = t
+        .ok("GET", &format!("/v1/snapshot?agent={A}"), Some(A), None)
+        .await;
+    let text = full["text"].as_str().unwrap();
+    assert!(text.contains(&format!("handed {id} to {A}")), "{text}");
+    // Getting it back is a change to the task, not an order to stop.
+    assert!(!text.contains("stop work on it"), "{text}");
 }

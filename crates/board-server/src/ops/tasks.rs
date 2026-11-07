@@ -1,8 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
-    AddNote, AgentId, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType, EvidenceKind, Note,
-    Priority, SUMMARY_CHARS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    AddNote, AgentId, AgentState, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType,
+    EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, Task, TaskId, TaskStatus, Timestamp,
+    UpdateTask,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -13,7 +14,9 @@ use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
 use crate::ops::{join_board, touch_agent};
-use crate::store::{NamedParams, get_board, get_task, handle_of, load_tasks, seen};
+use crate::store::{
+    NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks, seen,
+};
 use crate::text::{ago, check_line, check_text};
 
 /// Status changes allowed through `PATCH` (`docs/API.md`).
@@ -543,7 +546,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
     }
     if task.status != TaskStatus::Open {
         let next = if task.owner_stale && !task.status.is_closed() {
-            format!("its owner is stale: take it with task_take {id}")
+            format!("its owner is stale: take it with {}", take_hint(id))
         } else if task.status.is_closed() {
             format!("reopen it first (task_update {id} status=open) if it needs more work")
         } else {
@@ -657,8 +660,8 @@ fn require_owner(task: &Task, agent: &AgentId, action: &str) -> Result<()> {
             format!("only the owner {owner} may {action} {}", task.id),
             if task.owner_stale {
                 format!(
-                    "the owner is stale: take it first with task_take {}",
-                    task.id
+                    "the owner is stale: take it first with {}",
+                    take_hint(&task.id)
                 )
             } else {
                 format!("add a note instead (task_note {})", task.id)
@@ -691,14 +694,15 @@ fn require_status_rights(
 }
 
 /// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, the board's
-/// coordinator or the user, while the task stays owned and not closed; `target` must be
-/// registered.
+/// coordinator or the user. `owned` is whether the task has an owner once the request's
+/// status change applies, and `to` that status. The target must be a live agent.
 fn check_handover(
     cx: &Ctx<'_>,
     task: &Task,
     agent: &AgentId,
     by_user: bool,
     target: &AgentId,
+    owned: bool,
     to: TaskStatus,
 ) -> Result<()> {
     let id = &task.id;
@@ -713,7 +717,8 @@ fn check_handover(
                 ),
                 if task.owner_stale {
                     format!(
-                        "the owner is stale: take it first with task_take {id}, then hand it over"
+                        "the owner is stale: take it first ({}), then hand it over",
+                        take_hint(id)
                     )
                 } else {
                     format!("ask the owner in a note (task_note {id})")
@@ -723,31 +728,91 @@ fn check_handover(
                 format!(
                     "nobody owns {id}; only the board's coordinator or the user may give it to an agent"
                 ),
-                format!("claim it yourself with task_claim {id}"),
+                if task.status == TaskStatus::Open {
+                    format!("to work on it yourself, claim it (task_claim {id})")
+                } else {
+                    format!(
+                        "to work on it yourself, resume it (task_update {id} status=doing) without owner"
+                    )
+                },
             ),
         });
     }
     if to == TaskStatus::Open {
         return Err(invalid(
             format!("an open task has no owner, so {id} cannot be handed over"),
-            format!("claim it first (task_claim {id}), then hand it over with owner"),
+            if task.status == TaskStatus::Open {
+                format!("claim it first (task_claim {id}), then hand it over with owner")
+            } else {
+                format!(
+                    "leave owner out to release {id}, or send owner without status=open to hand it over"
+                )
+            },
         ));
     }
     if to.is_closed() {
         return Err(bad_transition(
-            format!("{id} is {}, so it cannot be handed over", status_str(to)),
-            format!("reopen it first (task_update {id} status=open)"),
+            if task.status == to {
+                format!("{id} is {}, so it cannot be handed over", status_str(to))
+            } else {
+                format!(
+                    "{id} cannot be handed over while it moves to {}",
+                    status_str(to)
+                )
+            },
+            if task.status == to {
+                format!("reopen it (task_update {id} status=open) and claim it to work on it")
+            } else {
+                format!("leave owner out to move it to {}", status_str(to))
+            },
         ));
     }
-    let registered: bool = cx.db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
-        [target.as_str()],
-        |r| r.get(0),
-    )?;
-    if !registered {
+    if !owned {
+        return Err(invalid(
+            format!("nobody owns {id}, so it cannot be handed over"),
+            format!("resume it for that agent: task_update {id} status=doing owner={target}"),
+        ));
+    }
+    let Some(found) = find_agent(cx, target)? else {
         return Err(not_found(
             format!("agent {target} is not registered"),
             "hand it to an agent that has started a session: its id shows among the peers in board_snapshot",
+        ));
+    };
+    if found.state == AgentState::Ended || !is_live(cx, target.as_str())? {
+        return Err(invalid(
+            format!(
+                "agent {target} is not live (its session ended or it is stale), so it would never finish {id}"
+            ),
+            "hand it to a live agent among the peers in board_snapshot, or to yourself",
+        ));
+    }
+    Ok(())
+}
+
+/// How to take a stale owner's task, through MCP or the CLI.
+fn take_hint(id: &TaskId) -> String {
+    format!("task_claim {id} take=true, or board take {id}")
+}
+
+/// `check_doing_limit` for `owner`, worded for the caller when someone else is the owner.
+fn check_owner_doing_limit(
+    cx: &Ctx<'_>,
+    owner: &AgentId,
+    caller: &AgentId,
+    task: &TaskId,
+) -> Result<()> {
+    if owner == caller {
+        return check_doing_limit(cx, owner, task);
+    }
+    let doing = doing_tasks(cx, owner, Some(task))?;
+    if doing.len() >= cx.s.max_doing_per_agent as usize {
+        return Err(refused(
+            format!("{owner} already has {} in doing", doing.join(", ")),
+            format!(
+                "hand {task} to another agent, or wait until {owner} finishes {0} or moves it to review or blocked",
+                doing[0]
+            ),
         ));
     }
     Ok(())
@@ -803,14 +868,6 @@ pub(crate) fn update(
     let to = req.status.unwrap_or(from);
     let mut owner = task.owner.clone();
     let mut fields: Vec<&str> = Vec::new();
-    // A handover to another agent than the owner: checked before anything else changes.
-    let handover = req
-        .owner
-        .as_ref()
-        .filter(|t| task.owner.as_ref() != Some(*t));
-    if let Some(target) = handover {
-        check_handover(cx, &task, agent, by_user, target, to)?;
-    }
 
     if to != from {
         if !transition_allowed(from, to) {
@@ -839,21 +896,22 @@ pub(crate) fn update(
             // Open means unowned, whatever it was before.
             TaskStatus::Open => owner = None,
             // Whoever moves a task to doing works on it, as with claim and take.
-            // Unless it names the agent that will.
-            TaskStatus::Doing => {
-                let worker = req.owner.as_ref().unwrap_or(agent);
-                check_doing_limit(cx, worker, id)?;
-                owner = Some(worker.clone());
-            }
+            TaskStatus::Doing => owner = Some(agent.clone()),
             _ => {}
         }
         fields.push("status");
     }
-    if let Some(target) = handover.filter(|t| owner.as_ref() != Some(*t)) {
-        if to == TaskStatus::Doing {
-            check_doing_limit(cx, target, id)?;
-        }
+    // A handover names another owner than the status change leaves.
+    if let Some(target) = req.owner.as_ref().filter(|t| owner.as_ref() != Some(*t)) {
+        check_handover(cx, &task, agent, by_user, target, owner.is_some(), to)?;
         owner = Some(target.clone());
+    }
+    // A task entering doing, or changing hands in doing, counts against its owner's limit.
+    if let Some(worker) = owner
+        .as_ref()
+        .filter(|_| to == TaskStatus::Doing && (from != to || owner != task.owner))
+    {
+        check_owner_doing_limit(cx, worker, agent, id)?;
     }
     if owner != task.owner {
         fields.push("owner");

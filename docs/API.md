@@ -195,17 +195,22 @@ Reopening a closed board, or any change on it, starts the period again.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
 - `owner` in `[UpdateTask]` hands the task over: the named agent owns it from then on, so
-  its `task_done` succeeds and the previous owner's is refused. Only the owner, the board's
-  coordinator or the user may hand a task over (403 `forbidden` otherwise; another agent
-  takes a stale owner's task first with `/take`). The target must be registered (404
-  `not_found`). An `open` task has no owner to hand over (400 `invalid`: claim it first),
-  nor does a `done` or `dropped` one (400 `invalid_transition`: reopen it first). In
-  `doing`, the new owner's `doing` limit applies (409 `claim_refused`); with `status:
-  doing`, the named agent rather than the caller becomes the owner. The status is
-  otherwise kept, and leases stay with the agents that took them. The `task_updated` event
-  lists `owner` in `fields` with `owner` and `previous_owner`, and the previous owner's
-  snapshot reports the change. Naming the current owner changes nothing. `owner` is sent
-  only when set; a server that predates it ignores it and answers with the owner unchanged.
+  its `task_done` succeeds and the previous owner's is refused. The owner is worked out
+  after the request's status change (`open` clears it, `doing` sets the caller), and
+  `owner` then replaces it; naming the owner that leaves changes nothing. Only the task's
+  owner, the board's coordinator or the user may hand a task over (403 `forbidden`; another
+  agent takes a stale owner's task first with `/take`). The status change is checked
+  first, then: a task left without an owner (`open`, or unowned and not moving to `doing`)
+  is refused with 400 `invalid` (claim it first, or resume it with `status: doing` and
+  `owner`); a `done` or `dropped` task, or one moving to `dropped`, with 400
+  `invalid_transition`; an unregistered target with 404 `not_found`; a target whose session
+  ended or that is stale with 400 `invalid`. A task in `doing` counts against the new
+  owner's `doing` limit (409 `claim_refused`, naming the owner's task in `doing`). Leases
+  stay with the agents that took them. The `task_updated` event lists `owner` in `fields`
+  with `owner` and `previous_owner`; the previous owner's snapshot alerts it to stop work
+  on the task, and recent activity shows `handed <task> to <agent>`. `owner` is sent only
+  when set; a server that predates it ignores it and answers with the owner unchanged, which
+  the CLI and MCP report as an error.
 - Within a minute of an open task's `not_before` passing, the server records one
   `task_updated` event by actor `server` with payload `{"fields": [], "not_before_passed":
   <time>}`; the task itself is unchanged (same `version`, `not_before` kept). The daemon

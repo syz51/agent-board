@@ -570,10 +570,14 @@ fn describe(event: &Event) -> Option<String> {
             Some(commit) => format!("done {} (commit {commit})", task?),
             None => format!("done {}", task?),
         },
-        EventType::TaskUpdated => {
-            let to: TaskStatus = serde_json::from_value(p.get("to")?.clone()).ok()?;
-            format!("moved {} to {}", task?, status_str(to))
-        }
+        EventType::TaskUpdated => match p.get("to") {
+            Some(to) => {
+                let to: TaskStatus = serde_json::from_value(to.clone()).ok()?;
+                format!("moved {} to {}", task?, status_str(to))
+            }
+            // A handover without a status change.
+            None => format!("handed {} to {}", task?, p.get("owner")?.as_str()?),
+        },
         EventType::NoteAdded => format!("noted {}", task?),
         EventType::FilesTouched => {
             let paths = str_list(p, "paths");
@@ -819,6 +823,26 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                 let was_mine =
                     event.payload.get("previous_owner").and_then(|o| o.as_str()) == Some(me);
                 if !mine_ids.contains(task) && !was_mine {
+                    continue;
+                }
+                // Handed to another agent: no longer mine to work on.
+                let handed_to = event
+                    .payload
+                    .get("owner")
+                    .and_then(|o| o.as_str())
+                    .filter(|o| was_mine && *o != me);
+                if let Some(to) = handed_to {
+                    let to = actor_name(cx, to, &mut handles)?;
+                    out.insert(
+                        (TAKEN, task.to_string()),
+                        Alert {
+                            alert: format!("{task} was handed to {to} by {actor}"),
+                            action:
+                                "stop work on it; pick another ready task (task_list ready=true)"
+                                    .to_owned(),
+                            rank: rank(TAKEN),
+                        },
+                    );
                     continue;
                 }
                 let what = match event.event_type {
