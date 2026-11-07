@@ -23,38 +23,52 @@ A pill in the header and a banner show when the view is connecting, offline or r
 
 ## Stack
 
-- **Preact 11 with preact-iso**: React's component model and JSX, plus a small router, in a
-  few kilobytes. The whole app, markdown parser included, is 36 KB of gzipped JavaScript, which matters on a phone over the tailnet. A
-  framework with server rendering would add nothing here, since the Rust server only serves
-  static files.
-- **marked, lexer only**: agent markdown is parsed into tokens and rendered as Preact
+- **React 19** with **TanStack Router** (code-based routes in `src/router.tsx`, typed path
+  and search params), **TanStack Query** for server state, **TanStack Table** for the board
+  and task tables, and **TanStack Form** for the answer form and confirmations. A framework
+  with server rendering would add nothing here, since the Rust server only serves static
+  files. The app is about 190 KB of gzipped JavaScript.
+- **Tailwind CSS 4** and **shadcn/ui** components (`src/components/ui/`, `components.json`).
+  The theme is a set of CSS variables in `src/styles.css`: colours, status colours, radii,
+  shadows and type sizes. Restyle the view by changing those tokens and the components.
+  Under the CSP (`style-src 'self'`) components that inject `<style>` elements cannot run,
+  so dialogs use the native `<dialog>`, selects are native, and so are checkboxes and radio
+  buttons.
+- **marked, lexer only**: agent markdown is parsed into tokens and rendered as React
   elements in `src/text/markdown.tsx`. No HTML string is ever produced, so there is
   nothing to sanitize after the fact and no DOMPurify dependency.
 - **Hand-written decoders** (`src/api/decode.ts`, about 100 lines) check every response
   against the `board-proto` shapes, without a schema library. The TypeScript types are
   derived from the decoders.
-- **Bun** as package manager, bundler (`Bun.build` with an HTML entry point), test runner
-  and dev server; no Vite.
-- **TypeScript 7** (`tsc`) for type checking only.
-- Effect is not used: the logic is a small fetch layer, a cache and a reconnecting stream,
-  and an effect runtime would add more weight than it removes.
+- **Bun** as package manager, bundler (`Bun.build` with an HTML entry point and
+  `bun-plugin-tailwind`), test runner (with happy-dom and Testing Library) and dev server;
+  no Vite. The dev server rebuilds with `Bun.build` on every change instead of using Bun's
+  HTML-import dev bundler, whose module runtime cannot load TanStack Router.
+- **TypeScript 7** (`tsc`) for type checking; TypeScript 6 only for typescript-eslint.
+- **ESLint** (typescript-eslint, react-hooks) and **Prettier** (with the Tailwind class
+  sorter), both part of `bun run check`.
+- Effect is not used: the logic is a small fetch layer and a reconnecting stream, and an
+  effect runtime would add more weight than it removes.
 
 All versions are pinned exactly in `package.json`.
 
 ## Scripts
 
-| Command | Does |
-|---|---|
-| `bun install` | Install dependencies |
-| `bun run dev` | The app with hot reload against fixtures and a fake event stream, on http://localhost:5173 |
-| `bun run preview` | Build, then serve `dist/` against the same fixtures (checks the production bundle and its CSP) |
-| `bun run build` | Production build into `dist/` |
-| `bun run typecheck` | `tsc --noEmit` over `src/`, `dev/` and `build.ts` |
-| `bun test` | Unit tests |
-| `bun run check` | Type check, tests and build |
+| Command                | Does                                                                                           |
+| ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `bun install`          | Install dependencies                                                                           |
+| `bun run dev`          | The app against fixtures and a fake event stream, on http://localhost:5173; rebuilt on changes |
+| `bun run preview`      | Build, then serve `dist/` against the same fixtures                                            |
+| `bun run build`        | Production build into `dist/`                                                                  |
+| `bun run typecheck`    | `tsc --noEmit` over `src/`, `dev/`, `test/` and `build.ts`                                     |
+| `bun run lint`         | ESLint                                                                                         |
+| `bun run format:check` | Prettier, checking only; `bun run format` rewrites                                             |
+| `bun test`             | Unit and component tests                                                                       |
+| `bun run check`        | Type check, lint, format check, tests and build                                                |
 
 `dev/server.ts` takes `--port`, `--events <ms>` (interval of simulated events; `0` turns
-them off), `--latency <ms>` and `--dist`. While it runs, these URLs control it:
+them off), `--latency <ms>` and `--dist`. Both modes serve the page with its CSP meta. While
+it runs, these URLs control it:
 
 - `/__dev/outage?on=1` (or `on=0`): every API call answers 500 with an `ApiError`, and live
   streams drop. Use it to see the error and reconnecting states.
@@ -74,10 +88,12 @@ updates seen cursor starts 8 hours back; "Mark all seen" moves it, until the ser
 - `src/live/refresh.ts` maps each event to cache tags (`board:<slug>`, `task:<id>`,
   `agents`, `asks`, `updates`, and so on). Updates record no event of their own: they refresh
   on `task_done`, `task_updated`, `agent_state_changed` and a board's deletion. Events in a 150 ms burst are batched.
-- `src/live/cache.ts` refetches the shown queries that carry an invalidated tag. Queries
-  that are not shown are marked stale and refetched when they are next shown. After a
-  reconnect, or an event the view cannot read, everything shown is refetched. No replica of
-  server state is kept.
+- Each query in `src/live/query.ts` carries its tags in `meta.tags`. `invalidateTags`
+  refetches the shown queries that carry an invalidated tag, cancelling a refresh in flight
+  so the last event wins. Queries that are not shown are marked stale and refetched when
+  they are next shown. Nothing refetches on a timer or on window focus. After a reconnect,
+  or an event the view cannot read, everything shown is refetched. Live events are added to
+  the event feed's query data as they arrive.
 
 ## Untrusted text
 

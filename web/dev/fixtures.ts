@@ -3,7 +3,16 @@
 // Some agent-written text is deliberately hostile, to show it renders as inert text.
 // Names, devices and repos are placeholders.
 
-import type { Agent, Ask, BoardEvent, Evidence, Handoff, Note, Said, Task } from "../src/api/schema.ts";
+import type {
+  Agent,
+  Ask,
+  BoardEvent,
+  Evidence,
+  Handoff,
+  Note,
+  Said,
+  Task,
+} from "../src/api/schema.ts";
 
 export interface BoardFixture {
   slug: string;
@@ -80,7 +89,9 @@ export function createFixtures(now: number): Fixtures {
   const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
   const day = 24 * 60;
 
-  const agent = (fields: Partial<Agent> & Pick<Agent, "id" | "handle" | "state" | "last_seen">): Agent => ({
+  const agent = (
+    fields: Partial<Agent> & Pick<Agent, "id" | "handle" | "state" | "last_seen">,
+  ): Agent => ({
     runtime: "claude",
     device: "laptop",
     role: "worker",
@@ -264,169 +275,282 @@ export function createFixtures(now: number): Fixtures {
   });
 
   const tasks: TaskFixture[] = [
-    task({
-      id: "factory-30",
-      title: "Rotate the release signing key",
-      status: "open",
-      priority: "p3",
-      not_before: new Date(now + 14 * day * 60_000).toISOString(),
-    }, 3 * day, 3 * day),
-    task({
-      id: "factory-12",
-      title: "Inject board delta on UserPromptSubmit",
-      status: "doing",
-      priority: "p1",
-      owner: id("t3:7f3a"),
-      blockers: ["factory-9"],
-      created_by: id("t3:7f3a"),
-      body:
-        "The `UserPromptSubmit` hook injects the **delta** since the agent's cursor, capped at 600 characters.\n\n## Steps\n\n1. Read the cursor from the cache.\n2. Call `GET /v1/snapshot?kind=delta`.\n3. Print nothing when the text is empty.\n\nSee [the text format](https://github.com/example/factory/blob/main/docs/DESIGN.md#text-format).",
-      acceptance: "bun test claude/tests passes\nlive suite passes\ndelta is empty when nothing changed",
-    }, 2 * day, 41),
-    task({
-      id: "factory-21",
-      parent: "factory-12",
-      title: "Cache the last delta per agent",
-      status: "open",
-      priority: "p3",
-      created_by: id("t3:7f3a"),
-    }, 60, 60),
-    task({
-      id: "factory-9",
-      title: "Fix CRLF split in stream parser",
-      status: "done",
-      priority: "p1",
-      owner: id("t3:a91c"),
-      created_by: id("t3:a91c"),
-      body: "Lines ending in `\\r\\n` split into an empty event.",
-      acceptance: "stream parser test with CRLF input passes",
-      summary:
-        "The stream parser now treats `\\r\\n` as one line ending, so CRLF input no longer produces empty events.\n\nNothing to do on your side; the fix is in commit `4e1c2ab`.",
-    }, 3 * day, 3),
-    task({
-      id: "factory-13",
-      title: "Report lease conflicts in the alerts block",
-      status: "review",
-      owner: id("t3:a91c"),
-      created_by: id("t3:a91c"),
-      body: "Ready for review; see the PR in evidence.",
-    }, 2 * day, 25),
-    task({
-      id: "factory-14",
-      title: "Let agents take stale-owner tasks",
-      status: "doing",
-      owner: id("t3:e4b7"),
-      created_by: id("t3:e4b7"),
-    }, 4 * day, 31 * 60),
-    task({ id: "factory-15", title: "Renew leases from PostToolUse heartbeat", status: "open", priority: "p1" }, day, day),
-    task({ id: "factory-16", title: "Add board import-plan for PLAN.md", status: "open" }, day, day),
-    task({ id: "factory-18", title: "Mark agents idle on Stop", status: "open", auto: false }, 20 * 60, 20 * 60),
-    task({
-      id: "factory-19",
-      title: "Show handoff age in the snapshot",
-      status: "open",
-      priority: "p3",
-      blockers: ["factory-14"],
-    }, 10 * 60, 10 * 60),
-    task({
-      id: "factory-17",
-      title: "Send asks to Telegram",
-      status: "blocked",
-      priority: "p1",
-      blocked_reason: "Needs the bot token and chat id from the user (ask #7).",
-    }, 3 * day, 12),
-    task({
-      id: "factory-20",
-      title: HOSTILE_TITLE,
-      status: "open",
-      priority: "p3",
-      created_by: id("t3:e4b7"),
-      body: HOSTILE_BODY,
-      acceptance: "<script>alert('acceptance')</script>\nnothing above runs",
-    }, 5 * 60, 40),
-    task({
-      id: "factory-8",
-      title: "Store device tokens as SHA-256 hashes",
-      status: "done",
-      owner: id("t3:9d02"),
-    }, 9 * day, 5 * day),
-    task({ id: "factory-3", title: "Pick the storage engine", status: "done", owner: id("t3:9d02") }, 40 * day, 38 * day),
-    task({ id: "factory-11", title: "Mirror the board to a git branch", status: "dropped" }, 8 * day, 7 * day),
+    task(
+      {
+        id: "factory-30",
+        title: "Rotate the release signing key",
+        status: "open",
+        priority: "p3",
+        not_before: new Date(now + 14 * day * 60_000).toISOString(),
+      },
+      3 * day,
+      3 * day,
+    ),
+    task(
+      {
+        id: "factory-12",
+        title: "Inject board delta on UserPromptSubmit",
+        status: "doing",
+        priority: "p1",
+        owner: id("t3:7f3a"),
+        blockers: ["factory-9"],
+        created_by: id("t3:7f3a"),
+        body: "The `UserPromptSubmit` hook injects the **delta** since the agent's cursor, capped at 600 characters.\n\n## Steps\n\n1. Read the cursor from the cache.\n2. Call `GET /v1/snapshot?kind=delta`.\n3. Print nothing when the text is empty.\n\nSee [the text format](https://github.com/example/factory/blob/main/docs/DESIGN.md#text-format).",
+        acceptance:
+          "bun test claude/tests passes\nlive suite passes\ndelta is empty when nothing changed",
+      },
+      2 * day,
+      41,
+    ),
+    task(
+      {
+        id: "factory-21",
+        parent: "factory-12",
+        title: "Cache the last delta per agent",
+        status: "open",
+        priority: "p3",
+        created_by: id("t3:7f3a"),
+      },
+      60,
+      60,
+    ),
+    task(
+      {
+        id: "factory-9",
+        title: "Fix CRLF split in stream parser",
+        status: "done",
+        priority: "p1",
+        owner: id("t3:a91c"),
+        created_by: id("t3:a91c"),
+        body: "Lines ending in `\\r\\n` split into an empty event.",
+        acceptance: "stream parser test with CRLF input passes",
+        summary:
+          "The stream parser now treats `\\r\\n` as one line ending, so CRLF input no longer produces empty events.\n\nNothing to do on your side; the fix is in commit `4e1c2ab`.",
+      },
+      3 * day,
+      3,
+    ),
+    task(
+      {
+        id: "factory-13",
+        title: "Report lease conflicts in the alerts block",
+        status: "review",
+        owner: id("t3:a91c"),
+        created_by: id("t3:a91c"),
+        body: "Ready for review; see the PR in evidence.",
+      },
+      2 * day,
+      25,
+    ),
+    task(
+      {
+        id: "factory-14",
+        title: "Let agents take stale-owner tasks",
+        status: "doing",
+        owner: id("t3:e4b7"),
+        created_by: id("t3:e4b7"),
+      },
+      4 * day,
+      31 * 60,
+    ),
+    task(
+      {
+        id: "factory-15",
+        title: "Renew leases from PostToolUse heartbeat",
+        status: "open",
+        priority: "p1",
+      },
+      day,
+      day,
+    ),
+    task(
+      { id: "factory-16", title: "Add board import-plan for PLAN.md", status: "open" },
+      day,
+      day,
+    ),
+    task(
+      { id: "factory-18", title: "Mark agents idle on Stop", status: "open", auto: false },
+      20 * 60,
+      20 * 60,
+    ),
+    task(
+      {
+        id: "factory-19",
+        title: "Show handoff age in the snapshot",
+        status: "open",
+        priority: "p3",
+        blockers: ["factory-14"],
+      },
+      10 * 60,
+      10 * 60,
+    ),
+    task(
+      {
+        id: "factory-17",
+        title: "Send asks to Telegram",
+        status: "blocked",
+        priority: "p1",
+        blocked_reason: "Needs the bot token and chat id from the user (ask #7).",
+      },
+      3 * day,
+      12,
+    ),
+    task(
+      {
+        id: "factory-20",
+        title: HOSTILE_TITLE,
+        status: "open",
+        priority: "p3",
+        created_by: id("t3:e4b7"),
+        body: HOSTILE_BODY,
+        acceptance: "<script>alert('acceptance')</script>\nnothing above runs",
+      },
+      5 * 60,
+      40,
+    ),
+    task(
+      {
+        id: "factory-8",
+        title: "Store device tokens as SHA-256 hashes",
+        status: "done",
+        owner: id("t3:9d02"),
+      },
+      9 * day,
+      5 * day,
+    ),
+    task(
+      { id: "factory-3", title: "Pick the storage engine", status: "done", owner: id("t3:9d02") },
+      40 * day,
+      38 * day,
+    ),
+    task(
+      { id: "factory-11", title: "Mirror the board to a git branch", status: "dropped" },
+      8 * day,
+      7 * day,
+    ),
 
-    task({
-      id: "web-view-1",
-      title: "Board web view skeleton",
-      status: "doing",
-      priority: "p1",
-      owner: id("claude:5be1"),
-      auto: false,
-      created_by: id("claude:5be1"),
-    }, 2 * day, 22),
-    task({ id: "web-view-2", title: "Answer asks from the web view", status: "open", auto: false }, 2 * day, 2 * day),
-    task({
-      id: "web-view-3",
-      title: "Pick a markdown renderer that never emits HTML",
-      status: "review",
-      owner: id("claude:5be1"),
-      auto: false,
-    }, 2 * day, 3 * 60),
+    task(
+      {
+        id: "web-view-1",
+        title: "Board web view skeleton",
+        status: "doing",
+        priority: "p1",
+        owner: id("claude:5be1"),
+        auto: false,
+        created_by: id("claude:5be1"),
+      },
+      2 * day,
+      22,
+    ),
+    task(
+      { id: "web-view-2", title: "Answer asks from the web view", status: "open", auto: false },
+      2 * day,
+      2 * day,
+    ),
+    task(
+      {
+        id: "web-view-3",
+        title: "Pick a markdown renderer that never emits HTML",
+        status: "review",
+        owner: id("claude:5be1"),
+        auto: false,
+      },
+      2 * day,
+      3 * 60,
+    ),
 
-    task({
-      id: "web-view-5",
-      title: "Render agent markdown without HTML",
-      status: "done",
-      owner: id("claude:5be1"),
-      auto: false,
-      summary:
-        "Agent markdown is now parsed into tokens and rendered as elements, so raw HTML shows as text.\n\n- Links work only for `http`, `https` and `mailto`.\n- **Review the PR** before the next deploy: it adds a CSP meta to `dist/index.html`.",
-    }, 2 * day, 2 * 60),
+    task(
+      {
+        id: "web-view-5",
+        title: "Render agent markdown without HTML",
+        status: "done",
+        owner: id("claude:5be1"),
+        auto: false,
+        summary:
+          "Agent markdown is now parsed into tokens and rendered as elements, so raw HTML shows as text.\n\n- Links work only for `http`, `https` and `mailto`.\n- **Review the PR** before the next deploy: it adds a CSP meta to `dist/index.html`.",
+      },
+      2 * day,
+      2 * 60,
+    ),
 
     // A pending proposal: open, not auto, body starting `Proposal:` (after whitespace).
-    task({
-      id: "web-view-4",
-      title: "Cache rendered markdown per note",
-      status: "open",
-      priority: "p3",
-      auto: false,
-      created_by: id("claude:5be1"),
-      body: "\n  Proposal: rendering long notes repeats work on every refresh. Size S.",
-    }, 3 * 60, 3 * 60),
+    task(
+      {
+        id: "web-view-4",
+        title: "Cache rendered markdown per note",
+        status: "open",
+        priority: "p3",
+        auto: false,
+        created_by: id("claude:5be1"),
+        body: "\n  Proposal: rendering long notes repeats work on every refresh. Size S.",
+      },
+      3 * 60,
+      3 * 60,
+    ),
 
-    task({ id: "docs-1", title: "Rewrite the install guide", status: "open", owner: null }, 5 * day, 5 * day),
+    task(
+      { id: "docs-1", title: "Rewrite the install guide", status: "open", owner: null },
+      5 * day,
+      5 * day,
+    ),
     // Blocked on the user with no ask: shown in Needs you.
-    task({
-      id: "docs-5",
-      title: "Publish the guide on the docs site",
-      status: "blocked",
-      priority: "p1",
-      blocked_reason: "Waits on the user to pick where the docs are hosted.",
-    }, 2 * day, 6 * 60),
+    task(
+      {
+        id: "docs-5",
+        title: "Publish the guide on the docs site",
+        status: "blocked",
+        priority: "p1",
+        blocked_reason: "Waits on the user to pick where the docs are hosted.",
+      },
+      2 * day,
+      6 * 60,
+    ),
     // Not auto, but held until a date: not shown in Needs you before then.
-    task({
-      id: "docs-6",
-      title: "Renew the docs domain",
-      status: "open",
-      priority: "p3",
-      auto: false,
-      not_before: new Date(now + 3 * day * 60_000).toISOString(),
-    }, day, day),
+    task(
+      {
+        id: "docs-6",
+        title: "Renew the docs domain",
+        status: "open",
+        priority: "p3",
+        auto: false,
+        not_before: new Date(now + 3 * day * 60_000).toISOString(),
+      },
+      day,
+      day,
+    ),
     // Not auto, with a long id: shown in Needs you.
-    task({
-      id: "release-engineering-112",
-      title: "Choose the signing key's custody",
-      status: "open",
-      priority: "p2",
-      auto: false,
-    }, 4 * day, 3 * 60),
-    task({ id: "release-engineering-7", title: "Cache the release toolchain", status: "open" }, 4 * day, 4 * day),
-    task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
-    task({
-      id: "docs-7",
-      parent: "docs-1",
-      title: "Fix broken links in the CLI reference",
-      status: "done",
-      owner: id("t3:61aa"),
-    }, 2 * day, 5 * 60),
+    task(
+      {
+        id: "release-engineering-112",
+        title: "Choose the signing key's custody",
+        status: "open",
+        priority: "p2",
+        auto: false,
+      },
+      4 * day,
+      3 * 60,
+    ),
+    task(
+      { id: "release-engineering-7", title: "Cache the release toolchain", status: "open" },
+      4 * day,
+      4 * day,
+    ),
+    task(
+      { id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") },
+      5 * day,
+      day,
+    ),
+    task(
+      {
+        id: "docs-7",
+        parent: "docs-1",
+        title: "Fix broken links in the CLI reference",
+        status: "done",
+        owner: id("t3:61aa"),
+      },
+      2 * day,
+      5 * 60,
+    ),
     task(
       {
         id: "docs-3",
@@ -442,7 +566,13 @@ export function createFixtures(now: number): Fixtures {
           reports: 3,
           reporters: [id("t3:9d02"), id("t3:a91c"), id("t3:61aa")],
           last_reported_at: ago(2 * day),
-          resolution: { kind: "routed", task: "docs-1", reason: null, at: ago(2 * day), by: "user" },
+          resolution: {
+            kind: "routed",
+            task: "docs-1",
+            reason: null,
+            at: ago(2 * day),
+            by: "user",
+          },
           recurs: null,
         },
       },
@@ -597,8 +727,22 @@ export function createFixtures(now: number): Fixtures {
   ];
 
   const evidence: EvidenceFixture[] = [
-    { task: "factory-9", kind: "commit", value: "4e1c2ab", exit_code: null, agent: id("t3:a91c"), at: ago(3) },
-    { task: "factory-9", kind: "check", value: "bun test claude/tests", exit_code: 0, agent: id("t3:a91c"), at: ago(4) },
+    {
+      task: "factory-9",
+      kind: "commit",
+      value: "4e1c2ab",
+      exit_code: null,
+      agent: id("t3:a91c"),
+      at: ago(3),
+    },
+    {
+      task: "factory-9",
+      kind: "check",
+      value: "bun test claude/tests",
+      exit_code: 0,
+      agent: id("t3:a91c"),
+      at: ago(4),
+    },
     {
       task: "web-view-5",
       kind: "pr",
@@ -607,9 +751,30 @@ export function createFixtures(now: number): Fixtures {
       agent: id("claude:5be1"),
       at: ago(2 * 60 + 5),
     },
-    { task: "web-view-5", kind: "commit", value: "9b3f0d1", exit_code: null, agent: id("claude:5be1"), at: ago(2 * 60 + 6) },
-    { task: "web-view-5", kind: "check", value: "bun run check", exit_code: 0, agent: id("claude:5be1"), at: ago(2 * 60 + 7) },
-    { task: "docs-7", kind: "commit", value: "c71e2a8", exit_code: null, agent: id("t3:61aa"), at: ago(5 * 60) },
+    {
+      task: "web-view-5",
+      kind: "commit",
+      value: "9b3f0d1",
+      exit_code: null,
+      agent: id("claude:5be1"),
+      at: ago(2 * 60 + 6),
+    },
+    {
+      task: "web-view-5",
+      kind: "check",
+      value: "bun run check",
+      exit_code: 0,
+      agent: id("claude:5be1"),
+      at: ago(2 * 60 + 7),
+    },
+    {
+      task: "docs-7",
+      kind: "commit",
+      value: "c71e2a8",
+      exit_code: null,
+      agent: id("t3:61aa"),
+      at: ago(5 * 60),
+    },
     {
       task: "factory-13",
       kind: "pr",
@@ -632,11 +797,20 @@ export function createFixtures(now: number): Fixtures {
   const raw: Omit<BoardEvent, "seq">[] = [
     ev(3 * day, "factory", id("t3:a91c"), "task_created", "factory-9", {}),
     ev(2 * day, "factory", id("t3:7f3a"), "task_created", "factory-12", {}),
-    ev(2 * day - 5, "factory", id("t3:7f3a"), "task_claimed", "factory-12", { from: "open", to: "doing" }),
-    ev(2 * day - 30, "web-view", id("claude:5be1"), "task_claimed", "web-view-1", { from: "open", to: "doing" }),
+    ev(2 * day - 5, "factory", id("t3:7f3a"), "task_claimed", "factory-12", {
+      from: "open",
+      to: "doing",
+    }),
+    ev(2 * day - 30, "web-view", id("claude:5be1"), "task_claimed", "web-view-1", {
+      from: "open",
+      to: "doing",
+    }),
     ev(31 * 60, "factory", id("t3:e4b7"), "handoff_updated", null, {}),
     ev(5 * 60, "factory", id("t3:e4b7"), "task_created", "factory-20", {}),
-    ev(3 * 60, "web-view", id("claude:5be1"), "task_updated", "web-view-3", { from: "doing", to: "review" }),
+    ev(3 * 60, "web-view", id("claude:5be1"), "task_updated", "web-view-3", {
+      from: "doing",
+      to: "review",
+    }),
     ev(90, "factory", id("t3:7f3a"), "note_added", "factory-12", { kind: "finding" }),
     ev(60, "factory", id("t3:7f3a"), "task_created", "factory-21", { parent: "factory-12" }),
     ev(50, "factory", id("t3:c2d0"), "note_added", "factory-12", { kind: "decision" }),
@@ -644,7 +818,10 @@ export function createFixtures(now: number): Fixtures {
     ev(40, "factory", id("t3:e4b7"), "ask_created", "factory-20", { ask: 9, kind: "decision" }),
     ev(39, "factory", id("t3:e4b7"), "note_added", "factory-20", { kind: "note" }),
     ev(30, "factory", "user", "board_updated", null, { autopilot: true }),
-    ev(27, "factory", id("t3:a91c"), "evidence_added", "factory-13", { kind: "check", exit_code: 101 }),
+    ev(27, "factory", id("t3:a91c"), "evidence_added", "factory-13", {
+      kind: "check",
+      exit_code: 101,
+    }),
     ev(25, "factory", id("t3:a91c"), "task_updated", "factory-13", { from: "doing", to: "review" }),
     ev(22, null, id("claude:5be1"), "agent_state_changed", null, { from: "running", to: "paused" }),
     ev(14, null, id("t3:61aa"), "agent_state_changed", null, { from: "running", to: "paused" }),
@@ -653,8 +830,14 @@ export function createFixtures(now: number): Fixtures {
     ev(12, "factory", id("t3:c2d0"), "task_updated", "factory-17", { from: "open", to: "blocked" }),
     ev(6, null, id("t3:a91c"), "agent_state_changed", null, { from: "running", to: "idle" }),
     ev(4, "factory", id("t3:a91c"), "evidence_added", "factory-9", { kind: "check", exit_code: 0 }),
-    ev(3, "factory", id("t3:a91c"), "files_touched", "factory-9", { paths: ["claude/tests/lib/stream.js"] }),
-    ev(3, "factory", id("t3:a91c"), "task_done", "factory-9", { from: "doing", to: "done", evidence: "commit 4e1c2ab" }),
+    ev(3, "factory", id("t3:a91c"), "files_touched", "factory-9", {
+      paths: ["claude/tests/lib/stream.js"],
+    }),
+    ev(3, "factory", id("t3:a91c"), "task_done", "factory-9", {
+      from: "doing",
+      to: "done",
+      evidence: "commit 4e1c2ab",
+    }),
     ev(3, "factory", id("t3:c2d0"), "handoff_updated", null, {}),
     ev(2, "web-view", id("claude:5be1"), "ask_created", "web-view-1", { ask: 8, kind: "action" }),
   ];
@@ -662,7 +845,13 @@ export function createFixtures(now: number): Fixtures {
   const events = raw.map((event, index) => ({ ...event, seq: firstSeq + index }));
 
   const said: Said[] = [
-    { id: 1, agent: id("t3:61aa"), board: "docs", text: "Paused for the usage limit; docs-1 resumes after the reset.", at: ago(2 * day) },
+    {
+      id: 1,
+      agent: id("t3:61aa"),
+      board: "docs",
+      text: "Paused for the usage limit; docs-1 resumes after the reset.",
+      at: ago(2 * day),
+    },
     {
       id: 2,
       agent: id("t3:c2d0"),
@@ -671,11 +860,28 @@ export function createFixtures(now: number): Fixtures {
       at: ago(10 * 60),
     },
     { id: 3, agent: id("t3:61aa"), board: "docs", text: HOSTILE_SAID, at: ago(15) },
-    { id: 4, agent: id("t3:c2d0"), board: "factory", text: "factory-13 is in review. **Waiting** on its PR checks.", at: ago(45) },
+    {
+      id: 4,
+      agent: id("t3:c2d0"),
+      board: "factory",
+      text: "factory-13 is in review. **Waiting** on its PR checks.",
+      at: ago(45),
+    },
     { id: 5, agent: id("t3:c2d0"), board: "factory", text: LONG_SAID, at: ago(2) },
   ];
 
-  return { boards, tasks, agents, handoffs, asks, notes, evidence, events, said, seenAt: ago(8 * 60) };
+  return {
+    boards,
+    tasks,
+    agents,
+    handoffs,
+    asks,
+    notes,
+    evidence,
+    events,
+    said,
+    seenAt: ago(8 * 60),
+  };
 
   function ev(
     minutesAgo: number,

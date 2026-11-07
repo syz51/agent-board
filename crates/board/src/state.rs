@@ -337,6 +337,42 @@ pub fn load_named<T: DeserializeOwned + Default>(home: &Home, name: &str) -> T {
     read_json(&home.state_dir().join(format!("{name}.json"))).unwrap_or_default()
 }
 
+/// Like [`load_named`], for state that must not vanish unnoticed: a file that exists but
+/// cannot be read is copied to `<name>.json.unreadable-<time>` with a warning, and the
+/// state starts fresh.
+pub fn load_named_keeping_unreadable<T: DeserializeOwned + Default>(home: &Home, name: &str) -> T {
+    let path = home.state_dir().join(format!("{name}.json"));
+    let read = std::fs::read(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?));
+    match read {
+        Ok(value) => value,
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            T::default()
+        }
+        Err(err) => {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let copy = path.with_extension(format!("json.unreadable-{stamp}"));
+            match std::fs::copy(&path, &copy) {
+                Ok(_) => tracing::warn!(
+                    "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
+                    path.display(),
+                    copy.display()
+                ),
+                Err(copy_err) => tracing::warn!(
+                    "{}: cannot read it ({err:#}) or copy it ({copy_err}); starting fresh",
+                    path.display()
+                ),
+            }
+            T::default()
+        }
+    }
+}
+
 pub fn save_named<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
     write_json(&home.state_dir().join(format!("{name}.json")), value)
 }

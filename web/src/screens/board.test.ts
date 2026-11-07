@@ -6,7 +6,12 @@ const now = Date.parse("2026-11-06T12:00:00Z");
 const tasks = new DevState(() => now).tasks(new URLSearchParams({ board: "factory" }));
 const none: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
 const ids = (filters: Partial<TaskFilters> = {}) =>
-  Object.fromEntries(groupTasks(tasks, { ...none, ...filters }, now).map((group) => [group.key, group.tasks.map((task) => task.id)]));
+  Object.fromEntries(
+    groupTasks(tasks, { ...none, ...filters }, now).map((group) => [
+      group.key,
+      group.tasks.map((task) => task.id),
+    ]),
+  );
 
 describe("groupTasks", () => {
   test("groups by status, ready apart from waiting, done of the last 30 days only, no dropped", () => {
@@ -24,7 +29,10 @@ describe("groupTasks", () => {
   test("a task waiting for its not_before is not ready until then", () => {
     let clock = now;
     const state = new DevState(() => clock);
-    const waiting = () => state.tasks(new URLSearchParams({ board: "factory" })).find((task) => task.id === "factory-30");
+    const waiting = () =>
+      state
+        .tasks(new URLSearchParams({ board: "factory" }))
+        .find((task) => task.id === "factory-30");
     const notBefore = waiting()?.not_before;
     expect(notBefore).toBeString();
     expect(waiting()?.ready).toBe(false);

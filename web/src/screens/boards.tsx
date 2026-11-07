@@ -1,100 +1,103 @@
-import { useState } from "preact/hooks";
-import { ApiFailure, api } from "../api/client.ts";
-import type { Agent, Board } from "../api/schema.ts";
-import { PlainText } from "../text/markdown.tsx";
-import { tags } from "../live/refresh.ts";
-import { cache, useResource } from "../live/runtime.ts";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
+import { useMemo, useState } from "react";
+import { api } from "@/api/client.ts";
+import type { Agent, Board } from "@/api/schema.ts";
+import { Badge } from "@/components/ui/badge.tsx";
+import { Switch } from "@/components/ui/switch.tsx";
+import { cn } from "@/lib/utils.ts";
+import { fetching, invalidateTags, queries } from "@/live/query.ts";
+import { tags } from "@/live/refresh.ts";
+import { PlainText } from "@/text/markdown.tsx";
 import {
   AgentStateBadge,
   agentIndex,
+  AskKind,
   Empty,
   ErrorNotice,
-  Query,
+  listClass,
+  PageHeader,
+  QueryFrame,
   RelTime,
+  SectionTitle,
+  StatePill,
   useAgents,
   useTitle,
   Who,
-} from "../ui/common.tsx";
-import { Icon, StatusIcon } from "../ui/icons.tsx";
+} from "@/ui/common.tsx";
+import { ConfirmDialog } from "@/ui/confirm.tsx";
+import { Icon, StatusIcon } from "@/ui/icons.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
-import { ConfirmDialog } from "../ui/confirm.tsx";
 
 export function BoardsScreen() {
   useTitle("Boards");
-  const boards = useResource("boards", [tags.boards], api.boards);
-  const agents = agentIndex(useAgents().data);
-  const asks = useOpenAsks();
-  const openAsks = asks.data ?? [];
+  const boards = useQuery(queries.boards());
+  const agentList = useAgents().data;
+  const agents = useMemo(() => agentIndex(agentList), [agentList]);
+  const openAsks = useOpenAsks().data ?? [];
 
   return (
     <>
-      <header class="page-head">
-        <div class="page-title">
-          <h1>Boards</h1>
-          {boards.data && (
-            <p class="page-sub">
+      <PageHeader
+        title="Boards"
+        sub={
+          boards.data && (
+            <>
               {boards.data.length} board{boards.data.length === 1 ? "" : "s"}
               {openAsks.length > 0 && <> · {openAsks.length} waiting on you</>}
-            </p>
-          )}
-        </div>
-      </header>
+            </>
+          )
+        }
+      />
       {openAsks.length > 0 && (
-        <section class="waiting" aria-labelledby="waiting-title">
-          <div class="section-head">
-            <h2 id="waiting-title">Waiting on you</h2>
-            <a class="section-link" href="/asks">
-              All asks <Icon name="arrow" />
-            </a>
+        <section className="mb-8" aria-labelledby="waiting-title">
+          <div className="flex items-baseline justify-between gap-3">
+            <SectionTitle id="waiting-title">Waiting on you</SectionTitle>
+            <Link
+              className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
+              to="/asks"
+            >
+              All asks <Icon name="arrow" className="size-3.5" />
+            </Link>
           </div>
-          <ul class="list ask-preview">
-            {newestFirst(openAsks).slice(0, 4).map((ask) => (
-              <li key={ask.id}>
-                <a class="row-link" href={`/asks/${ask.id}`}>
-                  <span class={`kind kind-${ask.kind}`}>
-                    <Icon name={ask.kind === "action" ? "hand" : "question"} />
-                    {ask.kind === "action" ? "Action" : "Decision"}
-                  </span>
-                  <span class="ask-preview-text" title={plainLine(ask.question)}>{plainLine(ask.question)}</span>
-                  <span class="ask-preview-meta">
-                    {ask.board} · <RelTime at={ask.created_at} />
-                  </span>
-                </a>
-              </li>
-            ))}
+          <ul className={listClass}>
+            {newestFirst(openAsks)
+              .slice(0, 4)
+              .map((ask) => (
+                <li key={ask.id}>
+                  <Link
+                    className="grid min-h-11 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-2 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
+                    to="/asks/$id"
+                    params={{ id: String(ask.id) }}
+                  >
+                    <AskKind kind={ask.kind} />
+                    <span
+                      className="truncate font-medium max-md:line-clamp-2 max-md:whitespace-normal"
+                      title={plainLine(ask.question)}
+                    >
+                      {plainLine(ask.question)}
+                    </span>
+                    <span className="text-meta whitespace-nowrap text-muted-foreground">
+                      {ask.board} · <RelTime at={ask.created_at} />
+                    </span>
+                  </Link>
+                </li>
+              ))}
           </ul>
         </section>
       )}
-      <Query resource={boards} label="Loading boards">
+      <QueryFrame query={boards} label="Loading boards">
         {(list) =>
-          list.length === 0
-            ? (
-              <Empty title="No boards yet">
-                Create one with <code>board create</code>; it appears here.
-              </Empty>
-            )
-            : (
-              <section class="board-table" aria-label="All boards">
-                <div class="board-table-head" aria-hidden="true">
-                  <span>Board</span>
-                  <span>Tasks</span>
-                  <span>Coordinator</span>
-                  <span>Asks</span>
-                  <span>Autopilot</span>
-                </div>
-                <ul class="board-list">
-                  {list.map((board) => (
-                    <BoardRow
-                      key={board.slug}
-                      board={board}
-                      coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
-                      agents={agents}
-                    />
-                  ))}
-                </ul>
-              </section>
-            )}
-      </Query>
+          list.length === 0 ? (
+            <Empty title="No boards yet">
+              Create one with <code>board create</code>; it appears here.
+            </Empty>
+          ) : (
+            <BoardTable boards={list} agents={agents} />
+          )
+        }
+      </QueryFrame>
     </>
   );
 }
@@ -109,12 +112,12 @@ export function plainLine(text: string): string {
 }
 
 const SEGMENTS = [
-  { key: "done", label: "done" },
-  { key: "review", label: "review" },
-  { key: "doing", label: "doing" },
-  { key: "blocked", label: "blocked" },
-  { key: "ready", label: "ready" },
-  { key: "waiting", label: "waiting" },
+  { key: "done", label: "done", bar: "bg-status-done" },
+  { key: "review", label: "review", bar: "bg-status-review" },
+  { key: "doing", label: "doing", bar: "bg-status-doing" },
+  { key: "blocked", label: "blocked", bar: "bg-status-blocked" },
+  { key: "ready", label: "ready", bar: "bg-status-ready" },
+  { key: "waiting", label: "waiting", bar: "bg-input" },
 ] as const;
 
 function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
@@ -128,151 +131,297 @@ function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number
   };
 }
 
-/** One board as a row of the boards table: name and goal, tasks by status, coordinator,
- *  open asks and autopilot, in columns that line up from board to board. */
-function BoardRow(
-  { board, coordinator, agents }: { board: Board; coordinator: Agent | undefined; agents: Map<string, Agent> },
-) {
+interface BoardRowData {
+  board: Board;
+  coordinator: Agent | undefined;
+  agents: Map<string, Agent>;
+}
+
+const features = tableFeatures({});
+const column = createColumnHelper<typeof features, BoardRowData>();
+
+/**
+ * The boards table: name and goal, tasks by status, coordinator, open asks and autopilot.
+ * At 760px of width and up the cells line up in columns under a header; below, a row
+ * stacks name, tasks, then coordinator, asks and autopilot.
+ */
+const columns = column.columns([
+  column.display({
+    id: "name",
+    header: "Board",
+    cell: ({ row }) => <BoardName board={row.original.board} />,
+  }),
+  column.display({
+    id: "tasks",
+    header: "Tasks",
+    cell: ({ row }) => <TaskTally board={row.original.board} />,
+  }),
+  column.display({
+    id: "coordinator",
+    header: "Coordinator",
+    cell: ({ row }) => <Coordinator {...row.original} />,
+  }),
+  column.display({
+    id: "asks",
+    header: "Asks",
+    cell: ({ row }) => <BoardAsks board={row.original.board} />,
+  }),
+  column.display({
+    id: "autopilot",
+    header: "Autopilot",
+    cell: ({ row }) => <AutopilotSwitch board={row.original.board} />,
+  }),
+]);
+
+const AREA: Record<string, string> = {
+  name: "[grid-area:name]",
+  tasks: "[grid-area:tasks]",
+  coordinator: "[grid-area:coord]",
+  asks: "[grid-area:asks]",
+  autopilot: "[grid-area:auto]",
+};
+
+const CELL_CLASS: Record<string, string> = {
+  name: "grid min-w-0 gap-0.5",
+  tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
+  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
+  asks: "",
+  autopilot: "flex flex-col items-end @min-[760px]:items-start",
+};
+
+const ROW_GRID =
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+
+function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
+  const data = useMemo(
+    () =>
+      boards.map((board) => ({
+        board,
+        coordinator: board.coordinator ? agents.get(board.coordinator) : undefined,
+        agents,
+      })),
+    [boards, agents],
+  );
+  const table = useTable({
+    features,
+    columns,
+    data,
+    getRowId: (row) => row.board.slug,
+  });
+  return (
+    <section
+      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
+      aria-label="All boards"
+    >
+      {table.getHeaderGroups().map((group) => (
+        <div
+          key={group.id}
+          className={cn(
+            ROW_GRID,
+            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
+          )}
+          aria-hidden="true"
+        >
+          {group.headers.map((header) => (
+            <span key={header.id} className={AREA[header.id]}>
+              <table.FlexRender header={header} />
+            </span>
+          ))}
+        </div>
+      ))}
+      <ul className="divide-y">
+        {table.getRowModel().rows.map((row) => (
+          <li
+            key={row.id}
+            className={cn(
+              ROW_GRID,
+              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
+            )}
+          >
+            {row.getAllCells().map((cell) => (
+              <div key={cell.id} className={cn(AREA[cell.column.id], CELL_CLASS[cell.column.id])}>
+                <table.FlexRender cell={cell} />
+              </div>
+            ))}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function BoardName({ board }: { board: Board }) {
+  return (
+    <>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
+          <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
+            {board.title}
+          </Link>
+        </h2>
+        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
+        {board.status !== "active" && (
+          <StatePill state={board.status}>
+            {board.status[0]?.toUpperCase()}
+            {board.status.slice(1)}
+          </StatePill>
+        )}
+        {board.temporary && (
+          <Badge variant="outline" shape="tag">
+            Temporary
+          </Badge>
+        )}
+      </div>
+      <p className="truncate text-meta text-muted-foreground">
+        {board.goal ? (
+          <PlainText className="whitespace-nowrap" text={board.goal} />
+        ) : (
+          "No goal written."
+        )}
+      </p>
+    </>
+  );
+}
+
+function TaskTally({ board }: { board: Board }) {
   const counts = segmentCounts(board.counts);
   const total = SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
   return (
-    <li class="board-row">
-      <div class="board-name">
-        <div class="board-name-line">
-          <h2 class="board-title">
-            <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
-          </h2>
-          <span class="slug ident">{board.slug}</span>
-          {board.status !== "active" && (
-            <span class={`pill board-${board.status}`}>
-              <span class="state-dot" aria-hidden="true" />
-              {board.status[0]?.toUpperCase()}{board.status.slice(1)}
-            </span>
-          )}
-          {board.temporary && <span class="tag">Temporary</span>}
-        </div>
-        <p class={board.goal ? "board-goal" : "board-goal muted"}>
-          {board.goal ? <PlainText text={board.goal} /> : "No goal written."}
-        </p>
-      </div>
-
-      <div class="board-tasks">
-        <div class="progress" aria-hidden="true">
-          {SEGMENTS.map((segment) =>
+    <>
+      <div
+        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary"
+        aria-hidden="true"
+      >
+        {SEGMENTS.map(
+          (segment) =>
             counts[segment.key] > 0 && (
               <span
                 key={segment.key}
-                class={`progress-seg seg-${segment.key}`}
+                className={cn("min-w-1 basis-0", segment.bar)}
                 style={{ flexGrow: counts[segment.key] }}
               />
-            )
+            ),
+        )}
+      </div>
+      {total === 0 ? (
+        <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
+      ) : (
+        <ul
+          className="flex flex-wrap gap-x-3 gap-y-1 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-2"
+          aria-label="Tasks by status"
+        >
+          {SEGMENTS.map(
+            (segment) =>
+              counts[segment.key] > 0 && (
+                <li
+                  key={segment.key}
+                  className="inline-flex items-center gap-1"
+                  title={`${counts[segment.key]} ${segment.label}`}
+                >
+                  <StatusIcon
+                    status={segment.key === "waiting" ? "open" : segment.key}
+                    className="size-3"
+                  />
+                  <strong className="font-semibold text-foreground tabular-nums">
+                    {counts[segment.key]}
+                  </strong>{" "}
+                  {/* The column head names the counts; each keeps its word for screen readers. */}
+                  <span className="@min-[760px]:sr-only">{segment.label}</span>
+                </li>
+              ),
           )}
-        </div>
-        {total === 0
-          ? <p class="tally muted">No tasks yet</p>
-          : (
-            <ul class="tally" aria-label="Tasks by status">
-              {SEGMENTS.map((segment) =>
-                counts[segment.key] > 0 && (
-                  <li key={segment.key} title={`${counts[segment.key]} ${segment.label}`}>
-                    <StatusIcon status={segment.key === "waiting" ? "open" : segment.key} />
-                    <strong>{counts[segment.key]}</strong> <span class="tally-label">{segment.label}</span>
-                  </li>
-                )
-              )}
-            </ul>
-          )}
-      </div>
+        </ul>
+      )}
+    </>
+  );
+}
 
-      <div class="coordinator">
-        {board.coordinator === null
-          ? <span class="muted">{board.autopilot ? "No coordinator running" : "No coordinator"}</span>
-          : coordinator
-          ? (
-            <>
-              <Who id={coordinator.id} agents={agents} />
-              <AgentStateBadge agent={coordinator} />
-            </>
-          )
-          : <Who id={board.coordinator} agents={agents} />}
-      </div>
+function Coordinator({ board, coordinator, agents }: BoardRowData) {
+  if (board.coordinator === null) {
+    return (
+      <span className="text-muted-foreground">
+        {board.autopilot ? "No coordinator running" : "No coordinator"}
+      </span>
+    );
+  }
+  if (!coordinator) return <Who id={board.coordinator} agents={agents} />;
+  return (
+    <>
+      <Who id={coordinator.id} agents={agents} />
+      <span className="hidden @min-[760px]:inline-flex">
+        <AgentStateBadge agent={coordinator} />
+      </span>
+    </>
+  );
+}
 
-      <div class="board-asks">
-        {board.open_asks > 0
-          ? (
-            <a class="asks-link" href={`/asks?board=${encodeURIComponent(board.slug)}`}>
-              <Icon name="inbox" />
-              {board.open_asks} <span class="asks-word">{board.open_asks === 1 ? "ask" : "asks"}</span>
-            </a>
-          )
-          : <span class="no-asks">No asks</span>}
-      </div>
-
-      <AutopilotSwitch board={board} />
-    </li>
+function BoardAsks({ board }: { board: Board }) {
+  if (board.open_asks === 0) {
+    return (
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">No asks</span>
+    );
+  }
+  return (
+    <Link
+      className="inline-flex min-h-7 items-center gap-1.25 text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
+      to="/asks"
+      search={{ board: board.slug }}
+    >
+      <Icon name="inbox" className="size-3.5" />
+      {board.open_asks}{" "}
+      <span className="@min-[760px]:hidden">{board.open_asks === 1 ? "ask" : "asks"}</span>
+    </Link>
   );
 }
 
 function AutopilotSwitch({ board }: { board: Board }) {
+  const client = useQueryClient();
   const [confirming, setConfirming] = useState(false);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<ApiFailure | null>(null);
   const turningOn = !board.autopilot;
-
-  async function apply() {
-    setConfirming(false);
-    setPending(true);
-    setError(null);
-    try {
-      await api.setAutopilot(board.slug, turningOn);
-      cache.invalidate([tags.boards, tags.board(board.slug)]);
-    } catch (failure) {
-      if (!(failure instanceof ApiFailure)) throw failure;
-      setError(failure);
-    } finally {
-      setPending(false);
-    }
-  }
+  const mutation = useMutation({
+    mutationFn: fetching((on: boolean) => api.setAutopilot(board.slug, on)),
+    onSuccess: () => invalidateTags(client, [tags.boards, tags.board(board.slug)]),
+  });
 
   return (
-    <div class="autopilot">
-      <button
-        type="button"
-        role="switch"
-        class="switch"
-        aria-checked={board.autopilot}
-        aria-busy={pending}
-        disabled={pending}
-        onClick={() => setConfirming(true)}
+    <>
+      <Switch
+        checked={board.autopilot}
+        aria-busy={mutation.isPending}
+        disabled={mutation.isPending}
+        // The dialog confirms the change; the switch itself only opens it.
+        onCheckedChange={() => setConfirming(true)}
       >
-        <span class="switch-track" aria-hidden="true"><span class="switch-thumb" /></span>
-        <span class="switch-label">
-          Autopilot<span class="sr-only"> {pending ? "…" : board.autopilot ? "on" : "off"}</span>
-        </span>
-      </button>
+        <span className="@min-[760px]:sr-only">Autopilot</span>
+      </Switch>
       <ConfirmDialog
         open={confirming}
         title={`Turn autopilot ${turningOn ? "on" : "off"} for ${board.title}?`}
         confirmLabel={turningOn ? "Turn on" : "Turn off"}
-        onConfirm={apply}
+        onConfirm={() => {
+          setConfirming(false);
+          mutation.mutate(turningOn);
+        }}
         onCancel={() => setConfirming(false)}
       >
-        {turningOn
-          ? (
-            <p>
-              A coordinator thread starts on one of the board's home devices and works through
-              ready tasks marked auto, one at a time, without waiting for you. It sends an ask
-              when it needs a decision.
-            </p>
-          )
-          : (
-            <p>
-              No coordinator will pick up ready tasks; they wait for an agent or for you to start
-              them.
-            </p>
-          )}
+        {turningOn ? (
+          <p>
+            A coordinator thread starts on one of the board's home devices and works through ready
+            tasks marked auto, one at a time, without waiting for you. It sends an ask when it needs
+            a decision.
+          </p>
+        ) : (
+          <p>
+            No coordinator will pick up ready tasks; they wait for an agent or for you to start
+            them.
+          </p>
+        )}
       </ConfirmDialog>
-      {error && <ErrorNotice error={error} compact />}
-    </div>
+      {mutation.error && (
+        <div className="mt-1.5">
+          <ErrorNotice error={mutation.error} compact />
+        </div>
+      )}
+    </>
   );
 }

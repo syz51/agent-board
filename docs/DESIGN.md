@@ -48,8 +48,9 @@ One Rust binary, `board`, provides every role through subcommands: `serve`, `mcp
 | `board-server` | Storage, rules, API, SSE, snapshot rendering, web assets, notifier |
 | `board` | The binary: CLI, MCP server, hook handler, device daemon, configuration |
 
-The web view lives in `web/` (TypeScript), is built to `web/dist` and embedded in the
-binary at compile time.
+The web view lives in `web/` (TypeScript: React with TanStack Router and Query, Tailwind CSS
+and shadcn/ui, built with Bun; see `web/README.md`), is built to `web/dist` and embedded in
+the binary at compile time.
 
 ### Why Rust
 
@@ -326,6 +327,25 @@ registers without a repo).
     delivered it.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
+  - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
+    reconcile gets 90 seconds and a flush's checks 30, eight queues at a time, and a stop
+    request cuts any step short. Every step is safe to cut: checks only read, queues and
+    the retry list change only once a result is in, a send cut short counts as maybe
+    delivered, and the state is saved after the last flush. A queue not checked in time
+    waits for the next flush without a back-off. A stream with no bytes for 45 seconds
+    (the server sends a keep-alive every 15) is reopened after the last event handled.
+    After a failed check a queue costs no request until its retry time; after a failed
+    send it is still checked, so an agent that ended or paused meanwhile has its answers
+    passed on. The event retries go on past one the server keeps failing and stop only
+    when the server cannot be reached. The daemon reconciles at start and on its tick,
+    also while the stream is down. The boards' `t3 thread show` checks run side by side,
+    10 seconds each; one that fails or runs out of time still renews a named coordinator,
+    and only a check that
+    answers replaces it. The reconnect delay (1 second, doubled up to a minute) resets
+    only after a connection that lasted a minute. An unreadable `watch.json` is copied to
+    `watch.json.unreadable-<time>` with a warning before the daemon starts fresh. The
+    daemon logs its starts, adoptions, reconnects and stops at INFO in `watch.log`; the
+    rest of the binary logs only warnings.
 - **Reporting to the user**: a coordinator's chat is a poor channel to the user, because a
   wake arrives as the thread's next turn and buries whatever the last turn said. So what
   the user should read goes to the board instead: every `task_done` carries a `summary`,
@@ -528,7 +548,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   a restore drill is part of the tests.
 - Devices: `board login` stores the server URL and token; `board install claude` adds the
   hooks and MCP server to Claude Code's user settings; `board watch` runs under launchd or
-  systemd.
+  systemd, one per `$BOARD_HOME`: it holds a lock on `state/watch.lock` while it runs, and
+  a second one exits naming the first one's pid.
 
 ## Testing
 

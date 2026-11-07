@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board::client::Client;
@@ -55,6 +56,10 @@ struct FakeT3 {
     fail_send: Arc<AtomicBool>,
     /// `t3 thread send` runs out of time while set, after it may have delivered.
     time_out_send: Arc<AtomicBool>,
+    /// Threads whose `t3 thread show` never answers.
+    hang_info: Arc<Mutex<Vec<String>>>,
+    /// Threads whose `t3 thread send` never answers.
+    hang_send: Arc<Mutex<Vec<String>>>,
     /// What `t3 thread list` shows, by title.
     listed: Arc<Mutex<Vec<(String, ListedThread)>>>,
     /// When T3 creates a thread.
@@ -133,6 +138,9 @@ impl T3 for FakeT3 {
             thread: thread.to_owned(),
             message: message.to_owned(),
         });
+        if self.hang_send.lock().unwrap().iter().any(|t| t == thread) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_send.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread send failed: server unavailable");
         }
@@ -151,6 +159,9 @@ impl T3 for FakeT3 {
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
+        if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
+            std::future::pending::<()>().await;
+        }
         Ok(self.threads.lock().unwrap().get(thread).cloned())
     }
 
@@ -204,6 +215,17 @@ fn daemon_at(
     projects: BTreeMap<String, PathBuf>,
     t3: &FakeT3,
 ) -> Daemon<FakeT3> {
+    daemon_timed(dir, stub, projects, t3, None)
+}
+
+/// [`daemon_at`] with a client that gives up on an answer after `timeout`.
+fn daemon_timed(
+    dir: &Path,
+    stub: &Stub,
+    projects: BTreeMap<String, PathBuf>,
+    t3: &FakeT3,
+    timeout: Option<Duration>,
+) -> Daemon<FakeT3> {
     let config = Config {
         server: Some(stub.url.clone()),
         device: Some(DEVICE.parse().unwrap()),
@@ -213,7 +235,7 @@ fn daemon_at(
     let ctx = Ctx {
         home: Home::at(dir.join("home")),
         device: DEVICE.parse().unwrap(),
-        client: Client::new(&stub.url, TOKEN.into(), None, None).unwrap(),
+        client: Client::new(&stub.url, TOKEN.into(), None, timeout).unwrap(),
         config,
         repo: RepoInfo::default(),
     };
@@ -1686,8 +1708,6 @@ async fn an_event_type_from_a_newer_server_is_passed_over() {
 #[cfg(unix)]
 #[test]
 fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
-    use std::time::{Duration, Instant};
-
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
     stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
@@ -1708,9 +1728,10 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
         .env("BOARD_KEYCHAIN", "0")
         .env_remove("T3CODE_THREAD_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("BOARD_LOG")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let streams = || stub.requests_to("GET /v1/events").len();
@@ -1739,6 +1760,18 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
     assert!(status.success(), "{status:?}");
     let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
     assert_eq!(saved.last_seq, Some(5), "state saved on the way out");
+    // What it did is in watch.log (its stderr) at the default log level.
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut log).unwrap();
+    for line in [
+        "watching as device mac-test",
+        "event stream open after #5",
+        "event stream ended; reconnecting in 1.0s",
+        "event stream ended; reconnecting in 2.0s",
+        "stopping",
+    ] {
+        assert!(log.contains(line), "{line:?} not in:\n{log}");
+    }
 }
 
 const ADOPTED: &str = "mcp:launch:existing";
@@ -2328,4 +2361,671 @@ async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
     let adopted = board::daemon::adoption_message(&"fb".parse().unwrap(), true);
     assert!(adopted.contains(triage));
     assert!(!board::daemon::adoption_message(&factory(), false).contains("# Triage"));
+}
+
+/// An env whose daemon follows the stub's event stream after seq 5, with a client that
+/// waits `request` for an answer and steps short enough for a test.
+fn following_env(request: Duration) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let mut daemon = daemon_timed(dir.path(), &stub, projects(), &t3, Some(request));
+    daemon.state.last_seq = Some(5);
+    daemon.timing = board::daemon::Timing {
+        reconcile_every: Duration::from_secs(60),
+        flush_every: Duration::from_millis(100),
+        stream_idle: Duration::from_secs(60),
+        reconcile_budget: Duration::from_secs(60),
+        flush_budget: Duration::from_millis(300),
+        stop_budget: Duration::from_secs(1),
+        thread_check: Duration::from_secs(10),
+        reconnect_first: Duration::from_secs(1),
+    };
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    Env {
+        _dir: dir,
+        stub,
+        t3,
+        daemon,
+    }
+}
+
+/// Follows the stream until `until` holds (checked every 20 ms) or `give_up` passes, then
+/// asks the daemon to stop; returns how long that took and how long stopping took.
+async fn follow_until(
+    e: &mut Env,
+    give_up: Duration,
+    until: impl Fn(&Stub, &FakeT3) -> bool,
+) -> (Duration, Duration) {
+    let (stopper, mut shutdown) = board::daemon::Shutdown::manual();
+    let started = Instant::now();
+    let (stub, t3) = (e.stub.clone(), e.t3.clone());
+    let watch = async {
+        while !until(&stub, &t3) && started.elapsed() < give_up {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let reached = started.elapsed();
+        stopper.stop();
+        (reached, Instant::now())
+    };
+    let (followed, (reached, asked)) =
+        tokio::time::timeout(give_up + Duration::from_secs(5), async {
+            tokio::join!(e.daemon.follow(&mut shutdown), watch)
+        })
+        .await
+        .expect("the daemon did not stop");
+    followed.unwrap();
+    (reached, asked.elapsed())
+}
+
+#[tokio::test]
+async fn a_stalled_server_still_lets_wake_ups_through_and_the_daemon_stop() {
+    let mut e = following_env(Duration::from_millis(500));
+    // The reconcile that runs first hangs on the board list for an hour.
+    e.stub.delay("GET /v1/boards", Duration::from_secs(3600));
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    let ev = answered(&e, 6, 3, "t3:worker");
+    e.stub.on_stream("GET /v1/events", vec![ev]);
+
+    let (reached, stopping) = follow_until(&mut e, Duration::from_secs(10), |_, t3| {
+        !t3.sends().is_empty()
+    })
+    .await;
+    assert_eq!(threads(&e.t3), ["worker"]);
+    assert!(
+        reached < Duration::from_secs(3),
+        "woken {reached:?} after start, despite the hanging reconcile"
+    );
+    assert!(stopping < Duration::from_secs(2), "stopped in {stopping:?}");
+    assert_eq!(saved_state(&e).last_seq, Some(6));
+}
+
+#[tokio::test]
+async fn a_stop_during_a_hanging_reconcile_and_flush_exits_and_keeps_the_wake_ups() {
+    // Long enough that only the race with the stop request ends the hanging steps.
+    let mut e = following_env(Duration::from_secs(3600));
+    e.stub.delay("GET /v1/boards", Duration::from_secs(3600));
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    e.stub.delay(
+        &format!("GET {}", agent_path("t3:worker")),
+        Duration::from_secs(3600),
+    );
+    e.stub.on_stream("GET /v1/events", vec![]);
+    let ev = answered(&e, 6, 3, "t3:worker");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+
+    let (_, stopping) = follow_until(&mut e, Duration::from_millis(500), |_, _| false).await;
+    assert!(stopping < Duration::from_secs(3), "stopped in {stopping:?}");
+    assert!(e.t3.sends().is_empty());
+    let saved = saved_state(&e);
+    assert_eq!(
+        saved.wakes.keys().map(|a| a.as_str()).collect::<Vec<_>>(),
+        ["t3:worker"],
+        "the wake-up stays saved for the next start"
+    );
+}
+
+#[tokio::test]
+async fn a_silent_stream_is_opened_again_after_the_last_event() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.stream_idle = Duration::from_millis(300);
+    let mut ev = event(6, EventType::TaskUpdated, None, "t3:someone");
+    ev.board = None;
+    e.stub.on_stream("GET /v1/events", vec![ev]);
+
+    let (reached, _) = follow_until(&mut e, Duration::from_secs(10), |stub, _| {
+        stub.requests_to("GET /v1/events").len() >= 2
+    })
+    .await;
+    assert!(
+        reached < Duration::from_secs(5),
+        "reconnected after {reached:?}"
+    );
+    let opened = e.stub.requests_to("GET /v1/events");
+    assert_eq!(opened[0].query_pairs()["since"], "5");
+    assert_eq!(
+        opened[1].query_pairs()["since"],
+        "6",
+        "resumes after the event"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_agent_lookup_waits_for_its_back_off() {
+    use board::daemon::WAKE_RETRY_FIRST;
+    let mut e = env();
+    let route = format!("GET {}", agent_path("t3:worker"));
+    e.stub
+        .on_error(&route, 503, "unavailable", "restarting", "try again");
+    let ev = answered(&e, 6, 3, "t3:worker");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+
+    e.daemon.flush(at()).await;
+    assert_eq!(e.stub.requests_to(&route).len(), 1);
+    e.daemon.flush(at() + chrono::Duration::seconds(3)).await;
+    e.daemon.flush(at() + chrono::Duration::seconds(20)).await;
+    assert_eq!(
+        e.stub.requests_to(&route).len(),
+        1,
+        "not before the back-off ends"
+    );
+
+    e.stub
+        .on(&route, agent_fixture("t3:worker", DEVICE, AgentState::Idle));
+    e.daemon.flush(at() + WAKE_RETRY_FIRST).await;
+    assert_eq!(e.stub.requests_to(&route).len(), 2);
+    assert_eq!(threads(&e.t3), ["worker"]);
+}
+
+#[test]
+fn the_watch_lock_is_held_once_per_home_and_released_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path().join("home"));
+    let lock = board::daemon::lock_watch(&home).unwrap();
+    let err = board::daemon::lock_watch(&home).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!("pid {}", std::process::id())) && err.contains("already running"),
+        "{err}"
+    );
+    drop(lock);
+    board::daemon::lock_watch(&home).expect("free again once released");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_watch_on_the_same_home_exits_naming_the_first() {
+    use std::process::{Child, Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    stub.on_stream("GET /v1/events", vec![]);
+    let home = home_for(dir.path(), &stub.url);
+    let watch = |stderr: Stdio| -> Child {
+        Command::new(env!("CARGO_BIN_EXE_board"))
+            .arg("watch")
+            .env("BOARD_HOME", &home)
+            .env("BOARD_TOKEN", TOKEN)
+            .env("BOARD_KEYCHAIN", "0")
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap()
+    };
+    let wait_connected = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stub.requests_to("GET /v1/events").len() < n {
+            assert!(Instant::now() < deadline, "the daemon never connected");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let stop = |mut child: Child| {
+        let killed = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{status:?}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "the daemon ignored SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let first = watch(Stdio::null());
+    wait_connected(1);
+    let second = watch(Stdio::piped()).wait_with_output().unwrap();
+    assert!(!second.status.success());
+    let message = stderr(&second);
+    assert!(
+        message.contains("already running") && message.contains(&format!("pid {}", first.id())),
+        "{message}"
+    );
+    assert_eq!(
+        stub.requests_to("GET /v1/events").len(),
+        1,
+        "the second never connected"
+    );
+
+    // Gone with the process: the next start (a launchd restart) takes it.
+    stop(first);
+    let third = watch(Stdio::null());
+    wait_connected(2);
+    stop(third);
+}
+
+#[tokio::test]
+async fn a_hanging_thread_check_holds_up_no_other_board() {
+    let mut e = env();
+    e.daemon.timing.thread_check = Duration::from_millis(300);
+    let mut boards = Vec::new();
+    for (slug, thread) in [("factory", "coord"), ("other", "hung"), ("third", "slow")] {
+        let agent = format!("t3:{thread}");
+        e.t3.live(thread);
+        e.daemon.state.coordinators.insert(
+            slug.parse().unwrap(),
+            Coordinator {
+                thread: thread.into(),
+                agent: agent.parse().unwrap(),
+                started_at: at(),
+                renewed_at: at(),
+                resumed_after: None,
+                registered: true,
+            },
+        );
+        let mut board = autopilot(Some(&agent), &[DEVICE]);
+        board.slug = slug.parse().unwrap();
+        e.stub
+            .on(&format!("POST /v1/boards/{slug}/coordinator"), &board);
+        e.stub.on(
+            &format!("GET {}", agent_path(&agent)),
+            agent_fixture(&agent, DEVICE, AgentState::Idle),
+        );
+        boards.push(board);
+    }
+    e.stub.on("GET /v1/boards", &boards);
+    // T3 answers for no thread: one after another, the checks would take 900 ms.
+    e.t3.hang_info
+        .lock()
+        .unwrap()
+        .extend(["coord".into(), "hung".into(), "slow".into()]);
+
+    let started = Instant::now();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(11))
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(700),
+        "the checks ran side by side, each cut at 300 ms: {took:?}"
+    );
+    for slug in ["factory", "other", "third"] {
+        assert_eq!(
+            e.stub
+                .requests_to(&format!("POST /v1/boards/{slug}/coordinator"))
+                .len(),
+            1,
+            "{slug}: renewed, a check that never answers being no sign the thread is gone"
+        );
+    }
+    assert_eq!(e.daemon.state.coordinators.len(), 3, "none replaced");
+}
+
+#[tokio::test]
+async fn a_flapping_stream_backs_off_although_each_connection_carries_an_event() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.reconnect_first = Duration::from_millis(50);
+    let events = (6..60)
+        .map(|seq| {
+            let mut ev = event(seq, EventType::TaskUpdated, None, "t3:someone");
+            ev.board = None;
+            ev
+        })
+        .collect();
+    e.stub.on_flapping_stream("GET /v1/events", events);
+
+    follow_until(&mut e, Duration::from_millis(1200), |_, _| false).await;
+    // Backing off: opened at about 0, 50, 150, 350 and 750 ms; one per 50 ms otherwise.
+    let opened = e.stub.requests_to("GET /v1/events").len();
+    assert!((3..=7).contains(&opened), "opened {opened} times in 1.2 s");
+    let handled = e.daemon.state.last_seq.unwrap() - 5;
+    assert!(
+        handled >= opened as i64 - 1,
+        "each connection's event was handled: {handled} of {opened}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_watch_state_is_kept_aside_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 9}));
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    stub.on(
+        "GET /v1/events",
+        board_proto::EventsPage {
+            events: vec![],
+            next_since: 9,
+        },
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("watch.json"), "{\"last_seq\": 4, \"wakes\": tru").unwrap();
+
+    let out = board(&home, dir.path(), &[], &["watch", "--once"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("watch.json: cannot read it") && log.contains("starting fresh"),
+        "{log}"
+    );
+    let copies: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|f| f.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("watch.json.unreadable-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(
+        std::fs::read_to_string(state.join(&copies[0])).unwrap(),
+        "{\"last_seq\": 4, \"wakes\": tru"
+    );
+    let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
+    assert_eq!(
+        saved.last_seq,
+        Some(9),
+        "started fresh from the server's seq"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_coordinator_start_is_logged() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
+    stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(&format!("t3:{NEW_THREAD}"), DEVICE, AgentState::Running),
+    );
+    stub.on(
+        "GET /v1/events",
+        board_proto::EventsPage {
+            events: vec![],
+            next_since: 5,
+        },
+    );
+    let t3 = dir.path().join("t3");
+    std::fs::write(
+        &t3,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             'thread start') cat >/dev/null; echo '{{\"threadId\":\"{NEW_THREAD}\"}}' ;;\n\
+             'thread show') echo '{{\"thread\":{{\"archived\":false}}}}' ;;\n\
+             'thread list') echo '{{\"threads\":[]}}' ;;\n\
+             *) cat >/dev/null ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = home_for(dir.path(), &stub.url);
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "{config}t3_bin = {:?}\n[projects]\n{REPO:?} = \"/src/agent-board\"\n",
+            t3.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let out = board(&home, dir.path(), &[], &["watch", "--once"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains(&format!(
+            "started coordinator thread {NEW_THREAD} for factory"
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("t3:{NEW_THREAD} coordinates factory")),
+        "{log}"
+    );
+}
+
+/// Stubs `agent` as an idle T3 thread on this device and queues the answer to its ask.
+async fn queue_answer(e: &mut Env, seq: i64, ask: i64, agent: &str, now: Timestamp) {
+    e.stub.on(
+        &format!("GET {}", agent_path(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    let ev = answered(e, seq, ask, agent);
+    e.daemon.on_event(&ev, now).await.unwrap();
+}
+
+fn queued(state: &board::daemon::WatchState) -> Vec<&str> {
+    state.wakes.keys().map(|a| a.as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_stop_that_cuts_a_flush_short_keeps_the_wake_ups_it_was_checking() {
+    let mut e = following_env(Duration::from_secs(3600));
+    // Only the stop request ends this flush.
+    e.daemon.timing.flush_budget = Duration::from_secs(3600);
+    e.daemon.timing.stop_budget = Duration::from_millis(300);
+    e.stub.on_stream("GET /v1/events", vec![]);
+    queue_answer(&mut e, 6, 3, "t3:worker", chrono::Utc::now()).await;
+    e.stub.delay(
+        &format!("GET {}", agent_path("t3:worker")),
+        Duration::from_secs(3600),
+    );
+
+    let (_, stopping) = follow_until(&mut e, Duration::from_millis(500), |_, _| false).await;
+    assert!(stopping < Duration::from_secs(2), "stopped in {stopping:?}");
+    assert_eq!(queued(&saved_state(&e)), ["t3:worker"]);
+}
+
+#[tokio::test]
+async fn a_last_flush_cut_short_saves_what_it_delivered() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.stop_budget = Duration::from_millis(300);
+    queue_answer(&mut e, 6, 3, "t3:a", chrono::Utc::now()).await;
+    queue_answer(&mut e, 7, 4, "t3:b", chrono::Utc::now()).await;
+    e.t3.hang_send.lock().unwrap().push("b".into());
+    e.stub.delay("GET /v1/boards", Duration::from_secs(3600));
+
+    // Asked to stop at once: the last flush delivers to a, then hangs sending to b.
+    let (_, stopping) = follow_until(&mut e, Duration::ZERO, |_, _| true).await;
+    assert!(stopping < Duration::from_secs(2), "stopped in {stopping:?}");
+    assert_eq!(threads(&e.t3), ["a", "b"]);
+    assert!(
+        queued(&saved_state(&e)).is_empty(),
+        "a was delivered and b may have been: neither is sent again"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_that_cuts_a_retry_short_keeps_its_events() {
+    let mut e = following_env(Duration::from_secs(3600));
+    e.stub.on_stream("GET /v1/events", vec![]);
+    e.stub
+        .on("GET /v1/tasks/factory-1", detail("factory-1", false, &[]));
+    e.stub
+        .delay("GET /v1/tasks/factory-1", Duration::from_secs(3600));
+    let mut failed = event(4, EventType::TaskDone, Some("factory-1"), "t3:x");
+    failed.at = chrono::Utc::now();
+    e.daemon.state.retry.push(failed);
+
+    follow_until(&mut e, Duration::from_millis(500), |_, _| false).await;
+    let saved = saved_state(&e);
+    assert_eq!(
+        saved.retry.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        [4],
+        "still to retry"
+    );
+}
+
+#[tokio::test]
+async fn an_event_the_server_keeps_failing_does_not_hold_up_the_others() {
+    let mut e = env();
+    e.stub.on_error(
+        "GET /v1/tasks/factory-1",
+        503,
+        "unavailable",
+        "broken",
+        "try again",
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-2", detail("factory-2", false, &[]));
+    for (seq, task) in [(6, "factory-1"), (7, "factory-2")] {
+        e.daemon
+            .state
+            .retry
+            .push(event(seq, EventType::TaskDone, Some(task), "t3:x"));
+    }
+    e.daemon.retry_failed(at()).await;
+    let left: Vec<i64> = e.daemon.state.retry.iter().map(|e| e.seq).collect();
+    assert_eq!(left, [6], "the second was retried and settled");
+}
+
+#[tokio::test]
+async fn an_unreachable_server_stops_a_retry_round_after_one_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let mut daemon = daemon_timed(
+        dir.path(),
+        &stub,
+        projects(),
+        &t3,
+        Some(Duration::from_millis(200)),
+    );
+    for (seq, task) in [(6, "factory-1"), (7, "factory-2")] {
+        let route = format!("GET /v1/tasks/{task}");
+        stub.on(&route, detail(task, false, &[]));
+        stub.delay(&route, Duration::from_secs(3600));
+        daemon
+            .state
+            .retry
+            .push(event(seq, EventType::TaskDone, Some(task), "t3:x"));
+    }
+    daemon.retry_failed(at()).await;
+    let tried = stub
+        .requests()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/tasks/"))
+        .count();
+    assert_eq!(tried, 1, "the rest wait for the next tick");
+    assert_eq!(daemon.state.retry.len(), 2);
+}
+
+#[tokio::test]
+async fn queues_a_flush_did_not_check_in_time_do_not_back_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let mut daemon = daemon_timed(
+        dir.path(),
+        &stub,
+        projects(),
+        &t3,
+        Some(Duration::from_secs(3600)),
+    );
+    daemon.timing.flush_budget = Duration::from_millis(300);
+    let mut e = Env {
+        _dir: dir,
+        stub,
+        t3,
+        daemon,
+    };
+    queue_answer(&mut e, 6, 3, "t3:worker", at()).await;
+    queue_answer(&mut e, 7, 4, "t3:slow", at()).await;
+    e.stub.delay(
+        &format!("GET {}", agent_path("t3:slow")),
+        Duration::from_secs(3600),
+    );
+
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["worker"], "checked side by side");
+    let slow = &e.daemon.state.wakes[&"t3:slow".parse().unwrap()];
+    assert_eq!(slow.wakes.len(), 1, "kept");
+    assert_eq!(slow.backoff, None, "never checked, so nothing failed");
+}
+
+#[tokio::test]
+async fn a_send_backing_off_still_passes_answers_on_to_the_coordinator() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_answer(&mut e, 30, 3, "t3:worker", at()).await;
+    e.t3.live("worker");
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["worker"]);
+    let worker = &e.daemon.state.wakes[&"t3:worker".parse().unwrap()];
+    assert!(worker.backoff.is_some(), "the send backs off");
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+
+    // The worker ended while its send backed off: its answer goes to the coordinator now,
+    // not once the back-off ends.
+    let ended = state_changed(31, "t3:worker", AgentState::Ended, None);
+    e.daemon.on_event(&ended, at()).await.unwrap();
+    e.daemon.flush(at() + chrono::Duration::seconds(3)).await;
+    e.daemon.flush(at() + chrono::Duration::seconds(6)).await;
+    assert_eq!(threads(&e.t3), ["worker", "coord"]);
+    assert!(
+        e.t3.sends()[1].1.contains("ask #3 by t3:worker"),
+        "{:?}",
+        e.t3.sends()
+    );
+}
+
+#[tokio::test]
+async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.reconcile_every = Duration::from_millis(200);
+    e.stub
+        .on_error("GET /v1/events", 503, "unavailable", "restarting", "retry");
+    let agent = "t3:coord";
+    e.t3.live("coord");
+    e.daemon.state.coordinators.insert(
+        "factory".parse().unwrap(),
+        Coordinator {
+            thread: "coord".into(),
+            agent: agent.parse().unwrap(),
+            started_at: at(),
+            renewed_at: at(),
+            resumed_after: None,
+            registered: true,
+        },
+    );
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(agent), &[DEVICE]),
+    );
+
+    let (reached, _) = follow_until(&mut e, Duration::from_secs(3), |stub, _| {
+        stub.requests_to("GET /v1/boards").len() >= 3
+    })
+    .await;
+    assert!(
+        reached < Duration::from_secs(2),
+        "reconciled at start and on its tick: {reached:?}"
+    );
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .len(),
+        1,
+        "the due lease was renewed"
+    );
 }
