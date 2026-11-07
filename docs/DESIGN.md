@@ -341,8 +341,11 @@ registers without a repo).
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
   moves the pairing to another chat once redeemed; message ids from the old chat are
-  forgotten then. Everything else from other chats is ignored. When the agent withdraws an
-  ask, its message is edited to say so and its buttons are removed.
+  forgotten then. Everything else from other chats is ignored. Each ask is sent once: the
+  notifier claims the send in the database, so an ask created while a chat pairs is not
+  sent by both paths. An answer the server cannot record (say the database is busy) is
+  acknowledged as not recorded, and the ask stays open to answer again. When the agent
+  withdraws an ask, its message is edited to say so and its buttons are removed.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

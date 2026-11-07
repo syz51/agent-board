@@ -20,6 +20,9 @@ const A: &str = "t3:alpha";
 struct Fake {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     updates: Arc<Mutex<VecDeque<Value>>>,
+    /// How long to hold the answer to the "Paired" message, which keeps the notifier
+    /// between pairing a chat and sending it the open asks.
+    paired_delay: Arc<Mutex<Duration>>,
 }
 
 impl Fake {
@@ -59,7 +62,15 @@ async fn bot_api(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     assert_eq!(bot, format!("bot{TOKEN}"));
+    let paired = method == "sendMessage"
+        && body["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("Paired"));
     fake.calls.lock().unwrap().push((method.clone(), body));
+    if paired {
+        let delay = *fake.paired_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+    }
     let result = match method.as_str() {
         "getUpdates" => {
             let next = fake.updates.lock().unwrap().pop_front();
@@ -570,4 +581,100 @@ async fn a_withdrawn_ask_is_marked_in_telegram() {
         .await
         .expect("the notifier stops on shutdown")
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_answer_that_fails_to_record_is_reported_and_stays_answerable() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    let mut config = TelegramConfig::new(CHAT);
+    config.bot_token = Some(TOKEN.to_owned());
+    config.api_base = api_base;
+    let notifier = spawn_telegram(t.state.clone(), config).unwrap().unwrap();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let id = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "kind": "decision",
+                "question": "Publish now?", "options": ["yes", "later"],
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    fake.wait("sendMessage", 1).await;
+
+    // The database refuses to record answers for a while.
+    let sql = |sql: &'static str| {
+        t.state.write(move |cx| {
+            cx.db.execute_batch(sql)?;
+            Ok(())
+        })
+    };
+    sql(
+        "CREATE TRIGGER refuse_answers BEFORE UPDATE OF status ON asks \
+         BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+    )
+    .await
+    .unwrap();
+    let press = |update_id: i64| {
+        json!({
+            "update_id": update_id,
+            "callback_query": {
+                "id": format!("cb-{update_id}"),
+                "data": format!("ask:{id}:0"),
+                "message": { "message_id": 1001, "chat": { "id": CHAT } },
+            },
+        })
+    };
+    fake.push(press(1));
+    let acks = fake.wait("answerCallbackQuery", 1).await;
+    assert_eq!(
+        acks[0]["text"],
+        format!(
+            "Ask {id}: the board could not record this answer; it is still open, so answer again."
+        )
+    );
+    let open = t.ok("GET", "/v1/asks?status=open", None, None).await;
+    assert_eq!(open.as_array().unwrap().len(), 1, "{open}");
+
+    // Pressing again once the database is back answers it.
+    sql("DROP TRIGGER refuse_answers;").await.unwrap();
+    fake.push(press(2));
+    assert_eq!(wait_for_answer(&t, id).await["answer"], "yes");
+    let acks = fake.wait("answerCallbackQuery", 2).await;
+    assert_eq!(acks[1]["text"], format!("Answered ask {id}: yes"));
+
+    t.state.shutdown();
+    notifier.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ask_created_while_a_chat_pairs_is_sent_once() {
+    const PHONE: i64 = 555;
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let notifier = spawn_telegram(t.state.clone(), unpaired(api_base))
+        .unwrap()
+        .unwrap();
+    *fake.paired_delay.lock().unwrap() = Duration::from_millis(300);
+    let code = t.state.create_telegram_pairing(false).unwrap();
+    fake.push(start(1, PHONE, "private", &format!("/start {code}")));
+    // The chat is paired once the notifier says so; the open asks follow after it.
+    fake.wait("sendMessage", 1).await;
+    ask(&t, "Mid-pairing").await;
+    let sent = fake.wait("sendMessage", 2).await;
+    assert!(sent[1]["text"].as_str().unwrap().contains("Mid-pairing"));
+    fake.wait("getUpdates", fake.calls("getUpdates").len() + 2)
+        .await;
+    assert_eq!(fake.calls("sendMessage").len(), 2, "the ask is sent once");
+
+    t.state.shutdown();
+    notifier.await.unwrap();
 }
