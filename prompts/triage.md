@@ -19,9 +19,10 @@ only for a cause that is already gone.
 - **duplicate**: the same problem as another item. `task_list` the board (done items too)
   to find it. `feedback_resolve` with kind `duplicate` and `task` the original's id.
 - **routed**: the owner should change something. Create a task on the owner's board with
-  `task_add` (`board` set, `auto=false`): an imperative title; a body that starts
-  `Proposal:`, stands alone, says what is wrong and what to change, and cites this item's
-  id and report count; and acceptance
+  `task_add` (`board` set, `auto=false`): an imperative title; a `priority` from the
+  Priority scale in the coordinator instructions above; a body that starts `Proposal:`,
+  stands alone, says what is wrong and what to change, and cites this item's id, its report
+  count and the priority criterion it meets; and acceptance
   checks, one per line, that show the problem is gone where agents meet it, the last one
   "the fix is deployed or installed where agents use it". Do not make the owner wait to
   watch for repeats: a report after the routed task is done opens a new item that recurs

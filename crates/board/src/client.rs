@@ -50,6 +50,16 @@ pub fn error_code(err: &anyhow::Error) -> Option<ErrorCode> {
     err.downcast_ref::<ServerError>().map(ServerError::code)
 }
 
+/// Whether `err` is the server not answering at all (no connection, or no answer in
+/// time), rather than an answer that was an error.
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_request())
+    })
+}
+
 /// Query filters for `GET /v1/tasks`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TaskQuery {
@@ -76,12 +86,18 @@ pub struct SnapshotQuery {
     pub format: SnapshotFormat,
 }
 
+/// How long a long-running process (the daemon, the MCP server) waits for one answer, so a
+/// server that accepts and never answers cannot hold it up.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base: String,
     token: String,
     agent: Option<AgentId>,
+    /// Bounds each request and its answer; for the event stream, only until it opens.
+    timeout: Option<Duration>,
 }
 
 impl fmt::Debug for Client {
@@ -95,24 +111,25 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// A client for `base`; `timeout` bounds each whole request (none for streams).
+    /// A client for `base`; `timeout` bounds each whole request, and only the opening of
+    /// the event stream, whose events arrive for as long as it stays open.
     pub fn new(
         base: &str,
         token: String,
         agent: Option<AgentId>,
         timeout: Option<Duration>,
     ) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
+        let http = reqwest::Client::builder()
             .connect_timeout(timeout.unwrap_or(Duration::from_secs(10)))
-            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")));
-        if let Some(timeout) = timeout {
-            builder = builder.timeout(timeout);
-        }
+            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
         Ok(Self {
-            http: builder.build().context("building the HTTP client")?,
+            http,
             base: base.trim_end_matches('/').to_owned(),
             token,
             agent,
+            timeout,
         })
     }
 
@@ -135,6 +152,26 @@ impl Client {
         }
     }
 
+    /// A client like [`Client::new`] with `timeout`, whose connections must open (TLS
+    /// included) within `connect`: a server that cannot be reached then fails as a connect
+    /// error well before `timeout`, which a hook tells apart from a slow answer.
+    pub fn with_connect_timeout(
+        base: &str,
+        token: String,
+        agent: Option<AgentId>,
+        timeout: Duration,
+        connect: Duration,
+    ) -> Result<Self> {
+        let mut client = Self::new(base, token, agent, Some(timeout))?;
+        client.http = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .timeout(timeout)
+            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(client)
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let mut req = self
             .http
@@ -146,7 +183,10 @@ impl Client {
         req
     }
 
-    async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
+    async fn send<T: DeserializeOwned>(&self, mut req: RequestBuilder) -> Result<T> {
+        if let Some(timeout) = self.timeout {
+            req = req.timeout(timeout);
+        }
         let resp = req.send().await.context("board server unreachable")?;
         let status = resp.status();
         let bytes = resp.bytes().await.context("reading the server's answer")?;
@@ -408,7 +448,14 @@ impl Client {
                 .header("Last-Event-ID", seq.to_string())
                 .query(&[("since", seq)]);
         }
-        let resp = req.send().await.context("board server unreachable")?;
+        let resp = match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, req.send())
+                .await
+                .map_err(|_| anyhow::anyhow!("no answer in {}s", timeout.as_secs_f32()))
+                .and_then(|sent| Ok(sent?)),
+            None => Ok(req.send().await?),
+        }
+        .context("board server unreachable")?;
         if !resp.status().is_success() {
             let status = resp.status();
             let bytes = resp.bytes().await.unwrap_or_default();

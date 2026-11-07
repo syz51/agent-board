@@ -24,9 +24,14 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_touch_modified.sql"),
     include_str!("../migrations/0009_feedback.sql"),
     include_str!("../migrations/0010_user_updates.sql"),
+    include_str!("../migrations/0011_query_indexes.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Prepared statements kept per connection. The server caches more than 40 distinct
+/// statements; rusqlite's default of 16 would evict and reparse them on every snapshot.
+const STATEMENT_CACHE: usize = 128;
 
 /// The board database: one SQLite connection that every request uses in turn, so writes
 /// are serialized, each in a `BEGIN IMMEDIATE` transaction. Committed events are
@@ -150,6 +155,7 @@ pub(crate) fn open_file(path: &Path) -> Result<Connection> {
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
 }
