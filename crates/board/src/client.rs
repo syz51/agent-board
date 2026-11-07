@@ -50,6 +50,53 @@ pub fn error_code(err: &anyhow::Error) -> Option<ErrorCode> {
     err.downcast_ref::<ServerError>().map(ServerError::code)
 }
 
+/// The first difference seen between the server's build and this one, and whether it was
+/// already reported.
+static SKEW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SKEW_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Compares the build headers of an answer with this build. A server that predates them
+/// sends none and is not compared.
+fn note_server_build(headers: &reqwest::header::HeaderMap) {
+    if SKEW.get().is_some() {
+        return;
+    }
+    let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let Some(version) = get(board_proto::VERSION_HEADER) else {
+        return;
+    };
+    let commit = get(board_proto::COMMIT_HEADER).unwrap_or("unknown");
+    if let Some(warning) = skew_warning(version, commit, board_proto::VERSION, board_proto::COMMIT)
+    {
+        let _ = SKEW.set(warning);
+    }
+}
+
+/// The warning when the server's build differs from the client's: by version, or by
+/// commit when both know theirs.
+pub fn skew_warning(
+    server_version: &str,
+    server_commit: &str,
+    version: &str,
+    commit: &str,
+) -> Option<String> {
+    let known = server_commit != "unknown" && commit != "unknown";
+    if server_version == version && (!known || server_commit == commit) {
+        return None;
+    }
+    Some(format!(
+        "the board server runs {server_version} ({server_commit}) but this client is {version} \
+         ({commit}): upgrade the older one (docs/DEPLOY.md), then restart any session whose \
+         MCP server started before the upgrade"
+    ))
+}
+
+/// The skew warning, once per process: `None` when the builds match or it was taken.
+pub fn take_skew_warning() -> Option<String> {
+    let warning = SKEW.get()?;
+    (!SKEW_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed)).then(|| warning.clone())
+}
+
 /// Query filters for `GET /v1/tasks`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TaskQuery {
@@ -168,6 +215,7 @@ impl Client {
 
     async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
         let resp = req.send().await.context("board server unreachable")?;
+        note_server_build(resp.headers());
         let status = resp.status();
         let bytes = resp.bytes().await.context("reading the server's answer")?;
         if status.is_success() {

@@ -91,7 +91,14 @@ server's minute sweep.
 
 ### Health
 
-- `GET /healthz` → `{"ok": true, "seq": <latest event>}`; no authentication.
+- `GET /healthz` → `{"ok": true, "seq": <latest event>, "version": "<x.y.z>", "commit":
+  "<12 hex digits or unknown>", "schema_version": <migrations run>}`; no authentication.
+  `version`, `commit` and `schema_version` are absent from servers that predate them.
+- Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
+  same values. The CLI and the MCP server compare them with their own build and warn once
+  per process when they differ: by version, or by commit when both know theirs. The CLI
+  writes the warning to stderr; the MCP server adds it to the next tool result. Hooks stay
+  silent. `board --version` prints `board <version> (<commit>)`.
 
 ### Agents
 

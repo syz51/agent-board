@@ -21,7 +21,7 @@ use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
 #[derive(Debug, Parser)]
 #[command(
     name = "board",
-    version,
+    version = board_proto::BUILD,
     about = "Shared work board for coding-agent threads"
 )]
 pub struct Cli {
@@ -682,13 +682,17 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Admin(cmd) => return report(admin(cmd)),
         _ => {}
     }
-    match dispatch(cli).await {
+    let code = match dispatch(cli).await {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("board: {err:#}");
             1
         }
+    };
+    if let Some(warning) = crate::client::take_skew_warning() {
+        eprintln!("board: warning: {warning}");
     }
+    code
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {

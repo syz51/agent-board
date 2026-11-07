@@ -65,6 +65,8 @@ struct StubState {
     requests: Vec<Recorded>,
     /// Delay applied to every request (an overloaded or hanging server).
     hang: Option<Duration>,
+    /// Version and commit sent in the build headers, as a server does since it reports them.
+    build: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,11 @@ impl Stub {
         self
     }
 
+    /// Names a server build in the headers of every answer.
+    pub fn build(&self, version: &str, commit: &str) {
+        self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned()));
+    }
+
     /// Delays every answer, as a hanging server would.
     pub fn hang(&self, delay: Duration) {
         self.state.lock().unwrap().hang = Some(delay);
@@ -189,7 +196,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         .unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let route = format!("{method} {path}");
-    let (canned, hang) = {
+    let (canned, hang, build) = {
         let mut st = state.lock().unwrap();
         st.requests.push(Recorded {
             method,
@@ -201,7 +208,11 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             body,
         });
         let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
-        (once.or_else(|| st.routes.get(&route).cloned()), st.hang)
+        (
+            once.or_else(|| st.routes.get(&route).cloned()),
+            st.hang,
+            st.build.clone(),
+        )
     };
     if let Some(delay) = hang {
         tokio::time::sleep(delay).await;
@@ -216,6 +227,17 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
     *resp.status_mut() = StatusCode::from_u16(canned.status).unwrap();
     resp.headers_mut()
         .insert("content-type", HeaderValue::from_static("application/json"));
+    if let Some((version, commit)) = build {
+        let headers = resp.headers_mut();
+        headers.insert(
+            board_proto::VERSION_HEADER,
+            HeaderValue::from_str(&version).unwrap(),
+        );
+        headers.insert(
+            board_proto::COMMIT_HEADER,
+            HeaderValue::from_str(&commit).unwrap(),
+        );
+    }
     resp
 }
 
