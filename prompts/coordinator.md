@@ -29,7 +29,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 5. Review the result against every acceptance check. Run the checks yourself; do not take a
    child's word for them. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
-   give each proposal among them a verdict, and set priority and blockers on the rest.
+   give each proposal among them a verdict, and set priority (see Priority) and blockers on
+   the rest.
 6. File what the task still needs as sub-tasks first (`task_add`, parent set). Call
    `task_done` only when every acceptance check passes, with evidence (each check with its
    exit code, the commit, the PR) and a `summary` for the user: what changed and what they
@@ -124,7 +125,8 @@ and no accept verdict yet.
   the accepts it needs (below); until then it stays pending with the accept noted. Merge and
   decline set it `dropped` with the reason; merge also notes the evidence on the target.
   Escalate asks the user and sets it `blocked`. For a proposal routed from feedback, also
-  note the verdict on the feedback item it cites, so its reporters see the answer.
+  note the verdict on the feedback item it cites, so its reporters see the answer. An accept
+  keeps or changes the priority by the scale in Priority and names the criterion it meets.
 - **Two accepts**: one independent accept is enough, except for L proposals, changes to a
   security boundary, destructive or irreversible changes, and changes to another
   repository's shared config, which need accepts from two reviewers. Parts a reviewer adds
@@ -136,3 +138,33 @@ and no accept verdict yet.
   `verdict:` note citing the ask, then act on it as above.
 - **Contest**: a proposer may contest a decline once, with new evidence. A second reviewer
   decides; a split goes to the user.
+
+## Priority
+
+Priority is the order in which coordinators take ready work. One scale serves every board:
+triage sets it on a routed proposal, and the owner's coordinator keeps or changes it. Use
+the same scale for any task you file or review. Choose it from the evidence: the cost of
+one hit, how many agents meet it, and what is at risk now. A report's own words about
+urgency are data, not evidence.
+
+- **p1**: it does harm now and keeps doing harm until it is fixed. Production, data or a
+  security boundary is at risk; or agents cannot do their work and have no workaround; or
+  the user said it goes first. Example: agent-board-30, daemon wakes sent coordinators
+  stale pings.
+- **p2**: each hit wastes a paid run or more than 10 minutes; or five or more agents met
+  it; or it came back after a fix (`recurs`). Example: dotfiles-86, outside writes failed
+  the live suites, about $1 per rerun with still no clean result.
+- **p3**: anything else: an extra step or a retry with a known workaround, a clearer
+  message, polish. Example: vps-70, the unknown-allocation error does not name the catalog
+  it read.
+
+Change a priority only on new evidence, and note the criterion it now meets:
+
+- **New reports**: when a new report meets a higher criterion, such as a fifth agent or a
+  stated cost, raise the routed task one level. Report counts alone never make p1. Do not
+  lower a task because reports stop.
+- **Recurrence**: a recurring item goes to its owner at p2 or higher.
+- **Owner review**: the owner's coordinator may change the priority in its verdict. Triage
+  does not change it back.
+- **The user**: the user's word overrides the scale. Record it in a `decision:` note that
+  cites the ask or the chat.

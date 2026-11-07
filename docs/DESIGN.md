@@ -450,6 +450,23 @@ agrees, after checking it.
   accepted proposals decide whether a server-side record is worth adding.
 - **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
   task; the owner's coordinator verifies it.
+- **Priority**: one scale orders work on every board. It is defined once, in the
+  "Priority" section of `prompts/coordinator.md`. The triage coordinator reads that file
+  before `prompts/triage.md`, so triage and owners apply the same text. The definition is
+  priority by impact and urgency, as in ITIL, set at triage, as Bugzilla projects set
+  their priority field:
+  - p1 is harm now: production, data or a security boundary at risk, agents blocked with no
+    workaround, or the user's word.
+  - p2 is real cost per hit: a wasted paid run or over 10 minutes, five or more agents, or a
+    fix that did not hold.
+  - p3 is everything else.
+
+  A priority changes only on new evidence. New reports raise it one level at a time, and
+  report counts never make p1. The owner's verdict stands over triage's choice, and the user's word over both.
+  Feedback items themselves stay filed at p2 by the server. Triage claims each one within
+  minutes (median 77 s over the first 81 items), so their priority orders no queue.
+  Setting it on the server would add code that decides nothing. Report counts also predict
+  value poorly: the item with the second most reports, 24 from 7 agents, was declined.
 
 ## Feedback loop
 
