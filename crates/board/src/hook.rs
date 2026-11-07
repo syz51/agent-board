@@ -513,24 +513,51 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
-        let mut paths = edited_paths(tool, &self.input["tool_input"]);
-        let shell_start = self.shell_start;
-        if !paths.is_empty() || shell_start.is_some() {
-            let repo = detect_repo(self.cwd()).await?;
-            if let (Some(since), Some(root)) = (shell_start, repo.root.as_deref()) {
-                // Bounded on its own, so a slow work tree never eats the server's budget.
-                match tokio::time::timeout(SHELL_SCAN_BUDGET, changed_since(root, since)).await {
-                    Ok(Ok(changed)) => paths.extend(changed),
-                    Ok(Err(err)) => tracing::debug!("files changed by the shell call: {err:#}"),
-                    Err(_) => tracing::debug!("files changed by the shell call: over budget"),
+        let edited = edited_paths(tool, &self.input["tool_input"]);
+        if !edited.is_empty() || self.shell_start.is_some() {
+            let cwd = self.cwd();
+            let repo = detect_repo(cwd.clone()).await?;
+            // An edit tool names its files; a shell call's are found by scanning the work
+            // tree, so another agent in the same checkout may have written them. Edit tools
+            // never have a start mark, and a shell call names no files.
+            let (paths, scanned) = match (self.shell_start, repo.root.as_deref()) {
+                (Some(since), Some(root)) => {
+                    // Bounded on its own, so a slow work tree never eats the server's budget.
+                    let found =
+                        match tokio::time::timeout(SHELL_SCAN_BUDGET, changed_since(root, since))
+                            .await
+                        {
+                            Ok(Ok(changed)) => changed,
+                            Ok(Err(err)) => {
+                                tracing::debug!("files changed by the shell call: {err:#}");
+                                Vec::new()
+                            }
+                            Err(_) => {
+                                tracing::debug!("files changed by the shell call: over budget");
+                                Vec::new()
+                            }
+                        };
+                    let found = found.into_iter().map(|(p, at)| (p, Some(at))).collect();
+                    (found, true)
                 }
-            }
+                (Some(_), None) => (Vec::new(), true),
+                (None, _) => {
+                    let named = edited
+                        .into_iter()
+                        .map(|p| {
+                            let at = modified_at(&cwd.join(&p));
+                            (p, at)
+                        })
+                        .collect();
+                    (named, false)
+                }
+            };
             if let Some(key) = repo.key.clone() {
                 // A path the server would refuse would fail the whole request.
-                let rel: Vec<String> = paths
+                let rel: Vec<(String, Option<Timestamp>)> = paths
                     .iter()
-                    .filter_map(|p| repo.relative(p))
-                    .filter(|p| {
+                    .filter_map(|(p, at)| Some((repo.relative(p)?, *at)))
+                    .filter(|(p, _)| {
                         p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control)
                     })
                     .collect();
@@ -540,7 +567,12 @@ impl Hook<'_> {
                         .touches(&Touches {
                             agent: self.agent.clone(),
                             repo: key.clone(),
-                            paths: chunk.to_vec(),
+                            paths: chunk.iter().map(|(p, _)| p.clone()).collect(),
+                            scanned,
+                            modified: chunk
+                                .iter()
+                                .filter_map(|(p, at)| Some((p.clone(), (*at)?)))
+                                .collect(),
                         })
                         .await?;
                     lines.extend(render::overlaps(&result));
@@ -681,7 +713,7 @@ const SHELL_SCAN_BUDGET: Duration = Duration::from_millis(500);
 /// Not seen: files the call deleted, changed and committed, or wrote keeping an older
 /// modification time (`mv`, `cp -p`, archives). Seen as well: files another writer in the
 /// same work tree changed during the call. Dropping the future stops `git`.
-pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>> {
+pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<(PathBuf, Timestamp)>> {
     let out = tokio::process::Command::new("git")
         // A read-only scan: no index refresh, so no `index.lock` to collide with.
         .arg("--no-optional-locks")
@@ -709,12 +741,17 @@ pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>
         .filter_map(|entry| std::str::from_utf8(entry.get(3..)?).ok())
         .filter(|path| !path.is_empty())
         .map(|path| root.join(path))
-        .filter(|path| {
-            std::fs::symlink_metadata(path)
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| DateTime::<Utc>::from(modified) >= since)
+        .filter_map(|path| {
+            let modified = modified_at(&path)?;
+            (modified >= since).then_some((path, modified))
         })
         .collect())
+}
+
+/// A file's modification time, without following a symlink; `None` when it is gone.
+fn modified_at(path: &Path) -> Option<Timestamp> {
+    let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
 }
 
 /// Files a tool call edited: Claude Code's `Edit`, `Write`, `MultiEdit` and

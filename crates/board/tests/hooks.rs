@@ -260,7 +260,8 @@ fn post_tool_use_records_touches_warns_on_overlap_and_throttles_heartbeats() {
     );
     assert_eq!(
         e.stub.requests_to("POST /v1/touches")[0].body,
-        json!({"agent": CLAUDE_AGENT, "repo": "github.com/syz51/agent-board", "paths": ["src/lib.rs"]})
+        json!({"agent": CLAUDE_AGENT, "repo": "github.com/syz51/agent-board", "paths": ["src/lib.rs"]}),
+        "an edit tool's paths are not scanned; a missing file has no time"
     );
     assert_eq!(e.stub.requests_to(&state_path()).len(), 1);
     assert_eq!(
@@ -283,6 +284,38 @@ fn post_tool_use_records_touches_warns_on_overlap_and_throttles_heartbeats() {
         "heartbeat throttled to once a minute"
     );
     assert_eq!(e.stub.requests_to("GET /v1/snapshot").len(), 1);
+}
+
+#[test]
+fn edit_tool_touches_carry_the_files_modification_time() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    std::fs::create_dir_all(e.repo.join("src")).unwrap();
+    std::fs::write(e.repo.join("src/lib.rs"), "b\n").unwrap();
+    let edit = e.with(
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": e.repo.join("src/lib.rs"), "old_string": "a", "new_string": "b"},
+            "tool_use_id": "toolu_ed1",
+        }),
+    );
+    e.hook("post-tool-use", "claude", edit);
+    assert_eq!(
+        e.stub.requests_to("POST /v1/touches")[0].body,
+        json!({
+            "agent": CLAUDE_AGENT,
+            "repo": "github.com/syz51/agent-board",
+            "paths": ["src/lib.rs"],
+            "modified": {"src/lib.rs": mtime(&e.repo.join("src/lib.rs"))},
+        })
+    );
 }
 
 #[test]
@@ -313,11 +346,35 @@ fn codex_apply_patch_records_each_patched_file() {
         "tool_input": {"command": patch},
         "tool_response": "Success",
     });
-    let (_, text) = e.hook("post-tool-use", "codex", payload);
-    assert_eq!(text, "");
+    std::fs::create_dir_all(e.repo.join("src")).unwrap();
+    std::fs::write(e.repo.join("src/a.rs"), "y\n").unwrap();
+    // Run from another directory: the patch's relative paths are the payload cwd's.
+    let elsewhere = e.home.parent().unwrap();
+    let out = board(
+        &e.home,
+        elsewhere,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "codex"],
+        &payload.to_string(),
+    );
+    assert_eq!(stdout(&out), "");
     let touch = &e.stub.requests_to("POST /v1/touches")[0];
     assert_eq!(touch.agent.as_deref(), Some(codex_agent));
     assert_eq!(touch.body["paths"], json!(["src/a.rs", "docs/b.md"]));
+    assert_eq!(
+        touch.body["modified"],
+        json!({"src/a.rs": mtime(&e.repo.join("src/a.rs"))}),
+        "the patched file's time; the added one is not on disk here"
+    );
+}
+
+/// A file's modification time as the hook reports it.
+fn mtime(path: &std::path::Path) -> chrono::DateTime<chrono::Utc> {
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .into()
 }
 
 /// Sets a file's modification time well before any hook in the test ran.
@@ -422,14 +479,21 @@ fn shell_calls_record_the_files_they_changed() {
         "the same alert as an Edit: {text}"
     );
     let touches = e.stub.requests_to("POST /v1/touches");
+    let mut body = touches[0].body.clone();
+    let modified = body.as_object_mut().unwrap().remove("modified").unwrap();
     assert_eq!(
-        touches[0].body,
+        body,
         json!({
             "agent": CLAUDE_AGENT,
             "repo": "github.com/syz51/agent-board",
             "paths": ["src/main.rs", "src/lib.rs", "src/new/mod.rs"],
+            "scanned": true,
         })
     );
+    // Each path's modification time, so the server can tell a peer's edit from this call's.
+    for path in ["src/main.rs", "src/lib.rs", "src/new/mod.rs"] {
+        assert_eq!(modified[path], json!(mtime(&e.repo.join(path))), "{path}");
+    }
 
     // The start mark is used once; a shell call without one records nothing.
     e.hook("post-tool-use", "claude", post);

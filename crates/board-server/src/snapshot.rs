@@ -791,6 +791,17 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                 };
                 let when = ago(cx.now - event.at);
                 for touched in str_list(&event.payload, "paths") {
+                    // Gone when a peer's edit showed a shell scan's path was the peer's.
+                    let still_theirs: bool = cx
+                        .db
+                        .prepare_cached(
+                            "SELECT EXISTS (SELECT 1 FROM touches \
+                         WHERE agent = ?1 AND repo = ?2 AND path = ?3)",
+                        )?
+                        .query_row(params![event.actor, repo, touched], |r| r.get(0))?;
+                    if !still_theirs {
+                        continue;
+                    }
                     let mine_touch = my_touches
                         .iter()
                         .filter(|(r, p, _)| r == repo && *p == touched)

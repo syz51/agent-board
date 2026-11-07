@@ -216,6 +216,16 @@ pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
     }
     req.paths.sort();
     req.paths.dedup();
+    if let Some(extra) = req
+        .modified
+        .keys()
+        .find(|path| req.paths.binary_search(path).is_err())
+    {
+        return Err(invalid(
+            format!("modified names {extra:?}, which is not in paths"),
+            "send modification times only for paths in the request",
+        ));
+    }
     Ok(req)
 }
 
@@ -224,12 +234,52 @@ pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
 pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
     touch_agent(cx, &req.agent)?;
     let now = cx.now_ms();
+    let me = req.agent.as_str();
+    let mut recorded = Vec::with_capacity(req.paths.len());
     for path in &req.paths {
-        cx.db.execute(
-            "INSERT INTO touches (agent, repo, path, at) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (agent, repo, path) DO UPDATE SET at = ?4",
-            params![req.agent.as_str(), req.repo, path, now],
+        let modified = req.modified.get(path).map(|at| at.timestamp_millis());
+        // A scanned path with the time of an edit-tool touch by a peer on the caller's
+        // device (the only peers that can share its work tree) is the peer's write, made
+        // during the caller's shell call. When the peer's touch comes second, it removes
+        // the scanned one instead.
+        if let Some(modified) = modified {
+            let peers = "agent != ?3 AND agent IN (SELECT id FROM agents \
+                 WHERE device = (SELECT device FROM agents WHERE id = ?3))";
+            if req.scanned {
+                let peer_wrote: bool = cx.db.query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM touches WHERE repo = ?1 AND path = ?2 \
+                         AND scanned = 0 AND modified = ?4 AND {peers})"
+                    ),
+                    params![req.repo, path, me, modified],
+                    |r| r.get(0),
+                )?;
+                if peer_wrote {
+                    continue;
+                }
+            } else {
+                cx.db.execute(
+                    &format!(
+                        "DELETE FROM touches WHERE repo = ?1 AND path = ?2 \
+                         AND scanned = 1 AND modified = ?4 AND {peers}"
+                    ),
+                    params![req.repo, path, me, modified],
+                )?;
+            }
+        }
+        // A scanned report never replaces the caller's own edit-tool touch, which a peer's
+        // matching write could then remove.
+        let written = cx.db.execute(
+            "INSERT INTO touches (agent, repo, path, at, scanned, modified) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent, repo, path) DO UPDATE \
+             SET at = ?4, scanned = ?5, modified = ?6 \
+             WHERE touches.scanned = 1 OR excluded.scanned = 0",
+            params![me, req.repo, path, now, req.scanned, modified],
         )?;
+        if written > 0 {
+            recorded.push(path.clone());
+        }
     }
     cx.db.execute(
         "UPDATE leases SET expires_at = MAX(expires_at, ?4) \
@@ -242,17 +292,19 @@ pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
         ],
     )?;
     let overlaps = overlaps(cx, &req.agent, &req.repo, &req.paths)?;
-    cx.emit(
-        None,
-        req.agent.as_str(),
-        EventType::FilesTouched,
-        None,
-        serde_json::json!({
-            "repo": req.repo,
-            "paths": req.paths,
-            "overlaps": overlaps.len(),
-        }),
-    )?;
+    if !recorded.is_empty() {
+        cx.emit(
+            None,
+            me,
+            EventType::FilesTouched,
+            None,
+            serde_json::json!({
+                "repo": req.repo,
+                "paths": recorded,
+                "overlaps": overlaps.iter().filter(|o| recorded.contains(&o.path)).count(),
+            }),
+        )?;
+    }
     Ok(TouchResult { overlaps })
 }
 

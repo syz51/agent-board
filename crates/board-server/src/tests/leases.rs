@@ -232,3 +232,89 @@ async fn repeated_globs_are_leased_once() {
     assert_eq!(globs, ["src/**", "docs/**"]);
     assert_eq!(t.count("SELECT count(*) FROM leases"), 2);
 }
+
+#[tokio::test]
+async fn a_peers_edit_found_by_a_shell_scan_is_not_the_scanners() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let send = |agent: &'static str, path: &'static str, scanned: bool, modified: &str| {
+        let t = &t;
+        let body = json!({
+            "agent": agent, "repo": REPO, "paths": [path], "scanned": scanned,
+            "modified": { path: modified },
+        });
+        async move { t.ok("POST", "/v1/touches", Some(agent), Some(body)).await }
+    };
+    let paths = |t: &T, agent: &str| {
+        t.count(&format!(
+            "SELECT COUNT(*) FROM touches WHERE agent = '{agent}'"
+        ))
+    };
+    let edited = "2026-11-06T12:00:00.250Z";
+
+    // B's shell scan reports first, then A's Edit of the same write: A is not warned
+    // about B, and B's scanned touch is gone.
+    send(B, "hooks/shell.js", true, edited).await;
+    let result = send(A, "hooks/shell.js", false, edited).await;
+    assert_eq!(result["overlaps"], json!([]), "{result}");
+    assert_eq!(paths(&t, B), 0);
+
+    // A's Edit reports first, then B's scan finds the same write: not recorded for B, and
+    // B learns A touched it.
+    send(A, "hooks/run.js", false, edited).await;
+    let since = t.count("SELECT MAX(seq) FROM events");
+    let result = send(B, "hooks/run.js", true, edited).await;
+    assert_eq!(result["overlaps"][0]["agent"], A, "{result}");
+    assert_eq!(paths(&t, B), 0);
+    assert_eq!(
+        t.count("SELECT MAX(seq) FROM events"),
+        since,
+        "no files_touched"
+    );
+
+    // A file B's command wrote itself has its own time: recorded for B, and A's later edit
+    // is a real overlap.
+    send(B, "hooks/build.js", true, "2026-11-06T12:00:01Z").await;
+    assert_eq!(paths(&t, B), 1);
+    let result = send(A, "hooks/build.js", false, "2026-11-06T12:00:05Z").await;
+    assert_eq!(result["overlaps"][0]["agent"], B, "{result}");
+
+    // A's alerts: B's real write of build.js, not B's scan of A's shell.js edit, whose
+    // files_touched event came before A's touch removed it.
+    let alerts = t.ok("GET", "/v1/snapshot?kind=alerts", Some(A), None).await;
+    let alerts = alerts["text"].as_str().unwrap();
+    assert!(alerts.contains("edited hooks/build.js"), "{alerts}");
+    assert!(!alerts.contains("hooks/shell.js"), "{alerts}");
+
+    // A scan never replaces the scanner's own earlier edit-tool touch, so a peer's matching
+    // write cannot remove it.
+    send(B, "src/own.rs", false, "2026-11-06T11:00:00Z").await;
+    send(B, "src/own.rs", true, edited).await;
+    send(A, "src/own.rs", false, edited).await;
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM touches WHERE agent = 't3:beta' AND path = 'src/own.rs'"),
+        1
+    );
+
+    // A peer on another device cannot share the work tree: its equal time proves nothing.
+    const C: &str = "t3:gamma";
+    t.register(C, Some(REPO), None).await;
+    send(C, "src/far.rs", true, edited).await;
+    t.exec("UPDATE agents SET device = 'pc' WHERE id = 't3:gamma'");
+    let result = send(A, "src/far.rs", false, edited).await;
+    assert_eq!(result["overlaps"][0]["agent"], C, "{result}");
+
+    // Times only for paths in the request.
+    let (status, _, _) = t
+        .fail(
+            "POST",
+            "/v1/touches",
+            Some(A),
+            Some(json!({
+                "agent": A, "repo": REPO, "paths": ["a.rs"], "modified": { "b.rs": edited },
+            })),
+        )
+        .await;
+    assert_eq!(status, 400);
+}
