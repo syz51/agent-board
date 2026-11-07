@@ -1,3 +1,4 @@
+use chrono::TimeDelta;
 use serde_json::json;
 
 use super::{T, USER, defaults};
@@ -178,4 +179,92 @@ async fn one_ask_is_read_by_id_in_any_status() {
     );
     let (status, code, _) = t.fail("GET", "/v1/asks/999", None, None).await;
     assert_eq!((status, code.as_str()), (404, "not_found"));
+}
+
+#[tokio::test]
+async fn an_ask_warns_of_the_boards_other_open_asks_under_30_minutes_old() {
+    const B: &str = "t3:beta";
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.register(B, None, None).await;
+    t.board("factory", &[]).await;
+    t.board("docs", &[]).await;
+    let task = t.task(A, "factory", "Pick a storage engine").await;
+    let ask = |agent: &'static str, board: &'static str, task: Option<String>| {
+        let t = &t;
+        async move {
+            t.ok(
+                "POST",
+                "/v1/asks",
+                Some(agent),
+                Some(json!({
+                    "agent": agent, "board": board, "task": task, "kind": "decision",
+                    "question": "Which one?",
+                })),
+            )
+            .await
+        }
+    };
+
+    // Alone on its board: no warning, and the answer is the plain ask.
+    let first = ask(A, "factory", Some(task.clone())).await;
+    assert!(first.get("warning").is_none(), "{first}");
+    let first_id = first["id"].as_i64().unwrap();
+
+    // Another board's ask is not a duplicate.
+    t.advance(TimeDelta::minutes(10));
+    let docs = ask(B, "docs", None).await;
+    assert!(docs.get("warning").is_none(), "{docs}");
+
+    // Ten minutes later on the same board: made, with a warning naming the first ask.
+    let second = ask(B, "factory", None).await;
+    assert_eq!(second["status"], "open");
+    let second_id = second["id"].as_i64().unwrap();
+    let warning = second["warning"].as_str().unwrap();
+    assert!(
+        warning.starts_with(&format!(
+            "board factory has 1 other open ask under 30 minutes old: #{first_id} on {task} by {A}, 10m ago."
+        )),
+        "{warning}"
+    );
+    assert!(
+        warning.contains(&format!("board withdraw {second_id}")),
+        "{warning}"
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM asks WHERE status = 'open'"),
+        3
+    );
+
+    // The first ask is now 35 minutes old: only the second is named, by its asker.
+    t.advance(TimeDelta::minutes(25));
+    let third = ask(A, "factory", None).await;
+    let warning = third["warning"].as_str().unwrap();
+    assert!(
+        warning.contains(&format!("#{second_id} on no task by {B}, 25m ago")),
+        "{warning}"
+    );
+    assert!(!warning.contains(&format!("#{first_id} ")), "{warning}");
+
+    // Answered and withdrawn asks are not named; the asker's own ask is "you".
+    t.as_user(
+        "POST",
+        &format!("/v1/asks/{second_id}/answer"),
+        Some(json!({ "answer": "SQLite" })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(1));
+    let fourth = ask(A, "factory", None).await;
+    let warning = fourth["warning"].as_str().unwrap();
+    let third_id = third["id"].as_i64().unwrap();
+    assert!(
+        warning.contains(&format!("#{third_id} on no task by you, 1m ago")),
+        "{warning}"
+    );
+    assert!(!warning.contains(&format!("#{second_id} ")), "{warning}");
+
+    // Once the others are 30 minutes old, nothing is named.
+    t.advance(TimeDelta::minutes(31));
+    let fifth = ask(A, "factory", None).await;
+    assert!(fifth.get("warning").is_none(), "{fifth}");
 }

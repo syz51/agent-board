@@ -1,16 +1,19 @@
 import { useLocation } from "preact-iso";
 import { useId, useState } from "preact/hooks";
 import { ApiFailure, api } from "../api/client.ts";
-import type { Agent, Ask } from "../api/schema.ts";
+import type { Agent, Ask, Task } from "../api/schema.ts";
 import { tags } from "../live/refresh.ts";
-import { cache, useResource } from "../live/runtime.ts";
-import { Markdown } from "../text/markdown.tsx";
+import { cache, useNow, useResource } from "../live/runtime.ts";
+import { Markdown, PlainText } from "../text/markdown.tsx";
 import {
   agentIndex,
   Empty,
   ErrorNotice,
+  Owner,
+  PriorityBadge,
   Query,
   RelTime,
+  StatusBadge,
   useAgents,
   useTitle,
   Who,
@@ -27,11 +30,64 @@ export function newestFirst(asks: Ask[]): Ask[] {
   return [...asks].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
 }
 
+/**
+ * A pending proposal: open, not `auto`, with a body starting `Proposal:` after whitespace.
+ * Agents review it, not the user (`is_proposal` in crates/board/src/daemon.rs).
+ */
+export function isProposal(task: Task): boolean {
+  return task.status === "open" && !task.auto && task.body.trimStart().startsWith("Proposal:");
+}
+
+export interface BoardTasks {
+  board: string;
+  tasks: Task[];
+}
+
+/**
+ * Tasks that wait on the user with no open ask, by board: blocked tasks, and open tasks
+ * not marked `auto`. Left out: pending proposals and feedback items (agents review and
+ * triage those), and open tasks held by a `not_before` still ahead. Exported for tests.
+ */
+export function waitingTasks(tasks: Task[], openAsks: Ask[], now: number): BoardTasks[] {
+  const asked = new Set(openAsks.flatMap((ask) => (ask.task ? [ask.task] : [])));
+  const byBoard = new Map<string, Task[]>();
+  for (const task of tasks) {
+    if (asked.has(task.id)) continue;
+    const waits = task.status === "blocked" ||
+      (task.status === "open" && !task.auto && !isProposal(task) && task.feedback === null &&
+        (task.not_before === null || Date.parse(task.not_before) <= now));
+    if (!waits) continue;
+    const list = byBoard.get(task.board) ?? [];
+    list.push(task);
+    byBoard.set(task.board, list);
+  }
+  const number = (id: string) => Number(id.slice(id.lastIndexOf("-") + 1));
+  return [...byBoard]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([board, list]) => ({
+      board,
+      tasks: list.sort((a, b) => a.priority.localeCompare(b.priority) || number(a.id) - number(b.id)),
+    }));
+}
+
+/** Open and blocked tasks on every board. */
+function useCandidateTasks() {
+  return useResource("tasks:needs-you", [tags.tasks], async () => {
+    const [open, blocked] = await Promise.all([
+      api.tasks({ status: "open" }),
+      api.tasks({ status: "blocked" }),
+    ]);
+    return [...open, ...blocked];
+  });
+}
+
 export function AsksScreen() {
   useTitle("Needs you");
   const location = useLocation();
   const board = location.query.board ?? "";
   const asks = useOpenAsks();
+  const tasks = useCandidateTasks();
+  const now = useNow(60_000);
   const agents = agentIndex(useAgents().data);
 
   return (
@@ -45,23 +101,78 @@ export function AsksScreen() {
         )}
       </header>
       <Query resource={asks} label="Loading asks">
-        {(list) => {
-          const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
-          if (shown.length === 0) {
-            return (
-              <Empty title="Nothing needs you">
-                Agents' questions and requests appear here, and on Telegram if it is set up.
-              </Empty>
-            );
-          }
-          return (
-            <div class="ask-list">
-              {shown.map((ask) => <AskCard key={ask.id} ask={ask} agents={agents} />)}
-            </div>
-          );
-        }}
+        {(list) => (
+          <Query resource={tasks} label="Loading tasks">
+            {(taskList) => {
+              const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
+              const waiting = waitingTasks(taskList, list, now).filter((group) => !board || group.board === board);
+              if (shown.length === 0 && waiting.length === 0) {
+                return (
+                  <Empty title="Nothing needs you">
+                    Agents' questions and requests appear here, and on Telegram if it is set up,
+                    with tasks that wait on you.
+                  </Empty>
+                );
+              }
+              return (
+                <>
+                  {shown.length > 0 && (
+                    <div class="ask-list">
+                      {shown.map((ask) => <AskCard key={ask.id} ask={ask} agents={agents} />)}
+                    </div>
+                  )}
+                  {waiting.length > 0 && <WaitingTasks groups={waiting} agents={agents} />}
+                </>
+              );
+            }}
+          </Query>
+        )}
       </Query>
     </>
+  );
+}
+
+/** Tasks that wait on the user without an open ask, one group per board. */
+function WaitingTasks({ groups, agents }: { groups: BoardTasks[]; agents: Map<string, Agent> }) {
+  return (
+    <section class="section" aria-labelledby="waiting-tasks">
+      <h2 id="waiting-tasks">Tasks waiting on you</h2>
+      <p class="lede">
+        Blocked tasks and tasks only you can start. Their agents have not asked yet.
+      </p>
+      {groups.map(({ board, tasks }) => (
+        <section key={board} class="task-group" aria-labelledby={`waiting-${board}`}>
+          <h3 id={`waiting-${board}`} class="group-title">
+            <a href={`/boards/${encodeURIComponent(board)}`}>{board}</a>{" "}
+            <span class="group-count">{tasks.length}</span>
+          </h3>
+          <ul class="task-list">
+            {tasks.map((task) => (
+              <li key={task.id} class="task-row">
+                <div class="task-line">
+                  <PriorityBadge priority={task.priority} />
+                  <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
+                    <code class="task-id">{task.id}</code> <PlainText text={task.title} />
+                  </a>
+                </div>
+                <div class="task-meta">
+                  <StatusBadge status={task.status} ready={task.ready} />
+                  <Owner task={task} agents={agents} />
+                  <span class="muted">
+                    updated <RelTime at={task.updated_at} />
+                  </span>
+                </div>
+                {task.blocked_reason && (
+                  <p class="blocked-reason">
+                    <PlainText text={task.blocked_reason} />
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </section>
   );
 }
 

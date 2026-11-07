@@ -528,7 +528,10 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         _ => ctx.resolve_board(ask.board.clone()).await?,
     };
     let agent = ctx.agent()?.clone();
-    let created = ctx
+    let board_proto::CreatedAsk {
+        ask: created,
+        warning,
+    } = ctx
         .client
         .create_ask(&CreateAsk {
             agent: agent.clone(),
@@ -543,6 +546,10 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
         render::ask_line(&created)
     );
+    // The server's warning names the board's other recent open asks, which this may repeat.
+    if let Some(warning) = &warning {
+        text.push_str(&format!("\nwarning: {warning}"));
+    }
     if let Some(task) = &created.task {
         // Advisory: the ask is made either way, so a failed check is reported, not raised.
         match ctx.client.asks(Some("open"), Some(&created.board)).await {
@@ -580,6 +587,10 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             )),
         }
     }
+    let created = board_proto::CreatedAsk {
+        ask: created,
+        warning,
+    };
     Ok(Output::new(text, &created))
 }
 
