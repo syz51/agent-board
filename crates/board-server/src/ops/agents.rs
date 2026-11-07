@@ -173,15 +173,27 @@ pub(crate) fn boards_for_repo(cx: &Ctx<'_>, repo: &str) -> Result<Vec<board_prot
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// How long an ended agent stays in a board's listing: its membership and record stay, so
+/// it comes back when it resumes, and `state=ended` lists it.
+const ENDED_LISTED_MS: i64 = 7 * 86_400_000;
+
+/// Agents, by board and state. A board's listing leaves out agents that ended more than a
+/// week ago unless `state=ended`, so it does not grow with every session the board ever
+/// had; the unfiltered listing stays complete, as clients use it to name agents.
 pub(crate) fn list(
     cx: &Ctx<'_>,
     board: Option<&board_proto::BoardSlug>,
     state: Option<AgentState>,
 ) -> Result<Vec<Agent>> {
     let board = board.map(|b| b.as_str().to_owned());
-    let state = state.map(|s| enum_str(&s));
+    let ended_before = cx.now_ms() - ENDED_LISTED_MS;
     let mut filter = vec!["1 = 1"];
     let mut params: crate::store::NamedParams<'_> = Vec::new();
+    if board.is_some() && state != Some(AgentState::Ended) {
+        filter.push("NOT (state = 'ended' AND last_seen < :ended_before)");
+        params.push((":ended_before", &ended_before));
+    }
+    let state = state.map(|s| enum_str(&s));
     if let Some(board) = &board {
         filter.push("id IN (SELECT agent FROM board_members WHERE board = :board)");
         params.push((":board", board));
