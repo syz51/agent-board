@@ -523,6 +523,40 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
 }
 
 #[tokio::test]
+async fn a_filed_proposal_wakes_the_coordinator_to_review_it() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut proposal = detail("factory-8", true, &[]);
+    proposal.task.auto = false;
+    proposal.task.body = "Proposal: the wake drops lines.".into();
+    e.stub.on("GET /v1/tasks/factory-8", proposal);
+    let mut plain = detail("factory-9", true, &[]);
+    plain.task.auto = false;
+    e.stub.on("GET /v1/tasks/factory-9", plain);
+
+    for (seq, kind, id) in [
+        (40, EventType::TaskCreated, "factory-8"),
+        // Edits to a pending proposal and new non-auto tasks that are not proposals wake no one.
+        (41, EventType::TaskUpdated, "factory-8"),
+        (42, EventType::TaskCreated, "factory-9"),
+    ] {
+        e.daemon
+            .on_event(&event(seq, kind, Some(id), "t3:worker"), at())
+            .await
+            .unwrap();
+    }
+    e.daemon.flush().await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-8 is a proposal to review\nRun board_snapshot and continue."
+                .to_owned()
+        )]
+    );
+}
+
+#[tokio::test]
 async fn a_passed_not_before_wakes_the_coordinator() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     e.daemon.reconcile(at()).await.unwrap();
@@ -1546,6 +1580,41 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
     }
     // Generic: no tool paths of one setup.
     assert!(!prompt.contains("factory/cli.js"));
+}
+
+#[test]
+fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
+    // Compare on words, so rewrapping the Markdown or CRLF checkouts change nothing.
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "give a verdict on each pending proposal on this board that you did not propose",
+        "file work it finds but won't do as a proposal",
+        "`task_add` with `auto=false`, a body starting `Proposal:`",
+        "Every task is `auto` unless the user must do or decide it, or it is a pending proposal",
+        "and is not a pending proposal, set it `auto`",
+        "File them as proposals and delegate their review to a reviewer child",
+        "the next review waits for the next task you finish",
+        "A pending proposal is a task with `auto=false`, a body starting `Proposal:`",
+        "**Reviewer**: never the proposer",
+        "reviewed by the coordinator of the board it was routed to",
+        "a `decision` note starting `verdict:`",
+        "once it has the accepts it needs",
+        "need accepts from two reviewers",
+        "Ask once per batch, each item with a recommendation",
+        "The user's answer is the verdict",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    // The old rule that filed every found task as `auto` is gone.
+    assert!(!prompt.contains("File new tasks without `auto=false` otherwise"));
+
+    // Routed feedback reaches the owner as a proposal, not as work.
+    let triage = words(&board::daemon::coordinator_message(&factory(), true));
+    assert!(triage.contains(
+        "(`board` set, `auto=false`): an imperative title; a body that starts `Proposal:`"
+    ));
+    assert!(triage.contains("You are not its reviewer"));
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
