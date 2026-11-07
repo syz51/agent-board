@@ -50,10 +50,18 @@ pub struct ServerConfig {
     /// Overrides of the rule and rendering defaults (`docs/API.md`, "Defaults").
     #[serde(default)]
     pub defaults: Settings,
+    /// The commit the server was built from, which `/healthz` and every answer report. Set
+    /// by the binary that runs the server, never read from the file.
+    #[serde(skip, default = "unknown_commit")]
+    pub commit: String,
 }
 
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 7377))
+}
+
+fn unknown_commit() -> String {
+    "unknown".to_owned()
 }
 
 fn default_true() -> bool {
@@ -71,6 +79,7 @@ impl ServerConfig {
             public_url: None,
             telegram: None,
             defaults: Settings::default(),
+            commit: unknown_commit(),
         }
     }
 

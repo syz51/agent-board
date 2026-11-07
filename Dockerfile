@@ -7,15 +7,15 @@ COPY web/ ./
 RUN bun run build
 
 FROM rust:1.99.1-slim-trixie AS build
-# The commit the image is built from (no .git in the build context); /healthz reports it.
-ARG BOARD_COMMIT=unknown
-ENV BOARD_COMMIT=${BOARD_COMMIT}
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY prompts/ prompts/
 COPY --from=web /src/web/dist web/dist
-RUN cargo build --release --locked -p board
+# The commit the image is built from (no .git in the build context); /healthz reports it.
+# Declared last, so a new commit reuses every layer above.
+ARG BOARD_COMMIT=unknown
+RUN BOARD_COMMIT=${BOARD_COMMIT} cargo build --release --locked -p board
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update \

@@ -1490,6 +1490,10 @@ fn add_with_claim_creates_it_claimed_and_claims_after_an_older_server() {
 fn a_server_on_another_build_gets_one_warning_and_version_names_the_commit() {
     let e = env();
     e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Fix the parser"),
+    );
     let warned = |out: &std::process::Output| stderr(out).matches("board: warning:").count();
 
     // A server that predates the build headers is not compared.
@@ -1498,31 +1502,23 @@ fn a_server_on_another_build_gets_one_warning_and_version_names_the_commit() {
     assert_eq!(warned(&out), 0, "{}", stderr(&out));
 
     // The same build: no warning.
-    e.stub.build(board_proto::VERSION, board_proto::COMMIT);
+    e.stub.build(board_proto::VERSION, board::COMMIT);
     assert_eq!(warned(&e.run(&["ls"])), 0);
 
-    // Another build: one warning per process, however many requests it made.
-    e.stub.build(board_proto::VERSION, "0123456789ab");
-    let out = e.run(&["ls"]);
+    // Another build: one warning per process, though claim sends two requests (the
+    // registration check, then the claim).
+    e.stub.build("0.0.1", "0123456789ab");
+    e.stub.clear();
+    let out = e.run(&["claim", "factory-12"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    if board_proto::COMMIT != "unknown" {
-        assert_eq!(warned(&out), 1, "{}", stderr(&out));
-        assert!(
-            stderr(&out).contains(&format!(
-                "the board server runs {} (0123456789ab) but this client is {} ({})",
-                board_proto::VERSION,
-                board_proto::VERSION,
-                board_proto::COMMIT
-            )),
-            "{}",
-            stderr(&out)
-        );
-    }
-    e.stub.build("0.0.1", "unknown");
-    let out = e.run(&["ls"]);
+    assert!(e.stub.requests().len() >= 2, "{:?}", e.stub.requests());
     assert_eq!(warned(&out), 1, "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("restart any session"),
+        stderr(&out).contains(&format!(
+            "the board server runs 0.0.1 (0123456789ab) but this client is {} ({})",
+            board_proto::VERSION,
+            board::COMMIT
+        )) && stderr(&out).contains("restart any session"),
         "{}",
         stderr(&out)
     );
@@ -1530,6 +1526,12 @@ fn a_server_on_another_build_gets_one_warning_and_version_names_the_commit() {
     let out = e.run(&["--version"]);
     assert_eq!(
         stdout(&out).trim(),
-        format!("board {} ({})", board_proto::VERSION, board_proto::COMMIT)
+        format!("board {} ({})", board_proto::VERSION, board::COMMIT)
+    );
+    let commit = board::COMMIT;
+    assert!(
+        commit == "unknown"
+            || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
+        "{commit}"
     );
 }

@@ -236,21 +236,12 @@ async fn health_and_every_answer_name_the_build() {
     use axum::http::Request;
     use tower::ServiceExt as _;
 
-    let t = T::new();
+    let t = T::with(|c| c.commit = "0123456789ab".into());
     let (s, v) = t.send("GET", "/healthz", &[], None).await;
     assert_eq!(s.as_u16(), 200);
     assert_eq!(v["version"], board_proto::VERSION);
-    assert_eq!(v["commit"], board_proto::COMMIT);
-    let migrations = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .unwrap()
-        .count();
-    assert_eq!(v["schema_version"], migrations, "{v}");
-    let commit = board_proto::COMMIT;
-    assert!(
-        commit == "unknown"
-            || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
-        "{commit}"
-    );
+    assert_eq!(v["commit"], "0123456789ab");
+    assert_eq!(v["schema_version"], crate::db::MIGRATIONS.len(), "{v}");
 
     // Answers and refusals alike carry the build headers.
     for path in ["/healthz", "/v1/boards"] {
@@ -262,8 +253,15 @@ async fn health_and_every_answer_name_the_build() {
                 headers[board_proto::VERSION_HEADER].to_str().unwrap(),
                 headers[board_proto::COMMIT_HEADER].to_str().unwrap()
             ),
-            (board_proto::VERSION, board_proto::COMMIT),
+            (board_proto::VERSION, "0123456789ab"),
             "{path}"
         );
     }
+
+    // A server started without a commit reports `unknown`.
+    let t = T::new();
+    assert_eq!(
+        t.ok("GET", "/healthz", None, None).await["commit"],
+        "unknown"
+    );
 }

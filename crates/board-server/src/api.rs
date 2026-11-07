@@ -105,18 +105,18 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .nest(board_proto::API_PREFIX, v1)
         .fallback(web::serve)
-        .layer(middleware::map_response(build_headers))
+        .layer(middleware::map_response_with_state(
+            state.clone(),
+            build_headers,
+        ))
         .with_state(state)
 }
 
 /// Names this build on every answer, so clients can warn when they and the server differ.
-async fn build_headers(mut resp: Response) -> Response {
+async fn build_headers(State(state): State<AppState>, mut resp: Response) -> Response {
     let headers = resp.headers_mut();
-    for (name, value) in [
-        (board_proto::VERSION_HEADER, board_proto::VERSION),
-        (board_proto::COMMIT_HEADER, board_proto::COMMIT),
-    ] {
-        headers.insert(name, header::HeaderValue::from_static(value));
+    for (name, value) in state.build_headers() {
+        headers.insert(name.clone(), value.clone());
     }
     resp
 }
@@ -173,6 +173,7 @@ async fn authenticated_agent(state: &AppState, headers: HeaderMap) -> Option<Age
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+    let commit = state.commit().to_owned();
     let (seq, schema) = state
         .read(|cx| {
             let schema: i64 = cx
@@ -185,7 +186,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "ok": true,
         "seq": seq,
         "version": board_proto::VERSION,
-        "commit": board_proto::COMMIT,
+        "commit": commit,
         "schema_version": schema,
     })))
 }

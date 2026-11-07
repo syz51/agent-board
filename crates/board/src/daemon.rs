@@ -1593,6 +1593,10 @@ impl<T: T3> Daemon<T> {
                     continue;
                 }
             };
+            // The daemon runs for days: log each server build that differs from this one.
+            if let Some(warning) = crate::client::take_skew_warning() {
+                tracing::warn!("{warning}");
+            }
             let opened = tokio::time::Instant::now();
             let mut stream = resp.bytes_stream().eventsource();
             loop {
