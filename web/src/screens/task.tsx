@@ -61,6 +61,12 @@ function TaskView(
     <article class="task-detail">
       <header class="task-head">
         <h1><PlainText text={task.title} /></h1>
+        {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
+        <p class="task-meta">
+          <StatusBadge status={task.status} ready={task.ready} />
+          <PriorityBadge priority={task.priority} />
+          <Owner task={task} agents={agents} />
+        </p>
       </header>
 
       <div class="task-layout">

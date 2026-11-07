@@ -136,10 +136,9 @@ const KIND_ICON: Record<string, IconName> = {
   files: "file",
 };
 
-/** Events that may need you: asks, blocked work, failed checks. */
+/** Events that went wrong: blocked work and failed checks. Asks get their own kind colour. */
 function isNotable(event: BoardEvent): boolean {
   const payload = (event.payload ?? {}) as Record<string, unknown>;
-  if (event.type === "ask_created") return true;
   if (event.type === "task_updated" && payload.to === "blocked") return true;
   return event.type === "evidence_added" && typeof payload.exit_code === "number" && payload.exit_code !== 0;
 }
@@ -156,10 +155,22 @@ export function EventLine(
   const summary = detail(event);
   const [verb, suffix] = describe(event);
   const kind = event.type.split("_")[0] ?? "";
-  const weight = isNotable(event) ? "notable" : ROUTINE.has(event.type) ? "routine" : "normal";
+  const askKind = event.type === "ask_created" && (event.payload as { kind?: unknown } | null)?.kind === "action"
+    ? "action"
+    : "decision";
+  const weight = event.type === "ask_created"
+    ? `ask event-ask-${askKind}`
+    : isNotable(event)
+    ? "notable"
+    : ROUTINE.has(event.type)
+    ? "routine"
+    : "normal";
+  const icon: IconName = event.type === "ask_created"
+    ? askKind === "action" ? "hand" : "question"
+    : KIND_ICON[kind] ?? "events";
   return (
     <li class={`event event-${weight}`} data-kind={kind}>
-      <span class="event-node" aria-hidden="true"><Icon name={KIND_ICON[kind] ?? "events"} /></span>
+      <span class="event-node" aria-hidden="true"><Icon name={icon} /></span>
       <div class="event-body">
         <p class="event-line">
           <Who id={event.actor} agents={agents} />

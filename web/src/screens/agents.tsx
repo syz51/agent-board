@@ -99,10 +99,15 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         <header class="agent-head">
           <Avatar handle={agent.handle} large />
           <h2 class="agent-handle" title={agent.id}>{agent.handle}</h2>
-          {agent.role === "coordinator" && <span class="tag">coordinator</span>}
+          <AgentStateBadge agent={agent} />
         </header>
-        <AgentStateBadge agent={agent} />
         <dl class="agent-facts">
+          {agent.role === "coordinator" && (
+            <div>
+              <dt>Role</dt>
+              <dd>Coordinator</dd>
+            </div>
+          )}
           <div>
             <dt>Device</dt>
             <dd>{agent.device} · {agent.runtime}</dd>
