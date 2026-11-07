@@ -178,7 +178,8 @@ const AREA: Record<string, string> = {
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
   asks: "[grid-area:asks]",
-  autopilot: "[grid-area:auto]",
+  // Not "auto": that is a keyword for grid-area and would place the cell automatically.
+  autopilot: "[grid-area:pilot]",
 };
 
 const CELL_CLASS: Record<string, string> = {
@@ -190,7 +191,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_236px_156px_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_256px_200px_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
