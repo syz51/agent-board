@@ -1595,3 +1595,101 @@ async fn the_previous_owner_is_told_to_stop_and_peers_see_the_handover() {
     // Getting it back is a change to the task, not an order to stop.
     assert!(!text.contains("stop work on it"), "{text}");
 }
+
+/// dotfiles-48: a pending proposal was claimed and fixed with no verdict. A proposal is
+/// stored not auto on every board, is not ready, and cannot be claimed until accepted.
+#[tokio::test]
+async fn a_pending_proposal_waits_for_a_verdict_before_it_is_work() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.register(B, None, None).await;
+    t.board("factory", &[]).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    let proposal = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Cache builds", "auto": true,
+                    "body": "\nProposal: cache the builds. Size S." }),
+        )
+        .await;
+    let work = t.task(A, "factory", "Ordinary work").await;
+    let task = t.get_task(&proposal).await;
+    assert_eq!(
+        (&task["auto"], &task["proposal"], &task["ready"]),
+        (&json!(false), &json!(true), &json!(false)),
+        "{task}"
+    );
+    assert_eq!(t.get_task(&work).await["proposal"], false);
+
+    // Not ready: not listed, not counted.
+    let ready = t
+        .ok("GET", "/v1/tasks?board=factory&ready=true", None, None)
+        .await;
+    let ids: Vec<&str> = ready
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [work.as_str()]);
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["counts"]["ready"], 1, "{board}");
+    // The proposal filter lists it alone, or everything else.
+    let only = t
+        .ok("GET", "/v1/tasks?board=factory&proposal=true", None, None)
+        .await;
+    assert_eq!(only.as_array().unwrap().len(), 1);
+    assert_eq!(only[0]["id"], proposal.as_str());
+    let others = t
+        .ok("GET", "/v1/tasks?board=factory&proposal=false", None, None)
+        .await;
+    assert_eq!(others.as_array().unwrap().len(), 1);
+    assert_eq!(others[0]["id"], work.as_str());
+
+    // Claiming it is refused with what to do instead.
+    let (s, v) = t.claim(B, &proposal).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("verdict"), "{v}");
+
+    // An accept sets auto: then it is ready work and claimable.
+    let (s, v) = t.patch(B, &proposal, json!({ "auto": true })).await;
+    assert!(s.is_success(), "{v}");
+    let task = t.get_task(&proposal).await;
+    assert_eq!(
+        (&task["proposal"], &task["ready"]),
+        (&json!(false), &json!(true))
+    );
+    assert!(t.claim(B, &proposal).await.0.is_success());
+}
+
+#[tokio::test]
+async fn a_proposal_cannot_be_created_claimed() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "agent": A, "board": "factory", "title": "Mine",
+                         "body": "Proposal: do it myself", "claim": true })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("without claim"), "{v}");
+}

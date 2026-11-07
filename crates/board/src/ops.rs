@@ -376,10 +376,14 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
         })
         .await?;
     if !new.claim {
-        return Ok(Output::new(
-            format!("added {}", render::task_line(&task)),
-            &task,
-        ));
+        let mut text = format!("added {}", render::task_line(&task));
+        if board_proto::is_pending_proposal(task.status, task.auto, &task.body) {
+            text.push_str(
+                "\npending proposal: not ready work. Another agent reviews it with a `verdict:` \
+                 note; an accept sets auto, which makes it claimable.",
+            );
+        }
+        return Ok(Output::new(text, &task));
     }
     // A server that predates `claim` ignores it and creates the task open: claim it now,
     // which another agent may win in between.

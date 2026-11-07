@@ -9,7 +9,7 @@ use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
 
 use crate::config::Settings;
-use crate::db::{Ctx, enum_str, parse_id, ready_sql, ts};
+use crate::db::{Ctx, enum_str, parse_id, proposal_sql, ready_sql, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
@@ -254,6 +254,15 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             ));
         }
     }
+    // A proposal waits for another agent's verdict, on every board: it is stored not auto
+    // whatever was asked, and only an accept sets auto.
+    let proposal = board_proto::is_proposal_body(&req.body);
+    if proposal && req.claim {
+        return Err(invalid(
+            "a proposal cannot be claimed by the agent that files it",
+            "file it without claim; another agent records a verdict, and an accept sets auto",
+        ));
+    }
     let blockers = check_blockers(cx, None, &req.blockers)?;
     if req.claim {
         check_claimable_new(cx, &req, &blockers)?;
@@ -288,7 +297,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             req.body,
             req.acceptance,
             priority_str(req.priority),
-            req.auto.unwrap_or(board.autopilot),
+            !proposal && req.auto.unwrap_or(board.autopilot),
             req.agent.as_str(),
             now,
             not_before,
@@ -490,6 +499,8 @@ pub(crate) struct TaskFilter {
     pub status: Option<TaskStatus>,
     pub owner: Option<AgentId>,
     pub ready: Option<bool>,
+    /// Only pending proposals (true), or none of them (false).
+    pub proposal: Option<bool>,
     pub limit: usize,
 }
 
@@ -524,6 +535,14 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     };
     if let Some(ready) = &ready {
         clauses.push(ready);
+    }
+    let proposal = match filter.proposal {
+        Some(true) => Some(proposal_sql("t")),
+        Some(false) => Some(format!("NOT {}", proposal_sql("t"))),
+        None => None,
+    };
+    if let Some(proposal) = &proposal {
+        clauses.push(proposal);
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }
@@ -623,6 +642,17 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
                 status_str(task.status)
             ),
             next,
+        ));
+    }
+    if task.proposal {
+        return Err(refused(
+            format!(
+                "{id} is a pending proposal: it becomes work only once another agent accepts it"
+            ),
+            format!(
+                "record a verdict first (task_note {id} kind=decision \"verdict: accept ...; or merge, decline, escalate\"); \
+                 an accept sets auto (task_update {id} auto=true), then claim it"
+            ),
         ));
     }
     check_blockers_done(cx, id)?;

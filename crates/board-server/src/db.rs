@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use board_proto::{BoardSlug, DeviceName, Event, EventType, TaskId, Timestamp};
 use chrono::DateTime;
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -157,6 +158,13 @@ fn configure(conn: &Connection) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // SQL uses board-proto's rule, so a proposal is defined once.
+    conn.create_scalar_function(
+        "is_proposal_body",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |f| Ok(board_proto::is_proposal_body(&f.get::<String>(0)?)),
+    )?;
     Ok(())
 }
 
@@ -287,8 +295,13 @@ pub(crate) fn live_sql(col: &str) -> String {
     )
 }
 
-/// SQL that is true when task `t` is ready: open, every blocker done, no live owner, and
-/// `not_before` (if any) passed.
+/// SQL that is true when task `t` is a pending proposal (`board_proto::is_pending_proposal`).
+pub(crate) fn proposal_sql(t: &str) -> String {
+    format!("({t}.status = 'open' AND {t}.auto = 0 AND is_proposal_body({t}.body))")
+}
+
+/// SQL that is true when task `t` is ready: open, every blocker done, no live owner,
+/// `not_before` (if any) passed, and not a pending proposal.
 /// Expects the named parameters `:now` and `:cutoff`.
 pub(crate) fn ready_sql(t: &str) -> String {
     format!(
@@ -296,8 +309,10 @@ pub(crate) fn ready_sql(t: &str) -> String {
          AND NOT EXISTS (SELECT 1 FROM task_blockers rb JOIN tasks rt ON rt.id = rb.blocker \
                          WHERE rb.task = {t}.id AND rt.status != 'done') \
          AND ({t}.owner IS NULL OR NOT {live}) \
-         AND ({t}.not_before IS NULL OR {t}.not_before <= :now))",
-        live = live_sql(&format!("{t}.owner"))
+         AND ({t}.not_before IS NULL OR {t}.not_before <= :now) \
+         AND NOT {proposal})",
+        live = live_sql(&format!("{t}.owner")),
+        proposal = proposal_sql(t),
     )
 }
 

@@ -422,8 +422,9 @@ keeping untrusted text out of those channels, so:
   not be followed. The server sets attribution; JSON escaping (with `<` and `>` as `\u003c`
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
-  order (you, counts, mine, handoff, alerts, peers, ready, waiting, recent; `waiting` lists
-  open tasks held by a `not_before`, soonest first); every alert ends with
+  order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
+  lists pending proposals, which are never ready work); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
@@ -491,6 +492,10 @@ agrees, after checking it.
   finding of a review report, a routed feedback item). It is a task with `auto=false` whose
   body starts `Proposal:` and gives the problem, the evidence, the change and its size. A
   coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
+  The server enforces the gate, with one definition in `board-proto`
+  (`is_pending_proposal`): it stores a new proposal with `auto=false` whatever was asked,
+  refuses to create it claimed, keeps it out of `ready` and refuses claims until an accept
+  sets `auto`, and lists it apart from ready work in snapshots (`Task.proposal`, API.md).
 - **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
   its board at the start of its loop; its own go to a reviewer child briefed with the
   evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
@@ -502,7 +507,8 @@ agrees, after checking it.
   destructive, irreversible or cross-repository changes. Split verdicts and decisions only
   the user can make (direction, spending, security posture, publishing, deleting data, what
   reaches their phone, this process) go to the user, one ask per batch with recommendations.
-- **Enforcement**: by convention for now (`prompts/coordinator.md`). Agent ids are asserted
+- **Enforcement**: the gate above is on the server; who may give a verdict, and when one
+  sets `auto`, is by convention for now (`prompts/coordinator.md`). Agent ids are asserted
   by clients, so the server cannot prove independence; stats on verdicts and on the fate of
   accepted proposals decide whether a server-side record is worth adding.
 - **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`

@@ -152,6 +152,9 @@ pub struct TaskQuery {
     pub owner: Option<AgentId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// Only pending proposals (true), or none of them (false); servers before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mine: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -105,6 +105,9 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
     if task.ready {
         line.push_str(" ready");
     }
+    if task.proposal {
+        line.push_str(" proposal");
+    }
     if !task.blockers.is_empty() {
         let ids: Vec<&str> = task.blockers.iter().map(|b| b.as_str()).collect();
         let _ = write!(line, " blockers {}", ids.join(","));

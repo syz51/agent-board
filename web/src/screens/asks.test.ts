@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DevState } from "../../dev/state.ts";
 import type { Task } from "../api/schema.ts";
-import { isProposal, needsYouCount, waitingTasks } from "./asks.tsx";
+import { needsYouCount, waitingTasks } from "./asks.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const state = new DevState(() => now);
@@ -86,23 +86,18 @@ describe("needsYouCount", () => {
   });
 });
 
-describe("isProposal", () => {
+describe("pending proposals", () => {
   const base = candidates().find((task) => task.id === "web-view-4") as Task;
 
-  test("matches an open non-auto task whose trimmed body starts with Proposal:", () => {
+  test("the server marks an open non-auto task whose trimmed body starts with Proposal:", () => {
     expect(base.body.startsWith("Proposal:")).toBe(false);
-    expect(isProposal(base)).toBe(true);
-  });
-
-  test("an auto, blocked or differently worded task is not a pending proposal", () => {
-    expect(isProposal({ ...base, auto: true })).toBe(false);
-    expect(isProposal({ ...base, status: "blocked" })).toBe(false);
-    expect(isProposal({ ...base, body: "proposal: lower case" })).toBe(false);
-    expect(isProposal({ ...base, body: "Fix it. Proposal: later" })).toBe(false);
+    expect(base.proposal).toBe(true);
+    expect(base.ready).toBe(false);
   });
 
   test("a blocked proposal without an ask still waits on the user", () => {
-    const blocked = { ...base, status: "blocked" as const };
+    // The server clears `proposal` once the task is no longer open.
+    const blocked = { ...base, status: "blocked" as const, proposal: false };
     expect(ids([blocked], [])).toEqual({ "web-view": ["web-view-4"] });
   });
 });

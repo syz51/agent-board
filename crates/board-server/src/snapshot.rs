@@ -83,6 +83,10 @@ struct Model {
     /// Open tasks held by a `not_before` that has not passed, soonest first.
     #[serde(skip_serializing_if = "Option::is_none")]
     waiting: Option<WaitingList>,
+    /// Pending proposals on the board: they wait for an agent's verdict and are not ready
+    /// work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposals: Option<Ready>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recent: Vec<Recent>,
 }
@@ -253,6 +257,7 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         peers: Vec::new(),
         ready: None,
         waiting: None,
+        proposals: None,
         recent: Vec::new(),
     };
     let shown_now = board
@@ -474,6 +479,22 @@ fn fill_full(
     )?
     .into_iter()
     .partition(|t| t.ready);
+    let (proposals, held): (Vec<Task>, Vec<Task>) = held.into_iter().partition(|t| t.proposal);
+    if !proposals.is_empty() {
+        model.proposals = Some(Ready {
+            total: proposals.len() as u32,
+            items: proposals
+                .iter()
+                .take(cx.s.snapshot_ready_items)
+                .map(|t| TaskLine {
+                    id: t.id.to_string(),
+                    status: None,
+                    priority: Some(priority_str(t.priority)),
+                    title: title(&t.title),
+                })
+                .collect(),
+        });
+    }
     let mut waiting: Vec<(board_proto::Timestamp, Task)> = held
         .into_iter()
         .filter_map(|t| t.not_before.filter(|at| *at > cx.now).map(|at| (at, t)))
@@ -1241,6 +1262,13 @@ fn cut_last(m: &mut Model) -> bool {
     if m.recent.pop().is_some() {
         return true;
     }
+    if let Some(proposals) = &mut m.proposals {
+        proposals.items.pop();
+        if proposals.items.is_empty() {
+            m.proposals = None;
+        }
+        return true;
+    }
     if let Some(waiting) = &mut m.waiting {
         waiting.items.pop();
         if waiting.items.is_empty() {
@@ -1439,6 +1467,23 @@ fn render_lines(m: &Model) -> String {
             );
         }
     }
+    if let Some(p) = &m.proposals {
+        let shown = if p.items.len() < p.total as usize {
+            format!("{} of {}", p.items.len(), p.total)
+        } else {
+            p.total.to_string()
+        };
+        let _ = writeln!(o, "proposals to review ({shown}), not ready work:");
+        for t in &p.items {
+            let _ = writeln!(
+                o,
+                "  {} {} {}",
+                t.id,
+                t.priority.unwrap_or(""),
+                quote(&t.title)
+            );
+        }
+    }
     if !m.recent.is_empty() {
         o.push_str("recent:\n");
         for e in &m.recent {
@@ -1556,6 +1601,18 @@ fn render_yaml(m: &Model) -> String {
                 t.priority,
                 q(&t.title),
                 q(&t.until)
+            );
+        }
+    }
+    if let Some(p) = &m.proposals {
+        let _ = writeln!(o, "proposals:\n  total: {}\n  items:", p.total);
+        for t in &p.items {
+            let _ = writeln!(
+                o,
+                "    - {{id: {}, priority: {}, title: {}}}",
+                t.id,
+                t.priority.unwrap_or(""),
+                q(&t.title)
             );
         }
     }

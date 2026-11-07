@@ -73,6 +73,23 @@ impl TaskStatus {
     }
 }
 
+/// The body prefix of a proposal: found work filed for another agent to review before it
+/// becomes work.
+pub const PROPOSAL_PREFIX: &str = "Proposal:";
+
+/// Whether a task body is a proposal's: it starts with [`PROPOSAL_PREFIX`] after leading
+/// whitespace.
+pub fn is_proposal_body(body: &str) -> bool {
+    body.trim_start().starts_with(PROPOSAL_PREFIX)
+}
+
+/// A pending proposal: open, not `auto`, with a proposal body. It is not ready and cannot
+/// be claimed; another agent records a `verdict:` note, and an accept sets `auto`, which
+/// makes it work.
+pub fn is_pending_proposal(status: TaskStatus, auto: bool, body: &str) -> bool {
+    status == TaskStatus::Open && !auto && is_proposal_body(body)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
@@ -101,8 +118,13 @@ pub struct Task {
     pub owner_stale: bool,
     /// Tasks that must be done before this one can start.
     pub blockers: Vec<TaskId>,
-    /// Open, every blocker done, no live owner, and `not_before` (if any) passed.
+    /// Open, every blocker done, no live owner, `not_before` (if any) passed, and not a
+    /// pending proposal.
     pub ready: bool,
+    /// A pending proposal ([`is_pending_proposal`]): agents review it before it is work.
+    /// Derived when read; absent from older servers, read as false.
+    #[serde(default)]
+    pub proposal: bool,
     /// The task is not ready, and cannot be claimed, before this time. Once it passes, the
     /// server announces it with a `task_updated` event (actor `server`, no field changes),
     /// which wakes the coordinator; the field itself stays.
@@ -442,4 +464,41 @@ pub struct Event {
     pub task: Option<TaskId>,
     /// Type-specific details, such as `{"from": "open", "to": "doing"}` or `{"paths": [...]}`.
     pub payload: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_proposal_is_open_not_auto_with_a_proposal_body() {
+        assert!(is_proposal_body("Proposal: cache builds"));
+        assert!(is_proposal_body("\n  Proposal: cache builds"));
+        assert!(!is_proposal_body("Fix it. Proposal: later"));
+        assert!(!is_proposal_body("proposal: lower case"));
+        assert!(is_pending_proposal(TaskStatus::Open, false, " Proposal: x"));
+        assert!(!is_pending_proposal(TaskStatus::Open, true, "Proposal: x"));
+        assert!(!is_pending_proposal(
+            TaskStatus::Doing,
+            false,
+            "Proposal: x"
+        ));
+        assert!(!is_pending_proposal(TaskStatus::Open, false, "Ship it"));
+    }
+
+    /// Servers that predate `proposal` send none: it reads as false, and old clients
+    /// ignore it.
+    #[test]
+    fn task_proposal_is_false_when_absent() {
+        let task = serde_json::json!({
+            "id": "factory-1", "board": "factory", "parent": null, "title": "T", "body": "",
+            "acceptance": "", "status": "open", "priority": "p2", "blocked_reason": null,
+            "owner": null, "owner_stale": false, "blockers": [], "ready": true, "auto": true,
+            "created_by": "t3:a", "version": 1,
+            "created_at": "2026-11-06T12:00:00Z", "updated_at": "2026-11-06T12:00:00Z",
+        });
+        let read: Task = serde_json::from_value(task).unwrap();
+        assert!(!read.proposal);
+        assert_eq!(serde_json::to_value(&read).unwrap()["proposal"], false);
+    }
 }

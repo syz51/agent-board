@@ -860,3 +860,39 @@ fn sweep_quiet_reviews(t: &T) -> usize {
         )
         .unwrap()
 }
+
+#[tokio::test]
+async fn snapshots_list_pending_proposals_apart_from_ready_work() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    t.task_with(
+        "t3:alpha",
+        json!({ "board": "factory", "title": "Ordinary", "auto": true }),
+    )
+    .await;
+    t.task_with(
+        "t3:alpha",
+        json!({ "board": "factory", "title": "Cache builds", "body": "Proposal: cache them." }),
+    )
+    .await;
+    let full = snapshot(&t, "t3:alpha", "").await;
+    let text = text(&full);
+    assert!(text.contains("ready 1"), "{text}");
+    assert!(
+        text.contains("ready (1):\n  factory-1 p2 \"Ordinary\"\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "proposals to review (1), not ready work:\n  factory-2 p2 \"Cache builds\"\n"
+        ),
+        "{text}"
+    );
+    let yaml = snapshot(&t, "t3:alpha", "format=yaml").await;
+    let yaml = yaml["text"].as_str().unwrap();
+    assert!(
+        yaml.contains("proposals:\n  total: 1\n  items:\n    - {id: factory-2, priority: p2, title: \"Cache builds\"}"),
+        "{yaml}"
+    );
+}

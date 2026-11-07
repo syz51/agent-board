@@ -568,11 +568,16 @@ export class DevState {
   private toTask(task: Fixtures["tasks"][number]): Task {
     const done = (id: string) => this.data.tasks.find((item) => item.id === id)?.status === "done";
     const owner = this.data.agents.find((item) => item.id === task.owner);
+    // `is_pending_proposal` in crates/board-proto/src/model.rs.
+    const proposal =
+      task.status === "open" && !task.auto && task.body.trimStart().startsWith("Proposal:");
     return {
       ...task,
       owner_stale: owner !== undefined && this.stale(owner),
+      proposal,
       ready:
         task.status === "open" &&
+        !proposal &&
         task.blockers.every(done) &&
         !this.ownerLive(task.owner) &&
         (task.not_before === null || Date.parse(task.not_before) <= this.now()),
