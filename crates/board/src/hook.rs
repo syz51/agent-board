@@ -171,6 +171,8 @@ struct Hook<'a> {
     agent: AgentId,
     input: &'a Value,
     local: AgentLocal,
+    /// When the shell call this PostToolUse reports started, from its PreToolUse mark.
+    shell_start: Option<Timestamp>,
     now: Timestamp,
 }
 
@@ -182,15 +184,32 @@ async fn handle(
     started: Instant,
 ) -> Result<Reply> {
     let home = Home::from_env()?;
+    let shell_call = (input["tool_name"] == SHELL_TOOL)
+        .then(|| input["tool_use_id"].as_str().filter(|s| !s.is_empty()))
+        .flatten();
     if event == HookEvent::PreToolUse {
-        // Runs before every shell call: local only, no login, token or server.
-        if input["tool_name"] == SHELL_TOOL
-            && let Some(tool_use) = input["tool_use_id"].as_str().filter(|s| !s.is_empty())
+        // Runs before every shell call: local only, no token or server. Logged out, no
+        // PostToolUse could report the call, so it leaves no mark.
+        if let Some(tool_use) = shell_call
+            && Config::load(&home)?.require_login().is_ok()
         {
             state::save_tool_start(&home, runtime, tool_use, Utc::now())?;
         }
         return Ok(Reply::Nothing);
     }
+    // Taken before any of the returns below (logged out, no agent, no token), so a shell
+    // call's start mark never outlives it.
+    let shell_start = match shell_call {
+        Some(tool_use)
+            if matches!(
+                event,
+                HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            ) =>
+        {
+            state::take_tool_start(&home, runtime, tool_use)?
+        }
+        _ => None,
+    };
     if event == HookEvent::SessionStart {
         // In every session, logged in or not: marks of shell calls that never reached
         // PostToolUse (failed to start, denied, interrupted, or hooks offline).
@@ -228,6 +247,7 @@ async fn handle(
         home,
         agent,
         input,
+        shell_start,
         now: Utc::now(),
     };
     let offline_until = state::load_offline_until(&hook.home);
@@ -494,12 +514,7 @@ impl Hook<'_> {
         let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
         let mut paths = edited_paths(tool, &self.input["tool_input"]);
-        let shell_start = match self.input["tool_use_id"].as_str() {
-            Some(tool_use) if tool == SHELL_TOOL => {
-                state::take_tool_start(&self.home, self.runtime, tool_use)?
-            }
-            _ => None,
-        };
+        let shell_start = self.shell_start;
         if !paths.is_empty() || shell_start.is_some() {
             let repo = detect_repo(self.cwd()).await?;
             if let (Some(since), Some(root)) = (shell_start, repo.root.as_deref()) {
