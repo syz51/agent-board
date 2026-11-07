@@ -99,12 +99,10 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
     // Registered already, as the session-start hook would have done.
-    for agent in ["t3:thread-1", "claude:other"] {
-        stub.on(
-            &format!("GET /v1/agents/{}", enc(agent)),
-            agent_fixture(agent, DEVICE, board_proto::AgentState::Running),
-        );
-    }
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
     let home = home_for(dir.path(), &stub.url);
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -123,6 +121,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     detail.task.body = "Parser splits on CRLF".into();
     stub.on("GET /v1/tasks/factory-12", &detail);
@@ -259,14 +258,14 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let noted = mcp.call(
         5,
         "task_note",
-        json!({"id": "factory-12", "text": "x", "kind": "decision", "agent": "claude:other"}),
+        json!({"id": "factory-12", "text": "x", "kind": "decision", "agent": "t3:thread-1"}),
     );
     assert_eq!(text(&noted), "noted on factory-12 (#5)");
     let req = &stub.requests_to("POST /v1/tasks/factory-12/notes")[0];
-    assert_eq!(req.agent.as_deref(), Some("claude:other"));
+    assert_eq!(req.agent.as_deref(), Some("t3:thread-1"));
     assert_eq!(
         req.body,
-        json!({"agent": "claude:other", "kind": "decision", "text": "x"})
+        json!({"agent": "t3:thread-1", "kind": "decision", "text": "x"})
     );
 
     // A JSON null clears not_before, as `none` does; absent leaves it alone.
@@ -464,6 +463,7 @@ fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     stub.on("GET /v1/tasks/factory-12", &detail);
     stub.build("0.0.1", "0123456789ab");
@@ -496,4 +496,61 @@ fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
     assert_eq!(warnings(&first), 1, "{first}");
     let second = mcp.call(3, "task_show", json!({"id": "factory-12"}));
     assert_eq!(warnings(&second), 0, "once per session: {second}");
+}
+
+#[test]
+fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // This server is t3:thread-1: a peer's id, or a new one, is refused before anything is
+    // sent, every time.
+    for (n, agent) in [
+        (2, "t3:thread-2"),
+        (3, "t3:new-thread"),
+        (4, "t3:new-thread"),
+    ] {
+        let refused = mcp.call(n, "task_claim", json!({"id": "factory-12", "agent": agent}));
+        assert_eq!(refused["isError"], true, "{agent}: {refused}");
+        assert!(
+            text(&refused).contains("drop agent= to act as yourself"),
+            "{refused}"
+        );
+    }
+    assert!(
+        stub.requests()
+            .iter()
+            .all(|r| r.agent.as_deref() != Some("t3:thread-2"))
+    );
+    assert!(
+        stub.requests_to("POST /v1/tasks/factory-12/claim")
+            .is_empty()
+    );
+
+    // Its own id still works.
+    let ok = mcp.call(
+        5,
+        "task_claim",
+        json!({"id": "factory-12", "agent": "t3:thread-1"}),
+    );
+    assert_ne!(ok["isError"], true, "{ok}");
+    assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
 }

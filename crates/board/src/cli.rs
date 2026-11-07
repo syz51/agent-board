@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::client::TaskQuery;
 use crate::config::{Config, Home, TokenStore, store_token};
-use crate::identity::agent_from_env;
+use crate::identity::{agent_from_env, proven_identity};
 use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
 
 #[derive(Debug, Parser)]
@@ -25,7 +25,8 @@ use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
     about = "Shared work board for coding-agent threads"
 )]
 pub struct Cli {
-    /// Act as this agent id instead of the one from the environment.
+    /// Act as this agent id instead of the one from the environment. In a T3 thread, only
+    /// the thread's own id is accepted.
     #[arg(long, global = true)]
     pub agent: Option<String>,
     /// Print JSON instead of text.
@@ -704,6 +705,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
     let ctx = || -> Result<Ctx> {
         if let Some(ctx) = loaded.get() {
             return Ok(Ctx::clone(ctx));
+        }
+        if let Some(named) = &cli.agent {
+            let named: board_proto::AgentId = named.parse().context("--agent")?;
+            crate::identity::refuse_borrowed(proven_identity().as_ref(), &named, "--agent")?;
         }
         let ctx = Ctx::load(home.clone(), agent()?, None)?;
         Ok(loaded.get_or_init(|| ctx).clone())

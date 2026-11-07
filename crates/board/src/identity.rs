@@ -121,6 +121,29 @@ pub fn is_nested(table: &impl ProcessTable, pid: u32) -> bool {
     false
 }
 
+/// The identity this process can prove from its environment: its T3 thread's id, outside a
+/// nested session. A Claude Code or Codex session id may be inherited from a parent session
+/// of another runtime, and an unreadable value proves nothing, so both give `None`.
+pub fn proven_identity() -> Option<AgentId> {
+    let env = |name: &str| std::env::var(name).ok();
+    if !t3_identity_applies(None, env) || nested_here() {
+        return None;
+    }
+    resolve_agent(None, env, None, false).ok().flatten()
+}
+
+/// Refuses an explicit agent (`flag`) other than the one this process proves (`own`): an
+/// agent acts only as itself. Without a proven identity, any agent may be named.
+pub fn refuse_borrowed(own: Option<&AgentId>, named: &AgentId, flag: &str) -> Result<()> {
+    match own {
+        Some(own) if own != named => anyhow::bail!(
+            "{flag} names {named}, but this session is {own}: drop {flag} to act as yourself \
+             (to give another agent a task, hand it over with owner=)"
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// [`is_nested`] for this process, from one read of the process table. A table that
 /// cannot be read counts as not nested.
 pub fn nested_here() -> bool {

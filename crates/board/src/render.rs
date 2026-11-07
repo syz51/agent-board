@@ -5,6 +5,7 @@
 //! acceptance, notes, handoffs, ask questions and answers) only appears inside
 //! [`peer_block`], as JSON lines under a header that says it is data.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
@@ -83,6 +84,11 @@ pub fn enum_str<T: serde::Serialize>(value: &T) -> String {
 }
 
 pub fn task_line(task: &Task) -> String {
+    task_line_as(task, |id| id)
+}
+
+/// [`task_line`], naming the owner as `who` gives it.
+fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String {
     let mut line = format!(
         "{} {} {} {}",
         task.id,
@@ -91,7 +97,7 @@ pub fn task_line(task: &Task) -> String {
         title(&task.title)
     );
     if let Some(owner) = &task.owner {
-        let _ = write!(line, " owner {owner}");
+        let _ = write!(line, " owner {}", who(owner.as_str()));
         if task.owner_stale {
             line.push_str(" (stale)");
         }
@@ -140,12 +146,18 @@ pub fn task_list_detailed(tasks: &[Task]) -> String {
 
 pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     let task = &detail.task;
-    let mut out = task_line(task);
+    // Agents by their short handle, so long delegated ids stay readable.
+    let handles = &detail.handles;
+    let mut out = task_line_as(task, |id| short(handles, id));
     let _ = write!(out, "\nboard {} · version {}", task.board, task.version);
     if let Some(parent) = &task.parent {
         let _ = write!(out, " · parent {parent}");
     }
-    let _ = write!(out, " · created by {}", task.created_by);
+    let _ = write!(
+        out,
+        " · created by {}",
+        short(handles, task.created_by.as_str())
+    );
     if let Some(fb) = &task.feedback {
         // `about` is a validated slug; the signature is agent-written, so quoted.
         let _ = write!(
@@ -165,7 +177,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
             if let Some(task) = &res.task {
                 let _ = write!(out, " to {task}");
             }
-            let _ = write!(out, " by {} {}", res.by, ago(res.at));
+            let _ = write!(out, " by {} {}", short(handles, &res.by), ago(res.at));
         }
         if let Some(recurs) = &fb.recurs {
             let _ = write!(out, "\nrecurs {recurs}");
@@ -189,7 +201,12 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         if let Some(code) = ev.exit_code {
             let _ = write!(out, " exit {code}");
         }
-        let _ = write!(out, " by {} {}", ev.agent, ago(ev.at));
+        let _ = write!(
+            out,
+            " by {} {}",
+            short(handles, ev.agent.as_str()),
+            ago(ev.at)
+        );
     }
     let notes: &[Note] = if detailed {
         &detail.notes
@@ -199,7 +216,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     };
     if detailed {
         for event in &detail.history {
-            let _ = write!(out, "\n{}", event_line(event));
+            let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
         }
     }
     let mut peer = Vec::new();
@@ -208,14 +225,17 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     }
     if !task.body.is_empty() {
         peer.push(
-            json!({"task": task.id, "field": "body", "by": task.created_by, "text": task.body}),
+            json!({"task": task.id, "field": "body", "by": short(handles, task.created_by.as_str()), "text": task.body}),
         );
     }
     if !task.acceptance.is_empty() {
         peer.push(json!({"task": task.id, "field": "acceptance", "text": task.acceptance}));
     }
     if let Some(summary) = &task.summary {
-        peer.push(json!({"task": task.id, "field": "summary", "by": task.owner, "text": summary}));
+        peer.push(json!({
+            "task": task.id, "field": "summary",
+            "by": task.owner.as_ref().map(|o| short(handles, o.as_str())), "text": summary,
+        }));
     }
     if let Some(reason) = task
         .feedback
@@ -227,7 +247,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     }
     for note in notes {
         peer.push(json!({
-            "task": task.id, "field": "note", "kind": note.kind, "by": note.agent,
+            "task": task.id, "field": "note", "kind": note.kind, "by": short(handles, note.agent.as_str()),
             "at": note.at, "text": note.text,
         }));
     }
@@ -244,6 +264,11 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         );
     }
     out
+}
+
+/// `id`'s short handle when `handles` has one, else `id`.
+fn short<'a>(handles: &'a BTreeMap<String, String>, id: &'a str) -> &'a str {
+    handles.get(id).map_or(id, String::as_str)
 }
 
 pub fn board_line(board: &Board) -> String {
@@ -385,11 +410,16 @@ pub fn ask_list(asks: &[Ask]) -> String {
 }
 
 pub fn event_line(event: &Event) -> String {
+    event_line_as(event, |id| id)
+}
+
+/// [`event_line`], naming the actor as `who` gives it.
+fn event_line_as<'a>(event: &'a Event, who: impl Fn(&'a str) -> &'a str) -> String {
     let mut line = format!(
         "#{} {} {} {}",
         event.seq,
         ago(event.at),
-        event.actor,
+        who(&event.actor),
         enum_str(&event.event_type)
     );
     if let Some(task) = &event.task {
@@ -512,5 +542,44 @@ mod tests {
         assert_eq!(cut.chars().count(), 82);
         assert!(cut.ends_with("…\""));
         assert_eq!(title("<b>"), "\"\\u003cb\\u003e\"");
+    }
+    #[test]
+    fn task_detail_names_agents_by_their_handles() {
+        const LONG: &str = "t3:thread:delegated-task:command%3Amcp%3A8f8e";
+        let at = "2026-11-07T10:00:00Z";
+        let detail: TaskDetail = serde_json::from_value(json!({
+            "task": {
+                "id": "factory-12", "board": "factory", "parent": null, "title": "Fix it",
+                "body": "Body", "acceptance": "", "status": "doing", "priority": "p2",
+                "blocked_reason": null, "owner": LONG, "owner_stale": false,
+                "blockers": [], "ready": false, "not_before": null, "auto": true,
+                "created_by": LONG, "version": 3, "summary": null,
+                "created_at": at, "updated_at": at,
+            },
+            "notes": [{
+                "id": 1, "task": "factory-12", "agent": LONG, "kind": "note",
+                "text": "working", "at": at,
+            }],
+            "evidence": [],
+            "blocks": [],
+            "children": [],
+            "history": [{
+                "seq": 9, "at": at, "board": "factory", "actor": LONG,
+                "type": "task_claimed", "task": "factory-12", "payload": {},
+            }],
+            "handles": { LONG: "t3:1a2b" },
+        }))
+        .unwrap();
+        let text = task_detail(&detail, true);
+        assert!(!text.contains("delegated-task"), "{text}");
+        assert!(text.contains(" owner t3:1a2b"), "{text}");
+        assert!(text.contains(" · created by t3:1a2b"), "{text}");
+        assert!(text.contains("t3:1a2b task_claimed"), "{text}");
+        assert!(text.contains("\"by\":\"t3:1a2b\""), "{text}");
+
+        // An answer without handles, as servers before them send: ids as they are.
+        let mut bare = detail;
+        bare.handles.clear();
+        assert!(task_detail(&bare, true).contains(&format!(" owner {LONG}")));
     }
 }

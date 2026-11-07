@@ -13,14 +13,49 @@ pub(crate) mod telegram;
 pub(crate) mod updates;
 
 use board_proto::{AgentId, BoardSlug, EventType};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::db::Ctx;
 use crate::error::Result;
 use crate::store::agent_missing;
 
-/// Checks that `agent` is registered and records that it was seen now.
+/// Checks that `agent` is registered and records that it was seen now. For calls the agent
+/// makes as itself: one marked ended is working after all, so it is running again,
+/// announced once. Calls made for it (a device claiming the coordinator lease, the user)
+/// use [`note_agent_seen`].
 pub(crate) fn touch_agent(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
+    let state: String = cx
+        .db
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?1",
+            [agent.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| agent_missing(agent))?;
+    let revive = state == "ended";
+    cx.db.execute(
+        "UPDATE agents SET last_seen = ?1, \
+         state = CASE WHEN ?3 THEN 'running' ELSE state END, \
+         paused_until = CASE WHEN ?3 THEN NULL ELSE paused_until END \
+         WHERE id = ?2",
+        params![cx.now_ms(), agent.as_str(), revive],
+    )?;
+    if revive {
+        cx.emit(
+            None,
+            agent.as_str(),
+            EventType::AgentStateChanged,
+            None,
+            serde_json::json!({ "from": "ended", "to": "running", "paused_until": null }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Checks that `agent` is registered and records that it was seen now, leaving its state
+/// alone: for the state change itself and for calls made on the agent's behalf.
+pub(crate) fn note_agent_seen(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
     let updated = cx.db.execute(
         "UPDATE agents SET last_seen = ?1 WHERE id = ?2",
         params![cx.now_ms(), agent.as_str()],
