@@ -162,7 +162,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call. Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; remind once if a task in `doing` has a handoff older than the turn |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -185,6 +185,26 @@ on one of the board's home devices.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Adopting a thread instead**: when a thread already does a board's work,
+  `board board adopt <board> <thread>`, run on a home device, makes that thread the
+  coordinator instead of a new one. The command refuses when the board has a live
+  coordinator (switch autopilot off first), when T3 on that device does not know the
+  thread or has archived it, when the device is not a home device, and when it has no
+  `[projects]` path for the board's repos. Otherwise it saves the adoption in
+  `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
+  device's daemon never starts a thread for the board in between, and then takes the
+  coordinator lease for this device, so no other home device does either. If another
+  device took the lease first (it reacted to autopilot going on), the command undoes the
+  adoption and says so. The next time the board needs a coordinator, the daemon takes the
+  lease, checks the thread with T3, and briefs it with the coordinator prompt (a board task
+  the thread already owns counts as the task in progress). It then drops the adoption and
+  names the thread coordinator. An agent the board already knows (the thread's hooks
+  registered it) keeps its record: where it works and any usage-limit pause. From then on
+  the daemon renews, wakes and, after a lapsed lease, re-claims the thread like one it
+  started. A failed brief releases the lease and is retried with the start back-off; an
+  adoption newer than the last failed start is tried at once. An adopted thread that T3 no
+  longer has, or has archived, is dropped, and a new thread is started. So is an adoption
+  not acted on within an hour, so an old request never replaces a thread later.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
   or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
   briefs so the children claim them; review the result against the acceptance checks; mark

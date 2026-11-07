@@ -65,7 +65,10 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
-- `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404.
+- `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
+  last changed the board or touched a file (its newest event other than a handoff,
+  registration or state change), on the same clock as `updated_at`; a handoff older than it
+  is stale. It is absent when the agent has made no change.
 - `PUT /v1/agents/{id}/handoff` `[PutHandoff]` → `[Handoff]`; 409 on a version mismatch.
 
 ### Boards

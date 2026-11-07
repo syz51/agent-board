@@ -32,7 +32,7 @@ One Rust binary, `board`:
 | `board serve` | The server: SQLite, HTTP API, event stream, web view, Telegram notifier |
 | `board mcp` | Stdio MCP server the agent runtime starts |
 | `board hook <event>` | Hook handler for Claude Code and Codex |
-| `board watch` | Device daemon: starts and wakes coordinator threads |
+| `board watch` | Device daemon: starts (or adopts, after `board board adopt`) and wakes coordinator threads |
 | `board ...` | CLI for you and for scripts |
 
 The server is meant to run on one host on a private network (Tailscale); every device
