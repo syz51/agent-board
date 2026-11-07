@@ -2145,6 +2145,18 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     assert!(triage.contains("You are not its reviewer"));
 }
 
+#[test]
+fn the_coordinator_prompt_files_what_remains_before_task_done() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "6. File what the task still needs as sub-tasks first (`task_add`, parent set).",
+        "Call `task_done` only when every acceptance check passes, with evidence",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
 async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
