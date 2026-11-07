@@ -53,10 +53,9 @@ and send the new code from that chat; the paired chat keeps working until then, 
 asks are sent again to the new one. Setting `[telegram] chat_id` in `server.toml` instead
 skips pairing and always wins over a paired chat.
 
-Upgrade: `git -C /opt/agent-board pull` and run the `BOARD_COMMIT=... docker compose ...
-up -d --build` line again, then verify with `/healthz` as above. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
-starts the notifier, without a `[telegram]` table; it sends nothing until a chat is paired
-or configured.
+To upgrade, use `deploy/upgrade.sh` (section 5). Migrations run on start. Since pairing
+came in, `BOARD_TELEGRAM_TOKEN` alone starts the notifier, without a `[telegram]` table; it
+sends nothing until a chat is paired or configured.
 
 ## 3. Devices
 
@@ -129,7 +128,9 @@ systemctl daemon-reload && systemctl enable --now agent-board-backup.timer
 ```
 
 The timer runs every 15 minutes and thins snapshots once a day (2 days of all
-snapshots, 30 daily, 26 weekly).
+snapshots, 30 daily, 26 weekly). The unit names are the ones in `deploy/`; a host set up
+by other tooling may run its own backup unit under another name, so check with
+`systemctl list-timers 'agent-board*'` on the host.
 
 Restore drill, at least after setup and after each upgrade:
 
@@ -142,3 +143,69 @@ docker run --rm --user 0 -v /tmp/board-restore:/r agent-board:local \
 A clean copy proves the backup opens and migrates. To restore for real, stop the
 container, move the restored file to `/var/lib/agent-board/board.db` (owner 10001), and
 start it again.
+
+## 5. Upgrade
+
+Run `deploy/upgrade.sh` from a clone of this repository on a device that reaches every
+host over SSH. It moves the server and every home device to one pinned revision: a full
+commit SHA on `main`, or a `v*` release tag whose commit is on `main`. Both are checked
+against the repository the hosts install from (`BOARD_GIT_URL`, default this one on
+GitHub), not against the clone's own remotes.
+
+```sh
+deploy/upgrade.sh 0123456789abcdef0123456789abcdef01234567          # print the plan only
+deploy/upgrade.sh --yes 0123456789abcdef0123456789abcdef01234567    # apply it
+```
+
+The hosts come from `~/.config/agent-board/upgrade.conf` (or `--config FILE`), which stays
+outside the repository:
+
+```text
+# server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
+server root@board-host
+# device local | <ssh-target> [identity=FILE]
+device local
+device user@laptop identity=~/.ssh/id_ed25519_board
+```
+
+`db` is the server's database (`db` in `server.toml`); it must sit in the directory
+`compose.yaml` mounts, which has the same path inside the container.
+
+Without `--yes` the script prints each host's current and new revision and changes
+nothing. With `--yes` it:
+
+1. Takes a lock in the server's clone and holds it until the last device is done, so a
+   second run waits instead of racing this one. A lock over two hours old is from a run
+   that died, and is replaced.
+2. Refuses a revision older than any host's current one, so a late run cannot install an
+   older build. `--rollback` allows it on purpose.
+3. On the server, checks out the revision (a detached `HEAD`) and builds the image while
+   the old server keeps running. A failed build puts the clone back.
+4. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
+   admin backup` in the running container, and checks it is not empty. It keeps the five
+   newest of these copies; the backup timer keeps the history.
+5. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
+   reports that commit.
+6. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
+   it is already installed, restarts `board watch` (launchd or the systemd user unit), and
+   checks `cargo install --list`.
+7. Prints each device's revision, the previous ones, and the rollback command.
+
+It stops at the first failed step and says what to do next. A failed server step leaves
+every device unchanged. After any failure, fix the cause and run the same command again:
+the server is skipped once it runs the revision, devices already at it only restart `board
+watch`, and the rollback command still names the revision from before the first run.
+Rolling back moves the code only; migrations do not run backwards, so a rollback across a
+migration needs the pre-upgrade backup restored as in section 4.
+
+The backup runs in the server's container, so a server whose container is not running
+cannot be upgraded this way: stop it, copy the database, and run the section 2 commands
+by hand.
+
+SSH runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, keepalives and no agent or
+port forwarding, so each host must already be in `known_hosts` and reachable with a key.
+The server target must run `docker compose`, own the clone, and read and write the data
+directory (mode 0700, owned by the container's user), so it is `root`. Devices need
+`cargo` (looked up in `~/.cargo/bin` too) and the `board watch` service from `board
+install launchd` or `board install systemd`; a service that runs another `board` binary
+than cargo's is not upgraded by this.

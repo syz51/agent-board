@@ -35,6 +35,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The runner image ships shellcheck; crates/board/tests/upgrade.rs tests upgrade.sh.
+      - run: shellcheck deploy/*.sh
 
   web:
     runs-on: ubuntu-24.04
