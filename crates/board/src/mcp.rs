@@ -243,7 +243,14 @@ const TOOLS: &[ToolSpec] = &[
                 ("task", s("The task the work is for."), false),
                 (
                     "ttl_secs",
-                    json!({"type": "integer", "minimum": 60, "description": "Default 2700."}),
+                    json!({
+                        "type": "integer",
+                        "minimum": 60,
+                        "description": format!(
+                            "Default {}.",
+                            board_server::Settings::default().lease_ttl_secs
+                        ),
+                    }),
                     false,
                 ),
             ]

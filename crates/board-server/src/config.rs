@@ -326,7 +326,10 @@ mod tests {
         .unwrap();
         assert_eq!(full.defaults.owner_stale_after_secs, 60);
         assert_eq!(full.defaults.snapshot_full_chars, 1500);
-        assert_eq!(full.defaults.lease_ttl_secs, 2700);
+        assert_eq!(
+            full.defaults.lease_ttl_secs,
+            Settings::default().lease_ttl_secs
+        );
         assert_eq!(full.telegram.as_ref().unwrap().chat_id, Some(-100));
         let paired = ServerConfig::from_toml("db = \"b\"\n[telegram]\n").unwrap();
         assert_eq!(paired.telegram.unwrap().chat_id, None);

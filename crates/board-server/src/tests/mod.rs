@@ -16,17 +16,53 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use board_proto::Timestamp;
-use chrono::{TimeDelta, TimeZone, Utc};
+use chrono::{SecondsFormat, TimeDelta, TimeZone, Utc};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::{AppState, Db, ManualClock, ServerConfig, app};
+use crate::{AppState, Db, ManualClock, ServerConfig, Settings, app};
 
 pub(crate) const USER: &str = "user@example.com";
 pub(crate) const REPO: &str = "github.com/example/app";
 
 pub(crate) fn start() -> Timestamp {
     Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0).unwrap()
+}
+
+// Durations from the server defaults, so a change to a default in `config.rs` alone keeps
+// the tests meaningful and green.
+
+fn secs(n: u64) -> TimeDelta {
+    TimeDelta::seconds(i64::try_from(n).unwrap())
+}
+
+pub(crate) fn defaults() -> Settings {
+    Settings::default()
+}
+
+/// An owner unseen this long is stale.
+pub(crate) fn stale_after() -> TimeDelta {
+    secs(defaults().owner_stale_after_secs)
+}
+
+/// The default file lease TTL.
+pub(crate) fn lease_ttl() -> TimeDelta {
+    secs(defaults().lease_ttl_secs)
+}
+
+/// The default coordinator lease TTL.
+pub(crate) fn coordinator_ttl() -> TimeDelta {
+    secs(defaults().coordinator_ttl_secs)
+}
+
+/// Touches this recent count as overlapping.
+pub(crate) fn touch_window() -> TimeDelta {
+    secs(defaults().touch_window_secs)
+}
+
+/// A timestamp as the API writes it.
+pub(crate) fn iso(at: Timestamp) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// A server over an in-memory database, with a device token (`mac`) and a user token
