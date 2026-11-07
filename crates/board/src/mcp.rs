@@ -201,7 +201,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "auto",
                     b(
-                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide; waiting on a task is a blocker.",
+                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide, or for a proposal (a body starting \"Proposal:\") until another agent accepts it; waiting on a task is a blocker.",
                     ),
                     false,
                 ),
@@ -254,7 +254,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "auto",
                     b(
-                        "May the coordinator start it? Set false only when the user must act or decide; waiting on a task is a blocker, waiting on the user an ask plus blocked.",
+                        "May the coordinator start it? Set false only when the user must act or decide, or for a pending proposal; set a proposal true only on an accept verdict. Waiting on a task is a blocker, waiting on the user an ask plus blocked.",
                     ),
                     false,
                 ),

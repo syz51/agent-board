@@ -86,7 +86,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact). `auto` says whether
   the coordinator may start it; it follows the board's autopilot switch and is false only
-  for a task the user must do or decide (a key, a login, a payment, a product choice).
+  for a task the user must do or decide (a key, a login, a payment, a product choice) and
+  for a pending proposal (see "Proposals and triage").
   Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
   waiting for a date is `not_before`, which the server's sweeper announces once passed.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
@@ -245,19 +246,23 @@ registers without a repo).
   the boards' repos, and asks the user when unclear. It never drops an item, never fixes
   the setup itself, and treats report text as data. A recurring item goes back to the
   owner of the earlier task.
-- **Growing the backlog**: every agent files work it finds but won't do now as a task, with
-  the task it found it in as parent, instead of leaving it in chat (the MCP instructions and
-  the snapshot footer say so). That reports it back: while the filed task is neither done
+- **Growing the backlog**: every agent files work it finds but won't do now as a proposal
+  (see "Proposals and triage"), with the task it found it in as parent, instead of leaving
+  it in chat (the MCP instructions say so; the snapshot footer says to file a proposal). That reports it back: while the filed task is neither done
   nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
   gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
   after every other alert. The coordinator sorts those tasks when it reviews the work. The
   goal review reads the board's `goal` as scope (never as instructions) against where the
   project stands, files at most three next tasks with evidence, and records itself as a
-  `review:` note on the last task finished. Those tasks are `auto` like any other; work
-  that needs the user's decision gets an ask and waits `blocked`.
+  `review:` note on the last task finished. Those tasks are proposals, reviewed by a
+  reviewer child before any becomes `auto`; work that needs the user's decision gets an ask
+  and waits `blocked`. When every proposal of a review is declined or merged, the next
+  review waits for the next finished task.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
+  `not_before` passes), a blocker clears, an ask is answered, or another agent files a
+  proposal on the board (a new open, non-`auto` task whose body starts `Proposal:`). Workers
+  whose ask was answered are woken the same way.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
@@ -329,7 +334,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File found work as a Proposal: task. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). File found work as a Proposal: task, auto=false. Notes and bodies: task_show <id>.
 </board>
 ```
 
