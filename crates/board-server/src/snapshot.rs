@@ -39,6 +39,9 @@ const TITLE_CHARS: usize = 80;
 const PATH_CHARS: usize = 80;
 /// Events scanned for alerts per request; later ones wait for the next request.
 const ALERT_SCAN: u32 = 1000;
+/// Alerts look back at most this many events, so a cursor far behind costs no more per
+/// request than a recent one: older events are skipped, and one alert says which.
+const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
 /// so traffic about other agents' work, on any board, does not use up the scan.
 const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
@@ -230,8 +233,9 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         .as_ref()
         .map(|b| counts(cx, b).map(Counts::from))
         .transpose()?;
-    // A scan cut at `ALERT_SCAN` ends before `seq`; the next request resumes there.
-    let (alerts, seq) = alerts(cx, &agent, since, seq)?;
+    // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
+    // request resumes there. Everything else shows the board as of `seq`.
+    let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
 
     let mut model = Model {
         kind: req.kind,
@@ -292,13 +296,13 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         cx.db.execute(
             "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
              WHERE id = ?1",
-            params![agent.id.as_str(), seq, counts_json],
+            params![agent.id.as_str(), scanned_to, counts_json],
         )?;
     }
     Ok(Snapshot {
         kind: req.kind,
         text,
-        seq,
+        seq: scanned_to,
         at: cx.now,
     })
 }
@@ -700,10 +704,12 @@ fn shares_paths(
 /// Events after `since` (up to `seq`) that concern the agent, as alerts, and the sequence
 /// they were scanned to: `seq`, or the last event scanned when more than `ALERT_SCAN` events
 /// can concern the agent. Then the first alert says how many are left for the next request.
+/// Only the last `ALERT_WINDOW` events are read; an alert names the older ones skipped.
 fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Alert>, i64)> {
     if since >= seq {
         return Ok((Vec::new(), seq));
     }
+    let skipped_to = (seq - ALERT_WINDOW).max(since);
     let me = agent.id.as_str();
     let mine: Vec<Task> = load_tasks(
         cx,
@@ -750,11 +756,12 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         (":mine", &mine_json),
         (":any_mine", &any_mine),
     ];
-    let events = load_events(cx, ALERT_FILTER, &filter, since, ALERT_SCAN)?;
+    let events = load_events(cx, ALERT_FILTER, &filter, skipped_to, ALERT_SCAN)?;
     let scanned_to = match events.last() {
         Some(last) if events.len() == ALERT_SCAN as usize => last.seq,
         _ => seq,
     };
+    // Bounded by the window, like the scan.
     let left: i64 = if scanned_to < seq {
         let mut params = filter.clone();
         params.push((":since", &scanned_to));
@@ -1074,7 +1081,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
     }
     let mut alerts: Vec<Alert> = out.into_values().collect();
     alerts.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.alert.cmp(&b.alert)));
-    // First, so a size cap never cuts it.
+    // First, so a size cap never cuts them.
     if left > 0 {
         alerts.insert(
             0,
@@ -1082,6 +1089,19 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 alert: format!("{left} more events not checked for alerts yet"),
                 action: "board_snapshot again to check them".to_owned(),
                 rank: (0, scanned_to),
+            },
+        );
+    }
+    if skipped_to > since {
+        alerts.insert(
+            0,
+            Alert {
+                alert: format!(
+                    "events #{}-#{skipped_to} are too old to check for alerts",
+                    since + 1
+                ),
+                action: "board_snapshot for the current state".to_owned(),
+                rank: (0, skipped_to),
             },
         );
     }

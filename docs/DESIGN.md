@@ -374,6 +374,8 @@ keeping untrusted text out of those channels, so:
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
   most 1,000 per request that can concern it; the rest wait, counted in the first alert.
+  They read only the last 10,000 events, so a cursor far behind costs no more; an alert
+  names the events skipped.
 - Tool descriptions and server instructions never change at run time, so they do not break
   prompt caching.
 

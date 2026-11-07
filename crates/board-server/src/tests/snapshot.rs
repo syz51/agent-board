@@ -593,9 +593,9 @@ fn log_events(t: &T, n: u32, actor: &str, kind: &str, task: &str, payload: &str)
     ));
 }
 
-#[tokio::test]
-async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
-    let t = T::new();
+/// ME owns a task blocked on B's task, with its cursor at the latest event; returns
+/// (blocker, mine).
+async fn blocked_on_peer(t: &T) -> (String, String) {
     t.board("factory", &[REPO]).await;
     t.register(ME, Some(REPO), None).await;
     t.register(B, Some(REPO), None).await;
@@ -605,10 +605,20 @@ async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
     assert!(t.claim(ME, &mine).await.0.is_success());
     let (s, v) = t.patch(ME, &mine, json!({ "blockers": [blocker] })).await;
     assert!(s.is_success(), "{v}");
-    snapshot(&t, ME, "kind=alerts").await;
+    snapshot(t, ME, "kind=alerts").await;
+    (blocker, mine)
+}
 
+async fn finish(t: &T, agent: &str, task: &str) {
     let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
-    assert!(t.done(B, &blocker, commit).await.0.is_success());
+    assert!(t.done(agent, task, commit).await.0.is_success());
+}
+
+#[tokio::test]
+async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
+    let t = T::new();
+    let (blocker, _) = blocked_on_peer(&t).await;
+    finish(&t, B, &blocker).await;
     // 600 events by peers on other work: notes on the peer's task, edits in another repo.
     log_events(&t, 300, B, "note_added", &blocker, "{}");
     let elsewhere = format!(r#"{{"repo":"{DOTFILES}","paths":["a.rs"]}}"#);
@@ -625,22 +635,12 @@ async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
 #[tokio::test]
 async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
     let t = T::new();
-    t.board("factory", &[REPO]).await;
-    t.register(ME, Some(REPO), None).await;
-    t.register(B, Some(REPO), None).await;
-    let blocker = t.task(B, "factory", "Blocker").await;
-    assert!(t.claim(B, &blocker).await.0.is_success());
-    let mine = t.task(ME, "factory", "Mine").await;
-    assert!(t.claim(ME, &mine).await.0.is_success());
-    let (s, v) = t.patch(ME, &mine, json!({ "blockers": [blocker] })).await;
-    assert!(s.is_success(), "{v}");
-    let first = snapshot(&t, ME, "kind=alerts").await;
-    let start = first["seq"].as_i64().unwrap();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
 
     // 1,100 notes on my task, all of which can concern me, then the blocker finishes.
     log_events(&t, 1100, B, "note_added", &mine, "{}");
-    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
-    assert!(t.done(B, &blocker, commit).await.0.is_success());
+    finish(&t, B, &blocker).await;
     let max = t.count("SELECT MAX(seq) FROM events");
 
     let cut = snapshot(&t, ME, "kind=alerts").await;
@@ -669,4 +669,56 @@ async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
     );
     assert!(!alerts.contains("not checked"), "{alerts}");
     assert_eq!(rest["seq"].as_i64().unwrap(), max);
+}
+
+#[tokio::test]
+async fn a_cut_alert_scan_leaves_the_rest_of_a_full_snapshot_current() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
+    log_events(&t, 1100, B, "note_added", &mine, "{}");
+    finish(&t, B, &blocker).await;
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let full = snapshot(&t, ME, "kind=full").await;
+    let body = text(&full);
+    // The cursor stops where the alert scan did; the board shows its latest state.
+    assert_eq!(full["seq"].as_i64().unwrap(), start + 1000);
+    assert!(body.contains(&format!("seq=\"{max}\"")), "{body}");
+    assert!(body.contains(&format!("#{max} ")), "{body}");
+    assert!(body.contains("101 more events not checked"), "{body}");
+}
+
+#[tokio::test]
+async fn alerts_skip_events_older_than_the_window_and_say_which() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
+    // The blocker finishes, then 10,500 events by peers on other work bury it.
+    finish(&t, B, &blocker).await;
+    log_events(&t, 10_500, B, "note_added", &blocker, "{}");
+    let (s, v) = t.patch(B, &mine, json!({ "priority": "p1" })).await;
+    assert!(s.is_success(), "{v}");
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let snap = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&snap);
+    let first_alert = alerts.lines().nth(1).unwrap_or_default();
+    assert_eq!(
+        first_alert,
+        format!(
+            "! events #{}-#{} are too old to check for alerts -> board_snapshot for the \
+             current state",
+            start + 1,
+            max - 10_000
+        ),
+        "{alerts}"
+    );
+    // Within the window, alerts still arrive.
+    assert!(
+        alerts.contains(&format!("changed your task {mine}")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("blocker is cleared"), "{alerts}");
+    assert_eq!(snap["seq"].as_i64().unwrap(), max);
 }

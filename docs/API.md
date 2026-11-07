@@ -402,7 +402,8 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
   `text`. The server also advances the agent's cursor to the returned `seq`. One request
   checks at most 1,000 events that can concern the agent for alerts; past that, `seq` is the
-  last one checked and the first alert says how many wait for the next request. `json` is
+  last one checked and the first alert says how many wait for the next request. Alerts read
+  only the last 10,000 events; an alert names the older ones skipped. `json` is
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
