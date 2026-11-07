@@ -150,9 +150,9 @@ be on the same board and must not form a cycle.
 - `POST /v1/asks/{id}/withdraw` `[TaskAction]` → `[Ask]` with status `withdrawn`. The
   asking agent only (403 otherwise); 400 `invalid_transition` unless the ask is open. It
   leaves the open queue, and its Telegram message is edited to say so and loses its
-  buttons. The CLI (`board withdraw <id>`) and MCP (`ask_withdraw`) call it; `ask_user` on a
-  task that already has open asks names them in a warning so the agent can withdraw
-  duplicates.
+  buttons. The CLI (`board withdraw <id>`) and MCP (`ask_withdraw`) call it. After `ask_user`
+  makes an ask on a task, it lists the task's other open asks and names them, with who
+  asked, in a warning, so the agent can withdraw its own duplicates.
 
 ### Snapshots and events
 

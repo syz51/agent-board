@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use board_proto::{AgentRole, Event, EventType};
+use board_proto::{AgentRole, AskStatus, Event, EventType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -245,9 +245,13 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
     send_ask_to(state, bot, chat, id).await
 }
 
-/// Sends ask `id` to `chat` and records the message, so replies to it answer the ask.
+/// Sends ask `id` to `chat` if it is still open and records the message, so replies to
+/// it answer the ask.
 async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<()> {
     let (ask, text) = ask_text(state, id).await?;
+    if ask.status != AskStatus::Open {
+        return Ok(());
+    }
     let mut body = json!({ "chat_id": chat, "text": text });
     if !ask.options.is_empty() {
         let rows: Vec<Value> = ask
@@ -260,10 +264,15 @@ async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<
             .collect();
         body["reply_markup"] = json!({ "inline_keyboard": rows });
     }
-    let message = bot.send(body).await?;
-    state
-        .write(move |cx| asks::set_telegram_message(cx, id, message.message_id))
-        .await
+    let message = bot.send(body).await?.message_id;
+    let status = state
+        .write(move |cx| asks::set_telegram_message(cx, id, chat, message))
+        .await?;
+    if status == AskStatus::Withdrawn {
+        // Withdrawn while it was being sent, when there was no message to mark yet.
+        edit_withdrawn(state, bot, id, chat, message).await?;
+    }
+    Ok(())
 }
 
 /// Marks a withdrawn ask's message as withdrawn and drops its buttons, so the user
@@ -272,14 +281,20 @@ async fn mark_withdrawn(state: &AppState, bot: &Bot, event: &Event) -> Result<()
     let Some(id) = event.payload.get("id").and_then(Value::as_i64) else {
         return Ok(());
     };
-    let Some(message) = state.read(move |cx| asks::telegram_message(cx, id)).await? else {
+    let Some((chat, message)) = state.read(move |cx| asks::telegram_message(cx, id)).await? else {
         return Ok(());
     };
-    let Some(chat) = bot.chat(state).await? else {
-        return Ok(());
-    };
-    let (_, mut text) = ask_text(state, id).await?;
-    text.push_str("\n\nWithdrawn by the agent; no answer is needed.");
+    edit_withdrawn(state, bot, id, chat, message).await
+}
+
+async fn edit_withdrawn(
+    state: &AppState,
+    bot: &Bot,
+    id: i64,
+    chat: i64,
+    message: i64,
+) -> Result<()> {
+    let (_, text) = ask_text(state, id).await?;
     bot.call::<Value>(
         "editMessageText",
         &json!({ "chat_id": chat, "message_id": message, "text": text }),
@@ -288,7 +303,8 @@ async fn mark_withdrawn(state: &AppState, bot: &Bot, event: &Event) -> Result<()
     Ok(())
 }
 
-/// Ask `id` and the text of its Telegram message.
+/// Ask `id` and the text of its Telegram message, which tells the user how to answer it
+/// or that it was withdrawn.
 async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String)> {
     let (ask, board, task, handle) = state
         .read(move |cx| {
@@ -318,7 +334,9 @@ async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String
     text.push('\n');
     text.push_str(&ask.question);
     text.push_str("\n\n");
-    if ask.options.is_empty() {
+    if ask.status == AskStatus::Withdrawn {
+        text.push_str("Withdrawn by the agent; no answer is needed.");
+    } else if ask.options.is_empty() {
         text.push_str("Reply to this message to answer.");
     } else {
         text.push_str("Pick an option, or reply to this message to answer freely.");

@@ -146,21 +146,28 @@ pub(crate) fn withdraw(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<Ask
 }
 
 /// Records the Telegram message an ask was sent as, so replies to it can be matched.
-pub(crate) fn set_telegram_message(cx: &mut Ctx<'_>, id: i64, message: i64) -> Result<()> {
+/// Returns the ask's status now, which may have changed while it was being sent.
+pub(crate) fn set_telegram_message(
+    cx: &mut Ctx<'_>,
+    id: i64,
+    chat: i64,
+    message: i64,
+) -> Result<AskStatus> {
     cx.db.execute(
-        "UPDATE asks SET telegram_message_id = ?2 WHERE id = ?1",
-        params![id, message],
+        "UPDATE asks SET telegram_chat_id = ?2, telegram_message_id = ?3 WHERE id = ?1",
+        params![id, chat, message],
     )?;
-    Ok(())
+    Ok(get_ask(cx, id)?.status)
 }
 
-/// The Telegram message ask `id` was sent as, if it was sent.
-pub(crate) fn telegram_message(cx: &Ctx<'_>, id: i64) -> Result<Option<i64>> {
-    Ok(cx.db.query_row(
-        "SELECT telegram_message_id FROM asks WHERE id = ?1",
+/// The chat and message ask `id` was sent as, if it was sent.
+pub(crate) fn telegram_message(cx: &Ctx<'_>, id: i64) -> Result<Option<(i64, i64)>> {
+    let (chat, message): (Option<i64>, Option<i64>) = cx.db.query_row(
+        "SELECT telegram_chat_id, telegram_message_id FROM asks WHERE id = ?1",
         [id],
-        |r| r.get(0),
-    )?)
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(chat.zip(message))
 }
 
 pub(crate) fn by_telegram_message(cx: &Ctx<'_>, message: i64) -> Result<Option<i64>> {

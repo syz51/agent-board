@@ -505,21 +505,57 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
         created_at: at(),
         answered_at: None,
     };
-    e.stub
-        .on("GET /v1/asks", [open(5, "factory-3"), open(6, "factory-4")]);
+    let mut theirs = open(8, "factory-3");
+    theirs.agent = "t3:c2d0".parse().unwrap();
+    e.stub.on(
+        "GET /v1/asks",
+        [
+            open(5, "factory-3"),
+            open(6, "factory-4"),
+            open(7, "factory-3"),
+            theirs.clone(),
+        ],
+    );
     e.stub.on("POST /v1/asks", open(7, "factory-3"));
     let out = e.run(&["ask", "Which db?", "--task", "factory-3"]);
     let text = stdout(&out);
     assert!(text.contains("ask #7 decision open on factory"), "{text}");
     assert!(
-        text.contains("warning: ask #5 is already open on factory-3"),
+        text.contains(
+            "warning: factory-3 already has open asks: #5 by you, #8 by t3:c2d0. Withdraw yours"
+        ),
         "{text}"
     );
-    assert!(!text.contains("#6"), "{text}");
+    assert!(!text.contains("#6") && !text.contains("#7 by"), "{text}");
     let q = e.stub.requests_to("GET /v1/asks")[0].query_pairs();
     assert_eq!(
         (q["status"].as_str(), q["board"].as_str()),
         ("open", "factory")
+    );
+
+    // Only another agent's ask: named, with nothing to withdraw.
+    e.stub.on("GET /v1/asks", [theirs]);
+    let text = stdout(&e.run(&["ask", "Which db?", "--task", "factory-3"]));
+    assert!(
+        text.contains("warning: factory-3 already has open ask: #8 by t3:c2d0.")
+            && !text.contains("Withdraw"),
+        "{text}"
+    );
+
+    // The check is advisory: when it fails, the ask still stands.
+    e.stub.on_error(
+        "GET /v1/asks",
+        500,
+        "internal",
+        "database is locked",
+        "retry",
+    );
+    let out = e.run(&["ask", "Which db?", "--task", "factory-3"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("warning: could not check factory-3 for other open asks"),
+        "{}",
+        stdout(&out)
     );
 
     let mut withdrawn = open(5, "factory-3");

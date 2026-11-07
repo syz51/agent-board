@@ -501,21 +501,11 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         (None, Some(task)) => task.board(),
         _ => ctx.resolve_board(ask.board.clone()).await?,
     };
-    let open_on_task: Vec<i64> = match &ask.task {
-        Some(task) => ctx
-            .client
-            .asks(Some("open"), Some(&board))
-            .await?
-            .into_iter()
-            .filter(|open| open.task.as_ref() == Some(task))
-            .map(|open| open.id)
-            .collect(),
-        None => Vec::new(),
-    };
+    let agent = ctx.agent()?.clone();
     let created = ctx
         .client
         .create_ask(&CreateAsk {
-            agent: ctx.agent()?.clone(),
+            agent: agent.clone(),
             board,
             task: ask.task,
             kind: ask.kind,
@@ -527,13 +517,42 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
         render::ask_line(&created)
     );
-    if !open_on_task.is_empty() {
-        let ids: Vec<String> = open_on_task.iter().map(|id| format!("#{id}")).collect();
-        text.push_str(&format!(
-            "\nwarning: ask {} is already open on {}. If this one replaces it, withdraw the old one (ask_withdraw).",
-            ids.join(", "),
-            created.task.as_ref().map(ToString::to_string).unwrap_or_default()
-        ));
+    if let Some(task) = &created.task {
+        // Advisory: the ask is made either way, so a failed check is reported, not raised.
+        match ctx.client.asks(Some("open"), Some(&created.board)).await {
+            Ok(open) => {
+                let others: Vec<_> = open
+                    .iter()
+                    .filter(|other| other.id != created.id && other.task.as_ref() == Some(task))
+                    .collect();
+                if !others.is_empty() {
+                    let named: Vec<String> = others
+                        .iter()
+                        .map(|other| {
+                            let by = if other.agent == agent {
+                                "you".to_owned()
+                            } else {
+                                other.agent.to_string()
+                            };
+                            format!("#{} by {by}", other.id)
+                        })
+                        .collect();
+                    text.push_str(&format!(
+                        "\nwarning: {task} already has open {}: {}.",
+                        if others.len() == 1 { "ask" } else { "asks" },
+                        named.join(", ")
+                    ));
+                    if others.iter().any(|other| other.agent == agent) {
+                        text.push_str(
+                            " Withdraw yours that this one replaces (ask_withdraw; CLI: board withdraw <id>).",
+                        );
+                    }
+                }
+            }
+            Err(err) => text.push_str(&format!(
+                "\nwarning: could not check {task} for other open asks: {err:#}"
+            )),
+        }
     }
     Ok(Output::new(text, &created))
 }

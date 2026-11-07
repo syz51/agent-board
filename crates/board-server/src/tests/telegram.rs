@@ -562,6 +562,7 @@ async fn a_withdrawn_ask_is_marked_in_telegram() {
         text.ends_with("Withdrawn by the agent; no answer is needed."),
         "{text}"
     );
+    assert!(!text.contains("answer freely"), "{text}");
     assert!(edits[0].get("reply_markup").is_none(), "the buttons go");
 
     t.state.shutdown();
