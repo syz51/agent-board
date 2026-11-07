@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_telegram_pairing.sql"),
     include_str!("../migrations/0004_events_actor.sql"),
     include_str!("../migrations/0005_telegram_chat_of_message.sql"),
+    include_str!("../migrations/0006_task_not_before.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -278,7 +279,8 @@ pub(crate) fn ready_sql(t: &str) -> String {
         "({t}.status = 'open' \
          AND NOT EXISTS (SELECT 1 FROM task_blockers rb JOIN tasks rt ON rt.id = rb.blocker \
                          WHERE rb.task = {t}.id AND rt.status != 'done') \
-         AND ({t}.owner IS NULL OR NOT {live}))",
+         AND ({t}.owner IS NULL OR NOT {live}) \
+         AND ({t}.not_before IS NULL OR {t}.not_before <= :now))",
         live = live_sql(&format!("{t}.owner"))
     )
 }

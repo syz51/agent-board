@@ -265,6 +265,7 @@ export class DevState {
       blocked_reason: null,
       owner: null,
       blockers: [],
+      not_before: null,
       auto: true,
       created_by: coordinator.id,
       version: 1,
@@ -336,7 +337,11 @@ export class DevState {
     return {
       ...task,
       owner_stale: owner !== undefined && this.stale(owner),
-      ready: task.status === "open" && task.blockers.every(done) && !this.ownerLive(task.owner),
+      ready:
+        task.status === "open" &&
+        task.blockers.every(done) &&
+        !this.ownerLive(task.owner) &&
+        (task.not_before === null || Date.parse(task.not_before) <= this.now()),
     };
   }
 

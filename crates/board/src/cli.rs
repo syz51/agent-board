@@ -240,6 +240,9 @@ pub struct AddArgs {
     /// false only when the user must act or decide; waiting on a task is a blocker.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
+    /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time.
+    #[arg(long)]
+    not_before: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -263,6 +266,9 @@ pub struct UpdateArgs {
     /// May the coordinator start it? Set false only when the user must act or decide.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
+    /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.
+    #[arg(long)]
+    not_before: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -501,6 +507,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blockers: a.blockers,
                 priority: a.priority,
                 auto: a.auto,
+                not_before: a
+                    .not_before
+                    .as_deref()
+                    .map(ops::parse_not_before)
+                    .transpose()?
+                    .flatten(),
             };
             ops::task_add(&ctx()?, new).await?
         }
@@ -518,6 +530,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blockers,
                 blocked_reason: a.blocked_reason,
                 auto: a.auto,
+                not_before: a
+                    .not_before
+                    .as_deref()
+                    .map(ops::parse_not_before)
+                    .transpose()?,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }

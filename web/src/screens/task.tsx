@@ -4,6 +4,7 @@ import { tags } from "../live/refresh.ts";
 import { useResource } from "../live/runtime.ts";
 import { Markdown, PlainText, SafeLink, safeHref } from "../text/markdown.tsx";
 import {
+  AbsTime,
   agentIndex,
   boardOfTask,
   Empty,
@@ -84,6 +85,12 @@ function TaskView(
           <dt>Autopilot</dt>
           <dd>{task.auto ? "May start without you" : "Needs you to start"}</dd>
         </div>
+        {task.not_before && (
+          <div>
+            <dt>Not before</dt>
+            <dd><AbsTime at={task.not_before} /></dd>
+          </div>
+        )}
         <div>
           <dt>Created</dt>
           <dd>

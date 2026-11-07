@@ -398,6 +398,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         owner_stale: false,
         blockers: Vec::new(),
         ready: true,
+        not_before: None,
         auto: true,
         created_by: "t3:creator".parse().unwrap(),
         version: 3,

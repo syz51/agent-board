@@ -29,8 +29,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 - When a task cannot proceed for any other reason, set it `blocked` with the reason and
   move on.
 - Every task is `auto` unless the user must do or decide it. File new tasks without
-  `auto=false` otherwise: a task that waits on another task gets `blockers`, and one that
-  waits on the user gets an ask and `blocked`. When a non-auto ready task needs nothing from
+  `auto=false` otherwise: a task that waits on another task gets `blockers`, one that waits
+  for a date gets `not_before`, and one that waits on the user gets an ask and `blocked`. When a non-auto ready task needs nothing from
   the user, set it `auto`.
 - File what you find as tasks or notes, not as chat. Notes start with their kind and cite
   evidence.

@@ -8,7 +8,7 @@ use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
 
 use crate::config::Settings;
-use crate::db::{Ctx, enum_str};
+use crate::db::{Ctx, enum_str, parse_id, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
@@ -256,10 +256,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     )?;
     let id = TaskId::new(&req.board, number as u64);
     let now = cx.now_ms();
+    let not_before = req
+        .not_before
+        .map(|at| at.timestamp_millis())
+        .filter(|&at| at > now);
     cx.db.execute(
         "INSERT INTO tasks (id, board, number, parent, title, body, acceptance, status, priority, \
-         auto, created_by, version, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, 1, ?11, ?11)",
+         auto, created_by, version, created_at, updated_at, not_before) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, 1, ?11, ?11, ?12)",
         params![
             id.as_str(),
             req.board.as_str(),
@@ -272,6 +276,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             req.auto.unwrap_or(board.autopilot),
             req.agent.as_str(),
             now,
+            not_before,
         ],
     )?;
     set_blockers(cx, &id, &blockers)?;
@@ -284,6 +289,40 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         serde_json::json!({ "title": req.title, "priority": req.priority }),
     )?;
     get_task(cx, &id)
+}
+
+/// Clears every `not_before` the clock has passed, each with a `task_updated` event by
+/// `server` so the coordinator learns the task may be ready. Run by the sweeper.
+pub(crate) fn pass_not_before(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let due: Vec<(TaskId, BoardSlug, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, board, not_before FROM tasks WHERE not_before <= ?1 ORDER BY not_before, id",
+        )?
+        .query_map([now], |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                r.get(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, board, at) in &due {
+        cx.db.execute(
+            "UPDATE tasks SET not_before = NULL, version = version + 1, updated_at = ?2 \
+             WHERE id = ?1",
+            params![id.as_str(), now],
+        )?;
+        cx.emit(
+            Some(board),
+            "server",
+            EventType::TaskUpdated,
+            Some(id),
+            serde_json::json!({ "fields": ["not_before"], "not_before": null, "passed": ts(*at) }),
+        )?;
+    }
+    Ok(due.len())
 }
 
 /// Filters of `GET /v1/tasks`.
@@ -702,6 +741,14 @@ pub(crate) fn update(
     if auto != task.auto {
         fields.push("auto");
     }
+    // A time already passed means no wait, as on create.
+    let not_before = match req.not_before {
+        Some(new) => new.filter(|&at| at > cx.now),
+        None => task.not_before,
+    };
+    if not_before != task.not_before {
+        fields.push("not_before");
+    }
     if fields.is_empty() {
         return Ok(task);
     }
@@ -710,6 +757,7 @@ pub(crate) fn update(
     cx.db.execute(
         "UPDATE tasks SET status = ?2, owner = ?3, title = ?4, body = ?5, acceptance = ?6, \
          priority = ?7, auto = ?8, blocked_reason = ?9, version = version + 1, updated_at = ?10, \
+         not_before = ?11, \
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \
          done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END \
@@ -725,6 +773,7 @@ pub(crate) fn update(
             auto,
             blocked_reason,
             now,
+            not_before.map(|at| at.timestamp_millis()),
         ],
     )?;
     if fields.contains(&"blockers") {
@@ -740,6 +789,9 @@ pub(crate) fn update(
     }
     if fields.contains(&"title") {
         payload["title"] = serde_json::json!(title);
+    }
+    if fields.contains(&"not_before") {
+        payload["not_before"] = serde_json::json!(not_before);
     }
     if fields.contains(&"owner") {
         payload["owner"] = serde_json::json!(owner);

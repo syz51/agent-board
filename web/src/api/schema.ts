@@ -61,6 +61,8 @@ export const task = object({
   owner_stale: boolean,
   blockers: array(string),
   ready: boolean,
+  /** Not ready before this time; the server clears it once passed. */
+  not_before: nullable(timestamp),
   auto: boolean,
   created_by: string,
   version: integer,

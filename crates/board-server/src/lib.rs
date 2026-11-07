@@ -107,7 +107,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// Sweeps expired leases every minute until shutdown.
+/// Every minute until shutdown, sweeps expired leases and passed `not_before` times.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -117,6 +117,9 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                 _ = tick.tick() => {
                     if let Err(error) = state.write(ops::leases::sweep_expired).await {
                         tracing::error!(%error, "lease sweep failed");
+                    }
+                    if let Err(error) = state.write(ops::tasks::pass_not_before).await {
+                        tracing::error!(%error, "not_before sweep failed");
                     }
                 }
             }

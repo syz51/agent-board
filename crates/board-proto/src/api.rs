@@ -115,6 +115,9 @@ pub struct CreateTask {
     pub priority: Priority,
     /// Defaults to the board's autopilot setting.
     pub auto: Option<bool>,
+    /// Not ready before this time; a time already passed is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<Timestamp>,
 }
 
 fn default_priority() -> Priority {
@@ -140,6 +143,23 @@ pub struct UpdateTask {
     pub blockers: Option<Vec<TaskId>>,
     pub blocked_reason: Option<String>,
     pub auto: Option<bool>,
+    /// Absent leaves it unchanged; `null` clears it, so the task no longer waits.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub not_before: Option<Option<Timestamp>>,
+}
+
+/// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
+/// absent field stays `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// `POST /v1/tasks/{id}/done`: at least one evidence item is required.
@@ -330,4 +350,32 @@ pub struct ApiError {
     pub message: String,
     /// What to do next, phrased for an agent ("re-read factory-12 and retry").
     pub next: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_task_tells_an_absent_not_before_from_null() {
+        let base = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        let absent: UpdateTask = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.not_before, None);
+        let mut cleared = base.clone();
+        cleared["not_before"] = serde_json::Value::Null;
+        let cleared: UpdateTask = serde_json::from_value(cleared).unwrap();
+        assert_eq!(cleared.not_before, Some(None));
+        let mut set = base;
+        set["not_before"] = serde_json::json!("2026-11-21T00:00:00Z");
+        let set: UpdateTask = serde_json::from_value(set).unwrap();
+        assert_eq!(
+            set.not_before,
+            Some(Some("2026-11-21T00:00:00Z".parse().unwrap()))
+        );
+        // Round trip: unchanged stays absent, a clear stays null.
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(json.get("not_before").is_none());
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["not_before"], serde_json::Value::Null);
+    }
 }

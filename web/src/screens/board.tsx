@@ -6,6 +6,7 @@ import { tags } from "../live/refresh.ts";
 import { useNow, useResource } from "../live/runtime.ts";
 import { PlainText } from "../text/markdown.tsx";
 import {
+  AbsTime,
   agentIndex,
   Empty,
   Owner,
@@ -208,6 +209,11 @@ function TaskRow(
           </span>
         )}
         {task.auto && <span class="chip">auto</span>}
+        {task.not_before && (
+          <span class="chip">
+            waits until <AbsTime at={task.not_before} />
+          </span>
+        )}
         <span class="muted">
           updated <RelTime at={task.updated_at} />
         </span>

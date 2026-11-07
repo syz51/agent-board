@@ -64,7 +64,7 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
-     t.updated_at";
+     t.updated_at, t.not_before";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -87,6 +87,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         owner_stale: false,
         blockers: Vec::new(),
         ready: false,
+        not_before: r.get::<_, Option<i64>>(15)?.map(ts),
         auto: r.get(10)?,
         created_by: parse_id(&r.get::<_, String>(11)?)?,
         version: r.get(12)?,
@@ -141,7 +142,8 @@ fn complete_task(cx: &Ctx<'_>, mut task: Task) -> Result<Task> {
         None => false,
     };
     task.owner_stale = task.owner.is_some() && !owner_live;
-    task.ready = task.status == TaskStatus::Open && all_done && !owner_live;
+    let waiting = task.not_before.is_some_and(|at| at > cx.now);
+    task.ready = task.status == TaskStatus::Open && all_done && !owner_live && !waiting;
     Ok(task)
 }
 

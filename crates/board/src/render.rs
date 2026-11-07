@@ -106,6 +106,9 @@ pub fn task_line(task: &Task) -> String {
     if task.auto {
         line.push_str(" auto");
     }
+    if let Some(at) = task.not_before {
+        let _ = write!(line, " waits until {}", at.format("%Y-%m-%d %H:%MZ"));
+    }
     line
 }
 

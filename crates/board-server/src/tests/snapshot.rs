@@ -441,3 +441,41 @@ async fn json_and_yaml_carry_the_same_model() {
     );
     assert!(yaml.chars().count() <= 2000);
 }
+
+#[tokio::test]
+async fn snapshots_list_tasks_waiting_for_their_not_before() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let at = super::start() + TimeDelta::days(15);
+    let soon = super::start() + TimeDelta::days(1);
+    for (title, at) in [("Later", at), ("Sooner", soon)] {
+        t.task_with(
+            "t3:alpha",
+            json!({ "board": "factory", "title": title, "not_before": super::iso(at) }),
+        )
+        .await;
+    }
+    let full = snapshot(&t, "t3:alpha", "").await;
+    assert!(
+        text(&full).contains(
+            "waiting (not ready before):\n  factory-2 p2 \"Sooner\" until 2026-11-07 12:00Z\n  factory-1 p2 \"Later\" until 2026-11-21 12:00Z\n"
+        ),
+        "{}",
+        text(&full)
+    );
+    assert!(text(&full).contains("ready 0"), "{}", text(&full));
+
+    t.advance(TimeDelta::days(2));
+    let full = snapshot(&t, "t3:alpha", "").await;
+    assert!(
+        text(&full).contains("waiting (not ready before):\n  factory-1 p2 \"Later\""),
+        "{}",
+        text(&full)
+    );
+    assert!(
+        text(&full).contains("ready (1):\n  factory-2 p2 \"Sooner\""),
+        "{}",
+        text(&full)
+    );
+}

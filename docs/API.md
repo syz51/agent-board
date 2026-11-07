@@ -89,10 +89,17 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 - `GET /v1/tasks?board=&status=&owner=&ready=&mine=&limit=` → `[Task]` list, sorted by
   priority, then id number. `mine=true` uses the `X-Board-Agent` header. `limit` defaults
   to 200, at most 1,000.
-- `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`.
+- `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
+  `not_before` (RFC 3339) holds the task: it is not `ready` until the server's clock passes
+  it, and a time already passed is ignored.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event.
-- `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`.
+- `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
+  is, a time sets it, and `null` (or a time already passed) clears it.
+- Within a minute of a task's `not_before` passing, the server clears it and records a
+  `task_updated` event by actor `server` with payload `{"fields": ["not_before"],
+  "not_before": null, "passed": <time>}`; the daemon wakes the coordinator if the task is
+  then ready. `not_before` is absent from a `Task` without one.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done. A claim

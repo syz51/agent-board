@@ -819,3 +819,109 @@ async fn task_history_shows_the_newest_events_oldest_first() {
     // Cut: the oldest event, task_created, is gone.
     assert_ne!(history[0]["type"], "task_created");
 }
+
+fn pass_not_before(t: &T) -> usize {
+    t.state
+        .db()
+        .write(
+            t.state.now(),
+            t.state.settings(),
+            crate::ops::tasks::pass_not_before,
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_task_waits_until_its_not_before() {
+    let t = setup().await;
+    let at = super::start() + TimeDelta::days(2);
+    let waiting = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Later", "not_before": super::iso(at) }),
+        )
+        .await;
+    let task = t.get_task(&waiting).await;
+    assert_eq!(
+        (task["ready"].as_bool(), task["not_before"].as_str()),
+        (Some(false), Some(super::iso(at).as_str()))
+    );
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["counts"]["ready"], 0);
+    assert_eq!(
+        t.ok("GET", "/v1/tasks?board=factory&ready=true", None, None)
+            .await,
+        json!([])
+    );
+    assert_eq!(pass_not_before(&t), 0, "not yet");
+
+    // Ready as soon as the clock passes it, before the sweeper runs.
+    t.advance(TimeDelta::days(2));
+    assert_eq!(t.get_task(&waiting).await["ready"], true);
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["counts"]["ready"], 1);
+
+    // The sweeper clears it with an event by `server` that wakes the coordinator.
+    let since = t.count("SELECT MAX(seq) FROM events");
+    let version = t.get_task(&waiting).await["version"].as_i64().unwrap();
+    assert_eq!(pass_not_before(&t), 1);
+    assert_eq!(pass_not_before(&t), 0, "once");
+    let task = t.get_task(&waiting).await;
+    assert!(task.get("not_before").is_none(), "{task}");
+    assert_eq!(task["version"], version + 1);
+    let page = t
+        .ok("GET", &format!("/v1/events?since={since}"), None, None)
+        .await;
+    let event = &page["events"][0];
+    assert_eq!(
+        (
+            event["type"].as_str(),
+            event["actor"].as_str(),
+            event["task"].as_str()
+        ),
+        (Some("task_updated"), Some("server"), Some(waiting.as_str()))
+    );
+    assert_eq!(event["payload"]["fields"], json!(["not_before"]));
+}
+
+#[tokio::test]
+async fn not_before_is_set_and_cleared_by_update() {
+    let t = setup().await;
+    let id = t.task(A, "factory", "Hold").await;
+    let at = super::start() + TimeDelta::days(14);
+    let (s, task) = t
+        .patch(A, &id, json!({ "not_before": super::iso(at) }))
+        .await;
+    assert!(s.is_success(), "{task}");
+    assert_eq!(
+        (task["ready"].as_bool(), task["not_before"].as_str()),
+        (Some(false), Some(super::iso(at).as_str()))
+    );
+
+    // Absent leaves it alone.
+    let (_, task) = t.patch(A, &id, json!({ "priority": "p1" })).await;
+    assert_eq!(task["not_before"].as_str(), Some(super::iso(at).as_str()));
+
+    // Null clears it; so does a time already passed.
+    let (_, task) = t.patch(A, &id, json!({ "not_before": null })).await;
+    assert!(
+        task.get("not_before").is_none() && task["ready"] == true,
+        "{task}"
+    );
+    t.patch(A, &id, json!({ "not_before": super::iso(at) }))
+        .await;
+    let past = super::start() - TimeDelta::hours(1);
+    let (_, task) = t
+        .patch(A, &id, json!({ "not_before": super::iso(past) }))
+        .await;
+    assert!(task.get("not_before").is_none(), "{task}");
+
+    // Created with a passed time, it does not wait.
+    let now = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Now", "not_before": super::iso(past) }),
+        )
+        .await;
+    assert_eq!(t.get_task(&now).await["ready"], true);
+}

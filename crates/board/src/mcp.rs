@@ -146,6 +146,13 @@ const TOOLS: &[ToolSpec] = &[
                     ),
                     false,
                 ),
+                (
+                    "not_before",
+                    s(
+                        "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time: for work that must wait for a date.",
+                    ),
+                    false,
+                ),
             ]
         },
     },
@@ -161,7 +168,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_update",
-        description: "Change a task: status (blocked, review, open, dropped...), title, body, acceptance, priority, blockers (the full list), blocked_reason, auto. Done goes through task_done.",
+        description: "Change a task: status (blocked, review, open, dropped...), title, body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before. Done goes through task_done.",
         params: || {
             vec![
                 ("id", s("Task id."), true),
@@ -180,6 +187,13 @@ const TOOLS: &[ToolSpec] = &[
                     "auto",
                     b(
                         "May the coordinator start it? Set false only when the user must act or decide; waiting on a task is a blocker, waiting on the user an ask plus blocked.",
+                    ),
+                    false,
+                ),
+                (
+                    "not_before",
+                    s(
+                        "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.",
                     ),
                     false,
                 ),
@@ -438,6 +452,12 @@ impl BoardMcp {
                     blockers: a.blockers,
                     priority: a.priority,
                     auto: a.auto,
+                    not_before: a
+                        .not_before
+                        .as_deref()
+                        .map(ops::parse_not_before)
+                        .transpose()?
+                        .flatten(),
                 };
                 ops::task_add(&ctx, new).await?
             }
@@ -457,6 +477,11 @@ impl BoardMcp {
                     blockers: a.blockers,
                     blocked_reason: a.blocked_reason,
                     auto: a.auto,
+                    not_before: a
+                        .not_before
+                        .as_deref()
+                        .map(ops::parse_not_before)
+                        .transpose()?,
                 };
                 ops::task_update(&ctx, &a.id, changes).await?
             }
@@ -561,6 +586,7 @@ struct AddArgs {
     blockers: Vec<TaskId>,
     priority: Option<Priority>,
     auto: Option<bool>,
+    not_before: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -581,6 +607,7 @@ struct UpdateArgs {
     blockers: Option<Vec<TaskId>>,
     blocked_reason: Option<String>,
     auto: Option<bool>,
+    not_before: Option<String>,
 }
 
 #[derive(Deserialize)]

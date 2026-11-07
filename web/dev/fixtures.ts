@@ -214,6 +214,7 @@ export function createFixtures(now: number): Fixtures {
     blocked_reason: null,
     owner: null,
     blockers: [],
+    not_before: null,
     auto: true,
     created_by: id("t3:c2d0"),
     version: version++,
@@ -223,6 +224,13 @@ export function createFixtures(now: number): Fixtures {
   });
 
   const tasks: TaskFixture[] = [
+    task({
+      id: "factory-30",
+      title: "Rotate the release signing key",
+      status: "open",
+      priority: "p3",
+      not_before: new Date(now + 14 * day * 60_000).toISOString(),
+    }, 3 * day, 3 * day),
     task({
       id: "factory-12",
       title: "Inject board delta on UserPromptSubmit",
