@@ -86,7 +86,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact). `auto` says whether
   the coordinator may start it; it follows the board's autopilot switch and is false only
-  for a task the user must do or decide (a key, a login, a payment, a product choice).
+  for a task the user must do or decide (a key, a login, a payment, a product choice) and
+  for a pending proposal (see "Proposals and triage").
   Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
   waiting for a date is `not_before`, which the server's sweeper announces once passed.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
@@ -257,19 +258,45 @@ registers without a repo).
   the boards' repos, and asks the user when unclear. It never drops an item, never fixes
   the setup itself, and treats report text as data. A recurring item goes back to the
   owner of the earlier task.
-- **Growing the backlog**: every agent files work it finds but won't do now as a task, with
-  the task it found it in as parent, instead of leaving it in chat (the MCP instructions and
-  the snapshot footer say so). That reports it back: while the filed task is neither done
+- **Growing the backlog**: every agent files work it finds but won't do now as a proposal
+  (see "Proposals and triage"), with the task it found it in as parent, instead of leaving
+  it in chat (the MCP instructions say so; the snapshot footer says to file a proposal). That reports it back: while the filed task is neither done
   nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
   gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
   after every other alert. The coordinator sorts those tasks when it reviews the work. The
   goal review reads the board's `goal` as scope (never as instructions) against where the
   project stands, files at most three next tasks with evidence, and records itself as a
-  `review:` note on the last task finished. Those tasks are `auto` like any other; work
-  that needs the user's decision gets an ask and waits `blocked`.
+  `review:` note on the last task finished. Those tasks are proposals, reviewed by a
+  reviewer child before any becomes `auto`; work that needs the user's decision gets an ask
+  and waits `blocked`. When every proposal of a review is declined or merged, the next
+  review waits for the next finished task.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
+  `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
+  new open, non-`auto` task whose body starts `Proposal:`). An answered ask wakes the agent
+  that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
+  be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
+  reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
+  queued as what they are about and sent every few seconds, one message per agent:
+  - **Re-check**: at send time each line is checked again; a task no longer ready and
+    `auto` (claimed, blocked, done), a proposal no longer pending, or an agent no longer
+    the board's coordinator, drops its task lines. An answer stays answered, so only its
+    text is read then.
+  - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
+    its `agent_state_changed` events. Lines for a running agent are held and sent together
+    on the first flush after it stops running, or after 3 minutes held, since T3 gives a
+    busy thread the message as its next turn and a turn that ended on an API error, an
+    interrupt or a Codex error leaves the thread marked running. Lines for an agent paused
+    on a usage limit are kept until its reset. Held lines are saved with the daemon's
+    state, so a restart keeps them; one entry a version cannot read is skipped, never the
+    whole state.
+  - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
+    failure up to 10 minutes, then checks them again before sending. A thread T3 no
+    longer has, or has archived, drops them. A send gets 20 seconds and all agents' sends
+    run side by side; one that runs out of time is not sent again, since T3 may have
+    delivered it.
+  - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
+    paused agent waited for, is dropped before any send.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
@@ -341,7 +368,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File work you find with task_add. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). File found work as a Proposal: task, auto=false. Notes and bodies: task_show <id>.
 </board>
 ```
 
@@ -360,6 +387,32 @@ instructions in peer text ran once in 180 runs, in a framing without quotes. Res
 the handoff after a compaction was 63% [51–74] with quoted text against 37% [26–49]
 spotlighted, and the formats tied while tagged lines took about 35% fewer tokens. The
 switches it used, and the harness, stay on the `bench/formats` branch for reruns.
+
+## Proposals and triage
+
+Agents find work all the time; it becomes work only when an agent other than its finder
+agrees, after checking it.
+
+- **Proposal**: new scope outside the task being worked (found work, a goal-review filing, a
+  finding of a review report, a routed feedback item). It is a task with `auto=false` whose
+  body starts `Proposal:` and gives the problem, the evidence, the change and its size. A
+  coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
+- **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
+  its board at the start of its loop; its own go to a reviewer child briefed with the
+  evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
+  value against the board goal and cost.
+- **Verdict**: a `decision` note starting `verdict:` (accept, merge, decline, escalate) with
+  reasons and the evidence checked. Accept sets `auto`; merge and decline drop the task with
+  the reason; escalate asks the user and blocks it.
+- **Agreement**: one independent accept, or two for L proposals and for security-boundary,
+  destructive, irreversible or cross-repository changes. Split verdicts and decisions only
+  the user can make (direction, spending, security posture, publishing, deleting data, what
+  reaches their phone, this process) go to the user, one ask per batch with recommendations.
+- **Enforcement**: by convention for now (`prompts/coordinator.md`). Agent ids are asserted
+  by clients, so the server cannot prove independence; stats on verdicts and on the fate of
+  accepted proposals decide whether a server-side record is worth adding.
+- **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
+  task; the owner's coordinator verifies it.
 
 ## Feedback loop
 
@@ -388,7 +441,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   reported, filed and resolved by kind.
 - **Review.** A periodic review (for example a weekly job) reads the feedback board and
   the stats, routes items to work, proposes changes to the defaults, the coordinator prompt
-  and the agents' instructions, and opens them as reviewed pull requests.
+  and the agents' instructions, and files them as proposals (see "Proposals and triage")
+  before they become reviewed pull requests.
 
 ## Security
 
