@@ -1695,7 +1695,12 @@ input[type="radio"] {
   font-variant-numeric: tabular-nums;
 }
 
+/* The rows share the list's columns, so the id column fits the longest id in the list.
+   A subgrid row's inline padding sits inside the first and last columns, hence +16px. */
 .task-list {
+  display: grid;
+  grid-template-columns: 54px 14px minmax(84px, max-content) minmax(0, 1fr) 132px 88px;
+  column-gap: 12px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -1704,7 +1709,8 @@ input[type="radio"] {
 .task-row {
   position: relative;
   display: grid;
-  grid-template-columns: 38px 14px 84px minmax(0, 1fr) 132px 72px;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
   column-gap: 12px;
   min-height: 44px;
@@ -1781,6 +1787,10 @@ input[type="radio"] {
 }
 
 @media (max-width: 720px) {
+  .task-list {
+    display: block;
+  }
+
   .task-row {
     grid-template-columns: 14px auto auto minmax(0, 1fr) auto;
     grid-template-areas:

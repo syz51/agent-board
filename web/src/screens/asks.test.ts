@@ -20,12 +20,14 @@ describe("waitingTasks", () => {
       docs: ["docs-5"],
       // factory-17 is blocked but has open ask #7.
       factory: ["factory-18"],
+      "release-engineering": ["release-engineering-112"],
       // web-view-4 is a pending proposal.
       "web-view": ["web-view-2"],
     });
     expect(waitingTasks(candidates(), openAsks(), now).map((group) => group.board)).toEqual([
       "docs",
       "factory",
+      "release-engineering",
       "web-view",
     ]);
   });
@@ -48,8 +50,8 @@ describe("waitingTasks", () => {
 
 describe("needsYouCount", () => {
   test("counts the open asks plus the tasks the page lists, on every board", () => {
-    // Asks #7, #8 and #9; docs-5, factory-18 and web-view-2.
-    expect(needsYouCount(openAsks(), candidates(), now)).toBe(6);
+    // Asks #7, #8 and #9; docs-5, factory-18, release-engineering-112 and web-view-2.
+    expect(needsYouCount(openAsks(), candidates(), now)).toBe(7);
     const listed = waitingTasks(candidates(), openAsks(), now).flatMap((group) => group.tasks);
     expect(needsYouCount(openAsks(), candidates(), now)).toBe(openAsks().length + listed.length);
   });
@@ -57,8 +59,8 @@ describe("needsYouCount", () => {
   test("an answered ask leaves the count; its blocked task joins it", () => {
     const asks = openAsks().filter((ask) => ask.id !== 7);
     // Ask #7 goes, factory-17 (blocked, no ask now) comes.
-    expect(needsYouCount(asks, candidates(), now)).toBe(6);
-    expect(needsYouCount(asks.filter((ask) => ask.id !== 8), candidates(), now)).toBe(5);
+    expect(needsYouCount(asks, candidates(), now)).toBe(7);
+    expect(needsYouCount(asks.filter((ask) => ask.id !== 8), candidates(), now)).toBe(6);
   });
 
   test("tasks on closed boards are left out", () => {
@@ -66,9 +68,10 @@ describe("needsYouCount", () => {
     const closed = new Set(["docs"]);
     expect(waitingTasks(candidates(), openAsks(), now, closed).map((group) => group.board)).toEqual([
       "factory",
+      "release-engineering",
       "web-view",
     ]);
-    expect(needsYouCount(openAsks(), candidates(), now, closed)).toBe(5);
+    expect(needsYouCount(openAsks(), candidates(), now, closed)).toBe(6);
   });
 
   test("before the tasks load, it counts the open asks", () => {

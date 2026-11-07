@@ -54,7 +54,7 @@ describe("api client parsing", () => {
 
     expect((await api.health()).seq).toBe(state.seq);
     const boards = await api.boards();
-    expect(boards.map((board) => board.slug)).toEqual(["factory", "web-view", "docs", "sandbox"]);
+    expect(boards.map((board) => board.slug)).toEqual(["factory", "web-view", "docs", "release-engineering", "sandbox"]);
     expect(boards[0]?.counts.ready).toBeGreaterThan(0);
     expect((await api.board("factory")).autopilot).toBe(true);
     expect((await api.tasks({ board: "factory" })).length).toBeGreaterThan(5);
