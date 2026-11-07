@@ -117,6 +117,13 @@ function TaskView(
       {task.parent && <TaskLinks title="Parent" ids={[task.parent]} related={related} />}
       <TaskLinks title="Subtasks" ids={detail.children} related={related} />
 
+      {task.status === "done" && task.summary && (
+        <section class="section">
+          <h2>Summary</h2>
+          <div class="agent-text"><Markdown text={task.summary} /></div>
+        </section>
+      )}
+
       <section class="section">
         <h2>Description</h2>
         {task.body.trim()

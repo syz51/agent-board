@@ -221,6 +221,28 @@ main:focus {
   font-variant-numeric: tabular-nums;
 }
 
+/* Unseen updates: a dot, distinct from the open-ask count. */
+.nav-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--surface);
+  flex: none;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .conn {
   display: inline-flex;
   align-items: center;
@@ -318,6 +340,12 @@ main {
     position: absolute;
     top: 4px;
     left: calc(50% + 6px);
+  }
+
+  .nav-dot {
+    position: absolute;
+    top: 6px;
+    right: calc(50% + 8px);
   }
 
   main {
@@ -1352,6 +1380,183 @@ p.handoff {
 .answered-text {
   margin: 4px 0 0;
   white-space: pre-wrap;
+}
+
+/* Updates: what finished and what coordinators said since the user last looked */
+
+.updates {
+  margin-top: 36px;
+}
+
+.section.updates > h2 {
+  font-size: 18px;
+  font-weight: 680;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.updates-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 4px;
+}
+
+.updates-since,
+.updates-note {
+  margin: 0;
+  font-size: 14px;
+}
+
+.updates-note {
+  margin-bottom: 8px;
+}
+
+.mark-seen {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.update-group {
+  margin-top: 18px;
+}
+
+.update-list {
+  display: grid;
+  gap: 10px;
+}
+
+.update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.update-title {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.update-title a {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.update-title a:hover {
+  text-decoration: underline;
+}
+
+.update-title code {
+  color: var(--muted);
+  font-weight: 500;
+  margin-right: 4px;
+}
+
+.update-title .plain {
+  white-space: normal;
+}
+
+.update-meta {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+.update-text {
+  margin: 2px 0 0;
+}
+
+.collapsible {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.clamped {
+  max-height: 9.5em;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  mask-image: linear-gradient(to bottom, #000 55%, transparent);
+}
+
+.link-button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 560;
+  min-height: 36px;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.update-evidence {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  font-size: 14px;
+}
+
+.update-evidence li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* A coordinator's recent turn endings on the agents screen */
+
+.said {
+  font-size: 14px;
+}
+
+.said > summary {
+  cursor: pointer;
+  min-height: 32px;
+  padding: 4px 0;
+  color: var(--muted);
+}
+
+.said > summary:hover {
+  color: var(--text);
+}
+
+.said-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+.said-item {
+  padding: 8px 12px;
+  margin-top: 6px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+}
+
+.said-item:first-child {
+  margin-top: 0;
+}
+
+.said-head {
+  margin: 0 0 4px;
+  font-size: 12.5px;
+  color: var(--muted);
 }
 
 /* Events */

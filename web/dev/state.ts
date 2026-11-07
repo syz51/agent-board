@@ -7,14 +7,20 @@ import type {
   Ask,
   Board,
   BoardEvent,
+  DoneUpdate,
   EventsPage,
   Handoff,
+  Said,
+  SeenCursor,
   Task,
   TaskDetail,
+  Updates,
 } from "../src/api/schema.ts";
 import { type BoardFixture, createFixtures, type Fixtures } from "./fixtures.ts";
 
 const STALE_MS = 24 * 3_600_000;
+const UPDATES_MAX = 100;
+const SAID_LIMIT_MAX = 50;
 
 /** An error the dev server returns as an `ApiError` body. */
 export class DevApiError extends Error {
@@ -41,6 +47,7 @@ export class DevState {
   private nextTaskNumber = 31;
   private nextAskId = 10;
   private nextNoteId = 40;
+  private nextSaidId = 6;
 
   constructor(private readonly now: () => number = Date.now) {
     this.data = createFixtures(now());
@@ -121,6 +128,64 @@ export class DevState {
     return ask;
   }
 
+  /**
+   * Done tasks and coordinators' turn endings after `since` (default: the seen cursor),
+   * newest first. Done time is the task's `updated_at`: fixtures do not change done tasks.
+   */
+  updates(params: URLSearchParams): Updates {
+    const sinceParam = params.get("since");
+    if (sinceParam !== null && !Number.isFinite(Date.parse(sinceParam))) {
+      throw new DevApiError(400, "invalid", "since is not an RFC 3339 time", "send since=2026-11-06T12:00:00Z");
+    }
+    const board = params.get("board");
+    if (board) this.findBoard(board);
+    const since = sinceParam ?? this.data.seenAt;
+    const after = (at: string) => since === null || Date.parse(at) > Date.parse(since);
+    const newest = <T>(items: T[], at: (item: T) => string) =>
+      items.sort((a, b) => Date.parse(at(b)) - Date.parse(at(a)));
+
+    const done: DoneUpdate[] = newest(
+      this.data.tasks
+        .filter((task) => task.status === "done" && (!board || task.board === board) && after(task.updated_at))
+        .map((task) => ({
+          task: task.id,
+          board: task.board,
+          parent: task.parent,
+          title: task.title,
+          summary: task.summary,
+          owner: task.owner,
+          done_at: task.updated_at,
+          evidence: this.task(task.id).evidence,
+        })),
+      (item) => item.done_at,
+    );
+    const said = newest(
+      this.data.said.filter((item) => (!board || item.board === board) && after(item.at)),
+      (item) => item.at,
+    );
+    return {
+      seen_at: this.data.seenAt,
+      since,
+      done: done.slice(0, UPDATES_MAX),
+      said: said.slice(0, UPDATES_MAX),
+      more: done.length > UPDATES_MAX || said.length > UPDATES_MAX,
+    };
+  }
+
+  said(agentId: string, params: URLSearchParams): Said[] {
+    if (!this.data.agents.some((agent) => agent.id === agentId)) {
+      throw notFound(`agent ${agentId}`, "list agents with GET /v1/agents");
+    }
+    const limit = Number(params.get("limit") ?? 20);
+    if (!Number.isInteger(limit) || limit < 1 || limit > SAID_LIMIT_MAX) {
+      throw new DevApiError(400, "invalid", `limit must be 1 to ${SAID_LIMIT_MAX}`, "send limit=20");
+    }
+    return this.data.said
+      .filter((item) => item.agent === agentId)
+      .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || b.id - a.id)
+      .slice(0, limit);
+  }
+
   events(since: number, limit: number, board: string | null): EventsPage {
     const events = this.eventsSince(since).filter((event) => !board || event.board === board).slice(0, limit);
     return { events, next_since: events.at(-1)?.seq ?? since };
@@ -164,6 +229,19 @@ export class DevState {
     return ask;
   }
 
+  /** Move the seen cursor forward to `at`, capped at now; an earlier `at` leaves it. */
+  markSeen(body: unknown): SeenCursor {
+    const at = isRecord(body) && typeof body.at === "string" ? Date.parse(body.at) : Number.NaN;
+    if (!Number.isFinite(at)) {
+      throw new DevApiError(400, "invalid", "at must be an RFC 3339 time", "send {\"at\": \"<the newest update's time>\"}");
+    }
+    const target = Math.min(at, this.now());
+    if (this.data.seenAt === null || target > Date.parse(this.data.seenAt)) {
+      this.data.seenAt = new Date(target).toISOString();
+    }
+    return { seen_at: this.data.seenAt };
+  }
+
   // The simulator: one plausible change per call.
 
   simulate(): BoardEvent | null {
@@ -176,6 +254,7 @@ export class DevState {
       () => this.finishReview(),
       () => this.createTask(),
       () => this.createAsk(),
+      () => this.coordinatorSays(),
     ];
     for (let tried = 0; tried < actions.length; tried++) {
       const action = actions[this.step++ % actions.length];
@@ -243,7 +322,12 @@ export class DevState {
     const at = this.iso();
     this.data.evidence.push({ task: task.id, kind: "check", value: "cargo test --workspace", exit_code: 0, agent: task.owner, at });
     this.emit({ board: task.board, actor: task.owner, type: "evidence_added", task: task.id, payload: { kind: "check", exit_code: 0 } });
-    Object.assign(task, { status: "done", updated_at: at, version: task.version + 1 });
+    Object.assign(task, {
+      status: "done",
+      updated_at: at,
+      version: task.version + 1,
+      summary: "Review passed and `cargo test --workspace` is green. Nothing needs you.",
+    });
     return this.emit({ board: task.board, actor: task.owner, type: "task_done", task: task.id, payload: { from: "review", to: "done" } });
   }
 
@@ -272,6 +356,7 @@ export class DevState {
       created_at: at,
       updated_at: at,
       feedback: null,
+      summary: null,
     });
     return this.emit({ board: "factory", actor: coordinator.id, type: "task_created", task: id, payload: {} });
   }
@@ -296,6 +381,25 @@ export class DevState {
       answered_at: null,
     });
     return this.emit({ board: "factory", actor: coordinator.id, type: "ask_created", task: null, payload: { ask: id, kind: "decision" } });
+  }
+
+  /** A coordinator ends its turn: what it said is kept, and its state change is the event. */
+  private coordinatorSays(): BoardEvent | null {
+    const coordinator = this.data.agents.find((item) => item.handle === "t3:c2d0");
+    if (!coordinator) return null;
+    const from = coordinator.state;
+    if (from === "running") {
+      this.data.said.push({
+        id: this.nextSaidId++,
+        agent: coordinator.id,
+        board: "factory",
+        text: `Round ${this.nextSaidId - 5} done. Ready tasks are assigned; **nothing needs you** right now.`,
+        at: this.iso(),
+      });
+    }
+    coordinator.state = from === "running" ? "idle" : "running";
+    coordinator.last_seen = this.iso();
+    return this.emit({ board: null, actor: coordinator.id, type: "agent_state_changed", task: null, payload: { from, to: coordinator.state } });
   }
 
   // Helpers.

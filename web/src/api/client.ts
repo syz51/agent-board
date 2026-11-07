@@ -25,6 +25,9 @@ export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
 const seg = encodeURIComponent;
 
+/** Most items of each kind `GET /v1/updates` returns (`UPDATES_MAX`). */
+export const UPDATES_MAX = 100;
+
 /** Largest `limit` `GET /v1/tasks` accepts. */
 export const MAX_TASKS = 1000;
 
@@ -110,6 +113,14 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
     ask: (id: number) => get(`/v1/asks/${id}`, s.ask),
     answerAsk: (id: number, answer: string) =>
       request("POST", `/v1/asks/${id}/answer`, s.ask, { answer }),
+    /** What finished and what coordinators said since `since`, or since the seen cursor. */
+    updates: (params: { since?: string; board?: string } = {}) =>
+      get(`/v1/updates${query(params)}`, s.updates),
+    /** Move the seen cursor to `at`: the time of the newest update shown, not now. */
+    markSeen: (at: string) => request("PUT", "/v1/updates/seen", s.seenCursor, { at }),
+    /** An agent's newest turn endings, newest first (`limit` 1 to 50). */
+    agentSaid: (agentId: string, limit?: number) =>
+      get(`/v1/agents/${seg(agentId)}/said${query({ limit })}`, array(s.said)),
     events: (params: { since: number; limit?: number; board?: string }) =>
       get(`/v1/events${query(params)}`, s.eventsPage),
   };
