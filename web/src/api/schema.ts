@@ -223,7 +223,6 @@ export const health = object({ ok: boolean, seq: integer });
 /** `ErrorCode` is kept open for the same reason as event types. */
 export const apiError = object({ code: string, message: string, next: nullable(string) });
 
-
 export type Board = Decoded<typeof board>;
 export type StatusCounts = Decoded<typeof statusCounts>;
 export type Task = Decoded<typeof task>;

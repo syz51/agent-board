@@ -1,52 +1,62 @@
-import type { ComponentChildren } from "preact";
-import { useEffect, useRef } from "preact/hooks";
+import { useForm } from "@tanstack/react-form";
+import type { ReactNode } from "react";
+import { Button } from "@/components/ui/button.tsx";
+import {
+  Dialog,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog.tsx";
 
 /** A modal confirmation on the native `<dialog>`: focus, Escape and the backdrop are built in. */
-export function ConfirmDialog(
-  { open, title, children, confirmLabel, onConfirm, onCancel }: {
-    open: boolean;
-    title: string;
-    children: ComponentChildren;
-    confirmLabel: string;
-    onConfirm: () => void;
-    onCancel: () => void;
-  },
-) {
-  const ref = useRef<HTMLDialogElement>(null);
-
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
-    if (!open && dialog.open) dialog.close();
-  }, [open]);
-
+export function ConfirmDialog({
+  open,
+  title,
+  children,
+  confirmLabel,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  title: string;
+  children: ReactNode;
+  confirmLabel: string;
+  onConfirm: () => void | Promise<void>;
+  onCancel: () => void;
+}) {
+  const form = useForm({ onSubmit: () => onConfirm() });
   return (
-    <dialog
-      ref={ref}
-      class="dialog"
+    <Dialog
+      open={open}
+      onOpenChange={(next) => !next && onCancel()}
       aria-labelledby="confirm-title"
-      onClose={onCancel}
-      onClick={(event) => {
-        // A click on the backdrop lands on the dialog element itself.
-        if (event.target === ref.current) onCancel();
-      }}
     >
       <form
         method="dialog"
-        class="dialog-body"
+        className="grid gap-4"
         onSubmit={(event) => {
           event.preventDefault();
-          onConfirm();
+          if (!form.state.isSubmitting) void form.handleSubmit();
         }}
       >
-        <h2 id="confirm-title">{title}</h2>
-        <div class="dialog-text">{children}</div>
-        <div class="dialog-actions">
-          <button type="button" class="button" onClick={onCancel}>Cancel</button>
-          <button type="submit" class="button button-primary" autofocus>{confirmLabel}</button>
-        </div>
+        <DialogHeader>
+          <DialogTitle id="confirm-title">{title}</DialogTitle>
+          <DialogDescription>{children}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+          <form.Subscribe selector={(state) => state.isSubmitting}>
+            {(submitting) => (
+              <Button type="submit" disabled={submitting} data-autofocus>
+                {confirmLabel}
+              </Button>
+            )}
+          </form.Subscribe>
+        </DialogFooter>
       </form>
-    </dialog>
+    </Dialog>
   );
 }

@@ -38,7 +38,8 @@ export class DevApiError extends Error {
   }
 }
 
-const notFound = (what: string, next: string) => new DevApiError(404, "not_found", `${what} not found`, next);
+const notFound = (what: string, next: string) =>
+  new DevApiError(404, "not_found", `${what} not found`, next);
 
 export class DevState {
   private data: Fixtures;
@@ -81,9 +82,12 @@ export class DevState {
     if (board) this.findBoard(board);
     return this.data.tasks
       .map((task) => this.toTask(task))
-      .filter((task) =>
-        (!board || task.board === board) && (!status || task.status === status) &&
-        (!owner || task.owner === owner) && (ready === null || String(task.ready) === ready)
+      .filter(
+        (task) =>
+          (!board || task.board === board) &&
+          (!status || task.status === status) &&
+          (!owner || task.owner === owner) &&
+          (ready === null || String(task.ready) === ready),
       )
       .sort((a, b) => a.priority.localeCompare(b.priority) || taskNumber(a.id) - taskNumber(b.id))
       .slice(0, limit);
@@ -95,7 +99,9 @@ export class DevState {
     return {
       task: this.toTask(stored),
       notes: this.data.notes.filter((note) => note.task === id),
-      evidence: this.data.evidence.filter((item) => item.task === id).map(({ task: _, ...item }) => item),
+      evidence: this.data.evidence
+        .filter((item) => item.task === id)
+        .map(({ task: _, ...item }) => item),
       blocks: this.data.tasks.filter((task) => task.blockers.includes(id)).map((task) => task.id),
       children: this.data.tasks.filter((task) => task.parent === id).map((task) => task.id),
       history: this.data.events.filter((event) => event.task === id),
@@ -105,21 +111,24 @@ export class DevState {
   agents(params: URLSearchParams): Agent[] {
     const board = params.get("board");
     const state = params.get("state");
-    return this.data.agents.filter((agent) =>
-      (!board || agent.boards.includes(board)) && (!state || agent.state === state)
+    return this.data.agents.filter(
+      (agent) => (!board || agent.boards.includes(board)) && (!state || agent.state === state),
     );
   }
 
   handoff(agentId: string): Handoff {
     const handoff = this.data.handoffs.find((item) => item.agent === agentId);
-    if (!handoff) throw notFound(`handoff of ${agentId}`, "the agent has not written a handoff yet");
+    if (!handoff)
+      throw notFound(`handoff of ${agentId}`, "the agent has not written a handoff yet");
     return handoff;
   }
 
   asks(params: URLSearchParams): Ask[] {
     const status = params.get("status");
     const board = params.get("board");
-    return this.data.asks.filter((ask) => (!status || ask.status === status) && (!board || ask.board === board));
+    return this.data.asks.filter(
+      (ask) => (!status || ask.status === status) && (!board || ask.board === board),
+    );
   }
 
   ask(id: number): Ask {
@@ -135,7 +144,12 @@ export class DevState {
   updates(params: URLSearchParams): Updates {
     const sinceParam = params.get("since");
     if (sinceParam !== null && !Number.isFinite(Date.parse(sinceParam))) {
-      throw new DevApiError(400, "invalid", "since is not an RFC 3339 time", "send since=2026-11-06T12:00:00Z");
+      throw new DevApiError(
+        400,
+        "invalid",
+        "since is not an RFC 3339 time",
+        "send since=2026-11-06T12:00:00Z",
+      );
     }
     const board = params.get("board");
     if (board) this.findBoard(board);
@@ -146,7 +160,10 @@ export class DevState {
 
     const done: DoneUpdate[] = newest(
       this.data.tasks
-        .filter((task) => task.status === "done" && (!board || task.board === board) && after(task.updated_at))
+        .filter(
+          (task) =>
+            task.status === "done" && (!board || task.board === board) && after(task.updated_at),
+        )
         .map((task) => ({
           task: task.id,
           board: task.board,
@@ -178,7 +195,12 @@ export class DevState {
     }
     const limit = Number(params.get("limit") ?? 20);
     if (!Number.isInteger(limit) || limit < 1 || limit > SAID_LIMIT_MAX) {
-      throw new DevApiError(400, "invalid", `limit must be 1 to ${SAID_LIMIT_MAX}`, "send limit=20");
+      throw new DevApiError(
+        400,
+        "invalid",
+        `limit must be 1 to ${SAID_LIMIT_MAX}`,
+        "send limit=20",
+      );
     }
     return this.data.said
       .filter((item) => item.agent === agentId)
@@ -187,7 +209,9 @@ export class DevState {
   }
 
   events(since: number, limit: number, board: string | null): EventsPage {
-    const events = this.eventsSince(since).filter((event) => !board || event.board === board).slice(0, limit);
+    const events = this.eventsSince(since)
+      .filter((event) => !board || event.board === board)
+      .slice(0, limit);
     return { events, next_since: events.at(-1)?.seq ?? since };
   }
 
@@ -201,12 +225,23 @@ export class DevState {
     const board = this.findBoard(slug);
     const autopilot = isRecord(body) ? body.autopilot : undefined;
     if (typeof autopilot !== "boolean") {
-      throw new DevApiError(400, "invalid", "autopilot must be true or false", "send {\"autopilot\": true}");
+      throw new DevApiError(
+        400,
+        "invalid",
+        "autopilot must be true or false",
+        'send {"autopilot": true}',
+      );
     }
     if (board.autopilot !== autopilot) {
       board.autopilot = autopilot;
       board.updated_at = this.iso();
-      this.emit({ board: slug, actor: "user", type: "board_updated", task: null, payload: { autopilot } });
+      this.emit({
+        board: slug,
+        actor: "user",
+        type: "board_updated",
+        task: null,
+        payload: { autopilot },
+      });
     }
     return this.toBoard(board);
   }
@@ -214,11 +249,22 @@ export class DevState {
   answerAsk(id: number, body: unknown): Ask {
     const ask = this.ask(id);
     const answer = isRecord(body) && typeof body.answer === "string" ? body.answer.trim() : "";
-    if (!answer) throw new DevApiError(400, "invalid", "answer is empty", "write an answer or pick an option");
+    if (!answer)
+      throw new DevApiError(400, "invalid", "answer is empty", "write an answer or pick an option");
     if (ask.status !== "open") {
-      throw new DevApiError(400, "invalid", `ask #${id} is already ${ask.status}`, "reload to see the answer");
+      throw new DevApiError(
+        400,
+        "invalid",
+        `ask #${id} is already ${ask.status}`,
+        "reload to see the answer",
+      );
     }
-    Object.assign(ask, { status: "answered", answer, answered_via: "web", answered_at: this.iso() });
+    Object.assign(ask, {
+      status: "answered",
+      answer,
+      answered_via: "web",
+      answered_at: this.iso(),
+    });
     this.emit({
       board: ask.board,
       actor: "user",
@@ -233,7 +279,12 @@ export class DevState {
   markSeen(body: unknown): SeenCursor {
     const at = isRecord(body) && typeof body.at === "string" ? Date.parse(body.at) : Number.NaN;
     if (!Number.isFinite(at)) {
-      throw new DevApiError(400, "invalid", "at must be an RFC 3339 time", "send {\"at\": \"<the newest update's time>\"}");
+      throw new DevApiError(
+        400,
+        "invalid",
+        "at must be an RFC 3339 time",
+        'send {"at": "<the newest update\'s time>"}',
+      );
     }
     const target = Math.min(at, this.now());
     if (this.data.seenAt === null || target > Date.parse(this.data.seenAt)) {
@@ -270,7 +321,13 @@ export class DevState {
     const from = agent.state;
     agent.state = from === "idle" ? "running" : "idle";
     agent.last_seen = this.iso();
-    return this.emit({ board: null, actor: agent.id, type: "agent_state_changed", task: null, payload: { from, to: agent.state } });
+    return this.emit({
+      board: null,
+      actor: agent.id,
+      type: "agent_state_changed",
+      task: null,
+      payload: { from, to: agent.state },
+    });
   }
 
   private claimReady(): BoardEvent | null {
@@ -278,9 +335,20 @@ export class DevState {
     const worker = this.data.agents.find((item) => item.handle === "t3:a91c");
     if (!ready || !worker) return null;
     const task = this.findTask(ready.id);
-    Object.assign(task, { status: "doing", owner: worker.id, updated_at: this.iso(), version: task.version + 1 });
+    Object.assign(task, {
+      status: "doing",
+      owner: worker.id,
+      updated_at: this.iso(),
+      version: task.version + 1,
+    });
     worker.state = "running";
-    return this.emit({ board: task.board, actor: worker.id, type: "task_claimed", task: task.id, payload: { from: "open", to: "doing" } });
+    return this.emit({
+      board: task.board,
+      actor: worker.id,
+      type: "task_claimed",
+      task: task.id,
+      payload: { from: "open", to: "doing" },
+    });
   }
 
   private touchFiles(): BoardEvent | null {
@@ -296,14 +364,28 @@ export class DevState {
   }
 
   private moveToReview(): BoardEvent | null {
-    const task = this.data.tasks.find((item) => item.status === "doing" && item.board === "factory" && item.id !== "factory-12" && item.id !== "factory-14");
+    const task = this.data.tasks.find(
+      (item) =>
+        item.status === "doing" &&
+        item.board === "factory" &&
+        item.id !== "factory-12" &&
+        item.id !== "factory-14",
+    );
     if (!task?.owner) return null;
     Object.assign(task, { status: "review", updated_at: this.iso(), version: task.version + 1 });
-    return this.emit({ board: task.board, actor: task.owner, type: "task_updated", task: task.id, payload: { from: "doing", to: "review" } });
+    return this.emit({
+      board: task.board,
+      actor: task.owner,
+      type: "task_updated",
+      task: task.id,
+      payload: { from: "doing", to: "review" },
+    });
   }
 
   private addNote(): BoardEvent | null {
-    const task = this.data.tasks.find((item) => item.status === "review" && item.board === "factory");
+    const task = this.data.tasks.find(
+      (item) => item.status === "review" && item.board === "factory",
+    );
     if (!task?.owner) return null;
     this.data.notes.push({
       id: this.nextNoteId++,
@@ -313,26 +395,55 @@ export class DevState {
       text: "Checks pass locally; waiting for review.",
       at: this.iso(),
     });
-    return this.emit({ board: task.board, actor: task.owner, type: "note_added", task: task.id, payload: { kind: "finding" } });
+    return this.emit({
+      board: task.board,
+      actor: task.owner,
+      type: "note_added",
+      task: task.id,
+      payload: { kind: "finding" },
+    });
   }
 
   private finishReview(): BoardEvent | null {
-    const task = this.data.tasks.find((item) => item.status === "review" && item.board === "factory");
+    const task = this.data.tasks.find(
+      (item) => item.status === "review" && item.board === "factory",
+    );
     if (!task?.owner) return null;
     const at = this.iso();
-    this.data.evidence.push({ task: task.id, kind: "check", value: "cargo test --workspace", exit_code: 0, agent: task.owner, at });
-    this.emit({ board: task.board, actor: task.owner, type: "evidence_added", task: task.id, payload: { kind: "check", exit_code: 0 } });
+    this.data.evidence.push({
+      task: task.id,
+      kind: "check",
+      value: "cargo test --workspace",
+      exit_code: 0,
+      agent: task.owner,
+      at,
+    });
+    this.emit({
+      board: task.board,
+      actor: task.owner,
+      type: "evidence_added",
+      task: task.id,
+      payload: { kind: "check", exit_code: 0 },
+    });
     Object.assign(task, {
       status: "done",
       updated_at: at,
       version: task.version + 1,
       summary: "Review passed and `cargo test --workspace` is green. Nothing needs you.",
     });
-    return this.emit({ board: task.board, actor: task.owner, type: "task_done", task: task.id, payload: { from: "review", to: "done" } });
+    return this.emit({
+      board: task.board,
+      actor: task.owner,
+      type: "task_done",
+      task: task.id,
+      payload: { from: "review", to: "done" },
+    });
   }
 
   private createTask(): BoardEvent | null {
-    const open = this.data.tasks.filter((task) => task.board === "factory" && task.status === "open").length;
+    const open = this.data.tasks.filter(
+      (task) => task.board === "factory" && task.status === "open",
+    ).length;
     const coordinator = this.data.agents.find((item) => item.handle === "t3:c2d0");
     if (open >= 6 || !coordinator) return null;
     const id = `factory-${this.nextTaskNumber++}`;
@@ -358,7 +469,13 @@ export class DevState {
       feedback: null,
       summary: null,
     });
-    return this.emit({ board: "factory", actor: coordinator.id, type: "task_created", task: id, payload: {} });
+    return this.emit({
+      board: "factory",
+      actor: coordinator.id,
+      type: "task_created",
+      task: id,
+      payload: {},
+    });
   }
 
   private createAsk(): BoardEvent | null {
@@ -380,7 +497,13 @@ export class DevState {
       created_at: this.iso(),
       answered_at: null,
     });
-    return this.emit({ board: "factory", actor: coordinator.id, type: "ask_created", task: null, payload: { ask: id, kind: "decision" } });
+    return this.emit({
+      board: "factory",
+      actor: coordinator.id,
+      type: "ask_created",
+      task: null,
+      payload: { ask: id, kind: "decision" },
+    });
   }
 
   /** A coordinator ends its turn: what it said is kept, and its state change is the event. */
@@ -399,7 +522,13 @@ export class DevState {
     }
     coordinator.state = from === "running" ? "idle" : "running";
     coordinator.last_seen = this.iso();
-    return this.emit({ board: null, actor: coordinator.id, type: "agent_state_changed", task: null, payload: { from, to: coordinator.state } });
+    return this.emit({
+      board: null,
+      actor: coordinator.id,
+      type: "agent_state_changed",
+      task: null,
+      payload: { from, to: coordinator.state },
+    });
   }
 
   // Helpers.
@@ -451,7 +580,9 @@ export class DevState {
   }
 
   private toBoard(board: BoardFixture): Board {
-    const tasks = this.data.tasks.filter((task) => task.board === board.slug).map((task) => this.toTask(task));
+    const tasks = this.data.tasks
+      .filter((task) => task.board === board.slug)
+      .map((task) => this.toTask(task));
     const count = (status: Task["status"]) => tasks.filter((task) => task.status === status).length;
     return {
       ...board,
@@ -464,7 +595,8 @@ export class DevState {
         dropped: count("dropped"),
         ready: tasks.filter((task) => task.ready).length,
       },
-      open_asks: this.data.asks.filter((ask) => ask.board === board.slug && ask.status === "open").length,
+      open_asks: this.data.asks.filter((ask) => ask.board === board.slug && ask.status === "open")
+        .length,
     };
   }
 }

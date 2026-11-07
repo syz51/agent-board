@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { render } from "preact-render-to-string";
+import { renderInApp } from "../../test/render.tsx";
 import { DevState } from "../../dev/state.ts";
 import { HOSTILE_SAID, LONG_SAID } from "../../dev/fixtures.ts";
 import { createApi } from "../api/client.ts";
@@ -12,20 +12,28 @@ const fresh = () => new DevState(() => now);
 const state = fresh();
 const agents = agentIndex(state.agents(new URLSearchParams()));
 const updates = state.updates(new URLSearchParams());
-const none: Updates = { seen_at: "2026-11-06T11:00:00Z", since: "2026-11-06T11:00:00Z", done: [], said: [], more: false };
+const none: Updates = {
+  seen_at: "2026-11-06T11:00:00Z",
+  since: "2026-11-06T11:00:00Z",
+  done: [],
+  said: [],
+  more: false,
+};
 
-const view = (data: Updates, board = "") => render(<UpdatesView updates={data} agents={agents} board={board} />);
+const view = async (data: Updates, board = "") =>
+  (await renderInApp(<UpdatesView updates={data} agents={agents} board={board} />)).container
+    .innerHTML;
 
 describe("updates section", () => {
-  test("with nothing new it says so and offers no mark-seen", () => {
-    const html = view(none);
+  test("with nothing new it says so and offers no mark-seen", async () => {
+    const html = await view(none);
     expect(html).toContain("You're up to date");
     expect(html).not.toContain("Mark all seen");
     expect(html).not.toContain("update-group");
   });
 
-  test("lists finished tasks with link, board, owner handle, summary and PR and commit evidence", () => {
-    const html = view(updates);
+  test("lists finished tasks with link, board, owner handle, summary and PR and commit evidence", async () => {
+    const html = await view(updates);
     expect(html).toContain("Mark all seen");
     expect(html).toContain('href="/tasks/web-view-5"');
     expect(html).toContain("Render agent markdown without HTML");
@@ -42,38 +50,38 @@ describe("updates section", () => {
     expect(html).toContain('href="/tasks/docs-1"');
   });
 
-  test("lists coordinators' turn endings and collapses long ones", () => {
-    const html = view(updates);
+  test("lists coordinators' turn endings and collapses long ones", async () => {
+    const html = await view(updates);
     expect(html).toContain("Coordinators said");
     expect(html).toContain(">t3:c2d0</span>");
     expect(isLong(LONG_SAID)).toBe(true);
-    expect(html).toContain('class="agent-text update-text clamped"');
+    expect(html).toContain("data-clamped");
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain("Show all");
   });
 
-  test("agent text stays inert: no script, no javascript: link, no remote image", () => {
-    const html = view(updates);
+  test("agent text stays inert: no script, no javascript: link, no remote image", async () => {
+    const html = await view(updates);
     expect(html).toContain("Round done.");
     expect(HOSTILE_SAID).toContain("<script>");
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<img");
     expect(html).not.toContain('href="javascript:');
-    expect(html).toContain("&lt;/board>");
+    expect(html).toContain("&lt;/board&gt;");
   });
 
-  test("says when older items were cut", () => {
-    expect(view({ ...updates, more: true })).toContain("older ones were cut");
-    expect(view(updates)).not.toContain("older ones were cut");
+  test("says when older items were cut", async () => {
+    expect(await view({ ...updates, more: true })).toContain("older ones were cut");
+    expect(await view(updates)).not.toContain("older ones were cut");
   });
 
-  test("with a board filter it cannot mark seen, since the cursor covers every board", () => {
-    const html = view(state.updates(new URLSearchParams({ board: "docs" })), "docs");
+  test("with a board filter it cannot mark seen, since the cursor covers every board", async () => {
+    const html = await view(state.updates(new URLSearchParams({ board: "docs" })), "docs");
     expect(html).not.toContain("Mark all seen");
     expect(html).toContain('href="/asks"');
   });
 
-  test("counts what is unseen and finds the newest shown time", () => {
+  test("counts what is unseen and finds the newest shown time", async () => {
     expect(unseenCount(updates)).toBe(updates.done.length + updates.said.length);
     expect(newestAt(none)).toBeNull();
     // The newest said (2 minutes ago) is newer than the newest done task (3 minutes ago).
@@ -96,7 +104,7 @@ describe("updates section", () => {
 });
 
 describe("dev server seen cursor", () => {
-  test("marking the newest shown time leaves only what came after", () => {
+  test("marking the newest shown time leaves only what came after", async () => {
     const dev = fresh();
     const shown = dev.updates(new URLSearchParams());
     const at = newestAt(shown) ?? "";
@@ -104,7 +112,7 @@ describe("dev server seen cursor", () => {
     expect(unseenCount(dev.updates(new URLSearchParams()))).toBe(0);
   });
 
-  test("the cursor only moves forward and never past now", () => {
+  test("the cursor only moves forward and never past now", async () => {
     const dev = fresh();
     const before = dev.updates(new URLSearchParams()).seen_at;
     expect(dev.markSeen({ at: "2020-01-01T00:00:00Z" }).seen_at).toBe(before ?? "");

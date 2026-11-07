@@ -159,7 +159,11 @@ export class EventStream {
     }
     this.attempt += 1;
     const delay = BACKOFF_MS[Math.min(this.attempt, BACKOFF_MS.length) - 1] ?? 15_000;
-    this.setState({ kind: "reconnecting", attempt: this.attempt, retryAt: this.deps.now() + delay });
+    this.setState({
+      kind: "reconnecting",
+      attempt: this.attempt,
+      retryAt: this.deps.now() + delay,
+    });
     this.retryTimer = this.deps.setTimeout(() => {
       this.retryTimer = null;
       void this.connect();

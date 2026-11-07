@@ -1,91 +1,155 @@
-import { api } from "../api/client.ts";
-import type { Agent, BoardEvent, Evidence, Feedback, Task, TaskDetail } from "../api/schema.ts";
-import { tags } from "../live/refresh.ts";
-import { useResource } from "../live/runtime.ts";
-import { Markdown, PlainText, SafeLink, safeHref } from "../text/markdown.tsx";
+import { useQuery } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { type ReactNode, useMemo } from "react";
+import type { Agent, BoardEvent, Evidence, Feedback, Task, TaskDetail } from "@/api/schema.ts";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
+import { Badge } from "@/components/ui/badge.tsx";
+import { boardOfTask } from "@/lib/ids.ts";
+import { cn } from "@/lib/utils.ts";
+import { queries } from "@/live/query.ts";
+import { Markdown, PlainText, SafeLink, safeHref } from "@/text/markdown.tsx";
 import {
   AbsTime,
   agentIndex,
-  boardOfTask,
+  Crumbs,
   Empty,
   Owner,
   PriorityBadge,
-  Query,
+  QueryFrame,
   RelTime,
+  SectionTitle,
   StatusBadge,
   useAgents,
   useTitle,
   Who,
-} from "../ui/common.tsx";
-import { Icon, StatusIcon } from "../ui/icons.tsx";
-import { EventLine } from "./events.tsx";
+} from "@/ui/common.tsx";
+import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { EventLine, Timeline } from "./events.tsx";
 
-export function TaskScreen({ id }: { id: string }) {
+const route = getRouteApi("/tasks/$id");
+
+export function TaskScreen() {
+  const { id } = route.useParams();
   const board = boardOfTask(id);
-  const detail = useResource(`task:${id}`, [tags.task(id), tags.board(board)], () => api.task(id));
-  const agents = agentIndex(useAgents().data);
+  const detail = useQuery(queries.task(id));
+  const agentList = useAgents().data;
+  const agents = useMemo(() => agentIndex(agentList), [agentList]);
   // Titles and statuses of blockers, subtasks and the parent (shared with the board screen).
-  const boardTasks = useResource(`tasks:${board}`, [tags.board(board)], () => api.tasks({ board }));
-  const related = new Map((boardTasks.data ?? []).map((task) => [task.id, task]));
+  const boardTasks = useQuery(queries.boardTasks(board));
+  const related = useMemo(
+    () => new Map((boardTasks.data ?? []).map((task) => [task.id, task])),
+    [boardTasks.data],
+  );
   useTitle(detail.data ? `${detail.data.task.id} ${detail.data.task.title}` : id);
 
   return (
     <>
-      <nav class="crumbs" aria-label="Breadcrumb">
-        <a href="/">Boards</a>
-        <Icon name="chevron" />
-        <a href={`/boards/${encodeURIComponent(detail.data?.task.board ?? board)}`}>
+      <Crumbs current={id}>
+        <Link to="/">Boards</Link>
+        <Icon name="chevron" className="size-3 opacity-70" />
+        <Link to="/boards/$slug" params={{ slug: detail.data?.task.board ?? board }}>
           {detail.data?.task.board ?? board}
-        </a>
-        <Icon name="chevron" />
-        <span aria-current="page">{id}</span>
-      </nav>
-      <Query resource={detail} label="Loading task">
+        </Link>
+      </Crumbs>
+      <QueryFrame query={detail} label="Loading task">
         {(data) => <TaskView detail={data} agents={agents} related={related} />}
-      </Query>
+      </QueryFrame>
     </>
   );
 }
 
-function TaskView(
-  { detail, agents, related }: {
-    detail: TaskDetail;
-    agents: Map<string, Agent>;
-    related: Map<string, Task>;
-  },
-) {
-  const { task } = detail;
-  const acceptance = task.acceptance.split("\n").map((line) => line.trim()).filter(Boolean);
+/** A task section: heading, optional count, then its content. */
+function Section({
+  id,
+  title,
+  count,
+  first,
+  children,
+}: {
+  id: string;
+  title: string;
+  count?: number;
+  first?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <section className={first ? undefined : "mt-9"} aria-labelledby={id}>
+      <SectionTitle id={id} {...(count === undefined ? {} : { count })}>
+        {title}
+      </SectionTitle>
+      {children}
+    </section>
+  );
+}
 
+function Muted({ children }: { children: ReactNode }) {
+  return <p className="text-muted-foreground">{children}</p>;
+}
+
+/** Facts as a two-column list: label, then value. */
+function Facts({ className, children }: { className?: string; children: ReactNode }) {
+  return (
+    <dl
+      className={cn(
+        "m-0 grid [&_dd]:m-0 [&_dd]:flex [&_dd]:min-w-0 [&_dd]:flex-wrap [&_dd]:items-center [&_dd]:gap-x-2 [&_dd]:gap-y-1 [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:items-baseline [&>div]:gap-2.5",
+        className,
+      )}
+    >
+      {children}
+    </dl>
+  );
+}
+
+function TaskView({
+  detail,
+  agents,
+  related,
+}: {
+  detail: TaskDetail;
+  agents: Map<string, Agent>;
+  related: Map<string, Task>;
+}) {
+  const { task } = detail;
+  const acceptance = task.acceptance
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
   const summary = task.status === "done" ? task.summary : undefined;
 
   return (
-    <article class="task-detail">
-      <header class="task-head">
-        <h1><PlainText text={task.title} /></h1>
+    <article>
+      <header className="mb-6">
+        <h1 className="max-w-[36ch] text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+          <PlainText text={task.title} />
+        </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
-        <p class="task-meta">
+        <p className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-meta lg:hidden">
           <StatusBadge status={task.status} ready={task.ready} />
           <PriorityBadge priority={task.priority} />
           <Owner task={task} agents={agents} />
         </p>
       </header>
 
-      <div class="task-layout">
-        <aside class="task-props" aria-label="Properties">
-          <dl class="props">
+      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
+        <aside
+          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
+          aria-label="Properties"
+        >
+          <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
             <div>
               <dt>Status</dt>
               <dd>
                 <StatusBadge status={task.status} ready={task.ready} />
                 {task.status === "open" && !task.ready && task.blockers.length > 0 && (
-                  <span class="muted">waiting on blockers</span>
+                  <span className="text-muted-foreground">waiting on blockers</span>
                 )}
               </dd>
             </div>
             <div>
               <dt>Priority</dt>
-              <dd><PriorityBadge priority={task.priority} /></dd>
+              <dd>
+                <PriorityBadge priority={task.priority} />
+              </dd>
             </div>
             <div>
               <dt>Owner</dt>
@@ -106,7 +170,9 @@ function TaskView(
             {task.not_before && (
               <div>
                 <dt>Not before</dt>
-                <dd><AbsTime at={task.not_before} /></dd>
+                <dd>
+                  <AbsTime at={task.not_before} />
+                </dd>
               </div>
             )}
             <div>
@@ -117,118 +183,156 @@ function TaskView(
             </div>
             <div>
               <dt>Updated</dt>
-              <dd><RelTime at={task.updated_at} /></dd>
+              <dd>
+                <RelTime at={task.updated_at} />
+              </dd>
             </div>
-          </dl>
+          </Facts>
           <TaskLinks title="Blocked by" ids={task.blockers} related={related} />
           <TaskLinks title="Blocks" ids={detail.blocks} related={related} />
           {task.parent && <TaskLinks title="Parent" ids={[task.parent]} related={related} />}
           <TaskLinks title="Subtasks" ids={detail.children} related={related} />
         </aside>
 
-        <div class="task-body">
+        <div className="min-w-0">
           {task.blocked_reason && (
-            <div class="notice notice-warn">
-              <p class="notice-title">Blocked</p>
-              <p><PlainText text={task.blocked_reason} /></p>
-            </div>
+            <Alert variant="warn" className="mb-5 px-4.5 py-4">
+              <AlertTitle className="text-sm font-semibold">Blocked</AlertTitle>
+              <AlertDescription className="text-warn">
+                <p>
+                  <PlainText text={task.blocked_reason} />
+                </p>
+              </AlertDescription>
+            </Alert>
           )}
 
-          {task.feedback && <FeedbackFacts feedback={task.feedback} agents={agents} related={related} />}
+          {task.feedback && (
+            <FeedbackFacts feedback={task.feedback} agents={agents} related={related} />
+          )}
 
           {summary && (
-            <section class="section section-first">
-              <h2>Summary</h2>
-              <div class="agent-text prose"><Markdown text={summary} /></div>
-            </section>
+            <Section id="task-summary" title="Summary" first>
+              <div className="max-w-[72ch] leading-relaxed">
+                <Markdown text={summary} />
+              </div>
+            </Section>
           )}
 
-          <section class={summary ? "section" : "section section-first"}>
-            <h2>Description</h2>
-            {task.body.trim()
-              ? <div class="agent-text prose"><Markdown text={task.body} /></div>
-              : <p class="muted">No description.</p>}
-          </section>
+          <Section id="task-description" title="Description" first={!summary && !task.feedback}>
+            {task.body.trim() ? (
+              <div className="max-w-[72ch] leading-relaxed">
+                <Markdown text={task.body} />
+              </div>
+            ) : (
+              <Muted>No description.</Muted>
+            )}
+          </Section>
 
-          <section class="section">
-            <h2>Acceptance <span class="section-count">{acceptance.length}</span></h2>
-            {acceptance.length > 0
-              ? (
-                <ul class="acceptance">
-                  {acceptance.map((line, index) => <li key={index}><PlainText text={line} /></li>)}
-                </ul>
-              )
-              : <p class="muted">No acceptance checks written.</p>}
-          </section>
+          <Section id="task-acceptance" title="Acceptance" count={acceptance.length}>
+            {acceptance.length > 0 ? (
+              <ol className="divide-y overflow-hidden rounded-lg border">
+                {acceptance.map((line, index) => (
+                  <li key={index} className="flex gap-3 px-3.5 py-2.5">
+                    <span
+                      className="mt-px grid size-5 flex-none place-items-center rounded-full bg-secondary text-2xs font-semibold text-subtle-foreground tabular-nums"
+                      aria-hidden="true"
+                    >
+                      {index + 1}
+                    </span>
+                    <PlainText text={line} />
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <Muted>No acceptance checks written.</Muted>
+            )}
+          </Section>
 
-          <section class="section">
-            <h2>Evidence <span class="section-count">{detail.evidence.length}</span></h2>
-            {detail.evidence.length > 0
-              ? (
-                <ul class="list evidence">
-                  {detail.evidence.map((item, index) => (
-                    <EvidenceItem key={index} item={item} agents={agents} />
-                  ))}
-                </ul>
-              )
-              : <p class="muted">None yet. Done requires a check, commit, PR or artifact.</p>}
-          </section>
+          <Section id="task-evidence" title="Evidence" count={detail.evidence.length}>
+            {detail.evidence.length > 0 ? (
+              <ul className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+                {detail.evidence.map((item, index) => (
+                  <EvidenceItem key={index} item={item} agents={agents} />
+                ))}
+              </ul>
+            ) : (
+              <Muted>None yet. Done requires a check, commit, PR or artifact.</Muted>
+            )}
+          </Section>
 
-          <section class="section">
-            <h2>Notes <span class="section-count">{detail.notes.length}</span></h2>
-            {detail.notes.length > 0
-              ? (
-                <ul class="notes">
-                  {detail.notes.map((note) => (
-                    <li key={note.id} class="note">
-                      <div class="note-meta">
-                        <Who id={note.agent} agents={agents} />
-                        <span class={`tag kind-${note.kind}`}>{note.kind}</span>
-                        <span class="muted"><RelTime at={note.at} /></span>
-                      </div>
-                      <p class="agent-text"><PlainText text={note.text} /></p>
-                    </li>
-                  ))}
-                </ul>
-              )
-              : <p class="muted">No notes.</p>}
-          </section>
+          <Section id="task-notes" title="Notes" count={detail.notes.length}>
+            {detail.notes.length > 0 ? (
+              <ul className="grid gap-2.5">
+                {detail.notes.map((note) => (
+                  <li key={note.id} className="grid gap-1.5 rounded-lg border bg-card px-3.5 py-3">
+                    <div className="flex flex-wrap items-center gap-2 text-meta">
+                      <Who id={note.agent} agents={agents} />
+                      <Badge
+                        variant={
+                          note.kind === "decision"
+                            ? "review"
+                            : note.kind === "finding"
+                              ? "doing"
+                              : "outline"
+                        }
+                        shape="tag"
+                      >
+                        {note.kind}
+                      </Badge>
+                      <span className="text-muted-foreground">
+                        <RelTime at={note.at} />
+                      </span>
+                    </div>
+                    <p className="max-w-[72ch]">
+                      <PlainText text={note.text} />
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <Muted>No notes.</Muted>
+            )}
+          </Section>
 
-          <section class="section">
-            <h2>History</h2>
-            {detail.history.length > 0
-              ? (
-                <ol class="timeline">
-                  {[...detail.history].sort((a, b) => b.seq - a.seq).map((event: BoardEvent) => (
+          <Section id="task-history" title="History">
+            {detail.history.length > 0 ? (
+              <Timeline>
+                {[...detail.history]
+                  .sort((a, b) => b.seq - a.seq)
+                  .map((event: BoardEvent) => (
                     <EventLine key={event.seq} event={event} agents={agents} showTask={false} />
                   ))}
-                </ol>
-              )
-              : <Empty title="No history" icon="events" />}
-          </section>
+              </Timeline>
+            ) : (
+              <Empty title="No history" icon="events" />
+            )}
+          </Section>
         </div>
       </div>
     </article>
   );
 }
 
-function FeedbackFacts(
-  { feedback, agents, related }: {
-    feedback: Feedback;
-    agents: Map<string, Agent>;
-    related: Map<string, Task>;
-  },
-) {
+function FeedbackFacts({
+  feedback,
+  agents,
+  related,
+}: {
+  feedback: Feedback;
+  agents: Map<string, Agent>;
+  related: Map<string, Task>;
+}) {
   const { resolution } = feedback;
   return (
-    <section class="section section-first">
-      <h2>Feedback</h2>
-      <dl class="facts">
+    <Section id="task-feedback" title="Feedback" first>
+      <Facts className="gap-2.5 rounded-lg border p-4 [&>div]:grid-cols-[100px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
         <div>
           <dt>About</dt>
           <dd>
             <code>{feedback.about}</code>
-            {feedback.activity && <span class="muted">while {feedback.activity}</span>}
+            {feedback.activity && (
+              <span className="text-muted-foreground">while {feedback.activity}</span>
+            )}
           </dd>
         </div>
         <div>
@@ -247,7 +351,7 @@ function FeedbackFacts(
                 </span>
               ))}
             </span>
-            <span class="muted">
+            <span className="text-muted-foreground">
               last <RelTime at={feedback.last_reported_at} />
             </span>
           </dd>
@@ -255,19 +359,21 @@ function FeedbackFacts(
         <div>
           <dt>Resolution</dt>
           <dd>
-            {resolution
-              ? (
-                <>
-                  <span class="tag">{resolution.kind}</span>
-                  {resolution.task && <TaskRef id={resolution.task} related={related} />}
-                  {resolution.reason && <PlainText text={resolution.reason} />}
-                  <span class="muted">
-                    by {resolution.by === "user" ? "you" : <Who id={resolution.by} agents={agents} />}{" "}
-                    <RelTime at={resolution.at} />
-                  </span>
-                </>
-              )
-              : <span class="muted">Unresolved</span>}
+            {resolution ? (
+              <>
+                <Badge variant="outline" shape="tag">
+                  {resolution.kind}
+                </Badge>
+                {resolution.task && <TaskRef id={resolution.task} related={related} />}
+                {resolution.reason && <PlainText text={resolution.reason} />}
+                <span className="text-muted-foreground">
+                  by {resolution.by === "user" ? "you" : <Who id={resolution.by} agents={agents} />}{" "}
+                  <RelTime at={resolution.at} />
+                </span>
+              </>
+            ) : (
+              <span className="text-muted-foreground">Unresolved</span>
+            )}
           </dd>
         </div>
         {feedback.recurs && (
@@ -275,12 +381,12 @@ function FeedbackFacts(
             <dt>Recurs</dt>
             <dd>
               <TaskRef id={feedback.recurs} related={related} />
-              <span class="muted">came back after that fix</span>
+              <span className="text-muted-foreground">came back after that fix</span>
             </dd>
           </div>
         )}
-      </dl>
-    </section>
+      </Facts>
+    </Section>
   );
 }
 
@@ -289,29 +395,46 @@ function TaskRef({ id, related }: { id: string; related: Map<string, Task> }) {
   const task = related.get(id);
   return (
     <>
-      <a href={`/tasks/${encodeURIComponent(id)}`}><span class="ident">{id}</span></a>
+      <Link to="/tasks/$id" params={{ id }}>
+        <span className="ident">{id}</span>
+      </Link>
       {task && <StatusBadge status={task.status} ready={task.ready} />}
     </>
   );
 }
 
-function TaskLinks(
-  { title, ids, related }: { title: string; ids: string[]; related: Map<string, Task> },
-) {
+function TaskLinks({
+  title,
+  ids,
+  related,
+}: {
+  title: string;
+  ids: string[];
+  related: Map<string, Task>;
+}) {
   if (ids.length === 0) return null;
   return (
-    <section class="prop-group">
-      <h2>{title}</h2>
-      <ul class="link-list">
+    <section className="border-t pt-4">
+      <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
+      <ul className="grid gap-1">
         {ids.map((id) => {
           const task = related.get(id);
           return (
             <li key={id}>
-              <a class="link-card" href={`/tasks/${encodeURIComponent(id)}`}>
-                {task && <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />}
-                <span class="ident">{id}</span>
-                {task && <PlainText text={task.title} class="link-card-title" />}
-              </a>
+              <Link
+                className="-mx-2 grid grid-cols-[14px_auto] items-center gap-x-2 gap-y-0.5 rounded-sm px-2 py-1.5 text-meta text-foreground hover:bg-secondary hover:no-underline"
+                to="/tasks/$id"
+                params={{ id }}
+              >
+                {task && (
+                  <StatusIcon
+                    status={task.status === "open" && task.ready ? "ready" : task.status}
+                    label
+                  />
+                )}
+                <span className="ident col-start-2 text-xs text-muted-foreground">{id}</span>
+                {task && <PlainText text={task.title} className="col-start-2 whitespace-normal" />}
+              </Link>
             </li>
           );
         })}
@@ -322,17 +445,23 @@ function TaskLinks(
 
 function EvidenceItem({ item, agents }: { item: Evidence; agents: Map<string, Agent> }) {
   return (
-    <li class="evidence-item">
-      <span class="tag">{item.kind}</span>
-      <span class="evidence-value">
-        {safeHref(item.value) ? <SafeLink href={item.value}>{item.value}</SafeLink> : <code>{item.value}</code>}
+    <li className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 py-2.5">
+      <Badge variant="outline" shape="tag">
+        {item.kind}
+      </Badge>
+      <span className="min-w-0 flex-[1_1_200px] [overflow-wrap:anywhere]">
+        {safeHref(item.value) ? (
+          <SafeLink href={item.value}>{item.value}</SafeLink>
+        ) : (
+          <code>{item.value}</code>
+        )}
       </span>
       {item.exit_code !== null && (
-        <span class={item.exit_code === 0 ? "tag tag-ok" : "tag tag-bad"}>
+        <Badge variant={item.exit_code === 0 ? "ok" : "bad"} shape="tag">
           exit {item.exit_code}
-        </span>
+        </Badge>
       )}
-      <span class="muted">
+      <span className="inline-flex items-center gap-1.5 text-meta text-muted-foreground">
         <Who id={item.agent} agents={agents} /> · <RelTime at={item.at} />
       </span>
     </li>
