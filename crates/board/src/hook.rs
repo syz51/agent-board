@@ -45,6 +45,9 @@ const PARENT_BUDGET: Duration = Duration::from_millis(400);
 const BUDGET: Duration = Duration::from_millis(1500);
 /// Kept free after the network work for writing state and output.
 const MARGIN: Duration = Duration::from_millis(200);
+/// A reply that misses a deadline shorter than this, because the hook's local steps took the
+/// rest of the budget, counts no strike against the server.
+const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
@@ -188,8 +191,10 @@ struct Hook<'a> {
     agent: AgentId,
     input: &'a Value,
     local: AgentLocal,
-    /// When the shell call this PostToolUse reports started, from its PreToolUse mark.
-    shell_start: Option<ToolStart>,
+    /// At `SessionStart`, and at `PostToolUse` for an edit or a shell call: the work tree.
+    repo: Option<RepoInfo>,
+    /// At `PostToolUse`, the files to report, in batches the server takes.
+    touches: Vec<Touches>,
     /// At `SessionStart`, the T3 thread that delegated this agent's thread.
     t3_parent: Option<String>,
     /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
@@ -204,6 +209,7 @@ async fn handle(
     input: &Value,
     started: Instant,
 ) -> Result<Reply> {
+    let mut steps = Steps::new(event, started);
     let home = Home::from_env()?;
     let shell_call = (input["tool_name"] == SHELL_TOOL)
         .then(|| input["tool_use_id"].as_str().filter(|s| !s.is_empty()))
@@ -254,28 +260,68 @@ async fn handle(
     let Ok((server, device)) = config.require_login() else {
         return Ok(Reply::Nothing);
     };
+    steps.mark("start");
     let session = input["session_id"].as_str().filter(|s| !s.is_empty());
     let env = |name: &str| std::env::var(name).ok();
-    // The Keychain lookup runs a process: keep it off the async threads. It runs while
-    // the process table is read below.
-    let token_home = home.clone();
-    let token = tokio::task::spawn_blocking(move || load_token(&token_home));
+    let post = matches!(
+        event,
+        HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+    );
+    let edited = if post {
+        let tool = input["tool_name"].as_str().unwrap_or_default();
+        edited_paths(tool, &input["tool_input"])
+    } else {
+        Vec::new()
+    };
+    // The Keychain lookup runs a process, while the process table and the work tree are
+    // read below. A PostToolUse hook other than an edit tool's often has nothing to send,
+    // so it looks the token up only once it knows it has.
+    let mut token = (!post || !edited.is_empty()).then(|| spawn_token(&home));
     let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
     let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
         return Ok(Reply::Nothing);
     };
+    steps.mark("agent");
+    let now = Utc::now();
+    let breaker: Breaker = state::load_named(&home, BREAKER);
+    if post && breaker.open_at(now).is_some() {
+        // Mid-turn hooks stay quiet while the server is skipped: no scan, token or call.
+        return Ok(Reply::Nothing);
+    }
+    let local = state::load_agent(&home, &agent);
+    // Local work comes before the server's share of the budget is set, so a slow work tree
+    // or T3 never looks like a slow server.
+    let repo = if event == HookEvent::SessionStart || !edited.is_empty() || shell_start.is_some() {
+        Some(detect_repo(input_cwd(input)).await?)
+    } else {
+        None
+    };
+    let touches = match &repo {
+        Some(repo) if post => local_touches(&agent, repo, edited, shell_start.as_ref()).await,
+        _ => Vec::new(),
+    };
+    let heartbeat = post && heartbeat_due(local.last_heartbeat, now);
+    steps.mark("local");
+    if post && touches.is_empty() && !heartbeat {
+        // Nothing to send: no server call and no Keychain lookup.
+        return Ok(Reply::Nothing);
+    }
+    let token = match token.take() {
+        Some(token) => token,
+        None => spawn_token(&home),
+    };
     let Some(token) = token.await?? else {
         return Ok(Reply::Nothing);
     };
-    // Before the server's share of the budget is set, so a slow T3 never looks like a slow
-    // server.
+    steps.mark("token");
     let t3_parent = match event {
         HookEvent::SessionStart if !nested && t3_identity_applies(explicit_agent, env) => {
             delegated_parent(&home, runtime, session).await
         }
         _ => None,
     };
+    steps.mark("t3");
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
     let client = Client::new(server, token, Some(agent.clone()), Some(remaining))?;
     let mut hook = Hook {
@@ -284,14 +330,15 @@ async fn handle(
         nested,
         device: device.clone(),
         client,
-        local: state::load_agent(&home, &agent),
+        local,
         home,
         agent,
         input,
-        shell_start,
+        repo,
+        touches,
         t3_parent,
         done_reminder: None,
-        now: Utc::now(),
+        now,
     };
     // Turn boundaries for the done reminder hold whether or not the server answers.
     match event {
@@ -306,7 +353,6 @@ async fn handle(
         }
         _ => {}
     }
-    let breaker: Breaker = state::load_named(&hook.home, BREAKER);
     if let Some(failure) = breaker.open_at(hook.now) {
         let reply = hook.offline(failure);
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
@@ -332,12 +378,55 @@ async fn handle(
             (hook.offline(Failure::Slow), Some(Failure::Slow))
         }
     };
-    let next = breaker.after(failure, hook.now)?;
+    steps.mark("server");
+    let next = match failure {
+        // This device left the server too little time to judge it.
+        Some(Failure::Slow) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
+        failure => breaker.after(failure, hook.now)?,
+    };
     if next != breaker {
         state::save_named(&hook.home, BREAKER, &next)?;
     }
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// How long each step of a hook took, logged at debug level when the hook returns
+/// (`BOARD_LOG=board=debug`): each step's time since the one before, and the total.
+struct Steps {
+    event: HookEvent,
+    started: Instant,
+    last: Duration,
+    done: Vec<String>,
+}
+
+impl Steps {
+    fn new(event: HookEvent, started: Instant) -> Self {
+        Self {
+            event,
+            started,
+            last: Duration::ZERO,
+            done: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, step: &str) {
+        let now = self.started.elapsed();
+        self.done
+            .push(format!("{step} {}ms", (now - self.last).as_millis()));
+        self.last = now;
+    }
+}
+
+impl Drop for Steps {
+    fn drop(&mut self) {
+        tracing::debug!(
+            "hook {} steps: {} (total {}ms)",
+            self.event.name(),
+            self.done.join(", "),
+            self.started.elapsed().as_millis()
+        );
+    }
 }
 
 /// Why the hook got no answer from the server.
@@ -669,7 +758,10 @@ impl Hook<'_> {
 
     async fn session_start(&mut self) -> Result<Reply> {
         let thread = std::env::var(T3_THREAD_ENV).ok().filter(|_| !self.nested);
-        let repo = detect_repo(self.cwd()).await?;
+        let repo = match self.repo.take() {
+            Some(repo) => repo,
+            None => detect_repo(self.cwd()).await?,
+        };
         let mut native = std::collections::BTreeMap::new();
         if let Some(session) = self.input["session_id"].as_str() {
             let key = match self.runtime {
@@ -755,73 +847,10 @@ impl Hook<'_> {
     }
 
     async fn post_tool_use(&mut self) -> Result<Reply> {
-        let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
-        let edited = edited_paths(tool, &self.input["tool_input"]);
-        if !edited.is_empty() || self.shell_start.is_some() {
-            let cwd = self.cwd();
-            let repo = detect_repo(cwd.clone()).await?;
-            // An edit tool names its files; a shell call's are found by scanning the work
-            // tree, so another agent in the same checkout may have written them. Edit tools
-            // never have a start mark, and a shell call names no files.
-            let (paths, scanned) = match (&self.shell_start, repo.root.as_deref()) {
-                (Some(start), Some(root)) => {
-                    // Bounded on its own, so a slow work tree never eats the server's budget.
-                    let found =
-                        match tokio::time::timeout(SHELL_SCAN_BUDGET, shell_changes(root, start))
-                            .await
-                        {
-                            Ok(Ok(changed)) => changed,
-                            Ok(Err(err)) => {
-                                tracing::debug!("files changed by the shell call: {err:#}");
-                                Vec::new()
-                            }
-                            Err(_) => {
-                                tracing::debug!("files changed by the shell call: over budget");
-                                Vec::new()
-                            }
-                        };
-                    let found = found.into_iter().map(|(p, at)| (p, Some(at))).collect();
-                    (found, true)
-                }
-                (Some(_), None) => (Vec::new(), true),
-                (None, _) => {
-                    let named = edited
-                        .into_iter()
-                        .map(|p| {
-                            let at = modified_at(&cwd.join(&p));
-                            (p, at)
-                        })
-                        .collect();
-                    (named, false)
-                }
-            };
-            if let Some(key) = repo.key.clone() {
-                // A path the server would refuse would fail the whole request.
-                let rel: Vec<(String, Option<Timestamp>)> = paths
-                    .iter()
-                    .filter_map(|(p, at)| Some((repo.relative(p)?, *at)))
-                    .filter(|(p, _)| {
-                        p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control)
-                    })
-                    .collect();
-                for chunk in rel.chunks(TOUCH_PATHS_MAX) {
-                    let result = self
-                        .client
-                        .touches(&Touches {
-                            agent: self.agent.clone(),
-                            repo: key.clone(),
-                            paths: chunk.iter().map(|(p, _)| p.clone()).collect(),
-                            scanned,
-                            modified: chunk
-                                .iter()
-                                .filter_map(|(p, at)| Some((p.clone(), (*at)?)))
-                                .collect(),
-                        })
-                        .await?;
-                    lines.extend(render::overlaps(&result));
-                }
-            }
+        for touches in &self.touches {
+            let result = self.client.touches(touches).await?;
+            lines.extend(render::overlaps(&result));
         }
         if heartbeat_due(self.local.last_heartbeat, self.now) {
             self.local.last_heartbeat = Some(self.now);
@@ -1008,6 +1037,77 @@ fn done_reminder(
         "board: you marked {} done this turn. Before you stop, file anything still to do: sub-tasks for its scope, Proposal: tasks for found work, a blocked task with an ask for the user's part; name them in your reply.",
         ids.join(", ")
     ))
+}
+
+/// Looks up the device token off the async threads: the Keychain lookup runs `security`.
+fn spawn_token(home: &Home) -> tokio::task::JoinHandle<Result<Option<String>>> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || load_token(&home))
+}
+
+/// What a `PostToolUse` hook reports for `agent`, in batches the server takes: the files an
+/// edit tool names, or those a shell call that started at `shell_start` changed in the work
+/// tree. Empty outside a repo with an `origin`.
+async fn local_touches(
+    agent: &AgentId,
+    repo: &RepoInfo,
+    edited: Vec<PathBuf>,
+    shell_start: Option<&ToolStart>,
+) -> Vec<Touches> {
+    let Some(key) = repo.key.clone() else {
+        return Vec::new();
+    };
+    // An edit tool names its files; a shell call's are found by scanning the work tree, so
+    // another agent in the same checkout may have written them. Edit tools never have a
+    // start mark, and a shell call names no files.
+    let (paths, scanned) = match (shell_start, repo.root.as_deref()) {
+        (Some(start), Some(root)) => {
+            // Bounded on its own, so a slow work tree never eats the server's budget.
+            let found =
+                match tokio::time::timeout(SHELL_SCAN_BUDGET, shell_changes(root, start)).await {
+                    Ok(Ok(changed)) => changed,
+                    Ok(Err(err)) => {
+                        tracing::debug!("files changed by the shell call: {err:#}");
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        tracing::debug!("files changed by the shell call: over budget");
+                        Vec::new()
+                    }
+                };
+            let found = found.into_iter().map(|(p, at)| (p, Some(at))).collect();
+            (found, true)
+        }
+        (Some(_), None) => (Vec::new(), true),
+        (None, _) => {
+            let named = edited
+                .into_iter()
+                .map(|p| {
+                    let at = modified_at(&repo.cwd.join(&p));
+                    (p, at)
+                })
+                .collect();
+            (named, false)
+        }
+    };
+    // A path the server would refuse would fail the whole request.
+    let rel: Vec<(String, Option<Timestamp>)> = paths
+        .iter()
+        .filter_map(|(p, at): &(PathBuf, Option<Timestamp>)| Some((repo.relative(p)?, *at)))
+        .filter(|(p, _)| p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control))
+        .collect();
+    rel.chunks(TOUCH_PATHS_MAX)
+        .map(|chunk| Touches {
+            agent: agent.clone(),
+            repo: key.clone(),
+            paths: chunk.iter().map(|(p, _)| p.clone()).collect(),
+            scanned,
+            modified: chunk
+                .iter()
+                .filter_map(|(p, at)| Some((p.clone(), (*at)?)))
+                .collect(),
+        })
+        .collect()
 }
 
 /// Runs `git` off the async threads, so the hook's deadline can still fire.

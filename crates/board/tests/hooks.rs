@@ -289,6 +289,95 @@ fn post_tool_use_records_touches_warns_on_overlap_and_throttles_heartbeats() {
 }
 
 #[test]
+fn post_tool_use_with_nothing_to_send_skips_the_server_and_the_keychain() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 20),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    // The token comes from the Keychain, through a `security` that logs each run and finds
+    // nothing, then from the file.
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = e.home.join("security.log");
+    let security = bin.join("security");
+    std::fs::write(
+        &security,
+        format!("#!/bin/sh\necho run >> '{}'\nexit 44\n", log.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(e.home.join("token"), format!("{TOKEN}\n")).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let keychain = [
+        ("PATH", path.as_str()),
+        ("BOARD_TOKEN", ""),
+        ("BOARD_KEYCHAIN", "1"),
+    ];
+    let runs = || {
+        std::fs::read_to_string(&log)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    let post = |tool: Value| {
+        let (_, text) = e.hook_env(
+            "post-tool-use",
+            "claude",
+            e.with("PostToolUse", tool),
+            &keychain,
+        );
+        text
+    };
+
+    // The first call in a minute heartbeats.
+    post(json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}));
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 1);
+    let looked_up = runs();
+    if cfg!(target_os = "macos") {
+        assert_eq!(looked_up, 1, "the heartbeat needs the token");
+    }
+
+    // Within the minute, a read and a shell call that changed nothing send nothing.
+    e.stub.clear();
+    assert_eq!(
+        post(json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}})),
+        ""
+    );
+    let shell =
+        json!({"tool_name": "Bash", "tool_use_id": "toolu_quiet", "tool_input": {"command": "ls"}});
+    e.hook_env(
+        "pre-tool-use",
+        "claude",
+        e.with("PreToolUse", shell.clone()),
+        &keychain,
+    );
+    assert_eq!(post(shell), "");
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
+    assert_eq!(
+        runs(),
+        looked_up,
+        "no Keychain lookup without a server call"
+    );
+
+    // An edit still reports its file.
+    std::fs::write(e.repo.join("README.md"), "x").unwrap();
+    post(json!({"tool_name": "Write", "tool_input": {"file_path": e.repo.join("README.md")}}));
+    assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 1);
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 0);
+}
+
+#[test]
 fn edit_tool_touches_carry_the_files_modification_time() {
     let e = env();
     e.agent_ok();
@@ -1440,6 +1529,51 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     let (reply, _) = timed(&e, "session-start", &start);
     assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
     assert_eq!(breaker(&e), json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (e, start) = cached_env();
+    // A `git` that takes most of the budget to name the remote, as on a busy Mac.
+    let real = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .map(|dir| std::path::Path::new(dir).join("git"))
+        .find(|git| git.is_file())
+        .expect("git on PATH");
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\ncase \"$3\" in remote) sleep 0.9;; esac\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    e.stub.hang(Duration::from_secs(10));
+    let began = Instant::now();
+    let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
+    let elapsed = began.elapsed();
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    // On a very slow runner the hook's own guard may answer first, with nothing.
+    if reply.is_some() {
+        assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    }
+    assert_eq!(
+        breaker(&e),
+        Value::Null,
+        "the server had too little time to judge it"
+    );
 }
 
 #[test]
