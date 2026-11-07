@@ -235,11 +235,7 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 
 /** The frame around task groups: one card, groups divided by rules. */
 export function TaskBoard({ children }: { children: ReactNode }) {
-  return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
-      {children}
-    </div>
-  );
+  return <div className="edge divide-y overflow-hidden border-y bg-card">{children}</div>;
 }
 
 /** A group of tasks under a shaded heading with its count. */
@@ -261,7 +257,7 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+        className="flex h-8 items-center gap-2 border-b bg-muted px-(--gutter) text-meta font-semibold"
       >
         {heading}
         <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
@@ -346,7 +342,7 @@ export function TaskList({
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:py-2.5 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>

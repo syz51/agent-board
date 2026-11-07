@@ -95,7 +95,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="grid gap-3">
+            <div className="edge divide-y border-y">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -107,22 +107,26 @@ export function AgentsScreen() {
   );
 }
 
+/**
+ * One agent per row: who and its state on the first line, where it runs on the second,
+ * then its task, handoff and, for a coordinator, its turn endings. Every row starts the
+ * same way, so the rows line up whether or not a fact is present.
+ */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
-    <article className="grid gap-3.5 rounded-lg border bg-card px-4 py-3.5 shadow-raise lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-6">
-      <div className="grid content-start justify-items-start gap-2">
-        {/* The avatar beside the handle, with the state on its own line under it. */}
-        <header className="grid grid-cols-[auto_minmax(0,1fr)] items-center justify-items-start gap-x-2.5 gap-y-0.5">
-          <Avatar handle={agent.handle} large className="row-span-2 size-9 text-xs" />
+    <article className="grid grid-cols-[28px_minmax(0,1fr)] gap-x-3 px-(--gutter) py-3 hover:bg-muted/60">
+      <Avatar handle={agent.handle} large className="mt-px size-7 text-2xs" />
+      <div className="grid min-w-0 gap-1.5">
+        <header className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
           <h2
-            className="text-base font-semibold tracking-[-0.011em] [font-variant-numeric:tabular-nums_slashed-zero]"
+            className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
             title={agent.id}
           >
             {agent.handle}
           </h2>
           <AgentStateBadge agent={agent} />
         </header>
-        <dl className="m-0 grid gap-0.5 text-meta leading-5 [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+        <dl className="m-0 flex flex-wrap gap-x-4 gap-y-0.5 text-meta [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:flex [&>div]:min-w-0 [&>div]:gap-1.5">
           {agent.role === "coordinator" && (
             <div>
               <dt>Role</dt>
@@ -158,9 +162,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             </dd>
           </div>
         </dl>
-      </div>
-      <div className="grid min-w-0 content-start gap-2.5">
-        <p className="font-medium">
+        <p className="mt-1 font-medium">
           {task ? (
             <Link
               className="inline-flex flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
@@ -184,7 +186,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   );
 }
 
-const handoffBox = "bg-muted grid gap-1.5 rounded-sm border px-3 py-2.5";
+const handoffBox = "grid gap-1 border-l-2 pl-3 text-meta";
 
 function HandoffView({ agentId }: { agentId: string }) {
   const handoff = useQuery(queries.handoff(agentId));
@@ -208,7 +210,7 @@ function HandoffView({ agentId }: { agentId: string }) {
           · <RelTime at={updated_at} />
         </span>
       </p>
-      <dl className="m-0 grid gap-1 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[64px_minmax(0,1fr)] [&>div]:gap-2.5">
+      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-subtle-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[64px_minmax(0,1fr)] [&>div]:gap-2">
         <div>
           <dt>Now</dt>
           <dd>

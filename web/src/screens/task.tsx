@@ -73,7 +73,7 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby={id}>
+    <section className={first ? undefined : "mt-7"} aria-labelledby={id}>
       <SectionTitle id={id} {...(count === undefined ? {} : { count })}>
         {title}
       </SectionTitle>
@@ -119,7 +119,7 @@ function TaskView({
   return (
     <article>
       <header className="mb-6">
-        <h1 className="max-w-[36ch] text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+        <h1 className="max-w-[40ch] text-[22px] leading-tight font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
@@ -130,9 +130,9 @@ function TaskView({
         </p>
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
+      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-start lg:gap-8">
         <aside
-          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
+          className="order-2 grid gap-5 max-lg:border-t max-lg:pt-5 lg:sticky lg:top-6 lg:border-l lg:pl-6"
           aria-label="Properties"
         >
           <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">

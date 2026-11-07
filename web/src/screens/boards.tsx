@@ -67,7 +67,7 @@ export function BoardsScreen() {
               .map((ask) => (
                 <li key={ask.id}>
                   <Link
-                    className="grid min-h-11 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-2 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
+                    className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
                     to="/asks/$id"
                     params={{ id: String(ask.id) }}
                   >
@@ -190,7 +190,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_236px_156px_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -209,16 +209,13 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
     getRowId: (row) => row.board.slug,
   });
   return (
-    <section
-      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
-      aria-label="All boards"
-    >
+    <section className="edge @container overflow-hidden border-y bg-card" aria-label="All boards">
       {table.getHeaderGroups().map((group) => (
         <div
           key={group.id}
           className={cn(
             ROW_GRID,
-            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
+            "hidden h-8 items-center border-b bg-muted px-(--gutter) text-xs font-medium text-muted-foreground @min-[760px]:grid",
           )}
           aria-hidden="true"
         >
@@ -235,7 +232,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-14 @min-[760px]:py-2 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -305,7 +302,7 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-3 gap-y-1 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-2"
+          className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -318,13 +315,13 @@ function TaskTally({ board }: { board: Board }) {
                 >
                   <StatusIcon
                     status={segment.key === "waiting" ? "open" : segment.key}
-                    className="size-3"
+                    className="size-3.5"
                   />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
-                  {/* The column head names the counts; each keeps its word for screen readers. */}
-                  <span className="@min-[760px]:sr-only">{segment.label}</span>
+                  {/* Each count keeps its word, so the status reads without its colour. */}
+                  <span>{segment.label}</span>
                 </li>
               ),
           )}

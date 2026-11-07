@@ -165,7 +165,7 @@ export function AsksScreen() {
           return (
             <>
               {shown.length > 0 && (
-                <div className="grid gap-4">
+                <div className="grid gap-3">
                   {shown.map((ask) => (
                     <AskCard key={ask.id} ask={ask} agents={agents} />
                   ))}
@@ -231,7 +231,7 @@ function WaitingTasks({
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
       {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
+      <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
             <TaskGroupSection
@@ -300,8 +300,8 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
-        "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
+        "relative grid gap-3 overflow-hidden rounded-lg border bg-card px-4.5 pt-3.5 pb-4",
+        "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
         ask.status !== "open"
           ? "before:bg-input"
           : ask.kind === "action"
@@ -341,7 +341,7 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="text-base leading-[1.55] text-foreground">
+      <div className="text-sm leading-normal text-foreground">
         <Markdown text={ask.question} />
       </div>
       {ask.status === "open" && <AnswerForm ask={ask} />}
@@ -424,7 +424,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     {ask.options.map((option, index) => (
                       <Label
                         key={index}
-                        className="flex min-h-[42px] cursor-pointer items-center gap-2.5 rounded-sm border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-primary has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
+                        className="flex min-h-9 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-primary has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
                       >
                         <input
                           type="radio"

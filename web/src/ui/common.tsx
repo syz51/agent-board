@@ -84,11 +84,11 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
-      <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
-        <Icon name={icon} className="size-5" />
+    <div className="grid justify-items-center gap-1 rounded-lg border border-dashed border-input px-6 py-9 text-center text-meta text-muted-foreground">
+      <span className="mb-1.5 grid size-8 place-items-center rounded-md border bg-card text-subtle-foreground">
+        <Icon name={icon} className="size-4" />
       </span>
-      <p className="text-base font-semibold text-foreground">{title}</p>
+      <p className="text-sm font-semibold text-foreground">{title}</p>
       {children && <p className="max-w-[48ch]">{children}</p>}
     </div>
   );
@@ -306,15 +306,15 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+    <header className="mb-5 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
       <div className="grid min-w-0 gap-1.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <h1 className="text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+          <h1 className="text-display font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
             {title}
           </h1>
           {children}
         </div>
-        {sub && <p className="max-w-[68ch] text-sm text-muted-foreground">{sub}</p>}
+        {sub && <p className="max-w-[68ch] text-meta text-muted-foreground">{sub}</p>}
       </div>
       {aside}
     </header>
@@ -350,10 +350,7 @@ export function SectionTitle({
   children: ReactNode;
 }) {
   return (
-    <h2
-      id={id}
-      className="mb-3 flex items-baseline gap-2 text-base font-semibold tracking-[-0.011em]"
-    >
+    <h2 id={id} className="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">
       {icon}
       {children}
       {count !== undefined && (
@@ -366,8 +363,7 @@ export function SectionTitle({
 }
 
 /** A bordered list of rows on a card surface. */
-export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+export const listClass = "edge bg-card divide-y overflow-hidden border-y [&>li]:border-border";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {
