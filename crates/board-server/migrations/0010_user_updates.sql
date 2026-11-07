@@ -20,3 +20,7 @@ CREATE TABLE user_seen (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     seen_at INTEGER NOT NULL
 ) STRICT;
+-- An existing board's history predates updates: count it as seen, so the user starts
+-- from what finishes next rather than from every task ever done.
+INSERT INTO user_seen (id, seen_at)
+SELECT 1, done_at FROM tasks WHERE done_at IS NOT NULL ORDER BY done_at DESC LIMIT 1;

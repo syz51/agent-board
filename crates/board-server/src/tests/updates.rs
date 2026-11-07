@@ -173,14 +173,20 @@ async fn a_coordinators_turn_ending_is_kept_per_board_and_a_workers_is_dropped()
 }
 
 #[tokio::test]
-async fn turn_endings_are_validated_and_the_newest_fifty_are_kept() {
+async fn turn_endings_are_cleaned_and_cut_never_refused_and_the_newest_fifty_are_kept() {
     let t = coordinated().await;
-    let (s, v) = stop(&t, COORD, Some("bell \u{7}")).await;
-    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
-    let (s, _) = stop(&t, COORD, Some(&"x".repeat(4001))).await;
-    assert_eq!(s, 400);
-    let (s, _) = stop(&t, COORD, Some(" \n ")).await;
-    assert_eq!(s, 400);
+    // Advisory text never fails the state change: it is cleaned, cut, or left out.
+    let (s, v) = stop(&t, COORD, Some("\u{1b}[1mbell\u{1b}[0m \u{7}")).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, _) = stop(&t, COORD, Some(&"x".repeat(5000))).await;
+    assert_eq!(s, 200);
+    let (s, _) = stop(&t, COORD, Some(" \n\u{7} ")).await;
+    assert_eq!(s, 200);
+    let kept = t.strings("SELECT text FROM said ORDER BY id");
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0], "bell");
+    assert_eq!(kept[1].chars().count(), 4000);
+    assert!(kept[1].ends_with("x…"));
 
     for n in 0..55 {
         t.advance(TimeDelta::seconds(1));
@@ -409,4 +415,74 @@ async fn summaries_and_turn_endings_stay_out_of_agents_context() {
         .await
         .to_string();
     assert!(!events.contains("SUMMARY-MARK") && !events.contains("SAID-MARK"));
+}
+
+#[tokio::test]
+async fn a_kept_turn_ending_announces_itself_even_when_already_idle() {
+    let t = coordinated().await;
+    stop(&t, COORD, None).await;
+    let count = || {
+        t.strings(
+            "SELECT type FROM events WHERE type = 'agent_state_changed' AND actor = 't3:coord'",
+        )
+        .len()
+    };
+    let before = count();
+    stop(&t, COORD, None).await;
+    assert_eq!(count(), before, "idle to idle without words is no change");
+    stop(&t, COORD, Some("Still here.")).await;
+    assert_eq!(
+        count(),
+        before + 1,
+        "a kept turn ending refreshes the user's views"
+    );
+    // A worker's words are not kept, so they announce nothing.
+    stop(&t, WORKER, None).await;
+    let worker = || {
+        t.strings(
+            "SELECT type FROM events WHERE type = 'agent_state_changed' AND actor = 't3:worker'",
+        )
+        .len()
+    };
+    let quiet = worker();
+    stop(&t, WORKER, Some("Done here.")).await;
+    assert_eq!(worker(), quiet);
+}
+
+#[tokio::test]
+async fn a_lapsed_coordinator_lease_keeps_nothing() {
+    let t = coordinated().await;
+    t.advance(TimeDelta::hours(2));
+    // The heartbeat no longer renews a lapsed lease, and nothing is kept.
+    stop(&t, COORD, Some("Talking to the user now.")).await;
+    assert!(t.strings("SELECT text FROM said").is_empty());
+}
+
+#[tokio::test]
+async fn resolved_feedback_items_are_not_finished_work() {
+    let t = coordinated().await;
+    let item = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Hooks print twice" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{item}/resolve"),
+            Some(json!({ "kind": "declined", "reason": "works as designed" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(t.get_task(&item).await["status"], "done");
+    let real = finished(&t, "Real work", Some("Shipped.")).await;
+    let done = updates(&t, "").await["done"].clone();
+    assert_eq!(done.as_array().unwrap().len(), 1, "{done}");
+    assert_eq!(done[0]["task"], real.as_str());
 }

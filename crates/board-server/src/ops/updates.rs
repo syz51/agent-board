@@ -2,61 +2,42 @@
 //! their summaries, coordinators' turn endings, and the user's seen cursor.
 
 use board_proto::{
-    AgentId, BoardSlug, DoneUpdate, MarkSeen, SAID_CHARS_MAX, Said, SeenCursor, Timestamp,
-    UPDATES_MAX, Updates,
+    AgentId, BoardSlug, DoneUpdate, MarkSeen, Said, SeenCursor, Timestamp, UPDATES_MAX, Updates,
 };
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Ctx, parse_id, ts};
-use crate::error::{Result, invalid};
+use crate::error::Result;
 use crate::store::load_evidence;
-use crate::text::check_text;
 
 /// Turn endings kept per agent and board.
 pub(crate) const SAID_KEPT: usize = 50;
 /// Default `limit` of `GET /v1/agents/{id}/said`; at most `SAID_KEPT`.
 pub(crate) const SAID_LIST_DEFAULT: usize = 20;
 
-/// Checks `AgentStateUpdate.said`.
-pub(crate) fn validate_said(text: &str) -> Result<()> {
-    if text.trim().is_empty() {
-        return Err(invalid(
-            "said is empty",
-            "send the last message of the turn, or leave said out when there was none",
-        ));
-    }
-    check_text("said", text, SAID_CHARS_MAX)
-}
-
-/// Stores `text` once per board `agent` coordinates now, keeping the newest `SAID_KEPT`
-/// per agent and board. An agent that coordinates no board stores nothing.
-pub(crate) fn record_said(cx: &mut Ctx<'_>, agent: &AgentId, text: &str) -> Result<Vec<Said>> {
+/// Stores `text` once per board whose live coordinator `agent` is, keeping the newest
+/// `SAID_KEPT` per agent and board. Whether anything was stored.
+pub(crate) fn record_said(cx: &mut Ctx<'_>, agent: &AgentId, text: &str) -> Result<bool> {
     let boards: Vec<String> = cx
         .db
-        .prepare_cached("SELECT slug FROM boards WHERE coordinator = ?1 ORDER BY slug")?
-        .query_map([agent.as_str()], |r| r.get(0))?
+        .prepare_cached(
+            "SELECT slug FROM boards WHERE coordinator = ?1 AND coordinator_expires_at > ?2 \
+             ORDER BY slug",
+        )?
+        .query_map(params![agent.as_str(), cx.now_ms()], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut stored = Vec::with_capacity(boards.len());
-    for board in boards {
+    for board in &boards {
         cx.db.execute(
             "INSERT INTO said (agent, board, text, at) VALUES (?1, ?2, ?3, ?4)",
             params![agent.as_str(), board, text, cx.now_ms()],
         )?;
-        let id = cx.db.last_insert_rowid();
         cx.db.execute(
             "DELETE FROM said WHERE agent = ?1 AND board = ?2 AND id NOT IN \
              (SELECT id FROM said WHERE agent = ?1 AND board = ?2 ORDER BY id DESC LIMIT ?3)",
             params![agent.as_str(), board, SAID_KEPT as i64],
         )?;
-        stored.push(Said {
-            id,
-            agent: agent.clone(),
-            board: parse_id(&board)?,
-            text: text.to_owned(),
-            at: cx.now,
-        });
     }
-    Ok(stored)
+    Ok(!boards.is_empty())
 }
 
 fn said_row(r: &Row<'_>) -> rusqlite::Result<Said> {
@@ -110,6 +91,8 @@ pub(crate) fn updates(
             "SELECT id, board, parent, title, summary, owner, done_at FROM tasks \
              WHERE status = 'done' AND done_at IS NOT NULL \
                AND (?1 IS NULL OR done_at > ?1) AND (?2 IS NULL OR board = ?2) \
+               AND NOT EXISTS (SELECT 1 FROM feedback f \
+                               WHERE f.task = tasks.id AND f.resolution IS NOT NULL) \
              ORDER BY done_at DESC, number DESC LIMIT ?3",
         )?
         .query_map(params![after, board, fetch], |r| {
@@ -163,7 +146,12 @@ pub(crate) fn mark_seen(cx: &mut Ctx<'_>, req: MarkSeen) -> Result<SeenCursor> {
          ON CONFLICT (id) DO UPDATE SET seen_at = MAX(seen_at, excluded.seen_at)",
         [at],
     )?;
+    let seen_at: i64 = cx
+        .db
+        .query_row("SELECT seen_at FROM user_seen WHERE id = 1", [], |r| {
+            r.get(0)
+        })?;
     Ok(SeenCursor {
-        seen_at: seen_at(cx)?.unwrap_or_else(|| ts(at)),
+        seen_at: ts(seen_at),
     })
 }

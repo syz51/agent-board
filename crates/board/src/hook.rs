@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, SAID_CHARS_MAX, Snapshot,
-    SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat,
+    SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -311,26 +311,6 @@ async fn handle(
     };
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
-}
-
-/// The turn's last message as the server accepts it (`AgentStateUpdate.said`): without
-/// control characters other than line breaks and tabs, trimmed, and cut to
-/// `SAID_CHARS_MAX` characters with an ellipsis. `None` when nothing is left.
-fn turn_ending(message: Option<&str>) -> Option<String> {
-    let clean: String = message?
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect();
-    let clean = clean.trim();
-    if clean.is_empty() {
-        return None;
-    }
-    if clean.chars().count() <= SAID_CHARS_MAX {
-        return Some(clean.to_owned());
-    }
-    let mut cut: String = clean.chars().take(SAID_CHARS_MAX - 1).collect();
-    cut.push('…');
-    Some(cut)
 }
 
 /// How long a session's cached decisions outlive its last SessionStart.
@@ -704,15 +684,17 @@ impl Hook<'_> {
     /// user while the agent coordinates a board. A turn the handoff reminder continues has
     /// not ended, so its message is not sent; the next `Stop` sends the final one.
     async fn stop(&mut self) -> Result<Reply> {
-        let reminder = if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
-            Ok(None)
+        // A Stop that follows our own block ends the turn that answered the reminder; the
+        // message worth keeping was the one the reminder interrupted.
+        let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
+        let said = if continued {
+            None
         } else {
-            self.handoff_reminder().await
+            self.input["last_assistant_message"]
+                .as_str()
+                .and_then(board_proto::turn_ending)
         };
-        let said = match &reminder {
-            Ok(Some(_)) => None,
-            _ => turn_ending(self.input["last_assistant_message"].as_str()),
-        };
+        // The state first: it matters most within the hook's budget.
         self.client
             .set_state(
                 &self.agent,
@@ -723,7 +705,13 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        Ok(reminder?.map_or(Reply::Nothing, Reply::Block))
+        if continued {
+            return Ok(Reply::Nothing);
+        }
+        Ok(self
+            .handoff_reminder()
+            .await?
+            .map_or(Reply::Nothing, Reply::Block))
     }
 
     /// The handoff reminder for a turn that leaves a task in `doing` with a stale handoff,

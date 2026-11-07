@@ -932,7 +932,7 @@ fn stop_sends_the_turns_last_message_cleaned_and_cut() {
     };
     assert_eq!(
         said(json!("  \u{1b}[1mPR open\u{1b}[0m:\n\t- review it\r\n  ")),
-        Some(json!("[1mPR open[0m:\n\t- review it"))
+        Some(json!("PR open:\n\t- review it"))
     );
     let long = said(json!("y".repeat(SAID_CHARS_MAX + 10))).unwrap();
     let long = long.as_str().unwrap();
@@ -959,9 +959,9 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
         .body
         .clone();
     assert_eq!(
-        (blocked["state"].as_str(), blocked.get("said")),
-        (Some("idle"), None),
-        "a blocked Stop is not the end of the turn: nothing to keep"
+        (blocked["state"].as_str(), blocked["said"].as_str()),
+        (Some("idle"), Some("Done.")),
+        "the reminder interrupts the turn's real closing message: keep it"
     );
     let reason = reply["reason"].as_str().unwrap();
     assert!(
@@ -971,8 +971,23 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
         "{reason}"
     );
     assert_eq!(stop(&e), None, "one reminder per change");
-    let continued = e.with("Stop", json!({"stop_hook_active": true}));
+    let continued = e.with(
+        "Stop",
+        json!({"stop_hook_active": true, "last_assistant_message": "Handoff updated."}),
+    );
     assert_eq!(e.hook("stop", "claude", continued).1, "");
+    let after = e
+        .stub
+        .requests_to(&state_path())
+        .last()
+        .unwrap()
+        .body
+        .clone();
+    assert_eq!(
+        (after["state"].as_str(), after.get("said")),
+        (Some("idle"), None),
+        "the reply to the reminder is not what the user should read"
+    );
 
     // A later change in the same turn (say, after a background task woke the agent).
     h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(2));

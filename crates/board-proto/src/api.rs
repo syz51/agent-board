@@ -37,9 +37,9 @@ pub struct AgentStateUpdate {
     pub state: AgentState,
     /// Set with `state: paused` when a usage limit stopped the agent.
     pub paused_until: Option<Timestamp>,
-    /// The last message of the turn that just ended (`Stop`), at most `SAID_CHARS_MAX`
-    /// characters. Kept as a `Said` only while the agent coordinates a board; servers that
-    /// predate it ignore it.
+    /// The last message of the turn that just ended (`Stop`). The server cleans and cuts it
+    /// with [`turn_ending`] and keeps it as a `Said` only while the agent coordinates a
+    /// board; it never fails the update. Servers that predate it ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub said: Option<String>,
 }
@@ -257,8 +257,53 @@ pub struct DoneTask {
 /// Longest `DoneTask.summary`, in characters.
 pub const SUMMARY_CHARS_MAX: usize = 600;
 
-/// Longest `Said.text`, in characters; clients cut longer messages to fit.
+/// Longest `Said.text`, in characters.
 pub const SAID_CHARS_MAX: usize = 4000;
+
+/// A turn's last message as kept for the user: terminal escape sequences and control
+/// characters other than line breaks and tabs removed, trimmed, and cut to
+/// `SAID_CHARS_MAX` characters ending with `…`. `None` when nothing is left.
+pub fn turn_ending(message: &str) -> Option<String> {
+    let mut clean = String::with_capacity(message.len().min(SAID_CHARS_MAX * 4));
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters and intermediates up to a final byte in @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST (ESC \).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is ESC and one character.
+                _ => {}
+            },
+            '\n' | '\t' => clean.push(c),
+            c if c.is_control() => {}
+            c => clean.push(c),
+        }
+    }
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if clean.chars().count() <= SAID_CHARS_MAX {
+        return Some(clean.to_owned());
+    }
+    let mut cut: String = clean.chars().take(SAID_CHARS_MAX - 1).collect();
+    cut.push('…');
+    Some(cut)
+}
 
 /// `GET /v1/updates`: what finished and what coordinators said since the user last looked,
 /// newest first, at most `UPDATES_MAX` of each.
@@ -497,6 +542,25 @@ pub struct ApiError {
 mod tests {
     use super::*;
     use crate::Board;
+
+    #[test]
+    fn turn_endings_lose_escapes_and_control_characters_and_fit() {
+        assert_eq!(
+            turn_ending("  \u{1b}[1;32mPR open\u{1b}[0m:\r\n\t- review it\u{7}  ").as_deref(),
+            Some("PR open:\n\t- review it")
+        );
+        assert_eq!(
+            turn_ending("\u{1b}]8;;https://x.test\u{1b}\\link\u{1b}]8;;\u{7} done").as_deref(),
+            Some("link done")
+        );
+        assert_eq!(turn_ending("a\u{1b}(Bb").as_deref(), Some("aBb"));
+        assert_eq!(turn_ending(" \u{7}\r\n "), None);
+        let long = turn_ending(&"y".repeat(SAID_CHARS_MAX + 10)).unwrap();
+        assert_eq!(long.chars().count(), SAID_CHARS_MAX);
+        assert!(long.ends_with("y…"));
+        let exact = "z".repeat(SAID_CHARS_MAX);
+        assert_eq!(turn_ending(&exact).as_deref(), Some(exact.as_str()));
+    }
 
     #[test]
     fn touches_from_older_clients_are_unscanned_without_times() {

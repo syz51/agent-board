@@ -22,7 +22,7 @@ async fn lease(t: &T, agent: &str, globs: &[&str]) -> Value {
 fn sweep(t: &T) -> usize {
     t.state
         .db()
-        .write(t.state.now(), t.state.settings(), sweep_expired)
+        .write(|| t.state.now(), t.state.settings(), sweep_expired)
         .unwrap()
 }
 

@@ -183,7 +183,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. A Stop that does not block also sends the turn's last message (`last_assistant_message`, control characters removed, cut to 4,000 characters) with the idle state, as `said`; the server keeps it only for a current coordinator (see Reporting to the user) |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when the reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -281,12 +281,13 @@ registers without a repo).
   wake arrives as the thread's next turn and buries whatever the last turn said. So what
   the user should read goes to the board instead: every `task_done` carries a `summary`,
   questions and decisions go to `ask_user`, and the Stop hook sends each turn's last
-  message. The server keeps that message only while the agent coordinates a board, once per
-  such board (the newest 50), in the same transaction as the state change; a worker's turn
-  endings are not kept, since its parent reads them. Summaries and turn endings are
-  agent-written and untrusted: they appear in the user's views only, never in snapshot,
-  delta, alert or wake text and never in event payloads, so no agent reads another's
-  words as context.
+  message. The server keeps that message only while the agent holds a live coordinator
+  lease, once per such board (the newest 50), in the same transaction as the state change;
+  a worker's turn endings are not kept, since its parent reads them. Summaries and turn
+  endings are agent-written and untrusted: never in snapshot, delta, alert or wake text and
+  never in event payloads. Turn endings are for the user only; a summary also shows in
+  `task_show`, marked as text written by another agent like notes, so a coordinator can
+  review its children's work.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.

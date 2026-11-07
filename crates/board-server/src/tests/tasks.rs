@@ -824,7 +824,7 @@ fn announce_not_before(t: &T) -> usize {
     t.state
         .db()
         .write(
-            t.state.now(),
+            || t.state.now(),
             t.state.settings(),
             crate::ops::tasks::announce_not_before,
         )

@@ -109,8 +109,10 @@ impl AppState {
     ) -> Result<T> {
         let state = self.clone();
         tokio::task::spawn_blocking(move || {
-            let now = state.now();
-            state.inner.db.write(now, &state.inner.settings, f)
+            state
+                .inner
+                .db
+                .write(|| state.now(), &state.inner.settings, f)
         })
         .await
         .map_err(|e| Error::Internal(format!("write task failed: {e}")))?

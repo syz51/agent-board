@@ -62,18 +62,22 @@ impl Db {
     /// Creates a device (a user device when `user`) and returns its token, shown once.
     pub fn create_device(&self, name: &DeviceName, user: bool, now: Timestamp) -> Result<String> {
         let now = crate::clock::truncate(now);
-        self.write(now, &Settings::default(), |cx| {
-            crate::ops::devices::create(cx, name, user)
-        })
+        self.write(
+            || now,
+            &Settings::default(),
+            |cx| crate::ops::devices::create(cx, name, user),
+        )
         .map(|t| t.token)
     }
 
     /// Creates a one-time Telegram pairing code and returns it, shown once.
     pub fn create_telegram_pairing(&self, replace: bool, now: Timestamp) -> Result<String> {
         let now = crate::clock::truncate(now);
-        self.write(now, &Settings::default(), |cx| {
-            crate::ops::telegram::create_code(cx, replace)
-        })
+        self.write(
+            || now,
+            &Settings::default(),
+            |cx| crate::ops::telegram::create_code(cx, replace),
+        )
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -87,10 +91,11 @@ impl Db {
     }
 
     /// Runs `f` in an immediate (write) transaction, commits, then broadcasts the events it
-    /// appended. Any error rolls everything back.
+    /// appended. Any error rolls everything back. `now` is read once the writer lock is
+    /// held, so writes are stamped in the order they commit (the seen cursor relies on it).
     pub(crate) fn write<T>(
         &self,
-        now: Timestamp,
+        now: impl FnOnce() -> Timestamp,
         settings: &Settings,
         f: impl FnOnce(&mut Ctx<'_>) -> Result<T>,
     ) -> Result<T> {
@@ -98,7 +103,7 @@ impl Db {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cx = Ctx {
             db: &tx,
-            now,
+            now: now(),
             s: settings,
             events: Vec::new(),
         };
@@ -347,6 +352,49 @@ mod tests {
             ),
             "github.com/myorg/repo a.rs 5; github.com/myorg/repo b.rs 1"
         );
+    }
+
+    #[test]
+    fn tasks_done_before_updates_count_as_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..9].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);",
+        )
+        .unwrap();
+        for (number, status, done_at) in [
+            (1, "done", Some(300)),
+            (2, "done", Some(100)),
+            (3, "open", None),
+        ] {
+            conn.execute(
+                "INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+                 auto, created_by, version, created_at, updated_at, done_at) \
+                 VALUES (?1, 'b', ?2, 't', '', '', ?3, 'p2', 1, 't3:a', 1, 0, 0, ?4)",
+                rusqlite::params![format!("b-{number}"), number, status, done_at],
+            )
+            .unwrap();
+        }
+        migrate(&conn).unwrap();
+        let seen: i64 = conn
+            .query_row("SELECT seen_at FROM user_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 300);
+
+        // A new database has nothing to count as seen.
+        let fresh = Connection::open_in_memory().unwrap();
+        configure(&fresh).unwrap();
+        migrate(&fresh).unwrap();
+        let rows: i64 = fresh
+            .query_row("SELECT count(*) FROM user_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

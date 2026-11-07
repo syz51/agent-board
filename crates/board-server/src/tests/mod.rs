@@ -311,10 +311,14 @@ impl T {
     pub fn exec(&self, sql: &str) {
         self.state
             .db()
-            .write(self.state.now(), self.state.settings(), |cx| {
-                cx.db.execute_batch(sql)?;
-                Ok(())
-            })
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                |cx| {
+                    cx.db.execute_batch(sql)?;
+                    Ok(())
+                },
+            )
             .unwrap();
     }
 
