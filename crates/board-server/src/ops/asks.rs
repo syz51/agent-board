@@ -198,25 +198,22 @@ pub(crate) fn withdraw(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<Ask
 }
 
 /// Claims sending ask `id` to `chat`: true unless it was already sent, or is being sent,
-/// to a chat. The notifier sends an ask both when it is created and when a chat pairs, so
-/// this makes exactly one of the two send it.
-pub(crate) fn claim_telegram_send(cx: &mut Ctx<'_>, id: i64, chat: i64) -> Result<bool> {
+/// to a chat, or `chat` is no longer the paired one (`paired` is false for a configured
+/// chat). The notifier sends an ask both when it is created and when a chat pairs, so this
+/// makes exactly one of the two send it, to the current chat. Pairing clears every claim,
+/// so the new chat gets the asks again, also those whose send failed.
+pub(crate) fn claim_telegram_send(
+    cx: &mut Ctx<'_>,
+    id: i64,
+    chat: i64,
+    paired: bool,
+) -> Result<bool> {
     let claimed = cx.db.execute(
-        "UPDATE asks SET telegram_chat_id = ?2 WHERE id = ?1 AND telegram_chat_id IS NULL",
-        params![id, chat],
+        "UPDATE asks SET telegram_chat_id = ?2 WHERE id = ?1 AND telegram_chat_id IS NULL \
+         AND (NOT ?3 OR ?2 = (SELECT chat_id FROM telegram_chat WHERE id = 1))",
+        params![id, chat, paired],
     )?;
     Ok(claimed == 1)
-}
-
-/// Releases a claim from [`claim_telegram_send`] whose send failed, so a later pairing
-/// sends the ask again.
-pub(crate) fn release_telegram_send(cx: &mut Ctx<'_>, id: i64, chat: i64) -> Result<()> {
-    cx.db.execute(
-        "UPDATE asks SET telegram_chat_id = NULL \
-         WHERE id = ?1 AND telegram_chat_id = ?2 AND telegram_message_id IS NULL",
-        params![id, chat],
-    )?;
-    Ok(())
 }
 
 /// Records the Telegram message an ask was sent as, so replies to it can be matched; not

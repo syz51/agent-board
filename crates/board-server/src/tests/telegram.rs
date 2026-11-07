@@ -678,3 +678,48 @@ async fn an_ask_created_while_a_chat_pairs_is_sent_once() {
     t.state.shutdown();
     notifier.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_send_claim_holds_only_for_the_current_chat() {
+    use crate::ops::asks::{claim_telegram_send, set_telegram_message, telegram_message};
+    use crate::ops::telegram::redeem;
+
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let id = ask(&t, "Claimed").await;
+    let other = ask(&t, "Configured").await;
+    let pair = |chat: i64, replace: bool| {
+        let code = t.state.create_telegram_pairing(replace).unwrap();
+        t.state.write(move |cx| redeem(cx, &code, chat))
+    };
+    let claim = |id: i64, chat: i64, paired: bool| {
+        t.state
+            .write(move |cx| claim_telegram_send(cx, id, chat, paired))
+    };
+    assert!(pair(1, false).await.unwrap());
+    assert!(claim(id, 1, true).await.unwrap());
+    assert!(!claim(id, 1, true).await.unwrap(), "claimed once");
+
+    // Pairing another chat while chat 1's send is in flight drops its claim: the message
+    // is not recorded, the old chat cannot claim again, and the new one can.
+    assert!(pair(2, true).await.unwrap());
+    let status = t
+        .state
+        .write(move |cx| set_telegram_message(cx, id, 1, 500))
+        .await
+        .unwrap();
+    assert_eq!(status, board_proto::AskStatus::Open);
+    let sent = |id: i64| t.state.read(move |cx| telegram_message(cx, id));
+    assert_eq!(sent(id).await.unwrap(), None);
+    assert!(!claim(id, 1, true).await.unwrap(), "not the paired chat");
+    assert!(claim(id, 2, true).await.unwrap());
+    t.state
+        .write(move |cx| set_telegram_message(cx, id, 2, 501))
+        .await
+        .unwrap();
+    assert_eq!(sent(id).await.unwrap(), Some((2, 501)));
+
+    // A configured chat is not checked against the paired one.
+    assert!(claim(other, 9, false).await.unwrap());
+}

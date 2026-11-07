@@ -249,9 +249,10 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
 /// message, so replies to it answer the ask.
 async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<()> {
     let (ask, text) = ask_text(state, id).await?;
+    let paired = bot.configured.is_none();
     if ask.status != AskStatus::Open
         || !state
-            .write(move |cx| asks::claim_telegram_send(cx, id, chat))
+            .write(move |cx| asks::claim_telegram_send(cx, id, chat, paired))
             .await?
     {
         return Ok(());
@@ -268,15 +269,7 @@ async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<
             .collect();
         body["reply_markup"] = json!({ "inline_keyboard": rows });
     }
-    let message = match bot.send(body).await {
-        Ok(message) => message.message_id,
-        Err(error) => {
-            state
-                .write(move |cx| asks::release_telegram_send(cx, id, chat))
-                .await?;
-            return Err(error);
-        }
-    };
+    let message = bot.send(body).await?.message_id;
     let status = state
         .write(move |cx| asks::set_telegram_message(cx, id, chat, message))
         .await?;
@@ -465,8 +458,11 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
     let open = state
         .read(|cx| asks::list(cx, Some(board_proto::AskStatus::Open), None))
         .await?;
+    // One failed ask does not keep the others from the new chat.
     for ask in open {
-        send_ask_to(state, bot, chat, ask.id).await?;
+        if let Err(error) = send_ask_to(state, bot, chat, ask.id).await {
+            tracing::error!(%error, ask = ask.id, "telegram: sending an open ask failed");
+        }
     }
     Ok(())
 }
