@@ -97,7 +97,18 @@ body {
 
 a {
   color: var(--accent);
+  text-decoration: none;
   text-underline-offset: 2px;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.md a,
+.ask-question a {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
 }
 
 code,
@@ -344,9 +355,17 @@ main {
 .crumbs {
   display: flex;
   gap: 8px;
-  font-size: 14px;
-  margin-bottom: 8px;
+  font-size: 13.5px;
+  margin-bottom: 6px;
   color: var(--muted);
+}
+
+.crumbs a {
+  color: var(--muted);
+}
+
+.crumbs a:hover {
+  color: var(--text);
 }
 
 .lede {
@@ -589,7 +608,9 @@ main {
 }
 
 .button:disabled {
-  opacity: 0.55;
+  color: var(--muted);
+  background: var(--surface-2);
+  border-color: var(--border);
   cursor: default;
 }
 
@@ -642,6 +663,35 @@ textarea {
   resize: vertical;
 }
 
+select {
+  appearance: none;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%2378818c%27 stroke-width=%271.6%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Cpath d=%27m4.5 6.5 3.5 3.5 3.5-3.5%27/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 16px;
+  cursor: pointer;
+}
+
+input[type="search"]:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--muted);
+}
+
+input[type="search"]:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+  border-color: var(--focus);
+}
+
+::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
 .check {
   display: inline-flex;
   align-items: center;
@@ -670,6 +720,9 @@ input[type="radio"] {
 
 .segmented a {
   flex: none;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
   padding: 5px 12px;
   border-radius: 999px;
   border: 1px solid var(--border);
@@ -885,8 +938,24 @@ input[type="radio"] {
 }
 
 .task-row {
-  padding: 11px 14px;
+  padding: 9px 14px;
   border-top: 1px solid var(--border);
+}
+
+.task-row:hover {
+  background: var(--surface-2);
+}
+
+.task-row:first-child {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.task-row:last-child {
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+.task-row:only-child {
+  border-radius: var(--radius);
 }
 
 .task-row:first-child {
@@ -922,6 +991,38 @@ input[type="radio"] {
   gap: 4px 12px;
   margin: 6px 0 0 36px;
   font-size: 13.5px;
+  color: var(--muted);
+}
+
+/* Wide screens: one line per task, title left and facts right, like an issue list. */
+@media (min-width: 721px) {
+  .task-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 16px;
+  }
+
+  .task-line {
+    flex: 1 1 320px;
+    min-width: 0;
+  }
+
+  /* A fixed start keeps the status badges in one column. */
+  .task-meta {
+    flex: 0 0 auto;
+    min-width: 400px;
+    max-width: 100%;
+    margin: 0 0 0 auto;
+  }
+
+  .task-meta > :last-child {
+    margin-left: auto;
+  }
+
+  .blocked-reason {
+    flex-basis: 100%;
+  }
 }
 
 .owner {
@@ -931,7 +1032,7 @@ input[type="radio"] {
 }
 
 .blocked-reason {
-  margin: 6px 0 0 36px;
+  margin: 4px 0 0 36px;
   font-size: 13.5px;
   color: var(--blocked);
 }
@@ -1419,6 +1520,26 @@ p.handoff {
 }
 
 @media (max-width: 520px) {
+  /* Phones: one joined control that fits the width, no sideways scrolling. */
+  .segmented {
+    gap: 0;
+    margin: 0 0 16px;
+    padding: 2px;
+    overflow: visible;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .segmented a {
+    flex: 1 1 0;
+    justify-content: center;
+    padding: 0 2px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+  }
+
   .counts {
     grid-template-columns: repeat(3, 1fr);
   }
