@@ -4,6 +4,7 @@
 set -eu
 
 set -a
+# shellcheck source=/dev/null
 . /etc/agent-board/restic.env
 set +a
 
