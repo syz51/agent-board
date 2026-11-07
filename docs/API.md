@@ -121,7 +121,8 @@ server's minute sweep.
 - `DELETE /v1/boards/{slug}` → 204. User only. Refused with 400 `invalid_transition` unless
   the board is `closed` and has no open asks. Deletes the board with its tasks, blockers,
   notes, evidence, asks, members, refused-claim records and events (including lease events
-  that name its tasks); leases that named one of its tasks keep running without it. One
+  that name its tasks); leases that named one of its tasks keep running without it. Tasks
+  on other boards that one of its tasks blocked lose that blocker (see "Tasks"). One
   event is then recorded for the board: `board_updated` with `{"fields": ["deleted"],
   "title": …}`, an existing type, so clients that predate deletion still read the feed. The
   slug may be used again, and its task numbers continue where the deleted board's stopped,
@@ -138,8 +139,9 @@ the server sweeps temporary boards that are **idle**: no event on the board (nor
 it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
 `review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
 period counts from the server's start at the earliest, so time the server was down is not
-idle time. Each board is swept in its own transaction; one that fails is logged and tried
-again on the next sweep.
+idle time. Nor is a board idle while one of its tasks that is not done blocks an
+unfinished task on another board. Each board is swept in its own transaction; one that
+fails is logged and tried again on the next sweep.
 
 - An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
   `board_updated` with `fields: ["status"]` and actor `server`.
@@ -160,6 +162,19 @@ Reopening a closed board, or any change on it, starts the period again.
   event's payload has `title`, `priority` and, when set, `parent`. While the new task is
   neither done nor dropped, an agent with an unfinished task anywhere above it, other than
   its creator, sees it in its snapshot alerts (`<agent> filed <ids> under your task <id>`).
+  - `claim: true` creates the task in `doing` owned by `agent`, in the same transaction, so
+    it is never `ready` and no coordinator is woken for it: an agent that files work it
+    starts at once no longer races the coordinator for it. It is checked as a claim is,
+    before anything is written: 409 `claim_refused` at the caller's `doing` limit (the
+    error names the task in `doing` and says to move it to `review` or `blocked` first), and
+    400 `invalid_transition` while a blocker is not done or `not_before` is ahead. A refused
+    request creates nothing and uses no task number. The `task_created` payload then also
+    has `"claimed": true`, and a `task_claimed` event (`previous_owner: null`) follows.
+  - Compatibility: `claim` is sent only when true, so older clients' requests are
+    unchanged. Request bodies are read without rejecting unknown fields, so a server that
+    predates `claim` ignores it and answers with an `open` task; the CLI and MCP see that
+    status and claim the task next (`POST /v1/tasks/{id}/claim`), which another agent may
+    win in between.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
@@ -206,7 +221,18 @@ that changes the owner, the `task_updated` event lists `owner` in `fields` and c
 `owner` and `previous_owner`.
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
-be on the same board and must not form a cycle.
+exist and must not form a cycle; they may be on any board. A task is not `ready`, and
+cannot be claimed, until every blocker is done, wherever it is. `GET /v1/tasks/{id}` lists
+the tasks waiting on it in `blocks`, from every board, and a blocker's `task_done` event,
+on its own board's feed, wakes the waiting task's board coordinator and the owner of a
+task blocked on it (`DESIGN.md`, "Waking it"). Deleting a board removes its tasks' links
+both ways: a task on another board that waited on one of them loses that blocker, with a
+`task_updated` event on its own board, by the deleting actor, with payload `{"fields":
+["blockers"], "blockers_removed": [ids], "board_deleted": slug}` and its `version` raised,
+so an open task left with nothing to wait on is announced as ready (a done or dropped task
+loses the link without an event). A blocked task's owner is not woken by this and sees the
+change in its next snapshot. The temporary-board sweep never does this to a blocker that
+is not done (see "Temporary boards").
 
 ### Leases and touches
 

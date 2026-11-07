@@ -270,7 +270,7 @@ pub struct AddArgs {
     acceptance: String,
     #[arg(long)]
     parent: Option<TaskId>,
-    /// A task that must be done first; repeat for more.
+    /// A task that must be done first, on any board; repeat for more.
     #[arg(long = "blocker")]
     blockers: Vec<TaskId>,
     #[arg(long, value_parser = parse_enum::<Priority>)]
@@ -283,6 +283,9 @@ pub struct AddArgs {
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time.
     #[arg(long)]
     not_before: Option<String>,
+    /// Create it in doing, owned by you, so no other agent starts it first.
+    #[arg(long)]
+    claim: bool,
 }
 
 #[derive(Debug, Args)]
@@ -561,6 +564,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 priority: a.priority,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
+                claim: a.claim,
             };
             ops::task_add(&ctx()?, new).await?
         }
