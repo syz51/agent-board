@@ -111,6 +111,8 @@ server's minute sweep.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
+  Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
+  `agent_state_changed` event (`from` its old state, `to` `running`).
 - Every call that acts as an agent marks it seen. One marked `ended` that makes such a call
   itself (a task, note, lease, touch, ask, handoff, board join, feedback call, or snapshot
   that advances its cursor) is `running` again, announced by one `agent_state_changed`

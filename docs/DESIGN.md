@@ -313,9 +313,21 @@ registers without a repo).
   and the owner of a `blocked` task is woken when its last blocker is done (told to check
   its blocked reason first when it has one). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
-  be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
-  reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
+  be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
+  no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
+  - **Ended is not gone**: T3 closes a Claude session left idle for 30 minutes, and that
+    session's end marks the agent `ended`, but the thread lives on and a message resumes
+    it (its session-start hook registers it running again, which the server announces).
+    So an ended T3 agent on this device is woken like an idle one while T3 has its thread
+    unarchived. The daemon asks T3 once per state change; when T3 does not answer, the
+    send is tried. A thread archived later, which no event announces, is found when a send
+    to it fails, and its answers then go to the coordinator. Lines dropped for an agent
+    the daemon cannot wake from its own device, and answers with no other coordinator to
+    go to, are logged as warnings.
+  - **Lapsed lease**: while the board names no coordinator (its lease lapsed, and naming
+    it again has not happened yet), the coordinator thread this device runs for the board
+    still gets the board's wake-ups.
   - **Re-check**: at send time each line is checked again; a task no longer ready and
     `auto` (claimed, blocked, done), a proposal no longer pending, a blocked task its
     owner resumed, released or still waits on, or an agent no longer the board's

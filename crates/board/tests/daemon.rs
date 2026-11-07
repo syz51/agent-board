@@ -58,8 +58,12 @@ struct FakeT3 {
     time_out_send: Arc<AtomicBool>,
     /// Threads whose `t3 thread show` never answers.
     hang_info: Arc<Mutex<Vec<String>>>,
+    /// `t3 thread show` fails while set.
+    fail_info: Arc<AtomicBool>,
     /// Threads whose `t3 thread send` never answers.
     hang_send: Arc<Mutex<Vec<String>>>,
+    /// Threads whose `t3 thread send` fails, as for an archived thread.
+    refuse_send: Arc<Mutex<Vec<String>>>,
     /// What `t3 thread list` shows, by title.
     listed: Arc<Mutex<Vec<(String, ListedThread)>>>,
     /// When T3 creates a thread.
@@ -144,6 +148,9 @@ impl T3 for FakeT3 {
         if self.fail_send.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread send failed: server unavailable");
         }
+        if self.refuse_send.lock().unwrap().iter().any(|t| t == thread) {
+            anyhow::bail!("t3 thread send failed: thread {thread} is archived");
+        }
         if self.time_out_send.load(Ordering::SeqCst) {
             return Err(TimedOut(format!("t3 thread send {thread}")).into());
         }
@@ -161,6 +168,9 @@ impl T3 for FakeT3 {
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
         if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
             std::future::pending::<()>().await;
+        }
+        if self.fail_info.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread show failed: server not running");
         }
         Ok(self.threads.lock().unwrap().get(thread).cloned())
     }
@@ -889,7 +899,8 @@ async fn an_answer_its_asker_cannot_be_woken_for_goes_to_the_coordinator() {
     ] {
         e.stub.on(&format!("GET {}", agent_path(agent)), info);
     }
-    // Not a T3 thread, on another device, ended, unknown to the server, paused with no reset.
+    // Not a T3 thread, on another device, ended with no thread left in T3, unknown to the
+    // server, paused with no reset.
     let askers = [
         (4, "claude:s1"),
         (6, "t3:remote"),
@@ -912,6 +923,188 @@ async fn an_answer_its_asker_cannot_be_woken_for_goes_to_the_coordinator() {
         assert_eq!(text.matches(&line).count(), 1, "{line} in {text}");
     }
     assert!(e.daemon.state.wakes.is_empty());
+}
+
+/// Captures the daemon's log lines on this thread while the guard lives.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let logs = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_ended_agent_whose_thread_t3_still_has_is_woken() {
+    // T3 closes a Claude session left idle for 30 minutes, which marks its agent ended; the
+    // thread lives on, and a message resumes it.
+    let (mut e, _) = coordinator_env(AgentState::Ended, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "the live thread stays coordinator");
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+        )]
+    );
+
+    // An ended asker whose thread is live hears its own answer, not the coordinator.
+    e.t3.live("worker");
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 11, 3, "t3:worker");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["coord", "worker"]);
+    assert!(
+        e.t3.sends()[1]
+            .1
+            .starts_with("the user answered ask #3 about factory-7")
+    );
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_whose_thread_is_archived_is_not_woken_and_says_so() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let (mut e, _) = coordinator_env(AgentState::Ended, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    // Archived after the reconcile, which would otherwise replace it.
+    e.t3.threads.lock().unwrap().insert(
+        "coord".into(),
+        ThreadInfo {
+            archived: true,
+            runtime: Runtime::Claude,
+        },
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    // An answer to the coordinator's own ask has no other coordinator to go to.
+    let ev = answered(&e, 11, 3, "t3:coord");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    assert!(e.daemon.state.wakes.is_empty());
+    let text = logs.text();
+    let gone = "waking t3:coord: it ended and T3 no longer has its thread, or archived it";
+    assert_eq!(
+        text.matches(&format!("{gone}; 1 wake-ups dropped")).count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches(&format!(
+            "{gone}; 1 answers to its asks dropped, with no other coordinator here to pass them to"
+        ))
+        .count(),
+        1,
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_ended_thread_t3_cannot_check_is_tried_and_not_asked_about_each_flush() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 11, 3, "t3:worker");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    // T3 is down: the check fails, the send is tried and fails, and it backs off.
+    e.t3.fail_info.store(true, Ordering::SeqCst);
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["worker"]);
+    e.daemon.flush(at() + chrono::Duration::seconds(3)).await;
+    let text = logs.text();
+    assert_eq!(
+        text.matches("waking t3:worker: checking its ended thread: ")
+            .count(),
+        1,
+        "asked once until its state changes: {text}"
+    );
+
+    // T3 is back: the send after the back-off resumes the thread.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    e.t3.live("worker");
+    e.daemon.flush(at() + chrono::Duration::seconds(31)).await;
+    assert_eq!(threads(&e.t3), ["worker", "worker"]);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_lease_lapsed_is_still_woken_until_a_reconcile_settles_it() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    // The lease lapsed, and claiming it again failed for now: the board names no one.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        503,
+        "unavailable",
+        "server busy",
+        "retry",
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.coordinators.contains_key(&factory()));
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["coord"]);
 }
 
 #[tokio::test]
@@ -2986,15 +3179,40 @@ async fn a_send_backing_off_still_passes_answers_on_to_the_coordinator() {
     assert!(worker.backoff.is_some(), "the send backs off");
     e.t3.fail_send.store(false, Ordering::SeqCst);
 
-    // The worker ended while its send backed off: its answer goes to the coordinator now,
-    // not once the back-off ends.
+    // The worker's session ended while its send backed off, its thread still in T3: the
+    // answer stays the worker's, sent once the back-off ends.
     let ended = state_changed(31, "t3:worker", AgentState::Ended, None);
     e.daemon.on_event(&ended, at()).await.unwrap();
     e.daemon.flush(at() + chrono::Duration::seconds(3)).await;
-    e.daemon.flush(at() + chrono::Duration::seconds(6)).await;
-    assert_eq!(threads(&e.t3), ["worker", "coord"]);
+    e.daemon.flush(at() + chrono::Duration::seconds(4)).await;
+    assert_eq!(threads(&e.t3), ["worker"]);
+    let worker = &e.daemon.state.wakes[&"t3:worker".parse().unwrap()];
+    assert_eq!(worker.wakes.len(), 1);
+    assert!(!worker.wakes[0].forwarded, "not passed to the coordinator");
     assert!(
-        e.t3.sends()[1].1.contains("ask #3 by t3:worker"),
+        !e.daemon
+            .state
+            .wakes
+            .contains_key(&"t3:coord".parse().unwrap())
+    );
+
+    // Its thread is archived meanwhile, which no event announces: once the back-off ends,
+    // the send fails, T3 says the thread is gone, and the answer goes to the coordinator.
+    e.t3.threads.lock().unwrap().remove("worker");
+    e.t3.refuse_send.lock().unwrap().push("worker".to_owned());
+    e.daemon.flush(at() + chrono::Duration::seconds(31)).await;
+    assert_eq!(threads(&e.t3), ["worker", "worker"]);
+    assert!(
+        !e.daemon
+            .state
+            .wakes
+            .contains_key(&"t3:worker".parse().unwrap()),
+        "dropped with its thread"
+    );
+    e.daemon.flush(at() + chrono::Duration::seconds(32)).await;
+    assert_eq!(threads(&e.t3), ["worker", "worker", "coord"]);
+    assert!(
+        e.t3.sends()[2].1.contains("ask #3 by t3:worker"),
         "{:?}",
         e.t3.sends()
     );

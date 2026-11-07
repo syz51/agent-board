@@ -70,12 +70,12 @@ fn new_handle(cx: &Ctx<'_>, id: &AgentId) -> Result<String> {
 pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
     let Registration { req, repo } = reg;
     let native_ids = serde_json::to_string(&req.native_ids).expect("maps serialize");
-    let previous: Option<(Option<String>, Option<String>)> = cx
+    let previous: Option<(Option<String>, Option<String>, String)> = cx
         .db
         .query_row(
-            "SELECT repo, branch FROM agents WHERE id = ?1",
+            "SELECT repo, branch, state FROM agents WHERE id = ?1",
             [req.id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     // The session-start hook registers every agent as a worker; an agent named as a
@@ -137,7 +137,25 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
             ],
         )?;
     }
-    let moved = previous.is_some_and(|(r, b)| r != repo || b != req.branch);
+    // A registration marks the agent running, such as a T3 thread resumed after its idle
+    // session was closed: announced like any state change, so followers such as the device
+    // daemon see it.
+    if let Some((_, _, before)) = &previous
+        && before != "running"
+    {
+        cx.emit(
+            None,
+            req.id.as_str(),
+            EventType::AgentStateChanged,
+            None,
+            serde_json::json!({
+                "from": before,
+                "to": AgentState::Running,
+                "paused_until": null,
+            }),
+        )?;
+    }
+    let moved = previous.is_some_and(|(r, b, _)| r != repo || b != req.branch);
     if is_new || moved {
         cx.emit(
             None,
