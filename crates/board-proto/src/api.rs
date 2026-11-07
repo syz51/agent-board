@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentState, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
-    EvidenceKind, NoteKind, Priority, Runtime, TaskId, TaskStatus, Timestamp,
+    EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind, Runtime,
+    Task, TaskId, TaskStatus, Timestamp,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -102,6 +103,74 @@ pub struct Stats {
     /// Median minutes a task spent in `doing` before `done`.
     pub doing_minutes_median: Option<f64>,
     pub done_without_check_evidence: u32,
+    /// Feedback reports and items. Absent from servers that predate feedback items.
+    #[serde(default)]
+    pub feedback: FeedbackStats,
+}
+
+/// Feedback counts in [`Stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackStats {
+    /// Reports received: new items and additions to live ones.
+    pub reported: u32,
+    /// Feedback items filed.
+    pub filed: u32,
+    pub resolved: ResolvedCounts,
+}
+
+/// Feedback items resolved, by kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCounts {
+    pub routed: u32,
+    pub duplicate: u32,
+    pub forwarded: u32,
+    pub declined: u32,
+}
+
+/// Longest feedback `about`.
+pub const FEEDBACK_ABOUT_MAX: usize = 40;
+/// Longest feedback `signature`.
+pub const FEEDBACK_SIGNATURE_MAX: usize = 120;
+
+/// `POST /v1/feedback`: report something in a setup that cost a step. Acts for the agent
+/// in `X-Board-Agent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateFeedback {
+    /// The setup: 1-40 characters of `a-z 0-9 : _ -`, `other` when unsure.
+    pub about: String,
+    /// The first line becomes the title; the whole text is the body.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<FeedbackActivity>,
+    /// Defaults to `agent`; `signal` is the server's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<FeedbackSource>,
+    /// Reports with equal signatures are one item. Derived from `about` and the title when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Answer to `POST /v1/feedback`: the item the report was filed on or added to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackResult {
+    pub task: Task,
+    /// The report was added to a live item instead of filing a new one.
+    pub duplicate: bool,
+    /// The item's reports, this one included.
+    pub reports: u32,
+}
+
+/// `POST /v1/feedback/{task_id}/resolve`: close a feedback item, by its owner or the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolveFeedback {
+    pub kind: ResolutionKind,
+    /// Required for `routed` and `duplicate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// Required for `forwarded` and `declined`; at most 280 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// `POST /v1/tasks`.
@@ -400,6 +469,27 @@ mod tests {
         assert!(json.get("not_before").is_none());
         let json = serde_json::to_value(&cleared).unwrap();
         assert_eq!(json["not_before"], serde_json::Value::Null);
+    }
+
+    /// Stats and tasks from servers that predate feedback items still parse.
+    #[test]
+    fn feedback_fields_are_optional_on_the_wire() {
+        let stats: Stats = serde_json::from_value(serde_json::json!({
+            "days": 7, "tasks_created": 1, "tasks_done": 0, "claims_refused": 0,
+            "tasks_taken_stale": 0, "lease_conflicts": 0, "asks_created": 0,
+            "asks_answered": 0, "ask_answer_minutes_median": null,
+            "doing_minutes_median": null, "done_without_check_evidence": 0,
+        }))
+        .unwrap();
+        assert_eq!(stats.feedback, FeedbackStats::default());
+        let create: CreateFeedback =
+            serde_json::from_value(serde_json::json!({ "about": "board", "text": "Slow" }))
+                .unwrap();
+        assert_eq!((&create.source, &create.signature), (&None, &None));
+        assert_eq!(
+            serde_json::to_value(&create).unwrap(),
+            serde_json::json!({ "about": "board", "text": "Slow" })
+        );
     }
 
     /// Peers that predate `temporary` neither send nor expect it.

@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use board_proto::BoardSlug;
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -220,6 +221,14 @@ pub struct Settings {
     pub handoff_field_chars: usize,
     pub question_chars: usize,
     pub body_chars: usize,
+    /// Board that feedback items are filed on; created on first use.
+    pub feedback_board: BoardSlug,
+    /// API errors with one signature file feedback once they reach this many...
+    pub signal_min_reports: u32,
+    /// ...from at least this many agents...
+    pub signal_min_agents: u32,
+    /// ...within this many days. Older error records are pruned.
+    pub signal_window_days: u32,
 }
 
 impl Default for Settings {
@@ -244,6 +253,10 @@ impl Default for Settings {
             handoff_field_chars: 200,
             question_chars: 1000,
             body_chars: 4000,
+            feedback_board: "board-feedback".parse().expect("a valid slug"),
+            signal_min_reports: 3,
+            signal_min_agents: 2,
+            signal_window_days: 7,
         }
     }
 }
@@ -269,6 +282,9 @@ impl Settings {
             ("handoff_field_chars", self.handoff_field_chars as u64),
             ("question_chars", self.question_chars as u64),
             ("body_chars", self.body_chars as u64),
+            ("signal_min_reports", u64::from(self.signal_min_reports)),
+            ("signal_min_agents", u64::from(self.signal_min_agents)),
+            ("signal_window_days", u64::from(self.signal_window_days)),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -311,6 +327,10 @@ impl Settings {
         secs_ms(self.touch_window_secs)
     }
 
+    pub(crate) fn signal_window_ms(&self) -> i64 {
+        secs_ms(u64::from(self.signal_window_days) * 86_400)
+    }
+
     pub(crate) fn done_hidden_ms(&self) -> i64 {
         secs_ms(u64::from(self.done_hidden_after_days) * 86_400)
     }
@@ -344,11 +364,14 @@ mod tests {
             [defaults]
             owner_stale_after_secs = 60
             snapshot_full_chars = 1500
+            feedback_board = "setup-feedback"
             "#,
         )
         .unwrap();
         assert_eq!(full.defaults.owner_stale_after_secs, 60);
         assert_eq!(full.defaults.snapshot_full_chars, 1500);
+        assert_eq!(full.defaults.feedback_board.as_str(), "setup-feedback");
+        assert_eq!(minimal.defaults.feedback_board.as_str(), "board-feedback");
         assert_eq!(
             full.defaults.lease_ttl_secs,
             Settings::default().lease_ttl_secs
@@ -366,7 +389,17 @@ mod tests {
             ServerConfig::from_toml("db = \"b\"\n[defaults]\nmax_doing_per_agent = 0").is_err()
         );
         assert!(ServerConfig::from_toml("db = \"b\"\npublic_url = \"board\"").is_err());
-        for name in ["temporary_close_after_secs", "temporary_delete_after_secs"] {
+        assert!(
+            ServerConfig::from_toml("db = \"b\"\n[defaults]\nfeedback_board = \"Bad Slug\"")
+                .is_err()
+        );
+        for name in [
+            "temporary_close_after_secs",
+            "temporary_delete_after_secs",
+            "signal_min_reports",
+            "signal_min_agents",
+            "signal_window_days",
+        ] {
             assert!(
                 ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 0")).is_err(),
                 "{name}"

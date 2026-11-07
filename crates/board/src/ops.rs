@@ -6,9 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
-    ClaimCoordinator, CreateAsk, CreateBoard, CreateLeases, CreateTask, DeviceName, DoneTask,
-    ErrorCode, EvidenceKind, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent, Runtime,
-    SnapshotFormat, SnapshotKind, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
+    DoneTask, ErrorCode, EvidenceKind, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
+    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TaskId, TaskStatus, Timestamp,
+    UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -817,26 +818,32 @@ pub async fn stats(ctx: &Ctx, days: u32) -> Result<Output> {
     Ok(Output::new(render::stats(&stats), &stats))
 }
 
-/// Files feedback about the board as a task on the feedback board.
-pub async fn feedback(ctx: &Ctx, text: String) -> Result<Output> {
-    let text = text.trim().to_owned();
-    if text.is_empty() {
-        bail!("feedback is empty");
+/// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a
+/// feedback item, or adds the report to the live item with the same signature.
+pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
+    if req.text.trim().is_empty() {
+        bail!("feedback is empty: say what cost you a step");
     }
-    let first = text.lines().next().unwrap_or_default();
-    let title: String = if first.chars().count() > 72 {
-        first.chars().take(71).chain(['…']).collect()
+    let result = ctx.client.feedback(&req).await?;
+    let task = &result.task;
+    let text = if result.duplicate {
+        format!(
+            "added your report to {} ({} reports): {}",
+            task.id,
+            result.reports,
+            render::task_line(task)
+        )
     } else {
-        first.to_owned()
+        format!("filed {}", render::task_line(task))
     };
-    task_add(
-        ctx,
-        NewTask {
-            board: Some(ctx.config.feedback_board()),
-            title,
-            body: text,
-            ..NewTask::default()
-        },
-    )
-    .await
+    Ok(Output::new(
+        format!("{text}\nthanks; carry on with your work"),
+        &result,
+    ))
+}
+
+/// Resolves a feedback item you own (or as the user): it moves to done.
+pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Output> {
+    let task = ctx.client.resolve_feedback(id, &req).await?;
+    Ok(Output::new(render::task_line(&task), &task))
 }

@@ -46,6 +46,16 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 `next` tells an agent what to do, for example `"claim refused: t3:c2d0 owns factory-12
 (seen 2m ago); pick another task from ready"`.
 
+**Signals.** The server records every error it answers to a request that names an agent
+(`X-Board-Agent`), except `version_conflict` (a normal retry): its code, the route template
+(`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become `N`, task ids `ID`,
+agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
+`signal_min_reports` errors from at least `signal_min_agents` agents within
+`signal_window_days`, the server files feedback itself (see "Feedback") with source
+`signal`, about `board` and signature `signal:<code>:<hash>`, giving the count, the agents,
+the window, the route and the template. Later errors add reports to that item while it is
+live. Records older than the window are deleted by the server's minute sweep.
+
 ## Endpoints
 
 ### Health
@@ -143,7 +153,10 @@ Reopening a closed board, or any change on it, starts the period again.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only; 400
   `evidence_required` without evidence, or with `check` evidence missing `exit_code`. The
   `task_done` event carries the evidence.
-- `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`.
+- `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`. Kind `feedback` is still accepted;
+  agents report feedback through `POST /v1/feedback` instead.
+- A task filed through `POST /v1/feedback` carries `feedback` (see "Feedback"); other tasks
+  have none, and the field is absent.
 
 Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 
@@ -199,6 +212,57 @@ be on the same board and must not form a cycle.
   makes an ask on a task, it lists the task's other open asks and names them, with who
   asked, in a warning, so the agent can withdraw its own duplicates.
 
+### Feedback
+
+Feedback is a report about any setup that cost an agent a step: the board, instructions,
+skills, hooks, tools, storage or a project's setup. Each report lands on one task, a
+feedback item, on the server's `feedback_board` (default `board-feedback`, created on first
+use, autopilot off). Items get `auto` from that board's autopilot.
+
+- `POST /v1/feedback` `[CreateFeedback]` `{about, text, activity?, source?, signature?}` →
+  `[FeedbackResult]` `{task, duplicate, reports}`. Needs `X-Board-Agent`: the reporter.
+  - `about` names the setup: 1 to 40 characters of `a-z 0-9 : _ -` (lowercased), such as
+    `board`, `skills:rust` or `t3`; `other` when unsure.
+  - `text`: the first line is the title, cut to 72 characters with an ellipsis; the whole
+    text is the body (at most 4,000 characters).
+  - `activity`: what the agent was doing, one of `explore`, `research`, `design`, `plan`,
+    `build`, `review`, `operate`, `other`.
+  - `source`: `agent` (default) or `capture` (a report written for the agent, such as by a
+    hook). `signal` is the server's own (400 if sent).
+  - `signature` (at most 120 characters) identifies the report for deduplication. Without
+    one it is `<about>:<title>`, lowercased, with numbers, task ids and agent ids
+    normalized as for signals.
+- A report whose signature matches a **live** item adds to it instead of filing a new one
+  (`duplicate: true`): `reports` grows by one, the reporter joins `reporters` (the latest
+  20), and at most once an hour a `feedback` note says it was reported again, naming the
+  routed task and its status when routed. The event is `task_updated` with
+  `{"fields": ["feedback"], "reports": n}`. The newest item with the signature is live
+  while it is unresolved, declined, a duplicate of a live item (the link is followed), or
+  routed to a task that is not done or dropped.
+- Otherwise a new item is filed (`task_created` with a `feedback` payload). When the newest
+  item with the signature is no longer live (its routed task is done or dropped, or it was
+  forwarded), the new item's `recurs` names it: the fix did not hold, or it came back.
+- `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
+  The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
+  next step. `kind` is one of:
+  - `routed`: `task` (any board) does the work. Reports go to this item until that task is
+    done or dropped; then a report opens a new item that `recurs` this one.
+  - `duplicate`: `task` is the original item, which takes later reports.
+  - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
+  - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
+
+  `task` is required for routed and duplicate and refused for the others; `reason` (one
+  line, at most 280 characters) is required for forwarded and declined. The item moves to
+  `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
+  its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
+  already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
+  when the task is not a feedback item or `task` does not exist.
+
+`Task.feedback` `[Feedback]`: `about`, `activity` (absent when not given), `source`,
+`signature`, `reports`, `reporters`, `last_reported_at`, `resolution` (absent until
+resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`) and
+`recurs` (absent unless it recurs an earlier item).
+
 ### Snapshots and events
 
 - `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml` →
@@ -228,13 +292,20 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 - `board stats [--days N] --json` → `[Stats]` from `GET /v1/stats?days=N` (default 7):
   `days`, `tasks_created`, `tasks_done`, `claims_refused`, `tasks_taken_stale`,
   `lease_conflicts`, `asks_created`, `asks_answered`, `ask_answer_minutes_median`,
-  `doing_minutes_median` (minutes, `null` when nothing was measured) and
-  `done_without_check_evidence`. Without `--json` it prints a three-line summary.
+  `doing_minutes_median` (minutes, `null` when nothing was measured),
+  `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
+  received, repeats included), `filed` (items created) and `resolved` (`routed`,
+  `duplicate`, `forwarded`, `declined`), each within the period. Without `--json` it prints
+  a four-line summary.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
-  example `board ls --board board-feedback --json` for the feedback tasks. It returns at
+  example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
+- `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
+  --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
+- `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
+  --declined <reason>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
 
-Both exit 1 with the error on stderr when the server refuses or cannot be reached.
+All exit 1 with the error on stderr when the server refuses or cannot be reached.
 
 ### Web view
 
@@ -257,5 +328,7 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
 | Text limits | title 72, note 280, handoff field 200, question 1,000, body 4,000 characters |
+| Feedback board (`feedback_board`) | `board-feedback`, created on first use |
+| Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

@@ -207,6 +207,8 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         format!("DELETE FROM notes WHERE task IN ({TASKS})"),
         format!("DELETE FROM evidence WHERE task IN ({TASKS})"),
         format!("DELETE FROM claim_refusals WHERE task IN ({TASKS})"),
+        format!("DELETE FROM feedback WHERE task IN ({TASKS})"),
+        format!("DELETE FROM feedback_reports WHERE task IN ({TASKS})"),
         // Leases belong to agents and expire on their own; only the task link goes.
         format!("UPDATE leases SET task = NULL WHERE task IN ({TASKS})"),
         // Lease events name a task but no board.

@@ -1,0 +1,814 @@
+//! Feedback items (`docs/API.md`, "Feedback"): reports about any setup, deduplicated by
+//! signature onto the newest live item, resolved by routing them to work, and filed by the
+//! server itself when agents keep hitting the same API error.
+
+use board_proto::{
+    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, EventType, EvidenceKind,
+    FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution,
+    FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind, ResolveFeedback,
+    ResolvedCounts, Task, TaskId,
+};
+use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+use crate::config::Settings;
+use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ts};
+use crate::error::{Result, bad_transition, forbidden, invalid};
+use crate::ops::tasks::status_str;
+use crate::ops::{boards, touch_agent};
+use crate::store::{find_board, find_task, get_task};
+use crate::text::{check_line, check_text, cut};
+
+/// Agents an item lists in `reporters`: the most recent ones.
+const REPORTERS_MAX: usize = 20;
+/// A repeat report adds a note at most this often per item.
+const NOTE_EVERY_MS: i64 = 3_600_000;
+/// Duplicate links followed at most, in case they form a loop.
+const DUPLICATE_DEPTH_MAX: usize = 8;
+/// Characters of a normalized error message kept.
+const TEMPLATE_MAX: usize = 200;
+
+/// A validated report.
+#[derive(Debug, Clone)]
+pub(crate) struct Report {
+    pub about: String,
+    pub title: String,
+    pub body: String,
+    pub activity: Option<FeedbackActivity>,
+    pub source: FeedbackSource,
+    pub signature: String,
+    pub reporter: AgentId,
+}
+
+/// Checks a report from `reporter` and works out its title and signature.
+pub(crate) fn validate_create(
+    req: CreateFeedback,
+    s: &Settings,
+    reporter: AgentId,
+) -> Result<Report> {
+    let about = req.about.trim().to_lowercase();
+    let about_ok = (1..=FEEDBACK_ABOUT_MAX).contains(&about.chars().count())
+        && about
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '_' | '-'));
+    if !about_ok {
+        return Err(invalid(
+            format!("about {:?} is not a setup name", req.about),
+            format!(
+                "send 1-{FEEDBACK_ABOUT_MAX} characters of a-z 0-9 : _ - naming the setup, such \
+                 as board, skills:rust or t3; use other when unsure"
+            ),
+        ));
+    }
+    let source = req.source.unwrap_or_default();
+    if source == FeedbackSource::Signal {
+        return Err(invalid(
+            "source signal is the server's own",
+            "send source agent (the default) or capture",
+        ));
+    }
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(invalid(
+            "feedback text is empty",
+            "say what cost you a step: the first line is the title",
+        ));
+    }
+    check_text("text", text, s.body_chars)?;
+    let first = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .replace('\t', " ");
+    let title = cut(&first, s.title_chars);
+    let signature = match req.signature.as_deref().map(str::trim) {
+        Some(sig) => {
+            check_line("signature", sig, FEEDBACK_SIGNATURE_MAX)?;
+            sig.to_owned()
+        }
+        None => derived_signature(&about, &title),
+    };
+    Ok(Report {
+        about,
+        title,
+        body: text.to_owned(),
+        activity: req.activity,
+        source,
+        signature,
+        reporter,
+    })
+}
+
+/// The signature of a report that names none: `about` and the title, lowercased, with
+/// ids and numbers normalized.
+pub(crate) fn derived_signature(about: &str, title: &str) -> String {
+    format!("{about}:{}", normalize(title, false))
+        .chars()
+        .take(FEEDBACK_SIGNATURE_MAX)
+        .collect()
+}
+
+/// Lowercases `text` and replaces agent ids with `AGENT`, task ids with `ID` and digit
+/// runs with `N`; with `quotes`, text in double quotes or backticks becomes `"…"`.
+pub(crate) fn normalize(text: &str, quotes: bool) -> String {
+    fn word_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '%' | '.')
+    }
+    fn flush(word: &mut String, out: &mut String) {
+        let core = word.trim_end_matches(['.', ':', '-', '_']);
+        let tail = &word[core.len()..];
+        if core.parse::<AgentId>().is_ok() {
+            out.push_str("AGENT");
+        } else if core.parse::<TaskId>().is_ok() {
+            out.push_str("ID");
+        } else {
+            let mut digits = false;
+            for c in core.chars() {
+                if c.is_ascii_digit() {
+                    if !digits {
+                        out.push('N');
+                    }
+                    digits = true;
+                } else {
+                    out.push(c);
+                    digits = false;
+                }
+            }
+        }
+        out.push_str(tail);
+        word.clear();
+    }
+    let lower = text.to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut word = String::new();
+    let mut chars = lower.chars();
+    while let Some(c) = chars.next() {
+        if quotes && matches!(c, '"' | '`') {
+            flush(&mut word, &mut out);
+            let mut escaped = false;
+            for q in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if q == '\\' && c == '"' {
+                    escaped = true;
+                } else if q == c {
+                    break;
+                }
+            }
+            out.push_str("\"…\"");
+        } else if word_char(c) {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Files a report: adds it to the live item with its signature, or files a new item.
+pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
+    touch_agent(cx, &r.reporter)?;
+    let actor = r.reporter.to_string();
+    let (task, duplicate) = match prior(cx, &r.signature)? {
+        Prior::Live(item) => (add_report(cx, &item, &r.reporter, &actor, &r.title)?, true),
+        Prior::Gone(earlier) => (
+            file(cx, &r, &actor, vec![r.reporter.clone()], 1, Some(earlier))?,
+            false,
+        ),
+        Prior::None => (
+            file(cx, &r, &actor, vec![r.reporter.clone()], 1, None)?,
+            false,
+        ),
+    };
+    let reports = task.feedback.as_ref().map_or(1, |f| f.reports);
+    Ok(FeedbackResult {
+        task,
+        duplicate,
+        reports,
+    })
+}
+
+/// The newest item with a signature: live, or no longer live.
+enum Prior {
+    /// Reports go to this item (an original, when the newest one was a duplicate).
+    Live(TaskId),
+    /// The newest item, no longer live: a new item recurs it.
+    Gone(TaskId),
+    None,
+}
+
+fn prior(cx: &Ctx<'_>, signature: &str) -> Result<Prior> {
+    let newest: Option<String> = cx
+        .db
+        .query_row(
+            "SELECT task FROM feedback WHERE signature = ?1 ORDER BY rowid DESC LIMIT 1",
+            [signature],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(newest) = newest else {
+        return Ok(Prior::None);
+    };
+    let newest: TaskId = parse_id(&newest)?;
+    Ok(match live_item(cx, &newest, 0)? {
+        Some(item) => Prior::Live(item),
+        None => Prior::Gone(newest),
+    })
+}
+
+/// The item that takes reports for feedback item `id`, if it is live: not resolved,
+/// declined, a duplicate of a live item, or routed to a task that is not done or dropped.
+fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> {
+    let row: Option<(Option<String>, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT resolution, resolution_task FROM feedback WHERE task = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, target)) = row else {
+        return Ok(None);
+    };
+    let kind: Option<ResolutionKind> = kind.map(|k| parse_enum(&k)).transpose()?;
+    let target: Option<TaskId> = target.map(|t| parse_id(&t)).transpose()?;
+    Ok(match (kind, target) {
+        (None | Some(ResolutionKind::Declined), _) => Some(id.clone()),
+        (Some(ResolutionKind::Duplicate), Some(original))
+            if depth < DUPLICATE_DEPTH_MAX && is_feedback(cx, &original)? =>
+        {
+            live_item(cx, &original, depth + 1)?
+        }
+        // A duplicate of a plain task counts as routed to it.
+        (Some(ResolutionKind::Routed | ResolutionKind::Duplicate), Some(task)) => {
+            task_open(cx, &task)?.then(|| id.clone())
+        }
+        _ => None,
+    })
+}
+
+fn is_feedback(cx: &Ctx<'_>, id: &TaskId) -> Result<bool> {
+    cx.exists("SELECT 1 FROM feedback WHERE task = ?1", [id.as_str()])
+}
+
+/// The task exists and is neither done nor dropped.
+fn task_open(cx: &Ctx<'_>, id: &TaskId) -> Result<bool> {
+    Ok(task_status(cx, id)?.is_some_and(|s| s != "done" && s != "dropped"))
+}
+
+fn task_status(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<String>> {
+    Ok(cx
+        .db
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The feedback board, created on first use.
+fn feedback_board(cx: &mut Ctx<'_>, actor: &str) -> Result<Board> {
+    let slug = cx.s.feedback_board.clone();
+    if let Some(board) = find_board(cx, &slug)? {
+        return Ok(board);
+    }
+    boards::create(
+        cx,
+        actor,
+        CreateBoard {
+            slug,
+            title: "Feedback".to_owned(),
+            goal: "Reports about any setup (the board, instructions, skills, hooks, tools, \
+                   storage, a project's setup) that cost an agent a step, and the server's \
+                   own signals; each is routed to work or resolved."
+                .to_owned(),
+            repos: Vec::new(),
+            autopilot: false,
+            home_devices: Vec::new(),
+            temporary: false,
+        },
+    )
+}
+
+/// Files a new item for `r` on the feedback board.
+fn file(
+    cx: &mut Ctx<'_>,
+    r: &Report,
+    actor: &str,
+    reporters: Vec<AgentId>,
+    reports: u32,
+    recurs: Option<TaskId>,
+) -> Result<Task> {
+    let board = feedback_board(cx, actor)?;
+    let number: i64 = cx.db.query_row(
+        "UPDATE boards SET next_number = next_number + 1 WHERE slug = ?1 RETURNING next_number - 1",
+        [board.slug.as_str()],
+        |row| row.get(0),
+    )?;
+    let id = TaskId::new(&board.slug, number as u64);
+    let now = cx.now_ms();
+    cx.db.execute(
+        "INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, auto, \
+         created_by, version, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '', 'open', 'p2', ?6, ?7, 1, ?8, ?8)",
+        params![
+            id.as_str(),
+            board.slug.as_str(),
+            number,
+            r.title,
+            r.body,
+            board.autopilot,
+            r.reporter.as_str(),
+            now,
+        ],
+    )?;
+    cx.db.execute(
+        "INSERT INTO feedback (task, about, activity, source, signature, reports, reporters, \
+         last_reported_at, recurs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id.as_str(),
+            r.about,
+            r.activity.map(|a| enum_str(&a)),
+            enum_str(&r.source),
+            r.signature,
+            reports,
+            serde_json::to_string(&reporters).expect("ids serialize"),
+            now,
+            recurs.as_ref().map(TaskId::as_str),
+        ],
+    )?;
+    record_report(cx, &id, &r.reporter)?;
+    cx.emit(
+        Some(&board.slug),
+        actor,
+        EventType::TaskCreated,
+        Some(&id),
+        serde_json::json!({
+            "title": r.title,
+            "priority": "p2",
+            "feedback": { "about": r.about, "source": r.source, "recurs": recurs },
+        }),
+    )?;
+    get_task(cx, &id)
+}
+
+fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId) -> Result<()> {
+    cx.db.execute(
+        "INSERT INTO feedback_reports (task, agent, at) VALUES (?1, ?2, ?3)",
+        params![item.as_str(), agent.as_str(), cx.now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Adds a report to a live item: counts it, records the reporter and, at most once an
+/// hour, notes it (with the routed task, if any).
+fn add_report(
+    cx: &mut Ctx<'_>,
+    item: &TaskId,
+    reporter: &AgentId,
+    actor: &str,
+    summary: &str,
+) -> Result<Task> {
+    let (reports, reporters, last_noted, kind, target): (
+        u32,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = cx.db.query_row(
+        "SELECT reports, reporters, last_noted_at, resolution, resolution_task FROM feedback \
+         WHERE task = ?1",
+        [item.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    let reports = reports.saturating_add(1);
+    let mut reporters: Vec<AgentId> = parse_json(&reporters)?;
+    reporters.retain(|a| a != reporter);
+    reporters.push(reporter.clone());
+    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
+    reporters.drain(..excess);
+    let now = cx.now_ms();
+    let note = last_noted.is_none_or(|at| now - at >= NOTE_EVERY_MS);
+    cx.db.execute(
+        "UPDATE feedback SET reports = ?2, reporters = ?3, last_reported_at = ?4, \
+         last_noted_at = CASE WHEN ?5 THEN ?4 ELSE last_noted_at END WHERE task = ?1",
+        params![
+            item.as_str(),
+            reports,
+            serde_json::to_string(&reporters).expect("ids serialize"),
+            now,
+            note,
+        ],
+    )?;
+    cx.db.execute(
+        "UPDATE tasks SET version = version + 1, updated_at = ?2 WHERE id = ?1",
+        params![item.as_str(), now],
+    )?;
+    record_report(cx, item, reporter)?;
+    let board = item.board();
+    if note {
+        let routed = match (kind.as_deref(), target) {
+            (Some("routed"), Some(task)) => {
+                let task: TaskId = parse_id(&task)?;
+                let status = task_status(cx, &task)?.unwrap_or_else(|| "gone".to_owned());
+                format!("; routed to {task} ({status})")
+            }
+            _ => String::new(),
+        };
+        let text = cut(
+            &format!("reported again ({reports} reports){routed}: {summary}"),
+            cx.s.note_chars,
+        );
+        cx.db.execute(
+            "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'feedback', ?3, ?4)",
+            params![item.as_str(), reporter.as_str(), text, now],
+        )?;
+        let note_id = cx.db.last_insert_rowid();
+        cx.emit(
+            Some(&board),
+            actor,
+            EventType::NoteAdded,
+            Some(item),
+            serde_json::json!({ "note": note_id, "kind": "feedback" }),
+        )?;
+    }
+    cx.emit(
+        Some(&board),
+        actor,
+        EventType::TaskUpdated,
+        Some(item),
+        serde_json::json!({ "fields": ["feedback"], "reports": reports }),
+    )?;
+    get_task(cx, item)
+}
+
+/// The feedback part of task `id`, if it is a feedback item.
+pub(crate) fn load(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<Feedback>> {
+    let row = cx
+        .db
+        .prepare_cached(
+            "SELECT about, activity, source, signature, reports, reporters, last_reported_at, \
+             resolution, resolution_task, resolution_reason, resolved_at, resolved_by, recurs \
+             FROM feedback WHERE task = ?1",
+        )?
+        .query_row([id.as_str()], |r| {
+            let resolution = match r.get::<_, Option<String>>(7)? {
+                Some(kind) => Some(FeedbackResolution {
+                    kind: parse_enum(&kind)?,
+                    task: r
+                        .get::<_, Option<String>>(8)?
+                        .map(|t| parse_id(&t))
+                        .transpose()?,
+                    reason: r.get(9)?,
+                    at: ts(r.get(10)?),
+                    by: r.get(11)?,
+                }),
+                None => None,
+            };
+            Ok(Feedback {
+                about: r.get(0)?,
+                activity: r
+                    .get::<_, Option<String>>(1)?
+                    .map(|a| parse_enum(&a))
+                    .transpose()?,
+                source: parse_enum(&r.get::<_, String>(2)?)?,
+                signature: r.get(3)?,
+                reports: r.get(4)?,
+                reporters: parse_json(&r.get::<_, String>(5)?)?,
+                last_reported_at: ts(r.get(6)?),
+                resolution,
+                recurs: r
+                    .get::<_, Option<String>>(12)?
+                    .map(|t| parse_id(&t))
+                    .transpose()?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// Forgets the resolution of a reopened item, so it is live again.
+pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
+    cx.db.execute(
+        "UPDATE feedback SET resolution = NULL, resolution_task = NULL, \
+         resolution_reason = NULL, resolved_at = NULL, resolved_by = NULL WHERE task = ?1",
+        [id.as_str()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()> {
+    let kind = enum_str(&req.kind);
+    match req.kind {
+        ResolutionKind::Routed | ResolutionKind::Duplicate if req.task.is_none() => {
+            return Err(invalid(
+                format!("{kind} needs the task"),
+                format!(
+                    "send task: the {} (it may be on another board)",
+                    if req.kind == ResolutionKind::Routed {
+                        "task that does the work"
+                    } else {
+                        "original item"
+                    }
+                ),
+            ));
+        }
+        ResolutionKind::Forwarded | ResolutionKind::Declined => {
+            if req.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                return Err(invalid(
+                    format!("{kind} needs a reason"),
+                    format!(
+                        "send reason (at most {} characters): {}",
+                        s.note_chars,
+                        if req.kind == ResolutionKind::Forwarded {
+                            "where it went"
+                        } else {
+                            "why it is not acted on"
+                        }
+                    ),
+                ));
+            }
+            if req.task.is_some() {
+                return Err(invalid(
+                    format!("{kind} takes no task"),
+                    "route it (kind routed) to name the task that does the work",
+                ));
+            }
+        }
+        _ => {}
+    }
+    if let Some(reason) = &req.reason {
+        check_line("reason", reason, s.note_chars)?;
+    }
+    Ok(())
+}
+
+/// Resolves a feedback item: it moves to done with the resolution recorded and artifact
+/// evidence naming it. Only its owner or the user may.
+pub(crate) fn resolve(
+    cx: &mut Ctx<'_>,
+    id: &TaskId,
+    req: ResolveFeedback,
+    agent: Option<AgentId>,
+    by_user: bool,
+) -> Result<Task> {
+    if let Some(agent) = &agent {
+        touch_agent(cx, agent)?;
+    }
+    let task = get_task(cx, id)?;
+    if task.feedback.is_none() {
+        return Err(invalid(
+            format!("{id} is not a feedback item"),
+            format!("mark it done with task_done {id} and evidence"),
+        ));
+    }
+    if task.status.is_closed() {
+        return Err(bad_transition(
+            format!("{id} is {}", status_str(task.status)),
+            format!("reopen it first (task_update {id} status=open) to resolve it again"),
+        ));
+    }
+    if !by_user {
+        match (&task.owner, &agent) {
+            (Some(owner), Some(me)) if owner == me => {}
+            (Some(owner), _) => {
+                return Err(forbidden(
+                    format!("only the owner {owner} or the user may resolve {id}"),
+                    format!("add a note instead (task_note {id}), or ask the user"),
+                ));
+            }
+            (None, _) => {
+                return Err(forbidden(
+                    format!("nobody owns {id}, so you may not resolve it"),
+                    format!("claim it first (task_claim {id}), then resolve it"),
+                ));
+            }
+        }
+    }
+    if let Some(target) = &req.task {
+        if target == id {
+            return Err(invalid(
+                format!("{id} cannot be resolved to itself"),
+                "name the task that does the work, or the original item",
+            ));
+        }
+        if find_task(cx, target)?.is_none() {
+            return Err(invalid(
+                format!("task {target} does not exist"),
+                format!(
+                    "check the id; task_list board={} lists its tasks",
+                    target.board()
+                ),
+            ));
+        }
+    }
+    let by = agent
+        .as_ref()
+        .map_or_else(|| "user".to_owned(), ToString::to_string);
+    let kind = enum_str(&req.kind);
+    let value = match (&req.task, &req.reason) {
+        (Some(task), Some(reason)) => format!("feedback {kind} to {task}: {reason}"),
+        (Some(task), None) => format!("feedback {kind} to {task}"),
+        (None, Some(reason)) => format!("feedback {kind}: {reason}"),
+        (None, None) => format!("feedback {kind}"),
+    };
+    let evidence = NewEvidence {
+        kind: EvidenceKind::Artifact,
+        value: cut(&value, 500),
+        exit_code: None,
+    };
+    // Evidence names an agent: the resolver, else the owner, else the reporter.
+    let credited = agent
+        .clone()
+        .or_else(|| task.owner.clone())
+        .unwrap_or_else(|| task.created_by.clone());
+    let now = cx.now_ms();
+    cx.db.execute(
+        "UPDATE feedback SET resolution = ?2, resolution_task = ?3, resolution_reason = ?4, \
+         resolved_at = ?5, resolved_by = ?6 WHERE task = ?1",
+        params![
+            id.as_str(),
+            kind,
+            req.task.as_ref().map(TaskId::as_str),
+            req.reason.as_deref().map(str::trim),
+            now,
+            by,
+        ],
+    )?;
+    cx.db.execute(
+        "INSERT INTO evidence (task, kind, value, exit_code, agent, at) \
+         VALUES (?1, 'artifact', ?2, NULL, ?3, ?4)",
+        params![id.as_str(), evidence.value, credited.as_str(), now],
+    )?;
+    cx.db.execute(
+        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, \
+         version = version + 1, updated_at = ?2 WHERE id = ?1",
+        params![id.as_str(), now],
+    )?;
+    let doing_since: Option<i64> = cx.db.query_row(
+        "SELECT doing_since FROM tasks WHERE id = ?1",
+        [id.as_str()],
+        |r| r.get(0),
+    )?;
+    cx.emit(
+        Some(&task.board),
+        &by,
+        EventType::TaskDone,
+        Some(id),
+        serde_json::json!({
+            "evidence": [evidence],
+            "doing_ms": doing_since.map(|d| now - d),
+            "resolution": { "kind": req.kind, "task": req.task, "reason": req.reason },
+        }),
+    )?;
+    get_task(cx, id)
+}
+
+// ---------------------------------------------------------------------------------------
+// Signals
+
+/// An error answer to an agent's request.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiErrorSeen {
+    pub agent: AgentId,
+    pub code: ErrorCode,
+    /// Method and route template, such as `POST /v1/tasks/{id}/claim`.
+    pub route: String,
+    pub message: String,
+}
+
+/// Records an error answered to an agent. Once its signature reaches the signal threshold
+/// it files feedback (source `signal`); later ones add to that item while it is live.
+pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<TaskId>> {
+    let code = enum_str(&e.code);
+    let template = cut(&normalize(&e.message, true), TEMPLATE_MAX);
+    let hash = crate::auth::hex(&Sha256::digest(format!("{} {template}", e.route)));
+    let signature = format!("signal:{code}:{}", &hash[..12]);
+    let now = cx.now_ms();
+    cx.db.execute(
+        "INSERT INTO api_errors (signature, agent, code, route, template, at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![signature, e.agent.as_str(), code, e.route, template, now],
+    )?;
+    let earlier = match prior(cx, &signature)? {
+        Prior::Live(item) => {
+            let summary = format!("{code} from {}", e.route);
+            add_report(cx, &item, &e.agent, "server", &summary)?;
+            return Ok(Some(item));
+        }
+        Prior::Gone(earlier) => Some(earlier),
+        Prior::None => None,
+    };
+    let from = now - cx.s.signal_window_ms();
+    let count: u32 = cx.db.query_row(
+        "SELECT COUNT(*) FROM api_errors WHERE signature = ?1 AND at >= ?2",
+        params![signature, from],
+        |r| r.get(0),
+    )?;
+    let agents: Vec<AgentId> = cx
+        .db
+        .prepare_cached(
+            "SELECT agent FROM api_errors WHERE signature = ?1 AND at >= ?2 \
+             GROUP BY agent ORDER BY MAX(id)",
+        )?
+        .query_map(params![signature, from], |r| {
+            parse_id(&r.get::<_, String>(0)?)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if count < cx.s.signal_min_reports || (agents.len() as u32) < cx.s.signal_min_agents {
+        return Ok(None);
+    }
+    let days = cx.s.signal_window_days;
+    let listed: Vec<&str> = agents.iter().map(AgentId::as_str).collect();
+    let title = cut(
+        &format!("{code} from {}: {template}", e.route),
+        cx.s.title_chars,
+    );
+    let body = format!(
+        "{title}\n\nThe server answered `{code}` to {count} requests from {} agents within \
+         {days} days.\n\nRoute: {}\nMessage (normalized): {template}\nAgents: {}",
+        agents.len(),
+        e.route,
+        listed.join(", "),
+    );
+    let report = Report {
+        about: "board".to_owned(),
+        title,
+        body: cut(&body, cx.s.body_chars),
+        activity: None,
+        source: FeedbackSource::Signal,
+        signature,
+        reporter: e.agent,
+    };
+    let excess = agents.len().saturating_sub(REPORTERS_MAX);
+    let reporters = agents[excess..].to_vec();
+    let task = file(cx, &report, "server", reporters, count, earlier)?;
+    Ok(Some(task.id))
+}
+
+/// Forgets error records older than the signal window. Run by the sweeper.
+pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
+    Ok(cx.db.execute(
+        "DELETE FROM api_errors WHERE at < ?1",
+        [cx.now_ms() - cx.s.signal_window_ms()],
+    )?)
+}
+
+/// Feedback counts since `from` (milliseconds).
+pub(crate) fn stats(cx: &Ctx<'_>, from: i64) -> Result<FeedbackStats> {
+    let count = |sql: &str| -> Result<u32> { Ok(cx.db.query_row(sql, [from], |r| r.get(0))?) };
+    let mut resolved = ResolvedCounts::default();
+    let rows: Vec<(String, u32)> = cx
+        .db
+        .prepare_cached(
+            "SELECT resolution, COUNT(*) FROM feedback WHERE resolution IS NOT NULL \
+             AND resolved_at >= ?1 GROUP BY resolution",
+        )?
+        .query_map([from], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (kind, n) in rows {
+        match parse_enum::<ResolutionKind>(&kind)? {
+            ResolutionKind::Routed => resolved.routed = n,
+            ResolutionKind::Duplicate => resolved.duplicate = n,
+            ResolutionKind::Forwarded => resolved.forwarded = n,
+            ResolutionKind::Declined => resolved.declined = n,
+        }
+    }
+    Ok(FeedbackStats {
+        reported: count("SELECT COUNT(*) FROM feedback_reports WHERE at >= ?1")?,
+        filed: count(
+            "SELECT COUNT(*) FROM feedback f JOIN tasks t ON t.id = f.task \
+             WHERE t.created_at >= ?1",
+        )?,
+        resolved,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizing_hides_ids_numbers_and_quotes() {
+        assert_eq!(
+            normalize(
+                "claim refused: t3:c2d0 owns factory-12 (seen 2m ago); limit \"x y\" is `z`",
+                true
+            ),
+            "claim refused: AGENT owns ID (seen Nm ago); limit \"…\" is \"…\""
+        );
+        assert_eq!(
+            normalize("Board-Feedback-3 failed: \"keep\"", false),
+            "ID failed: \"keep\""
+        );
+        assert_eq!(normalize(r#"bad "a \" b" end"#, true), r#"bad "…" end"#);
+        assert_eq!(
+            derived_signature("board", "Claims take 30s"),
+            "board:claims take Ns"
+        );
+    }
+}

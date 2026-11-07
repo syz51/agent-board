@@ -5,6 +5,7 @@ pub(crate) mod agents;
 pub(crate) mod asks;
 pub(crate) mod boards;
 pub(crate) mod devices;
+pub(crate) mod feedback;
 pub(crate) mod leases;
 pub(crate) mod stats;
 pub(crate) mod tasks;

@@ -34,6 +34,9 @@ struct DonePayload {
     evidence: Vec<NewEvidence>,
     /// Absent when the task never was in `doing`.
     doing_ms: Option<i64>,
+    /// Set when a feedback item was resolved: its evidence is the resolution.
+    #[serde(default)]
+    resolution: Option<serde::de::IgnoredAny>,
 }
 
 pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
@@ -62,7 +65,8 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
     let mut without_check = 0;
     for payload in done_payloads {
         let done: DonePayload = parse_json(&payload)?;
-        if !done.evidence.iter().any(|e| e.kind == EvidenceKind::Check) {
+        if done.resolution.is_none() && !done.evidence.iter().any(|e| e.kind == EvidenceKind::Check)
+        {
             without_check += 1;
         }
         if let Some(ms) = done.doing_ms {
@@ -99,6 +103,7 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
         ask_answer_minutes_median: median(answer_minutes),
         doing_minutes_median: median(doing_minutes),
         done_without_check_evidence: without_check,
+        feedback: crate::ops::feedback::stats(cx, from)?,
     })
 }
 

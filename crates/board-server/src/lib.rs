@@ -107,8 +107,8 @@ async fn shutdown_signal() {
     }
 }
 
-/// Every minute until shutdown: sweeps expired leases and announces passed `not_before`
-/// times in one transaction, then closes or deletes idle temporary boards, one transaction
+/// Every minute until shutdown: sweeps expired leases, prunes old API error records and
+/// announces passed `not_before` times in one transaction, then closes or deletes idle temporary boards, one transaction
 /// per board.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -120,6 +120,7 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                     let swept = state
                         .write(|cx| {
                             ops::leases::sweep_expired(cx)?;
+                            ops::feedback::prune_signals(cx)?;
                             ops::tasks::announce_not_before(cx)
                         })
                         .await;

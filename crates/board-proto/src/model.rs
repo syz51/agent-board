@@ -116,6 +116,88 @@ pub struct Task {
     pub version: i64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// Set on a feedback item (`POST /v1/feedback`); absent on every other task, and from
+    /// servers that predate feedback items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<Feedback>,
+}
+
+/// What the reporter was doing when a setup cost it a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackActivity {
+    Explore,
+    Research,
+    Design,
+    Plan,
+    Build,
+    Review,
+    Operate,
+    Other,
+}
+
+/// Where a feedback report came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackSource {
+    /// An agent reported it (the `feedback` tool or `board feedback`).
+    #[default]
+    Agent,
+    /// A capture job found it in transcripts.
+    Capture,
+    /// The server filed it from repeated API errors; clients cannot send it.
+    Signal,
+}
+
+/// How a feedback item was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionKind {
+    /// A task now does the work (`task`).
+    Routed,
+    /// The same as an earlier item (`task`), which gets later reports.
+    Duplicate,
+    /// Handed on outside the board (`reason` says where).
+    Forwarded,
+    /// Not acted on (`reason` says why); later reports still add to it.
+    Declined,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackResolution {
+    pub kind: ResolutionKind,
+    /// The routed task, or the original of a duplicate; may be on another board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// Required for `forwarded` and `declined`; untrusted for readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub at: Timestamp,
+    /// The resolving agent id, or `user`.
+    pub by: String,
+}
+
+/// A feedback item's report counts and resolution (`docs/API.md`, "Feedback").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Feedback {
+    /// The setup it is about: a slug such as `board`, `skills:rust` or `other`.
+    pub about: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<FeedbackActivity>,
+    pub source: FeedbackSource,
+    /// Reports with the same signature add to this item while it is live.
+    pub signature: String,
+    /// Reports received, the first included.
+    pub reports: u32,
+    /// Agents that reported it, oldest first; at most the 20 most recent.
+    pub reporters: Vec<AgentId>,
+    pub last_reported_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<FeedbackResolution>,
+    /// The earlier item with this signature, which was no longer live when this one was
+    /// filed (its routed task was done, for example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurs: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,7 +284,8 @@ pub enum NoteKind {
     Note,
     Finding,
     Decision,
-    /// Feedback about the board itself, its rules or defaults, for the review loop.
+    /// Feedback about the board itself. Still accepted; agents report through
+    /// `POST /v1/feedback` instead, which files a feedback item.
     Feedback,
 }
 

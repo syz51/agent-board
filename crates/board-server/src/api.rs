@@ -2,18 +2,20 @@
 //! Rules live in `ops`; handlers check who may act, validate input, then run one
 //! transaction.
 
-use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use board_proto::{
-    AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, Ask, AskStatus, Board,
-    BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice, CreateLeases, CreateTask,
-    DeviceInfo, DeviceName, DeviceToken, DoneTask, ErrorCode, Handoff, LeaseResult, Note,
-    PutHandoff, RegisterAgent, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction,
-    TaskDetail, TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
+    AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
+    AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
+    CreateFeedback, CreateLeases, CreateTask, DeviceInfo, DeviceName, DeviceToken, DoneTask,
+    ErrorCode, FeedbackResult, Handoff, LeaseResult, Note, PutHandoff, RegisterAgent,
+    ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
+    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -21,7 +23,7 @@ use serde::de::DeserializeOwned;
 use crate::auth::Caller;
 use crate::error::{Error, Result, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
-use crate::ops::{agents, asks, boards, devices, leases, stats, tasks};
+use crate::ops::{agents, asks, boards, devices, feedback, leases, stats, tasks};
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
 use crate::{events, snapshot, web};
@@ -83,6 +85,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/leases", post(create_leases))
         .route("/leases/{id}", delete(release_lease))
         .route("/touches", post(touches))
+        .route("/feedback", post(create_feedback))
+        .route("/feedback/{id}/resolve", post(resolve_feedback))
         .route("/asks", get(list_asks).post(create_ask))
         .route("/asks/{id}", get(show_ask))
         .route("/asks/{id}/answer", post(answer_ask))
@@ -91,7 +95,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/events", get(show_events))
         .route("/admin/devices", get(list_devices).post(create_device))
         .route("/admin/devices/{name}", delete(revoke_device))
-        .fallback(unknown_api);
+        .fallback(unknown_api)
+        .layer(middleware::from_fn_with_state(state.clone(), record_errors));
     Router::new()
         .route("/healthz", get(health))
         .nest(board_proto::API_PREFIX, v1)
@@ -104,6 +109,43 @@ async fn unknown_api() -> Error {
         "no such endpoint",
         "check the method and path against docs/API.md",
     )
+}
+
+/// Records every error answered to an agent's request (one that sends `X-Board-Agent`),
+/// except version conflicts, for the feedback signals (`ops::feedback::record_error`).
+/// Recording never changes the answer; a failure to record is logged.
+async fn record_errors(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let agent = req
+        .headers()
+        .get(AGENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<AgentId>().ok());
+    let route = format!(
+        "{} {}",
+        req.method(),
+        req.extensions()
+            .get::<MatchedPath>()
+            .map_or("(no route)", MatchedPath::as_str)
+    );
+    let response = next.run(req).await;
+    if let Some(agent) = agent
+        && let Some(error) = response.extensions().get::<ApiError>()
+        && error.code != ErrorCode::VersionConflict
+    {
+        let seen = feedback::ApiErrorSeen {
+            agent,
+            code: error.code,
+            route,
+            message: error.message.clone(),
+        };
+        if let Err(error) = state
+            .write(move |cx| feedback::record_error(cx, seen))
+            .await
+        {
+            tracing::warn!(%error, "recording an API error for the feedback signals failed");
+        }
+    }
+    response
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
@@ -524,6 +566,42 @@ async fn touches(
     caller.act_as(&req.agent)?;
     let req = leases::validate_touches(req)?;
     Ok(Json(state.write(move |cx| leases::touch(cx, req)).await?))
+}
+
+// ---------------------------------------------------------------------------------------
+// Feedback
+
+async fn create_feedback(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<CreateFeedback>,
+) -> Result<Json<FeedbackResult>> {
+    let reporter = caller.agent()?.clone();
+    let report = feedback::validate_create(req, state.settings(), reporter)?;
+    Ok(Json(
+        state.write(move |cx| feedback::report(cx, report)).await?,
+    ))
+}
+
+async fn resolve_feedback(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<ResolveFeedback>,
+) -> Result<Json<Task>> {
+    let id = parse_task_id(&id)?;
+    let by_user = caller.is_user();
+    let agent = if by_user {
+        caller.agent.clone()
+    } else {
+        Some(caller.agent()?.clone())
+    };
+    feedback::validate_resolve(&req, state.settings())?;
+    Ok(Json(
+        state
+            .write(move |cx| feedback::resolve(cx, &id, req, agent, by_user))
+            .await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
