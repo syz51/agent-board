@@ -253,7 +253,7 @@ export function TaskRow(
         )}
         {task.blocked_reason && (
           <p class="blocked-reason">
-            <PlainText text={task.blocked_reason} />
+            <span class="blocked-label">Blocked:</span> <PlainText text={task.blocked_reason} />
           </p>
         )}
       </div>

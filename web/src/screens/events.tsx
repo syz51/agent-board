@@ -165,11 +165,12 @@ export function EventLine(
     : ROUTINE.has(event.type)
     ? "routine"
     : "normal";
-  // Events that went wrong share one glyph, so failure reads apart from routine work.
+  // Events that went wrong get the glyph of what went wrong: the blocked mark, or a cross
+  // for a failed check, so failure reads apart from routine work and the two apart.
   const icon: IconName = event.type === "ask_created"
     ? askKind === "action" ? "hand" : "question"
     : weight === "notable"
-    ? "alert"
+    ? event.type === "evidence_added" ? "cross" : "minus"
     : KIND_ICON[kind] ?? "events";
   return (
     <li class={`event event-${weight}`} data-kind={kind}>

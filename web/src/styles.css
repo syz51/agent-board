@@ -1641,14 +1641,21 @@ input[type="radio"] {
   margin-bottom: 32px;
 }
 
+/* Kind and origin stacked on the left, so the question gets the row's full width. */
 .ask-preview .row-link {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) auto;
+  grid-template-columns: 132px minmax(0, 1fr);
   align-items: center;
-  gap: 14px;
-  min-height: 44px;
+  gap: 16px;
+  min-height: 52px;
   padding: 8px 16px;
   color: var(--text);
+}
+
+.ask-preview-side {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
 }
 
 .ask-preview .row-link:hover {
@@ -1664,9 +1671,11 @@ input[type="radio"] {
 }
 
 .ask-preview-meta {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--muted);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .kind {
@@ -1755,7 +1764,7 @@ input[type="radio"] {
 }
 
 .task-id {
-  color: var(--muted);
+  color: var(--text-2);
   font-size: var(--fs-xs);
 }
 
@@ -1807,6 +1816,10 @@ input[type="radio"] {
   flex-basis: 100%;
   color: var(--blocked);
   font-size: var(--fs-sm);
+}
+
+.blocked-label {
+  font-weight: 600;
 }
 
 .prio-compact {
@@ -1929,6 +1942,13 @@ input[type="radio"] {
   .ask-preview .row-link {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
+  }
+
+  .ask-preview-side {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
   }
 
   .ask-preview-text {
@@ -2945,7 +2965,7 @@ input[type="radio"] {
 }
 
 .event-notable .event-node .icon {
-  stroke-width: 2.25;
+  stroke-width: 2;
 }
 
 .event-notable .event-node {

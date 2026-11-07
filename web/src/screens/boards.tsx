@@ -51,14 +51,16 @@ export function BoardsScreen() {
             {newestFirst(openAsks).slice(0, 4).map((ask) => (
               <li key={ask.id}>
                 <a class="row-link" href={`/asks/${ask.id}`}>
-                  <span class={`kind kind-${ask.kind}`}>
-                    <Icon name={ask.kind === "action" ? "hand" : "question"} />
-                    {ask.kind === "action" ? "Action" : "Decision"}
+                  <span class="ask-preview-side">
+                    <span class={`kind kind-${ask.kind}`}>
+                      <Icon name={ask.kind === "action" ? "hand" : "question"} />
+                      {ask.kind === "action" ? "Action" : "Decision"}
+                    </span>
+                    <span class="ask-preview-meta">
+                      {ask.board} · <RelTime at={ask.created_at} />
+                    </span>
                   </span>
-                  <span class="ask-preview-text">{plainLine(ask.question)}</span>
-                  <span class="ask-preview-meta">
-                    {ask.board} · <RelTime at={ask.created_at} />
-                  </span>
+                  <span class="ask-preview-text" title={plainLine(ask.question)}>{plainLine(ask.question)}</span>
                 </a>
               </li>
             ))}
