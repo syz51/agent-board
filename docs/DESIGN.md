@@ -144,8 +144,16 @@ host.
   identified by the `Tailscale-User-Login` header that `tailscale serve` adds.
 - Writes fail fast when the server is unreachable: an exclusive claim needs one arbiter.
   Hooks then inject the cached snapshot marked with its age and never delay the agent by more
-  than 1.5 seconds; after one hook finds the server unreachable, the device's hooks use the
-  cache without trying the server for a minute.
+  than 1.5 seconds. A failed connection (refused, DNS, TLS) says the server is unreachable
+  and claims and updates fail, and the device's hooks use the cache without trying the
+  server for a minute. A reply that misses the budget says the server is slow and that
+  board tools and the CLI, which wait longer, still work; the next hook tries again, and
+  only three slow replies in a row make the device's hooks skip the server, for ten
+  seconds. A connection not open (TLS included) within half a second counts as
+  unreachable. Any answer resets both.
+  The server's deadline is set after the hook's local steps (Keychain, process table, T3,
+  git), and a failure changes nothing when those steps left the server under half a
+  second.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
@@ -186,12 +194,12 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
-| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
+| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
