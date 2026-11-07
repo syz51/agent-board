@@ -44,6 +44,10 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
   choice, a login, a payment, a key. Give options, recommended first. Then set the task
   `blocked` with the reason and continue with other ready work. Do not ask again while an
   ask on the task is open; withdraw an ask you no longer need (`ask_withdraw`).
+- Open each ask, and the body of each task you set non-auto or blocked on the user, with a
+  brief in plain, short sentences: what it is, in one sentence; why it waits on the user;
+  the options, each with its consequence; your recommendation. Agent detail goes below the
+  brief.
 - Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal: the
   user sees only what an ask tells them. A task blocked on the user gets an ask; never set a
   task `blocked` on the user without one. When `ask_user` warns of another open ask that
