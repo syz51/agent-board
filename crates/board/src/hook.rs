@@ -255,6 +255,10 @@ async fn handle(
         if let Err(err) = state::prune_done(&home, DONE_MARK_AGE) {
             tracing::debug!("pruning done marks: {err:#}");
         }
+        // Hook state and cached snapshots of agents gone for a week.
+        if let Err(err) = state::prune_agents(&home, AGENT_FILE_AGE) {
+            tracing::debug!("pruning agent files: {err:#}");
+        }
     }
     let config = Config::load(&home)?;
     let Ok((server, device)) = config.require_login() else {
@@ -513,6 +517,8 @@ impl Breaker {
 const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// How long the start mark of a shell call that never reached PostToolUse is kept.
 const TOOL_START_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How long an agent's hook state and cached snapshot outlive its last write.
+const AGENT_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// How long a done mark no `Stop` hook read (an interrupted turn, an ended session) is kept.
 const DONE_MARK_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 

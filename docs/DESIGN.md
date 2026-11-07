@@ -190,7 +190,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |

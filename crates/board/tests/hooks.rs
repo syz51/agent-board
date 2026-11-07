@@ -681,6 +681,51 @@ fn session_start_prunes_old_shell_marks_outside_t3_and_without_login() {
 }
 
 #[test]
+fn session_start_prunes_agent_files_untouched_for_a_week() {
+    let (e, start) = cached_env();
+    let backdate = |path: &std::path::Path, days: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600))
+            .unwrap();
+    };
+    let gone = ["t3_3agone.json", "codex_3agone.json"];
+    let recent = "claude_3arecent.json";
+    for dir in ["state", "cache"] {
+        for name in gone.iter().chain([&recent]) {
+            std::fs::write(e.home.join(dir).join(name), "{}").unwrap();
+        }
+        for name in gone {
+            backdate(&e.home.join(dir).join(name), 8);
+        }
+        backdate(&e.home.join(dir).join(recent), 6);
+    }
+    // Named state files are not an agent's, however old.
+    std::fs::write(e.home.join("state/watch.json"), "{}").unwrap();
+    backdate(&e.home.join("state/watch.json"), 30);
+
+    let (reply, _) = e.hook("session-start", "claude", start);
+    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    for dir in ["state", "cache"] {
+        let mut left: Vec<String> = std::fs::read_dir(e.home.join(dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        left.sort();
+        // This agent's own files, written by the SessionStart that pruned.
+        let mut want = vec![recent.to_owned(), format!("claude_3a{SESSION}.json")];
+        if dir == "state" {
+            want.push("watch.json".into());
+        }
+        want.sort();
+        assert_eq!(left, want, "{dir}");
+    }
+}
+
+#[test]
 fn shell_calls_leave_no_mark_without_login_token_or_agent() {
     let e = env();
     let marks = e.home.join("state/tool-starts");

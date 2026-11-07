@@ -191,6 +191,33 @@ pub fn prune_tool_starts(home: &Home, age: std::time::Duration) -> Result<()> {
     prune_dir(&home.state_dir().join("tool-starts"), age)
 }
 
+/// The file stems of agent ids begin with their source and an encoded `:` ([`file_stem`]);
+/// the named state files (the daemon's, the hooks' breaker) never do.
+const AGENT_STEMS: [&str; 3] = ["t3_3a", "claude_3a", "codex_3a"];
+
+/// Removes the hook state (`state/<agent>.json`) and cached snapshots (`cache/<agent>.json`)
+/// not written for `age`: agents whose sessions ended long ago. An agent that comes back
+/// starts fresh, with a full snapshot. Named state files are left alone.
+pub fn prune_agents(home: &Home, age: std::time::Duration) -> Result<()> {
+    for dir in [home.state_dir(), home.cache_dir()] {
+        let Some(entries) = read_dir_if_exists(&dir)? else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            // Not `write_atomic`'s temporary files, which end in `.tmp<n>`.
+            let agent = name.to_str().is_some_and(|name| {
+                name.ends_with(".json") && AGENT_STEMS.iter().any(|s| name.starts_with(s))
+            });
+            if agent && entry.file_type()?.is_file() && older_than(&entry.path(), age)? {
+                remove_if_exists(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Removes the files in `dir` not written for `age`; a missing `dir` is fine.
 fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
     let Some(entries) = read_dir_if_exists(dir)? else {
@@ -429,6 +456,57 @@ mod tests {
         prune_done(&home, std::time::Duration::from_secs(60)).unwrap();
         assert!(!done_dir(&home, &peer).exists());
         assert!(!done_dir(&home, &me).exists());
+    }
+
+    #[test]
+    fn agent_files_are_pruned_and_named_files_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let age = std::time::Duration::from_secs(60);
+        // Nothing to prune before the first hook.
+        prune_agents(&home, age).unwrap();
+
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "kind": "full", "seq": 3, "at": chrono::Utc::now(), "text": "x"
+        }))
+        .unwrap();
+        let ids = ["t3:old", "claude:old", "codex:old", "t3:new"].map(|id| id.parse().unwrap());
+        for agent in &ids {
+            save_agent(&home, agent, &AgentLocal::default()).unwrap();
+            save_cached_snapshot(&home, agent, &snap).unwrap();
+        }
+        save_named(&home, "watch", &1).unwrap();
+        save_named(&home, "offline", &1).unwrap();
+        let tmp = home.state_dir().join("t3_3aold.json.tmp42");
+        std::fs::write(&tmp, "{").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let backdate = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        for agent in &ids[..3] {
+            backdate(&agent_state_path(&home, agent));
+            backdate(&cache_path(&home, agent));
+        }
+        for name in ["watch", "offline"] {
+            backdate(&home.state_dir().join(format!("{name}.json")));
+        }
+        backdate(&tmp);
+
+        prune_agents(&home, age).unwrap();
+        for agent in &ids[..3] {
+            assert!(!agent_state_path(&home, agent).exists(), "{agent}");
+            assert!(!cache_path(&home, agent).exists(), "{agent}");
+        }
+        assert!(agent_state_path(&home, &ids[3]).exists());
+        assert!(load_cached_snapshot(&home, &ids[3]).is_some());
+        assert!(home.state_dir().join("watch.json").exists());
+        assert!(home.state_dir().join("offline.json").exists());
+        assert!(tmp.exists(), "a write in progress is left alone");
     }
 
     #[test]
