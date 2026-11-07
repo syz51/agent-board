@@ -387,7 +387,7 @@ registers without a repo).
 - **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
   public endpoint is needed; answers are accepted only from that chat. The same channel
-  reports a coordinator that is stuck or paused. The chat is `[telegram] chat_id` when set;
+  reports a coordinator paused on a usage limit. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
@@ -397,6 +397,28 @@ registers without a repo).
   sent by both paths. An answer the server cannot record (say the database is busy) is
   acknowledged as not recorded, and the ask stays open to answer again. When the agent
   withdraws an ask, its message is edited to say so and its buttons are removed.
+- **Scheduled alerts** (same chat, checked every minute, times from the server clock):
+  - *Stuck task*: a task in `doing` or `review` on a board that is not closed, whose
+    newest event not by the server is older than `[telegram] stuck_after_secs` (default
+    4 hours), is reported once, with its owner, how long it has been quiet, its last event
+    and a link. The tasks found at one check share one message; those past its length
+    (3,500 characters) go in the next check's message. A task is reported again only
+    after a new event and another quiet period. Tasks of a coordinator paused on a usage
+    limit wait until the reset (or, without an end time, until it resumes), since that
+    pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
+    blocked tasks are never reported, and finishing a task sends nothing.
+  - *Daily digest*: once per local day, at the first check past `digest_at` (default
+    09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
+    after local midnight, one message lists the Needs you items by board,
+    by the web view's rule: open asks, and tasks without an open ask, on boards that are
+    not closed, that are blocked or that are open, not auto, not a proposal, not a
+    feedback item and past any `not_before`. It adds how many tasks were done since the
+    user last marked updates seen. Nothing is sent when every list is empty.
+  - The sent state is stored (`telegram_stuck`, `telegram_digest`) after each send, so a
+    restart repeats neither, and an alert that cannot be sent, or is cut off by shutdown,
+    is tried again at the next check; a crash between a send and its record repeats that
+    alert once. Nothing is recorded while no chat is paired, and pairing a new chat
+    forgets what was sent to the old one. With both alerts off, nothing is checked.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

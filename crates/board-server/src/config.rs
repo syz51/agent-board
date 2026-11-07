@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use board_proto::BoardSlug;
-use serde::{Deserialize, Serialize};
+use chrono::{FixedOffset, NaiveTime};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Error;
 
@@ -20,6 +21,9 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 ///
 /// [telegram]
 /// chat_id = 123456789          # optional; else paired with `board admin telegram-pair`
+/// stuck_after_secs = 14400      # 0 turns the stuck-task alert off
+/// digest_at = "09:00"           # daily Needs you digest, local time; "off" turns it off
+/// utc_offset = "+00:00"         # the local time's offset from UTC
 ///
 /// [defaults]
 /// owner_stale_after_secs = 86400
@@ -149,6 +153,52 @@ pub struct TelegramConfig {
     /// Bot API base URL; tests point it at a local fake.
     #[serde(default = "default_telegram_api")]
     pub api_base: String,
+    /// A task in doing or review with no event from an agent or the user for this long is
+    /// reported once as stuck, and again only after it changes and goes quiet again. 0
+    /// turns the alert off. Default 4 hours.
+    #[serde(default = "default_stuck_after")]
+    pub stuck_after_secs: u64,
+    /// Local time of the daily Needs you digest (`HH:MM`, at `utc_offset`); `None`
+    /// (`"off"` in the file) sends none. Default 09:00.
+    #[serde(default = "default_digest_at", deserialize_with = "digest_time")]
+    pub digest_at: Option<NaiveTime>,
+    /// Offset of `digest_at` from UTC, such as `+08:00`; fixed, so daylight saving time
+    /// moves the digest by an hour. Default `+00:00`.
+    #[serde(default = "utc", deserialize_with = "utc_offset")]
+    pub utc_offset: FixedOffset,
+}
+
+fn default_stuck_after() -> u64 {
+    4 * 3600
+}
+
+fn default_digest_at() -> Option<NaiveTime> {
+    NaiveTime::from_hms_opt(9, 0, 0)
+}
+
+fn utc() -> FixedOffset {
+    FixedOffset::east_opt(0).expect("zero is a valid offset")
+}
+
+fn digest_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveTime>, D::Error> {
+    let text = String::deserialize(d)?;
+    if text == "off" {
+        return Ok(None);
+    }
+    NaiveTime::parse_from_str(&text, "%H:%M")
+        .map(Some)
+        .map_err(|_| {
+            serde::de::Error::custom(format!("digest_at: `{text}` is not HH:MM or \"off\""))
+        })
+}
+
+fn utc_offset<'de, D: Deserializer<'de>>(d: D) -> Result<FixedOffset, D::Error> {
+    let text = String::deserialize(d)?;
+    text.parse().map_err(|_| {
+        serde::de::Error::custom(format!(
+            "utc_offset: `{text}` is not an offset such as \"+08:00\""
+        ))
+    })
 }
 
 fn default_telegram_api() -> String {
@@ -162,6 +212,9 @@ impl Default for TelegramConfig {
             bot_token: None,
             chat_id: None,
             api_base: default_telegram_api(),
+            stuck_after_secs: default_stuck_after(),
+            digest_at: default_digest_at(),
+            utc_offset: utc(),
         }
     }
 }
@@ -190,6 +243,9 @@ impl fmt::Debug for TelegramConfig {
             .field("bot_token", &self.bot_token.as_ref().map(|_| "<redacted>"))
             .field("chat_id", &self.chat_id)
             .field("api_base", &self.api_base)
+            .field("stuck_after_secs", &self.stuck_after_secs)
+            .field("digest_at", &self.digest_at)
+            .field("utc_offset", &self.utc_offset)
             .finish()
     }
 }
@@ -403,12 +459,42 @@ mod tests {
         );
         assert_eq!(full.telegram.as_ref().unwrap().chat_id, Some(-100));
         let paired = ServerConfig::from_toml("db = \"b\"\n[telegram]\n").unwrap();
-        assert_eq!(paired.telegram.unwrap().chat_id, None);
+        let paired = paired.telegram.unwrap();
+        assert_eq!(paired.chat_id, None);
+        assert_eq!(paired.stuck_after_secs, 4 * 3600);
+        assert_eq!(paired.digest_at, NaiveTime::from_hms_opt(9, 0, 0));
+        assert_eq!(paired.utc_offset, FixedOffset::east_opt(0).unwrap());
+        let alerts = ServerConfig::from_toml(
+            "db = \"b\"\n[telegram]\nstuck_after_secs = 0\ndigest_at = \"off\"\nutc_offset = \"+08:00\"",
+        )
+        .unwrap()
+        .telegram
+        .unwrap();
+        assert_eq!(
+            (alerts.stuck_after_secs, alerts.digest_at, alerts.utc_offset),
+            (0, None, FixedOffset::east_opt(8 * 3600).unwrap())
+        );
+        let at = ServerConfig::from_toml("db = \"b\"\n[telegram]\ndigest_at = \"18:30\"").unwrap();
+        assert_eq!(
+            at.telegram.unwrap().digest_at,
+            NaiveTime::from_hms_opt(18, 30, 0)
+        );
         assert!(!format!("{full:?}").contains("secret-token"));
     }
 
     #[test]
     fn rejects_unknown_and_bad_values() {
+        for bad in [
+            "digest_at = \"9am\"",
+            "digest_at = \"25:00\"",
+            "utc_offset = \"Europe/London\"",
+            "stuck_after_secs = -1",
+        ] {
+            assert!(
+                ServerConfig::from_toml(&format!("db = \"b\"\n[telegram]\n{bad}")).is_err(),
+                "{bad}"
+            );
+        }
         assert!(ServerConfig::from_toml("db = \"b\"\nlisten_addr = \"x\"").is_err());
         assert!(
             ServerConfig::from_toml("db = \"b\"\n[defaults]\nmax_doing_per_agent = 0").is_err()
