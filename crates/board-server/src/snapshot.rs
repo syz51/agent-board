@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{delegated_between, glob_matches, globs_overlap};
+use crate::ops::leases::{delegation_family, glob_matches, globs_overlap};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
     agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events, load_agents,
@@ -711,7 +711,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
 
     let mut handles = HashMap::new();
     let mut live = HashMap::<String, bool>::new();
-    let mut delegated = HashMap::<String, bool>::new();
+    let family = delegation_family(cx, me)?;
     // Keyed so a repeated event yields one alert (the latest).
     let mut out: BTreeMap<(u8, String), Alert> = BTreeMap::new();
     let mut changed: BTreeMap<(String, String), (i64, BTreeSet<String>)> = BTreeMap::new();
@@ -736,18 +736,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
         if matches!(
             event.event_type,
             EventType::AgentRegistered | EventType::FilesTouched | EventType::LeaseCreated
-        ) {
-            let related = match delegated.get(&event.actor) {
-                Some(r) => *r,
-                None => {
-                    let r = delegated_between(cx, me, &event.actor)?;
-                    delegated.insert(event.actor.clone(), r);
-                    r
-                }
-            };
-            if related {
-                continue;
-            }
+        ) && family.contains(&event.actor)
+        {
+            continue;
         }
         match event.event_type {
             EventType::TaskDone => {

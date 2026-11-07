@@ -81,11 +81,14 @@ pub fn save_cached_snapshot(home: &Home, agent: &AgentId, snapshot: &Snapshot) -
 }
 
 /// What the hooks decided once per runtime session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLocal {
     /// The session runs inside another agent session, so it does not take the T3 thread
     /// id it inherited (`identity::is_nested`).
     pub nested: bool,
+    /// The T3 thread that delegated this session's thread, once T3 named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_parent: Option<String>,
 }
 
 fn runtime_name(runtime: Runtime) -> &'static str {
@@ -272,9 +275,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().to_path_buf());
         assert_eq!(load_session(&home, Runtime::Claude, "s/1"), None);
-        let nested = SessionLocal { nested: true };
+        let nested = SessionLocal {
+            nested: true,
+            t3_parent: Some("parent-1".into()),
+        };
         save_session(&home, Runtime::Claude, "s/1", &nested).unwrap();
-        assert_eq!(load_session(&home, Runtime::Claude, "s/1"), Some(nested));
+        assert_eq!(
+            load_session(&home, Runtime::Claude, "s/1"),
+            Some(nested.clone())
+        );
         assert_eq!(load_session(&home, Runtime::Codex, "s/1"), None);
         remove_session(&home, Runtime::Claude, "s/1").unwrap();
         remove_session(&home, Runtime::Claude, "s/1").unwrap();

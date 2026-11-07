@@ -361,10 +361,11 @@ async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
     const PARENT: &str = "t3:b8745db9-8b9a-4047-8e1d-15b7ac1b2f40";
     const CHILD: &str = "t3:thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
     const SIBLING: &str = "t3:thread:delegated-task:command%3Amcp%3Ac2%3Adelegate-task%3At2";
+    const GRANDCHILD: &str = "t3:thread:delegated-task:command%3Amcp%3Ac3%3Adelegate-task%3At3";
     let t = T::new();
     t.board("factory", &[REPO]).await;
     t.register(PARENT, Some(REPO), Some("main")).await;
-    for child in [CHILD, SIBLING] {
+    for (child, parent) in [(CHILD, PARENT), (SIBLING, PARENT), (GRANDCHILD, CHILD)] {
         t.ok(
             "POST",
             "/v1/agents",
@@ -372,7 +373,7 @@ async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
             Some(json!({
                 "id": child, "runtime": "claude", "device": "mac", "repo": REPO,
                 "branch": "main",
-                "native_ids": {"t3_thread": &child[3..], "t3_parent": &PARENT[3..]},
+                "native_ids": {"t3_thread": &child[3..], "t3_parent": &parent[3..]},
             })),
         )
         .await;
@@ -400,9 +401,24 @@ async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
     let parent_alerts = alerts(&t, PARENT).await;
     assert!(!parent_alerts.contains("! "), "{parent_alerts}");
 
-    // Two children of one parent are peers: their overlaps are real.
+    // The child's own child is family to both, all the way up.
+    alerts(&t, GRANDCHILD).await;
+    assert_eq!(
+        touch(&t, GRANDCHILD, &["src/lib.rs"]).await["overlaps"],
+        json!([])
+    );
+    assert_eq!(
+        lease(&t, GRANDCHILD, &["src/lib.rs"]).await["conflicts"],
+        json!([])
+    );
+    for agent in [PARENT, CHILD, GRANDCHILD] {
+        let text = alerts(&t, agent).await;
+        assert!(!text.contains("! "), "{agent}: {text}");
+    }
+
+    // Two children of one parent are peers: their overlaps are real, down their lines.
     let overlaps = touch(&t, SIBLING, &["src/lib.rs"]).await["overlaps"].clone();
-    assert_eq!(agents_in(&overlaps), [CHILD], "{overlaps}");
+    assert_eq!(agents_in(&overlaps), [CHILD, GRANDCHILD], "{overlaps}");
     let child_alerts = alerts(&t, CHILD).await;
     assert!(child_alerts.contains("edited src/lib.rs"), "{child_alerts}");
     // And any other thread is a peer of the parent.
@@ -410,7 +426,11 @@ async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
     assert!(!parent_alerts.contains("! "), "{parent_alerts}");
     t.register(B, Some(REPO), Some("main")).await;
     let overlaps = touch(&t, B, &["src/lib.rs"]).await["overlaps"].clone();
-    assert_eq!(agents_in(&overlaps), [PARENT, CHILD, SIBLING], "{overlaps}");
+    assert_eq!(
+        agents_in(&overlaps),
+        [PARENT, CHILD, SIBLING, GRANDCHILD],
+        "{overlaps}"
+    );
     let parent_alerts = alerts(&t, PARENT).await;
     assert!(
         parent_alerts.contains("edited src/lib.rs"),

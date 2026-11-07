@@ -776,8 +776,12 @@ fn shell_calls_leave_out_the_files_git_brought_in() {
     );
     std::fs::remove_file(e.repo.join("src/mine.rs")).unwrap();
 
-    // A conflicted merge stages what it brings in without moving HEAD.
-    commit_files(&e.repo, &[("src/a.rs", "a-mine\n")]);
+    // A conflicted merge stages what it brings in without moving HEAD. This branch changed
+    // b.rs too, so b.rs differs from the merged branch, but the merge did not write it.
+    commit_files(
+        &e.repo,
+        &[("src/a.rs", "a-mine\n"), ("src/b.rs", "b-mine\n")],
+    );
     let paths = shell_call(&e, "toolu_merge", || {
         let merge = git(&e.repo, &["merge", "--no-edit", "other"]);
         assert!(!merge.status.success(), "the merge stops on a conflict");
@@ -816,6 +820,21 @@ fn shell_calls_leave_out_the_files_git_brought_in() {
     let status = String::from_utf8(git(&e.repo, &["status", "--porcelain"]).stdout).unwrap();
     assert!(status.contains("src/a.rs"), "{status}");
     assert_eq!(paths, None, "nothing of the call's own");
+
+    // HEAD moved by the call's own commits: what it committed and then edited counts.
+    assert!(git(&e.repo, &["rebase", "--abort"]).status.success());
+    let paths = shell_call(&e, "toolu_commit", || {
+        std::fs::write(e.repo.join("src/b.rs"), "b-committed\n").unwrap();
+        assert!(git(&e.repo, &["commit", "-qam", "mine"]).status.success());
+        std::fs::write(e.repo.join("src/b.rs"), "b-amended\n").unwrap();
+        assert!(
+            git(&e.repo, &["commit", "-qa", "--amend", "--no-edit"])
+                .status
+                .success()
+        );
+        std::fs::write(e.repo.join("src/b.rs"), "b-after\n").unwrap();
+    });
+    assert_eq!(paths, Some(json!(["src/b.rs"])));
 }
 
 /// A task in doing, a delta snapshot and a handoff written an hour ago, with the agent's
@@ -1171,7 +1190,13 @@ fn a_delegated_t3_thread_registers_its_parent() {
     .unwrap();
     std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
     let t3 = t3.to_str().unwrap();
-    for (thread, parent) in [(CHILD, Some("parent-1")), ("thread-7", None)] {
+    // The child starts twice (a resume): the second start reuses the parent it found.
+    let starts = [
+        (CHILD, Some("parent-1")),
+        (CHILD, Some("parent-1")),
+        ("thread-7", None),
+    ];
+    for (thread, parent) in starts {
         let agent = format!("t3:{thread}");
         e.stub.on(
             "POST /v1/agents",
@@ -1196,7 +1221,7 @@ fn a_delegated_t3_thread_registers_its_parent() {
             "{thread}"
         );
     }
-    // Only the delegated thread asked T3, once.
+    // Only the delegated thread asked T3, and only once.
     let calls = std::fs::read_to_string(&log).unwrap();
     assert_eq!(calls, format!("thread show --json --messages 0 {CHILD}\n"));
 }
