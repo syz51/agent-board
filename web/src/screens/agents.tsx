@@ -170,7 +170,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         <p className="font-medium">
           {task ? (
             <Link
-              className="inline-flex flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
+              className="inline-flex min-h-6 flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
               to="/tasks/$id"
               params={{ id: task.id }}
             >
