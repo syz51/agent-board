@@ -10,7 +10,9 @@
 //!   of the waiting task's board, which may differ from the blocker's), the owner of a
 //!   blocked task when its last blocker is done, and the asker (worker or coordinator) when
 //!   its ask is answered, or the coordinator when the asker cannot be woken;
-//! - never wakes a paused agent before its `paused_until`.
+//! - never wakes a paused agent before its `paused_until`;
+//! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
+//!   session left idle, which marks its agent ended, and a message resumes the thread.
 //!
 //! Wake-ups are queued as what they are about (a task, an ask), not as text. Each flush
 //! checks them again before sending: a task no longer ready and auto drops its line. Lines
@@ -172,7 +174,7 @@ pub struct Wake {
     pub board: BoardSlug,
     pub about: WakeAbout,
     pub queued_at: Timestamp,
-    /// An answer whose asker is paused, already passed on to the coordinator.
+    /// An answer whose asker cannot be woken now, already passed on to the coordinator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarded: bool,
 }
@@ -246,6 +248,33 @@ struct Seen {
     since: Timestamp,
     /// The agent stopped running since it was first read: its held wake-ups are due.
     idled: bool,
+    /// For an ended agent: what T3 said of its thread, asked once per state change.
+    thread: ThreadCheck,
+}
+
+/// What T3 said of an ended agent's thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadCheck {
+    /// Not asked since the agent's state last changed.
+    NotAsked,
+    /// T3 has the thread and has not archived it.
+    Live,
+    /// T3 no longer has the thread, or archived it.
+    Gone,
+    /// T3 did not answer: the send is tried, and a failed send asks again.
+    NoAnswer,
+}
+
+impl Seen {
+    /// An ended T3 agent on this device whose thread T3 has not been asked about yet. T3
+    /// closes a Claude session that sits idle (after 30 minutes), and the session's end marks
+    /// the agent ended, but the thread lives on and a message resumes it.
+    fn needs_thread_check(&self, device: &DeviceName) -> bool {
+        self.agent.state == AgentState::Ended
+            && self.thread == ThreadCheck::NotAsked
+            && &self.agent.device == device
+            && self.agent.id.source() == AgentSource::T3
+    }
 }
 
 /// Whether an agent's wake-ups can be sent now.
@@ -255,23 +284,62 @@ enum Reach {
     Held,
     /// Paused until a usage-limit reset still to come.
     Paused,
-    /// Not a T3 thread on this device, ended, or paused with no reset time.
-    Never,
+    /// Not to be woken by this daemon.
+    Never(Unreachable),
+}
+
+/// Why an agent's wake-ups cannot be sent from this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreachable {
+    /// Another device's agent: that device's daemon wakes it.
+    Elsewhere,
+    /// Not a T3 thread.
+    NotT3,
+    /// Ended, and T3 no longer has its thread or has archived it.
+    ThreadGone,
+    /// Paused with no reset time: resuming is left to the user.
+    NoReset,
+}
+
+impl Unreachable {
+    /// Expected on a device that is not the agent's: nothing is lost, so nothing is logged.
+    fn expected(self) -> bool {
+        matches!(self, Self::Elsewhere | Self::NotT3)
+    }
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Elsewhere => "it runs on another device",
+            Self::NotT3 => "it is not a T3 thread",
+            Self::ThreadGone => "it ended and T3 no longer has its thread, or archived it",
+            Self::NoReset => "it is paused with no reset time",
+        })
+    }
 }
 
 impl Reach {
     fn of(seen: &Seen, device: &DeviceName, now: Timestamp) -> Self {
         let agent = &seen.agent;
-        if &agent.device != device || agent.id.source() != AgentSource::T3 {
-            return Self::Never;
+        if &agent.device != device {
+            return Self::Never(Unreachable::Elsewhere);
+        }
+        if agent.id.source() != AgentSource::T3 {
+            return Self::Never(Unreachable::NotT3);
         }
         match agent.state {
-            AgentState::Ended => Self::Never,
+            // T3 closes idle sessions, which marks their agents ended; a message resumes
+            // the thread unless T3 says it is gone. When T3 did not answer, the send finds out.
+            AgentState::Ended => match seen.thread {
+                ThreadCheck::Gone => Self::Never(Unreachable::ThreadGone),
+                ThreadCheck::NotAsked | ThreadCheck::Live | ThreadCheck::NoAnswer => Self::Now,
+            },
             AgentState::Paused => match agent.paused_until {
                 Some(until) if until > now => Self::Paused,
                 Some(_) => Self::Now,
                 // Without a reset time, resuming is left to the user.
-                None => Self::Never,
+                None => Self::Never(Unreachable::NoReset),
             },
             AgentState::Running if !seen.idled && now - seen.since < WAKE_HOLD_MAX => Self::Held,
             AgentState::Running | AgentState::Idle => Self::Now,
@@ -1046,6 +1114,8 @@ impl<T: T3> Daemon<T> {
             .flatten();
         seen.since = now;
         seen.idled |= state != AgentState::Running;
+        // Asked again when it next matters: a thread may be archived or resumed meanwhile.
+        seen.thread = ThreadCheck::NotAsked;
     }
 
     /// What one event calls for: a reconcile, and wake-ups by agent, each with the board
@@ -1169,12 +1239,18 @@ impl<T: T3> Daemon<T> {
         agent.filter(|a| a.as_str() != event.actor && a.source() == AgentSource::T3)
     }
 
-    /// The coordinator of an autopilot board, when there is one.
+    /// The coordinator of an autopilot board, when there is one: the one the board names,
+    /// else this device's own coordinator thread while its lease has lapsed (a reconcile
+    /// names it again, or replaces it when its thread is gone), so no wake-up is lost meanwhile.
     fn coordinator_here(&self, slug: &BoardSlug) -> Option<&AgentId> {
-        self.boards
+        let board = self
+            .boards
             .get(slug)
-            .filter(|b| b.autopilot && b.status == BoardStatus::Active)
-            .and_then(|b| b.coordinator.as_ref())
+            .filter(|b| b.autopilot && b.status == BoardStatus::Active)?;
+        board
+            .coordinator
+            .as_ref()
+            .or_else(|| self.state.coordinators.get(slug).map(|c| &c.agent))
     }
 
     /// Sends the queued wake-ups, one message per agent, after checking each again. The
@@ -1234,7 +1310,7 @@ impl<T: T3> Daemon<T> {
     /// when it can be sent now. Changes nothing.
     async fn check(&self, agent: &AgentId, queue: &WakeQueue, now: Timestamp) -> Checked {
         let backing_off = queue.backoff.as_ref().filter(|b| now < b.retry_at);
-        let (seen, read) = match self.agents.get(agent) {
+        let (mut seen, mut read) = match self.agents.get(agent) {
             Some(seen) => (seen.clone(), false),
             // During an outage a lookup backing off costs no request.
             None if backing_off.is_some_and(|b| b.lookup) => return Checked::Waiting,
@@ -1244,6 +1320,7 @@ impl<T: T3> Daemon<T> {
                         agent: info,
                         since: now,
                         idled: false,
+                        thread: ThreadCheck::NotAsked,
                     };
                     (seen, true)
                 }
@@ -1253,6 +1330,21 @@ impl<T: T3> Daemon<T> {
                 Err(err) => return Checked::LookupFailed(err),
             },
         };
+        // Asked once per state change, also while a failed send backs off. A thread that goes
+        // later is found by the next send that fails, which asks T3 again.
+        if seen.needs_thread_check(&self.ctx.device) {
+            seen.thread = match self.thread_live(agent.native()).await {
+                Ok(true) => ThreadCheck::Live,
+                Ok(false) => ThreadCheck::Gone,
+                Err(err) => {
+                    tracing::warn!(
+                        "waking {agent}: checking its ended thread: {err:#}; trying the send"
+                    );
+                    ThreadCheck::NoAnswer
+                }
+            };
+            read = true;
+        }
         let due =
             backing_off.is_none() && matches!(Reach::of(&seen, &self.ctx.device, now), Reach::Now);
         let rechecks = if due {
@@ -1321,7 +1413,13 @@ impl<T: T3> Daemon<T> {
             }
             // Unknown to the server: its answers go to the coordinator.
             Checked::Unknown => {
-                self.forward_answers(agent, &mut queue.wakes);
+                let unheard = self.forward_answers(agent, &mut queue.wakes);
+                if unheard > 0 {
+                    tracing::warn!(
+                        "waking {agent}: unknown to the server; {unheard} answers to its asks \
+                         dropped, with no coordinator here to pass them to"
+                    );
+                }
                 return None;
             }
             Checked::LookupFailed(err) => {
@@ -1359,7 +1457,8 @@ impl<T: T3> Daemon<T> {
                 self.requeue(agent.clone(), queue);
                 return None;
             }
-            // Kept for the reset; meanwhile the coordinator hears of its answers.
+            // Kept for the reset; meanwhile the coordinator hears of its answers, once one
+            // is named.
             Reach::Paused => {
                 self.forward_answers(agent, &mut queue.wakes);
                 self.requeue(agent.clone(), queue);
@@ -1367,8 +1466,24 @@ impl<T: T3> Daemon<T> {
             }
             // Another device's, or not to be woken by the daemon: its answers go to the
             // coordinator, and the rest is not ours to send.
-            Reach::Never => {
-                self.forward_answers(agent, &mut queue.wakes);
+            Reach::Never(why) => {
+                let dropped = queue
+                    .wakes
+                    .iter()
+                    .filter(|w| !matches!(&w.about, WakeAbout::Answered { asker, .. } if asker == agent))
+                    .count();
+                let unheard = self.forward_answers(agent, &mut queue.wakes);
+                if !why.expected() {
+                    if dropped > 0 {
+                        tracing::warn!("waking {agent}: {why}; {dropped} wake-ups dropped");
+                    }
+                    if unheard > 0 {
+                        tracing::warn!(
+                            "waking {agent}: {why}; {unheard} answers to its asks dropped, \
+                             with no other coordinator here to pass them to"
+                        );
+                    }
+                }
                 return None;
             }
         }
@@ -1427,25 +1542,31 @@ impl<T: T3> Daemon<T> {
 
     /// Passes the answers to `from`'s own asks, which `from` cannot be woken for now, to the
     /// board's coordinator, once each: an answer no one hears of would stall its task.
-    fn forward_answers(&mut self, from: &AgentId, wakes: &mut [Wake]) {
+    /// Returns how many have no coordinator to go to (none named, or `from` is it); a queue
+    /// kept for later tries those again.
+    fn forward_answers(&mut self, from: &AgentId, wakes: &mut [Wake]) -> usize {
+        let mut unheard = 0;
         for wake in wakes {
             let own = matches!(&wake.about, WakeAbout::Answered { asker, .. } if asker == from);
             if !own || wake.forwarded {
                 continue;
             }
-            wake.forwarded = true;
             let coordinator = self
                 .coordinator_here(&wake.board)
                 .filter(|c| *c != from && c.source() == AgentSource::T3)
                 .cloned();
-            if let Some(coordinator) = coordinator {
-                let forward = Wake {
-                    forwarded: false,
-                    ..wake.clone()
-                };
-                self.queue(coordinator, forward);
-            }
+            let Some(coordinator) = coordinator else {
+                unheard += 1;
+                continue;
+            };
+            wake.forwarded = true;
+            let forward = Wake {
+                forwarded: false,
+                ..wake.clone()
+            };
+            self.queue(coordinator, forward);
         }
+        unheard
     }
 
     /// Sends `message` to `agent`'s thread; on a failure, asks T3 whether the thread is gone.
@@ -1489,7 +1610,13 @@ impl<T: T3> Daemon<T> {
                 if let Some(queue) = self.state.wakes.remove(&agent) {
                     wakes.extend(queue.wakes);
                 }
-                self.forward_answers(&agent, &mut wakes);
+                let unheard = self.forward_answers(&agent, &mut wakes);
+                if unheard > 0 {
+                    tracing::warn!(
+                        "waking {agent}: {unheard} answers to its asks dropped, with no other \
+                         coordinator here to pass them to"
+                    );
+                }
                 self.agents.remove(&agent);
             }
             Sent::Failed(err) => {
