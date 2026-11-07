@@ -169,7 +169,7 @@ function BoardLinks() {
                 <span className="min-w-0 flex-1 truncate">{board.title}</span>
                 {board.open_asks > 0 && (
                   <span
-                    className="h-4.5 min-w-5 px-1 text-right text-xs leading-4.5 font-medium tracking-normal text-muted-foreground tabular-nums"
+                    className="h-4.5 min-w-5 px-1 text-right text-xs leading-4.5 font-medium tracking-normal text-sidebar-foreground tabular-nums"
                     aria-label={`${board.open_asks} open asks`}
                   >
                     {board.open_asks}
