@@ -436,7 +436,7 @@ impl Hook<'_> {
             })
             .await?;
         self.local.turn_started = None;
-        self.local.reminded_turn = None;
+        self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
             return Ok(Reply::Context(text));
@@ -493,9 +493,6 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
-        if changes_board(tool) {
-            self.local.changed_at = Some(self.now);
-        }
         let mut paths = edited_paths(tool, &self.input["tool_input"]);
         let shell_start = match self.input["tool_use_id"].as_str() {
             Some(tool_use) if tool == SHELL_TOOL => {
@@ -512,9 +509,6 @@ impl Hook<'_> {
                     Ok(Err(err)) => tracing::debug!("files changed by the shell call: {err:#}"),
                     Err(_) => tracing::debug!("files changed by the shell call: over budget"),
                 }
-            }
-            if !paths.is_empty() {
-                self.local.changed_at = Some(self.now);
             }
             if let Some(key) = repo.key.clone() {
                 // A path the server would refuse would fail the whole request.
@@ -555,9 +549,7 @@ impl Hook<'_> {
 
     async fn stop(&mut self) -> Result<Reply> {
         self.set_state(AgentState::Idle, None).await?;
-        let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
-        let turn = self.local.turn_started;
-        if continued || (self.local.reminded_turn.is_some() && self.local.reminded_turn == turn) {
+        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
             return Ok(Reply::Nothing);
         }
         let doing = self
@@ -571,25 +563,33 @@ impl Hook<'_> {
         let Some(task) = doing.first() else {
             return Ok(Reply::Nothing);
         };
-        // Only work since the handoff makes it stale: file edits and board calls seen here,
-        // or a change to the task itself (which also covers `board` CLI calls).
         let handoff = self.client.handoff(&self.agent).await?;
-        let changed = self
-            .local
-            .changed_at
-            .into_iter()
-            .chain([task.updated_at])
-            .max();
-        let stale = match &handoff {
-            None => true,
-            Some(h) => changed.is_some_and(|at| at > h.updated_at),
+        let turn = self.local.turn_started;
+        // The server dates the agent's last board change or file touch on the handoff's own
+        // clock, so a turn that only read or replied leaves the handoff current. A server
+        // without that date falls back to: a handoff older than the turn is stale.
+        let (stale_since, why) = match &handoff {
+            None => (Some(turn.unwrap_or(self.now)), "you have no handoff"),
+            Some(h) => match h.last_change_at {
+                Some(at) => (
+                    (at > h.updated_at).then_some(at),
+                    "your handoff predates your last board change or file edit",
+                ),
+                None => (
+                    turn.filter(|&t| h.updated_at < t),
+                    "your handoff is older than this turn",
+                ),
+            },
         };
-        if !stale {
+        let Some(since) = stale_since else {
+            return Ok(Reply::Nothing);
+        };
+        if self.local.reminded_for == Some(since) {
             return Ok(Reply::Nothing);
         }
-        self.local.reminded_turn = Some(turn.unwrap_or(self.now));
+        self.local.reminded_for = Some(since);
         Ok(Reply::Block(format!(
-            "board: {} is in doing and your handoff predates your latest changes. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
+            "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
             task.id
         )))
     }
@@ -700,24 +700,6 @@ pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>
                 .is_ok_and(|modified| DateTime::<Utc>::from(modified) >= since)
         })
         .collect())
-}
-
-/// Board MCP tools that change board state; `handoff_set` refreshes the handoff itself.
-const BOARD_CHANGING_TOOLS: [&str; 8] = [
-    "task_add",
-    "task_claim",
-    "task_update",
-    "task_done",
-    "task_note",
-    "lease_paths",
-    "ask_user",
-    "board_join",
-];
-
-/// Whether a tool call changed board state: a board MCP tool such as `mcp__board__task_note`.
-pub fn changes_board(tool: &str) -> bool {
-    tool.strip_prefix("mcp__board__")
-        .is_some_and(|name| BOARD_CHANGING_TOOLS.contains(&name))
 }
 
 /// Files a tool call edited: Claude Code's `Edit`, `Write`, `MultiEdit` and

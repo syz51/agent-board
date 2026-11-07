@@ -574,62 +574,9 @@ fn codex_shell_calls_record_the_files_they_changed() {
     assert_eq!(touch.body["paths"], json!(["docs/notes.md"]));
 }
 
-#[test]
-fn stop_reminds_once_about_a_stale_handoff() {
-    let e = env();
-    e.agent_ok();
-    let mut task = task_fixture("factory-12", "Do it");
-    task.status = TaskStatus::Doing;
-    // The task changed after the handoff, say through `board update` in a shell call.
-    task.updated_at = chrono::Utc::now();
-    e.stub.on("GET /v1/tasks", [task]);
-    e.stub.on(
-        "GET /v1/snapshot",
-        snapshot_fixture(SnapshotKind::Delta, "", 1),
-    );
-    e.hook(
-        "user-prompt-submit",
-        "claude",
-        e.with("UserPromptSubmit", json!({"prompt": "go"})),
-    );
-    let handoff = Handoff {
-        agent: CLAUDE_AGENT.parse().unwrap(),
-        now: "old".into(),
-        next: "x".into(),
-        blockers: String::new(),
-        version: 2,
-        updated_at: chrono::Utc::now() - chrono::Duration::hours(1),
-    };
-    e.stub.on(
-        &format!("GET /v1/agents/{}/handoff", enc(CLAUDE_AGENT)),
-        &handoff,
-    );
-
-    let stop = e.with(
-        "Stop",
-        json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
-    );
-    let (reply, _) = e.hook("stop", "claude", stop.clone());
-    let reply = reply.unwrap();
-    assert_eq!(reply["decision"], "block");
-    assert!(
-        reply["reason"].as_str().unwrap().contains("factory-12")
-            && reply["reason"].as_str().unwrap().contains("handoff_set")
-    );
-    assert_eq!(
-        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
-        "idle"
-    );
-
-    let (_, text) = e.hook("stop", "claude", stop);
-    assert_eq!(text, "", "one reminder per turn");
-    let continued = e.with("Stop", json!({"stop_hook_active": true}));
-    let (_, text) = e.hook("stop", "claude", continued);
-    assert_eq!(text, "");
-}
-
-/// A doing task last changed before a handoff an hour old, and that handoff.
-fn quiet_doing_task(e: &Env) {
+/// A task in doing, a delta snapshot and a handoff written an hour ago, with the agent's
+/// last change dated by the server (`None`: a server that does not date changes).
+fn doing_with_handoff(e: &Env, last_change_at: Option<chrono::DateTime<chrono::Utc>>) -> Handoff {
     e.agent_ok();
     let mut task = task_fixture("factory-12", "Do it");
     task.status = TaskStatus::Doing;
@@ -638,8 +585,6 @@ fn quiet_doing_task(e: &Env) {
         "GET /v1/snapshot",
         snapshot_fixture(SnapshotKind::Delta, "", 1),
     );
-    e.stub
-        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
     let handoff = Handoff {
         agent: CLAUDE_AGENT.parse().unwrap(),
         now: "waiting on the user".into(),
@@ -647,70 +592,115 @@ fn quiet_doing_task(e: &Env) {
         blockers: String::new(),
         version: 2,
         updated_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        last_change_at,
     };
-    e.stub.on(
-        &format!("GET /v1/agents/{}/handoff", enc(CLAUDE_AGENT)),
-        &handoff,
+    e.stub.on(&handoff_route(), &handoff);
+    handoff
+}
+
+fn handoff_route() -> String {
+    format!("GET /v1/agents/{}/handoff", enc(CLAUDE_AGENT))
+}
+
+fn prompt(e: &Env, text: &str) {
+    e.hook(
+        "user-prompt-submit",
+        "claude",
+        e.with("UserPromptSubmit", json!({"prompt": text})),
     );
 }
 
-#[test]
-fn stop_skips_the_handoff_demand_when_nothing_changed_since_it() {
-    let e = env();
-    quiet_doing_task(&e);
+fn stop(e: &Env) -> Option<Value> {
     let stop = e.with(
         "Stop",
-        json!({"stop_hook_active": false, "last_assistant_message": "Still waiting."}),
+        json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
     );
-    for prompt in ["status?", "and now?"] {
-        e.hook(
-            "user-prompt-submit",
-            "claude",
-            e.with("UserPromptSubmit", json!({"prompt": prompt})),
-        );
-        let read = e.with(
-            "PostToolUse",
-            json!({"tool_name": "mcp__board__task_show", "tool_input": {"id": "factory-12"}, "tool_use_id": "toolu_1"}),
-        );
-        e.hook("post-tool-use", "claude", read);
-        let (_, text) = e.hook("stop", "claude", stop.clone());
-        assert_eq!(text, "", "a turn that only read and replied stops quietly");
-    }
+    e.hook("stop", "claude", stop).0
 }
 
 #[test]
-fn stop_demands_a_handoff_after_board_changes_or_file_edits() {
-    for edits_a_file in [false, true] {
-        let e = env();
-        quiet_doing_task(&e);
-        let call = if edits_a_file {
-            json!({
-                "tool_name": "Edit",
-                "tool_input": {"file_path": e.repo.join("src/lib.rs"), "old_string": "a", "new_string": "b"},
-                "tool_use_id": "toolu_3",
-            })
-        } else {
-            json!({"tool_name": "mcp__board__task_note", "tool_input": {"id": "factory-12", "text": "note: x"}, "tool_use_id": "toolu_2"})
-        };
-        e.hook(
-            "user-prompt-submit",
-            "claude",
-            e.with("UserPromptSubmit", json!({"prompt": "go"})),
+fn stop_stays_quiet_when_nothing_changed_since_the_handoff() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at - chrono::Duration::minutes(5));
+    e.stub.on(&handoff_route(), &h);
+    for text in ["status?", "and now?"] {
+        prompt(&e, text);
+        assert_eq!(
+            stop(&e),
+            None,
+            "a turn that only read or replied stops quietly"
         );
-        e.hook(
-            "post-tool-use",
-            "claude",
-            e.with("PostToolUse", call.clone()),
-        );
-        let stop = e.with(
-            "Stop",
-            json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
-        );
-        let (reply, _) = e.hook("stop", "claude", stop);
-        let reply = reply.unwrap_or_else(|| panic!("no demand after {call}"));
-        assert_eq!(reply["decision"], "block", "{call}");
-        assert!(reply["reason"].as_str().unwrap().contains("factory-12"));
     }
+    assert_eq!(
+        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
+        "idle"
+    );
+}
+
+#[test]
+fn stop_reminds_once_per_change_made_after_the_handoff() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    prompt(&e, "go");
+    let reply = stop(&e).expect("a change after the handoff gets the demand");
+    assert_eq!(reply["decision"], "block");
+    let reason = reply["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("factory-12")
+            && reason.contains("predates your last board change")
+            && reason.contains("handoff_set"),
+        "{reason}"
+    );
+    assert_eq!(stop(&e), None, "one reminder per change");
+    let continued = e.with("Stop", json!({"stop_hook_active": true}));
+    assert_eq!(e.hook("stop", "claude", continued).1, "");
+
+    // A later change in the same turn (say, after a background task woke the agent).
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(2));
+    e.stub.on(&handoff_route(), &h);
+    assert_eq!(stop(&e).unwrap()["decision"], "block");
+}
+
+#[test]
+fn stop_asks_for_a_first_handoff() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    e.stub.on_error(
+        &handoff_route(),
+        404,
+        "not_found",
+        "no handoff",
+        "write one",
+    );
+    prompt(&e, "go");
+    let reply = stop(&e).unwrap();
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .contains("you have no handoff"),
+        "{reply}"
+    );
+    assert_eq!(stop(&e), None, "one reminder per turn");
+}
+
+#[test]
+fn stop_falls_back_to_the_turn_against_a_server_without_change_dates() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    let reply = stop(&e).unwrap();
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .contains("older than this turn"),
+        "{reply}"
+    );
+    assert_eq!(stop(&e), None, "one reminder per turn");
 }
 
 #[test]
