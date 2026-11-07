@@ -231,6 +231,8 @@ pub struct Settings {
     pub signal_window_days: u32,
     /// Creating an ask warns of the board's other open asks younger than this.
     pub duplicate_ask_window_secs: u64,
+    /// A task in review this long with no note from its owner raises one alert.
+    pub review_quiet_secs: u64,
 }
 
 impl Default for Settings {
@@ -260,6 +262,7 @@ impl Default for Settings {
             signal_min_agents: 2,
             signal_window_days: 7,
             duplicate_ask_window_secs: 30 * 60,
+            review_quiet_secs: 24 * 3600,
         }
     }
 }
@@ -289,6 +292,7 @@ impl Settings {
             ("signal_min_agents", u64::from(self.signal_min_agents)),
             ("signal_window_days", u64::from(self.signal_window_days)),
             ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
+            ("review_quiet_secs", self.review_quiet_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -329,6 +333,10 @@ impl Settings {
 
     pub(crate) fn duplicate_ask_ms(&self) -> i64 {
         secs_ms(self.duplicate_ask_window_secs)
+    }
+
+    pub(crate) fn review_quiet_ms(&self) -> i64 {
+        secs_ms(self.review_quiet_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

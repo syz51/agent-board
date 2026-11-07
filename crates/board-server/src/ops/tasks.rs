@@ -368,10 +368,10 @@ fn check_claimable_new(cx: &Ctx<'_>, req: &CreateTask, blockers: &[TaskId]) -> R
                 doing.join(", ")
             ),
             format!(
-                "move {0} to review or blocked first (task_update {0} status=review), finish it \
-                 (task_done) or release it, then add the task with claim again; or add it \
+                "finish {0} (task_done) or {1}, then add the task with claim again; or add it \
                  without claim",
-                doing[0]
+                doing[0],
+                park_hint(&doing[0])
             ),
         ));
     }
@@ -414,6 +414,54 @@ pub(crate) fn announce_not_before(cx: &mut Ctx<'_>) -> Result<usize> {
         announced += 1;
     }
     Ok(announced)
+}
+
+/// Announces each task left in `review` for `review_quiet_secs` with no note from its
+/// owner: a `task_updated` event by `server` (no field changes; `quiet_review` names the
+/// last note or the move to review, `in_review_since` the move). The snapshot turns it into
+/// an alert for the owner, or for the board's coordinator when the owner is gone. While the
+/// task stays quiet it is announced again every `review_quiet_secs`; a note from the owner
+/// or a new move to review starts the clock again. Run by the sweeper.
+pub(crate) fn announce_quiet_reviews(cx: &mut Ctx<'_>) -> Result<usize> {
+    let quiet: Vec<(TaskId, BoardSlug, i64, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, board, since, MAX(since, noted) FROM ( \
+               SELECT t.id, t.board, \
+                 COALESCE((SELECT MAX(e.at) FROM events e WHERE e.task = t.id \
+                   AND e.type = 'task_updated' \
+                   AND json_extract(e.payload, '$.to') = 'review'), t.updated_at) AS since, \
+                 COALESCE((SELECT MAX(n.at) FROM notes n \
+                   WHERE n.task = t.id AND n.agent = t.owner), 0) AS noted, \
+                 COALESCE((SELECT MAX(e.at) FROM events e WHERE e.task = t.id \
+                   AND e.type = 'task_updated' \
+                   AND json_extract(e.payload, '$.quiet_review') IS NOT NULL), 0) AS announced \
+               FROM tasks t WHERE t.status = 'review') \
+             WHERE MAX(since, noted, announced) <= ?1",
+        )?
+        .query_map([cx.now_ms() - cx.s.review_quiet_ms()], |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                r.get(2)?,
+                r.get(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, board, since, last) in &quiet {
+        cx.emit(
+            Some(board),
+            "server",
+            EventType::TaskUpdated,
+            Some(id),
+            serde_json::json!({
+                "fields": [],
+                "quiet_review": ts(*last),
+                "in_review_since": ts(*since),
+            }),
+        )?;
+    }
+    Ok(quiet.len())
 }
 
 /// Refuses to start a task whose `not_before` has not passed.
@@ -488,14 +536,25 @@ fn doing_tasks(cx: &Ctx<'_>, agent: &AgentId, except: Option<&TaskId>) -> Result
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// How to park the task in doing by what it waits on (the coordinator prompt's rule).
+fn park_hint(task: &str) -> String {
+    format!(
+        "park it by what it waits on: CI or a review -> task_update {task} status=review, then \
+         task_note {task} naming the PR; another task, the user or anything else -> task_update \
+         {task} status=blocked with blocked_reason (or blockers); only a date -> release {task} \
+         and set its not_before"
+    )
+}
+
 fn check_doing_limit(cx: &Ctx<'_>, agent: &AgentId, task: &TaskId) -> Result<()> {
     let doing = doing_tasks(cx, agent, Some(task))?;
     if doing.len() >= cx.s.max_doing_per_agent as usize {
         return Err(refused(
             format!("you already have {} in doing", doing.join(", ")),
             format!(
-                "finish {0} (task_done), or park it before taking {task}: review while it waits on CI or a review, blocked while it waits on a task, the user or a date (task_update {0} status=..., with a note on what it waits on), or release it",
-                doing[0]
+                "finish {0} (task_done) or {1}, then take {task}",
+                doing[0],
+                park_hint(&doing[0])
             ),
         ));
     }

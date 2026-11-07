@@ -239,6 +239,35 @@ async fn stats_count_the_feedback_signals() {
     assert!(t.done(a, &quick, check(0)).await.0.is_success());
     let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
     assert_eq!(stats["done_under_a_minute"], 1);
+    // Finishing a stale owner's work right after taking it over is not a quick done.
+    let stale = t.task(a, "factory", "Left behind").await;
+    assert!(t.claim(a, &stale).await.0.is_success());
+    t.advance(super::stale_after() + TimeDelta::hours(1));
+    let b = "t3:beta";
+    t.register(b, None, None).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{stale}/take"),
+        Some(b),
+        Some(json!({ "agent": b })),
+    )
+    .await;
+    t.advance(TimeDelta::seconds(20));
+    assert!(t.done(b, &stale, check(0)).await.0.is_success());
+    // Nor is a feedback item resolved right after its claim: it is routed, not worked.
+    t.board("board-feedback", &[]).await;
+    let item = t.task(b, "board-feedback", "Hook blocks git fetch").await;
+    assert!(t.claim(b, &item).await.0.is_success());
+    t.advance(TimeDelta::seconds(20));
+    t.ok(
+        "POST",
+        &format!("/v1/feedback/{item}/resolve"),
+        Some(b),
+        Some(json!({ "kind": "declined", "reason": "works as intended" })),
+    )
+    .await;
+    let stats = t.ok("GET", "/v1/stats?days=30", None, None).await;
+    assert_eq!(stats["done_under_a_minute"], 1, "{stats}");
     let (s, _) = t.call("GET", "/v1/stats?days=0", None, None).await;
     assert_eq!(s.as_u16(), 400);
 }

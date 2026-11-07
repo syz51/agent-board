@@ -23,8 +23,8 @@ use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{delegation_family, glob_matches, globs_overlap};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events, load_agents,
-    load_events, load_tasks,
+    agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live, latest_events,
+    load_agents, load_events, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -218,8 +218,7 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         .as_ref()
         .map(|b| counts(cx, b).map(Counts::from))
         .transpose()?;
-    let mut alerts = alerts(cx, &agent, since, seq)?;
-    alerts.extend(quiet_reviews(cx, &agent)?);
+    let alerts = alerts(cx, &agent, since, seq)?;
 
     let mut model = Model {
         kind: req.kind,
@@ -647,11 +646,10 @@ const CHANGED: u8 = 2;
 const ANSWERED: u8 = 3;
 const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
+/// A task left quiet in review: a reminder, so after the alerts about change.
+const QUIET_REVIEW: u8 = 6;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
-const FILED: u8 = 6;
-const QUIET_REVIEW: u8 = 7;
-/// How long a task may sit in review with no note before its owner is reminded.
-const REVIEW_QUIET_MS: i64 = 86_400_000;
+const FILED: u8 = 7;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -820,6 +818,62 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                         },
                     );
                 }
+            }
+            EventType::TaskUpdated if event.payload.get("quiet_review").is_some() => {
+                let Some(task) = &event.task else { continue };
+                // The owner is reminded; when the owner is gone (such as an ended child),
+                // the board's coordinator is, so the wait is not lost.
+                let to_me = mine_ids.contains(task) || {
+                    let row: Option<(Option<String>, String, String, Option<String>)> = cx
+                        .db
+                        .query_row(
+                            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
+                             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
+                            [task.as_str()],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?;
+                    match row {
+                        Some((owner, board, status, state)) if status == "review" => {
+                            let board: BoardSlug = parse_id(&board)?;
+                            let gone = match &owner {
+                                Some(owner) => {
+                                    state.as_deref() == Some("ended") || !is_live(cx, owner)?
+                                }
+                                None => true,
+                            };
+                            gone && get_board(cx, &board)?
+                                .coordinator
+                                .is_some_and(|c| c.as_str() == me)
+                        }
+                        _ => false,
+                    }
+                };
+                if !to_me {
+                    continue;
+                }
+                let age = |key: &str| {
+                    event
+                        .payload
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                        .map_or_else(|| "a day".to_owned(), |at| ago(cx.now - at))
+                };
+                out.insert(
+                    (QUIET_REVIEW, task.to_string()),
+                    Alert {
+                        alert: format!(
+                            "{task} has sat in review for {} with no note from its owner for {}",
+                            age("in_review_since"),
+                            age("quiet_review")
+                        ),
+                        action: format!(
+                            "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
+                        ),
+                        rank: rank(QUIET_REVIEW),
+                    },
+                );
             }
             EventType::TaskUpdated | EventType::TaskReleased | EventType::NoteAdded => {
                 let Some(task) = &event.task else { continue };
@@ -1023,38 +1077,6 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
     let mut alerts: Vec<Alert> = out.into_values().collect();
     alerts.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.alert.cmp(&b.alert)));
     Ok(alerts)
-}
-
-/// The agent's tasks in review with no note and no change for a day. Review is the wait
-/// on CI or a review: one that quiet should be checked, or noted with what it waits on.
-/// Unlike the event alerts these hold until the owner acts, so a delta shows them too.
-fn quiet_reviews(cx: &Ctx<'_>, agent: &Agent) -> Result<Vec<Alert>> {
-    let cutoff = cx.now_ms() - REVIEW_QUIET_MS;
-    let quiet: Vec<(String, i64)> = cx
-        .db
-        .prepare_cached(
-            "SELECT id, last FROM (SELECT t.id, t.number, t.board, MAX(t.updated_at, \
-             COALESCE((SELECT MAX(n.at) FROM notes n WHERE n.task = t.id), 0)) AS last \
-             FROM tasks t WHERE t.owner = ?1 AND t.status = 'review') \
-             WHERE last < ?2 ORDER BY board, number",
-        )?
-        .query_map(params![agent.id.as_str(), cutoff], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(quiet
-        .into_iter()
-        .map(|(task, last)| Alert {
-            alert: format!(
-                "{task} has sat in review for {} with no note",
-                ago(TimeDelta::milliseconds(cx.now_ms() - last))
-            ),
-            action: format!(
-                "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
-            ),
-            rank: (QUIET_REVIEW, last),
-        })
-        .collect())
 }
 
 fn record_change(

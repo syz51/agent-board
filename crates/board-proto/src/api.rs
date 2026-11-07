@@ -108,10 +108,11 @@ pub struct Stats {
     /// Median minutes a task spent in `doing` before `done`.
     pub doing_minutes_median: Option<f64>,
     pub done_without_check_evidence: u32,
-    /// Tasks done after under a minute in `doing`: work done off the board and claimed
-    /// after the fact. Absent (0) from servers that predate it.
+    /// Tasks done after under a minute in `doing`, not counting takeovers or feedback
+    /// items: work done off the board and claimed after the fact. Absent (`None`) from
+    /// servers that predate it.
     #[serde(default)]
-    pub done_under_a_minute: u32,
+    pub done_under_a_minute: Option<u32>,
     /// Feedback reports and items. Absent from servers that predate feedback items.
     #[serde(default)]
     pub feedback: FeedbackStats,
@@ -656,7 +657,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stats.feedback, FeedbackStats::default());
-        assert_eq!(stats.done_under_a_minute, 0);
+        assert_eq!(stats.done_under_a_minute, None);
         let create: CreateFeedback =
             serde_json::from_value(serde_json::json!({ "about": "board", "text": "Slow" }))
                 .unwrap();

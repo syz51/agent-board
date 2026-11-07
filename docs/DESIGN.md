@@ -91,12 +91,13 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
 - **Waiting states**: `review` is where a task waits on CI or a reviewer, with a note naming
-  the PR; `blocked` is where it waits on another task, the user (an ask) or a date. Both free
-  the owner's one `doing` slot, and the doing-limit refusal says which fits which wait. A
-  task in `review` with no note and no change for a day raises an alert to its owner on
-  every snapshot until the owner notes what it still waits on or moves it on. Stats count
-  dones that spent under a minute in `doing`, which shows work done off the board and
-  claimed afterwards.
+  the PR; `blocked` is where it waits on another task or the user (an ask), or on anything
+  else with a `blocked_reason`; a wait for a date alone is an `open` task with `not_before`.
+  `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
+  which fits which wait. The sweeper announces a task in `review` a day with no note from
+  its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
+  when the owner is gone. Stats count dones that spent under a minute in `doing`, takeovers
+  and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
@@ -378,8 +379,7 @@ keeping untrusted text out of those channels, so:
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, recent; `waiting` lists
   open tasks held by a `not_before`, soonest first); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
-  grammar, alerts and changed counts only, empty when nothing changed (a task left quiet in
-  `review` is a standing alert, so it shows until its owner acts). **Alerts** (≤ 400):
+  grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each.
 - Tool descriptions and server instructions never change at run time, so they do not break
   prompt caching.

@@ -41,12 +41,15 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 
 - One task in progress per project at a time. Do not start the next until this one is done,
   blocked or in review.
-- Park a task by what it waits on. Use `review` while it waits on CI or a review, with a
-  note naming the PR. Use `blocked` only while it waits on another task (`blockers`), the
-  user (an ask) or a date (`not_before`). Each parked task's latest note says what it waits
-  on. Never wait on CI in `doing`, and never do work off the board and claim it afterwards.
-  A task left in review a day with no note raises an alert: check what it waits on, then
-  move it on or note what it still waits on.
+- Park a task by what it waits on, and `task_note` what that is:
+  - CI or a review: `review`, with a note naming the PR.
+  - Another task, the user or anything else: `blocked`, with `blockers` or
+    `blocked_reason` (and an ask when it waits on the user).
+  - Only a date: release it to `open` and set `not_before`.
+  Never wait on CI in `doing`, and never do work off the board and claim it afterwards. A
+  task in review a day with no note from its owner raises an alert, again each quiet day,
+  to the owner or, when the owner is gone, to you: check what it waits on, then move it on
+  or note what it still waits on.
 - Ask the user (`ask_user`) only for a decision or an action only they can take: a product
   choice, a login, a payment, a key. Give options, recommended first. Then set the task
   `blocked` with the reason and continue with other ready work. Do not ask again while an

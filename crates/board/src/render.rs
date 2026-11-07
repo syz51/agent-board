@@ -447,7 +447,9 @@ pub fn stats(stats: &Stats) -> String {
         stats.tasks_created,
         stats.tasks_done,
         stats.done_without_check_evidence,
-        stats.done_under_a_minute,
+        stats
+            .done_under_a_minute
+            .map_or_else(|| "n/a".to_owned(), |n| n.to_string()),
         minutes(stats.doing_minutes_median),
         stats.claims_refused,
         stats.tasks_taken_stale,

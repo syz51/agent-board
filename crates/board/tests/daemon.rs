@@ -2169,11 +2169,12 @@ fn the_coordinator_prompt_parks_waits_in_review_or_blocked() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
-        "Use `review` while it waits on CI or a review, with a note naming the PR.",
-        "Use `blocked` only while it waits on another task (`blockers`), the user (an ask) or a date (`not_before`).",
-        "Each parked task's latest note says what it waits on.",
+        "Park a task by what it waits on, and `task_note` what that is:",
+        "- CI or a review: `review`, with a note naming the PR.",
+        "- Another task, the user or anything else: `blocked`, with `blockers` or `blocked_reason`",
+        "- Only a date: release it to `open` and set `not_before`.",
         "Never wait on CI in `doing`, and never do work off the board and claim it afterwards.",
-        "A task left in review a day with no note raises an alert",
+        "A task in review a day with no note from its owner raises an alert, again each quiet day, to the owner or, when the owner is gone, to you",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }

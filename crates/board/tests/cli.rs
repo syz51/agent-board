@@ -696,7 +696,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
         ask_answer_minutes_median: Some(4.0),
         doing_minutes_median: None,
         done_without_check_evidence: 1,
-        done_under_a_minute: 2,
+        done_under_a_minute: Some(2),
         feedback: board_proto::FeedbackStats {
             reported: 6,
             filed: 2,
