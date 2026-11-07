@@ -267,7 +267,7 @@ pub struct Agent {
 }
 
 /// The last message of one turn of a board's coordinator, kept for the user
-/// (`POST /v1/agents/{id}/said`): what it said may be followed at once by a wake-up that
+/// (`AgentStateUpdate.said`): what it said may be followed at once by a wake-up that
 /// starts the next turn, so the user reads it here instead of in the thread. Written by the
 /// agent, so untrusted for readers; never shown to agents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -214,6 +214,7 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         // Lease events name a task but no board.
         format!("DELETE FROM events WHERE board = ?1 OR task IN ({TASKS})"),
         "DELETE FROM asks WHERE board = ?1".to_owned(),
+        "DELETE FROM said WHERE board = ?1".to_owned(),
         // Parents are on the same board, so no task elsewhere refers to these.
         "UPDATE tasks SET parent = NULL WHERE board = ?1".to_owned(),
         "INSERT OR REPLACE INTO deleted_boards (slug, next_number) \

@@ -1548,6 +1548,21 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
     assert!(!prompt.contains("factory/cli.js"));
 }
 
+#[test]
+fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
+    let prompt = board::daemon::coordinator_message(&factory(), false);
+    for rule in [
+        "`task_done` with evidence (each check with its exit code, the commit, the PR) and a\n   `summary` for the user",
+        "finish with `task_done`, evidence and a `summary`",
+        "The user does not read this chat as it happens",
+        "end every turn with a short status",
+        "put a question or an offer to the\n  user in `ask_user`, never only in chat",
+        "never end a turn on a question",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
 async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {

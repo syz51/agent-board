@@ -80,20 +80,20 @@ server's minute sweep.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
+  `said`, optional, is the last message of the turn that just ended: the hooks send it
+  with the `Stop` update. While the agent coordinates boards it is kept, once per board, as
+  a `[Said]` for the user (see "Updates"), in the same transaction as the state change and
+  its `agent_state_changed` event; otherwise it is dropped. It is 1 to 4,000 characters
+  (`SAID_CHARS_MAX`) without control characters other than line breaks and tabs; clients
+  cut and clean it first. The newest 50 per agent and board are kept.
 - `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
   last changed the board or touched a file (its newest event other than a handoff,
   registration or state change), on the same clock as `updated_at`; a handoff older than it
   is stale. It is absent when the agent has made no change.
 - `PUT /v1/agents/{id}/handoff` `[PutHandoff]` → `[Handoff]`; 409 on a version mismatch.
-- `POST /v1/agents/{id}/said` `[PostSaid]` → `[Said]` list: the last message of one of the
-  agent's turns, kept for the user (see "Updates"). The hooks send it at `Stop` for an
-  agent whose role is `coordinator`. One `Said` is stored per board the agent coordinates
-  now; an agent that coordinates none gets an empty list and nothing is stored. `text` is
-  1 to 4,000 characters (`SAID_CHARS_MAX`); clients cut longer messages. The newest 50 per
-  agent and board are kept. No event is recorded: the web view refreshes updates when the
-  coordinator's state changes, which the same `Stop` reports.
-- `GET /v1/agents/{id}/said?limit=` → `[Said]` list, newest first, `limit` 1 to 50
-  (default 20). User only: agents never read what another agent told the user.
+- `GET /v1/agents/{id}/said?limit=` → `[Said]` list: the agent's kept turn endings,
+  newest first, `limit` 1 to 50 (default 20). User only: agents never read what another
+  agent told the user.
 
 ### Boards
 
@@ -249,7 +249,9 @@ turn, so the thread is not where the user reads it. One seen cursor is kept for 
   leaves it). Clients send the time of the newest update they showed, so updates that
   arrived after the page loaded stay unseen.
 
-Neither records an event; agent tokens get 403 `forbidden`.
+Neither records an event; agent tokens get 403 `forbidden`. A new turn ending arrives with
+its coordinator's `agent_state_changed` event, and a new or reopened done task with
+`task_done` or `task_updated`, so clients refresh updates on those.
 
 ### Feedback
 

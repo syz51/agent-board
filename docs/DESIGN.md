@@ -84,7 +84,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
   computed when read (open, all blockers done, no live owner, `not_before` passed), never
   stored. Done requires
-  evidence (a check with its exit code, a commit, a PR or an artifact). `auto` says whether
+  evidence (a check with its exit code, a commit, a PR or an artifact), and may carry a
+  `summary` for the user: what changed and what they should know or decide. Reopening
+  clears it. `auto` says whether
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice).
   Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
@@ -180,7 +182,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. A Stop that does not block also sends the turn's last message (`last_assistant_message`, control characters removed, cut to 4,000 characters) with the idle state, as `said`; the server keeps it only for a current coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -258,6 +260,16 @@ registers without a repo).
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
+- **Reporting to the user**: a coordinator's chat is a poor channel to the user, because a
+  wake arrives as the thread's next turn and buries whatever the last turn said. So what
+  the user should read goes to the board instead: every `task_done` carries a `summary`,
+  questions and decisions go to `ask_user`, and the Stop hook sends each turn's last
+  message. The server keeps that message only while the agent coordinates a board, once per
+  such board (the newest 50), in the same transaction as the state change; a worker's turn
+  endings are not kept, since its parent reads them. Summaries and turn endings are
+  agent-written and untrusted: they appear in the user's views only, never in snapshot,
+  delta, alert or wake text and never in event payloads, so no agent reads another's
+  words as context.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
@@ -277,7 +289,9 @@ registers without a repo).
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**
-  queue to answer asks; a live event feed.
+  queue to answer asks; **Updates**, the tasks finished and the coordinators' turn endings
+  since the user last looked (one seen cursor for the user, moved forward only when the
+  page has shown them), newest first; a live event feed.
 
 ## Text format
 

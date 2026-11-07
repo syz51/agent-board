@@ -9,8 +9,8 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use board_proto::{
     AgentId, AskKind, BoardSlug, CreateFeedback, FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind,
-    PATH_CHARS_MAX, Priority, ResolutionKind, ResolveFeedback, SnapshotFormat, SnapshotKind,
-    TaskId, TaskStatus,
+    PATH_CHARS_MAX, Priority, ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat,
+    SnapshotKind, TaskId, TaskStatus,
 };
 use board_server::Settings;
 use rmcp::model::{
@@ -270,7 +270,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_done",
-        description: "Mark a task you own done, with evidence: checks run (command and exit code), commits, PRs or artifacts. At least one is required.",
+        description: "Mark a task you own done, with evidence: checks run (command and exit code), commits, PRs or artifacts. At least one is required. Add a summary when the user should hear about the result: the user reads it in the web view's updates, apart from this chat.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -295,6 +295,14 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "artifacts",
                     strings("Artifact links or paths.", EVIDENCE_MAX),
+                    false,
+                ),
+                (
+                    "summary",
+                    s(
+                        "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone.",
+                        SUMMARY_CHARS_MAX,
+                    ),
                     false,
                 ),
             ]
@@ -647,7 +655,7 @@ impl BoardMcp {
                     prs: a.prs,
                     artifacts: a.artifacts,
                 };
-                ops::task_done(&ctx, &a.id, evidence).await?
+                ops::task_done(&ctx, &a.id, evidence, a.summary).await?
             }
             "task_note" => {
                 let a: NoteArgs = parse(args)?;
@@ -806,6 +814,7 @@ struct DoneArgs {
     prs: Vec<String>,
     #[serde(default)]
     artifacts: Vec<String>,
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat,
-    SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, SAID_CHARS_MAX, Snapshot,
+    SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -284,6 +284,26 @@ async fn handle(
     Ok(reply)
 }
 
+/// The turn's last message as the server accepts it (`AgentStateUpdate.said`): without
+/// control characters other than line breaks and tabs, trimmed, and cut to
+/// `SAID_CHARS_MAX` characters with an ellipsis. `None` when nothing is left.
+fn turn_ending(message: Option<&str>) -> Option<String> {
+    let clean: String = message?
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if clean.chars().count() <= SAID_CHARS_MAX {
+        return Some(clean.to_owned());
+    }
+    let mut cut: String = clean.chars().take(SAID_CHARS_MAX - 1).collect();
+    cut.push('…');
+    Some(cut)
+}
+
 /// How long a session's cached decisions outlive its last SessionStart.
 const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// How long the start mark of a shell call that never reached PostToolUse is kept.
@@ -390,6 +410,7 @@ impl Hook<'_> {
                 &AgentStateUpdate {
                     state,
                     paused_until,
+                    said: None,
                 },
             )
             .await?;
@@ -498,6 +519,7 @@ impl Hook<'_> {
             &AgentStateUpdate {
                 state: AgentState::Running,
                 paused_until: None,
+                said: None,
             },
         );
         let (beat, snap) = tokio::join!(heartbeat, self.fetch(kind));
@@ -594,11 +616,35 @@ impl Hook<'_> {
         })
     }
 
+    /// Marks the agent idle with the turn's last message, which the server keeps for the
+    /// user while the agent coordinates a board. A turn the handoff reminder continues has
+    /// not ended, so its message is not sent; the next `Stop` sends the final one.
     async fn stop(&mut self) -> Result<Reply> {
-        self.set_state(AgentState::Idle, None).await?;
-        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
-            return Ok(Reply::Nothing);
-        }
+        let reminder = if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
+            Ok(None)
+        } else {
+            self.handoff_reminder().await
+        };
+        let said = match &reminder {
+            Ok(Some(_)) => None,
+            _ => turn_ending(self.input["last_assistant_message"].as_str()),
+        };
+        self.client
+            .set_state(
+                &self.agent,
+                &AgentStateUpdate {
+                    state: AgentState::Idle,
+                    paused_until: None,
+                    said,
+                },
+            )
+            .await?;
+        Ok(reminder?.map_or(Reply::Nothing, Reply::Block))
+    }
+
+    /// The handoff reminder for a turn that leaves a task in `doing` with a stale handoff,
+    /// once per change.
+    async fn handoff_reminder(&mut self) -> Result<Option<String>> {
         let doing = self
             .client
             .tasks(&TaskQuery {
@@ -608,7 +654,7 @@ impl Hook<'_> {
             })
             .await?;
         let Some(task) = doing.first() else {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         };
         let handoff = self.client.handoff(&self.agent).await?;
         let turn = self.local.turn_started;
@@ -629,13 +675,13 @@ impl Hook<'_> {
             },
         };
         let Some(since) = stale_since else {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         };
         if self.local.reminded_for == Some(since) {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         }
         self.local.reminded_for = Some(since);
-        Ok(Reply::Block(format!(
+        Ok(Some(format!(
             "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
             task.id
         )))

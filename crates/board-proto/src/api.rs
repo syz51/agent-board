@@ -37,6 +37,11 @@ pub struct AgentStateUpdate {
     pub state: AgentState,
     /// Set with `state: paused` when a usage limit stopped the agent.
     pub paused_until: Option<Timestamp>,
+    /// The last message of the turn that just ended (`Stop`), at most `SAID_CHARS_MAX`
+    /// characters. Kept as a `Said` only while the agent coordinates a board; servers that
+    /// predate it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
 }
 
 /// `POST /v1/boards`.
@@ -251,12 +256,6 @@ pub struct DoneTask {
 
 /// Longest `DoneTask.summary`, in characters.
 pub const SUMMARY_CHARS_MAX: usize = 600;
-
-/// `POST /v1/agents/{id}/said`: the last message of a turn (`Said`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PostSaid {
-    pub text: String,
-}
 
 /// Longest `Said.text`, in characters; clients cut longer messages to fit.
 pub const SAID_CHARS_MAX: usize = 4000;

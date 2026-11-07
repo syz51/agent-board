@@ -199,6 +199,9 @@ pub(crate) fn validate_state(update: &AgentStateUpdate) -> Result<()> {
             "send state=paused with paused_until, or leave paused_until out",
         ));
     }
+    if let Some(said) = &update.said {
+        crate::ops::updates::validate_said(said)?;
+    }
     Ok(())
 }
 
@@ -215,6 +218,10 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
         .optional()?
         .ok_or_else(|| agent_missing(id))?;
     touch_agent(cx, id)?;
+    // Before `ended` releases the boards it coordinates.
+    if let Some(said) = &update.said {
+        crate::ops::updates::record_said(cx, id, said)?;
+    }
     let state = enum_str(&update.state);
     cx.db.execute(
         "UPDATE agents SET state = ?2, paused_until = ?3 WHERE id = ?1",

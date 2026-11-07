@@ -6,7 +6,9 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use board_proto::{AgentState, Handoff, Overlap, SnapshotKind, TaskStatus, TouchResult};
+use board_proto::{
+    AgentState, Handoff, Overlap, SAID_CHARS_MAX, SnapshotKind, TaskStatus, TouchResult,
+};
 use common::*;
 use serde_json::{Value, json};
 
@@ -740,10 +742,49 @@ fn stop_stays_quiet_when_nothing_changed_since_the_handoff() {
             "a turn that only read or replied stops quietly"
         );
     }
+    let state = e
+        .stub
+        .requests_to(&state_path())
+        .last()
+        .unwrap()
+        .body
+        .clone();
     assert_eq!(
-        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
-        "idle"
+        (&state["state"], &state["said"]),
+        (&json!("idle"), &json!("Done."))
     );
+}
+
+#[test]
+fn stop_sends_the_turns_last_message_cleaned_and_cut() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at - chrono::Duration::minutes(5));
+    e.stub.on(&handoff_route(), &h);
+    let said = |message: Value| {
+        let stop = e.with(
+            "Stop",
+            json!({"stop_hook_active": false, "last_assistant_message": message}),
+        );
+        assert_eq!(e.hook("stop", "claude", stop).0, None);
+        e.stub
+            .requests_to(&state_path())
+            .last()
+            .unwrap()
+            .body
+            .get("said")
+            .cloned()
+    };
+    assert_eq!(
+        said(json!("  \u{1b}[1mPR open\u{1b}[0m:\n\t- review it\r\n  ")),
+        Some(json!("[1mPR open[0m:\n\t- review it"))
+    );
+    let long = said(json!("y".repeat(SAID_CHARS_MAX + 10))).unwrap();
+    let long = long.as_str().unwrap();
+    assert_eq!(long.chars().count(), SAID_CHARS_MAX);
+    assert!(long.ends_with("y…"), "{long}");
+    assert_eq!(said(json!(" \u{7} ")), None, "nothing left to keep");
+    assert_eq!(said(Value::Null), None, "a runtime without the field");
 }
 
 #[test]
@@ -755,6 +796,18 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
     prompt(&e, "go");
     let reply = stop(&e).expect("a change after the handoff gets the demand");
     assert_eq!(reply["decision"], "block");
+    let blocked = e
+        .stub
+        .requests_to(&state_path())
+        .last()
+        .unwrap()
+        .body
+        .clone();
+    assert_eq!(
+        (blocked["state"].as_str(), blocked.get("said")),
+        (Some("idle"), None),
+        "a blocked Stop is not the end of the turn: nothing to keep"
+    );
     let reason = reply["reason"].as_str().unwrap();
     assert!(
         reason.contains("factory-12")
