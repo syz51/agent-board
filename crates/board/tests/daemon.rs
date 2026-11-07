@@ -1533,6 +1533,21 @@ async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
     assert!(load_adoption(&home_of(&e), &factory()).is_some());
 }
 
+#[test]
+fn the_coordinator_prompt_says_how_to_run_a_climb() {
+    let prompt = board::daemon::coordinator_message(&factory(), false);
+    for rule in [
+        "A climb is a task whose acceptance is a score command",
+        "note starting `score:`",
+        "rounds in a row gain no more than the score's noise",
+        "merges only on the user's decision",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    // Generic: no tool paths of one setup.
+    assert!(!prompt.contains("factory/cli.js"));
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
 async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
