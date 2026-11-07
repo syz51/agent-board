@@ -45,8 +45,12 @@ const PARENT_BUDGET: Duration = Duration::from_millis(400);
 const BUDGET: Duration = Duration::from_millis(1500);
 /// Kept free after the network work for writing state and output.
 const MARGIN: Duration = Duration::from_millis(200);
-/// A reply that misses a deadline shorter than this, because the hook's local steps took the
-/// rest of the budget, counts no strike against the server.
+/// Time for opening a connection to the server, TLS included (well under 0.1 s on a
+/// tailnet). Past it the server counts as unreachable, not slow: a connect that hangs (a
+/// peer asleep or dropping packets) never answers however long the hook waits.
+const CONNECT_BUDGET: Duration = Duration::from_millis(500);
+/// A failure to get an answer within a deadline shorter than this, because the hook's local
+/// steps took the rest of the budget, leaves the breaker as it was.
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
@@ -191,8 +195,6 @@ struct Hook<'a> {
     agent: AgentId,
     input: &'a Value,
     local: AgentLocal,
-    /// At `SessionStart`, and at `PostToolUse` for an edit or a shell call: the work tree.
-    repo: Option<RepoInfo>,
     /// At `PostToolUse`, the files to report, in batches the server takes.
     touches: Vec<Touches>,
     /// At `SessionStart`, the T3 thread that delegated this agent's thread.
@@ -327,7 +329,9 @@ async fn handle(
     };
     steps.mark("t3");
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
-    let client = Client::new(server, token, Some(agent.clone()), Some(remaining))?;
+    let connect = CONNECT_BUDGET.min(remaining);
+    let client =
+        Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?;
     let mut hook = Hook {
         event,
         runtime,
@@ -338,7 +342,6 @@ async fn handle(
         home,
         agent,
         input,
-        repo,
         touches,
         t3_parent,
         done_reminder: None,
@@ -362,7 +365,7 @@ async fn handle(
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
-    let (reply, failure) = match tokio::time::timeout(remaining, hook.online()).await {
+    let (reply, failure) = match tokio::time::timeout(remaining, hook.online(repo)).await {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
             (reply, None)
@@ -385,7 +388,7 @@ async fn handle(
     steps.mark("server");
     let next = match failure {
         // This device left the server too little time to judge it.
-        Some(Failure::Slow) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
+        Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
@@ -439,14 +442,14 @@ enum Failure {
     /// The server did not answer within the hook's budget. It may be busy, or this device
     /// may be; board tools and the CLI, which wait longer, still work.
     Slow,
-    /// The connection failed: refused, DNS, TLS. The server cannot take writes now.
+    /// The connection failed: refused, DNS, TLS, or not open within [`CONNECT_BUDGET`].
+    /// The server cannot take writes now.
     Unreachable,
 }
 
 impl Failure {
     /// A request that timed out after it connected is slow; any other failure to get an
-    /// answer is unreachable. A connect that hangs past the budget counts as slow: the
-    /// client's request deadline fires before its connect deadline.
+    /// answer is unreachable, a connection not opened within [`CONNECT_BUDGET`] included.
     fn of(err: &anyhow::Error) -> Self {
         let timed_out = err
             .chain()
@@ -623,9 +626,10 @@ impl Hook<'_> {
         input_cwd(self.input)
     }
 
-    async fn online(&mut self) -> Result<Reply> {
+    /// `repo`: the work tree, when the local steps detected it.
+    async fn online(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
         match self.event {
-            HookEvent::SessionStart => self.session_start().await,
+            HookEvent::SessionStart => self.session_start(repo).await,
             HookEvent::UserPromptSubmit => self.user_prompt_submit().await,
             // Handled before login (`handle`).
             HookEvent::PreToolUse => Ok(Reply::Nothing),
@@ -762,9 +766,9 @@ impl Hook<'_> {
         self.keep(snap)
     }
 
-    async fn session_start(&mut self) -> Result<Reply> {
+    async fn session_start(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
         let thread = std::env::var(T3_THREAD_ENV).ok().filter(|_| !self.nested);
-        let repo = match self.repo.take() {
+        let repo = match repo {
             Some(repo) => repo,
             None => detect_repo(self.cwd()).await?,
         };

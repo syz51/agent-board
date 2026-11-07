@@ -1684,6 +1684,30 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
 }
 
 #[test]
+fn a_connect_that_hangs_counts_as_unreachable() {
+    let (e, start) = cached_env();
+    // TEST-NET-1 (RFC 5737): packets to it are dropped, so the connect hangs, as to a tailnet
+    // peer that is asleep; where a network refuses it at once, it is unreachable all the same.
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("server = \"http://192.0.2.1:9\"\ndevice = \"{DEVICE}\"\n"),
+    )
+    .unwrap();
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let text = context(&reply, "SessionStart");
+    assert!(text.starts_with("board server unreachable"), "{text}");
+    let open = breaker(&e);
+    assert!(open.get("slow").is_none(), "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    assert!(
+        until - chrono::Utc::now() > chrono::Duration::seconds(50),
+        "{open}"
+    );
+}
+
+#[test]
 fn hooks_without_an_agent_or_login_do_nothing() {
     let e = env();
     let (_, text) = e.hook(

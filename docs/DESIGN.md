@@ -147,9 +147,11 @@ host.
   server for a minute. A reply that misses the budget says the server is slow and that
   board tools and the CLI, which wait longer, still work; the next hook tries again, and
   only three slow replies in a row make the device's hooks skip the server, for ten
-  seconds. A connect that hangs past the budget counts as slow. Any answer resets both.
+  seconds. A connection not open (TLS included) within half a second counts as
+  unreachable. Any answer resets both.
   The server's deadline is set after the hook's local steps (Keychain, process table, T3,
-  git), and a slow reply counts no strike when those steps left it under half a second.
+  git), and a failure changes nothing when those steps left the server under half a
+  second.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
