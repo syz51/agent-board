@@ -174,11 +174,11 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
-| `PreToolUse` on `Bash` (both runtimes) | Mark when the call started, in a local file, when logged in; no server call |
+| `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
-| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
+| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
@@ -187,6 +187,18 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 T3 Code runs Claude Code and Codex underneath, so these hooks fire in T3 threads too; T3
 adds the thread id (agent id) and `t3 thread start/send` (used by the daemon).
+
+Overlaps and alerts leave out work that is one piece:
+
+- A thread and those it delegated, down every level (each child's `t3_parent` names
+  its parent's thread), never overlap each other: no overlap in a touch's answer, no
+  lease conflict, and no overlap or new-agent alert between them. Two children of one
+  parent are peers, and so are their lines.
+- "new agent on your repo and branch" is raised only when that peer has already touched
+  (within the touch window) or leased a path the agent touched or leased. A peer that
+  arrives with nothing is no news; the overlap alerts report it once it reaches the
+  agent's files. A transcript scan (2026-11-07) found 76 such alerts in 20 sessions, one
+  per peer, and only 2 of those peers ever overlapped the agent afterwards.
 
 ## Autopilot and the coordinator
 
