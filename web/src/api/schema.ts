@@ -48,6 +48,31 @@ export const board = object({
   updated_at: timestamp,
 });
 
+export const RESOLUTION_KINDS = ["routed", "duplicate", "forwarded", "declined"] as const;
+
+/** How a feedback item was resolved; `task` is set for routed and duplicate. */
+const feedbackResolution = object({
+  kind: oneOf(...RESOLUTION_KINDS),
+  task: nullable(string),
+  reason: nullable(string),
+  at: timestamp,
+  by: string,
+});
+
+/** A feedback item's report: set only on tasks filed through `POST /v1/feedback`. */
+const feedback = object({
+  about: string,
+  activity: nullable(string),
+  source: oneOf("agent", "capture", "signal"),
+  signature: string,
+  reports: integer,
+  reporters: array(string),
+  last_reported_at: timestamp,
+  resolution: nullable(feedbackResolution),
+  /** An earlier item for the same report, resolved and fixed, that came back. */
+  recurs: nullable(string),
+});
+
 export const task = object({
   id: string,
   board: string,
@@ -69,6 +94,7 @@ export const task = object({
   version: integer,
   created_at: timestamp,
   updated_at: timestamp,
+  feedback: nullable(feedback),
 });
 
 /**
@@ -165,6 +191,7 @@ export const apiError = object({ code: string, message: string, next: nullable(s
 export type Board = Decoded<typeof board>;
 export type StatusCounts = Decoded<typeof statusCounts>;
 export type Task = Decoded<typeof task>;
+export type Feedback = NonNullable<Task["feedback"]>;
 export type TaskStatus = Task["status"];
 export type Priority = Task["priority"];
 export type TaskDetail = Decoded<typeof taskDetail>;

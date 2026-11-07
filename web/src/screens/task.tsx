@@ -1,5 +1,5 @@
 import { api } from "../api/client.ts";
-import type { Agent, BoardEvent, Evidence, Task, TaskDetail } from "../api/schema.ts";
+import type { Agent, BoardEvent, Evidence, Feedback, Task, TaskDetail } from "../api/schema.ts";
 import { tags } from "../live/refresh.ts";
 import { useResource } from "../live/runtime.ts";
 import { Markdown, PlainText, SafeLink, safeHref } from "../text/markdown.tsx";
@@ -110,6 +110,8 @@ function TaskView(
         </div>
       )}
 
+      {task.feedback && <FeedbackFacts feedback={task.feedback} agents={agents} related={related} />}
+
       <TaskLinks title="Blocked by" ids={task.blockers} related={related} />
       <TaskLinks title="Blocks" ids={detail.blocks} related={related} />
       {task.parent && <TaskLinks title="Parent" ids={[task.parent]} related={related} />}
@@ -182,6 +184,89 @@ function TaskView(
   );
 }
 
+function FeedbackFacts(
+  { feedback, agents, related }: {
+    feedback: Feedback;
+    agents: Map<string, Agent>;
+    related: Map<string, Task>;
+  },
+) {
+  const { resolution } = feedback;
+  return (
+    <section class="section section-tight">
+      <h2>Feedback</h2>
+      <dl class="facts">
+        <div>
+          <dt>About</dt>
+          <dd>
+            <code>{feedback.about}</code>
+            {feedback.activity && <span class="muted">while {feedback.activity}</span>}
+          </dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd>{feedback.source}</dd>
+        </div>
+        <div>
+          <dt>Reports</dt>
+          <dd>
+            <span>
+              {feedback.reports} from{" "}
+              {feedback.reporters.map((id, index) => (
+                <span key={id}>
+                  {index > 0 && ", "}
+                  <Who id={id} agents={agents} />
+                </span>
+              ))}
+            </span>
+            <span class="muted">
+              last <RelTime at={feedback.last_reported_at} />
+            </span>
+          </dd>
+        </div>
+        <div>
+          <dt>Resolution</dt>
+          <dd>
+            {resolution
+              ? (
+                <>
+                  <span class="chip">{resolution.kind}</span>
+                  {resolution.task && <TaskRef id={resolution.task} related={related} />}
+                  {resolution.reason && <PlainText text={resolution.reason} />}
+                  <span class="muted">
+                    by {resolution.by === "user" ? "you" : <Who id={resolution.by} agents={agents} />}{" "}
+                    <RelTime at={resolution.at} />
+                  </span>
+                </>
+              )
+              : <span class="muted">Unresolved</span>}
+          </dd>
+        </div>
+        {feedback.recurs && (
+          <div>
+            <dt>Recurs</dt>
+            <dd>
+              <TaskRef id={feedback.recurs} related={related} />
+              <span class="muted">came back after that fix</span>
+            </dd>
+          </div>
+        )}
+      </dl>
+    </section>
+  );
+}
+
+/** A link to a task, with its status and title when it is on this board. */
+function TaskRef({ id, related }: { id: string; related: Map<string, Task> }) {
+  const task = related.get(id);
+  return (
+    <>
+      <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
+      {task && <StatusBadge status={task.status} ready={task.ready} />}
+    </>
+  );
+}
+
 function TaskLinks(
   { title, ids, related }: { title: string; ids: string[]; related: Map<string, Task> },
 ) {
@@ -194,13 +279,8 @@ function TaskLinks(
           const task = related.get(id);
           return (
             <li key={id}>
-              <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
-              {task && (
-                <>
-                  <StatusBadge status={task.status} ready={task.ready} />
-                  <PlainText text={task.title} />
-                </>
-              )}
+              <TaskRef id={id} related={related} />
+              {task && <PlainText text={task.title} />}
             </li>
           );
         })}

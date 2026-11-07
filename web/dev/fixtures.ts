@@ -223,6 +223,7 @@ export function createFixtures(now: number): Fixtures {
     auto: true,
     created_by: id("t3:c2d0"),
     version: version++,
+    feedback: null,
     created_at: ago(createdAgo),
     updated_at: ago(updatedAgo),
     ...fields,
@@ -336,6 +337,49 @@ export function createFixtures(now: number): Fixtures {
 
     task({ id: "docs-1", title: "Rewrite the install guide", status: "open", owner: null }, 5 * day, 5 * day),
     task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
+    task(
+      {
+        id: "docs-3",
+        title: "The install guide skips the token step",
+        body: "The install guide skips the token step\n\nI had to read the CLI source to find `board login`.",
+        status: "done",
+        owner: id("t3:61aa"),
+        feedback: {
+          about: "instructions",
+          activity: "operate",
+          source: "agent",
+          signature: "instructions:the install guide skips the token step",
+          reports: 3,
+          reporters: [id("t3:9d02"), id("t3:a91c"), id("t3:61aa")],
+          last_reported_at: ago(2 * day),
+          resolution: { kind: "routed", task: "docs-1", reason: null, at: ago(2 * day), by: "user" },
+          recurs: null,
+        },
+      },
+      4 * day,
+      2 * day,
+    ),
+    task(
+      {
+        id: "docs-4",
+        title: "claim_refused from POST /v1/tasks/{id}/claim: AGENT owns ID (seen Nm ago)",
+        status: "open",
+        auto: false,
+        feedback: {
+          about: "board",
+          activity: null,
+          source: "signal",
+          signature: "signal:claim_refused:3f9a0c2b71de",
+          reports: 4,
+          reporters: [id("t3:7f3a"), id("t3:a91c")],
+          last_reported_at: ago(40),
+          resolution: null,
+          recurs: "docs-3",
+        },
+      },
+      day,
+      40,
+    ),
   ];
 
   const handoffs: Handoff[] = [
