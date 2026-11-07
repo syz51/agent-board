@@ -125,6 +125,9 @@ pub struct ResolvedCounts {
     pub duplicate: u32,
     pub forwarded: u32,
     pub declined: u32,
+    /// Absent from servers that predate the `fixed` kind.
+    #[serde(default)]
+    pub fixed: u32,
 }
 
 /// Longest feedback `about`.
@@ -168,7 +171,7 @@ pub struct ResolveFeedback {
     /// Required for `routed` and `duplicate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
-    /// Required for `forwarded` and `declined`; at most 280 characters.
+    /// Required for `forwarded`, `declined` and `fixed`; at most 280 characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -524,6 +527,45 @@ mod tests {
             ..create
         };
         assert_eq!(serde_json::to_value(&claimed).unwrap()["claim"], true);
+    }
+
+    /// Resolution counts from servers that predate `fixed` still parse.
+    #[test]
+    fn resolved_counts_without_fixed_parse() {
+        let counts: ResolvedCounts = serde_json::from_value(serde_json::json!({
+            "routed": 1, "duplicate": 2, "forwarded": 3, "declined": 4,
+        }))
+        .unwrap();
+        assert_eq!((counts.declined, counts.fixed), (4, 0));
+        let counts: ResolvedCounts = serde_json::from_value(serde_json::json!({
+            "routed": 0, "duplicate": 0, "forwarded": 0, "declined": 0, "fixed": 5,
+        }))
+        .unwrap();
+        assert_eq!(counts.fixed, 5);
+    }
+
+    /// A resolution kind or event type added by a newer server reads as `Unknown`, so a
+    /// running client can still read the item or the event; known values are unchanged.
+    #[test]
+    fn newer_resolution_kinds_and_event_types_read_as_unknown() {
+        let resolution: crate::FeedbackResolution = serde_json::from_value(serde_json::json!({
+            "kind": "rerouted_somewhere", "reason": "x",
+            "at": "2026-11-07T12:00:00Z", "by": "t3:a",
+        }))
+        .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unknown);
+        let fixed: ResolutionKind = serde_json::from_value(serde_json::json!("fixed")).unwrap();
+        assert_eq!(fixed, ResolutionKind::Fixed);
+        assert_eq!(serde_json::to_value(fixed).unwrap(), "fixed");
+        let event: crate::Event = serde_json::from_value(serde_json::json!({
+            "seq": 1, "at": "2026-11-07T12:00:00Z", "board": null, "actor": "server",
+            "type": "board_renamed", "task": null, "payload": {},
+        }))
+        .unwrap();
+        assert_eq!(event.event_type, crate::EventType::Unknown);
+        let done: crate::EventType =
+            serde_json::from_value(serde_json::json!("task_done")).unwrap();
+        assert_eq!(done, crate::EventType::TaskDone);
     }
 
     /// A created ask is an `Ask` on the wire; `warning` is an optional extra field.

@@ -187,6 +187,9 @@ pub enum Command {
         /// Not acted on: say why.
         #[arg(long, group = "resolution", value_name = "REASON")]
         declined: Option<String>,
+        /// You fixed the cause yourself: say what changed.
+        #[arg(long, group = "resolution", value_name = "WHAT CHANGED")]
+        fixed: Option<String>,
     },
     /// Run the MCP server on stdio.
     Mcp,
@@ -712,12 +715,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             duplicate,
             forwarded,
             declined,
+            fixed,
         } => {
-            let (kind, task, reason) = match (routed, duplicate, forwarded, declined) {
+            let (kind, task, reason) = match (routed, duplicate, forwarded, declined, fixed) {
                 (Some(task), ..) => (ResolutionKind::Routed, Some(task), None),
                 (_, Some(task), ..) => (ResolutionKind::Duplicate, Some(task), None),
-                (_, _, Some(reason), _) => (ResolutionKind::Forwarded, None, Some(reason)),
-                (.., Some(reason)) => (ResolutionKind::Declined, None, Some(reason)),
+                (_, _, Some(reason), ..) => (ResolutionKind::Forwarded, None, Some(reason)),
+                (_, _, _, Some(reason), _) => (ResolutionKind::Declined, None, Some(reason)),
+                (.., Some(reason)) => (ResolutionKind::Fixed, None, Some(reason)),
                 _ => unreachable!("clap requires one resolution"),
             };
             let req = ResolveFeedback { kind, task, reason };
