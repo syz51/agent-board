@@ -68,7 +68,13 @@ struct StubState {
     hang: Option<Duration>,
     /// Routes answered as a server-sent event stream: the events after the request's
     /// `since`, then nothing more while the connection stays open.
-    streams: BTreeMap<String, Vec<board_proto::Event>>,
+    streams: BTreeMap<String, Stream>,
+}
+
+struct Stream {
+    events: Vec<board_proto::Event>,
+    /// Each connection carries the first event after `since` and then ends.
+    flapping: bool,
 }
 
 #[derive(Clone)]
@@ -160,11 +166,30 @@ impl Stub {
     /// Answers `route` as an event stream carrying the `events` after the request's
     /// `since`, then staying open and silent: no event and no keep-alive.
     pub fn on_stream(&self, route: &str, events: Vec<board_proto::Event>) -> &Self {
+        let stream = Stream {
+            events,
+            flapping: false,
+        };
         self.state
             .lock()
             .unwrap()
             .streams
-            .insert(route.to_owned(), events);
+            .insert(route.to_owned(), stream);
+        self
+    }
+
+    /// Answers `route` as an event stream that carries the first of `events` after the
+    /// request's `since` and then ends, as a flapping connection would.
+    pub fn on_flapping_stream(&self, route: &str, events: Vec<board_proto::Event>) -> &Self {
+        let stream = Stream {
+            events,
+            flapping: true,
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(route.to_owned(), stream);
         self
     }
 
@@ -229,10 +254,11 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             body,
         });
         let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
-        let stream = st.streams.get(&route).map(|events| {
-            events
-                .iter()
-                .filter(|e| e.seq > since)
+        let stream = st.streams.get(&route).map(|stream| {
+            let after = stream.events.iter().filter(|e| e.seq > since);
+            let take = if stream.flapping { 1 } else { usize::MAX };
+            let text = after
+                .take(take)
                 .map(|e| {
                     format!(
                         "id: {}\ndata: {}\n\n",
@@ -240,7 +266,8 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
                         serde_json::to_string(e).unwrap()
                     )
                 })
-                .collect::<String>()
+                .collect::<String>();
+            (text, stream.flapping)
         });
         (
             once.or_else(|| st.routes.get(&route).cloned()),
@@ -248,10 +275,14 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             stream,
         )
     };
-    if let Some(text) = stream {
-        let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>(text)])
-            .chain(futures_util::stream::pending());
-        let mut resp = Response::new(Body::from_stream(chunks));
+    if let Some((text, flapping)) = stream {
+        let sent = futures_util::stream::iter([Ok::<_, std::io::Error>(text)]);
+        let body = if flapping {
+            Body::from_stream(sent)
+        } else {
+            Body::from_stream(sent.chain(futures_util::stream::pending()))
+        };
+        let mut resp = Response::new(body);
         resp.headers_mut().insert(
             "content-type",
             HeaderValue::from_static("text/event-stream"),

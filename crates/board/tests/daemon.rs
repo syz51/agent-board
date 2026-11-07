@@ -56,6 +56,8 @@ struct FakeT3 {
     fail_send: Arc<AtomicBool>,
     /// `t3 thread send` runs out of time while set, after it may have delivered.
     time_out_send: Arc<AtomicBool>,
+    /// Threads whose `t3 thread show` never answers.
+    hang_info: Arc<Mutex<Vec<String>>>,
     /// What `t3 thread list` shows, by title.
     listed: Arc<Mutex<Vec<(String, ListedThread)>>>,
     /// When T3 creates a thread.
@@ -152,6 +154,9 @@ impl T3 for FakeT3 {
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
+        if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
+            std::future::pending::<()>().await;
+        }
         Ok(self.threads.lock().unwrap().get(thread).cloned())
     }
 
@@ -1718,9 +1723,10 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
         .env("BOARD_KEYCHAIN", "0")
         .env_remove("T3CODE_THREAD_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("BOARD_LOG")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let streams = || stub.requests_to("GET /v1/events").len();
@@ -1749,6 +1755,18 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
     assert!(status.success(), "{status:?}");
     let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
     assert_eq!(saved.last_seq, Some(5), "state saved on the way out");
+    // What it did is in watch.log (its stderr) at the default log level.
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut log).unwrap();
+    for line in [
+        "watching as device mac-test",
+        "event stream open after #5",
+        "event stream ended; reconnecting in 1.0s",
+        "event stream ended; reconnecting in 2.0s",
+        "stopping",
+    ] {
+        assert!(log.contains(line), "{line:?} not in:\n{log}");
+    }
 }
 
 const ADOPTED: &str = "mcp:launch:existing";
@@ -2321,6 +2339,8 @@ fn following_env(request: Duration) -> Env {
         reconcile_budget: Duration::from_secs(60),
         flush_budget: Duration::from_millis(300),
         stop_budget: Duration::from_secs(1),
+        thread_check: Duration::from_secs(10),
+        reconnect_first: Duration::from_secs(1),
     };
     stub.on("GET /v1/boards", Vec::<Board>::new());
     Env {
@@ -2547,4 +2567,193 @@ fn a_second_watch_on_the_same_home_exits_naming_the_first() {
     let third = watch(Stdio::null());
     wait_connected(2);
     stop(third);
+}
+
+#[tokio::test]
+async fn a_hanging_thread_check_holds_up_no_other_board() {
+    let mut e = env();
+    e.daemon.timing.thread_check = Duration::from_millis(300);
+    let mut boards = Vec::new();
+    for (slug, thread) in [("factory", "coord"), ("other", "hung"), ("third", "slow")] {
+        let agent = format!("t3:{thread}");
+        e.t3.live(thread);
+        e.daemon.state.coordinators.insert(
+            slug.parse().unwrap(),
+            Coordinator {
+                thread: thread.into(),
+                agent: agent.parse().unwrap(),
+                started_at: at(),
+                renewed_at: at(),
+                resumed_after: None,
+                registered: true,
+            },
+        );
+        let mut board = autopilot(Some(&agent), &[DEVICE]);
+        board.slug = slug.parse().unwrap();
+        e.stub
+            .on(&format!("POST /v1/boards/{slug}/coordinator"), &board);
+        e.stub.on(
+            &format!("GET {}", agent_path(&agent)),
+            agent_fixture(&agent, DEVICE, AgentState::Idle),
+        );
+        boards.push(board);
+    }
+    e.stub.on("GET /v1/boards", &boards);
+    // T3 answers for no thread: one after another, the checks would take 900 ms.
+    e.t3.hang_info
+        .lock()
+        .unwrap()
+        .extend(["coord".into(), "hung".into(), "slow".into()]);
+
+    let started = Instant::now();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(11))
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(700),
+        "the checks ran side by side, each cut at 300 ms: {took:?}"
+    );
+    for slug in ["factory", "other", "third"] {
+        assert_eq!(
+            e.stub
+                .requests_to(&format!("POST /v1/boards/{slug}/coordinator"))
+                .len(),
+            1,
+            "{slug}: renewed, a check that never answers being no sign the thread is gone"
+        );
+    }
+    assert_eq!(e.daemon.state.coordinators.len(), 3, "none replaced");
+}
+
+#[tokio::test]
+async fn a_flapping_stream_backs_off_although_each_connection_carries_an_event() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.reconnect_first = Duration::from_millis(50);
+    let events = (6..60)
+        .map(|seq| {
+            let mut ev = event(seq, EventType::TaskUpdated, None, "t3:someone");
+            ev.board = None;
+            ev
+        })
+        .collect();
+    e.stub.on_flapping_stream("GET /v1/events", events);
+
+    follow_until(&mut e, Duration::from_millis(1200), |_, _| false).await;
+    // Backing off: opened at about 0, 50, 150, 350 and 750 ms; one per 50 ms otherwise.
+    let opened = e.stub.requests_to("GET /v1/events").len();
+    assert!((3..=7).contains(&opened), "opened {opened} times in 1.2 s");
+    let handled = e.daemon.state.last_seq.unwrap() - 5;
+    assert!(
+        handled >= opened as i64 - 1,
+        "each connection's event was handled: {handled} of {opened}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_watch_state_is_kept_aside_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 9}));
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    stub.on(
+        "GET /v1/events",
+        board_proto::EventsPage {
+            events: vec![],
+            next_since: 9,
+        },
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("watch.json"), "{\"last_seq\": 4, \"wakes\": tru").unwrap();
+
+    let out = board(&home, dir.path(), &[], &["watch", "--once"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("watch.json: cannot read it") && log.contains("starting fresh"),
+        "{log}"
+    );
+    let copies: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|f| f.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("watch.json.unreadable-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(
+        std::fs::read_to_string(state.join(&copies[0])).unwrap(),
+        "{\"last_seq\": 4, \"wakes\": tru"
+    );
+    let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
+    assert_eq!(
+        saved.last_seq,
+        Some(9),
+        "started fresh from the server's seq"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_coordinator_start_is_logged() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
+    stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(&format!("t3:{NEW_THREAD}"), DEVICE, AgentState::Running),
+    );
+    stub.on(
+        "GET /v1/events",
+        board_proto::EventsPage {
+            events: vec![],
+            next_since: 5,
+        },
+    );
+    let t3 = dir.path().join("t3");
+    std::fs::write(
+        &t3,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             'thread start') cat >/dev/null; echo '{{\"threadId\":\"{NEW_THREAD}\"}}' ;;\n\
+             'thread show') echo '{{\"thread\":{{\"archived\":false}}}}' ;;\n\
+             'thread list') echo '{{\"threads\":[]}}' ;;\n\
+             *) cat >/dev/null ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = home_for(dir.path(), &stub.url);
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "{config}t3_bin = {:?}\n[projects]\n{REPO:?} = \"/src/agent-board\"\n",
+            t3.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let out = board(&home, dir.path(), &[], &["watch", "--once"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains(&format!(
+            "started coordinator thread {NEW_THREAD} for factory"
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("t3:{NEW_THREAD} coordinates factory")),
+        "{log}"
+    );
 }

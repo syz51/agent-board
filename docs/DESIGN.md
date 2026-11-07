@@ -322,7 +322,13 @@ registers without a repo).
     with no bytes for 45 seconds (the server sends a keep-alive every 15) is reopened
     after the last event handled. A queue backing off after a failed check or send costs
     no request until its retry time, and the event retries stop at the first that still
-    fails.
+    fails. The boards' `t3 thread show` checks run side by side, 10 seconds each; one that
+    fails or runs out of time still renews a named coordinator, and only a check that
+    answers replaces it. The reconnect delay (1 second, doubled up to a minute) resets
+    only after a connection that lasted a minute. An unreadable `watch.json` is copied to
+    `watch.json.unreadable-<time>` with a warning before the daemon starts fresh. The
+    daemon logs its starts, adoptions, reconnects and stops at INFO in `watch.log`; the
+    rest of the binary logs only warnings.
 - **Reporting to the user**: a coordinator's chat is a poor channel to the user, because a
   wake arrives as the thread's next turn and buries whatever the last turn said. So what
   the user should read goes to the board instead: every `task_done` carries a `summary`,

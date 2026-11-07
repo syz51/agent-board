@@ -74,8 +74,8 @@ pub const START_RETRY_MAX: TimeDelta = TimeDelta::minutes(30);
 /// Events whose handling failed on a transient error are retried for this long.
 pub const RETRY_EVENTS_FOR: TimeDelta = TimeDelta::minutes(30);
 const RETRY_EVENTS_MAX: usize = 500;
-/// Event stream reconnect delay: doubled per failed or short-lived connection, up to the cap.
-const RECONNECT_FIRST: Duration = Duration::from_secs(1);
+/// The cap of the event stream's reconnect delay, which doubles per failed or short-lived
+/// connection from [`Timing::reconnect_first`].
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 /// A connection that stayed open this long resets the reconnect delay.
 const STREAM_HEALTHY: Duration = Duration::from_secs(60);
@@ -98,6 +98,11 @@ pub struct Timing {
     pub flush_budget: Duration,
     /// The last flush before exiting gets this long; what it does not send stays saved.
     pub stop_budget: Duration,
+    /// Each board's `t3 thread show` gets this long. The boards' checks run side by side,
+    /// so a slow T3 for one thread delays a reconcile by this much at most.
+    pub thread_check: Duration,
+    /// The first delay before reopening the event stream.
+    pub reconnect_first: Duration,
 }
 
 impl Default for Timing {
@@ -109,6 +114,8 @@ impl Default for Timing {
             reconcile_budget: Duration::from_secs(90),
             flush_budget: Duration::from_secs(30),
             stop_budget: Duration::from_secs(10),
+            thread_check: Duration::from_secs(10),
+            reconnect_first: Duration::from_secs(1),
         }
     }
 }
@@ -401,7 +408,8 @@ pub struct Daemon<T: T3> {
 impl<T: T3> Daemon<T> {
     /// A daemon acting as the device of `ctx` (whose client must carry no agent id).
     pub fn new(ctx: Ctx, t3: T) -> Self {
-        let state = load_watch_state(&ctx.home);
+        // A file it cannot read is kept aside rather than lost on the next save.
+        let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
         Self {
             ctx,
             t3,
@@ -431,6 +439,7 @@ impl<T: T3> Daemon<T> {
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
+        let mut checks = self.check_threads(&boards).await;
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -440,7 +449,8 @@ impl<T: T3> Daemon<T> {
                 }
                 continue;
             }
-            if let Err(err) = self.reconcile_board(board, now).await {
+            let check = checks.remove(&board.slug);
+            if let Err(err) = self.reconcile_board(board, now, check).await {
                 tracing::warn!("coordinator of {}: {err:#}", board.slug);
             }
         }
@@ -455,7 +465,46 @@ impl<T: T3> Daemon<T> {
         self.save()
     }
 
-    async fn reconcile_board(&mut self, board: &Board, now: Timestamp) -> Result<()> {
+    /// Whether each coordinator thread of ours that a home board still leaves to us is live,
+    /// by board: asked side by side, each within [`Timing::thread_check`].
+    async fn check_threads(&self, boards: &[Board]) -> BTreeMap<BoardSlug, Result<bool>> {
+        let ours: Vec<(BoardSlug, String)> = boards
+            .iter()
+            .filter(|board| self.is_home(board))
+            .filter_map(|board| {
+                let local = self.state.coordinators.get(&board.slug)?;
+                board
+                    .coordinator
+                    .as_ref()
+                    .is_none_or(|c| *c == local.agent)
+                    .then(|| (board.slug.clone(), local.thread.clone()))
+            })
+            .collect();
+        let checked =
+            futures_util::future::join_all(ours.iter().map(|(_, thread)| self.thread_live(thread)))
+                .await;
+        ours.into_iter()
+            .map(|(slug, _)| slug)
+            .zip(checked)
+            .collect()
+    }
+
+    /// Whether T3 has `thread` and has not archived it.
+    async fn thread_live(&self, thread: &str) -> Result<bool> {
+        let limit = self.timing.thread_check;
+        match tokio::time::timeout(limit, self.t3.thread_info(thread)).await {
+            Ok(info) => Ok(info?.is_some_and(|t| !t.archived)),
+            Err(_) => Err(TimedOut(format!("t3 thread show {thread}")).into()),
+        }
+    }
+
+    /// `check` is what [`Self::check_threads`] found of the board's thread, if it asked.
+    async fn reconcile_board(
+        &mut self,
+        board: &Board,
+        now: Timestamp,
+        check: Option<Result<bool>>,
+    ) -> Result<()> {
         let slug = &board.slug;
         // Our own coordinator whose thread is gone: replace it whatever its agent record says.
         let mut ours_gone = false;
@@ -463,13 +512,26 @@ impl<T: T3> Daemon<T> {
             // No coordinator named: the lease lapsed (the device slept) or the start did not
             // finish. The thread may still be ours to run.
             if board.coordinator.as_ref().is_none_or(|c| *c == local.agent) {
-                let live = self
-                    .t3
-                    .thread_info(&local.thread)
-                    .await?
-                    .is_some_and(|t| !t.archived);
+                let named = board.coordinator.is_some() && local.registered;
+                let live = match check {
+                    Some(check) => check,
+                    None => self.thread_live(&local.thread).await,
+                };
+                let live = match live {
+                    Ok(live) => live,
+                    // A failed check says nothing of the thread: the named coordinator keeps
+                    // its lease, and only a check that answers replaces it.
+                    Err(err) if named => {
+                        tracing::warn!(
+                            "coordinator of {slug}: checking thread {}: {err:#}; renewing it as live",
+                            local.thread
+                        );
+                        true
+                    }
+                    Err(err) => return Err(err),
+                };
                 if live {
-                    return if board.coordinator.is_some() && local.registered {
+                    return if named {
                         self.keep_alive(board, local, now).await
                     } else {
                         self.adopt(board, local, now).await
@@ -1612,6 +1674,11 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
     let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
+    tracing::info!(
+        "watching as device {} with {}",
+        ctx.device,
+        t3.bin.display()
+    );
     let mut daemon = Daemon::new(ctx, t3);
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
@@ -1709,7 +1776,8 @@ impl<T: T3> Daemon<T> {
     /// asks it to stop. Each step races the request to stop, so a step that waits on a
     /// server or `t3` never delays the exit.
     pub async fn follow(&mut self, shutdown: &mut Shutdown) -> Result<()> {
-        let mut delay = RECONNECT_FIRST;
+        let first = self.timing.reconnect_first;
+        let mut delay = first;
         let mut reconcile_tick = tokio::time::interval(self.timing.reconcile_every);
         let mut flush_tick = tokio::time::interval(self.timing.flush_every);
         let mut reconcile_needed = false;
@@ -1722,22 +1790,28 @@ impl<T: T3> Daemon<T> {
             let resp = match connected {
                 Ok(resp) => resp,
                 Err(err) => {
-                    tracing::warn!("event stream: {err:#}; retrying in {}s", delay.as_secs());
+                    tracing::warn!(
+                        "event stream: {err:#}; retrying in {:.1}s",
+                        delay.as_secs_f32()
+                    );
                     if wait_to_reconnect(shutdown, &mut delay).await {
                         return self.stop().await;
                     }
                     continue;
                 }
             };
+            tracing::info!(
+                "event stream open after #{}",
+                self.state.last_seq.unwrap_or(0)
+            );
             let opened = tokio::time::Instant::now();
             let mut stream = Box::pin(idle_limited(resp, self.timing.stream_idle).eventsource());
             loop {
                 let step = tokio::select! {
                     item = stream.next() => match item {
-                        Some(Ok(message)) => {
-                            delay = RECONNECT_FIRST;
-                            Step::Event(message.data)
-                        }
+                        // The delay resets only after a stable connection (below), so a
+                        // stream that drops after each event still backs off.
+                        Some(Ok(message)) => Step::Event(message.data),
                         Some(Err(err)) => {
                             tracing::warn!("event stream: {err}");
                             break;
@@ -1758,9 +1832,12 @@ impl<T: T3> Daemon<T> {
                 }
             }
             if opened.elapsed() >= STREAM_HEALTHY {
-                delay = RECONNECT_FIRST;
+                delay = first;
             }
-            tracing::info!("event stream ended; reconnecting in {}s", delay.as_secs());
+            tracing::info!(
+                "event stream ended; reconnecting in {:.1}s",
+                delay.as_secs_f32()
+            );
             if wait_to_reconnect(shutdown, &mut delay).await {
                 return self.stop().await;
             }
