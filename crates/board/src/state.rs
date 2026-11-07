@@ -305,21 +305,7 @@ fn older_than(path: &Path, age: std::time::Duration) -> Result<bool> {
         .is_ok_and(|elapsed| elapsed > age))
 }
 
-/// Until when this device's hooks skip the server after it failed to answer.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Offline {
-    until: Option<Timestamp>,
-}
-
-pub fn load_offline_until(home: &Home) -> Option<Timestamp> {
-    load_named::<Offline>(home, "offline").until
-}
-
-pub fn save_offline_until(home: &Home, until: Option<Timestamp>) -> Result<()> {
-    save_named(home, "offline", &Offline { until })
-}
-
-/// Generic named state file, for the daemon.
+/// Generic named state file, for the daemon and the hooks' breaker.
 pub fn load_named<T: DeserializeOwned + Default>(home: &Home, name: &str) -> T {
     read_json(&home.state_dir().join(format!("{name}.json"))).unwrap_or_default()
 }

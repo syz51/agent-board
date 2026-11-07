@@ -45,9 +45,16 @@ const PARENT_BUDGET: Duration = Duration::from_millis(400);
 const BUDGET: Duration = Duration::from_millis(1500);
 /// Kept free after the network work for writing state and output.
 const MARGIN: Duration = Duration::from_millis(200);
-/// After the server fails to answer, hooks on this device use the cache for this long
-/// instead of waiting on it again.
+/// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
+/// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
+/// Replies that missed the hook's budget, in a row, before hooks on this device stop asking
+/// for [`SLOW_BACKOFF`]. One slow reply (a busy Mac, a long query) opens nothing.
+const SLOW_STRIKES: u32 = 3;
+/// How long hooks on this device use the cache after [`SLOW_STRIKES`] slow replies.
+const SLOW_BACKOFF: Duration = Duration::from_secs(10);
+/// The device's breaker file in `$BOARD_HOME/state`, shared by every hook on the device.
+const BREAKER: &str = "offline";
 /// Heartbeats and alert checks from `PostToolUse` happen at most this often.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
@@ -299,38 +306,118 @@ async fn handle(
         }
         _ => {}
     }
-    let offline_until = state::load_offline_until(&hook.home);
-    if offline_until.is_some_and(|until| until > hook.now) {
-        let reply = hook.offline();
+    let breaker: Breaker = state::load_named(&hook.home, BREAKER);
+    if let Some(failure) = breaker.open_at(hook.now) {
+        let reply = hook.offline(failure);
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
-    let unreachable = |hook: &mut Hook<'_>| -> Result<Reply> {
-        let backoff = chrono::Duration::from_std(OFFLINE_BACKOFF)?;
-        state::save_offline_until(&hook.home, Some(hook.now + backoff))?;
-        Ok(hook.offline())
-    };
-    let reply = match tokio::time::timeout(remaining, hook.online()).await {
+    let (reply, failure) = match tokio::time::timeout(remaining, hook.online()).await {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
-            if offline_until.is_some() {
-                state::save_offline_until(&hook.home, None)?;
-            }
-            reply
+            (reply, None)
         }
         // The server answered with an error: it is reachable, so the cache is no better.
         Ok(Err(err)) if crate::client::error_code(&err).is_some() => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            hook.local_stop()
+            (hook.local_stop(), None)
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            unreachable(&mut hook)?
+            let failure = Failure::of(&err);
+            (hook.offline(failure), Some(failure))
         }
-        Err(_) => unreachable(&mut hook)?,
+        Err(_) => {
+            tracing::debug!("hook {}: no answer within {remaining:?}", event.name());
+            (hook.offline(Failure::Slow), Some(Failure::Slow))
+        }
     };
+    let next = breaker.after(failure, hook.now)?;
+    if next != breaker {
+        state::save_named(&hook.home, BREAKER, &next)?;
+    }
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// Why the hook got no answer from the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The server did not answer within the hook's budget. It may be busy, or this device
+    /// may be; board tools and the CLI, which wait longer, still work.
+    Slow,
+    /// The connection failed: refused, DNS, TLS. The server cannot take writes now.
+    Unreachable,
+}
+
+impl Failure {
+    /// A request that timed out after it connected is slow; any other failure to get an
+    /// answer is unreachable. A connect that hangs past the budget counts as slow: the
+    /// client's request deadline fires before its connect deadline.
+    fn of(err: &anyhow::Error) -> Self {
+        let timed_out = err
+            .chain()
+            .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+            .any(|e| e.is_timeout() && !e.is_connect());
+        if timed_out {
+            Self::Slow
+        } else {
+            Self::Unreachable
+        }
+    }
+}
+
+/// The device's breaker (`state/offline.json`): while it is open, hooks use the cache
+/// without trying the server. A failed connection opens it for [`OFFLINE_BACKOFF`];
+/// [`SLOW_STRIKES`] slow replies in a row open it for [`SLOW_BACKOFF`]. Any answer closes it.
+/// Hooks running at once may each count the same strike; the count is a rough guide.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Breaker {
+    /// Until when hooks skip the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    until: Option<Timestamp>,
+    /// The breaker opened on slow replies, not on a failed connection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    slow: bool,
+    /// Slow replies in a row since the server last answered in time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    strikes: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl Breaker {
+    /// Why hooks skip the server at `now`; `None` when they should try it.
+    fn open_at(&self, now: Timestamp) -> Option<Failure> {
+        let open = self.until.is_some_and(|until| until > now);
+        open.then_some(if self.slow {
+            Failure::Slow
+        } else {
+            Failure::Unreachable
+        })
+    }
+
+    /// The breaker after a hook that tried the server and got `failure`, or an answer.
+    fn after(&self, failure: Option<Failure>, now: Timestamp) -> Result<Self> {
+        Ok(match failure {
+            None => Self::default(),
+            Some(Failure::Unreachable) => Self {
+                until: Some(now + chrono::Duration::from_std(OFFLINE_BACKOFF)?),
+                ..Self::default()
+            },
+            Some(Failure::Slow) if self.strikes + 1 >= SLOW_STRIKES => Self {
+                until: Some(now + chrono::Duration::from_std(SLOW_BACKOFF)?),
+                slow: true,
+                strikes: 0,
+            },
+            Some(Failure::Slow) => Self {
+                strikes: self.strikes + 1,
+                ..Self::default()
+            },
+        })
+    }
 }
 
 /// How long a session's cached decisions outlive its last SessionStart.
@@ -460,10 +547,12 @@ impl Hook<'_> {
     }
 
     /// The server is unreachable or too slow: fall back to the cache.
-    fn offline(&mut self) -> Reply {
+    fn offline(&mut self, failure: Failure) -> Reply {
         match self.event {
-            HookEvent::SessionStart => self.cached_snapshot(),
-            HookEvent::UserPromptSubmit if !self.local.offline_notified => self.cached_snapshot(),
+            HookEvent::SessionStart => self.cached_snapshot(failure),
+            HookEvent::UserPromptSubmit if !self.local.offline_notified => {
+                self.cached_snapshot(failure)
+            }
             HookEvent::PreCompact => self.compact_instructions(None),
             _ => self.local_stop(),
         }
@@ -513,7 +602,7 @@ impl Hook<'_> {
         ))
     }
 
-    fn cached_snapshot(&mut self) -> Reply {
+    fn cached_snapshot(&mut self, failure: Failure) -> Reply {
         let Some(snap) = state::load_cached_snapshot(&self.home, &self.agent) else {
             return Reply::Nothing;
         };
@@ -521,12 +610,17 @@ impl Hook<'_> {
             return Reply::Nothing;
         }
         self.local.offline_notified = true;
-        Reply::Context(format!(
-            "board server unreachable: cached snapshot from {} (seq {}); claims and updates fail until it is back.\n{}",
-            render::ago(snap.at),
-            snap.seq,
-            snap.text
-        ))
+        let (ago, seq) = (render::ago(snap.at), snap.seq);
+        let head = match failure {
+            Failure::Slow => format!(
+                "board server slow (no answer within the hook's {:.1} s): cached snapshot from {ago} (seq {seq}); board tools and the CLI wait longer and still work.",
+                BUDGET.as_secs_f32()
+            ),
+            Failure::Unreachable => format!(
+                "board server unreachable: cached snapshot from {ago} (seq {seq}); claims and updates fail until it is back."
+            ),
+        };
+        Reply::Context(format!("{head}\n{}", snap.text))
     }
 
     async fn set_state(&self, state: AgentState, paused_until: Option<Timestamp>) -> Result<()> {

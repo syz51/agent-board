@@ -142,8 +142,12 @@ host.
   identified by the `Tailscale-User-Login` header that `tailscale serve` adds.
 - Writes fail fast when the server is unreachable: an exclusive claim needs one arbiter.
   Hooks then inject the cached snapshot marked with its age and never delay the agent by more
-  than 1.5 seconds; after one hook finds the server unreachable, the device's hooks use the
-  cache without trying the server for a minute.
+  than 1.5 seconds. A failed connection (refused, DNS, TLS) says the server is unreachable
+  and claims and updates fail, and the device's hooks use the cache without trying the
+  server for a minute. A reply that misses the budget says the server is slow and that
+  board tools and the CLI, which wait longer, still work; the next hook tries again, and
+  only three slow replies in a row make the device's hooks skip the server, for ten
+  seconds. A connect that hangs past the budget counts as slow. Any answer resets both.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,

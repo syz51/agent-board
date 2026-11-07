@@ -1350,8 +1350,8 @@ fn pre_compact_keeps_the_agent_and_task_ids() {
     );
 }
 
-#[test]
-fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
+/// An env whose agent has a cached full snapshot (seq 812) from a first `SessionStart`.
+fn cached_env() -> (Env, Value) {
     let e = env();
     e.stub.on(
         "POST /v1/agents",
@@ -1363,50 +1363,89 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
     );
     let start = e.with("SessionStart", json!({"source": "startup"}));
     e.hook("session-start", "claude", start.clone());
+    (e, start)
+}
 
-    e.stub.hang(Duration::from_secs(10));
+fn breaker(e: &Env) -> Value {
+    std::fs::read(e.home.join("state/offline.json"))
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or(Value::Null)
+}
+
+/// Runs a hook and returns its reply and how long it took.
+fn timed(e: &Env, event: &str, payload: &Value) -> (Option<Value>, Duration) {
     let began = Instant::now();
-    let (reply, _) = e.hook("session-start", "claude", start.clone());
-    let elapsed = began.elapsed();
+    let (reply, _) = e.hook(event, "claude", payload.clone());
+    (reply, began.elapsed())
+}
+
+#[test]
+fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
+    let (e, start) = cached_env();
+    e.stub.hang(Duration::from_secs(10));
+    let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     let text = context(&reply, "SessionStart");
     assert!(
-        text.starts_with("board server unreachable: cached snapshot from "),
+        text.starts_with(
+            "board server slow (no answer within the hook's 1.5 s): cached snapshot from "
+        ),
         "{text}"
     );
     assert!(
         text.contains(" ago (seq 812)") && text.ends_with(SNAPSHOT),
         "{text}"
     );
+    assert!(!text.contains("fail"), "board tools still work: {text}");
+    assert_eq!(
+        breaker(&e),
+        json!({"strikes": 1}),
+        "one slow reply opens nothing"
+    );
 
-    // Later hooks on this device skip the server for a while instead of waiting again.
-    let began = Instant::now();
-    let (reply, _) = e.hook("session-start", "claude", start.clone());
-    let elapsed = began.elapsed();
+    // The next hook tries the server again at once.
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "skipped the server: {elapsed:?}"
+    );
+    assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    assert_eq!(breaker(&e), json!({"strikes": 2}));
+
+    // Three slow replies in a row: hooks skip the server for a few seconds, still "slow".
+    timed(&e, "session-start", &start);
+    let open = breaker(&e);
+    assert_eq!(open["slow"], true, "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    let left = until - chrono::Utc::now();
+    assert!(
+        left > chrono::Duration::zero() && left <= chrono::Duration::seconds(10),
+        "{open}"
+    );
+    let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(
         elapsed < Duration::from_millis(500),
         "waited again: {elapsed:?}"
     );
-    assert!(context(&reply, "SessionStart").contains("cached snapshot"));
-    let marked: Value =
-        serde_json::from_slice(&std::fs::read(e.home.join("state/offline.json")).unwrap()).unwrap();
-    assert!(marked["until"].is_string(), "{marked}");
+    assert!(context(&reply, "SessionStart").starts_with("board server slow"));
 
-    // Once the backoff has passed, the server is tried again.
+    // Once it has passed and the server answers in time, the breaker closes.
     std::fs::write(
         e.home.join("state/offline.json"),
-        r#"{"until":"2000-01-01T00:00:00Z"}"#,
+        r#"{"until":"2000-01-01T00:00:00Z","slow":true,"strikes":2}"#,
     )
     .unwrap();
-    let began = Instant::now();
-    e.hook("session-start", "claude", start.clone());
-    assert!(
-        began.elapsed() >= Duration::from_millis(900),
-        "an expired backoff waits on the server again"
-    );
+    e.stub.hang(Duration::ZERO);
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    assert_eq!(breaker(&e), json!({}));
+}
 
-    // A closed port fails fast and falls back the same way.
-    std::fs::remove_file(e.home.join("state/offline.json")).unwrap();
+#[test]
+fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
+    let (e, start) = cached_env();
+    // A closed port: the connection is refused.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
@@ -1415,8 +1454,34 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
         format!("server = \"{url}\"\ndevice = \"{DEVICE}\"\n"),
     )
     .unwrap();
-    let (reply, _) = e.hook("session-start", "claude", start);
-    assert!(context(&reply, "SessionStart").contains("cached snapshot"));
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let text = context(&reply, "SessionStart");
+    assert!(
+        text.starts_with("board server unreachable: cached snapshot from ")
+            && text.contains(" ago (seq 812); claims and updates fail until it is back.")
+            && text.ends_with(SNAPSHOT),
+        "{text}"
+    );
+    let open = breaker(&e);
+    assert!(open.get("slow").is_none(), "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    let left = until - chrono::Utc::now();
+    assert!(
+        left > chrono::Duration::seconds(50) && left <= chrono::Duration::seconds(60),
+        "{open}"
+    );
+
+    // Later hooks on this device skip the server while the backoff lasts.
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("server = \"{}\"\ndevice = \"{DEVICE}\"\n", e.stub.url),
+    )
+    .unwrap();
+    e.stub.clear();
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
     let (_, text) = e.hook(
         "post-tool-use",
         "claude",
@@ -1426,6 +1491,17 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
         ),
     );
     assert_eq!(text, "", "mid-turn hooks stay quiet offline");
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
+
+    // A breaker file from before slow replies were told apart still reads as unreachable.
+    let until = chrono::Utc::now() + chrono::Duration::minutes(1);
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        json!({"until": until}).to_string(),
+    )
+    .unwrap();
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
 }
 
 #[test]
