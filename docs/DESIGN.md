@@ -178,9 +178,13 @@ on one of the board's home devices.
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
   with the coordinator prompt (`prompts/coordinator.md`), then records the thread as the
-  coordinator. A start that died after T3 created its thread (the daemon was killed, or
-  `t3` failed mid-start) leaves an empty thread titled `<board> coordinator`; the next start
-  sends the prompt to that thread instead of starting another.
+  coordinator. Before running `t3 thread start` the daemon saves a pending mark for the
+  board in `watch.json`, and clears it once the thread is recorded. A start that did not
+  finish (the daemon was killed, or `t3` failed or timed out after T3 created the thread)
+  leaves the mark, and the next start adopts the newest `<board> coordinator` thread created
+  since then: it sends the prompt first if that thread never ran, and starts a new thread
+  only when there is none, or when briefing it failed. Older threads with that title are
+  never taken.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
   or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
   briefs so the children claim them; review the result against the acceptance checks; mark
