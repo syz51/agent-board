@@ -74,6 +74,10 @@ pub(crate) fn validate_create(
             "say what cost you a step: the first line is the title",
         ));
     }
+    if let Some(long) = board_proto::TooLong::check("text", text, s.body_chars) {
+        let goes = "keep to what happened and what it cost, and add the rest as notes on the item";
+        return Err(invalid(long.message(), long.next_or(Some(goes))));
+    }
     check_text("text", text, s.body_chars)?;
     let first: String = text
         .split(['\n', '\r'])

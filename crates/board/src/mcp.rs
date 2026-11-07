@@ -8,11 +8,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    AgentId, AskKind, BoardSlug, CreateFeedback, FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind,
-    PATH_CHARS_MAX, Priority, ResolutionKind, ResolveFeedback, SnapshotFormat, SnapshotKind,
-    TaskId, TaskStatus,
+    ASK_OPTION_CHARS_MAX, AgentId, AskKind, BoardSlug, CreateFeedback, EVIDENCE_VALUE_CHARS_MAX,
+    FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind, PATH_CHARS_MAX, Priority, ResolutionKind,
+    ResolveFeedback, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
 };
-use board_server::Settings;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
     ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
@@ -27,7 +26,7 @@ use tokio::sync::Mutex;
 use crate::client::TaskQuery;
 use crate::config::Home;
 use crate::identity::agent_from_env;
-use crate::ops::{self, Ctx, Output};
+use crate::ops::{self, Ctx, Output, limits};
 
 const INSTRUCTIONS: &str = "Shared work board for agent threads. At session start and after \
 compaction call board_snapshot. Claim a task before working on it, keep your handoff current, \
@@ -50,13 +49,8 @@ const AGENT_ID_MAX: usize = 7 + 256;
 /// An RFC 3339 time with offset and fraction, or a date.
 const TIME_MAX: usize = 40;
 /// Limits the server checks outside `Settings`: an evidence value and an ask option.
-const EVIDENCE_MAX: usize = 500;
-const OPTION_MAX: usize = 60;
-
-/// Text limits from the server defaults (`docs/API.md`, "Defaults").
-fn limits() -> Settings {
-    Settings::default()
-}
+const EVIDENCE_MAX: usize = EVIDENCE_VALUE_CHARS_MAX;
+const OPTION_MAX: usize = ASK_OPTION_CHARS_MAX;
 
 struct ToolSpec {
     name: &'static str,
@@ -85,6 +79,12 @@ fn strings(description: &str, max: usize) -> Value {
 fn one_of(values: &[&str], description: &str) -> Value {
     let max = values.iter().map(|v| v.len()).max().unwrap_or(0);
     json!({"type": "string", "enum": values, "maxLength": max, "description": description})
+}
+
+/// A handoff field, its limit stated in words: `maxLength` alone does not stop every client.
+fn handoff_field(what: &str) -> Value {
+    let max = limits().handoff_field_chars;
+    s(&format!("{what}; at most {max} characters."), max)
 }
 
 fn board_arg(description: &str) -> Value {
@@ -248,7 +248,13 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "blocked_reason",
-                    s("Why it is blocked.", limits().note_chars),
+                    s(
+                        &format!(
+                            "Why it is blocked; at most {} characters.",
+                            limits().note_chars
+                        ),
+                        limits().note_chars,
+                    ),
                     false,
                 ),
                 (
@@ -303,13 +309,16 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_note",
-        description: "Add a note (at most 280 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision. To report something in a setup that cost you a step, use the feedback tool instead.",
+        description: "Add a note (at most 500 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision. To report something in a setup that cost you a step, use the feedback tool instead.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
                 (
                     "text",
-                    s("At most 280 characters.", limits().note_chars),
+                    s(
+                        &format!("At most {} characters.", limits().note_chars),
+                        limits().note_chars,
+                    ),
                     true,
                 ),
                 (
@@ -325,22 +334,11 @@ const TOOLS: &[ToolSpec] = &[
         description: "Replace your handoff, read first after a restart: now (state of the work), next (the first concrete action), blockers. Update it before you stop with a task in doing.",
         params: || {
             vec![
-                (
-                    "now",
-                    s("Where the work stands.", limits().handoff_field_chars),
-                    true,
-                ),
-                (
-                    "next",
-                    s("The first concrete action.", limits().handoff_field_chars),
-                    true,
-                ),
+                ("now", handoff_field("Where the work stands"), true),
+                ("next", handoff_field("The first concrete action"), true),
                 (
                     "blockers",
-                    s(
-                        "What blocks you, if anything.",
-                        limits().handoff_field_chars,
-                    ),
+                    handoff_field("What blocks you, if anything"),
                     false,
                 ),
             ]
@@ -392,7 +390,12 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "options",
-                    strings("Suggested answers, recommended first.", OPTION_MAX),
+                    strings(
+                        &format!(
+                            "Suggested answers, recommended first; at most {OPTION_MAX} characters each."
+                        ),
+                        OPTION_MAX,
+                    ),
                     false,
                 ),
                 ("task", task_arg("The task it is about."), false),
@@ -961,14 +964,25 @@ mod tests {
         assert_eq!(add.input_schema["properties"]["title"]["maxLength"], 72);
         assert_eq!(add.input_schema["properties"]["body"]["maxLength"], 4000);
         let note = by_name("task_note");
-        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 280);
+        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 500);
+        assert!(
+            note.description
+                .as_deref()
+                .unwrap()
+                .contains(&format!("at most {} characters", limits().note_chars)),
+            "the description states the server's note limit"
+        );
         assert_eq!(
             note.input_schema["properties"]["kind"]["enum"],
             json!(["note", "finding", "decision"]),
             "feedback goes through the feedback tool"
         );
         let handoff = by_name("handoff_set");
-        assert_eq!(handoff.input_schema["properties"]["next"]["maxLength"], 200);
+        assert_eq!(handoff.input_schema["properties"]["next"]["maxLength"], 300);
+        assert_eq!(
+            handoff.input_schema["properties"]["now"]["description"],
+            "Where the work stands; at most 300 characters."
+        );
         let ask = by_name("ask_user");
         assert_eq!(
             ask.input_schema["properties"]["question"]["maxLength"],

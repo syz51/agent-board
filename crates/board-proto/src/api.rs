@@ -168,7 +168,7 @@ pub struct ResolveFeedback {
     /// Required for `routed` and `duplicate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
-    /// Required for `forwarded` and `declined`; at most 280 characters.
+    /// Required for `forwarded` and `declined`; at most 500 characters by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

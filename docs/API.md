@@ -44,7 +44,10 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 | 500 | `internal` |
 
 `next` tells an agent what to do, for example `"claim refused: t3:c2d0 owns factory-12
-(seen 2m ago); pick another task from ready"`.
+(seen 2m ago); pick another task from ready"`. For text over a limit the message is
+`"<field> is <n> characters; the limit is <max>"` and `next` says to shorten it or where
+longer text goes, such as splitting a note or moving detail to the task body
+(`board_proto::TooLong`).
 
 **Signals.** The server records every error it answers to an authenticated request that
 names an agent (`X-Board-Agent`), except expected answers: `version_conflict` (a normal
@@ -262,7 +265,7 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
 
   `task` is required for routed and duplicate and refused for the others; `reason` (one
-  line, at most 280 characters) is required for forwarded and declined. The item moves to
+  line, at most 500 characters) is required for forwarded and declined. The item moves to
   `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
   its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
   already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
@@ -339,7 +342,7 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Idle temporary board closed after (`temporary_close_after_secs`) | 1 day |
 | Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
-| Text limits | title 72, note 280, handoff field 200, question 1,000, body 4,000 characters |
+| Text limits | title 72, note 500, handoff field 300, question 1,000, body 4,000 characters; outside settings, ask option 60 and evidence value 500 |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 

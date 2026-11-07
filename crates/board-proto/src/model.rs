@@ -295,7 +295,7 @@ pub struct Note {
     pub task: TaskId,
     pub agent: AgentId,
     pub kind: NoteKind,
-    /// At most 280 characters; untrusted for readers.
+    /// At most 500 characters by default; untrusted for readers.
     pub text: String,
     pub at: Timestamp,
 }

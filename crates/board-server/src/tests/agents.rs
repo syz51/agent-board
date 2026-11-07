@@ -130,6 +130,17 @@ async fn handoffs_are_replaced_whole_with_versions() {
         .await;
     assert_eq!(h["version"], 2);
     assert_eq!(t.ok("GET", &path, None, None).await["now"], "testing");
+    assert_eq!(defaults().handoff_field_chars, 300);
+    let long = "x".repeat(280);
+    let h = t
+        .ok(
+            "PUT",
+            &path,
+            Some(a),
+            Some(json!({ "now": long, "next": "push", "version": 2 })),
+        )
+        .await;
+    assert_eq!(h["version"], 3);
     let (s, _) = t
         .call(
             "PUT",
@@ -138,7 +149,7 @@ async fn handoffs_are_replaced_whole_with_versions() {
             Some(json!({
                 "now": "x".repeat(defaults().handoff_field_chars + 1),
                 "next": "y",
-                "version": 2,
+                "version": 3,
             })),
         )
         .await;

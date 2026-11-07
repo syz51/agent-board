@@ -23,7 +23,7 @@ pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
         ));
     }
     for option in &req.options {
-        check_line("option", option, 60)?;
+        check_line("option", option, board_proto::ASK_OPTION_CHARS_MAX)?;
     }
     Ok(())
 }
