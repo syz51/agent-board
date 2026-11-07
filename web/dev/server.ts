@@ -152,11 +152,16 @@ async function serveDist(req: Request): Promise<Response> {
     if (await file.exists()) return new Response(file);
     return new Response("not found", { status: 404 });
   }
+  const index = Bun.file(join(distDir, "index.html"));
+  // Missing while a rebuild replaces the output directory, or before the first build.
+  if (!(await index.exists())) {
+    return new Response("The web view is building; reload in a moment.", { status: 503 });
+  }
   // A fresh style nonce per page, as board-server does.
   const nonce = crypto.randomUUID().replaceAll("-", "");
-  const html = await Bun.file(join(distDir, "index.html")).text();
-  return new Response(html.replaceAll(NONCE_PLACEHOLDER, nonce), {
-    headers: { "content-type": "text/html" },
+  const html = (await index.text()).replaceAll(NONCE_PLACEHOLDER, nonce);
+  return new Response(html, {
+    headers: { "content-type": "text/html", "cache-control": "no-store" },
   });
 }
 

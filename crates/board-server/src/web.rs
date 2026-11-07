@@ -22,31 +22,31 @@ max-width: 40rem; margin: 3rem auto; padding: 0 1rem\"><h1>agent-board</h1>\
 (<code>bun run build</code>) and rebuild the server to embed it.</p>\
 <p>The API is under <code>/v1</code>; <code>/healthz</code> reports status.</p></body></html>\n";
 
-/// Where `web/build.ts` leaves the style nonce in `index.html`: in its CSP meta and in the
-/// `csp-nonce` meta the app reads. Each page response replaces it with a fresh nonce.
-const NONCE_PLACEHOLDER: &str = "__CSP_NONCE__";
+/// Where `web/build.ts` leaves the style nonce in `index.html`: in its CSP meta and on the
+/// `csp-nonce` meta the app reads. Each page response replaces it with a fresh nonce. It is
+/// not a valid nonce itself, so a page served without the replacement allows no `<style>`.
+const NONCE_PLACEHOLDER: &str = "{{CSP_NONCE}}";
 
 /// The policy `web/build.ts` also puts in `index.html`, plus what only a header can say.
-/// Styles may also come from `<style>` elements that carry the page's nonce: Radix adds
-/// them for its scroll lock and Select. Scripts stay limited to this origin's files.
-fn csp(style_nonce: Option<&str>) -> header::HeaderValue {
-    let style = style_nonce.map_or_else(
-        || "'self'".to_owned(),
-        |nonce| format!("'self' 'nonce-{nonce}'"),
-    );
-    let policy = format!(
-        "default-src 'self'; script-src 'self'; style-src {style}; \
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
 img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
-form-action 'self'; frame-ancestors 'none'"
+form-action 'self'; frame-ancestors 'none'";
+
+/// The policy for a page: `<style>` elements that carry its nonce are allowed too, since
+/// Radix adds them for its scroll lock and Select. Scripts stay limited to this origin.
+fn page_csp(nonce: &str) -> header::HeaderValue {
+    let policy = CSP.replace(
+        "style-src 'self';",
+        &format!("style-src 'self' 'nonce-{nonce}';"),
     );
     header::HeaderValue::try_from(policy).expect("the policy and a hex nonce are visible ASCII")
 }
 
 /// Security headers for every web view response: the CSP matters for HTML (whether served
 /// as a client route or as `/index.html`); `nosniff` and the referrer policy for all.
-fn security_headers(mut response: Response, style_nonce: Option<&str>) -> Response {
+fn security_headers(mut response: Response, csp: header::HeaderValue) -> Response {
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, csp(style_nonce));
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -74,9 +74,7 @@ fn embedded(path: &str) -> Option<File> {
 
 /// A new random 128-bit nonce, hex-encoded (hex digits are valid in a CSP nonce).
 fn new_nonce() -> String {
-    let mut bytes = [0u8; 16];
-    rand::fill(&mut bytes);
-    crate::auth::hex(&bytes)
+    crate::auth::random_hex::<16>()
 }
 
 fn with_cache(mime: String, cache: &'static str, body: impl IntoResponse) -> Response {
@@ -92,17 +90,19 @@ fn with_cache(mime: String, cache: &'static str, body: impl IntoResponse) -> Res
 
 /// Serves the web view for every GET outside `/v1`.
 pub(crate) async fn serve(method: Method, uri: Uri) -> Response {
-    route(&method, uri.path(), embedded, &new_nonce())
+    route(&method, uri.path(), embedded, new_nonce)
 }
 
 /// The response for `path`, with files looked up by `files`. Pages (`index.html`, also as
-/// the fallback for client routes) carry `nonce` in their HTML and in their CSP.
+/// the fallback for client routes) carry a nonce from `nonce` in their HTML and their CSP,
+/// and are not stored by caches, so a nonce serves one response.
 fn route(
     method: &Method,
     path: &str,
     files: impl Fn(&str) -> Option<File>,
-    nonce: &str,
+    nonce: impl FnOnce() -> String,
 ) -> Response {
+    let csp = header::HeaderValue::from_static(CSP);
     if method != Method::GET && method != Method::HEAD {
         return not_found("no such endpoint", "the API is under /v1; see docs/API.md")
             .into_response();
@@ -116,22 +116,22 @@ fn route(
             } else {
                 "no-cache"
             };
-            let response = with_cache(file.mime, cache, file.data.into_owned());
-            return security_headers(response, None);
+            return security_headers(with_cache(file.mime, cache, file.data), csp);
         }
         // A missing file with an extension is a real 404, not a client route.
         None if path.rsplit('/').next().unwrap_or("").contains('.') => {
             let response = (StatusCode::NOT_FOUND, "not found").into_response();
-            return security_headers(response, None);
+            return security_headers(response, csp);
         }
         None => files("index.html"),
     };
     match page {
         Some(file) => {
-            let html = String::from_utf8_lossy(&file.data).replace(NONCE_PLACEHOLDER, nonce);
-            security_headers(with_cache(file.mime, "no-cache", html), Some(nonce))
+            let nonce = nonce();
+            let html = String::from_utf8_lossy(&file.data).replace(NONCE_PLACEHOLDER, &nonce);
+            security_headers(with_cache(file.mime, "no-store", html), page_csp(&nonce))
         }
-        None => security_headers(Html(PLACEHOLDER).into_response(), None),
+        None => security_headers(Html(PLACEHOLDER).into_response(), csp),
     }
 }
 
@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     const INDEX: &str = "<meta http-equiv=\"Content-Security-Policy\" content=\"style-src \
-'self' 'nonce-__CSP_NONCE__'\" /><meta name=\"csp-nonce\" content=\"__CSP_NONCE__\" />";
+'self' 'nonce-{{CSP_NONCE}}'\" /><meta property=\"csp-nonce\" nonce=\"{{CSP_NONCE}}\" />";
 
     fn fake(path: &str) -> Option<File> {
         let (mime, data): (&str, &'static [u8]) = match path {
@@ -155,6 +155,10 @@ mod tests {
             mime: mime.to_owned(),
             data: Cow::Borrowed(data),
         })
+    }
+
+    fn nonce() -> String {
+        "abc123".to_owned()
     }
 
     fn csp_of(response: &Response) -> &str {
@@ -173,7 +177,7 @@ mod tests {
             ("/favicon.svg", 200, Some("image/svg+xml")),
             ("/missing.js", 404, None),
         ] {
-            let response = route(&Method::GET, path, fake, "abc123");
+            let response = route(&Method::GET, path, fake, nonce);
             assert_eq!(response.status().as_u16(), status, "{path}");
             let headers = response.headers();
             if let Some(mime) = mime {
@@ -185,19 +189,19 @@ mod tests {
             assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
             assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "{path}");
         }
-        let post = route(&Method::POST, "/", fake, "abc123");
+        let post = route(&Method::POST, "/", fake, nonce);
         assert_eq!(post.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn pages_carry_the_nonce_in_their_html_and_policy() {
         for path in ["/", "/index.html", "/tasks/factory-12"] {
-            let response = route(&Method::GET, path, fake, "abc123");
+            let response = route(&Method::GET, path, fake, nonce);
             assert!(
                 csp_of(&response).contains("style-src 'self' 'nonce-abc123';"),
                 "{path}"
             );
-            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(!html.contains(NONCE_PLACEHOLDER), "{path}: {html}");
@@ -207,13 +211,22 @@ mod tests {
 
     #[test]
     fn other_files_allow_no_inline_styles() {
+        let unused = || -> String { panic!("only pages need a nonce") };
         for path in ["/assets/app.js", "/favicon.svg", "/missing.js"] {
-            let csp = route(&Method::GET, path, fake, "abc123");
-            assert!(csp_of(&csp).contains("style-src 'self';"), "{path}");
+            let response = route(&Method::GET, path, fake, unused);
+            assert!(csp_of(&response).contains("style-src 'self';"), "{path}");
         }
-        let built = |_: &str| None;
-        let placeholder = route(&Method::GET, "/", built, "abc123");
-        assert!(csp_of(&placeholder).contains("style-src 'self';"));
+        let unbuilt = route(&Method::GET, "/", |_| None, unused);
+        assert!(csp_of(&unbuilt).contains("style-src 'self';"));
+    }
+
+    #[test]
+    fn the_build_writes_the_placeholder_this_server_replaces() {
+        let build = include_str!("../../../web/build.ts");
+        assert!(
+            build.contains(&format!("NONCE_PLACEHOLDER = \"{NONCE_PLACEHOLDER}\"")),
+            "web/build.ts and web.rs must use the same nonce placeholder"
+        );
     }
 
     #[test]

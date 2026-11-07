@@ -6,15 +6,15 @@ function page(nonce?: string): Document {
   const doc = document.implementation.createHTMLDocument("page");
   if (nonce !== undefined) {
     const meta = doc.createElement("meta");
-    meta.name = "csp-nonce";
-    meta.content = nonce;
+    meta.setAttribute("property", "csp-nonce");
+    meta.setAttribute("nonce", nonce);
     doc.head.append(meta);
   }
   return doc;
 }
 
 describe("installCspNonce", () => {
-  afterEach(() => setNonce(""));
+  afterEach(() => installCspNonce(page()));
 
   test("hands the page's nonce to Radix and to nonce props", () => {
     installCspNonce(page("0f3a"));
@@ -22,10 +22,13 @@ describe("installCspNonce", () => {
     expect(getNonce()).toBe("0f3a");
   });
 
-  test("leaves styles without a nonce when the page has none", () => {
+  test("clears an earlier nonce when the page has none", () => {
+    setNonce("stale");
     installCspNonce(page());
     expect(cspNonce()).toBeUndefined();
+    expect(getNonce()).toBeFalsy();
     installCspNonce(page(""));
     expect(cspNonce()).toBeUndefined();
+    expect(getNonce()).toBeFalsy();
   });
 });

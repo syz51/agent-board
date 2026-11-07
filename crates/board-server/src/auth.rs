@@ -114,7 +114,12 @@ pub(crate) fn hash_token(token: &str) -> String {
 
 /// A new random 32-byte token, hex-encoded.
 pub(crate) fn new_token() -> String {
-    let mut bytes = [0u8; 32];
+    random_hex::<32>()
+}
+
+/// `N` random bytes, hex-encoded.
+pub(crate) fn random_hex<const N: usize>() -> String {
+    let mut bytes = [0u8; N];
     rand::fill(&mut bytes);
     hex(&bytes)
 }
