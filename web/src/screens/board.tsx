@@ -223,13 +223,13 @@ function TaskRow(
               ))}
             </span>
           )}
-          {task.auto && <span class="chip">auto</span>}
           {waitsUntil && (
             <span class="chip">
               waits until <AbsTime at={waitsUntil} />
             </span>
           )}
         </div>
+        {task.auto && <span class="chip task-auto">auto</span>}
         <span class="task-owner"><Owner task={task} agents={agents} /></span>
         <span class="task-updated muted">
           updated <RelTime at={task.updated_at} />
