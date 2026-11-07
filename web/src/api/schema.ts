@@ -37,6 +37,7 @@ export const board = object({
   title: string,
   goal: string,
   status: boardStatus,
+  temporary: boolean,
   repos: array(string),
   autopilot: boolean,
   coordinator: nullable(string),

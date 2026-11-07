@@ -82,7 +82,36 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
   thread, then claims again with the thread's `agent` id, which makes that agent's role
   `coordinator`. `DELETE` releases it; only the holding device or the user may. Both emit
   `board_updated` with `coordinator` and the lease's `device` in the payload.
+- `DELETE /v1/boards/{slug}` → 204. User only. Refused with 400 `invalid_transition` unless
+  the board is `closed` and has no open asks. Deletes the board with its tasks, blockers,
+  notes, evidence, asks, members, refused-claim records and events (including lease events
+  that name its tasks); leases that named one of its tasks keep running without it. One
+  event is then recorded for the board: `board_updated` with `{"fields": ["deleted"],
+  "title": …}`, an existing type, so clients that predate deletion still read the feed. The
+  slug may be used again, and its task numbers continue where the deleted board's stopped,
+  so a task id an agent still holds never names a new task. Ask ids are never reused
+  either.
 - `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
+
+#### Temporary boards
+
+A board created with `temporary: true` is for a test or a one-off. Agents may set it when
+creating a board and anyone may turn it off; turning it on for an existing board is user
+only (403 `forbidden` otherwise), because the server then deletes the board. Every minute
+the server sweeps temporary boards that are **idle**: no event on the board (nor change to
+it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
+`review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
+period counts from the server's start at the earliest, so time the server was down is not
+idle time. Each board is swept in its own transaction; one that fails is logged and tried
+again on the next sweep.
+
+- An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
+  `board_updated` with `fields: ["status"]` and actor `server`.
+- A `closed` temporary board idle for `temporary_delete_after_secs` is deleted as by
+  `DELETE` above, with actor `server`. Closing is an event, so deletion comes that long after
+  the board was closed at the earliest.
+
+Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
@@ -217,6 +246,8 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Touch overlap window | 1 hour |
 | Tasks in `doing` per agent | 1 (claiming a second is refused unless the first is blocked or in review) |
 | Done tasks hidden from snapshots after | 30 days |
+| Idle temporary board closed after (`temporary_close_after_secs`) | 1 day |
+| Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
 | Text limits | title 72, note 280, handoff field 200, question 1,000, body 4,000 characters |
 

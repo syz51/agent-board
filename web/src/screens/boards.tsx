@@ -60,6 +60,7 @@ function BoardCard({ board, coordinator }: { board: Board; coordinator: Agent | 
         </h2>
         <code class="muted">{board.slug}</code>
         {board.status !== "active" && <span class="badge tone-dropped">{board.status}</span>}
+        {board.temporary && <span class="badge tone-open">temporary</span>}
       </header>
       {board.goal && <p class="board-goal"><PlainText text={board.goal} /></p>}
 

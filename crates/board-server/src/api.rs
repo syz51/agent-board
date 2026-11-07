@@ -63,7 +63,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/agents/{id}/state", post(agent_state))
         .route("/agents/{id}/handoff", get(show_handoff).put(put_handoff))
         .route("/boards", get(list_boards_h).post(create_board))
-        .route("/boards/{slug}", get(show_board).patch(update_board))
+        .route(
+            "/boards/{slug}",
+            get(show_board).patch(update_board).delete(delete_board),
+        )
         .route("/boards/{slug}/join", post(join_board))
         .route(
             "/boards/{slug}/coordinator",
@@ -242,11 +245,27 @@ async fn update_board(
     let slug: BoardSlug = parse_path(&slug)?;
     let req = boards::validate_update(req, state.settings())?;
     let actor = caller.actor();
+    let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| boards::update(cx, &actor, &slug, req))
+            .write(move |cx| boards::update(cx, &actor, &slug, req, by_user))
             .await?,
     ))
+}
+
+/// User only: deleting cannot be undone.
+async fn delete_board(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(slug): Path<String>,
+) -> Result<StatusCode> {
+    caller.require_user()?;
+    let slug: BoardSlug = parse_path(&slug)?;
+    let actor = caller.actor();
+    state
+        .write(move |cx| boards::delete(cx, &actor, &slug))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn join_board(

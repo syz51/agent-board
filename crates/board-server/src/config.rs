@@ -201,6 +201,11 @@ pub struct Settings {
     pub max_doing_per_agent: u32,
     /// Done tasks older than this are left out of snapshots.
     pub done_hidden_after_days: u32,
+    /// A temporary board idle this long (no event on it, no open ask, no live owner of a
+    /// task in `doing`) is closed.
+    pub temporary_close_after_secs: u64,
+    /// A closed temporary board idle this long is deleted.
+    pub temporary_delete_after_secs: u64,
     pub snapshot_full_chars: usize,
     pub snapshot_delta_chars: usize,
     pub snapshot_alerts_chars: usize,
@@ -226,6 +231,8 @@ impl Default for Settings {
             touch_window_secs: 3600,
             max_doing_per_agent: 1,
             done_hidden_after_days: 30,
+            temporary_close_after_secs: 24 * 3600,
+            temporary_delete_after_secs: 7 * 24 * 3600,
             snapshot_full_chars: 2000,
             snapshot_delta_chars: 600,
             snapshot_alerts_chars: 400,
@@ -249,6 +256,14 @@ impl Settings {
             ("coordinator_ttl_secs", self.coordinator_ttl_secs),
             ("touch_window_secs", self.touch_window_secs),
             ("max_doing_per_agent", u64::from(self.max_doing_per_agent)),
+            (
+                "temporary_close_after_secs",
+                self.temporary_close_after_secs,
+            ),
+            (
+                "temporary_delete_after_secs",
+                self.temporary_delete_after_secs,
+            ),
             ("title_chars", self.title_chars as u64),
             ("note_chars", self.note_chars as u64),
             ("handoff_field_chars", self.handoff_field_chars as u64),
@@ -282,6 +297,14 @@ impl Settings {
 
     pub(crate) fn coordinator_ms(&self) -> i64 {
         secs_ms(self.coordinator_ttl_secs)
+    }
+
+    pub(crate) fn temporary_close_ms(&self) -> i64 {
+        secs_ms(self.temporary_close_after_secs)
+    }
+
+    pub(crate) fn temporary_delete_ms(&self) -> i64 {
+        secs_ms(self.temporary_delete_after_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {
@@ -343,5 +366,14 @@ mod tests {
             ServerConfig::from_toml("db = \"b\"\n[defaults]\nmax_doing_per_agent = 0").is_err()
         );
         assert!(ServerConfig::from_toml("db = \"b\"\npublic_url = \"board\"").is_err());
+        for name in ["temporary_close_after_secs", "temporary_delete_after_secs"] {
+            assert!(
+                ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 0")).is_err(),
+                "{name}"
+            );
+            let set =
+                ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 60")).unwrap();
+            assert_ne!(set.defaults, Settings::default(), "{name}");
+        }
     }
 }

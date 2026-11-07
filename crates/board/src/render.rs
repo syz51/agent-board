@@ -227,6 +227,9 @@ pub fn board_line(board: &Board) -> String {
     if board.open_asks > 0 {
         let _ = write!(line, " · asks {}", board.open_asks);
     }
+    if board.temporary {
+        line.push_str(" · temporary");
+    }
     if board.autopilot {
         line.push_str(" · autopilot");
         match &board.coordinator {
