@@ -233,10 +233,18 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-/** Task groups as columns side by side, wrapping onto new rows; stacked on a phone. */
+/**
+ * Task groups as columns in one row that scrolls sideways, so the board reads left to right;
+ * stacked on a phone. The row takes focus so the keyboard can scroll it.
+ */
 export function TaskBoard({ children }: { children: ReactNode }) {
   return (
-    <div className="grid items-start gap-3 md:grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
+    <div
+      className="grid items-start gap-3 md:auto-cols-[284px] md:grid-flow-col md:overflow-x-auto md:pb-2"
+      role="region"
+      aria-label="Task columns"
+      tabIndex={0}
+    >
       {children}
     </div>
   );

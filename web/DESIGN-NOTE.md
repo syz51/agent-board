@@ -10,7 +10,8 @@ and white raised cards for boards, tasks and agents, with task groups laid out a
   page is wide (up to 1360px). Phones keep the bottom tabs.
 - **Board as columns**: each status group is a tinted lane with its count, holding one
   card per task (status and title, then id, priority, owner and last update). Lanes sit
-  side by side and wrap onto new rows; on a phone they stack.
+  side by side in one row that scrolls sideways (the row takes keyboard focus); on a
+  phone they stack.
 - **Boards as cards**: a grid of board cards, three across on a wide screen: name and
   slug, goal, the task bar with counts in words, coordinator and asks, autopilot at the
   foot.

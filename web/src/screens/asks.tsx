@@ -274,11 +274,7 @@ export function AskScreen() {
       </Crumbs>
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
-          {(data) => (
-            <div className="max-w-[720px]">
-              <AskCard ask={data} agents={agents} standalone />
-            </div>
-          )}
+          {(data) => <AskCard ask={data} agents={agents} standalone />}
         </QueryFrame>
       ) : (
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
