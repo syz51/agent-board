@@ -163,6 +163,25 @@ describe("api client parsing", () => {
     expect(decoded).not.toHaveProperty("new_field");
   });
 
+  test("reads fixed and resolution kinds it does not know", async () => {
+    const task = state.task("factory-12").task;
+    const item = (kind: string) => ({
+      ...task,
+      feedback: {
+        about: "board",
+        source: "agent",
+        signature: "board:x",
+        reports: 1,
+        reporters: ["t3:a"],
+        last_reported_at: "2026-11-06T12:00:00Z",
+        resolution: { kind, reason: "changed x", at: "2026-11-06T12:00:00Z", by: "t3:a" },
+      },
+    });
+    const { api } = fakeFetch(() => json([item("fixed"), item("future_kind")]));
+    const kinds = (await api.tasks({})).map((t) => t.feedback?.resolution?.kind);
+    expect(kinds).toEqual(["fixed", "unknown"]);
+  });
+
   test("keeps unknown event types for the feed", async () => {
     const { api } = fakeFetch(() =>
       json({
