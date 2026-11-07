@@ -1,5 +1,6 @@
 use board_proto::{
-    AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TouchResult, Touches,
+    AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX, TouchResult,
+    Touches,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::{OptionalExtension, params};
@@ -204,9 +205,9 @@ pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> 
 
 pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
     req.repo = normalize_repo(&req.repo)?;
-    if req.paths.is_empty() || req.paths.len() > 100 {
+    if req.paths.is_empty() || req.paths.len() > TOUCH_PATHS_MAX {
         return Err(invalid(
-            "send 1 to 100 paths",
+            format!("send 1 to {TOUCH_PATHS_MAX} paths"),
             "send the files you changed, relative to the repo root",
         ));
     }

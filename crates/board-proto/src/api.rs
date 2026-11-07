@@ -196,6 +196,11 @@ pub struct LeaseResult {
     pub conflicts: Vec<crate::Lease>,
 }
 
+/// Paths one `POST /v1/touches` accepts.
+pub const TOUCH_PATHS_MAX: usize = 100;
+/// Characters in one touched path or leased glob.
+pub const PATH_CHARS_MAX: usize = 300;
+
 /// `POST /v1/touches`: files the agent changed, relative to the repo root.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Touches {

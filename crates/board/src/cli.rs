@@ -155,7 +155,9 @@ pub enum Command {
     Mcp,
     /// Handle a Claude Code or Codex hook event (reads its JSON from stdin).
     Hook {
-        event: crate::hook::HookEvent,
+        /// The event, such as post-tool-use or PostToolUse. An event this version does
+        /// not know is ignored: exit code 2 would block the tool call on some events.
+        event: String,
         #[arg(long, value_enum)]
         runtime: RuntimeArg,
     },
@@ -419,7 +421,10 @@ pub async fn run(cli: Cli) -> i32 {
     match cli.command {
         // Hooks never fail the turn.
         Command::Hook { event, runtime } => {
-            crate::hook::run(event, runtime.into(), cli.agent.as_deref()).await;
+            match <crate::hook::HookEvent as ValueEnum>::from_str(&event, false) {
+                Ok(event) => crate::hook::run(event, runtime.into(), cli.agent.as_deref()).await,
+                Err(_) => tracing::debug!("hook {event}: unknown event, ignored"),
+            }
             return 0;
         }
         Command::Serve { config } => {

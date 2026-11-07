@@ -132,7 +132,9 @@ be on the same board and must not form a cycle.
   `globs` is leased once.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
-  paths within the last hour.
+  paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
+  most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
+  limit.
 
 ### Asks (decisions and actions for the user)
 

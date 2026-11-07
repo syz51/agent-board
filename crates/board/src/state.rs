@@ -87,14 +87,19 @@ pub struct SessionLocal {
     pub nested: bool,
 }
 
-fn session_path(home: &Home, runtime: Runtime, session: &str) -> PathBuf {
-    let runtime = match runtime {
+fn runtime_name(runtime: Runtime) -> &'static str {
+    match runtime {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
-    };
-    home.state_dir()
-        .join("sessions")
-        .join(format!("{runtime}-{}.json", safe_stem(session)))
+    }
+}
+
+fn session_path(home: &Home, runtime: Runtime, session: &str) -> PathBuf {
+    home.state_dir().join("sessions").join(format!(
+        "{}-{}.json",
+        runtime_name(runtime),
+        safe_stem(session)
+    ))
 }
 
 /// The session's cached decisions; `None` when none were saved.
@@ -122,15 +127,60 @@ pub fn remove_session(home: &Home, runtime: Runtime, session: &str) -> Result<()
 /// Removes the cached decisions of sessions not written for `age`: sessions that ended
 /// without a SessionEnd hook. A session that comes back decides again.
 pub fn prune_sessions(home: &Home, age: std::time::Duration) -> Result<()> {
-    let dir = home.state_dir().join("sessions");
-    let entries = match std::fs::read_dir(&dir) {
+    prune_dir(&home.state_dir().join("sessions"), age)
+}
+
+fn tool_start_path(home: &Home, runtime: Runtime, tool_use: &str) -> PathBuf {
+    home.state_dir().join("tool-starts").join(format!(
+        "{}-{}.json",
+        runtime_name(runtime),
+        safe_stem(tool_use)
+    ))
+}
+
+/// When a shell tool call started, from its `PreToolUse` hook.
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolStart {
+    at: Timestamp,
+}
+
+/// Records when the tool call `tool_use` started. One file per call, so parallel calls
+/// never write the same file.
+pub fn save_tool_start(home: &Home, runtime: Runtime, tool_use: &str, at: Timestamp) -> Result<()> {
+    write_json(&tool_start_path(home, runtime, tool_use), &ToolStart { at })
+}
+
+/// When the tool call `tool_use` started, forgetting it; `None` when no `PreToolUse` hook
+/// recorded it.
+pub fn take_tool_start(home: &Home, runtime: Runtime, tool_use: &str) -> Result<Option<Timestamp>> {
+    let path = tool_start_path(home, runtime, tool_use);
+    let start = read_json::<ToolStart>(&path).map(|s| s.at);
+    match std::fs::remove_file(&path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        _ => Ok(start),
+    }
+}
+
+/// Removes start marks of tool calls that never reached `PostToolUse` (failed or
+/// interrupted) after `age`.
+pub fn prune_tool_starts(home: &Home, age: std::time::Duration) -> Result<()> {
+    prune_dir(&home.state_dir().join("tool-starts"), age)
+}
+
+/// Removes the files in `dir` not written for `age`; a missing `dir` is fine.
+fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         entries => entries?,
     };
     let now = std::time::SystemTime::now();
     for entry in entries {
         let entry = entry?;
-        let modified = entry.metadata()?.modified()?;
+        // Removed by another hook since the listing.
+        let modified = match entry.metadata() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            metadata => metadata?.modified()?,
+        };
         if now
             .duration_since(modified)
             .is_ok_and(|elapsed| elapsed > age)
@@ -222,5 +272,50 @@ mod tests {
         prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "old"), None);
         assert_eq!(load_session(&home, Runtime::Codex, "new"), Some(nested));
+    }
+
+    #[test]
+    fn tool_starts_are_taken_once_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let at = chrono::Utc::now();
+        // Nothing to prune or take before the first mark.
+        prune_tool_starts(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            None
+        );
+
+        save_tool_start(&home, Runtime::Claude, "toolu_1", at).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Codex, "toolu_1").unwrap(),
+            None
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            Some(at)
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
+            None
+        );
+
+        save_tool_start(&home, Runtime::Claude, "old/1", at).unwrap();
+        save_tool_start(&home, Runtime::Codex, "new", at).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(tool_start_path(&home, Runtime::Claude, "old/1"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        prune_tool_starts(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "old/1").unwrap(),
+            None
+        );
+        assert_eq!(
+            take_tool_start(&home, Runtime::Codex, "new").unwrap(),
+            Some(at)
+        );
     }
 }
