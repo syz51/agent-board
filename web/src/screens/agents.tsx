@@ -95,7 +95,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="grid gap-3">
+            <div className="divide-y overflow-hidden rounded-md border bg-card">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -109,8 +109,9 @@ export function AgentsScreen() {
 
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
-    <article className="grid gap-3.5 rounded-lg border bg-card px-4 py-3.5 shadow-raise lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-6">
-      <div className="grid content-start justify-items-start gap-2">
+    // One row of the agents box: who and their state, what they work on, then where they run.
+    <article className="grid gap-3.5 px-4 py-4 lg:grid-cols-[248px_minmax(0,1fr)_232px] lg:gap-6">
+      <div className="grid content-start justify-items-start">
         {/* The avatar beside the handle, with the state on its own line under it. */}
         <header className="grid grid-cols-[auto_minmax(0,1fr)] items-center justify-items-start gap-x-2.5 gap-y-0.5">
           <Avatar handle={agent.handle} large className="row-span-2 size-9 text-xs" />
@@ -122,42 +123,6 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
           </h2>
           <AgentStateBadge agent={agent} />
         </header>
-        <dl className="m-0 grid gap-0.5 text-meta leading-5 [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
-          {agent.role === "coordinator" && (
-            <div>
-              <dt>Role</dt>
-              <dd>Coordinator</dd>
-            </div>
-          )}
-          <div>
-            <dt>Device</dt>
-            <dd>
-              {agent.device} · {agent.runtime}
-            </dd>
-          </div>
-          {agent.repo && (
-            <div>
-              <dt>Repo</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.repo.replace(/^github\.com\//, "")}</code>
-              </dd>
-            </div>
-          )}
-          {agent.branch && (
-            <div>
-              <dt>Branch</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.branch}</code>
-              </dd>
-            </div>
-          )}
-          <div>
-            <dt>Last seen</dt>
-            <dd>
-              <RelTime at={agent.last_seen} />
-            </dd>
-          </div>
-        </dl>
       </div>
       <div className="grid min-w-0 content-start gap-2.5">
         <p className="font-medium">
@@ -180,11 +145,47 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
         {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
       </div>
+      <dl className="m-0 grid content-start gap-0.5 text-meta leading-5 lg:border-l lg:pl-4 [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+        {agent.role === "coordinator" && (
+          <div>
+            <dt>Role</dt>
+            <dd>Coordinator</dd>
+          </div>
+        )}
+        <div>
+          <dt>Device</dt>
+          <dd>
+            {agent.device} · {agent.runtime}
+          </dd>
+        </div>
+        {agent.repo && (
+          <div>
+            <dt>Repo</dt>
+            <dd className="[overflow-wrap:anywhere]">
+              <code>{agent.repo.replace(/^github\.com\//, "")}</code>
+            </dd>
+          </div>
+        )}
+        {agent.branch && (
+          <div>
+            <dt>Branch</dt>
+            <dd className="[overflow-wrap:anywhere]">
+              <code>{agent.branch}</code>
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt>Last seen</dt>
+          <dd>
+            <RelTime at={agent.last_seen} />
+          </dd>
+        </div>
+      </dl>
     </article>
   );
 }
 
-const handoffBox = "bg-muted grid gap-1.5 rounded-sm border px-3 py-2.5";
+const handoffBox = "bg-muted grid gap-1.5 rounded-md border px-3 py-2.5";
 
 function HandoffView({ agentId }: { agentId: string }) {
   const handoff = useQuery(queries.handoff(agentId));

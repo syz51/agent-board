@@ -58,26 +58,38 @@ export function TaskScreen() {
   );
 }
 
-/** A task section: heading, optional count, then its content. */
+/**
+ * A task section as a box: a grey header bar with the heading and count, then its content,
+ * padded unless it is a list that runs to the box's edges.
+ */
 function Section({
   id,
   title,
   count,
   first,
+  flush,
   children,
 }: {
   id: string;
   title: string;
   count?: number;
   first?: boolean;
+  flush?: boolean;
   children: ReactNode;
 }) {
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby={id}>
-      <SectionTitle id={id} {...(count === undefined ? {} : { count })}>
+    <section
+      className={cn("overflow-hidden rounded-md border bg-card", !first && "mt-6")}
+      aria-labelledby={id}
+    >
+      <SectionTitle
+        id={id}
+        className="mb-0 h-10 border-b bg-muted px-4 text-sm"
+        {...(count === undefined ? {} : { count })}
+      >
         {title}
       </SectionTitle>
-      {children}
+      {flush ? children : <div className="px-4 py-3.5">{children}</div>}
     </section>
   );
 }
@@ -118,24 +130,24 @@ function TaskView({
 
   return (
     <article>
-      <header className="mb-6">
-        <h1 className="max-w-[36ch] text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+      <header className="mb-6 border-b pb-4">
+        <h1 className="text-[32px] leading-10 font-normal text-balance max-md:text-display-phone max-md:leading-8">
           <PlainText text={task.title} />
         </h1>
-        {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
-        <p className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-meta lg:hidden">
+        {/* The state line under the title, as an issue page has it; the sidebar repeats the facts. */}
+        <p className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
           <StatusBadge status={task.status} ready={task.ready} />
           <PriorityBadge priority={task.priority} />
           <Owner task={task} agents={agents} />
+          <span className="text-muted-foreground">
+            opened <RelTime at={task.created_at} />
+          </span>
         </p>
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
-        <aside
-          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
-          aria-label="Properties"
-        >
-          <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
+      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_256px] lg:items-start lg:gap-8">
+        <aside className="order-2 grid lg:sticky lg:top-6" aria-label="Properties">
+          <Facts className="divide-y text-meta [&_dt]:text-xs [&_dt]:font-semibold [&>div]:grid-cols-1 [&>div]:gap-1.5 [&>div]:py-3 [&>div:first-child]:pt-0">
             <div>
               <dt>Status</dt>
               <dd>
@@ -196,7 +208,7 @@ function TaskView({
 
         <div className="min-w-0">
           {task.blocked_reason && (
-            <Alert variant="warn" className="mb-5 px-4.5 py-4">
+            <Alert variant="warn" className="mb-6 rounded-md px-4 py-3.5">
               <AlertTitle className="text-sm font-semibold">Blocked</AlertTitle>
               <AlertDescription className="text-warn">
                 <p>
@@ -228,11 +240,16 @@ function TaskView({
             )}
           </Section>
 
-          <Section id="task-acceptance" title="Acceptance" count={acceptance.length}>
+          <Section
+            id="task-acceptance"
+            title="Acceptance"
+            count={acceptance.length}
+            flush={acceptance.length > 0}
+          >
             {acceptance.length > 0 ? (
-              <ol className="divide-y overflow-hidden rounded-lg border">
+              <ol className="divide-y">
                 {acceptance.map((line, index) => (
-                  <li key={index} className="flex gap-3 px-3.5 py-2.5">
+                  <li key={index} className="flex gap-3 px-4 py-2.5">
                     <span
                       className="mt-px grid size-5 flex-none place-items-center rounded-full bg-secondary text-2xs font-semibold text-subtle-foreground tabular-nums"
                       aria-hidden="true"
@@ -248,9 +265,14 @@ function TaskView({
             )}
           </Section>
 
-          <Section id="task-evidence" title="Evidence" count={detail.evidence.length}>
+          <Section
+            id="task-evidence"
+            title="Evidence"
+            count={detail.evidence.length}
+            flush={detail.evidence.length > 0}
+          >
             {detail.evidence.length > 0 ? (
-              <ul className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+              <ul className="divide-y">
                 {detail.evidence.map((item, index) => (
                   <EvidenceItem key={index} item={item} agents={agents} />
                 ))}
@@ -260,11 +282,16 @@ function TaskView({
             )}
           </Section>
 
-          <Section id="task-notes" title="Notes" count={detail.notes.length}>
+          <Section
+            id="task-notes"
+            title="Notes"
+            count={detail.notes.length}
+            flush={detail.notes.length > 0}
+          >
             {detail.notes.length > 0 ? (
-              <ul className="grid gap-2.5">
+              <ul className="divide-y">
                 {detail.notes.map((note) => (
-                  <li key={note.id} className="grid gap-1.5 rounded-lg border bg-card px-3.5 py-3">
+                  <li key={note.id} className="grid gap-1.5 px-4 py-3">
                     <div className="flex flex-wrap items-center gap-2 text-meta">
                       <Who id={note.agent} agents={agents} />
                       <Badge
@@ -325,7 +352,7 @@ function FeedbackFacts({
   const { resolution } = feedback;
   return (
     <Section id="task-feedback" title="Feedback" first>
-      <Facts className="gap-2.5 rounded-lg border p-4 [&>div]:grid-cols-[100px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
+      <Facts className="gap-2.5 [&>div]:grid-cols-[100px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
         <div>
           <dt>About</dt>
           <dd>
@@ -414,8 +441,8 @@ function TaskLinks({
 }) {
   if (ids.length === 0) return null;
   return (
-    <section className="border-t pt-4">
-      <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
+    <section className="border-t py-3">
+      <h2 className="mb-1.5 text-xs font-semibold text-muted-foreground">{title}</h2>
       <ul className="grid gap-1">
         {ids.map((id) => {
           const task = related.get(id);
@@ -445,7 +472,7 @@ function TaskLinks({
 
 function EvidenceItem({ item, agents }: { item: Evidence; agents: Map<string, Agent> }) {
   return (
-    <li className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 py-2.5">
+    <li className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-4 py-2.5">
       <Badge variant="outline" shape="tag">
         {item.kind}
       </Badge>

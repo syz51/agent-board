@@ -235,11 +235,7 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 
 /** The frame around task groups: one card, groups divided by rules. */
 export function TaskBoard({ children }: { children: ReactNode }) {
-  return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
-      {children}
-    </div>
-  );
+  return <div className="grid gap-4">{children}</div>;
 }
 
 /** A group of tasks under a shaded heading with its count. */
@@ -258,13 +254,15 @@ export function TaskGroupSection({
 }) {
   const Heading = level === 2 ? "h2" : "h3";
   return (
-    <section aria-labelledby={id}>
+    <section className="overflow-hidden rounded-md border bg-card" aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+        className="flex h-10 items-center gap-2 border-b bg-muted px-4 text-sm font-semibold"
       >
         {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        <span className="h-5 min-w-5 rounded-full bg-secondary px-1.5 text-center text-xs leading-5 font-medium text-foreground tabular-nums">
+          {count}
+        </span>
       </Heading>
       {children}
     </section>
@@ -346,7 +344,7 @@ export function TaskList({
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-2 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>
@@ -371,7 +369,7 @@ function TaskMain({ task, done, now }: TaskRowData) {
     <>
       {/* The whole row opens the task; tags and blocker links sit above the link's cover. */}
       <Link
-        className="min-w-0 py-0.5 font-medium text-foreground after:absolute after:inset-0"
+        className="min-w-0 py-0.5 font-semibold text-foreground after:absolute after:inset-0 hover:text-link"
         to="/tasks/$id"
         params={{ id: task.id }}
       >

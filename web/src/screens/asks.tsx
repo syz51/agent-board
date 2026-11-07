@@ -8,7 +8,6 @@ import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Label } from "@/components/ui/label.tsx";
 import { Textarea } from "@/components/ui/textarea.tsx";
-import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
 import { useNow } from "@/live/runtime.ts";
@@ -230,8 +229,8 @@ function WaitingTasks({
       <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
-      {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
+      {/* Tasks only you can start keep their amber tag. */}
+      <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
             <TaskGroupSection
@@ -299,18 +298,11 @@ function AskCard({
   const Heading = standalone ? "h1" : "h2";
   return (
     <article
-      className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
-        "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
-        ask.status !== "open"
-          ? "before:bg-input"
-          : ask.kind === "action"
-            ? "before:bg-amber"
-            : "before:bg-status-review",
-      )}
+      // A comment box: who asked and where in a grey header, the question, then the reply.
+      className="overflow-hidden rounded-md border bg-card"
       data-status={ask.status}
     >
-      <header className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-meta">
+      <header className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 border-b bg-muted px-4 py-2 text-meta">
         <AskKind kind={ask.kind} />
         <Heading className="text-meta font-semibold">
           {standalone ? (
@@ -341,12 +333,16 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="text-base leading-[1.55] text-foreground">
+      <div className="px-4 py-4 text-base leading-[1.55] text-foreground">
         <Markdown text={ask.question} />
       </div>
-      {ask.status === "open" && <AnswerForm ask={ask} />}
+      {ask.status === "open" && (
+        <div className="border-t bg-muted/50 px-4 py-3.5">
+          <AnswerForm ask={ask} />
+        </div>
+      )}
       {ask.status === "answered" && (
-        <div className="grid gap-1 rounded-sm bg-status-ready-soft px-3.5 py-3">
+        <div className="grid gap-1 border-t bg-status-ready-soft px-4 py-3">
           <p className="text-meta font-semibold text-status-ready">
             Answered{ask.answered_via ? ` via ${VIA[ask.answered_via] ?? ask.answered_via}` : ""}
             {ask.answered_at && (
@@ -360,7 +356,7 @@ function AskCard({
         </div>
       )}
       {ask.status === "withdrawn" && (
-        <p className="text-muted-foreground">The agent withdrew this ask.</p>
+        <p className="border-t px-4 py-3 text-muted-foreground">The agent withdrew this ask.</p>
       )}
     </article>
   );
@@ -397,7 +393,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
 
   return (
     <form
-      className="grid gap-3 border-t pt-3.5"
+      className="grid gap-3"
       noValidate
       onSubmit={(event) => {
         event.preventDefault();

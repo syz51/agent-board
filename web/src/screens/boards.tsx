@@ -182,15 +182,16 @@ const AREA: Record<string, string> = {
 };
 
 const CELL_CLASS: Record<string, string> = {
-  name: "grid min-w-0 gap-0.5",
-  tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
+  name: "grid min-w-0 gap-1",
+  tasks: "grid min-w-0",
   coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
   asks: "",
-  autopilot: "flex flex-col items-end @min-[760px]:items-start",
+  autopilot: "flex flex-col items-end @min-[760px]:self-start",
 };
 
+/** A repository-list row: name and goal with autopilot at the right, then one line of facts. */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[auto_auto_auto_minmax(0,1fr)_auto] @min-[760px]:[grid-template-areas:'name_name_name_name_auto'_'tasks_coord_asks_._.'] @min-[760px]:gap-x-6 @min-[760px]:gap-y-2.5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -210,18 +211,11 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
   });
   return (
     <section
-      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
+      className="@container overflow-hidden rounded-md border bg-card"
       aria-label="All boards"
     >
       {table.getHeaderGroups().map((group) => (
-        <div
-          key={group.id}
-          className={cn(
-            ROW_GRID,
-            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
-          )}
-          aria-hidden="true"
-        >
+        <div key={group.id} className={cn(ROW_GRID, "hidden")} aria-hidden="true">
           {group.headers.map((header) => (
             <span key={header.id} className={AREA[header.id]}>
               <table.FlexRender header={header} />
@@ -231,13 +225,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
       ))}
       <ul className="divide-y">
         {table.getRowModel().rows.map((row) => (
-          <li
-            key={row.id}
-            className={cn(
-              ROW_GRID,
-              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
-            )}
-          >
+          <li key={row.id} className={cn(ROW_GRID, "items-center px-4 py-4 @min-[760px]:py-5")}>
             {row.getAllCells().map((cell) => (
               <div key={cell.id} className={cn(AREA[cell.column.id], CELL_CLASS[cell.column.id])}>
                 <table.FlexRender cell={cell} />
@@ -254,12 +242,14 @@ function BoardName({ board }: { board: Board }) {
   return (
     <>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
-          <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
+        <h2 className="min-w-0 text-[20px] leading-7 font-semibold">
+          <Link className="text-link" to="/boards/$slug" params={{ slug: board.slug }}>
             {board.title}
           </Link>
         </h2>
-        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
+        <span className="ident h-5 rounded-full border px-2 text-xs leading-[18px] text-muted-foreground">
+          {board.slug}
+        </span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}
@@ -273,9 +263,9 @@ function BoardName({ board }: { board: Board }) {
         )}
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
+        <ExpandableLine className="text-sm text-muted-foreground" text={board.goal} />
       ) : (
-        <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
+        <p className="text-sm leading-6 text-muted-foreground">No goal written.</p>
       )}
     </>
   );
@@ -287,7 +277,7 @@ function TaskTally({ board }: { board: Board }) {
   return (
     <>
       <div
-        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary"
+        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary @min-[760px]:hidden"
         aria-hidden="true"
       >
         {SEGMENTS.map(
@@ -305,7 +295,7 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-3 gap-y-1 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-2"
+          className="flex flex-wrap gap-x-3 gap-y-1 text-meta leading-[18px] text-muted-foreground max-[759px]:mt-2"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -323,8 +313,7 @@ function TaskTally({ board }: { board: Board }) {
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
-                  {/* The column head names the counts; each keeps its word for screen readers. */}
-                  <span className="@min-[760px]:sr-only">{segment.label}</span>
+                  <span>{segment.label}</span>
                 </li>
               ),
           )}
@@ -352,10 +341,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
-        <span aria-hidden="true">–</span>
-        <span className="sr-only">No asks</span>
-      </span>
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">No asks</span>
     );
   }
   return (
@@ -365,8 +351,7 @@ function BoardAsks({ board }: { board: Board }) {
       search={{ board: board.slug }}
     >
       <Icon name="inbox" className="size-3.5" />
-      {board.open_asks}{" "}
-      <span className="@min-[760px]:hidden">{board.open_asks === 1 ? "ask" : "asks"}</span>
+      {board.open_asks} <span>{board.open_asks === 1 ? "ask" : "asks"}</span>
     </Link>
   );
 }
@@ -389,7 +374,7 @@ function AutopilotSwitch({ board }: { board: Board }) {
         // The dialog confirms the change; the switch itself only opens it.
         onCheckedChange={() => setConfirming(true)}
       >
-        <span className="@min-[760px]:sr-only">Autopilot</span>
+        <span>Autopilot</span>
       </Switch>
       <ConfirmDialog
         open={confirming}

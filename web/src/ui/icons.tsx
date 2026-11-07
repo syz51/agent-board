@@ -155,7 +155,7 @@ export function StatusPill({ status }: { status: StatusKey }) {
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 items-center gap-1.5 rounded-full pr-2.25 pl-1.75 text-xs font-[550] whitespace-nowrap",
+        "inline-flex h-6 items-center gap-1.5 rounded-full border border-current/25 pr-2.5 pl-2 text-xs font-medium whitespace-nowrap",
         STATUS_PILL[status],
       )}
     >

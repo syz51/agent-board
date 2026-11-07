@@ -84,11 +84,11 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
-      <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
-        <Icon name={icon} className="size-5" />
+    <div className="grid justify-items-center gap-1.5 rounded-md border px-6 py-10 text-center text-muted-foreground">
+      <span className="mb-1 grid size-8 place-items-center text-muted-foreground">
+        <Icon name={icon} className="size-6" />
       </span>
-      <p className="text-base font-semibold text-foreground">{title}</p>
+      <p className="text-title font-semibold text-foreground">{title}</p>
       {children && <p className="max-w-[48ch]">{children}</p>}
     </div>
   );
@@ -201,7 +201,7 @@ export function StatePill({
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 items-center gap-1.5 rounded-full pr-2.25 pl-1.75 text-xs font-[550] whitespace-nowrap",
+        "inline-flex h-6 items-center gap-1.5 rounded-full border border-current/25 pr-2.5 pl-2 text-xs font-medium whitespace-nowrap",
         state === "running"
           ? "bg-status-ready-soft text-status-ready"
           : state === "paused"
@@ -306,10 +306,10 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3 border-b pb-4">
       <div className="grid min-w-0 gap-1.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <h1 className="text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+          <h1 className="text-display font-semibold text-balance max-md:text-display-phone">
             {title}
           </h1>
           {children}
@@ -342,22 +342,21 @@ export function SectionTitle({
   id,
   count,
   icon,
+  className,
   children,
 }: {
   id: string;
   count?: number;
   icon?: ReactNode;
+  className?: string;
   children: ReactNode;
 }) {
   return (
-    <h2
-      id={id}
-      className="mb-3 flex items-baseline gap-2 text-base font-semibold tracking-[-0.011em]"
-    >
+    <h2 id={id} className={cn("mb-3 flex items-center gap-2 text-base font-semibold", className)}>
       {icon}
       {children}
       {count !== undefined && (
-        <span className="text-meta font-medium tracking-normal text-muted-foreground tabular-nums">
+        <span className="h-5 min-w-5 rounded-full bg-secondary px-1.5 text-center text-xs leading-5 font-medium text-foreground tabular-nums">
           {count}
         </span>
       )}
@@ -366,8 +365,7 @@ export function SectionTitle({
 }
 
 /** A bordered list of rows on a card surface. */
-export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+export const listClass = "bg-card divide-y overflow-hidden rounded-md border [&>li]:border-border";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {
