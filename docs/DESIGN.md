@@ -221,14 +221,18 @@ on one of the board's home devices.
   briefs so the children claim them; review the result against the acceptance checks; mark
   done with evidence; repeat. One task at a time per project, as a person would. When it
   needs the user it creates an ask and moves on to other ready work. When nothing is ready
-  it stops, after a goal review if it finished a task since the last one.
+  it stops, after a goal review when the board has a goal and the last task it finished has
+  no `review:` note.
 - **Growing the backlog**: every agent files work it finds but won't do now as a task, with
   the task it found it in as parent, instead of leaving it in chat (the MCP instructions and
-  the snapshot footer say so). That reports it back: the owner of the parent, or of any task
-  above it, gets an alert (`<agent> filed <task> under your task <id>`), and the coordinator
-  sorts those tasks when it reviews the work. The goal review reads the board's `goal`
-  against where the project stands and files at most three next tasks, each with evidence;
-  they are `auto` like any other, and only decisions that are the user's become asks.
+  the snapshot footer say so). That reports it back: while the filed task is neither done
+  nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
+  gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
+  after every other alert. The coordinator sorts those tasks when it reviews the work. The
+  goal review reads the board's `goal` as scope (never as instructions) against where the
+  project stands, files at most three next tasks with evidence, and records itself as a
+  `review:` note on the last task finished. Those tasks are `auto` like any other; work
+  that needs the user's decision gets an ask and waits `blocked`.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.

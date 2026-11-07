@@ -307,46 +307,59 @@ async fn tasks_filed_under_mine_alert_me() {
     for agent in ["t3:coord", "t3:child", "t3:other"] {
         t.register(agent, Some(REPO), None).await;
     }
-    // The coordinator owns the task; its child owns a sub-task of it.
+    let under =
+        |title: &str, parent: &str| json!({"board": "factory", "title": title, "parent": parent});
+    let claim = async |agent: &str, task: &str| assert!(t.claim(agent, task).await.0.is_success());
+    // A task the coordinator already finished.
+    let old = t.task("t3:coord", "factory", "Old").await;
+    claim("t3:coord", &old).await;
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    assert!(t.done("t3:coord", &old, commit).await.0.is_success());
+    // The coordinator owns the root; its child owns a sub-task, with a split of it below.
     let root = t.task("t3:coord", "factory", "Root").await;
-    t.claim("t3:coord", &root).await;
-    let sub = t
-        .task_with(
-            "t3:coord",
-            json!({"board": "factory", "title": "Sub", "parent": root}),
-        )
-        .await;
-    t.claim("t3:child", &sub).await;
-    snapshot(&t, "t3:coord", "kind=alerts").await;
-
-    // Found work filed under the child's task reaches the owner of its ancestor.
-    let found = t
-        .task_with(
-            "t3:child",
-            json!({"board": "factory", "title": "Found", "parent": sub}),
-        )
-        .await;
-    // A task with no parent, and one under a task the coordinator does not own, do not.
-    t.task("t3:child", "factory", "Loose").await;
+    claim("t3:coord", &root).await;
+    let sub = t.task_with("t3:coord", under("Sub", &root)).await;
+    claim("t3:child", &sub).await;
+    let deep = t.task_with("t3:child", under("Deep", &sub)).await;
+    // Another agent's task.
     let elsewhere = t.task("t3:other", "factory", "Elsewhere").await;
-    t.task_with(
-        "t3:child",
-        json!({"board": "factory", "title": "Under elsewhere", "parent": elsewhere}),
-    )
-    .await;
+    claim("t3:other", &elsewhere).await;
+    snapshot(&t, "t3:coord", "kind=alerts").await;
+    snapshot(&t, "t3:other", "kind=alerts").await;
+
+    // Found work under the child's tasks, at any depth, reaches the coordinator in one line.
+    let near = t.task_with("t3:child", under("Near", &sub)).await;
+    let far = t.task_with("t3:child", under("Far", &deep)).await;
+    // Not reported to the coordinator: no parent, another owner's task, a finished task,
+    // and a filed task already dropped.
+    t.task("t3:child", "factory", "Loose").await;
+    let theirs = t.task_with("t3:child", under("Theirs", &elsewhere)).await;
+    t.task_with("t3:child", under("Late", &old)).await;
+    let gone = t.task_with("t3:child", under("Gone", &sub)).await;
+    let (status, _) = t
+        .patch("t3:child", &gone, json!({ "status": "dropped" }))
+        .await;
+    assert!(status.is_success());
 
     let alerts = text(&snapshot(&t, "t3:coord", "kind=alerts").await).to_owned();
     let filed: Vec<&str> = alerts.lines().filter(|l| l.contains(" filed ")).collect();
     assert_eq!(filed.len(), 1, "{alerts}");
     assert!(
         filed[0].ends_with(&format!(
-            " filed {found} under your task {root} -> task_show {found}"
+            " filed {near},{far} under your task {root} -> task_show each"
         )),
         "{alerts}"
     );
-    // The filer itself is not alerted about its own task.
+    let other = text(&snapshot(&t, "t3:other", "kind=alerts").await).to_owned();
+    assert!(
+        other.contains(&format!(
+            " filed {theirs} under your task {elsewhere} -> task_show {theirs}"
+        )),
+        "{other}"
+    );
+    // The filer itself is not alerted about its own filings.
     let child = text(&snapshot(&t, "t3:child", "kind=alerts").await).to_owned();
-    assert!(!child.contains("filed"), "{child}");
+    assert!(!child.contains(" filed "), "{child}");
 }
 
 #[tokio::test]
