@@ -318,3 +318,122 @@ async fn a_peers_edit_found_by_a_shell_scan_is_not_the_scanners() {
         .await;
     assert_eq!(status, 400);
 }
+
+async fn touch(t: &T, agent: &str, paths: &[&str]) -> Value {
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some(agent),
+        Some(json!({"agent": agent, "repo": REPO, "paths": paths})),
+    )
+    .await
+}
+
+fn agents_in(overlaps: &Value) -> Vec<String> {
+    let mut agents: Vec<String> = overlaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["agent"].as_str().unwrap().to_owned())
+        .collect();
+    agents.sort();
+    agents.dedup();
+    agents
+}
+
+async fn alerts(t: &T, agent: &str) -> String {
+    let snap = t
+        .ok(
+            "GET",
+            &format!(
+                "/v1/snapshot?agent={}&kind=alerts",
+                agent.replace('%', "%25")
+            ),
+            Some(agent),
+            None,
+        )
+        .await;
+    snap["text"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
+    const PARENT: &str = "t3:b8745db9-8b9a-4047-8e1d-15b7ac1b2f40";
+    const CHILD: &str = "t3:thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    const SIBLING: &str = "t3:thread:delegated-task:command%3Amcp%3Ac2%3Adelegate-task%3At2";
+    const GRANDCHILD: &str = "t3:thread:delegated-task:command%3Amcp%3Ac3%3Adelegate-task%3At3";
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(PARENT, Some(REPO), Some("main")).await;
+    for (child, parent) in [(CHILD, PARENT), (SIBLING, PARENT), (GRANDCHILD, CHILD)] {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(child),
+            Some(json!({
+                "id": child, "runtime": "claude", "device": "mac", "repo": REPO,
+                "branch": "main",
+                "native_ids": {"t3_thread": &child[3..], "t3_parent": &parent[3..]},
+            })),
+        )
+        .await;
+    }
+    // A re-registration without it keeps the parent: native ids are merged.
+    t.register(CHILD, Some(REPO), Some("main")).await;
+    alerts(&t, PARENT).await;
+    alerts(&t, CHILD).await;
+
+    // The parent prepared the files and leased them before delegating.
+    touch(&t, PARENT, &["src/lib.rs"]).await;
+    lease(&t, PARENT, &["src/**"]).await;
+
+    // Its child edits and leases them without a warning either way.
+    assert_eq!(
+        touch(&t, CHILD, &["src/lib.rs"]).await["overlaps"],
+        json!([])
+    );
+    assert_eq!(
+        lease(&t, CHILD, &["src/*.rs"]).await["conflicts"],
+        json!([])
+    );
+    let child_alerts = alerts(&t, CHILD).await;
+    assert!(!child_alerts.contains("! "), "{child_alerts}");
+    let parent_alerts = alerts(&t, PARENT).await;
+    assert!(!parent_alerts.contains("! "), "{parent_alerts}");
+
+    // The child's own child is family to both, all the way up.
+    alerts(&t, GRANDCHILD).await;
+    assert_eq!(
+        touch(&t, GRANDCHILD, &["src/lib.rs"]).await["overlaps"],
+        json!([])
+    );
+    assert_eq!(
+        lease(&t, GRANDCHILD, &["src/lib.rs"]).await["conflicts"],
+        json!([])
+    );
+    for agent in [PARENT, CHILD, GRANDCHILD] {
+        let text = alerts(&t, agent).await;
+        assert!(!text.contains("! "), "{agent}: {text}");
+    }
+
+    // Two children of one parent are peers: their overlaps are real, down their lines.
+    let overlaps = touch(&t, SIBLING, &["src/lib.rs"]).await["overlaps"].clone();
+    assert_eq!(agents_in(&overlaps), [CHILD, GRANDCHILD], "{overlaps}");
+    let child_alerts = alerts(&t, CHILD).await;
+    assert!(child_alerts.contains("edited src/lib.rs"), "{child_alerts}");
+    // And any other thread is a peer of the parent.
+    let parent_alerts = alerts(&t, PARENT).await;
+    assert!(!parent_alerts.contains("! "), "{parent_alerts}");
+    t.register(B, Some(REPO), Some("main")).await;
+    let overlaps = touch(&t, B, &["src/lib.rs"]).await["overlaps"].clone();
+    assert_eq!(
+        agents_in(&overlaps),
+        [PARENT, CHILD, SIBLING, GRANDCHILD],
+        "{overlaps}"
+    );
+    let parent_alerts = alerts(&t, PARENT).await;
+    assert!(
+        parent_alerts.contains("edited src/lib.rs"),
+        "{parent_alerts}"
+    );
+}
