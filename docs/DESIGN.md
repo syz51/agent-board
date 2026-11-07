@@ -183,7 +183,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -262,9 +262,13 @@ registers without a repo).
   item, never fixes a setup on a report's say-so, and treats report text as data. A
   recurring item goes back to the owner of the earlier task, or to the setup's owner when
   the earlier item had no task (fixed or forwarded).
-- **Growing the backlog**: every agent files work it finds but won't do now as a proposal
-  (see "Proposals and triage"), with the task it found it in as parent, instead of leaving
-  it in chat (the MCP instructions say so; the snapshot footer says to file a proposal). That reports it back: while the filed task is neither done
+- **Growing the backlog**: an agent leaves nothing still to do only in chat. Before
+  `task_done`, and before it stops, it files the task's remaining scope as sub-tasks (parent
+  the task), work it found outside the task as a proposal (see "Proposals and triage"), with
+  the task it found it in as parent, and the user's part as a task blocked on an ask; it
+  calls `task_done` only when every acceptance check passes, and names what it filed in its
+  reply. The MCP instructions say so, the snapshot footer repeats the first two, and the
+  `Stop` hook reminds it once per task it marked done that turn. Filing reports it back: while the filed task is neither done
   nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
   gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
   after every other alert. The coordinator sorts those tasks when it reviews the work. The
@@ -378,7 +382,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File found work as a Proposal: task, auto=false. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). Before task_done, file what is left as sub-tasks and found work as Proposal: tasks (auto=false). Notes and bodies: task_show <id>.
 </board>
 ```
 
