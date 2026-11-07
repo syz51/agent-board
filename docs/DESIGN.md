@@ -321,7 +321,9 @@ registers without a repo).
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**
-  queue to answer asks; a live event feed.
+  queue to answer asks, followed by the tasks that wait on the user without an open ask,
+  by board: blocked ones, and open ones not `auto` other than pending proposals, feedback
+  items and those held by a `not_before` (its navigation badge counts both); a live event feed.
 
 ## Text format
 

@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
-    DoneTask, ErrorCode, EventsPage, FeedbackResult, Handoff, JoinBoard, LeaseResult, Note,
-    PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats,
-    Task, TaskAction, TaskDetail, TaskId, TaskStatus, TouchResult, Touches, UpdateBoard,
+    CreatedAsk, DoneTask, ErrorCode, EventsPage, FeedbackResult, Handoff, JoinBoard, LeaseResult,
+    Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, TouchResult, Touches, UpdateBoard,
     UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
@@ -330,7 +330,7 @@ impl Client {
 
     // Asks
 
-    pub async fn create_ask(&self, body: &CreateAsk) -> Result<Ask> {
+    pub async fn create_ask(&self, body: &CreateAsk) -> Result<CreatedAsk> {
         self.with_body(Method::POST, "/v1/asks", body).await
     }
 

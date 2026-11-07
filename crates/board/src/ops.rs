@@ -552,7 +552,7 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         _ => ctx.resolve_board(ask.board.clone()).await?,
     };
     let agent = ctx.agent()?.clone();
-    let created = ctx
+    let answer = ctx
         .client
         .create_ask(&CreateAsk {
             agent: agent.clone(),
@@ -563,10 +563,15 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             options: ask.options,
         })
         .await?;
+    let created = &answer.ask;
     let mut text = format!(
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
-        render::ask_line(&created)
+        render::ask_line(created)
     );
+    // The server's warning names the board's other recent open asks, which this may repeat.
+    if let Some(warning) = &answer.warning {
+        text.push_str(&format!("\nwarning: {warning}"));
+    }
     if let Some(task) = &created.task {
         // Advisory: the ask is made either way, so a failed check is reported, not raised.
         match ctx.client.asks(Some("open"), Some(&created.board)).await {
@@ -604,7 +609,7 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             )),
         }
     }
-    Ok(Output::new(text, &created))
+    Ok(Output::new(text, &answer))
 }
 
 pub async fn ask_withdraw(ctx: &Ctx, id: i64) -> Result<Output> {
