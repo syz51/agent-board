@@ -146,6 +146,58 @@ async fn handoffs_are_replaced_whole_with_versions() {
 }
 
 #[tokio::test]
+async fn handoffs_carry_the_agents_last_change() {
+    let t = T::new();
+    let (a, b) = ("t3:alpha", "t3:beta");
+    t.register(a, Some(REPO), None).await;
+    t.register(b, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let task = t.task(a, "factory", "Parse it").await;
+    assert!(t.claim(a, &task).await.0.is_success());
+    let path = format!("/v1/agents/{a}/handoff");
+    let put = |now: &str| json!({ "now": now, "next": "y" });
+    t.advance(TimeDelta::minutes(1));
+    let h = t.ok("PUT", &path, Some(a), Some(put("claimed"))).await;
+    let claimed_at = super::iso(super::start());
+    assert_eq!(h["last_change_at"], claimed_at.as_str(), "{h}");
+    assert!(h["updated_at"].as_str() > h["last_change_at"].as_str());
+
+    // Presence, a newer handoff and other agents' changes are not this agent's work.
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{a}/state"),
+        Some(a),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    t.register(a, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task}/notes"),
+        Some(b),
+        Some(json!({ "agent": b, "kind": "note", "text": "note: from b" })),
+    )
+    .await;
+    let h = t.ok("GET", &path, None, None).await;
+    assert_eq!(h["last_change_at"], claimed_at.as_str());
+
+    // A note or a file touch is a change, dated on the server's clock.
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some(a),
+        Some(json!({ "agent": a, "repo": REPO, "paths": ["src/lib.rs"] })),
+    )
+    .await;
+    let h = t.ok("GET", &path, None, None).await;
+    let touched_at = super::iso(super::start() + TimeDelta::minutes(3));
+    assert_eq!(h["last_change_at"], touched_at.as_str());
+    assert!(h["last_change_at"].as_str() > h["updated_at"].as_str());
+}
+
+#[tokio::test]
 async fn ended_agents_release_leases_and_coordinator() {
     let t = T::new();
     let a = "t3:alpha";

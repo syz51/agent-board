@@ -436,7 +436,7 @@ impl Hook<'_> {
             })
             .await?;
         self.local.turn_started = None;
-        self.local.reminded_turn = None;
+        self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
             return Ok(Reply::Context(text));
@@ -549,9 +549,7 @@ impl Hook<'_> {
 
     async fn stop(&mut self) -> Result<Reply> {
         self.set_state(AgentState::Idle, None).await?;
-        let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
-        let turn = self.local.turn_started;
-        if continued || (self.local.reminded_turn.is_some() && self.local.reminded_turn == turn) {
+        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
             return Ok(Reply::Nothing);
         }
         let doing = self
@@ -566,17 +564,32 @@ impl Hook<'_> {
             return Ok(Reply::Nothing);
         };
         let handoff = self.client.handoff(&self.agent).await?;
-        let stale = match (&handoff, turn) {
-            (None, _) => true,
-            (Some(h), Some(turn)) => h.updated_at < turn,
-            (Some(_), None) => false,
+        let turn = self.local.turn_started;
+        // The server dates the agent's last board change or file touch on the handoff's own
+        // clock, so a turn that only read or replied leaves the handoff current. A server
+        // without that date falls back to: a handoff older than the turn is stale.
+        let (stale_since, why) = match &handoff {
+            None => (Some(turn.unwrap_or(self.now)), "you have no handoff"),
+            Some(h) => match h.last_change_at {
+                Some(at) => (
+                    (at > h.updated_at).then_some(at),
+                    "your handoff predates your last board change or file edit",
+                ),
+                None => (
+                    turn.filter(|&t| h.updated_at < t),
+                    "your handoff is older than this turn",
+                ),
+            },
         };
-        if !stale {
+        let Some(since) = stale_since else {
+            return Ok(Reply::Nothing);
+        };
+        if self.local.reminded_for == Some(since) {
             return Ok(Reply::Nothing);
         }
-        self.local.reminded_turn = Some(turn.unwrap_or(self.now));
+        self.local.reminded_for = Some(since);
         Ok(Reply::Block(format!(
-            "board: {} is in doing and your handoff is older than this turn. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
+            "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
             task.id
         )))
     }
