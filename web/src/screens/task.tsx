@@ -57,6 +57,8 @@ function TaskView(
   const { task } = detail;
   const acceptance = task.acceptance.split("\n").map((line) => line.trim()).filter(Boolean);
 
+  const summary = task.status === "done" ? task.summary : undefined;
+
   return (
     <article class="task-detail">
       <header class="task-head">
@@ -134,7 +136,14 @@ function TaskView(
 
           {task.feedback && <FeedbackFacts feedback={task.feedback} agents={agents} related={related} />}
 
-          <section class="section section-first">
+          {summary && (
+            <section class="section section-first">
+              <h2>Summary</h2>
+              <div class="agent-text prose"><Markdown text={summary} /></div>
+            </section>
+          )}
+
+          <section class={summary ? "section" : "section section-first"}>
             <h2>Description</h2>
             {task.body.trim()
               ? <div class="agent-text prose"><Markdown text={task.body} /></div>

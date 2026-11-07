@@ -536,6 +536,7 @@ impl Hook<'_> {
                 &AgentStateUpdate {
                     state,
                     paused_until,
+                    said: None,
                 },
             )
             .await?;
@@ -646,6 +647,7 @@ impl Hook<'_> {
             &AgentStateUpdate {
                 state: AgentState::Running,
                 paused_until: None,
+                said: None,
             },
         );
         let (beat, snap) = tokio::join!(heartbeat, self.fetch(kind));
@@ -742,13 +744,37 @@ impl Hook<'_> {
         })
     }
 
+    /// Marks the agent idle with the turn's last message, which the server keeps for the
+    /// user while the agent coordinates a board. A turn the reminders continue has not
+    /// ended, so its message is not sent; the next `Stop` sends the final one.
+    ///
     /// Both reminders go in one block: the turn continues once, and the `Stop` that follows
     /// has `stop_hook_active` and stays quiet, so a second block would never be seen.
     async fn stop(&mut self) -> Result<Reply> {
         // Before any server call, so it survives a server that fails (`local_stop`).
         self.prepare_done_reminder();
-        self.set_state(AgentState::Idle, None).await?;
-        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
+        // A Stop that follows our own block ends the turn that answered a reminder; the
+        // message worth keeping was the one the reminder interrupted.
+        let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
+        let said = if continued {
+            None
+        } else {
+            self.input["last_assistant_message"]
+                .as_str()
+                .and_then(board_proto::turn_ending)
+        };
+        // The state first: it matters most within the hook's budget.
+        self.client
+            .set_state(
+                &self.agent,
+                &AgentStateUpdate {
+                    state: AgentState::Idle,
+                    paused_until: None,
+                    said,
+                },
+            )
+            .await?;
+        if continued {
             return Ok(Reply::Nothing);
         }
         let handoff = self.handoff_reminder().await?;

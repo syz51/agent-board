@@ -10,6 +10,8 @@ export const tags = {
   asks: "asks",
   /** Tasks across boards, such as the agents screen's current tasks. */
   tasks: "tasks",
+  /** What finished and what coordinators said, for the user (`GET /v1/updates`, said lists). */
+  updates: "updates",
   board: (slug: string) => `board:${slug}`,
   task: (id: string) => `task:${id}`,
   handoff: (agentId: string) => `handoff:${agentId}`,
@@ -41,7 +43,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "board_updated":
       if (isDeletion(event)) {
         // Its tasks, asks and memberships went with it.
-        onBoard(tags.boards, tags.tasks, tags.agents, tags.asks);
+        onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.updates);
       } else {
         onBoard(tags.boards);
       }
@@ -53,10 +55,13 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "task_claimed":
     case "task_released":
     case "task_taken":
-    case "task_updated":
-    case "task_done":
       // Counts on the boards screen and current tasks on the agents screen change too.
       onBoard(tags.boards, tags.tasks);
+      break;
+    case "task_updated":
+    case "task_done":
+      // A done task joins the updates; a reopened one leaves them and loses its summary.
+      onBoard(tags.boards, tags.tasks, tags.updates);
       break;
     case "note_added":
     case "evidence_added":
@@ -66,9 +71,12 @@ export function tagsForEvent(event: BoardEvent): string[] {
       out.push(tags.handoff(event.actor));
       break;
     case "agent_registered":
-    case "agent_state_changed":
       // The boards screen shows the coordinator's state.
       out.push(tags.agents, tags.boards);
+      break;
+    case "agent_state_changed":
+      // A coordinator's turn ending is stored on the same Stop that changes its state.
+      out.push(tags.agents, tags.boards, tags.updates);
       break;
     case "ask_created":
     case "ask_answered":
@@ -78,7 +86,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
       break;
     default:
       // A type this view does not know yet: refresh everything it could touch.
-      onBoard(tags.boards, tags.tasks, tags.agents, tags.asks);
+      onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.updates);
   }
   return out;
 }

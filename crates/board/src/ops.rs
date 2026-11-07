@@ -498,7 +498,12 @@ impl Evidence {
     }
 }
 
-pub async fn task_done(ctx: &Ctx, id: &TaskId, evidence: Evidence) -> Result<Output> {
+pub async fn task_done(
+    ctx: &Ctx,
+    id: &TaskId,
+    evidence: Evidence,
+    summary: Option<String>,
+) -> Result<Output> {
     let evidence = evidence.into_wire();
     if evidence.is_empty() {
         bail!(
@@ -514,6 +519,7 @@ pub async fn task_done(ctx: &Ctx, id: &TaskId, evidence: Evidence) -> Result<Out
                 agent: ctx.agent()?.clone(),
                 version,
                 evidence,
+                summary,
             },
         )
         .await?;

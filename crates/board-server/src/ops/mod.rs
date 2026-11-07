@@ -10,6 +10,7 @@ pub(crate) mod leases;
 pub(crate) mod stats;
 pub(crate) mod tasks;
 pub(crate) mod telegram;
+pub(crate) mod updates;
 
 use board_proto::{AgentId, BoardSlug, EventType};
 use rusqlite::params;

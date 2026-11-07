@@ -14,6 +14,7 @@ import {
   useTitle,
 } from "../ui/common.tsx";
 import { Avatar, StatusIcon } from "../ui/icons.tsx";
+import { CollapsibleMarkdown } from "./updates.tsx";
 
 const STATE_ORDER: Record<Agent["state"], number> = { running: 0, paused: 1, idle: 2, ended: 3 };
 const FILTERS = [
@@ -144,6 +145,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             : <span class="muted">No task in doing</span>}
         </p>
         {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
+        {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
       </div>
     </article>
   );
@@ -183,5 +185,39 @@ function HandoffView({ agentId }: { agentId: string }) {
         )}
       </dl>
     </section>
+  );
+}
+
+/** How many of a coordinator's turn endings the agents screen shows. */
+const SAID_SHOWN = 3;
+
+/** A coordinator's latest turn endings, collapsed until opened. */
+function SaidView({ agentId }: { agentId: string }) {
+  const said = useResource(`said:${agentId}`, [tags.updates], () => api.agentSaid(agentId, SAID_SHOWN));
+  const latest = said.data?.[0];
+  return (
+    <details class="said">
+      <summary>
+        Recent turn endings
+        {latest && <> · latest <RelTime at={latest.at} /></>}
+      </summary>
+      {said.error && <ErrorNotice error={said.error} retry={said.retry} compact />}
+      {said.data === undefined
+        ? !said.error && <p class="muted said-head">Loading…</p>
+        : said.data.length === 0
+        ? <p class="muted said-head">Nothing kept yet. Turn endings are kept while it coordinates a board.</p>
+        : (
+          <ul class="said-list">
+            {said.data.map((item) => (
+              <li key={item.id} class="said-item">
+                <p class="said-head">
+                  <a href={`/boards/${encodeURIComponent(item.board)}`}>{item.board}</a> · <RelTime at={item.at} />
+                </p>
+                <CollapsibleMarkdown text={item.text} />
+              </li>
+            ))}
+          </ul>
+        )}
+    </details>
   );
 }

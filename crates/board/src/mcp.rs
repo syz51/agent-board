@@ -10,8 +10,8 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     ASK_OPTION_CHARS_MAX, AgentId, AskKind, BoardSlug, CreateFeedback, EVIDENCE_VALUE_CHARS_MAX,
     FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind, PATH_CHARS_MAX, Priority,
-    RESOLUTION_REASON_CHARS_MAX, ResolutionKind, ResolveFeedback, SnapshotFormat, SnapshotKind,
-    TaskId, TaskStatus,
+    RESOLUTION_REASON_CHARS_MAX, ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX,
+    SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
@@ -287,7 +287,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_done",
-        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks run (command and exit code), commits, PRs or artifacts; at least one.",
+        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks run (command and exit code), commits, PRs or artifacts; at least one. Add a summary for the user, who reads it in the web view, apart from this chat.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -320,6 +320,14 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "artifacts",
                     strings("Artifact links or paths.", EVIDENCE_VALUE_CHARS_MAX),
+                    false,
+                ),
+                (
+                    "summary",
+                    s(
+                        "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone.",
+                        SUMMARY_CHARS_MAX,
+                    ),
                     false,
                 ),
             ]
@@ -670,7 +678,7 @@ impl BoardMcp {
                     prs: a.prs,
                     artifacts: a.artifacts,
                 };
-                ops::task_done(&ctx, &a.id, evidence).await?
+                ops::task_done(&ctx, &a.id, evidence, a.summary).await?
             }
             "task_note" => {
                 let a: NoteArgs = parse(args)?;
@@ -831,6 +839,7 @@ struct DoneArgs {
     prs: Vec<String>,
     #[serde(default)]
     artifacts: Vec<String>,
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]

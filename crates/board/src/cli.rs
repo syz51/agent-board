@@ -403,6 +403,9 @@ pub struct DoneArgs {
         EVIDENCE_VALUE_CHARS_MAX,
     ))]
     artifacts: Vec<String>,
+    /// For the user: what changed and what they should know (at most 600 characters).
+    #[arg(long)]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -766,7 +769,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 prs: a.prs,
                 artifacts: a.artifacts,
             };
-            ops::task_done(&ctx()?, &a.id, evidence).await?
+            ops::task_done(&ctx()?, &a.id, evidence, a.summary).await?
         }
         Command::Note { id, text, kind } => ops::task_note(&ctx()?, &id, kind, text).await?,
         Command::Handoff {

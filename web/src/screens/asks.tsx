@@ -17,6 +17,7 @@ import {
 } from "../ui/common.tsx";
 import { Icon } from "../ui/icons.tsx";
 import { TaskRow } from "./board.tsx";
+import { UpdatesSection } from "./updates.tsx";
 
 const VIA: Record<string, string> = { web: "the web view", telegram: "Telegram", cli: "the CLI" };
 
@@ -169,6 +170,7 @@ export function AsksScreen() {
           );
         }}
       </Query>
+      <UpdatesSection board={board} />
     </>
   );
 }

@@ -216,6 +216,12 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
         .optional()?
         .ok_or_else(|| agent_missing(id))?;
     touch_agent(cx, id)?;
+    // Before `ended` releases the boards it coordinates. Advisory: cleaned and cut here,
+    // never a reason to refuse the state change.
+    let said = match update.said.as_deref().and_then(board_proto::turn_ending) {
+        Some(text) => crate::ops::updates::record_said(cx, id, &text)?,
+        None => false,
+    };
     let state = enum_str(&update.state);
     cx.db.execute(
         "UPDATE agents SET state = ?2, paused_until = ?3 WHERE id = ?1",
@@ -239,7 +245,8 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
             params![id.as_str(), now, expires(cx, cx.s.coordinator_ms())],
         )?;
     }
-    if before != state || update.state == AgentState::Paused {
+    // A kept turn ending also announces itself, so the user's views refresh.
+    if before != state || update.state == AgentState::Paused || said {
         cx.emit(
             None,
             id.as_str(),

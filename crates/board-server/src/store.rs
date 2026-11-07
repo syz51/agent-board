@@ -64,7 +64,7 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
-     t.updated_at, t.not_before";
+     t.updated_at, t.not_before, t.summary";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -94,6 +94,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: ts(r.get(13)?),
         updated_at: ts(r.get(14)?),
         feedback: None,
+        summary: r.get(16)?,
     })
 }
 
@@ -149,6 +150,25 @@ fn complete_task(cx: &Ctx<'_>, mut task: Task) -> Result<Task> {
     Ok(task)
 }
 
+/// A task's evidence, oldest first.
+pub(crate) fn load_evidence(cx: &Ctx<'_>, task: &str) -> Result<Vec<Evidence>> {
+    Ok(cx
+        .db
+        .prepare_cached(
+            "SELECT kind, value, exit_code, agent, at FROM evidence WHERE task = ?1 ORDER BY id",
+        )?
+        .query_map([task], |r| {
+            Ok(Evidence {
+                kind: parse_enum(&r.get::<_, String>(0)?)?,
+                value: r.get(1)?,
+                exit_code: r.get(2)?,
+                agent: parse_id(&r.get::<_, String>(3)?)?,
+                at: ts(r.get(4)?),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub(crate) fn find_task(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<Task>> {
     Ok(load_tasks(cx, "t.id = :id", &vec![(":id", &id.as_str())])?
         .into_iter()
@@ -183,21 +203,7 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let evidence = cx
-        .db
-        .prepare_cached(
-            "SELECT kind, value, exit_code, agent, at FROM evidence WHERE task = ?1 ORDER BY id",
-        )?
-        .query_map([id.as_str()], |r| {
-            Ok(Evidence {
-                kind: parse_enum(&r.get::<_, String>(0)?)?,
-                value: r.get(1)?,
-                exit_code: r.get(2)?,
-                agent: parse_id(&r.get::<_, String>(3)?)?,
-                at: ts(r.get(4)?),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let evidence = load_evidence(cx, id.as_str())?;
     let blocks = task_ids(
         cx,
         "SELECT b.task FROM task_blockers b JOIN tasks t ON t.id = b.task \

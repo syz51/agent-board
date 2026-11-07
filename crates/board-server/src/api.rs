@@ -7,15 +7,16 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
     AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
     CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
-    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, Note, PutHandoff, RegisterAgent,
-    ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
-    TaskStatus, TouchResult, Touches, UpdateBoard, UpdateTask,
+    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note, PutHandoff,
+    RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -23,7 +24,7 @@ use serde::de::DeserializeOwned;
 use crate::auth::Caller;
 use crate::error::{Error, Result, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
-use crate::ops::{agents, asks, boards, devices, feedback, leases, stats, tasks};
+use crate::ops::{agents, asks, boards, devices, feedback, leases, stats, tasks, updates};
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
 use crate::{events, snapshot, web};
@@ -64,6 +65,9 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/agents/{id}", get(show_agent))
         .route("/agents/{id}/state", post(agent_state))
         .route("/agents/{id}/handoff", get(show_handoff).put(put_handoff))
+        .route("/agents/{id}/said", get(list_said))
+        .route("/updates", get(show_updates))
+        .route("/updates/seen", put(mark_seen))
         .route("/boards", get(list_boards_h).post(create_board))
         .route(
             "/boards/{slug}",
@@ -372,6 +376,63 @@ async fn release_coordinator(
 #[derive(Deserialize)]
 struct StatsQuery {
     days: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct SaidQuery {
+    limit: Option<usize>,
+}
+
+async fn list_said(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Q(q): Q<SaidQuery>,
+) -> Result<Json<Vec<Said>>> {
+    caller.require_user()?;
+    let id: AgentId = parse_path(&id)?;
+    let limit = q.limit.unwrap_or(updates::SAID_LIST_DEFAULT);
+    if !(1..=updates::SAID_KEPT).contains(&limit) {
+        return Err(invalid(
+            format!("limit {limit} is out of range"),
+            format!("send a limit from 1 to {}", updates::SAID_KEPT),
+        ));
+    }
+    Ok(Json(
+        state
+            .read(move |cx| updates::list_said(cx, &id, limit))
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpdatesQuery {
+    since: Option<Timestamp>,
+    board: Option<BoardSlug>,
+}
+
+async fn show_updates(
+    State(state): State<AppState>,
+    caller: Caller,
+    Q(q): Q<UpdatesQuery>,
+) -> Result<Json<Updates>> {
+    caller.require_user()?;
+    Ok(Json(
+        state
+            .read(move |cx| updates::updates(cx, q.since, q.board.as_ref()))
+            .await?,
+    ))
+}
+
+async fn mark_seen(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<MarkSeen>,
+) -> Result<Json<SeenCursor>> {
+    caller.require_user()?;
+    Ok(Json(
+        state.write(move |cx| updates::mark_seen(cx, req)).await?,
+    ))
 }
 
 async fn show_stats(

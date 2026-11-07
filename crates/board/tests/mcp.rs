@@ -339,6 +339,21 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         json!({"kind": "routed", "task": "factory-12"})
     );
 
+    // The summary for the user rides along with the evidence.
+    stub.on(
+        "POST /v1/tasks/factory-12/done",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    let done = mcp.call(
+        10,
+        "task_done",
+        json!({"id": "factory-12", "commits": ["4e1c2ab"], "summary": "Parser fixed; PR #4 is open."}),
+    );
+    assert_ne!(done["isError"], true, "{done}");
+    let sent = &stub.requests_to("POST /v1/tasks/factory-12/done")[0].body;
+    assert_eq!(sent["summary"], "Parser fixed; PR #4 is open.");
+    assert_eq!(sent["evidence"][0]["value"], "4e1c2ab");
+
     let bad = mcp.call(6, "task_show", json!({"id": "not an id"}));
     assert_eq!(bad["isError"], true);
     assert!(text(&bad).starts_with("error: invalid arguments"));

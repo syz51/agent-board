@@ -11,6 +11,7 @@ import { TaskScreen } from "./screens/task.tsx";
 import { api } from "./api/client.ts";
 import { tags } from "./live/refresh.ts";
 import { useResource } from "./live/runtime.ts";
+import { unseenCount, useUpdates } from "./screens/updates.tsx";
 import { Empty, useTitle } from "./ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "./ui/icons.tsx";
 
@@ -71,6 +72,8 @@ function Nav() {
   const { path } = useLocation();
   // Open asks plus the tasks waiting on the user without one, as the page lists them.
   const open = useNeedsYouCount();
+  const updates = useUpdates();
+  const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
     <nav class="nav" aria-label="Main">
       {NAV.map((item) => (
@@ -79,6 +82,12 @@ function Nav() {
           <span class="nav-label">{item.label}</span>
           {item.href === "/asks" && open > 0 && (
             <span class="nav-count" aria-label={`${open} waiting on you`}>{open}</span>
+          )}
+          {item.href === "/asks" && unseen > 0 && (
+            <>
+              <span class="nav-dot" aria-hidden="true" title={`${unseen} unseen updates`} />
+              <span class="visually-hidden">, {unseen} unseen {unseen === 1 ? "update" : "updates"}</span>
+            </>
           )}
         </a>
       ))}

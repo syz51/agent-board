@@ -60,11 +60,38 @@ describe("tagsForEvent", () => {
   test("a board's deletion also refreshes the tasks, agents and asks that went with it", () => {
     expect(
       tagsForEvent(event("board_updated", { payload: { fields: ["deleted"], title: "Factory" } })),
-    ).toEqual([tags.board("factory"), tags.boards, tags.tasks, tags.agents, tags.asks]);
+    ).toEqual([tags.board("factory"), tags.boards, tags.tasks, tags.agents, tags.asks, tags.updates]);
   });
 
   test("agent changes refresh agents and boards, which show the coordinator", () => {
-    expect(tagsForEvent(event("agent_state_changed", { board: null }))).toEqual([tags.agents, tags.boards]);
+    expect(tagsForEvent(event("agent_registered", { board: null }))).toEqual([tags.agents, tags.boards]);
+  });
+
+  test("an agent's state change also refreshes updates: a coordinator's turn ending comes with it", () => {
+    expect(tagsForEvent(event("agent_state_changed", { board: null }))).toEqual([
+      tags.agents,
+      tags.boards,
+      tags.updates,
+    ]);
+  });
+
+  test("done and updated tasks refresh updates; claims and releases do not", () => {
+    for (const type of ["task_done", "task_updated"]) {
+      expect(tagsForEvent(event(type, { task: "factory-9" }))).toContain(tags.updates);
+    }
+    for (const type of ["task_created", "task_claimed", "task_released", "task_taken"]) {
+      expect(tagsForEvent(event(type, { task: "factory-9" }))).not.toContain(tags.updates);
+    }
+  });
+
+  test("a plain board change, notes, asks and handoffs leave updates alone", () => {
+    const quiet = [
+      event("board_updated", { payload: { fields: ["autopilot"] } }),
+      event("note_added", { task: "factory-9" }),
+      event("ask_created"),
+      event("handoff_updated"),
+    ];
+    for (const item of quiet) expect(tagsForEvent(item)).not.toContain(tags.updates);
   });
 
   test("ask changes refresh asks, board counts and the task", () => {
@@ -89,6 +116,7 @@ describe("tagsForEvent", () => {
       tags.tasks,
       tags.agents,
       tags.asks,
+      tags.updates,
     ]);
   });
 });

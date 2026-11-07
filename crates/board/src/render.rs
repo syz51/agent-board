@@ -214,6 +214,9 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     if !task.acceptance.is_empty() {
         peer.push(json!({"task": task.id, "field": "acceptance", "text": task.acceptance}));
     }
+    if let Some(summary) = &task.summary {
+        peer.push(json!({"task": task.id, "field": "summary", "by": task.owner, "text": summary}));
+    }
     if let Some(reason) = task
         .feedback
         .as_ref()

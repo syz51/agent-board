@@ -2106,6 +2106,22 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
 }
 
 #[test]
+fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
+        "finish with `task_done`, evidence and a `summary`",
+        "The user does not read this chat as it happens",
+        "end every turn with a short status",
+        "put a question or an offer to the user in `ask_user`, never only in chat",
+        "never end a turn on a question",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
 fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     // Compare on words, so rewrapping the Markdown or CRLF checkouts change nothing.
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
