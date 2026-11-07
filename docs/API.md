@@ -398,7 +398,9 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 - `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml` →
   `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
-  `text`. The server also advances the agent's cursor to the returned `seq`. `json` is
+  `text`. The server also advances the agent's cursor to the returned `seq`. One request
+  checks at most 1,000 events that can concern the agent for alerts; past that, `seq` is the
+  last one checked and the first alert says how many wait for the next request. `json` is
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),

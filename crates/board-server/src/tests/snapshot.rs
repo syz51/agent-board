@@ -582,3 +582,91 @@ async fn a_new_peer_on_the_branch_alerts_only_when_it_shares_files() {
         text(&alerts)
     );
 }
+
+/// Appends `n` events by `actor` to the log, as if the server had recorded them.
+fn log_events(t: &T, n: u32, actor: &str, kind: &str, task: &str, payload: &str) {
+    t.exec(&format!(
+        "WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < {n}) \
+         INSERT INTO events (at, board, actor, type, task, payload) \
+         SELECT (SELECT MAX(at) FROM events), 'factory', '{actor}', '{kind}', '{task}', \
+         '{payload}' FROM i"
+    ));
+}
+
+#[tokio::test]
+async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(ME, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let blocker = t.task(B, "factory", "Blocker").await;
+    assert!(t.claim(B, &blocker).await.0.is_success());
+    let mine = t.task(ME, "factory", "Mine").await;
+    assert!(t.claim(ME, &mine).await.0.is_success());
+    let (s, v) = t.patch(ME, &mine, json!({ "blockers": [blocker] })).await;
+    assert!(s.is_success(), "{v}");
+    snapshot(&t, ME, "kind=alerts").await;
+
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    assert!(t.done(B, &blocker, commit).await.0.is_success());
+    // 600 events by peers on other work: notes on the peer's task, edits in another repo.
+    log_events(&t, 300, B, "note_added", &blocker, "{}");
+    let elsewhere = format!(r#"{{"repo":"{DOTFILES}","paths":["a.rs"]}}"#);
+    log_events(&t, 300, B, "files_touched", "", &elsewhere);
+
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("not checked"), "{alerts}");
+}
+
+#[tokio::test]
+async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(ME, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let blocker = t.task(B, "factory", "Blocker").await;
+    assert!(t.claim(B, &blocker).await.0.is_success());
+    let mine = t.task(ME, "factory", "Mine").await;
+    assert!(t.claim(ME, &mine).await.0.is_success());
+    let (s, v) = t.patch(ME, &mine, json!({ "blockers": [blocker] })).await;
+    assert!(s.is_success(), "{v}");
+    let first = snapshot(&t, ME, "kind=alerts").await;
+    let start = first["seq"].as_i64().unwrap();
+
+    // 1,100 notes on my task, all of which can concern me, then the blocker finishes.
+    log_events(&t, 1100, B, "note_added", &mine, "{}");
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    assert!(t.done(B, &blocker, commit).await.0.is_success());
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let cut = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&cut).to_owned();
+    // 1,000 scanned; the other 100 notes and the done event wait.
+    let first_alert = alerts.lines().nth(1).unwrap_or_default();
+    assert!(
+        first_alert.starts_with("! 101 more events not checked for alerts yet"),
+        "{alerts}"
+    );
+    assert!(alerts.contains("changed your task"), "{alerts}");
+    assert!(!alerts.contains("your blocker is cleared"), "{alerts}");
+    let resume = cut["seq"].as_i64().unwrap();
+    assert_eq!(resume, start + 1000);
+    assert_eq!(
+        t.count(&format!("SELECT cursor FROM agents WHERE id = '{ME}'")),
+        resume
+    );
+
+    // The next request picks up where the cut one stopped.
+    let rest = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&rest).to_owned();
+    assert!(
+        alerts.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("not checked"), "{alerts}");
+    assert_eq!(rest["seq"].as_i64().unwrap(), max);
+}

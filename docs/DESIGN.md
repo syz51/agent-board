@@ -372,7 +372,8 @@ keeping untrusted text out of those channels, so:
   open tasks held by a `not_before`, soonest first); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
-  one line each.
+  one line each. Alerts come from the events since the agent's cursor, oldest first, at
+  most 1,000 per request that can concern it; the rest wait, counted in the first alert.
 - Tool descriptions and server instructions never change at run time, so they do not break
   prompt caching.
 

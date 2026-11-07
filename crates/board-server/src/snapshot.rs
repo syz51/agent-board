@@ -23,8 +23,8 @@ use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{delegation_family, glob_matches, globs_overlap};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events, load_agents,
-    load_events, load_tasks,
+    NamedParams, agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events,
+    load_agents, load_events, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -37,8 +37,20 @@ sub-tasks and found work as Proposal: tasks (auto=false). Notes and bodies: task
 const TITLE_CHARS: usize = 80;
 /// Paths and globs are cut to this many characters in hook text.
 const PATH_CHARS: usize = 80;
-/// Events scanned for alerts per request.
-const ALERT_SCAN: u32 = 500;
+/// Events scanned for alerts per request; later ones wait for the next request.
+const ALERT_SCAN: u32 = 1000;
+/// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
+/// so traffic about other agents' work, on any board, does not use up the scan.
+const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
+     (type IN ('files_touched', 'lease_created', 'agent_registered') \
+      AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
+     OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
+     OR (type IN ('task_updated', 'task_released', 'note_added') \
+      AND (task IN (SELECT value FROM json_each(:mine)) \
+           OR json_extract(payload, '$.previous_owner') = :me)) \
+     OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
+     OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
+     OR (type = 'task_created' AND :any_mine))";
 
 #[derive(Debug, Clone, Serialize)]
 struct Model {
@@ -218,7 +230,8 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         .as_ref()
         .map(|b| counts(cx, b).map(Counts::from))
         .transpose()?;
-    let alerts = alerts(cx, &agent, since, seq)?;
+    // A scan cut at `ALERT_SCAN` ends before `seq`; the next request resumes there.
+    let (alerts, seq) = alerts(cx, &agent, since, seq)?;
 
     let mut model = Model {
         kind: req.kind,
@@ -684,13 +697,13 @@ fn shares_paths(
     Ok(touched || leased)
 }
 
-/// Events after `since` (up to `seq`) that concern the agent, as alerts.
-fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert>> {
+/// Events after `since` (up to `seq`) that concern the agent, as alerts, and the sequence
+/// they were scanned to: `seq`, or the last event scanned when more than `ALERT_SCAN` events
+/// can concern the agent. Then the first alert says how many are left for the next request.
+fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Alert>, i64)> {
     if since >= seq {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), seq));
     }
-    let start = since.max(seq - i64::from(ALERT_SCAN));
-    let events = load_events(cx, "seq <= :seq", &vec![(":seq", &seq)], start, ALERT_SCAN)?;
     let me = agent.id.as_str();
     let mine: Vec<Task> = load_tasks(
         cx,
@@ -712,6 +725,47 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
         .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
         .query_map(params![me, now], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+
+    let repos: BTreeSet<&str> = agent
+        .repo
+        .as_deref()
+        .into_iter()
+        .chain(my_touches.iter().map(|(r, _, _)| r.as_str()))
+        .chain(my_leases.iter().map(|(r, _)| r.as_str()))
+        .collect();
+    let watched: BTreeSet<&TaskId> = mine
+        .iter()
+        .flat_map(|t| t.blockers.iter())
+        .chain(mine_ids.iter().copied())
+        .collect();
+    let repos = serde_json::to_string(&repos).expect("serializes");
+    let watched = serde_json::to_string(&watched).expect("serializes");
+    let mine_json = serde_json::to_string(&mine_ids).expect("serializes");
+    let any_mine = !mine.is_empty();
+    let filter: NamedParams<'_> = vec![
+        (":seq", &seq),
+        (":me", &me),
+        (":repos", &repos),
+        (":watched", &watched),
+        (":mine", &mine_json),
+        (":any_mine", &any_mine),
+    ];
+    let events = load_events(cx, ALERT_FILTER, &filter, since, ALERT_SCAN)?;
+    let scanned_to = match events.last() {
+        Some(last) if events.len() == ALERT_SCAN as usize => last.seq,
+        _ => seq,
+    };
+    let left: i64 = if scanned_to < seq {
+        let mut params = filter.clone();
+        params.push((":since", &scanned_to));
+        cx.db
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM events WHERE seq > :since AND {ALERT_FILTER}"
+            ))?
+            .query_row(params.as_slice(), |r| r.get(0))?
+    } else {
+        0
+    };
 
     let mut handles = HashMap::new();
     let mut live = HashMap::<String, bool>::new();
@@ -1018,7 +1072,18 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
     }
     let mut alerts: Vec<Alert> = out.into_values().collect();
     alerts.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.alert.cmp(&b.alert)));
-    Ok(alerts)
+    // First, so a size cap never cuts it.
+    if left > 0 {
+        alerts.insert(
+            0,
+            Alert {
+                alert: format!("{left} more events not checked for alerts yet"),
+                action: "board_snapshot again to check them".to_owned(),
+                rank: (0, scanned_to),
+            },
+        );
+    }
+    Ok((alerts, scanned_to))
 }
 
 fn record_change(
