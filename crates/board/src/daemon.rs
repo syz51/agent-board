@@ -1930,6 +1930,11 @@ impl<T: T3> Daemon<T> {
                         "event stream open after #{}",
                         self.state.last_seq.unwrap_or(0)
                     );
+                    // The daemon runs for days: log each server build that differs from
+                    // this one.
+                    if let Some(warning) = crate::client::take_skew_warning() {
+                        tracing::warn!("{warning}");
+                    }
                     let opened = tokio::time::Instant::now();
                     let mut stream =
                         Box::pin(idle_limited(resp, self.timing.stream_idle).eventsource());

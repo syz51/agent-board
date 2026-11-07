@@ -229,3 +229,39 @@ async fn unknown_endpoints_and_bad_bodies_answer_with_api_errors() {
     assert_eq!((s.as_u16(), v["code"].as_str()), (400, Some("invalid")));
     assert!(v["message"].as_str().unwrap().contains("board slug"), "{v}");
 }
+
+#[tokio::test]
+async fn health_and_every_answer_name_the_build() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    let t = T::with(|c| c.commit = "0123456789ab".into());
+    let (s, v) = t.send("GET", "/healthz", &[], None).await;
+    assert_eq!(s.as_u16(), 200);
+    assert_eq!(v["version"], board_proto::VERSION);
+    assert_eq!(v["commit"], "0123456789ab");
+    assert_eq!(v["schema_version"], crate::db::MIGRATIONS.len(), "{v}");
+
+    // Answers and refusals alike carry the build headers.
+    for path in ["/healthz", "/v1/boards"] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = t.app.clone().oneshot(req).await.unwrap();
+        let headers = resp.headers();
+        assert_eq!(
+            (
+                headers[board_proto::VERSION_HEADER].to_str().unwrap(),
+                headers[board_proto::COMMIT_HEADER].to_str().unwrap()
+            ),
+            (board_proto::VERSION, "0123456789ab"),
+            "{path}"
+        );
+    }
+
+    // A server started without a commit reports `unknown`.
+    let t = T::new();
+    assert_eq!(
+        t.ok("GET", "/healthz", None, None).await["commit"],
+        "unknown"
+    );
+}

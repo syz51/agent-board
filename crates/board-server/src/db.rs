@@ -13,7 +13,7 @@ use crate::config::Settings;
 use crate::error::{Error, Result};
 
 /// Numbered schema migrations; `PRAGMA user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_lowercase_repo_keys.sql"),
     include_str!("../migrations/0003_telegram_pairing.sql"),

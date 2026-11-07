@@ -69,6 +69,8 @@ struct StubState {
     /// Routes answered as a server-sent event stream: the events after the request's
     /// `since`, then nothing more while the connection stays open.
     streams: BTreeMap<String, Stream>,
+    /// Version and commit sent in the build headers, as a server does since it reports them.
+    build: Option<(String, String)>,
 }
 
 struct Stream {
@@ -153,6 +155,11 @@ impl Stub {
                 delay: Duration::ZERO,
             });
         self
+    }
+
+    /// Names a server build in the headers of every answer.
+    pub fn build(&self, version: &str, commit: &str) {
+        self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned()));
     }
 
     /// Delays the answers to `route` by `delay`, as a server stalled on it would.
@@ -242,7 +249,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         .find_map(|p| p.strip_prefix("since="))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let (canned, hang, stream) = {
+    let (canned, hang, stream, build) = {
         let mut st = state.lock().unwrap();
         st.requests.push(Recorded {
             method,
@@ -273,6 +280,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             once.or_else(|| st.routes.get(&route).cloned()),
             st.hang,
             stream,
+            st.build.clone(),
         )
     };
     if let Some((text, flapping)) = stream {
@@ -302,6 +310,17 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
     *resp.status_mut() = StatusCode::from_u16(canned.status).unwrap();
     resp.headers_mut()
         .insert("content-type", HeaderValue::from_static("application/json"));
+    if let Some((version, commit)) = build {
+        let headers = resp.headers_mut();
+        headers.insert(
+            board_proto::VERSION_HEADER,
+            HeaderValue::from_str(&version).unwrap(),
+        );
+        headers.insert(
+            board_proto::COMMIT_HEADER,
+            HeaderValue::from_str(&commit).unwrap(),
+        );
+    }
     resp
 }
 

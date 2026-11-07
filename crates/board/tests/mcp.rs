@@ -448,3 +448,52 @@ fn lease_paths_prints_the_servers_warning_above_the_lease() {
         "{kept}"
     );
 }
+
+#[test]
+fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let detail = TaskDetail {
+        task: task_fixture("factory-12", "Fix the parser"),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        history: vec![],
+    };
+    stub.on("GET /v1/tasks/factory-12", &detail);
+    stub.build("0.0.1", "0123456789ab");
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let warnings = |result: &Value| {
+        result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("warning: the board server runs 0.0.1")
+            })
+            .count()
+    };
+    let first = mcp.call(2, "task_show", json!({"id": "factory-12"}));
+    assert!(text(&first).contains("factory-12"), "{first}");
+    assert_eq!(warnings(&first), 1, "{first}");
+    let second = mcp.call(3, "task_show", json!({"id": "factory-12"}));
+    assert_eq!(warnings(&second), 0, "once per session: {second}");
+}

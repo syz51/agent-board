@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::http::{HeaderName, HeaderValue};
 use board_proto::Timestamp;
 use tokio::sync::watch;
 
@@ -24,6 +25,8 @@ struct Inner {
     users: Vec<String>,
     trust_identity_header: bool,
     public_url: Option<String>,
+    /// The build's response headers: version and commit.
+    build: [(HeaderName, HeaderValue); 2],
     shutdown: watch::Sender<bool>,
 }
 
@@ -45,9 +48,32 @@ impl AppState {
                     .public_url
                     .as_deref()
                     .map(|u| u.trim_end_matches('/').to_owned()),
+                build: [
+                    (
+                        HeaderName::from_static(board_proto::VERSION_HEADER),
+                        HeaderValue::from_static(board_proto::VERSION),
+                    ),
+                    (
+                        HeaderName::from_static(board_proto::COMMIT_HEADER),
+                        // The binary passes 12 hex digits or `unknown`; anything else is
+                        // not reported.
+                        HeaderValue::from_str(&config.commit)
+                            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+                    ),
+                ],
                 shutdown,
             }),
         }
+    }
+
+    /// The response headers naming this build.
+    pub(crate) fn build_headers(&self) -> &[(HeaderName, HeaderValue); 2] {
+        &self.inner.build
+    }
+
+    /// The commit this build reports.
+    pub(crate) fn commit(&self) -> &str {
+        self.inner.build[1].1.to_str().unwrap_or("unknown")
     }
 
     /// The current time, truncated to the stored precision.

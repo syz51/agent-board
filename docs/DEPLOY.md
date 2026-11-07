@@ -20,10 +20,17 @@ install -d -m 0755 /etc/agent-board
 install -d -o 10001 -g 10001 -m 0700 /var/lib/agent-board
 install -m 0644 /opt/agent-board/deploy/server.example.toml /etc/agent-board/server.toml
 # edit /etc/agent-board/server.toml: users, public_url, optional [telegram] chat_id
-docker compose -f /opt/agent-board/deploy/compose.yaml up -d --build
+BOARD_COMMIT=$(git -C /opt/agent-board rev-parse --short=12 HEAD) \
+    docker compose -f /opt/agent-board/deploy/compose.yaml up -d --build
 tailscale serve --bg --https=443 http://127.0.0.1:7377
 curl -fsS https://board-host.your-tailnet.ts.net/healthz
 ```
+
+The image has no `.git`, so the build reads the commit from `BOARD_COMMIT`. Verify the
+deploy with `/healthz`: `commit` matches `git -C /opt/agent-board rev-parse --short=12
+HEAD`, `version` matches the workspace version, and `schema_version` is the number of files
+in `crates/board-server/migrations`. Each device's `board --version` prints the version
+and commit it was built from; when they differ from the server's, the CLI and MCP warn.
 
 The container uses the host network and listens on `127.0.0.1:7377`, so only processes on
 the host reach it. `tailscale serve` terminates TLS and adds `Tailscale-User-Login`, which
@@ -46,8 +53,8 @@ and send the new code from that chat; the paired chat keeps working until then, 
 asks are sent again to the new one. Setting `[telegram] chat_id` in `server.toml` instead
 skips pairing and always wins over a paired chat.
 
-Upgrade: `git -C /opt/agent-board pull` and run the `docker compose ... up -d --build`
-line again. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
+Upgrade: `git -C /opt/agent-board pull` and run the `BOARD_COMMIT=... docker compose ...
+up -d --build` line again, then verify with `/healthz` as above. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
 starts the notifier, without a `[telegram]` table; it sends nothing until a chat is paired
 or configured.
 

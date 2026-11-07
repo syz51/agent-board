@@ -21,3 +21,13 @@ pub const API_PREFIX: &str = "/v1";
 
 /// Header carrying the calling agent's id on agent requests.
 pub const AGENT_HEADER: &str = "x-board-agent";
+
+/// The version of this build: the workspace version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Response header with the server's [`VERSION`], on every answer.
+pub const VERSION_HEADER: &str = "x-board-version";
+
+/// Response header with the commit the server was built from (12 hex digits or `unknown`),
+/// on every answer.
+pub const COMMIT_HEADER: &str = "x-board-commit";

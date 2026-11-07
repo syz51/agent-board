@@ -932,11 +932,18 @@ impl ServerHandler for BoardMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let result = match self.call(&request.name, args).await {
+        let mut result = match self.call(&request.name, args).await {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             // Server errors carry their `next` hint in the message (see `ServerError`).
             Err(err) => CallToolResult::error(vec![ContentBlock::text(format!("error: {err:#}"))]),
         };
+        // Once per session: a server on another build may answer in shapes this one
+        // misreads.
+        if let Some(warning) = crate::client::take_skew_warning() {
+            result
+                .content
+                .push(ContentBlock::text(format!("warning: {warning}")));
+        }
         Ok(result.into())
     }
 }

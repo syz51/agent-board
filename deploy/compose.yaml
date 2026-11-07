@@ -2,7 +2,11 @@
 # `tailscale serve` on this host can reach it (see docs/DEPLOY.md).
 services:
   board:
-    build: ..
+    build:
+      context: ..
+      args:
+        # Set by the deploy command: BOARD_COMMIT=$(git rev-parse --short=12 HEAD).
+        BOARD_COMMIT: ${BOARD_COMMIT:-unknown}
     image: agent-board:local
     restart: unless-stopped
     network_mode: host
