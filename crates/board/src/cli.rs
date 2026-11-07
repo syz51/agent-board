@@ -316,6 +316,14 @@ pub enum BoardCommand {
         #[arg(long = "home-device")]
         home_devices: Option<Vec<DeviceName>>,
     },
+    /// Make an existing T3 thread on this device the board's coordinator, then switch
+    /// autopilot on. Run it on a home device whose daemon (`board watch`) then briefs the
+    /// thread instead of starting a new one.
+    Adopt {
+        slug: BoardSlug,
+        /// The T3 thread id, as in its link or `t3 thread show`.
+        thread: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -597,6 +605,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 home_devices,
             };
             ops::board_update(&ctx()?, &slug, body).await?
+        }
+        Command::Board(BoardCommand::Adopt { slug, thread }) => {
+            let ctx = ctx()?;
+            let t3 = crate::t3::T3Cli::locate(ctx.config.t3_bin.as_deref());
+            ops::board_adopt(&ctx, &t3, &slug, &thread, chrono::Utc::now()).await?
         }
         Command::Log {
             board,

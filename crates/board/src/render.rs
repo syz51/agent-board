@@ -75,7 +75,7 @@ pub fn ago(at: Timestamp) -> String {
     }
 }
 
-fn enum_str<T: serde::Serialize>(value: &T) -> String {
+pub fn enum_str<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))

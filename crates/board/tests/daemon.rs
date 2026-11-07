@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, Home};
-use board::daemon::{Coordinator, Daemon};
+use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
 use board::t3::{T3, ThreadInfo};
@@ -42,6 +42,10 @@ struct FakeT3 {
     threads: Arc<Mutex<BTreeMap<String, ThreadInfo>>>,
     /// `t3 thread start` fails while set.
     fail_start: Arc<AtomicBool>,
+    /// `t3 thread send` fails while set.
+    fail_send: Arc<AtomicBool>,
+    /// Saved by the next `t3 thread send`: a newer `board board adopt` arriving meanwhile.
+    adopt_during_send: Arc<Mutex<Option<(Home, Adoption)>>>,
 }
 
 impl FakeT3 {
@@ -89,6 +93,12 @@ impl T3 for FakeT3 {
             thread: thread.to_owned(),
             message: message.to_owned(),
         });
+        if self.fail_send.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread send failed: server unavailable");
+        }
+        if let Some((home, adoption)) = self.adopt_during_send.lock().unwrap().take() {
+            save_adoption(&home, &"factory".parse().unwrap(), &adoption).unwrap();
+        }
         Ok(())
     }
 
@@ -306,7 +316,8 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
     assert_eq!(renew[0].body["agent"], agent);
     assert_eq!(e.t3.calls().len(), 1, "no second thread");
 
-    // Thread archived: start a fresh one.
+    // Thread archived: start a fresh one, after releasing the lease that still names the
+    // archived thread, so the board never names it while the new one starts.
     e.t3.threads.lock().unwrap().insert(
         NEW_THREAD.into(),
         ThreadInfo {
@@ -314,11 +325,28 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
             runtime: Runtime::Claude,
         },
     );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.clear();
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(12))
         .await
         .unwrap();
     assert_eq!(e.t3.calls().len(), 2);
+    let lease: Vec<_> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(
+        lease,
+        ["DELETE", "POST", "POST"],
+        "release, claim, claim as the agent"
+    );
 }
 
 fn coordinator_env(
@@ -913,4 +941,353 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
     assert!(status.success(), "{status:?}");
     let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
     assert_eq!(saved.last_seq, Some(5), "state saved on the way out");
+}
+
+const ADOPTED: &str = "mcp:launch:existing";
+
+fn home_of(e: &Env) -> Home {
+    Home::at(e._dir.path().join("home"))
+}
+
+/// An env whose device was asked (`board board adopt`) to adopt the live thread [`ADOPTED`].
+fn adoption_env() -> Env {
+    let e = env();
+    e.t3.live(ADOPTED);
+    save_adoption(
+        &home_of(&e),
+        &factory(),
+        &Adoption {
+            thread: ADOPTED.into(),
+            requested_at: at(),
+        },
+    )
+    .unwrap();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e
+}
+
+#[tokio::test]
+async fn an_adopted_thread_is_briefed_and_named_coordinator_instead_of_a_new_thread() {
+    let mut e = adoption_env();
+    let agent = format!("t3:{ADOPTED}");
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(starts(&e.t3), 0, "no new thread");
+    let sends = e.t3.sends();
+    let [(thread, brief)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, ADOPTED);
+    assert!(brief.starts_with("# Coordinator"), "the standing prompt");
+    assert!(
+        brief.contains("now also the coordinator of board factory"),
+        "{brief}"
+    );
+    assert!(brief.contains("A board task you already own counts as the board's task in progress"));
+    assert!(brief.ends_with("Start now: call board_snapshot."));
+
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].body, json!({"device": DEVICE, "agent": null}));
+    assert_eq!(claims[1].body, json!({"device": DEVICE, "agent": agent}));
+    assert_eq!(claims[1].agent.as_deref(), Some(agent.as_str()));
+    let register = &e.stub.requests_to("POST /v1/agents")[0];
+    assert_eq!(register.body["id"], agent);
+    assert_eq!(register.body["role"], "coordinator");
+    assert_eq!(register.body["device"], DEVICE);
+    assert_eq!(register.body["native_ids"]["t3_thread"], ADOPTED);
+
+    let local = &e.daemon.state.coordinators[&factory()];
+    assert_eq!((local.thread.as_str(), local.registered), (ADOPTED, true));
+    assert_eq!(local.agent.as_str(), agent);
+    assert_eq!(load_adoption(&home_of(&e), &factory()), None, "used up");
+    let saved = board::daemon::load_watch_state(&home_of(&e));
+    assert_eq!(saved.coordinators[&factory()].thread, ADOPTED, "saved");
+
+    // From now on it is this device's coordinator: renewed, never re-briefed or replaced.
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(11))
+        .await
+        .unwrap();
+    let renew = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(renew.len(), 1);
+    assert_eq!(renew[0].body["agent"], agent);
+
+    // A lapsed lease (the device slept) is claimed again for the same thread.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(70))
+        .await
+        .unwrap();
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body, json!({"device": DEVICE, "agent": agent}));
+
+    // A ready task wakes it.
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(71))
+        .await
+        .unwrap();
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at() + chrono::Duration::minutes(71),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush().await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "the brief, then one wake-up: {sends:?}");
+    assert_eq!(
+        sends[1],
+        (
+            ADOPTED.to_owned(),
+            "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+        )
+    );
+    assert_eq!(starts(&e.t3), 0, "never a new thread");
+}
+
+#[tokio::test]
+async fn a_failed_brief_releases_the_lease_keeps_the_adoption_and_retries_later() {
+    let mut e = adoption_env();
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    let secs = |s: i64| at() + chrono::Duration::seconds(s);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(
+        e.stub
+            .requests_to("DELETE /v1/boards/factory/coordinator")
+            .len(),
+        1,
+        "the lease is released after the failed brief"
+    );
+    assert!(e.daemon.state.coordinators.is_empty());
+    assert!(load_adoption(&home_of(&e), &factory()).is_some(), "kept");
+
+    // Backs off like a failed start, then briefs once and adopts.
+    e.daemon.reconcile(secs(30)).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1, "no retry inside the first minute");
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    e.daemon.reconcile(secs(61)).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 2);
+    assert_eq!(starts(&e.t3), 0);
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+    assert_eq!(load_adoption(&home_of(&e), &factory()), None);
+}
+
+#[tokio::test]
+async fn an_adoption_waits_for_a_live_coordinator_or_another_devices_lease() {
+    // A live coordinator: nothing happens, and the adoption stays.
+    let mut e = adoption_env();
+    e.stub.on(
+        "GET /v1/boards",
+        [autopilot(Some("t3:elsewhere"), &[DEVICE])],
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:elsewhere")),
+        agent_fixture("t3:elsewhere", "mac-air", AgentState::Idle),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    assert!(load_adoption(&home_of(&e), &factory()).is_some());
+
+    // Another device holds the lease: the thread is not briefed, the adoption stays.
+    let mut e = adoption_env();
+    e.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        409,
+        "claim_refused",
+        "mac-air holds it",
+        "wait",
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(load_adoption(&home_of(&e), &factory()).is_some());
+    assert!(e.daemon.state.coordinators.is_empty());
+
+    // Not a home device: nothing at all.
+    let mut e = adoption_env();
+    e.stub.on("GET /v1/boards", [autopilot(None, &["mac-air"])]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(load_adoption(&home_of(&e), &factory()).is_some());
+}
+
+#[tokio::test]
+async fn an_adoption_of_a_gone_or_archived_thread_is_dropped_for_a_new_thread() {
+    for archived in [false, true] {
+        let mut e = adoption_env();
+        if archived {
+            e.t3.threads.lock().unwrap().insert(
+                ADOPTED.into(),
+                ThreadInfo {
+                    archived: true,
+                    runtime: Runtime::Claude,
+                },
+            );
+        } else {
+            e.t3.threads.lock().unwrap().clear();
+        }
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(e.t3.sends().is_empty(), "the gone thread is not briefed");
+        assert_eq!(starts(&e.t3), 1);
+        assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+        assert_eq!(load_adoption(&home_of(&e), &factory()), None);
+    }
+}
+
+#[tokio::test]
+async fn an_adopted_thread_its_hooks_registered_keeps_its_agent_record() {
+    let mut e = adoption_env();
+    let agent = format!("t3:{ADOPTED}");
+    let mut known = agent_fixture(&agent, DEVICE, AgentState::Paused);
+    known.paused_until = Some(at() + chrono::Duration::hours(1));
+    e.stub.on(&format!("GET {}", agent_path(&agent)), &known);
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(e.t3.sends().len(), 1, "briefed");
+    assert!(
+        e.stub.requests_to("POST /v1/agents").is_empty(),
+        "never re-registered: its repo, branch, cwd and pause stay"
+    );
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[1].body["agent"], agent, "named by the claim");
+    assert!(e.daemon.state.coordinators[&factory()].registered);
+}
+
+#[tokio::test]
+async fn an_adoption_claims_the_lease_before_asking_t3() {
+    let mut e = adoption_env();
+    e.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        409,
+        "claim_refused",
+        "mac-air holds it",
+        "wait",
+    );
+    // A thread T3 has lost is not looked up, so not dropped, while another device holds it.
+    e.t3.threads.lock().unwrap().clear();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(load_adoption(&home_of(&e), &factory()).is_some());
+    assert_eq!(starts(&e.t3), 0);
+}
+
+#[tokio::test]
+async fn a_stale_adoption_is_dropped_for_a_new_thread() {
+    let mut e = adoption_env();
+    e.daemon
+        .reconcile(at() + board::daemon::ADOPTION_TTL)
+        .await
+        .unwrap();
+    assert!(e.t3.sends().is_empty(), "the stale request is not acted on");
+    assert_eq!(starts(&e.t3), 1);
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+    assert_eq!(load_adoption(&home_of(&e), &factory()), None);
+}
+
+#[tokio::test]
+async fn an_adoption_newer_than_a_failed_start_skips_the_back_off() {
+    let mut e = adoption_env();
+    board::daemon::remove_adoption(&home_of(&e), &factory()).unwrap();
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    let secs = |s: i64| at() + chrono::Duration::seconds(s);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1, "the failed start");
+
+    save_adoption(
+        &home_of(&e),
+        &factory(),
+        &Adoption {
+            thread: ADOPTED.into(),
+            requested_at: secs(10),
+        },
+    )
+    .unwrap();
+    e.daemon.reconcile(secs(20)).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1, "briefed inside the back-off");
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+}
+
+#[tokio::test]
+async fn a_newer_adoption_saved_while_one_is_briefed_is_kept() {
+    let mut e = adoption_env();
+    let newer = Adoption {
+        thread: "mcp:launch:newer".into(),
+        requested_at: at() + chrono::Duration::seconds(5),
+    };
+    *e.t3.adopt_during_send.lock().unwrap() = Some((home_of(&e), newer.clone()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+    assert_eq!(load_adoption(&home_of(&e), &factory()), Some(newer));
+}
+
+#[tokio::test]
+async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
+    let mut e = env_with_projects(BTreeMap::new());
+    e.t3.live(ADOPTED);
+    save_adoption(
+        &home_of(&e),
+        &factory(),
+        &Adoption {
+            thread: ADOPTED.into(),
+            requested_at: at(),
+        },
+    )
+    .unwrap();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    assert!(load_adoption(&home_of(&e), &factory()).is_some());
 }

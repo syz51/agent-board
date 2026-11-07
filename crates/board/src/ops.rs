@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    AddNote, AgentId, AgentRole, AgentSource, AskKind, Board, BoardSlug, BoardStatus, CreateAsk,
-    CreateBoard, CreateLeases, CreateTask, DeviceName, DoneTask, ErrorCode, EvidenceKind,
-    NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent, Runtime, SnapshotFormat,
-    SnapshotKind, TaskId, TaskStatus, UpdateBoard, UpdateTask,
+    AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
+    ClaimCoordinator, CreateAsk, CreateBoard, CreateLeases, CreateTask, DeviceName, DoneTask,
+    ErrorCode, EvidenceKind, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent, Runtime,
+    SnapshotFormat, SnapshotKind, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, SnapshotQuery, TaskQuery, error_code};
 use crate::config::{Config, Home, load_token};
+use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
 use crate::render;
+use crate::t3::T3;
 
 /// Everything a command needs: configuration, a client and where it runs.
 #[derive(Debug, Clone)]
@@ -558,6 +560,149 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
     let board = ctx.client.update_board(slug, &body).await?;
     Ok(Output::new(
         format!("updated {}", render::board_line(&board)),
+        &board,
+    ))
+}
+
+/// `board board adopt`: asks this device's daemon to make `thread`, an existing T3 thread,
+/// the board's coordinator, then switches autopilot on and holds the coordinator lease for
+/// this device. The adoption is saved before autopilot goes on, so this device's daemon
+/// never starts a new thread for the board instead.
+pub async fn board_adopt(
+    ctx: &Ctx,
+    t3: &impl T3,
+    slug: &BoardSlug,
+    thread: &str,
+    now: Timestamp,
+) -> Result<Output> {
+    let agent = daemon::thread_agent(thread)?;
+    let board = ctx.client.board(slug).await?;
+    if board.status != BoardStatus::Active {
+        bail!(
+            "board {slug} is {}: only active boards run a coordinator; set it active first \
+             (board board update {slug} --status active)",
+            render::enum_str(&board.status)
+        );
+    }
+    let device = &ctx.device;
+    if !board.home_devices.contains(device) {
+        bail!(
+            "this device ({device}) is not a home device of board {slug}, so its daemon cannot \
+             run the coordinator; run this on the device that has the thread, after adding it \
+             (board board update {slug} --home-device {device}, repeating --home-device for \
+             each device to keep)"
+        );
+    }
+    if !board
+        .repos
+        .iter()
+        .any(|repo| ctx.config.projects.contains_key(repo))
+    {
+        bail!(
+            "config.toml has no [projects] path for any repo of board {slug} ({}); add one, \
+             since the daemon registers the coordinator in that project",
+            board.repos.join(", ")
+        );
+    }
+    if let Some(current) = &board.coordinator {
+        if *current == agent {
+            // Nothing left to adopt: an older request must not replace this thread later.
+            daemon::remove_adoption(&ctx.home, slug)?;
+            return Ok(Output::new(
+                format!(
+                    "{agent} already coordinates {slug}\n{}",
+                    render::board_line(&board)
+                ),
+                &board,
+            ));
+        }
+        // A coordinator that has ended is replaced by the daemon, as when none is named.
+        let live = match ctx.client.agent_info(current).await {
+            Ok(info) => info.state != AgentState::Ended,
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+            Err(err) => return Err(err),
+        };
+        if live {
+            bail!(
+                "{current} coordinates board {slug} now; switch autopilot off (board board \
+                 update {slug} --autopilot false), wait until `board boards` shows it without \
+                 a coordinator, then adopt again"
+            );
+        }
+    }
+    if let Some(local) = daemon::load_watch_state(&ctx.home).coordinators.get(slug)
+        && local.thread != thread
+        && t3
+            .thread_info(&local.thread)
+            .await?
+            .is_some_and(|t| !t.archived)
+    {
+        bail!(
+            "the daemon on this device still keeps thread {} as the coordinator of board \
+             {slug}; switch autopilot off (board board update {slug} --autopilot false) and \
+             let the daemon run (board watch --once), then adopt again",
+            local.thread
+        );
+    }
+    match t3.thread_info(thread).await? {
+        None => bail!(
+            "T3 on this device knows no thread {thread}; pass the id of a thread on this device"
+        ),
+        Some(info) if info.archived => {
+            bail!("thread {thread} is archived; unarchive it in T3 or adopt another thread")
+        }
+        Some(_) => {}
+    }
+    daemon::save_adoption(
+        &ctx.home,
+        slug,
+        &Adoption {
+            thread: thread.to_owned(),
+            requested_at: now,
+        },
+    )?;
+    if !board.autopilot {
+        let body = UpdateBoard {
+            autopilot: Some(true),
+            ..UpdateBoard::default()
+        };
+        if let Err(err) = ctx.client.update_board(slug, &body).await {
+            daemon::remove_adoption(&ctx.home, slug)?;
+            return Err(err);
+        }
+    }
+    // The lease, held for this device, keeps every other home device from starting a thread
+    // for the board before this device's daemon adopts.
+    let claimed = ctx
+        .client
+        .with_agent(None)
+        .claim_coordinator(
+            slug,
+            &ClaimCoordinator {
+                device: device.clone(),
+                agent: None,
+            },
+        )
+        .await;
+    let board = match claimed {
+        Ok(board) => board,
+        Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => {
+            daemon::remove_adoption(&ctx.home, slug)?;
+            bail!(
+                "another device runs the coordinator of board {slug} ({err:#}); switch autopilot \
+                 off (board board update {slug} --autopilot false), wait until `board boards` \
+                 shows no coordinator, then adopt again"
+            );
+        }
+        // The adoption stays: the daemon acts on it without the lease being held now.
+        Err(err) => return Err(err.context("reserving the coordinator lease for this device")),
+    };
+    Ok(Output::new(
+        format!(
+            "adopting {agent} as the coordinator of {slug}: the daemon on {device} (board watch) \
+             briefs the thread and names it coordinator within a minute\n{}",
+            render::board_line(&board)
+        ),
         &board,
     ))
 }
