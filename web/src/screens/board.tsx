@@ -100,7 +100,7 @@ export function BoardScreen({ slug }: { slug: string }) {
         <div class="page-title">
           <div class="title-line">
             <h1>{board.data?.title ?? slug}</h1>
-            <span class="slug ident">{slug}</span>
+            {board.data && board.data.title !== slug && <span class="slug ident">{slug}</span>}
             {board.data?.autopilot && <span class="tag tag-accent"><Icon name="bolt" />Autopilot</span>}
             {board.data?.temporary && <span class="tag">Temporary</span>}
           </div>

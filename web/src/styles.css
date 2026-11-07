@@ -1,8 +1,8 @@
 /* agent-board web view. One token set, light and dark from the system preference.
    Type: Inter (self-hosted, optical sizes; see ui/fonts.ts) on a fixed scale of roles:
      11 badge · 12 caption · 13 meta/label · 14 body · 16 heading · 20 title · 28 display.
-   Ids and handles are sans with tabular figures; monospace is only for code, repos and
-   branches. Structure: hairline borders; shadows only on raised and overlay surfaces. */
+   Every machine identifier (task ids, slugs, repos, branches) and code is monospace in one
+   style; handles and counts use tabular figures. Structure: hairline borders; shadows only on raised and overlay surfaces. */
 
 :root {
   color-scheme: light dark;
@@ -159,13 +159,12 @@ pre {
   font-variant-ligatures: none;
 }
 
-/* Ids, slugs and handles: the text face with tabular, slashed figures, so they line up
-   and read as identifiers without switching families in every row. */
+/* Machine identifiers: task ids and board slugs, one monospace style everywhere. */
 .ident {
-  font-family: var(--font);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums slashed-zero;
+  font-family: var(--mono);
+  font-size: 0.875em;
   letter-spacing: 0;
+  font-variant-ligatures: none;
   white-space: nowrap;
 }
 
@@ -587,7 +586,11 @@ main {
   .nav-dot {
     position: absolute;
     top: 6px;
-    right: calc(50% + 8px);
+    left: calc(50% + 8px);
+  }
+
+  .nav-count ~ .nav-dot {
+    display: none;
   }
 
   main {
@@ -957,14 +960,14 @@ main {
 .avatar {
   display: grid;
   place-items: center;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   flex: none;
   border-radius: 50%;
   background: var(--surface-3);
   box-shadow: inset 0 0 0 1px var(--line-strong);
   color: var(--text-2);
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 650;
   letter-spacing: 0.01em;
   font-variant-numeric: tabular-nums;
@@ -1119,6 +1122,10 @@ main {
   color: var(--text);
 }
 
+.notice-next::first-letter {
+  text-transform: uppercase;
+}
+
 .notice-code {
   margin-top: 2px;
   font-size: var(--fs-xs);
@@ -1262,7 +1269,7 @@ textarea {
 
 textarea {
   width: 100%;
-  min-height: 60px;
+  min-height: 40px;
   resize: vertical;
   field-sizing: content;
   line-height: 1.5;
@@ -1601,17 +1608,17 @@ input[type="radio"] {
   align-items: center;
   gap: 5px;
   min-height: 28px;
-  padding: 0 8px;
+  padding: 0 4px;
   border-radius: var(--radius-sm);
   font-size: var(--fs-sm);
   font-weight: 600;
-  color: var(--muted);
+  color: var(--amber);
   font-variant-numeric: tabular-nums;
 }
 
-.asks-link.has-asks {
-  color: var(--amber);
-  background: var(--amber-soft);
+.asks-link .icon {
+  width: 14px;
+  height: 14px;
 }
 
 .asks-link:hover {
@@ -1649,10 +1656,9 @@ input[type="radio"] {
 }
 
 .ask-preview-text {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 500;
 }
 
@@ -1922,6 +1928,13 @@ input[type="radio"] {
   .ask-preview .row-link {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
+  }
+
+  .ask-preview-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
   }
 }
 
@@ -2286,21 +2299,9 @@ input[type="radio"] {
 
 .link-target {
   color: var(--muted);
-  font-size: 0.9em;
-  overflow-wrap: anywhere;
+  font-size: var(--fs-sm);
 }
 
-/* On a phone the destination stays on one line, cut at the end; the link itself is whole. */
-@media (max-width: 720px) {
-  .link-target {
-    display: inline-block;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    vertical-align: bottom;
-  }
-}
 
 .md-link-blocked {
   color: var(--text-2);
@@ -2319,14 +2320,14 @@ input[type="radio"] {
 
 .agent-card {
   display: grid;
-  gap: 16px;
-  padding: 16px 18px;
+  gap: 14px;
+  padding: 14px 16px;
 }
 
 @media (min-width: 900px) {
   .agent-card {
-    grid-template-columns: 280px minmax(0, 1fr);
-    gap: 28px;
+    grid-template-columns: 248px minmax(0, 1fr);
+    gap: 24px;
   }
 }
 
@@ -2334,14 +2335,24 @@ input[type="radio"] {
   display: grid;
   align-content: start;
   justify-items: start;
-  gap: 10px;
+  gap: 8px;
 }
 
+/* The avatar beside the handle, with the state on its own line under it on every card. */
 .agent-head {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  justify-items: start;
   align-items: center;
-  gap: 6px 10px;
+  column-gap: 10px;
+  row-gap: 2px;
+}
+
+.agent-head .avatar {
+  grid-row: span 2;
+  width: 36px;
+  height: 36px;
+  font-size: var(--fs-xs);
 }
 
 .agent-handle {
@@ -2357,9 +2368,10 @@ input[type="radio"] {
 
 .agent-facts {
   display: grid;
-  gap: 4px;
-  margin: 2px 0 0;
+  gap: 2px;
+  margin: 0;
   font-size: var(--fs-sm);
+  line-height: 20px;
 }
 
 .agent-facts > div {
@@ -2380,7 +2392,7 @@ input[type="radio"] {
 .agent-work {
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -2411,8 +2423,8 @@ input[type="radio"] {
 
 .handoff {
   display: grid;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: 6px;
+  padding: 10px 12px;
   border-radius: var(--radius-sm);
   background: var(--surface-2);
   border: 1px solid var(--line);
@@ -2430,7 +2442,7 @@ input[type="radio"] {
 
 .handoff-fields {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   margin: 0;
 }
 
@@ -2791,8 +2803,9 @@ input[type="radio"] {
 
 .said > summary {
   cursor: pointer;
-  min-height: 32px;
-  padding: 4px 0;
+  min-height: 28px;
+  padding: 2px 0;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 
@@ -2854,12 +2867,13 @@ input[type="radio"] {
 .event-node {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
+  margin: 2px;
   border-radius: 50%;
-  background: var(--canvas);
-  border: 1px solid var(--line);
-  color: var(--muted);
+  background: var(--surface-3);
+  border: 1px solid var(--canvas);
+  color: var(--text-2);
 }
 
 .event-node .icon {
@@ -2915,17 +2929,9 @@ input[type="radio"] {
   padding-top: 1px;
 }
 
-.event-routine .event-node {
-  width: 20px;
-  height: 20px;
-  margin: 4px;
-  border-color: transparent;
-  background: var(--surface-3);
-}
-
 .event-routine .event-node .icon {
-  width: 11px;
-  height: 11px;
+  width: 13px;
+  height: 13px;
 }
 
 .event-routine .event-line,
