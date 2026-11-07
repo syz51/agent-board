@@ -28,6 +28,26 @@ fn matcher(glob: &str) -> Option<GlobMatcher> {
 /// ids ends.
 const DELEGATION_DEPTH: i64 = 8;
 
+/// The query of [`delegation_family`]: `?1` the agent, `?2` the depth. The `down` join
+/// compares the indexed expression `agents_t3_parent` with the parent's id without `t3:`, so
+/// it is an index search rather than a scan of every agent per step.
+pub(crate) const DELEGATION_FAMILY: &str = "WITH RECURSIVE \
+     up(id, depth) AS ( \
+       SELECT ?1, 0 \
+       UNION \
+       SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
+       FROM agents a JOIN up ON a.id = up.id \
+       WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
+         AND up.depth < ?2), \
+     down(id, depth) AS ( \
+       SELECT ?1, 0 \
+       UNION \
+       SELECT a.id, down.depth + 1 \
+       FROM down JOIN agents a \
+         ON json_extract(a.native_ids, '$.t3_parent') = substr(down.id, 4) \
+       WHERE substr(down.id, 1, 3) = 't3:' AND down.depth < ?2) \
+     SELECT id FROM up UNION SELECT id FROM down";
+
 /// The T3 threads that delegated `agent`, up the chain, and those it delegated, down every
 /// branch (each `t3_parent` native id names the thread that delegated it), without `agent`.
 /// A thread and those it delegates do one piece of work, so their edits and leases never
@@ -35,33 +55,49 @@ const DELEGATION_DEPTH: i64 = 8;
 pub(crate) fn delegation_family(cx: &Ctx<'_>, agent: &str) -> Result<HashSet<String>> {
     let mut family: HashSet<String> = cx
         .db
-        .prepare_cached(
-            "WITH RECURSIVE \
-             up(id, depth) AS ( \
-               SELECT ?1, 0 \
-               UNION \
-               SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
-               FROM agents a JOIN up ON a.id = up.id \
-               WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
-                 AND up.depth < ?2), \
-             down(id, depth) AS ( \
-               SELECT ?1, 0 \
-               UNION \
-               SELECT a.id, down.depth + 1 \
-               FROM agents a JOIN down \
-                 ON 't3:' || json_extract(a.native_ids, '$.t3_parent') = down.id \
-               WHERE down.depth < ?2) \
-             SELECT id FROM up UNION SELECT id FROM down",
-        )?
+        .prepare_cached(DELEGATION_FAMILY)?
         .query_map(params![agent, DELEGATION_DEPTH], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     family.remove(agent);
     Ok(family)
 }
 
-/// Does `glob` cover the repo-relative `path`?
+/// A lease glob compiled once, to compare with many paths or globs.
+pub(crate) struct Glob<'a> {
+    text: &'a str,
+    matcher: Option<GlobMatcher>,
+}
+
+impl<'a> Glob<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            matcher: matcher(text),
+        }
+    }
+
+    /// Does it cover the repo-relative `path`?
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        self.text == path || self.matcher.as_ref().is_some_and(|m| m.is_match(path))
+    }
+
+    /// Could some path match both globs? Exact for literal paths; for two patterns, true
+    /// when either matches the other's text or a recursive (`**`) glob covers the other's
+    /// directory.
+    pub(crate) fn overlaps(&self, other: &Glob<'_>) -> bool {
+        if self.matches(other.text) || other.matches(self.text) {
+            return true;
+        }
+        let (a, b) = (self.text, other.text);
+        let (da, db) = (static_dir(a), static_dir(b));
+        (db.starts_with(da) && a.contains("**")) || (da.starts_with(db) && b.contains("**"))
+    }
+}
+
+/// Does `glob` cover the repo-relative `path`? Compiles `glob`: to compare it more than
+/// once, use [`Glob`].
 pub(crate) fn glob_matches(glob: &str, path: &str) -> bool {
-    glob == path || matcher(glob).is_some_and(|m| m.is_match(path))
+    Glob::new(glob).matches(path)
 }
 
 /// The directory part of a glob before its first wildcard, such as `crates/board/` for
@@ -71,14 +107,9 @@ fn static_dir(glob: &str) -> &str {
     literal.rfind('/').map_or("", |i| &literal[..=i])
 }
 
-/// Could some path match both globs? Exact for literal paths; for two patterns, true when
-/// either matches the other's text or a recursive (`**`) glob covers the other's directory.
+/// Could some path match both globs? See [`Glob::overlaps`].
 pub(crate) fn globs_overlap(a: &str, b: &str) -> bool {
-    if glob_matches(a, b) || glob_matches(b, a) {
-        return true;
-    }
-    let (da, db) = (static_dir(a), static_dir(b));
-    (db.starts_with(da) && a.contains("**")) || (da.starts_with(db) && b.contains("**"))
+    Glob::new(a).overlaps(&Glob::new(b))
 }
 
 pub(crate) struct ValidLeases {
@@ -185,6 +216,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
     }
     let mut conflicts: Vec<Lease> = Vec::new();
     let family = delegation_family(cx, req.agent.as_str())?;
+    let globs: Vec<Glob<'_>> = req.globs.iter().map(|g| Glob::new(g)).collect();
     for lease in live_leases(cx, &req.repo)? {
         if lease.agent == req.agent
             || !is_live(cx, lease.agent.as_str())?
@@ -192,7 +224,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         {
             continue;
         }
-        if req.globs.iter().any(|g| globs_overlap(g, &lease.glob)) {
+        let theirs = Glob::new(&lease.glob);
+        if globs.iter().any(|g| g.overlaps(&theirs)) {
+            drop(theirs);
             conflicts.push(lease);
         }
     }
@@ -376,11 +410,12 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let globs: Vec<Glob<'_>> = leases.iter().map(|(_, g, _)| Glob::new(g)).collect();
     let family = delegation_family(cx, me.as_str())?;
     let window_start = cx.now_ms() - cx.s.touch_ms();
     for path in paths {
-        for (agent, glob, at) in &leases {
-            if glob_matches(glob, path) && is_live(cx, agent)? && !family.contains(agent) {
+        for ((agent, _, at), glob) in leases.iter().zip(&globs) {
+            if glob.matches(path) && is_live(cx, agent)? && !family.contains(agent) {
                 out.push(Overlap {
                     path: path.clone(),
                     agent: parse_id(agent)?,
