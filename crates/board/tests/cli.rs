@@ -196,6 +196,35 @@ fn show_frames_peer_text_and_escapes_tags() {
     assert!(text.contains("\\u003c/board\\u003e"));
 }
 
+/// An item resolved with a kind a newer server added still shows, as `unknown`.
+#[test]
+fn show_reads_resolution_kinds_from_newer_servers() {
+    let e = env();
+    let detail = TaskDetail {
+        task: task_fixture("board-feedback-3", "Slow claims"),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        history: vec![],
+    };
+    let mut detail = serde_json::to_value(&detail).unwrap();
+    detail["task"]["feedback"] = json!({
+        "about": "board", "source": "agent", "signature": "board:slow claims",
+        "reports": 1, "reporters": ["t3:a"], "last_reported_at": "2026-11-07T12:00:00Z",
+        "resolution": { "kind": "superseded", "reason": "x", "at": "2026-11-07T12:00:00Z",
+                        "by": "t3:a" },
+    });
+    e.stub.on("GET /v1/tasks/board-feedback-3", &detail);
+    let out = e.run(&["show", "board-feedback-3"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("resolved unknown by t3:a"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
     let e = env();
@@ -264,8 +293,55 @@ fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
             .body,
         json!({"kind": "declined", "reason": "works as designed"})
     );
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--fixed",
+        "config.toml:12 sets the path",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/feedback/board-feedback-1/resolve")[2]
+            .body,
+        json!({"kind": "fixed", "reason": "config.toml:12 sets the path"})
+    );
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--forwarded",
+        "filed upstream",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--duplicate",
+        "board-feedback-2",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = e
+        .stub
+        .requests_to("POST /v1/feedback/board-feedback-1/resolve");
+    assert_eq!(
+        sent[3].body,
+        json!({"kind": "forwarded", "reason": "filed upstream"})
+    );
+    assert_eq!(
+        sent[4].body,
+        json!({"kind": "duplicate", "task": "board-feedback-2"})
+    );
     let out = e.run(&["resolve", "board-feedback-1"]);
     assert!(!out.status.success(), "a resolution is required");
+    let out = e.run(&[
+        "resolve",
+        "board-feedback-1",
+        "--fixed",
+        "x",
+        "--declined",
+        "y",
+    ]);
+    assert!(!out.status.success(), "only one resolution");
 
     let out = e.run(&[
         "add",
@@ -628,6 +704,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
                 duplicate: 0,
                 forwarded: 0,
                 declined: 1,
+                fixed: 2,
             },
         },
     };
@@ -641,7 +718,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
          tasks: 5 created · 3 done (1 without a check) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
          asks: 2 created · 1 answered · median 4m to answer\n\
-         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined"
+         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed"
     );
     assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
 
@@ -730,6 +807,23 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
         "{}",
         stdout(&out)
     );
+
+    // The server's warning of the board's other recent asks is relayed, also in `--json`.
+    let mut created = serde_json::to_value(open(9, "factory-4")).unwrap();
+    created["warning"] =
+        json!("board factory has 1 other open ask under 30 minutes old: #6 on factory-4");
+    e.stub.on("POST /v1/asks", &created);
+    e.stub.on("GET /v1/asks", Vec::<Ask>::new());
+    let text = stdout(&e.run(&["ask", "Which db?", "--task", "factory-4"]));
+    assert!(
+        text.contains(
+            "\nwarning: board factory has 1 other open ask under 30 minutes old: #6 on factory-4"
+        ),
+        "{text}"
+    );
+    let out = e.run(&["ask", "Which db?", "--task", "factory-4", "--json"]);
+    let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json, created);
 
     let mut withdrawn = open(5, "factory-3");
     withdrawn.status = AskStatus::Withdrawn;

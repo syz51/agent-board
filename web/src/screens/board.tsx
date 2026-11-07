@@ -204,16 +204,21 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function TaskRow(
+/**
+ * One task as a row: priority, status, id, title with its tags, owner and last update.
+ * `done` holds the ids of done tasks, so finished blockers drop out; without it, as on
+ * Needs you where done tasks are not loaded, blockers are not listed.
+ */
+export function TaskRow(
   { task, agents, done, now }: {
     task: Task;
     agents: Map<string, Agent>;
-    done: ReadonlySet<string>;
+    done?: ReadonlySet<string>;
     now: number;
   },
 ) {
   // Blockers already done no longer hold the task up.
-  const blockers = task.blockers.filter((id) => !done.has(id));
+  const blockers = done ? task.blockers.filter((id) => !done.has(id)) : [];
   // Only a date still ahead holds an open task up.
   const waitsUntil = task.status === "open" && task.not_before !== null &&
       Date.parse(task.not_before) > now
@@ -240,7 +245,7 @@ function TaskRow(
           </span>
         )}
         {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
-        {!task.auto && <span class="tag" title="Autopilot leaves this task for you to start">manual</span>}
+        {!task.auto && <span class="tag tag-manual" title="Autopilot leaves this task for you to start">manual</span>}
         {waitsUntil && (
           <span class="tag">
             waits until <AbsTime at={waitsUntil} />

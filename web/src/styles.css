@@ -2395,6 +2395,41 @@ input[type="radio"] {
   gap: 16px;
 }
 
+/* Needs you: tasks that wait on the user, in the board's rows with an amber edge like action asks. */
+
+.section-sub {
+  margin: -6px 0 12px;
+  max-width: 68ch;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.waiting-icon {
+  color: var(--amber);
+}
+
+.waiting-board {
+  position: relative;
+  border-left: 3px solid var(--amber);
+}
+
+.waiting-board .group-head .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+}
+
+.waiting-board .tag-manual {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  background: var(--amber-soft);
+}
+
+.waiting-board .group-head a {
+  color: var(--text);
+  font-family: var(--mono);
+}
+
 .ask-card {
   --kind-bar: var(--review);
   position: relative;

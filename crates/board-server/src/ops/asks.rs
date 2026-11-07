@@ -1,4 +1,6 @@
-use board_proto::{AgentId, AnswerAsk, Ask, AskStatus, BoardSlug, CreateAsk, EventType};
+use board_proto::{
+    AgentId, AnswerAsk, Ask, AskStatus, BoardSlug, CreateAsk, CreatedAsk, EventType,
+};
 use rusqlite::params;
 
 use crate::config::Settings;
@@ -6,7 +8,7 @@ use crate::db::{Ctx, enum_str};
 use crate::error::{Result, bad_transition, forbidden, invalid};
 use crate::ops::touch_agent;
 use crate::store::{NamedParams, get_ask, get_board, get_task, load_asks};
-use crate::text::{check_line, check_text};
+use crate::text::{ago, check_line, check_text};
 
 pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
     if req.question.trim().is_empty() {
@@ -35,7 +37,9 @@ pub(crate) fn validate_answer(req: &AnswerAsk, s: &Settings) -> Result<()> {
     check_text("answer", &req.answer, s.question_chars)
 }
 
-pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<Ask> {
+/// Creates the ask and warns of the board's other recent open asks, which it may repeat:
+/// the ask is made either way.
+pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
     get_board(cx, &req.board)?;
     touch_agent(cx, &req.agent)?;
     if let Some(task) = &req.task {
@@ -71,7 +75,55 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<Ask> {
         req.task.as_ref(),
         serde_json::json!({ "id": id, "kind": req.kind }),
     )?;
-    get_ask(cx, id)
+    let ask = get_ask(cx, id)?;
+    let warning = recent_open_asks_warning(cx, &ask)?;
+    Ok(CreatedAsk { ask, warning })
+}
+
+/// Names the board's other open asks younger than `duplicate_ask_window_secs`, newest first.
+fn recent_open_asks_warning(cx: &Ctx<'_>, ask: &Ask) -> Result<Option<String>> {
+    let since = cx.now_ms() - cx.s.duplicate_ask_ms();
+    let board = ask.board.as_str();
+    let mut recent = load_asks(
+        cx,
+        "board = :board AND status = 'open' AND id != :id AND created_at > :since",
+        &vec![(":board", &board), (":id", &ask.id), (":since", &since)],
+    )?;
+    if recent.is_empty() {
+        return Ok(None);
+    }
+    recent.sort_by_key(|other| std::cmp::Reverse((other.created_at, other.id)));
+    let named: Vec<String> = recent
+        .iter()
+        .map(|other| {
+            let task = other
+                .task
+                .as_ref()
+                .map_or("no task".to_owned(), ToString::to_string);
+            let by = if other.agent == ask.agent {
+                "you".to_owned()
+            } else {
+                other.agent.to_string()
+            };
+            let age = ago(cx.now.signed_duration_since(other.created_at));
+            format!("#{} on {task} by {by}, {age} ago", other.id)
+        })
+        .collect();
+    let window = cx.s.duplicate_ask_window_secs;
+    let (count, unit) = if window.is_multiple_of(60) {
+        (window / 60, "minute")
+    } else {
+        (window, "second")
+    };
+    Ok(Some(format!(
+        "board {board} has {} other open {} under {count} {unit}{} old: {}. If ask #{} repeats \
+         one of them, keep one and withdraw the other (ask_withdraw; CLI: board withdraw <id>).",
+        recent.len(),
+        if recent.len() == 1 { "ask" } else { "asks" },
+        if count == 1 { "" } else { "s" },
+        named.join("; "),
+        ask.id,
+    )))
 }
 
 pub(crate) fn list(
