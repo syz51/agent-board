@@ -84,18 +84,37 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
             |r| r.get(0),
         )?)
     };
-    let done_payloads: Vec<String> = cx
+    let done_payloads: Vec<(String, Option<String>, i64)> = cx
         .db
-        .prepare_cached("SELECT payload FROM events WHERE type = 'task_done' AND at >= ?1")?
-        .query_map([from], |r| r.get(0))?
+        .prepare_cached(
+            "SELECT payload, task, at FROM events WHERE type = 'task_done' AND at >= ?1",
+        )?
+        .query_map([from], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut doing_minutes = Vec::new();
     let mut without_check = 0;
-    for payload in done_payloads {
+    let mut under_a_minute = 0;
+    for (payload, task, done_at) in done_payloads {
         let done: DonePayload = parse_json(&payload)?;
+        // Feedback items (with a resolution) are routed, not worked: neither count applies.
         if done.resolution.is_none() && !done.evidence.iter().any(|e| e.kind == EvidenceKind::Check)
         {
             without_check += 1;
+        }
+        if let Some(ms) = done.doing_ms.filter(|ms| *ms < 60_000)
+            && done.resolution.is_none()
+        {
+            // A takeover restarts `doing`: finishing a stale owner's work quickly is not
+            // work done off the board.
+            let taken: bool = cx.db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM events WHERE type = 'task_taken' AND task = ?1 \
+                 AND at BETWEEN ?2 AND ?3)",
+                params![task, done_at - ms, done_at],
+                |r| r.get(0),
+            )?;
+            if !taken {
+                under_a_minute += 1;
+            }
         }
         if let Some(ms) = done.doing_ms {
             doing_minutes.push(ms as f64 / 60_000.0);
@@ -131,6 +150,7 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
         ask_answer_minutes_median: median(answer_minutes),
         doing_minutes_median: median(doing_minutes),
         done_without_check_evidence: without_check,
+        done_under_a_minute: Some(under_a_minute),
         feedback: crate::ops::feedback::stats(cx, from)?,
     })
 }

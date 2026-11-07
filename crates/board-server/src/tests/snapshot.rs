@@ -582,3 +582,141 @@ async fn a_new_peer_on_the_branch_alerts_only_when_it_shares_files() {
         text(&alerts)
     );
 }
+
+#[tokio::test]
+async fn a_review_left_a_day_without_a_note_reminds_its_owner() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.register("t3:beta", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task("t3:alpha", "factory", "Wait on CI").await;
+    assert!(t.claim("t3:alpha", &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch("t3:alpha", &id, review).await.0.is_success());
+    let quiet = |s: &Value| text(s).contains(&format!("{id} has sat in review"));
+    snapshot(&t, "t3:alpha", "kind=delta").await;
+    snapshot(&t, "t3:beta", "kind=delta").await;
+
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0, "not a day yet");
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    assert_eq!(
+        sweep_quiet_reviews(&t),
+        0,
+        "once a day while it stays quiet"
+    );
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains(&format!(
+            "{id} has sat in review for 25h with no note from its owner for 25h"
+        )) && text(&delta).contains(&format!("task_note {id}")),
+        "{}",
+        text(&delta)
+    );
+    // An event alert: shown once, not on every snapshot after it.
+    assert!(!quiet(&snapshot(&t, "t3:alpha", "kind=delta").await));
+    // Another live agent's task is not this agent's business.
+    assert!(!quiet(&snapshot(&t, "t3:beta", "kind=delta").await));
+
+    // A note saying what it still waits on starts the clock again.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some("t3:alpha"),
+        Some(json!({ "agent": "t3:alpha", "kind": "note", "text": "note: CI queued" })),
+    )
+    .await;
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0);
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("in review for 2d with no note from its owner for 25h"),
+        "{}",
+        text(&delta)
+    );
+
+    // A task out of review is never announced.
+    let doing = json!({ "status": "doing" });
+    assert!(t.patch("t3:alpha", &id, doing).await.0.is_success());
+    t.advance(TimeDelta::hours(25));
+    assert_eq!(sweep_quiet_reviews(&t), 0);
+}
+
+#[tokio::test]
+async fn a_quiet_review_whose_owner_ended_goes_to_the_coordinator() {
+    let t = T::new();
+    let (coordinator, child) = ("t3:coord", "t3:child");
+    t.register(coordinator, Some(REPO), None).await;
+    t.register(child, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    let lease = json!({ "device": "mac", "agent": coordinator });
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease.clone()),
+    )
+    .await;
+    let id = t.task(child, "auto", "Wait on review").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(child, &id, review).await.0.is_success());
+    let quiet = |s: &Value| text(s).contains(&format!("{id} has sat in review"));
+    snapshot(&t, coordinator, "kind=delta").await;
+
+    // While the owner lives, the reminder is the owner's alone.
+    t.advance(TimeDelta::hours(23));
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease.clone()),
+    )
+    .await;
+    t.register(child, Some(REPO), None).await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    assert!(!quiet(&snapshot(&t, coordinator, "kind=delta").await));
+
+    // Once the owner has ended, the coordinator gets it, so the wait is not lost.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{child}/state"),
+        Some(child),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0, "a day after the last reminder");
+    t.advance(TimeDelta::hours(2));
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease),
+    )
+    .await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(quiet(&delta), "{}", text(&delta));
+}
+
+fn sweep_quiet_reviews(t: &T) -> usize {
+    t.state
+        .db()
+        .write(
+            || t.state.now(),
+            t.state.settings(),
+            crate::ops::tasks::announce_quiet_reviews,
+        )
+        .unwrap()
+}
