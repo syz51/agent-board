@@ -64,7 +64,7 @@ export function AgentsScreen() {
         }
       />
       <nav
-        className="-mt-2 mb-5 inline-flex max-w-full gap-0.5 overflow-x-auto rounded-lg bg-secondary p-0.75 [scrollbar-width:none] max-md:flex"
+        className="-mt-2 mb-6 inline-flex max-w-full gap-0.5 overflow-x-auto rounded-full bg-secondary p-1 [scrollbar-width:none] max-md:flex"
         aria-label="Filter agents by state"
       >
         {FILTERS.map((filter) => (
@@ -73,7 +73,7 @@ export function AgentsScreen() {
             to="/agents"
             search={filter.value ? { state: filter.value } : {}}
             activeOptions={{ exact: true }}
-            className="inline-flex min-h-7 flex-none items-center rounded-md px-3 py-1 text-meta font-medium text-subtle-foreground hover:text-foreground hover:no-underline aria-[current=page]:bg-card aria-[current=page]:font-semibold aria-[current=page]:text-foreground aria-[current=page]:shadow-[0_1px_2px_rgb(16_24_40/0.1),0_0_0_1px_var(--border)] max-md:flex-[1_0_auto] max-md:justify-center max-md:px-2"
+            className="inline-flex min-h-8 flex-none items-center rounded-full px-3.5 py-1 text-meta font-medium text-subtle-foreground hover:text-foreground hover:no-underline aria-[current=page]:bg-popover aria-[current=page]:font-semibold aria-[current=page]:text-foreground aria-[current=page]:shadow-[0_1px_2px_rgb(16_24_40/0.1),0_0_0_1px_var(--border)] max-md:flex-[1_0_auto] max-md:justify-center max-md:px-2"
           >
             {filter.label}
           </Link>
@@ -95,7 +95,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="grid gap-3">
+            <div className="divide-y border-t border-foreground/80">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -109,7 +109,7 @@ export function AgentsScreen() {
 
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
-    <article className="grid gap-3.5 rounded-lg border bg-card px-4 py-3.5 shadow-raise lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-6">
+    <article className="grid gap-3.5 px-1 py-5 lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-8">
       <div className="grid content-start justify-items-start gap-2">
         {/* The avatar beside the handle, with the state on its own line under it. */}
         <header className="grid grid-cols-[auto_minmax(0,1fr)] items-center justify-items-start gap-x-2.5 gap-y-0.5">
@@ -184,7 +184,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   );
 }
 
-const handoffBox = "bg-muted grid gap-1.5 rounded-sm border px-3 py-2.5";
+const handoffBox = "grid gap-1.5 border-l-2 pl-3.5";
 
 function HandoffView({ agentId }: { agentId: string }) {
   const handoff = useQuery(queries.handoff(agentId));
@@ -267,7 +267,7 @@ function SaidView({ agentId }: { agentId: string }) {
       ) : (
         <ul className="mt-1.5 grid gap-1.5">
           {said.data.map((item) => (
-            <li key={item.id} className="rounded-sm bg-muted px-3 py-2">
+            <li key={item.id} className="border-l-2 py-1 pl-3.5">
               <p className={note}>
                 <Link to="/boards/$slug" params={{ slug: item.board }}>
                   {item.board}

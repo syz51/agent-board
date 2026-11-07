@@ -48,7 +48,7 @@ export function EventsScreen() {
     <>
       <PageHeader title="Events" sub="Everything agents and you did, live as it happens." />
       <form
-        className="mb-5 flex flex-wrap items-center gap-2"
+        className="mb-8 flex flex-wrap items-center gap-2"
         onSubmit={(event) => event.preventDefault()}
       >
         <FilterSelect label="Board" value={board} onChange={setBoard}>

@@ -51,8 +51,8 @@ export function BoardsScreen() {
         }
       />
       {openAsks.length > 0 && (
-        <section className="mb-8" aria-labelledby="waiting-title">
-          <div className="flex items-baseline justify-between gap-3">
+        <section className="mb-12" aria-labelledby="waiting-title">
+          <div className="mb-1 flex items-baseline justify-between gap-3 border-b border-foreground/80 [&>h2]:m-0 [&>h2]:border-0">
             <SectionTitle id="waiting-title">Waiting on you</SectionTitle>
             <Link
               className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
@@ -67,7 +67,7 @@ export function BoardsScreen() {
               .map((ask) => (
                 <li key={ask.id}>
                   <Link
-                    className="grid min-h-11 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-2 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
+                    className="grid min-h-11 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-1 py-2.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
                     to="/asks/$id"
                     params={{ id: String(ask.id) }}
                   >
@@ -178,7 +178,8 @@ const AREA: Record<string, string> = {
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
   asks: "[grid-area:asks]",
-  autopilot: "[grid-area:auto]",
+  // Not "auto": that is a keyword for grid-area and would place the cell automatically.
+  autopilot: "[grid-area:pilot]",
 };
 
 const CELL_CLASS: Record<string, string> = {
@@ -190,7 +191,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_168px_168px_48px_80px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -209,16 +210,13 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
     getRowId: (row) => row.board.slug,
   });
   return (
-    <section
-      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
-      aria-label="All boards"
-    >
+    <section className="@container" aria-label="All boards">
       {table.getHeaderGroups().map((group) => (
         <div
           key={group.id}
           className={cn(
             ROW_GRID,
-            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
+            "hidden h-9 items-end border-b border-foreground/80 px-1 pb-2 text-xs font-medium text-muted-foreground @min-[760px]:grid",
           )}
           aria-hidden="true"
         >
@@ -235,7 +233,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
+              "items-center px-1 py-4 @min-[760px]:min-h-18 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -254,7 +252,7 @@ function BoardName({ board }: { board: Board }) {
   return (
     <>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
+        <h2 className="min-w-0 font-serif text-[18px] leading-snug font-semibold">
           <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
             {board.title}
           </Link>

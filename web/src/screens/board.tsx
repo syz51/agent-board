@@ -116,7 +116,23 @@ export function BoardScreen() {
       <Crumbs current={board?.title ?? slug}>
         <Link to="/">Boards</Link>
       </Crumbs>
-      <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
+      <PageHeader
+        title={board?.title ?? slug}
+        sub={
+          (board?.goal || board?.temporary) && (
+            // The temporary note sits with the goal, under the title.
+            <>
+              {board.goal && <PlainText className="block" text={board.goal} />}
+              {board.temporary && (
+                <span className="block">
+                  Temporary: the server closes this board once it is idle, and deletes it some time
+                  after that.
+                </span>
+              )}
+            </>
+          )
+        }
+      >
         {board && board.title !== slug && (
           <span className="ident text-meta text-muted-foreground">{slug}</span>
         )}
@@ -132,17 +148,11 @@ export function BoardScreen() {
           </Badge>
         )}
       </PageHeader>
-      {board?.temporary && (
-        <p className="-mt-3 mb-5 text-meta text-muted-foreground">
-          Temporary: the server closes this board once it is idle, and deletes it some time after
-          that.
-        </p>
-      )}
 
       {/* No filters on a board without tasks; disabled until its tasks have loaded. */}
       {(filtered || tasks.data === undefined || tasks.data.length > 0) && (
         <form
-          className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+          className="mb-8 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
           role="search"
           onSubmit={(event) => event.preventDefault()}
         >
@@ -233,16 +243,12 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-/** The frame around task groups: one card, groups divided by rules. */
+/** The task groups, one after another down the page like a document's sections. */
 export function TaskBoard({ children }: { children: ReactNode }) {
-  return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
-      {children}
-    </div>
-  );
+  return <div className="grid gap-9">{children}</div>;
 }
 
-/** A group of tasks under a shaded heading with its count. */
+/** A group of tasks under a ruled serif heading with its count. */
 export function TaskGroupSection({
   id,
   heading,
@@ -261,10 +267,12 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+        className="flex items-center gap-2 border-b border-foreground/80 pb-2 font-serif text-title font-semibold"
       >
         {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        <span className="self-end pb-px font-sans text-meta font-medium text-muted-foreground tabular-nums">
+          {count}
+        </span>
       </Heading>
       {children}
     </section>
@@ -346,7 +354,7 @@ export function TaskList({
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-12 grid-cols-subgrid items-center gap-x-3 px-1 py-2 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-0.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>

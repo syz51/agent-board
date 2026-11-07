@@ -73,7 +73,7 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby={id}>
+    <section className={first ? undefined : "mt-11"} aria-labelledby={id}>
       <SectionTitle id={id} {...(count === undefined ? {} : { count })}>
         {title}
       </SectionTitle>
@@ -118,8 +118,8 @@ function TaskView({
 
   return (
     <article>
-      <header className="mb-6">
-        <h1 className="max-w-[36ch] text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+      <header className="mb-9">
+        <h1 className="max-w-[30ch] font-serif text-display font-semibold tracking-[-0.012em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
@@ -130,12 +130,12 @@ function TaskView({
         </p>
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
+      <div className="grid gap-9 lg:grid-cols-[minmax(0,1fr)_224px] lg:items-start lg:gap-10">
         <aside
-          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
+          className="order-2 grid gap-5 border-t pt-5 lg:sticky lg:top-24 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-6"
           aria-label="Properties"
         >
-          <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
+          <Facts className="gap-3.5 text-meta [&_dt]:text-xs [&>div]:grid-cols-1 [&>div]:gap-0.5 max-lg:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
             <div>
               <dt>Status</dt>
               <dd>
@@ -230,11 +230,11 @@ function TaskView({
 
           <Section id="task-acceptance" title="Acceptance" count={acceptance.length}>
             {acceptance.length > 0 ? (
-              <ol className="divide-y overflow-hidden rounded-lg border">
+              <ol className="divide-y">
                 {acceptance.map((line, index) => (
-                  <li key={index} className="flex gap-3 px-3.5 py-2.5">
+                  <li key={index} className="flex gap-3 py-2.5">
                     <span
-                      className="mt-px grid size-5 flex-none place-items-center rounded-full bg-secondary text-2xs font-semibold text-subtle-foreground tabular-nums"
+                      className="w-5 flex-none font-serif text-muted-foreground tabular-nums"
                       aria-hidden="true"
                     >
                       {index + 1}
@@ -250,7 +250,7 @@ function TaskView({
 
           <Section id="task-evidence" title="Evidence" count={detail.evidence.length}>
             {detail.evidence.length > 0 ? (
-              <ul className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+              <ul className="divide-y">
                 {detail.evidence.map((item, index) => (
                   <EvidenceItem key={index} item={item} agents={agents} />
                 ))}
@@ -262,9 +262,9 @@ function TaskView({
 
           <Section id="task-notes" title="Notes" count={detail.notes.length}>
             {detail.notes.length > 0 ? (
-              <ul className="grid gap-2.5">
+              <ul className="divide-y">
                 {detail.notes.map((note) => (
-                  <li key={note.id} className="grid gap-1.5 rounded-lg border bg-card px-3.5 py-3">
+                  <li key={note.id} className="grid gap-1.5 py-3.5">
                     <div className="flex flex-wrap items-center gap-2 text-meta">
                       <Who id={note.agent} agents={agents} />
                       <Badge
@@ -325,7 +325,7 @@ function FeedbackFacts({
   const { resolution } = feedback;
   return (
     <Section id="task-feedback" title="Feedback" first>
-      <Facts className="gap-2.5 rounded-lg border p-4 [&>div]:grid-cols-[100px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
+      <Facts className="gap-2.5 border-y py-4 [&>div]:grid-cols-[100px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
         <div>
           <dt>About</dt>
           <dd>
@@ -415,7 +415,7 @@ function TaskLinks({
   if (ids.length === 0) return null;
   return (
     <section className="border-t pt-4">
-      <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
+      <h2 className="mb-2 text-xs font-medium text-muted-foreground">{title}</h2>
       <ul className="grid gap-1">
         {ids.map((id) => {
           const task = related.get(id);
@@ -445,7 +445,7 @@ function TaskLinks({
 
 function EvidenceItem({ item, agents }: { item: Evidence; agents: Map<string, Agent> }) {
   return (
-    <li className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 py-2.5">
+    <li className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 py-2.5">
       <Badge variant="outline" shape="tag">
         {item.kind}
       </Badge>

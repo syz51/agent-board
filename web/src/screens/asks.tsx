@@ -165,7 +165,7 @@ export function AsksScreen() {
           return (
             <>
               {shown.length > 0 && (
-                <div className="grid gap-4">
+                <div className="divide-y border-t border-foreground/80">
                   {shown.map((ask) => (
                     <AskCard key={ask.id} ask={ask} agents={agents} />
                   ))}
@@ -219,7 +219,7 @@ function WaitingTasks({
 }) {
   const count = groups.reduce((sum, group) => sum + group.tasks.length, 0);
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby="needs-you-tasks">
+    <section className={first ? undefined : "mt-12"} aria-labelledby="needs-you-tasks">
       <SectionTitle
         id="needs-you-tasks"
         count={count}
@@ -230,8 +230,8 @@ function WaitingTasks({
       <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
-      {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
+      {/* Manual tags in amber, the colour of action asks. */}
+      <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
             <TaskGroupSection
@@ -275,7 +275,7 @@ export function AskScreen() {
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
-            <div className="max-w-[720px]">
+            <div className="border-t border-foreground/80">
               <AskCard ask={data} agents={agents} standalone />
             </div>
           )}
@@ -300,8 +300,8 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
-        "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
+        "relative grid gap-3.5 py-6 pl-5",
+        "before:absolute before:top-6 before:bottom-6 before:left-0 before:w-[3px] before:rounded-full",
         ask.status !== "open"
           ? "before:bg-input"
           : ask.kind === "action"

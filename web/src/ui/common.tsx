@@ -84,11 +84,9 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
-      <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
-        <Icon name={icon} className="size-5" />
-      </span>
-      <p className="text-base font-semibold text-foreground">{title}</p>
+    <div className="grid justify-items-center gap-1.5 border-y px-6 py-14 text-center text-muted-foreground">
+      <Icon name={icon} className="mb-1.5 size-6 text-subtle-foreground" />
+      <p className="font-serif text-title font-semibold text-foreground">{title}</p>
       {children && <p className="max-w-[48ch]">{children}</p>}
     </div>
   );
@@ -306,15 +304,15 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
-      <div className="grid min-w-0 gap-1.5">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <h1 className="text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+    <header className="mb-8 flex flex-wrap items-end justify-between gap-x-4 gap-y-3">
+      <div className="grid min-w-0 gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5">
+          <h1 className="font-serif text-display font-semibold tracking-[-0.012em] text-balance max-md:text-display-phone">
             {title}
           </h1>
           {children}
         </div>
-        {sub && <p className="max-w-[68ch] text-sm text-muted-foreground">{sub}</p>}
+        {sub && <p className="max-w-[68ch] text-base text-muted-foreground">{sub}</p>}
       </div>
       {aside}
     </header>
@@ -352,12 +350,12 @@ export function SectionTitle({
   return (
     <h2
       id={id}
-      className="mb-3 flex items-baseline gap-2 text-base font-semibold tracking-[-0.011em]"
+      className="mb-3 flex items-baseline gap-2 border-b border-foreground/80 pb-2 font-serif text-title font-semibold"
     >
       {icon}
       {children}
       {count !== undefined && (
-        <span className="text-meta font-medium tracking-normal text-muted-foreground tabular-nums">
+        <span className="font-sans text-meta font-medium text-muted-foreground tabular-nums">
           {count}
         </span>
       )}
@@ -365,9 +363,8 @@ export function SectionTitle({
   );
 }
 
-/** A bordered list of rows on a card surface. */
-export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+/** A list of rows divided by hairline rules, with no box around it. */
+export const listClass = "divide-y [&>li]:border-border";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {

@@ -1,8 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useRouter, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils.ts";
-import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
 import { useNeedsYouCount } from "@/screens/asks.tsx";
@@ -11,8 +9,9 @@ import { Empty, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 
 /**
- * The app frame: a sidebar from 900px, a top bar below, and bottom tabs on phones (below
- * 720px). Focus moves to the page on each navigation so screen readers announce it.
+ * The app frame: one centred column under a quiet top bar with the sections as a segmented
+ * pill, and bottom tabs on phones (below 720px). Focus moves to the page on each navigation so
+ * screen readers announce it.
  */
 export function Shell() {
   const main = useRef<HTMLElement>(null);
@@ -25,24 +24,25 @@ export function Shell() {
     [router],
   );
   return (
-    <div className="min-h-screen lg:grid lg:grid-cols-[232px_minmax(0,1fr)]">
+    <div className="min-h-screen bg-background">
       <a
-        className="fixed -top-12 left-2 z-30 rounded-sm bg-card px-3 py-2 shadow-overlay focus:top-2"
+        className="fixed -top-12 left-2 z-30 rounded-sm bg-popover px-3 py-2 focus:top-2 focus:shadow-overlay"
         href="#main"
       >
         Skip to content
       </a>
-      <header className="sticky top-0 z-10 flex h-[52px] items-center gap-5 border-b bg-sidebar px-4 max-md:justify-between lg:h-screen lg:flex-col lg:items-stretch lg:gap-[22px] lg:border-r lg:border-b-0 lg:px-3 lg:py-4">
-        <Link
-          className="inline-flex min-h-8 items-center gap-2.25 text-base font-[650] tracking-[-0.011em] whitespace-nowrap text-foreground hover:no-underline lg:px-2"
-          to="/"
-        >
-          <BrandMark />
-          <span>agent-board</span>
-        </Link>
-        <Nav />
-        <BoardLinks />
-        <ConnectionPill />
+      <header className="sticky top-0 z-10 border-b bg-background">
+        <div className="mx-auto flex h-14 max-w-[944px] items-center gap-6 px-4 max-md:justify-between md:px-8">
+          <Link
+            className="inline-flex min-h-8 items-center gap-2.25 font-serif text-[19px] font-semibold whitespace-nowrap text-foreground hover:no-underline"
+            to="/"
+          >
+            <BrandMark />
+            <span>agent-board</span>
+          </Link>
+          <Nav />
+          <ConnectionPill />
+        </div>
       </header>
       <div className="min-w-0">
         <ConnectionBanner />
@@ -50,7 +50,7 @@ export function Shell() {
           id="main"
           ref={main}
           tabIndex={-1}
-          className="mx-auto max-w-[1000px] px-4 pt-6 pb-16 max-md:pb-[calc(92px+env(safe-area-inset-bottom))] lg:px-10 lg:pt-8 lg:pb-[72px]"
+          className="mx-auto max-w-[944px] px-4 pt-7 pb-16 max-md:pb-[calc(92px+env(safe-area-inset-bottom))] md:px-8 md:pt-10 md:pb-[88px]"
         >
           <Outlet />
         </main>
@@ -88,7 +88,7 @@ export function Nav() {
   const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
     <nav
-      className="flex flex-1 gap-0.5 max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-10 max-md:h-[calc(60px+env(safe-area-inset-bottom))] max-md:gap-0 max-md:border-t max-md:bg-card max-md:px-1 max-md:pb-[env(safe-area-inset-bottom)] lg:flex-none lg:flex-col"
+      className="flex gap-0.5 max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-10 max-md:h-[calc(60px+env(safe-area-inset-bottom))] max-md:gap-0 max-md:border-t max-md:bg-background max-md:px-1 max-md:pb-[env(safe-area-inset-bottom)] md:mx-auto md:rounded-full md:bg-secondary md:p-1"
       aria-label="Main"
     >
       {NAV.map((item) => (
@@ -97,13 +97,13 @@ export function Nav() {
           to={item.to}
           // Boards stays current on a board and a task; the router's own match would not.
           aria-current={item.match(path) ? "page" : undefined}
-          className="relative flex min-h-8 items-center gap-2.25 rounded-sm px-2.5 py-1.5 font-medium text-subtle-foreground hover:bg-secondary hover:text-foreground hover:no-underline aria-[current=page]:bg-secondary aria-[current=page]:font-semibold aria-[current=page]:text-foreground max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link max-md:[&>svg]:size-5.25"
+          className="relative flex min-h-8 items-center gap-2 rounded-full px-3.5 py-1 text-meta font-medium text-subtle-foreground hover:text-foreground hover:no-underline max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link md:aria-[current=page]:bg-popover md:aria-[current=page]:text-foreground md:aria-[current=page]:shadow-[0_1px_2px_rgb(0_0_0/0.08),0_0_0_1px_var(--border)] max-md:[&>svg]:size-5.25 md:[&>svg]:hidden"
         >
           <Icon name={item.icon} />
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
             <span
-              className="ml-auto h-4.5 min-w-5 rounded-full bg-amber px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-background tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0"
+              className="ml-0.5 h-4.5 min-w-5 rounded-full bg-amber px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-background tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0"
               aria-label={`${open} waiting on you`}
             >
               {open}
@@ -114,7 +114,7 @@ export function Nav() {
               {/* One mark at a time: the count when something waits, else a dot for news. */}
               {open === 0 && (
                 <span
-                  className="ml-auto size-2 flex-none rounded-full bg-primary max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                  className="ml-0.5 size-2 flex-none rounded-full bg-primary max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
                   aria-hidden="true"
                   title={`${unseen} unseen updates`}
                 />
@@ -126,57 +126,6 @@ export function Nav() {
           )}
         </Link>
       ))}
-    </nav>
-  );
-}
-
-/** Each board, with its open asks, so a board is one click from anywhere on a wide screen. */
-function BoardLinks() {
-  const path = usePathname();
-  const boards = useQuery(queries.boards());
-  const list = (boards.data ?? []).filter((board) => board.status !== "closed");
-  return (
-    <nav className="hidden min-h-0 flex-1 overflow-y-auto lg:block" aria-label="Boards">
-      <p className="px-2.5 pb-1.5 text-xs font-semibold text-muted-foreground" aria-hidden="true">
-        Boards
-      </p>
-      {boards.data === undefined && (
-        <p className="px-2.5 py-1 text-meta text-muted-foreground">
-          {boards.error ? "Boards are unavailable" : "Loading…"}
-        </p>
-      )}
-      <ul className="grid gap-px">
-        {list.map((board) => {
-          const href = `/boards/${encodeURIComponent(board.slug)}`;
-          const here = path === href || path.startsWith(`/tasks/${board.slug}-`);
-          return (
-            <li key={board.slug}>
-              <Link
-                to="/boards/$slug"
-                params={{ slug: board.slug }}
-                aria-current={here ? "page" : undefined}
-                className="flex min-h-7.5 items-center gap-2.5 rounded-sm px-2.5 py-1 text-subtle-foreground hover:bg-secondary hover:no-underline aria-[current=page]:bg-secondary aria-[current=page]:font-[550] aria-[current=page]:text-foreground"
-              >
-                <span
-                  className="grid size-4.5 flex-none place-items-center rounded-[5px] border border-input bg-card text-2xs font-semibold tracking-normal text-subtle-foreground"
-                  aria-hidden="true"
-                >
-                  {board.title.trim()[0]?.toUpperCase() ?? "#"}
-                </span>
-                <span className="min-w-0 flex-1 truncate">{board.title}</span>
-                {board.open_asks > 0 && (
-                  <span
-                    className="h-4.5 min-w-5 rounded-full bg-amber-soft px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-amber tabular-nums"
-                    aria-label={`${board.open_asks} open asks`}
-                  >
-                    {board.open_asks}
-                  </span>
-                )}
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
     </nav>
   );
 }
@@ -202,7 +151,7 @@ function ConnectionPill() {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.75 text-meta whitespace-nowrap lg:mt-auto lg:border-t lg:px-2.5 lg:pt-2",
+        "inline-flex items-center gap-1.75 text-meta whitespace-nowrap",
         state.kind === "offline" || state.kind === "reconnecting"
           ? "text-foreground"
           : "text-muted-foreground",
@@ -231,7 +180,7 @@ function ConnectionBanner() {
   return (
     <div
       className={cn(
-        "flex items-center gap-2.5 border-b px-6 py-2.5",
+        "flex items-center justify-center gap-2.5 border-b px-4 py-2 text-meta",
         state.kind === "offline"
           ? "border-error-border bg-error-soft text-error"
           : "border-warn-border bg-warn-soft text-warn",
