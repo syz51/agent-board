@@ -13,7 +13,7 @@ use board::config::{Config, Home};
 use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{T3, ThreadInfo};
+use board::t3::{ListedThread, T3, ThreadInfo};
 use board_proto::{
     AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, Timestamp,
 };
@@ -22,6 +22,7 @@ use serde_json::json;
 
 const REPO: &str = "github.com/syz51/agent-board";
 const NEW_THREAD: &str = "thread:project:p1:new";
+const ORPHAN: &str = "thread:project:p1:orphan";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
@@ -34,6 +35,10 @@ enum Call {
         thread: String,
         message: String,
     },
+    List {
+        project: PathBuf,
+        title: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -42,8 +47,16 @@ struct FakeT3 {
     threads: Arc<Mutex<BTreeMap<String, ThreadInfo>>>,
     /// `t3 thread start` fails while set.
     fail_start: Arc<AtomicBool>,
-    /// `t3 thread send` fails while set.
+    /// While set, `t3 thread start` creates [`ORPHAN`] and then fails, as when the daemon is
+    /// killed or `t3` times out mid-start; the value says whether its message got through.
+    die_after_create: Arc<Mutex<Option<bool>>>,
+    /// `t3 thread list` and `t3 thread send` fail while set.
+    fail_list: Arc<AtomicBool>,
     fail_send: Arc<AtomicBool>,
+    /// What `t3 thread list` shows, by title.
+    listed: Arc<Mutex<Vec<(String, ListedThread)>>>,
+    /// When T3 creates a thread.
+    clock: Arc<Mutex<Timestamp>>,
     /// Saved by the next `t3 thread send`: a newer `board board adopt` arriving meanwhile.
     adopt_during_send: Arc<Mutex<Option<(Home, Adoption)>>>,
 }
@@ -58,9 +71,27 @@ impl FakeT3 {
             .into_iter()
             .filter_map(|c| match c {
                 Call::Send { thread, message } => Some((thread, message)),
-                Call::Start { .. } => None,
+                _ => None,
             })
             .collect()
+    }
+
+    fn list(&self, title: &str, id: &str, created_at: Timestamp, ran: bool) {
+        self.listed.lock().unwrap().push((
+            title.to_owned(),
+            ListedThread {
+                id: id.to_owned(),
+                created_at,
+                ran,
+            },
+        ));
+    }
+
+    fn lists(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::List { .. }))
+            .count()
     }
 
     fn live(&self, thread: &str) {
@@ -84,7 +115,14 @@ impl T3 for FakeT3 {
         if self.fail_start.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread start failed: no such project");
         }
+        let now = *self.clock.lock().unwrap();
+        if let Some(ran) = *self.die_after_create.lock().unwrap() {
+            self.live(ORPHAN);
+            self.list(title, ORPHAN, now, ran);
+            anyhow::bail!("t3 thread start timed out");
+        }
         self.live(NEW_THREAD);
+        self.list(title, NEW_THREAD, now, true);
         Ok(NEW_THREAD.to_owned())
     }
 
@@ -99,11 +137,34 @@ impl T3 for FakeT3 {
         if let Some((home, adoption)) = self.adopt_during_send.lock().unwrap().take() {
             save_adoption(&home, &"factory".parse().unwrap(), &adoption).unwrap();
         }
+        for (_, t) in self.listed.lock().unwrap().iter_mut() {
+            if t.id == thread {
+                t.ran = true;
+            }
+        }
         Ok(())
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
         Ok(self.threads.lock().unwrap().get(thread).cloned())
+    }
+
+    async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
+        self.calls.lock().unwrap().push(Call::List {
+            project: project.to_path_buf(),
+            title: title.to_owned(),
+        });
+        if self.fail_list.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread list failed: server not running");
+        }
+        Ok(self
+            .listed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == title)
+            .map(|(_, thread)| thread.clone())
+            .collect())
     }
 }
 
@@ -121,7 +182,23 @@ fn env() -> Env {
 fn env_with_projects(projects: BTreeMap<String, PathBuf>) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
-    let home = Home::at(dir.path().join("home"));
+    let t3 = FakeT3::default();
+    let daemon = daemon_at(dir.path(), &stub, projects, &t3);
+    Env {
+        _dir: dir,
+        stub,
+        t3,
+        daemon,
+    }
+}
+
+/// A daemon whose home is under `dir`; called again on the same `dir`, a restarted one.
+fn daemon_at(
+    dir: &Path,
+    stub: &Stub,
+    projects: BTreeMap<String, PathBuf>,
+    t3: &FakeT3,
+) -> Daemon<FakeT3> {
     let config = Config {
         server: Some(stub.url.clone()),
         device: Some(DEVICE.parse().unwrap()),
@@ -129,20 +206,13 @@ fn env_with_projects(projects: BTreeMap<String, PathBuf>) -> Env {
         ..Config::default()
     };
     let ctx = Ctx {
-        home,
+        home: Home::at(dir.join("home")),
         device: DEVICE.parse().unwrap(),
         client: Client::new(&stub.url, TOKEN.into(), None, None).unwrap(),
         config,
         repo: RepoInfo::default(),
     };
-    let t3 = FakeT3::default();
-    let daemon = Daemon::new(ctx, t3.clone());
-    Env {
-        _dir: dir,
-        stub,
-        t3,
-        daemon,
-    }
+    Daemon::new(ctx, t3.clone())
 }
 
 fn autopilot(coordinator: Option<&str>, homes: &[&str]) -> Board {
@@ -733,6 +803,154 @@ async fn a_failed_start_backs_off_instead_of_looping() {
         (5, 4),
         "claim, start, claim as the agent"
     );
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+}
+
+/// An env whose board needs a coordinator, with the lease, its release and registration stubbed.
+fn start_env() -> Env {
+    let e = env();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    *e.t3.clock.lock().unwrap() = at() + chrono::Duration::seconds(1);
+    e
+}
+
+fn releases(e: &Env) -> usize {
+    e.stub
+        .requests_to("DELETE /v1/boards/factory/coordinator")
+        .len()
+}
+
+fn saved_state(e: &Env) -> board::daemon::WatchState {
+    board::state::load_named(&Home::at(e._dir.path().join("home")), "watch")
+}
+
+fn projects() -> BTreeMap<String, PathBuf> {
+    [(REPO.to_owned(), PathBuf::from("/src/agent-board"))].into()
+}
+
+#[tokio::test]
+async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_restart() {
+    let mut e = start_env();
+    // An empty coordinator thread from before, which no start of this daemon made.
+    e.t3.list(
+        "factory coordinator",
+        "old",
+        at() - chrono::Duration::days(1),
+        false,
+    );
+    *e.t3.die_after_create.lock().unwrap() = Some(false);
+
+    // The start dies after T3 created its thread, before the message was sent.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        (starts(&e.t3), e.t3.lists()),
+        (1, 0),
+        "no listing without a mark"
+    );
+    assert!(!e.daemon.state.coordinators.contains_key(&factory()));
+    assert_eq!(
+        saved_state(&e).pending_starts.get(&factory()),
+        Some(&at()),
+        "the mark is on disk before t3 runs"
+    );
+
+    // A restarted daemon (no in-memory backoff) briefs that thread instead of starting one.
+    *e.t3.die_after_create.lock().unwrap() = None;
+    e.daemon = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1, "no second thread");
+    let lists: Vec<Call> =
+        e.t3.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::List { .. }))
+            .collect();
+    assert_eq!(
+        lists,
+        [Call::List {
+            project: PathBuf::from("/src/agent-board"),
+            title: "factory coordinator".into()
+        }]
+    );
+    let sends = e.t3.sends();
+    let [(thread, message)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, ORPHAN);
+    assert_eq!(message, &board::daemon::coordinator_message(&factory()));
+    assert!(
+        e.t3.listed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, t)| t.ran || t.id == "old"),
+        "no thread of this start is left idle"
+    );
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    assert!(saved_state(&e).pending_starts.is_empty());
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.last().unwrap().body["agent"], format!("t3:{ORPHAN}"));
+}
+
+#[tokio::test]
+async fn a_start_that_timed_out_after_delivery_adopts_its_thread_without_briefing_it() {
+    let mut e = start_env();
+    *e.t3.die_after_create.lock().unwrap() = Some(true);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+
+    *e.t3.die_after_create.lock().unwrap() = None;
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1, "no second thread");
+    assert!(e.t3.sends().is_empty(), "its message already got through");
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    assert!(e.daemon.state.pending_starts.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_listing_waits_and_a_failed_brief_gives_up_on_that_thread() {
+    let mut e = start_env();
+    let later = |m: i64| at() + chrono::Duration::minutes(m);
+    *e.t3.die_after_create.lock().unwrap() = Some(false);
+    e.daemon.reconcile(at()).await.unwrap();
+    *e.t3.die_after_create.lock().unwrap() = None;
+
+    // The listing fails: no new thread, the lease is released, the mark kept.
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(later(40)).await.unwrap();
+    assert_eq!((starts(&e.t3), releases(&e)), (1, 2));
+    assert_eq!(e.daemon.state.pending_starts.get(&factory()), Some(&at()));
+
+    // Briefing the found thread fails: the lease is released and the mark dropped.
+    e.t3.fail_list.store(false, Ordering::SeqCst);
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(later(80)).await.unwrap();
+    let tried: Vec<String> = e.t3.sends().into_iter().map(|(t, _)| t).collect();
+    assert_eq!(tried, [ORPHAN]);
+    assert_eq!((starts(&e.t3), releases(&e)), (1, 3));
+    assert!(saved_state(&e).pending_starts.is_empty());
+
+    // So the next start makes a new thread rather than retrying that one forever.
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    e.daemon.reconcile(later(120)).await.unwrap();
+    assert_eq!(starts(&e.t3), 2);
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
 }
 

@@ -178,7 +178,13 @@ on one of the board's home devices.
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
   with the coordinator prompt (`prompts/coordinator.md`), then records the thread as the
-  coordinator.
+  coordinator. Before running `t3 thread start` the daemon saves a pending mark for the
+  board in `watch.json`, and clears it once the thread is recorded. A start that did not
+  finish (the daemon was killed, or `t3` failed or timed out after T3 created the thread)
+  leaves the mark, and the next start adopts the newest `<board> coordinator` thread created
+  since then: it sends the prompt first if that thread never ran, and starts a new thread
+  only when there is none, or when briefing it failed. Older threads with that title are
+  never taken.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
