@@ -31,9 +31,12 @@ A pill in the header and a banner show when the view is connecting, offline or r
 - **Tailwind CSS 4** and **shadcn/ui** components (`src/components/ui/`, `components.json`).
   The theme is a set of CSS variables in `src/styles.css`: colours, status colours, radii,
   shadows and type sizes. Restyle the view by changing those tokens and the components.
-  Under the CSP (`style-src 'self'`) components that inject `<style>` elements cannot run,
-  so dialogs use the native `<dialog>`, selects are native, and so are checkboxes and radio
-  buttons.
+  The CSP allows `<style>` elements only with the page's nonce. Radix's scroll lock (Dialog,
+  AlertDialog, Sheet, Select, modal menus and popovers) gets it from `src/lib/csp-nonce.ts`
+  through get-nonce; pass `nonce={cspNonce()}` to Radix Select's and ScrollArea's
+  content, which render their own `<style>`. Check a new Radix component in the production
+  build (`bun run preview`) for CSP violations in the console. Dialogs, selects, checkboxes
+  and radio buttons are native today, from before the nonce.
 - **marked, lexer only**: agent markdown is parsed into tokens and rendered as React
   elements in `src/text/markdown.tsx`. No HTML string is ever produced, so there is
   nothing to sanitize after the fact and no DOMPurify dependency.
@@ -106,8 +109,10 @@ event payloads) is untrusted:
   target, and open in a new tab with `noopener noreferrer`. Other links show what they
   pointed to, struck through. Images are never loaded; they become a link.
 - `build.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
-  styles and connections only, no remote images. The server should also send it as a
-  header with `frame-ancestors 'none'`.
+  styles and connections only, no remote images. `<style>` elements need a nonce, which the
+  server (and the dev server) puts fresh into each page in place of `__CSP_NONCE__`. The
+  server also sends the policy as a header with `frame-ancestors 'none'`. Scripts get no
+  nonce: only this origin's files run.
 - `src/text/markdown.test.tsx` pins this down. It also fails if any source file starts
   injecting HTML strings.
 

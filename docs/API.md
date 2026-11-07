@@ -496,7 +496,10 @@ Every `GET` outside `/v1` and `/healthz` serves the embedded web view: files und
 `/assets/` with immutable caching, any other path without a file extension as
 `index.html` (`no-cache`). Every web view response, `/index.html` included, carries a
 Content-Security-Policy that allows only this origin and forbids framing, plus
-`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Pages (`index.html`
+and the client routes) also allow `<style>` elements that carry a nonce: each page response
+has a fresh random one in its `style-src` and in the page's `csp-nonce` meta. Scripts get
+no nonce.
 
 ## Defaults
 

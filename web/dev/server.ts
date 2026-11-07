@@ -13,7 +13,7 @@
 import { watch } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { buildApp } from "../build.ts";
+import { buildApp, NONCE_PLACEHOLDER } from "../build.ts";
 import { DevApiError, DevState } from "./state.ts";
 
 const { values: args } = parseArgs({
@@ -152,7 +152,10 @@ async function serveDist(req: Request): Promise<Response> {
     if (await file.exists()) return new Response(file);
     return new Response("not found", { status: 404 });
   }
-  return new Response(Bun.file(join(distDir, "index.html")), {
+  // A fresh style nonce per page, as board-server does.
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const html = await Bun.file(join(distDir, "index.html")).text();
+  return new Response(html.replaceAll(NONCE_PLACEHOLDER, nonce), {
     headers: { "content-type": "text/html" },
   });
 }
