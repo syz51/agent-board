@@ -120,7 +120,9 @@ Reopening a closed board, or any change on it, starts the period again.
   to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
-  the server's clock passes it, and a time already passed is ignored.
+  the server's clock passes it, and a time already passed is ignored. The `task_created`
+  event's payload has `title`, `priority` and, when set, `parent`; the owner of the parent
+  or of any task above it (up to eight levels) gets a `filed` alert in its snapshot.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it

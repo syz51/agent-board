@@ -301,6 +301,55 @@ async fn answered_asks_alert_the_asker() {
 }
 
 #[tokio::test]
+async fn tasks_filed_under_mine_alert_me() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    for agent in ["t3:coord", "t3:child", "t3:other"] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    // The coordinator owns the task; its child owns a sub-task of it.
+    let root = t.task("t3:coord", "factory", "Root").await;
+    t.claim("t3:coord", &root).await;
+    let sub = t
+        .task_with(
+            "t3:coord",
+            json!({"board": "factory", "title": "Sub", "parent": root}),
+        )
+        .await;
+    t.claim("t3:child", &sub).await;
+    snapshot(&t, "t3:coord", "kind=alerts").await;
+
+    // Found work filed under the child's task reaches the owner of its ancestor.
+    let found = t
+        .task_with(
+            "t3:child",
+            json!({"board": "factory", "title": "Found", "parent": sub}),
+        )
+        .await;
+    // A task with no parent, and one under a task the coordinator does not own, do not.
+    t.task("t3:child", "factory", "Loose").await;
+    let elsewhere = t.task("t3:other", "factory", "Elsewhere").await;
+    t.task_with(
+        "t3:child",
+        json!({"board": "factory", "title": "Under elsewhere", "parent": elsewhere}),
+    )
+    .await;
+
+    let alerts = text(&snapshot(&t, "t3:coord", "kind=alerts").await).to_owned();
+    let filed: Vec<&str> = alerts.lines().filter(|l| l.contains(" filed ")).collect();
+    assert_eq!(filed.len(), 1, "{alerts}");
+    assert!(
+        filed[0].ends_with(&format!(
+            " filed {found} under your task {root} -> task_show {found}"
+        )),
+        "{alerts}"
+    );
+    // The filer itself is not alerted about its own task.
+    let child = text(&snapshot(&t, "t3:child", "kind=alerts").await).to_owned();
+    assert!(!child.contains("filed"), "{child}");
+}
+
+#[tokio::test]
 async fn snapshots_respect_their_caps() {
     let t = T::new();
     let me = "t3:alpha";
@@ -348,6 +397,7 @@ async fn snapshots_respect_their_caps() {
         "{full}"
     );
     assert!(full.contains("Claim before working"));
+    assert!(full.contains("File work you find with task_add."));
     let delta = text(&snapshot(&t, me, "kind=delta&since=0").await).to_owned();
     assert!(
         delta.chars().count() <= caps.snapshot_delta_chars,
