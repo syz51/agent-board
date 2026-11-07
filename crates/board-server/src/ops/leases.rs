@@ -7,10 +7,10 @@ use board_proto::{
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::{OptionalExtension, params};
 
-use crate::db::{Ctx, parse_id, ts};
+use crate::db::{Ctx, parse_id, parse_json, ts};
 use crate::error::{Result, forbidden, invalid, not_found};
 use crate::ops::{expires, touch_agent};
-use crate::store::{LEASE_COLUMNS, get_board, handle_of, is_live, lease_row, live_leases};
+use crate::store::{LEASE_COLUMNS, handle_of, is_live, lease_row, live_leases};
 use crate::text::{check_path, normalize_repo};
 
 /// Longest lease a request may ask for.
@@ -137,15 +137,17 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
 }
 
 pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult> {
-    let mut req = valid.req;
+    let req = valid.req;
     touch_agent(cx, &req.agent)?;
-    let board = match &req.task {
-        Some(task) => Some(
-            cx.db
+    let (board, warning) = match &req.task {
+        Some(task) => {
+            let (board, repos) = cx
+                .db
                 .query_row(
-                    "SELECT board FROM tasks WHERE id = ?1",
+                    "SELECT t.board, b.repos FROM tasks t JOIN boards b ON b.slug = t.board \
+                     WHERE t.id = ?1",
                     [task.as_str()],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -153,14 +155,22 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
                         format!("task {task} does not exist"),
                         "check the task id, or leave task out",
                     )
-                })
-                .and_then(|b| Ok(parse_id::<board_proto::BoardSlug>(&b)?))?,
-        ),
-        None => None,
+                })?;
+            let board = parse_id::<board_proto::BoardSlug>(&board)?;
+            let repos: Vec<String> = parse_json(&repos)?;
+            let warning = (!repos.is_empty() && !repos.contains(&req.repo)).then(|| {
+                format!(
+                    "task {task} is on board {board}, which lists {}, not {}: peers working \
+                     the task there get no warning from this lease; if you edit one of those \
+                     repos, lease its files from a checkout of it",
+                    repos.join(", "),
+                    req.repo
+                )
+            });
+            (Some(board), warning)
+        }
+        None => (None, None),
     };
-    if let Some(board) = &board {
-        req.repo = lease_repo(cx, board, req.task.as_ref(), req.repo)?;
-    }
     let ttl_ms = req
         .ttl_secs
         .map_or(cx.s.lease_ms(), |s| i64::from(s) * 1000);
@@ -234,36 +244,11 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             "conflicts": conflicts.len(),
         }),
     )?;
-    Ok(LeaseResult { leases, conflicts })
-}
-
-/// The repo a lease for a task on `board` goes to. Peers working the task are on the
-/// board's repos, so a lease from a checkout of another repo would warn nobody: it moves to
-/// the board's repo when the board lists one, and is refused when it lists several. A board
-/// without repos takes the caller's.
-fn lease_repo(
-    cx: &Ctx<'_>,
-    board: &board_proto::BoardSlug,
-    task: Option<&board_proto::TaskId>,
-    repo: String,
-) -> Result<String> {
-    let repos = get_board(cx, board)?.repos;
-    match repos.as_slice() {
-        [] => Ok(repo),
-        list if list.contains(&repo) => Ok(repo),
-        [only] => Ok(only.clone()),
-        list => Err(invalid(
-            format!(
-                "board {board} of task {} lists {}, not {repo}",
-                task.map_or("", |t| t.as_str()),
-                list.join(", ")
-            ),
-            format!(
-                "run lease_paths from a checkout of one of {}, or leave task out to lease in {repo}",
-                list.join(", ")
-            ),
-        )),
-    }
+    Ok(LeaseResult {
+        leases,
+        conflicts,
+        warning,
+    })
 }
 
 pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> {

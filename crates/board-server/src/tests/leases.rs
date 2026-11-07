@@ -502,7 +502,7 @@ async fn one_write_found_by_two_peers_shell_scans_is_neither_ones_overlap() {
 }
 
 #[tokio::test]
-async fn a_task_lease_goes_to_its_boards_repo() {
+async fn a_task_lease_outside_its_boards_repos_warns_and_stays_put() {
     const OTHER: &str = "github.com/acme/dotfiles";
     const SECOND: &str = "github.com/acme/site";
     let t = T::new();
@@ -513,52 +513,43 @@ async fn a_task_lease_goes_to_its_boards_repo() {
     let one = t.task(A, "factory", "One repo").await;
     let two = t.task(A, "pair", "Two repos").await;
     let free = t.task(A, "loose", "No repos").await;
-    let lease_for =
-        |task: &str| json!({ "agent": A, "repo": OTHER, "globs": ["src/**"], "task": task });
+    let lease = |repo: &str, task: Option<&str>| json!({ "agent": A, "repo": repo, "globs": ["src/**"], "task": task });
 
-    // From a checkout of another repo, a lease for a one-repo board's task lands on that
-    // repo, where the task's peers work.
-    let v = t
-        .ok("POST", "/v1/leases", Some(A), Some(lease_for(&one)))
-        .await;
-    assert_eq!(v["leases"][0]["repo"], REPO, "{v}");
+    // From a checkout of a repo the task's board does not list, the lease is still the
+    // caller's, in the repo it named, and the answer warns, naming the board's repos.
+    for (task, listed) in [(&one, vec![REPO]), (&two, vec![REPO, SECOND])] {
+        let v = t
+            .ok(
+                "POST",
+                "/v1/leases",
+                Some(A),
+                Some(lease(OTHER, Some(task))),
+            )
+            .await;
+        assert_eq!(v["leases"][0]["repo"], OTHER, "{v}");
+        let warning = v["warning"].as_str().unwrap();
+        assert!(
+            warning.contains(task.as_str()) && warning.contains(OTHER),
+            "{v}"
+        );
+        for repo in listed {
+            assert!(warning.contains(repo), "{v}");
+        }
+    }
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM leases WHERE repo = '{OTHER}'"
         )),
-        0
+        1
     );
 
-    // A board with several repos cannot pick one: refused, naming them.
-    let (code, err, v) = t
-        .fail("POST", "/v1/leases", Some(A), Some(lease_for(&two)))
-        .await;
-    assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
-    let message = v["message"].as_str().unwrap();
-    assert!(
-        message.contains(REPO) && message.contains(SECOND) && message.contains(OTHER),
-        "{v}"
-    );
-    assert!(
-        v["next"].as_str().unwrap().contains("leave task out"),
-        "{v}"
-    );
-
-    // A listed repo, a board without repos, and no task keep the caller's repo.
-    let listed = json!({ "agent": A, "repo": SECOND, "globs": ["web/**"], "task": two });
-    let v = t.ok("POST", "/v1/leases", Some(A), Some(listed)).await;
-    assert_eq!(v["leases"][0]["repo"], SECOND, "{v}");
-    let v = t
-        .ok("POST", "/v1/leases", Some(A), Some(lease_for(&free)))
-        .await;
-    assert_eq!(v["leases"][0]["repo"], OTHER, "{v}");
-    let v = t
-        .ok(
-            "POST",
-            "/v1/leases",
-            Some(A),
-            Some(json!({ "agent": A, "repo": OTHER, "globs": ["docs/**"] })),
-        )
-        .await;
-    assert_eq!(v["leases"][0]["repo"], OTHER, "{v}");
+    // A listed repo, a board without repos, and no task: no warning.
+    for body in [
+        lease(SECOND, Some(&two)),
+        lease(OTHER, Some(&free)),
+        lease(OTHER, None),
+    ] {
+        let v = t.ok("POST", "/v1/leases", Some(A), Some(body)).await;
+        assert!(v.get("warning").is_none(), "{v}");
+    }
 }
