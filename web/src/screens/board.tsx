@@ -6,6 +6,7 @@ import { tags } from "../live/refresh.ts";
 import { useNow, useResource } from "../live/runtime.ts";
 import { PlainText } from "../text/markdown.tsx";
 import {
+  AbsTime,
   agentIndex,
   Empty,
   Owner,
@@ -162,7 +163,7 @@ export function BoardScreen({ slug }: { slug: string }) {
               </h2>
               <ul class="task-list">
                 {group.tasks.map((task) => (
-                  <TaskRow key={task.id} task={task} agents={agents} done={done} />
+                  <TaskRow key={task.id} task={task} agents={agents} done={done} now={now} />
                 ))}
               </ul>
             </section>
@@ -181,10 +182,20 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 }
 
 function TaskRow(
-  { task, agents, done }: { task: Task; agents: Map<string, Agent>; done: ReadonlySet<string> },
+  { task, agents, done, now }: {
+    task: Task;
+    agents: Map<string, Agent>;
+    done: ReadonlySet<string>;
+    now: number;
+  },
 ) {
   // Blockers already done no longer hold the task up.
   const blockers = task.blockers.filter((id) => !done.has(id));
+  // Only a date still ahead holds an open task up.
+  const waitsUntil = task.status === "open" && task.not_before !== null &&
+      Date.parse(task.not_before) > now
+    ? task.not_before
+    : null;
   return (
     <li class="task-row">
       <div class="task-line">
@@ -208,6 +219,11 @@ function TaskRow(
           </span>
         )}
         {task.auto && <span class="chip">auto</span>}
+        {waitsUntil && (
+          <span class="chip">
+            waits until <AbsTime at={waitsUntil} />
+          </span>
+        )}
         <span class="muted">
           updated <RelTime at={task.updated_at} />
         </span>

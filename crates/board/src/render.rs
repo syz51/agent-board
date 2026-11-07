@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use board_proto::{
     Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task, TaskDetail,
-    Timestamp, TouchResult,
+    TaskStatus, Timestamp, TouchResult,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -105,6 +105,12 @@ pub fn task_line(task: &Task) -> String {
     }
     if task.auto {
         line.push_str(" auto");
+    }
+    if let Some(at) = task.not_before
+        && task.status == TaskStatus::Open
+        && at > Utc::now()
+    {
+        let _ = write!(line, " waits until {}", at.format("%Y-%m-%d %H:%MZ"));
     }
     line
 }

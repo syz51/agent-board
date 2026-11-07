@@ -168,6 +168,26 @@ impl Output {
     }
 }
 
+/// A `not_before` argument: absent leaves it alone (`None`); `none` clears it
+/// (`Some(None)`); otherwise a date (`YYYY-MM-DD`, midnight UTC) or an RFC 3339 time.
+pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(Some(at.to_utc())));
+    }
+    match chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        Ok(date) => Ok(Some(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()))),
+        Err(_) => bail!(
+            "not_before {value:?} is neither a date (YYYY-MM-DD) nor an RFC 3339 time; send one, or none to clear it"
+        ),
+    }
+}
+
 /// Parses a `snake_case` enum value the way the wire format spells it.
 pub fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_value(Value::String(value.to_owned()))
@@ -261,6 +281,7 @@ pub struct NewTask {
     pub blockers: Vec<TaskId>,
     pub priority: Option<Priority>,
     pub auto: Option<bool>,
+    pub not_before: Option<Timestamp>,
 }
 
 pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
@@ -280,6 +301,7 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             blockers: new.blockers,
             priority: new.priority.unwrap_or(Priority::P2),
             auto: new.auto,
+            not_before: new.not_before,
         })
         .await?;
     Ok(Output::new(
@@ -312,6 +334,8 @@ pub struct TaskChanges {
     pub blockers: Option<Vec<TaskId>>,
     pub blocked_reason: Option<String>,
     pub auto: Option<bool>,
+    /// `Some(None)` clears it.
+    pub not_before: Option<Option<Timestamp>>,
 }
 
 /// Reads the task's version, then applies the changes.
@@ -332,6 +356,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 blockers: changes.blockers,
                 blocked_reason: changes.blocked_reason,
                 auto: changes.auto,
+                not_before: changes.not_before,
             },
         )
         .await?;

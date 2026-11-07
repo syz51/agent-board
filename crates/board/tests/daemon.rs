@@ -523,6 +523,26 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
 }
 
 #[tokio::test]
+async fn a_passed_not_before_wakes_the_coordinator() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub
+        .on("GET /v1/tasks/factory-7", detail("factory-7", true, &[]));
+    // What the server's sweeper records when the clock passes the task's not_before.
+    let mut passed = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
+    passed.payload = json!({ "fields": [], "not_before_passed": "2026-11-07T00:00:00Z" });
+    e.daemon.on_event(&passed, at()).await.unwrap();
+    e.daemon.flush().await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-7 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+        )]
+    );
+}
+
+#[tokio::test]
 async fn a_cleared_blocker_wakes_the_coordinator() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     e.daemon.reconcile(at()).await.unwrap();

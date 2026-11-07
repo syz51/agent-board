@@ -96,6 +96,11 @@ export function formatAbsolute(at: string): string {
   return absolute.format(new Date(at));
 }
 
+/** An absolute time, for a moment that matters by its date. */
+export function AbsTime({ at }: { at: string }) {
+  return <time dateTime={at}>{formatAbsolute(at)}</time>;
+}
+
 /** A relative time; the absolute time is in `title` and `datetime`. */
 export function RelTime({ at }: { at: string }) {
   const now = useNow();

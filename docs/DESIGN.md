@@ -73,11 +73,13 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Board**: one effort. Has repos (normalized origin URLs, so every checkout and worktree on
   every device matches), an autopilot switch, a coordinator and its home devices.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
-  computed when read (open, all blockers done, no live owner), never stored. Done requires
+  computed when read (open, all blockers done, no live owner, `not_before` passed), never
+  stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact). `auto` says whether
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice).
-  Waiting on another task is a blocker; waiting on the user is an ask and `blocked`.
+  Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
+  waiting for a date is `not_before`, which the server's sweeper announces once passed.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.
@@ -212,8 +214,8 @@ on one of the board's home devices.
   needs the user it creates an ask and moves on to other ready work. When nothing is ready
   it stops.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
-  board-generated message (`t3 thread send`) when a task becomes ready, a blocker clears or
-  an ask is answered. Workers whose ask was answered are woken the same way.
+  board-generated message (`t3 thread send`) when a task becomes ready (including when its
+  `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
@@ -248,7 +250,8 @@ keeping untrusted text out of those channels, so:
   not be followed. The server sets attribution; JSON escaping (with `<` and `>` as `\u003c`
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
-  order (you, counts, mine, handoff, alerts, peers, ready, recent); every alert ends with
+  order (you, counts, mine, handoff, alerts, peers, ready, waiting, recent; `waiting` lists
+  open tasks held by a `not_before`, soonest first); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each.
