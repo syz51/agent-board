@@ -10,37 +10,37 @@
 
 :root {
   color-scheme: light dark;
-  --radius: 0.625rem;
+  --radius: 0.25rem;
 
   /* shadcn/ui tokens */
-  --background: #ffffff;
-  --foreground: #15171b;
+  --background: #f7f7f8;
+  --foreground: #18181b;
   --card: #ffffff;
-  --card-foreground: #15171b;
+  --card-foreground: #18181b;
   --popover: #ffffff;
-  --popover-foreground: #15171b;
-  --primary: #3b55d9;
+  --popover-foreground: #18181b;
+  --primary: #b45309;
   --primary-foreground: #ffffff;
-  --secondary: #eef0f3;
-  --secondary-foreground: #15171b;
-  --muted: #f7f8fa;
-  --muted-foreground: #626975;
-  --accent: #eef0f3;
-  --accent-foreground: #15171b;
+  --secondary: #ededf0;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f6;
+  --muted-foreground: #5c5c66;
+  --accent: #ededf0;
+  --accent-foreground: #18181b;
   --destructive: #c0391b;
-  --border: #e7e9ed;
-  --input: #d4d8de;
-  --ring: #3b55d9;
-  --sidebar: #f6f7f9;
-  --sidebar-foreground: #3d424b;
-  --sidebar-accent: #eef0f3;
-  --sidebar-accent-foreground: #15171b;
-  --sidebar-border: #e7e9ed;
+  --border: #e2e2e6;
+  --input: #cfcfd6;
+  --ring: #b45309;
+  --sidebar: #1c1c20;
+  --sidebar-foreground: #d4d4d8;
+  --sidebar-accent: #2c2c31;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #2c2c31;
 
   /* agent-board tokens */
-  --subtle-foreground: #3d424b;
-  --link: #2f47bf;
-  --primary-soft: #edf0fd;
+  --subtle-foreground: #3f3f46;
+  --link: #9a4a07;
+  --primary-soft: #fdf1e2;
   --status-ready: #18794e;
   --status-ready-soft: #e6f4ec;
   --status-doing: #2f5fd0;
@@ -61,39 +61,39 @@
   --error: #8c2a12;
   --error-soft: #fdf0ed;
   --error-border: #f3c5ba;
-  --shadow-raise: 0 1px 2px rgb(16 24 40 / 0.05);
-  --shadow-overlay: 0 16px 48px rgb(16 24 40 / 0.2);
+  --shadow-raise: 0 0 0 0 transparent;
+  --shadow-overlay: 0 12px 32px rgb(0 0 0 / 0.22);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #111216;
-    --foreground: #ecedf0;
-    --card: #17191e;
-    --card-foreground: #ecedf0;
-    --popover: #17191e;
-    --popover-foreground: #ecedf0;
-    --primary: #8299f7;
-    --primary-foreground: #0c1124;
-    --secondary: #24272e;
-    --secondary-foreground: #ecedf0;
-    --muted: #1b1d23;
-    --muted-foreground: #99a0ab;
-    --accent: #24272e;
-    --accent-foreground: #ecedf0;
+    --background: #0e0e10;
+    --foreground: #e4e4e7;
+    --card: #141417;
+    --card-foreground: #e4e4e7;
+    --popover: #18181b;
+    --popover-foreground: #e4e4e7;
+    --primary: #f2a531;
+    --primary-foreground: #1a1203;
+    --secondary: #222226;
+    --secondary-foreground: #e4e4e7;
+    --muted: #18181c;
+    --muted-foreground: #9d9da7;
+    --accent: #222226;
+    --accent-foreground: #e4e4e7;
     --destructive: #f49a82;
-    --border: #262930;
-    --input: #353943;
-    --ring: #8ea3f8;
-    --sidebar: #0c0d10;
-    --sidebar-foreground: #c7cad1;
-    --sidebar-accent: #24272e;
-    --sidebar-accent-foreground: #ecedf0;
-    --sidebar-border: #262930;
+    --border: #26262b;
+    --input: #3a3a41;
+    --ring: #f2a531;
+    --sidebar: #09090b;
+    --sidebar-foreground: #c4c4cc;
+    --sidebar-accent: #202024;
+    --sidebar-accent-foreground: #ffffff;
+    --sidebar-border: #26262b;
 
-    --subtle-foreground: #c7cad1;
-    --link: #9fb1fa;
-    --primary-soft: #1d2442;
+    --subtle-foreground: #c8c8d0;
+    --link: #f5b453;
+    --primary-soft: #2c200d;
     --status-ready: #5fd197;
     --status-ready-soft: #15301f;
     --status-doing: #86a8f6;
@@ -114,8 +114,8 @@
     --error: #f7b4a2;
     --error-soft: #34170f;
     --error-border: #5b2618;
-    --shadow-raise: 0 1px 2px rgb(0 0 0 / 0.3);
-    --shadow-overlay: 0 16px 48px rgb(0 0 0 / 0.6);
+    --shadow-raise: 0 0 0 0 transparent;
+    --shadow-overlay: 0 12px 32px rgb(0 0 0 / 0.6);
   }
 }
 
@@ -187,18 +187,24 @@
   /* The type scale: 11 badge, 12 caption, 13 meta, 14 body, 16 heading, 20 title, 28 display. */
   --text-2xs: 11px;
   --text-2xs--line-height: 1.4;
-  --text-meta: 13px;
+  --text-meta: 12px;
   --text-meta--line-height: 1.45;
-  --text-title: 20px;
+  --text-title: 16px;
   --text-title--line-height: 1.3;
-  --text-display: 28px;
-  --text-display--line-height: 1.2;
-  --text-display-phone: 24px;
+  --text-display: 18px;
+  --text-display--line-height: 1.3;
+  --text-display-phone: 18px;
   --text-display-phone--line-height: 1.2;
 
   /* Phone below md (720px); the sidebar layout from lg (900px). */
   --breakpoint-md: 45rem;
   --breakpoint-lg: 56.25rem;
+  --text-sm: 12.5px;
+  --text-sm--line-height: 1.5;
+  --text-xs: 11px;
+  --text-xs--line-height: 1.45;
+  --text-base: 14px;
+  --text-base--line-height: 1.45;
 }
 
 @layer base {
@@ -212,15 +218,14 @@
 
   body {
     @apply bg-background font-sans text-sm text-foreground antialiased;
-    letter-spacing: -0.006em;
     font-optical-sizing: auto;
-    font-feature-settings: "kern", "calt", "cv05";
+    font-feature-settings: "kern", "calt", "cv05", "tnum";
     overflow-wrap: break-word;
   }
 
   @media (max-width: 45rem) {
     body {
-      font-size: 15px;
+      font-size: 14px;
     }
   }
 

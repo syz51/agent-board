@@ -84,11 +84,11 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
-      <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
-        <Icon name={icon} className="size-5" />
+    <div className="grid justify-items-center gap-1 rounded-md border bg-card px-6 py-10 text-center text-muted-foreground">
+      <span className="mb-1 grid size-8 place-items-center rounded-md border bg-muted text-subtle-foreground">
+        <Icon name={icon} className="size-4" />
       </span>
-      <p className="text-base font-semibold text-foreground">{title}</p>
+      <p className="text-sm font-semibold text-foreground">{title}</p>
       {children && <p className="max-w-[48ch]">{children}</p>}
     </div>
   );
@@ -306,15 +306,15 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
-      <div className="grid min-w-0 gap-1.5">
+    <header className="mb-4 flex flex-wrap items-start justify-between gap-x-4 gap-y-2 border-b pb-3">
+      <div className="grid min-w-0 gap-1">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <h1 className="text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+          <h1 className="text-display font-semibold text-balance max-md:text-display-phone">
             {title}
           </h1>
           {children}
         </div>
-        {sub && <p className="max-w-[68ch] text-sm text-muted-foreground">{sub}</p>}
+        {sub && <p className="max-w-[96ch] text-meta text-muted-foreground">{sub}</p>}
       </div>
       {aside}
     </header>
@@ -325,7 +325,7 @@ export function PageHeader({
 export function Crumbs({ children, current }: { children: ReactNode; current: ReactNode }) {
   return (
     <nav
-      className="mb-3 flex flex-wrap items-center gap-1.5 text-meta text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
+      className="mb-2 flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
       aria-label="Breadcrumb"
     >
       {children}
@@ -352,12 +352,12 @@ export function SectionTitle({
   return (
     <h2
       id={id}
-      className="mb-3 flex items-baseline gap-2 text-base font-semibold tracking-[-0.011em]"
+      className="mb-2 flex items-center gap-2 text-xs font-semibold tracking-[0.06em] text-subtle-foreground uppercase"
     >
       {icon}
       {children}
       {count !== undefined && (
-        <span className="text-meta font-medium tracking-normal text-muted-foreground tabular-nums">
+        <span className="font-mono font-medium tracking-normal text-muted-foreground tabular-nums">
           {count}
         </span>
       )}
@@ -367,7 +367,7 @@ export function SectionTitle({
 
 /** A bordered list of rows on a card surface. */
 export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+  "bg-card divide-y overflow-hidden rounded-md border [&>li]:border-border [&>li:nth-child(even)]:bg-muted/60";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {

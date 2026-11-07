@@ -116,7 +116,23 @@ export function BoardScreen() {
       <Crumbs current={board?.title ?? slug}>
         <Link to="/">Boards</Link>
       </Crumbs>
-      <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
+      <PageHeader
+        title={board?.title ?? slug}
+        sub={
+          (board?.goal || board?.temporary) && (
+            // The temporary note sits with the goal, above the header's rule.
+            <>
+              {board.goal && <PlainText className="block" text={board.goal} />}
+              {board.temporary && (
+                <span className="block">
+                  Temporary: the server closes this board once it is idle, and deletes it some time
+                  after that.
+                </span>
+              )}
+            </>
+          )
+        }
+      >
         {board && board.title !== slug && (
           <span className="ident text-meta text-muted-foreground">{slug}</span>
         )}
@@ -132,12 +148,6 @@ export function BoardScreen() {
           </Badge>
         )}
       </PageHeader>
-      {board?.temporary && (
-        <p className="-mt-3 mb-5 text-meta text-muted-foreground">
-          Temporary: the server closes this board once it is idle, and deletes it some time after
-          that.
-        </p>
-      )}
 
       {/* No filters on a board without tasks; disabled until its tasks have loaded. */}
       {(filtered || tasks.data === undefined || tasks.data.length > 0) && (
@@ -233,10 +243,24 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-/** The frame around task groups: one card, groups divided by rules. */
+/** The task table's columns, shared by its head and every group's rows. */
+const TASK_COLUMNS = "md:grid-cols-[52px_32px_104px_minmax(0,1fr)_148px_92px]";
+
+/** The frame around task groups: one gridded table under a row of column heads. */
 export function TaskBoard({ children }: { children: ReactNode }) {
   return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+    <div className="divide-y overflow-hidden rounded-md border bg-card">
+      <div
+        className={`hidden h-7 items-stretch bg-muted text-2xs font-semibold tracking-[0.06em] text-muted-foreground uppercase md:grid ${TASK_COLUMNS} [&>span]:flex [&>span]:items-center [&>span]:border-r [&>span]:px-2.5 [&>span:last-child]:justify-end [&>span:last-child]:border-r-0`}
+        aria-hidden="true"
+      >
+        <span>Pri</span>
+        <span />
+        <span>Id</span>
+        <span>Title</span>
+        <span>Owner</span>
+        <span>Updated</span>
+      </div>
       {children}
     </div>
   );
@@ -261,10 +285,12 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+        className="flex h-7 items-center gap-2 border-b bg-secondary px-2.5 text-xs font-semibold tracking-[0.06em] uppercase"
       >
         {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        <span className="font-mono font-medium tracking-normal text-muted-foreground tabular-nums">
+          {count}
+        </span>
       </Heading>
       {children}
     </section>
@@ -314,15 +340,15 @@ const columns = column.columns([
 
 // Desktop rows share the list's columns (subgrid), so the id column fits the longest id.
 // On a phone a row stacks: status and title, then id, priority, owner and update.
+const GRID_CELL = "md:flex md:items-center md:self-stretch md:border-r md:px-2.5 md:py-1";
 const CELL_CLASS: Record<string, string> = {
-  priority: "max-md:[grid-area:prio] max-md:self-center",
-  status: "max-md:[grid-area:status] max-md:mt-0.75",
-  id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center",
-  main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
-  owner:
-    "min-w-0 overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
+  priority: `${GRID_CELL} max-md:[grid-area:prio] max-md:self-center`,
+  status: `${GRID_CELL} md:justify-center max-md:[grid-area:status] max-md:mt-0.75`,
+  id: `${GRID_CELL} ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center`,
+  main: `${GRID_CELL} flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]`,
+  owner: `${GRID_CELL} min-w-0 overflow-hidden text-meta max-md:[grid-area:owner] max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden`,
   updated:
-    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+    "md:flex md:items-center md:justify-end md:self-stretch md:px-2.5 md:py-1 font-mono text-xs text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
 };
 
 export function TaskList({
@@ -342,11 +368,11 @@ export function TaskList({
   );
   const table = useTable({ features, columns, data, getRowId: (row) => row.task.id });
   return (
-    <ul className="grid grid-cols-[54px_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_88px] gap-x-3 divide-y max-md:block">
+    <ul className={`grid ${TASK_COLUMNS} divide-y max-md:block`}>
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-8 grid-cols-subgrid items-center even:bg-muted/60 hover:bg-primary-soft max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-2.5 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>
@@ -371,7 +397,7 @@ function TaskMain({ task, done, now }: TaskRowData) {
     <>
       {/* The whole row opens the task; tags and blocker links sit above the link's cover. */}
       <Link
-        className="min-w-0 py-0.5 font-medium text-foreground after:absolute after:inset-0"
+        className="min-w-0 py-0.5 text-foreground after:absolute after:inset-0"
         to="/tasks/$id"
         params={{ id: task.id }}
       >

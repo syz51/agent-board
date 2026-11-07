@@ -178,19 +178,23 @@ const AREA: Record<string, string> = {
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
   asks: "[grid-area:asks]",
-  autopilot: "[grid-area:auto]",
+  autopilot: "[grid-area:pilot]",
 };
 
+/** Wide rows are a gridded table: every cell ruled off from the next. */
+const GRID_CELL =
+  "@min-[760px]:self-stretch @min-[760px]:border-r @min-[760px]:px-3 @min-[760px]:py-2 @min-[760px]:content-center";
 const CELL_CLASS: Record<string, string> = {
-  name: "grid min-w-0 gap-0.5",
-  tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
-  asks: "",
-  autopilot: "flex flex-col items-end @min-[760px]:items-start",
+  name: `grid min-w-0 gap-0.5 ${GRID_CELL}`,
+  tasks: `grid min-w-0 gap-2 @min-[760px]:gap-1.5 ${GRID_CELL}`,
+  coordinator: `text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 ${GRID_CELL}`,
+  asks: `@min-[760px]:flex @min-[760px]:justify-end ${GRID_CELL}`,
+  autopilot:
+    "flex flex-col items-end @min-[760px]:items-start @min-[760px]:justify-center @min-[760px]:self-stretch @min-[760px]:px-3",
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_200px_240px_64px_100px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-0";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -210,7 +214,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
   });
   return (
     <section
-      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
+      className="@container overflow-hidden rounded-md border bg-card"
       aria-label="All boards"
     >
       {table.getHeaderGroups().map((group) => (
@@ -218,7 +222,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
           key={group.id}
           className={cn(
             ROW_GRID,
-            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
+            "hidden h-7 items-stretch border-b bg-muted text-2xs font-semibold tracking-[0.06em] text-muted-foreground uppercase @min-[760px]:grid [&>span]:flex [&>span]:items-center [&>span]:border-r [&>span]:px-3 [&>span:last-child]:border-r-0 [&>span:nth-child(4)]:justify-end",
           )}
           aria-hidden="true"
         >
@@ -235,7 +239,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
+              "items-center px-4 py-3.5 even:bg-muted/60 @min-[760px]:min-h-12 @min-[760px]:p-0 @min-[760px]:hover:bg-primary-soft",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -254,7 +258,7 @@ function BoardName({ board }: { board: Board }) {
   return (
     <>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
+        <h2 className="min-w-0 text-sm font-semibold">
           <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
             {board.title}
           </Link>
@@ -352,7 +356,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
+      <span className="hidden font-mono text-meta text-muted-foreground @min-[760px]:inline">
         <span aria-hidden="true">–</span>
         <span className="sr-only">No asks</span>
       </span>
@@ -360,7 +364,7 @@ function BoardAsks({ board }: { board: Board }) {
   }
   return (
     <Link
-      className="inline-flex min-h-7 items-center gap-1.25 text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
+      className="inline-flex min-h-7 items-center gap-1.25 font-mono text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
       to="/asks"
       search={{ board: board.slug }}
     >

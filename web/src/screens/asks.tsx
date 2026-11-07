@@ -165,7 +165,7 @@ export function AsksScreen() {
           return (
             <>
               {shown.length > 0 && (
-                <div className="grid gap-4">
+                <div className="grid gap-2.5">
                   {shown.map((ask) => (
                     <AskCard key={ask.id} ask={ask} agents={agents} />
                   ))}
@@ -219,7 +219,7 @@ function WaitingTasks({
 }) {
   const count = groups.reduce((sum, group) => sum + group.tasks.length, 0);
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby="needs-you-tasks">
+    <section className={first ? undefined : "mt-6"} aria-labelledby="needs-you-tasks">
       <SectionTitle
         id="needs-you-tasks"
         count={count}
@@ -231,7 +231,7 @@ function WaitingTasks({
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
       {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
+      <div className="rounded-md border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
             <TaskGroupSection
@@ -274,11 +274,7 @@ export function AskScreen() {
       </Crumbs>
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
-          {(data) => (
-            <div className="max-w-[720px]">
-              <AskCard ask={data} agents={agents} standalone />
-            </div>
-          )}
+          {(data) => <AskCard ask={data} agents={agents} standalone />}
         </QueryFrame>
       ) : (
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
@@ -300,13 +296,12 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
-        "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
+        "grid gap-3 rounded-md border border-l-3 bg-card px-4 pt-3 pb-3.5",
         ask.status !== "open"
-          ? "before:bg-input"
+          ? "border-l-input"
           : ask.kind === "action"
-            ? "before:bg-amber"
-            : "before:bg-status-review",
+            ? "border-l-amber"
+            : "border-l-status-review",
       )}
       data-status={ask.status}
     >
@@ -341,7 +336,7 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="text-base leading-[1.55] text-foreground">
+      <div className="max-w-[96ch] text-sm leading-[1.55] text-foreground">
         <Markdown text={ask.question} />
       </div>
       {ask.status === "open" && <AnswerForm ask={ask} />}

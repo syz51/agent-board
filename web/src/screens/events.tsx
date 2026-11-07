@@ -48,7 +48,7 @@ export function EventsScreen() {
     <>
       <PageHeader title="Events" sub="Everything agents and you did, live as it happens." />
       <form
-        className="mb-5 flex flex-wrap items-center gap-2"
+        className="mb-4 flex flex-wrap items-center gap-2"
         onSubmit={(event) => event.preventDefault()}
       >
         <FilterSelect label="Board" value={board} onChange={setBoard}>
@@ -103,11 +103,11 @@ export function EventsScreen() {
   );
 }
 
-/** A vertical timeline of events, joined by a rule through their icons. */
+/** A log of events: one ruled, striped table row per event. */
 export function Timeline({ live, children }: { live?: boolean; children: React.ReactNode }) {
   return (
     <ol
-      className="relative before:absolute before:top-3.5 before:bottom-3.5 before:left-[13px] before:w-px before:bg-border"
+      className="divide-y overflow-hidden rounded-md border bg-card"
       {...(live ? { "aria-live": "polite" as const, "aria-relevant": "additions" as const } : {})}
     >
       {children}
@@ -185,7 +185,7 @@ export function EventMark({ event, className }: { event: BoardEvent; className?:
   return (
     <span
       className={cn(
-        "grid size-6 flex-none place-items-center rounded-full border bg-card",
+        "grid size-5 flex-none place-items-center rounded-sm border bg-card",
         mark.tone,
         className,
       )}
@@ -214,11 +214,11 @@ export function EventLine({
   const kind = event.type.split("_")[0] ?? "";
   return (
     <li
-      className="relative grid grid-cols-[28px_minmax(0,1fr)_auto] items-start gap-x-3 py-1.75 max-[520px]:grid-cols-[28px_minmax(0,1fr)]"
+      className="grid grid-cols-[20px_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-1.5 even:bg-muted/60 max-[520px]:grid-cols-[20px_minmax(0,1fr)]"
       data-kind={kind}
     >
-      <EventMark event={event} className="m-0.5" />
-      <div className="grid min-w-0 gap-0.5 pt-1">
+      <EventMark event={event} className="mt-px" />
+      <div className="grid min-w-0 gap-0.5 pt-0.5">
         <p className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-foreground">
           <Who id={event.actor} agents={agents} />
           <span title={event.type}>{verb}</span>
@@ -238,9 +238,9 @@ export function EventLine({
           <p className="text-meta [overflow-wrap:anywhere] text-muted-foreground">{summary}</p>
         )}
       </div>
-      <span className="inline-flex gap-2 pt-1.25 text-meta whitespace-nowrap text-muted-foreground tabular-nums max-[520px]:col-start-2 max-[520px]:pt-0">
+      <span className="inline-flex gap-2 pt-0.75 font-mono text-xs whitespace-nowrap text-muted-foreground tabular-nums max-[520px]:col-start-2 max-[520px]:pt-0">
         <RelTime at={event.at} />
-        <span className="min-w-[4ch] pt-px text-right text-xs [font-variant-numeric:tabular-nums_slashed-zero]">
+        <span className="min-w-[5ch] text-right [font-variant-numeric:tabular-nums_slashed-zero]">
           #{event.seq}
         </span>
       </span>
