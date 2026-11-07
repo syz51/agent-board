@@ -223,14 +223,14 @@ function TaskRow(
               ))}
             </span>
           )}
+          {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
+          {!task.auto && <span class="chip">manual</span>}
           {waitsUntil && (
             <span class="chip">
               waits until <AbsTime at={waitsUntil} />
             </span>
           )}
         </div>
-        {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
-        {!task.auto && <span class="chip task-auto">manual</span>}
         <span class="task-owner"><Owner task={task} agents={agents} /></span>
         <span class="task-updated muted">
           updated <RelTime at={task.updated_at} />
