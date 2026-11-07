@@ -3,7 +3,8 @@
 //! It follows the server's event stream and, on this device:
 //! - starts a coordinator thread for each autopilot board that lists this device in
 //!   `home_devices` and has no live coordinator (claim the lease as the device, start a T3
-//!   thread with `prompts/coordinator.md`, claim again as the thread's agent);
+//!   thread with `prompts/coordinator.md`, plus `prompts/triage.md` on the device's feedback
+//!   board, claim again as the thread's agent);
 //! - renews the coordinator lease while the thread is live;
 //! - wakes the coordinator when a task becomes ready, a blocker clears or an ask is
 //!   answered, and wakes a worker whose ask was answered;
@@ -39,6 +40,8 @@ use crate::t3::{T3, T3Cli};
 
 /// The coordinator's standing instructions.
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
+/// The feedback board coordinator's triage instructions, after [`COORDINATOR_PROMPT`].
+pub const TRIAGE_PROMPT: &str = include_str!("../../../prompts/triage.md");
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
@@ -420,7 +423,7 @@ impl<T: T3> Daemon<T> {
                 device: self.ctx.device.clone(),
                 role: AgentRole::Coordinator,
                 title: Some(coordinator_title(slug)),
-                repo: Some(repo),
+                repo,
                 branch: None,
                 cwd: Some(project.display().to_string()),
                 native_ids: [("t3_thread".to_owned(), local.thread.clone())].into(),
@@ -453,15 +456,30 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// The local T3 project folder for one of the board's repos.
-    fn project_for(&self, board: &Board) -> Option<(String, PathBuf)> {
-        board.repos.iter().find_map(|repo| {
-            self.ctx
-                .config
-                .projects
-                .get(repo)
-                .map(|path| (repo.clone(), path.clone()))
-        })
+    /// The local T3 project folder for one of the board's repos, with that repo; else the
+    /// folder `[board_projects]` names for the board, without a repo.
+    fn project_for(&self, board: &Board) -> Option<(Option<String>, PathBuf)> {
+        let config = &self.ctx.config;
+        board
+            .repos
+            .iter()
+            .find_map(|repo| {
+                config
+                    .projects
+                    .get(repo)
+                    .map(|path| (Some(repo.clone()), path.clone()))
+            })
+            .or_else(|| {
+                config
+                    .board_projects
+                    .get(&board.slug)
+                    .map(|path| (None, path.clone()))
+            })
+    }
+
+    /// Whether `slug` is this device's feedback board, whose coordinator also triages.
+    fn triages(&self, slug: &BoardSlug) -> bool {
+        *slug == self.ctx.config.feedback_board()
     }
 
     async fn start_coordinator(&mut self, board: &Board, now: Timestamp) -> Result<()> {
@@ -521,7 +539,7 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<String> {
         let title = coordinator_title(slug);
-        let message = coordinator_message(slug);
+        let message = coordinator_message(slug, self.triages(slug));
         if let Some(&since) = self.state.pending_starts.get(slug) {
             let found = self
                 .t3
@@ -625,7 +643,10 @@ impl<T: T3> Daemon<T> {
         };
         if let Err(err) = self
             .t3
-            .send(&adoption.thread, &adoption_message(slug))
+            .send(
+                &adoption.thread,
+                &adoption_message(slug, self.triages(slug)),
+            )
             .await
         {
             self.release(slug).await;
@@ -887,8 +908,15 @@ fn is_transient(err: &anyhow::Error) -> bool {
 }
 
 fn no_project(board: &Board) -> String {
+    if board.repos.is_empty() {
+        return format!(
+            "no T3 project for board {} on this device: add it under [board_projects] in config.toml",
+            board.slug
+        );
+    }
     format!(
-        "no T3 project for {} on this device: add it under [projects] in config.toml",
+        "no T3 project for {} on this device: add it under [projects] (or the board under \
+         [board_projects]) in config.toml",
         board.repos.join(", ")
     )
 }
@@ -917,17 +945,28 @@ pub fn coordinator_title(slug: &BoardSlug) -> String {
     format!("{slug} coordinator")
 }
 
-/// The first message of a coordinator thread.
-pub fn coordinator_message(slug: &BoardSlug) -> String {
-    format!(
-        "{COORDINATOR_PROMPT}\nYou are the coordinator of board {slug}. Start now: call board_snapshot."
-    )
+/// The coordinator's standing instructions: [`COORDINATOR_PROMPT`], followed by
+/// [`TRIAGE_PROMPT`] when the board is the feedback board.
+fn standing_prompt(triage: bool) -> String {
+    if triage {
+        format!("{COORDINATOR_PROMPT}\n{TRIAGE_PROMPT}")
+    } else {
+        COORDINATOR_PROMPT.to_owned()
+    }
 }
 
-/// The message that briefs an existing thread adopted as a board's coordinator.
-pub fn adoption_message(slug: &BoardSlug) -> String {
+/// The first message of a coordinator thread; `triage` for the device's feedback board.
+pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
+    format!("{prompt}\nYou are the coordinator of board {slug}. Start now: call board_snapshot.")
+}
+
+/// The message that briefs an existing thread adopted as a board's coordinator; `triage`
+/// for the device's feedback board.
+pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
     format!(
-        "{COORDINATOR_PROMPT}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready or an ask is answered. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
+        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready or an ask is answered. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
     )
 }
 
