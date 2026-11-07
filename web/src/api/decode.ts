@@ -65,6 +65,19 @@ export function oneOf<const T extends readonly string[]>(...values: T): Decoder<
   };
 }
 
+/**
+ * Like `oneOf`, for enums that may grow within `/v1` (docs/API.md, "Compatibility"): a value
+ * this view does not know reads as `"unknown"` instead of failing the whole response.
+ */
+export function oneOfOrUnknown<const T extends readonly string[]>(
+  ...values: T
+): Decoder<T[number] | "unknown"> {
+  return (value, path) => {
+    const text = string(value, path);
+    return values.includes(text) ? (text as T[number]) : "unknown";
+  };
+}
+
 /** `Option<T>` on the Rust side: `null`, or absent when the server skips it. */
 export function nullable<T>(decode: Decoder<T>): Decoder<T | null> {
   return (value, path) => (value === null || value === undefined ? null : decode(value, path));

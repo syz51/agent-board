@@ -86,8 +86,8 @@ project on that device. `board watch` finds the project in the device's
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
-task on the owner's board, forwards it to the setup's own channel, or declines it with a
-reason (`prompts/triage.md`). To give it one, pick a home device and a T3 project folder on
+task on the owner's board, forwards it to the setup's own channel, declines it with a
+reason, or marks it fixed when the cause is already gone (`prompts/triage.md`). To give it one, pick a home device and a T3 project folder on
 it (for example the folder holding your `setups.toml`, the registry of setups and their
 owning boards), then:
 

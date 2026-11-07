@@ -370,6 +370,80 @@ async fn resolve_is_for_the_owner_or_the_user() {
 }
 
 #[tokio::test]
+async fn a_fixed_item_names_the_fix_and_a_later_report_recurs_it() {
+    let t = setup().await;
+    let text = json!({ "about": "tools", "text": "The example tool is missing from PATH" });
+    let item = report(&t, A, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(A, &item).await.0.is_success());
+    let path = format!("/v1/feedback/{item}/resolve");
+
+    // A reason is required, a task refused, and an unknown kind refused; each says what to send.
+    let (code, err, v) = t
+        .fail("POST", &path, Some(A), Some(json!({ "kind": "fixed" })))
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid"));
+    assert!(v["next"].as_str().unwrap().contains("what changed"), "{v}");
+    let (code, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(A),
+            Some(json!({ "kind": "fixed", "reason": "  " })),
+        )
+        .await;
+    assert_eq!(code, 400, "{v}");
+    let (code, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(A),
+            Some(json!({ "kind": "fixed", "reason": "x", "task": item })),
+        )
+        .await;
+    assert_eq!(code, 400);
+    assert!(v["next"].as_str().unwrap().contains("routed"), "{v}");
+    let (code, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(A),
+            Some(json!({ "kind": "mended", "reason": "x" })),
+        )
+        .await;
+    assert_eq!(code, 400);
+    assert!(v["next"].as_str().unwrap().contains("fixed"), "{v}");
+
+    let fix = "config.toml:12 now adds the tool's folder to PATH";
+    let (s, done) = resolve(
+        &t,
+        Some(A),
+        &item,
+        json!({ "kind": "fixed", "reason": fix }),
+    )
+    .await;
+    assert_eq!(s, 200, "{done}");
+    assert_eq!(done["status"], "done");
+    let resolution = &done["feedback"]["resolution"];
+    assert_eq!(resolution["kind"], "fixed");
+    assert_eq!(resolution["reason"], fix);
+    assert!(resolution.get("task").is_none());
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    assert_eq!(
+        detail["evidence"][0]["value"],
+        format!("feedback fixed: {fix}")
+    );
+
+    // Not live: the same report files a new item that recurs the fixed one.
+    let again = report(&t, B, text).await;
+    assert_eq!(again["duplicate"], false);
+    assert_ne!(again["task"]["id"], item.as_str());
+    assert_eq!(again["task"]["feedback"]["recurs"], item.as_str());
+}
+
+#[tokio::test]
 async fn a_plain_task_on_the_feedback_board_resolves_as_an_item() {
     let t = setup().await;
     t.board("factory", &[]).await;
@@ -586,21 +660,28 @@ async fn stats_count_feedback() {
         .unwrap()
         .to_owned();
     report(&t, B, json!({ "about": "board", "text": "One" })).await;
-    report(&t, B, json!({ "about": "board", "text": "Two" })).await;
-    let (s, _) = t
-        .as_user(
-            "POST",
-            &format!("/v1/feedback/{item}/resolve"),
-            Some(json!({ "kind": "declined", "reason": "no" })),
-        )
-        .await;
-    assert_eq!(s.as_u16(), 200);
+    let two = report(&t, B, json!({ "about": "board", "text": "Two" })).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (id, body) in [
+        (&item, json!({ "kind": "declined", "reason": "no" })),
+        (
+            &two,
+            json!({ "kind": "fixed", "reason": "raised the limit" }),
+        ),
+    ] {
+        let (s, _) = t
+            .as_user("POST", &format!("/v1/feedback/{id}/resolve"), Some(body))
+            .await;
+        assert_eq!(s.as_u16(), 200);
+    }
     let stats = t.ok("GET", "/v1/stats", None, None).await;
     assert_eq!(
         stats["feedback"],
         json!({
             "reported": 3, "filed": 2,
-            "resolved": { "routed": 0, "duplicate": 0, "forwarded": 0, "declined": 1 },
+            "resolved": { "routed": 0, "duplicate": 0, "forwarded": 0, "declined": 1, "fixed": 1 },
         })
     );
     assert_eq!(
