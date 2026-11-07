@@ -428,6 +428,8 @@ pub struct TaskChanges {
     pub auto: Option<bool>,
     /// `Some(None)` clears it.
     pub not_before: Option<Option<Timestamp>>,
+    /// Hand the task to this agent.
+    pub owner: Option<AgentId>,
 }
 
 /// Reads the task's version, then applies the changes.
@@ -449,6 +451,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 blocked_reason: changes.blocked_reason,
                 auto: changes.auto,
                 not_before: changes.not_before,
+                owner: changes.owner,
             },
         )
         .await?;

@@ -1265,3 +1265,199 @@ async fn a_blocker_on_another_board_holds_the_task_until_it_is_done() {
         "{text}"
     );
 }
+
+/// PATCHes `task` with `body` as `agent`, through the user token when `user`.
+async fn patch_as(t: &T, agent: &str, user: bool, task: &str, mut body: Value) -> (u16, Value) {
+    body["agent"] = json!(agent);
+    body["version"] = t.get_task(task).await["version"].clone();
+    let path = format!("/v1/tasks/{task}");
+    let (s, v) = if user {
+        let bearer = format!("Bearer {}", t.user_token);
+        t.send(
+            "PATCH",
+            &path,
+            &[("authorization", bearer.as_str()), ("x-board-agent", agent)],
+            Some(body),
+        )
+        .await
+    } else {
+        t.call("PATCH", &path, Some(agent), Some(body)).await
+    };
+    (s.as_u16(), v)
+}
+
+#[tokio::test]
+async fn an_owner_hands_a_task_to_the_agent_that_finishes_it() {
+    let t = setup().await;
+    let id = task_in(&t, TaskStatus::Doing).await;
+
+    let (s, v) = patch_as(&t, A, false, &id, json!({ "owner": B })).await;
+    assert_eq!(
+        (s, v["owner"].as_str(), v["status"].as_str()),
+        (200, Some(B), Some("doing")),
+        "{v}"
+    );
+    let (kind, payload) = events_of(&t, &id).await.pop().unwrap();
+    assert_eq!(kind, "task_updated");
+    assert_eq!(
+        payload,
+        json!({ "fields": ["owner"], "owner": B, "previous_owner": A })
+    );
+
+    // The old owner can no longer finish it; the new one can.
+    assert_eq!(t.done(A, &id, check(0)).await.0.as_u16(), 403);
+    let (s, v) = t.done(B, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+
+    // Handing over to the owner it already has changes nothing.
+    let review = task_in(&t, TaskStatus::Review).await;
+    let version = t.get_task(&review).await["version"].clone();
+    let (s, v) = patch_as(&t, A, false, &review, json!({ "owner": A })).await;
+    assert_eq!((s, &v["version"]), (200, &version), "{v}");
+
+    // A task in doing counts against the new owner's doing limit; review does not.
+    let busy = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = patch_as(&t, A, false, &busy, json!({ "owner": B })).await;
+    assert_eq!(s, 200, "{v}");
+    let second = t.task(A, "factory", "Another job").await;
+    assert!(t.claim(A, &second).await.0.is_success());
+    let (s, v) = patch_as(&t, A, false, &second, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&busy), "{v}");
+    let (s, v) = patch_as(&t, A, false, &review, json!({ "owner": B })).await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(B)), "{v}");
+
+    // Resuming a blocked task can name the agent that will work on it.
+    assert_eq!(
+        patch_as(&t, A, false, &second, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+    let blocked = task_in(&t, TaskStatus::Blocked).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &blocked,
+        json!({ "status": "doing", "owner": B }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(t.done(B, &busy, check(0)).await.0.is_success());
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &blocked,
+        json!({ "status": "doing", "owner": B }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["owner"].as_str(), v["status"].as_str()),
+        (200, Some(B), Some("doing")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn only_the_owner_coordinator_or_user_hand_a_task_over() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+    t.register(C, Some(REPO), None).await;
+    t.register(U, None, None).await;
+    let id = task_in(&t, TaskStatus::Review).await;
+
+    // Another agent may neither give itself A's task nor take it from a live owner.
+    let (s, v) = patch_as(&t, B, false, &id, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(v["message"].as_str().unwrap().contains(A), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("task_note"), "{v}");
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{id}/take"),
+            Some(B),
+            Some(json!({ "agent": B })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    // Before the coordinator is named, C is just another agent.
+    assert_eq!(
+        patch_as(&t, C, false, &id, json!({ "owner": C })).await.0,
+        403
+    );
+    assert_eq!(t.get_task(&id).await["owner"], A);
+
+    // The board's coordinator takes back a task its child left, keeping its status.
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(C),
+        Some(json!({ "device": "mac", "agent": C })),
+    )
+    .await;
+    let (s, v) = patch_as(&t, C, false, &id, json!({ "owner": C })).await;
+    assert_eq!(
+        (s, v["owner"].as_str(), v["status"].as_str()),
+        (200, Some(C), Some("review")),
+        "{v}"
+    );
+    assert!(t.done(C, &id, check(0)).await.0.is_success());
+
+    // The user may hand any owned task over.
+    let doing = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = patch_as(&t, U, true, &doing, json!({ "owner": B })).await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(B)), "{v}");
+
+    // Only to a registered agent, and not for open or closed tasks.
+    let (s, v) = patch_as(&t, B, false, &doing, json!({ "owner": "t3:nobody" })).await;
+    assert_eq!((s, v["code"].as_str()), (404, Some("not_found")), "{v}");
+    let open = task_in(&t, TaskStatus::Open).await;
+    let (s, v) = patch_as(&t, C, false, &open, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("task_claim"), "{v}");
+    let (s, v) = patch_as(&t, B, false, &open, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    let (s, v) = patch_as(
+        &t,
+        C,
+        false,
+        &doing,
+        json!({ "status": "open", "owner": C }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    let (s, v) = patch_as(&t, C, false, &id, json!({ "owner": B })).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&doing).await["owner"], B);
+}
+
+#[tokio::test]
+async fn a_handover_from_a_stale_owner_says_to_take_it_first() {
+    let t = setup().await;
+    let id = task_in(&t, TaskStatus::Review).await;
+    t.advance(stale_after() + TimeDelta::minutes(1));
+    t.register(B, Some(REPO), Some("main")).await;
+    let (s, v) = patch_as(&t, B, false, &id, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("task_take"), "{v}");
+}

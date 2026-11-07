@@ -690,6 +690,69 @@ fn require_status_rights(
     require_owner(task, agent, action)
 }
 
+/// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, the board's
+/// coordinator or the user, while the task stays owned and not closed; `target` must be
+/// registered.
+fn check_handover(
+    cx: &Ctx<'_>,
+    task: &Task,
+    agent: &AgentId,
+    by_user: bool,
+    target: &AgentId,
+    to: TaskStatus,
+) -> Result<()> {
+    let id = &task.id;
+    let allowed = by_user
+        || task.owner.as_ref() == Some(agent)
+        || get_board(cx, &task.board)?.coordinator.as_ref() == Some(agent);
+    if !allowed {
+        return Err(match &task.owner {
+            Some(owner) => forbidden(
+                format!(
+                    "only the owner {owner}, the board's coordinator or the user may hand {id} over"
+                ),
+                if task.owner_stale {
+                    format!(
+                        "the owner is stale: take it first with task_take {id}, then hand it over"
+                    )
+                } else {
+                    format!("ask the owner in a note (task_note {id})")
+                },
+            ),
+            None => forbidden(
+                format!(
+                    "nobody owns {id}; only the board's coordinator or the user may give it to an agent"
+                ),
+                format!("claim it yourself with task_claim {id}"),
+            ),
+        });
+    }
+    if to == TaskStatus::Open {
+        return Err(invalid(
+            format!("an open task has no owner, so {id} cannot be handed over"),
+            format!("claim it first (task_claim {id}), then hand it over with owner"),
+        ));
+    }
+    if to.is_closed() {
+        return Err(bad_transition(
+            format!("{id} is {}, so it cannot be handed over", status_str(to)),
+            format!("reopen it first (task_update {id} status=open)"),
+        ));
+    }
+    let registered: bool = cx.db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+        [target.as_str()],
+        |r| r.get(0),
+    )?;
+    if !registered {
+        return Err(not_found(
+            format!("agent {target} is not registered"),
+            "hand it to an agent that has started a session: its id shows among the peers in board_snapshot",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn release(
     cx: &mut Ctx<'_>,
     id: &TaskId,
@@ -740,6 +803,14 @@ pub(crate) fn update(
     let to = req.status.unwrap_or(from);
     let mut owner = task.owner.clone();
     let mut fields: Vec<&str> = Vec::new();
+    // A handover to another agent than the owner: checked before anything else changes.
+    let handover = req
+        .owner
+        .as_ref()
+        .filter(|t| task.owner.as_ref() != Some(*t));
+    if let Some(target) = handover {
+        check_handover(cx, &task, agent, by_user, target, to)?;
+    }
 
     if to != from {
         if !transition_allowed(from, to) {
@@ -768,13 +839,21 @@ pub(crate) fn update(
             // Open means unowned, whatever it was before.
             TaskStatus::Open => owner = None,
             // Whoever moves a task to doing works on it, as with claim and take.
+            // Unless it names the agent that will.
             TaskStatus::Doing => {
-                check_doing_limit(cx, agent, id)?;
-                owner = Some(agent.clone());
+                let worker = req.owner.as_ref().unwrap_or(agent);
+                check_doing_limit(cx, worker, id)?;
+                owner = Some(worker.clone());
             }
             _ => {}
         }
         fields.push("status");
+    }
+    if let Some(target) = handover.filter(|t| owner.as_ref() != Some(*t)) {
+        if to == TaskStatus::Doing {
+            check_doing_limit(cx, target, id)?;
+        }
+        owner = Some(target.clone());
     }
     if owner != task.owner {
         fields.push("owner");
