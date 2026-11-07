@@ -1,13 +1,13 @@
 # Design 4: Console
 
 A dense operator console in the spirit of terminal dashboards and admin tools: a dark
-command bar, gridded tables with column heads and zebra rows, small type with mono data,
-graphite surfaces and one amber accent.
+command bar, gridded tables with column heads and zebra rows, small type with mono ids,
+graphite surfaces, blue links and amber kept for what needs attention.
 
 ## Key choices
 
 - **Layout**: one dark command bar across the top with the product mark, the sections
-  inline (the current one underlined in amber) and the connection state in mono capitals.
+  inline (the current one underlined in amber) and the connection state at the right.
   The page uses the full width. Phones keep the bottom tabs.
 - **Board as a table**: one ruled table under a row of column heads (priority, status,
   id, title, owner, updated). Each status group is a shaded band with its count; rows
@@ -20,13 +20,13 @@ graphite surfaces and one amber accent.
   below.
 - **Agents**: one table, a row per agent: who and their state, what they work on with
   the handoff, and where they run.
-- **Events**: a striped log, one row per event, with time and sequence number in mono at
-  the right.
+- **Events**: a striped log, one row per event, with time and sequence number at the
+  right.
 - **Asks**: square cards with a coloured left edge (amber for actions, violet for
   decisions); the single ask uses the full width.
-- **Type and colour**: Inter at 12.5px with tabular figures, mono for ids, times and
-  counts; 4px corners, no shadows; graphite neutrals and amber for links, the primary
-  action and the current section.
+- **Type and colour**: Inter at 12.5px with tabular figures, mono only for ids and
+  code; 4px corners, no shadows; graphite neutrals and the primary action, blue links,
+  and amber for the mark, the current section, the Needs you count and actions.
 - **Round-6 findings**: autopilot switches write On or Off; board goals open in full on
   click, tap or key; empty coordinators read "No coordinator"; event marks show the state
   an event leaves; agent rows keep the same order of facts. The temporary-board note

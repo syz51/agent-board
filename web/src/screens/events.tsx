@@ -238,7 +238,7 @@ export function EventLine({
           <p className="text-meta [overflow-wrap:anywhere] text-muted-foreground">{summary}</p>
         )}
       </div>
-      <span className="inline-flex gap-2 pt-0.75 font-mono text-xs whitespace-nowrap text-muted-foreground tabular-nums max-[520px]:col-start-2 max-[520px]:pt-0">
+      <span className="inline-flex gap-2 pt-0.75 text-xs whitespace-nowrap text-muted-foreground tabular-nums max-[520px]:col-start-2 max-[520px]:pt-0">
         <RelTime at={event.at} />
         <span className="min-w-[5ch] text-right [font-variant-numeric:tabular-nums_slashed-zero]">
           #{event.seq}

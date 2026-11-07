@@ -356,7 +356,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden font-mono text-meta text-muted-foreground @min-[760px]:inline">
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
         <span aria-hidden="true">–</span>
         <span className="sr-only">No asks</span>
       </span>
@@ -364,7 +364,7 @@ function BoardAsks({ board }: { board: Board }) {
   }
   return (
     <Link
-      className="inline-flex min-h-7 items-center gap-1.25 font-mono text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
+      className="inline-flex min-h-7 items-center gap-1.25 text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
       to="/asks"
       search={{ board: board.slug }}
     >

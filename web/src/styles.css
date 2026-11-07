@@ -19,7 +19,7 @@
   --card-foreground: #18181b;
   --popover: #ffffff;
   --popover-foreground: #18181b;
-  --primary: #b45309;
+  --primary: #24242a;
   --primary-foreground: #ffffff;
   --secondary: #ededf0;
   --secondary-foreground: #18181b;
@@ -30,7 +30,7 @@
   --destructive: #c0391b;
   --border: #e2e2e6;
   --input: #cfcfd6;
-  --ring: #b45309;
+  --ring: #2b62c8;
   --sidebar: #1c1c20;
   --sidebar-foreground: #d4d4d8;
   --sidebar-accent: #2c2c31;
@@ -39,8 +39,8 @@
 
   /* agent-board tokens */
   --subtle-foreground: #3f3f46;
-  --link: #9a4a07;
-  --primary-soft: #fdf1e2;
+  --link: #1f58bd;
+  --primary-soft: #eef3fc;
   --status-ready: #18794e;
   --status-ready-soft: #e6f4ec;
   --status-doing: #2f5fd0;
@@ -73,8 +73,8 @@
     --card-foreground: #e4e4e7;
     --popover: #18181b;
     --popover-foreground: #e4e4e7;
-    --primary: #f2a531;
-    --primary-foreground: #1a1203;
+    --primary: #e4e4e7;
+    --primary-foreground: #141417;
     --secondary: #222226;
     --secondary-foreground: #e4e4e7;
     --muted: #18181c;
@@ -84,7 +84,7 @@
     --destructive: #f49a82;
     --border: #26262b;
     --input: #3a3a41;
-    --ring: #f2a531;
+    --ring: #6f9ef0;
     --sidebar: #09090b;
     --sidebar-foreground: #c4c4cc;
     --sidebar-accent: #202024;
@@ -92,8 +92,8 @@
     --sidebar-border: #26262b;
 
     --subtle-foreground: #c8c8d0;
-    --link: #f5b453;
-    --primary-soft: #2c200d;
+    --link: #8db1f5;
+    --primary-soft: #18213a;
     --status-ready: #5fd197;
     --status-ready-soft: #15301f;
     --status-doing: #86a8f6;

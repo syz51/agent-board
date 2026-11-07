@@ -288,7 +288,7 @@ export function TaskGroupSection({
         className="flex h-7 items-center gap-2 border-b bg-secondary px-2.5 text-xs font-semibold tracking-[0.06em] uppercase"
       >
         {heading}
-        <span className="font-mono font-medium tracking-normal text-muted-foreground tabular-nums">
+        <span className="font-medium tracking-normal text-muted-foreground tabular-nums">
           {count}
         </span>
       </Heading>
@@ -348,7 +348,7 @@ const CELL_CLASS: Record<string, string> = {
   main: `${GRID_CELL} flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]`,
   owner: `${GRID_CELL} min-w-0 overflow-hidden text-meta max-md:[grid-area:owner] max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden`,
   updated:
-    "md:flex md:items-center md:justify-end md:self-stretch md:px-2.5 md:py-1 font-mono text-xs text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+    "md:flex md:items-center md:justify-end md:self-stretch md:px-2.5 md:py-1 text-xs text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
 };
 
 export function TaskList({

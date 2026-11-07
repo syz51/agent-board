@@ -325,7 +325,7 @@ export function PageHeader({
 export function Crumbs({ children, current }: { children: ReactNode; current: ReactNode }) {
   return (
     <nav
-      className="mb-2 flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
+      className="mb-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
       aria-label="Breadcrumb"
     >
       {children}
@@ -357,7 +357,7 @@ export function SectionTitle({
       {icon}
       {children}
       {count !== undefined && (
-        <span className="font-mono font-medium tracking-normal text-muted-foreground tabular-nums">
+        <span className="font-medium tracking-normal text-muted-foreground tabular-nums">
           {count}
         </span>
       )}

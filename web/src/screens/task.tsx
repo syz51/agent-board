@@ -241,7 +241,7 @@ function TaskView({
                 {acceptance.map((line, index) => (
                   <li key={index} className="flex gap-3 px-3 py-1.5 even:bg-muted/60">
                     <span
-                      className="mt-px w-5 flex-none text-right font-mono text-xs text-muted-foreground tabular-nums"
+                      className="mt-px w-5 flex-none text-right text-xs text-muted-foreground tabular-nums"
                       aria-hidden="true"
                     >
                       {index + 1}

@@ -32,7 +32,7 @@ export function Shell() {
       </a>
       <header className="sticky top-0 z-10 flex h-11 items-center gap-4 border-b border-sidebar-border bg-sidebar px-4 text-sidebar-foreground max-md:justify-between md:h-10 md:gap-6">
         <Link
-          className="inline-flex min-h-8 items-center gap-2 font-mono text-[13px] font-semibold whitespace-nowrap text-sidebar-accent-foreground hover:no-underline [&_path]:stroke-sidebar [&_rect]:fill-primary"
+          className="inline-flex min-h-8 items-center gap-2 text-[13px] font-semibold whitespace-nowrap text-sidebar-accent-foreground hover:no-underline [&_path]:stroke-sidebar [&_rect]:fill-amber"
           to="/"
         >
           <BrandMark />
@@ -94,13 +94,13 @@ export function Nav() {
           to={item.to}
           // Boards stays current on a board and a task; the router's own match would not.
           aria-current={item.match(path) ? "page" : undefined}
-          className="relative flex min-h-8 items-center gap-2 border-y-2 border-transparent px-2.5 text-meta font-medium hover:no-underline max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:border-0 max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:text-subtle-foreground max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link md:text-sidebar-foreground md:hover:text-sidebar-accent-foreground md:aria-[current=page]:border-b-primary md:aria-[current=page]:text-sidebar-accent-foreground max-md:[&>svg]:size-5.25"
+          className="relative flex min-h-8 items-center gap-2 border-y-2 border-transparent px-2.5 text-meta font-medium hover:no-underline max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:border-0 max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:text-subtle-foreground max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link md:text-sidebar-foreground md:hover:text-sidebar-accent-foreground md:aria-[current=page]:border-b-amber md:aria-[current=page]:text-sidebar-accent-foreground max-md:[&>svg]:size-5.25"
         >
           <Icon name={item.icon} />
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
             <span
-              className="ml-0.5 h-4.5 min-w-5 rounded-sm bg-primary px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-primary-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0"
+              className="ml-0.5 h-4.5 min-w-5 rounded-full bg-amber-soft px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-amber tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0"
               aria-label={`${open} waiting on you`}
             >
               {open}
@@ -111,7 +111,7 @@ export function Nav() {
               {/* One mark at a time: the count when something waits, else a dot for news. */}
               {open === 0 && (
                 <span
-                  className="ml-0.5 size-2 flex-none rounded-full bg-primary max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                  className="ml-0.5 size-2 flex-none rounded-full bg-amber max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
                   aria-hidden="true"
                   title={`${unseen} unseen updates`}
                 />
@@ -148,7 +148,7 @@ function ConnectionPill() {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.75 font-mono text-xs whitespace-nowrap uppercase",
+        "inline-flex items-center gap-1.75 text-xs whitespace-nowrap",
         state.kind === "offline" || state.kind === "reconnecting"
           ? "text-sidebar-accent-foreground"
           : "text-sidebar-foreground",
