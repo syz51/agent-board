@@ -526,6 +526,50 @@ fn session_start_prunes_old_shell_marks_outside_t3_and_without_login() {
 }
 
 #[test]
+fn shell_calls_leave_no_mark_without_login_token_or_agent() {
+    let e = env();
+    let marks = e.home.join("state/tool-starts");
+    let count = || std::fs::read_dir(&marks).map_or(0, |dir| dir.count());
+    let call = |event: &str, id: &str| {
+        e.with(
+            event,
+            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": id}),
+        )
+    };
+
+    // No token: PostToolUse stops before the server but still takes the mark.
+    let no_token = [("BOARD_TOKEN", "")];
+    e.hook_env(
+        "pre-tool-use",
+        "claude",
+        call("PreToolUse", "toolu_a"),
+        &no_token,
+    );
+    assert_eq!(count(), 1, "logged in: PreToolUse marks the call");
+    e.hook_env(
+        "post-tool-use",
+        "claude",
+        call("PostToolUse", "toolu_a"),
+        &no_token,
+    );
+    assert_eq!(count(), 0, "taken without a token");
+
+    // No agent (no session id): the same, for a failed call too.
+    let mut no_agent = call("PreToolUse", "toolu_b");
+    no_agent.as_object_mut().unwrap().remove("session_id");
+    e.hook("pre-tool-use", "claude", no_agent.clone());
+    no_agent["hook_event_name"] = json!("PostToolUseFailure");
+    e.hook("post-tool-use-failure", "claude", no_agent);
+    assert_eq!(count(), 0, "taken without an agent");
+
+    // Logged out: no mark at all.
+    std::fs::remove_file(e.home.join("config.toml")).unwrap();
+    e.hook("pre-tool-use", "claude", call("PreToolUse", "toolu_c"));
+    assert_eq!(count(), 0, "logged out: nothing to report the call to");
+    assert!(e.stub.requests().is_empty());
+}
+
+#[test]
 fn unknown_hook_events_are_ignored() {
     let e = env();
     let (reply, text) = e.hook("some-future-event", "claude", json!({}));
