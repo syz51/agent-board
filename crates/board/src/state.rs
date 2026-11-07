@@ -145,22 +145,35 @@ fn tool_start_path(home: &Home, runtime: Runtime, tool_use: &str) -> PathBuf {
 }
 
 /// When a shell tool call started, from its `PreToolUse` hook.
-#[derive(Debug, Serialize, Deserialize)]
-struct ToolStart {
-    at: Timestamp,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolStart {
+    pub at: Timestamp,
+    /// The git directory of the call's work tree then, so `head` is compared with the same
+    /// work tree after the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dir: Option<PathBuf>,
+    /// The commit checked out in the call's work tree then; `None` outside a repo, before
+    /// the first commit, or when `git` did not answer in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 /// Records when the tool call `tool_use` started. One file per call, so parallel calls
 /// never write the same file.
-pub fn save_tool_start(home: &Home, runtime: Runtime, tool_use: &str, at: Timestamp) -> Result<()> {
-    write_json(&tool_start_path(home, runtime, tool_use), &ToolStart { at })
+pub fn save_tool_start(
+    home: &Home,
+    runtime: Runtime,
+    tool_use: &str,
+    start: &ToolStart,
+) -> Result<()> {
+    write_json(&tool_start_path(home, runtime, tool_use), start)
 }
 
 /// When the tool call `tool_use` started, forgetting it; `None` when no `PreToolUse` hook
 /// recorded it.
-pub fn take_tool_start(home: &Home, runtime: Runtime, tool_use: &str) -> Result<Option<Timestamp>> {
+pub fn take_tool_start(home: &Home, runtime: Runtime, tool_use: &str) -> Result<Option<ToolStart>> {
     let path = tool_start_path(home, runtime, tool_use);
-    let start = read_json::<ToolStart>(&path).map(|s| s.at);
+    let start = read_json::<ToolStart>(&path);
     remove_if_exists(&path)?;
     Ok(start)
 }
@@ -285,6 +298,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().to_path_buf());
         let at = chrono::Utc::now();
+        let mark = ToolStart {
+            at,
+            git_dir: Some("/src/r/.git".into()),
+            head: Some("4e1c2ab".into()),
+        };
         // Nothing to prune or take before the first mark.
         prune_tool_starts(&home, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(
@@ -292,22 +310,27 @@ mod tests {
             None
         );
 
-        save_tool_start(&home, Runtime::Claude, "toolu_1", at).unwrap();
+        save_tool_start(&home, Runtime::Claude, "toolu_1", &mark).unwrap();
         assert_eq!(
             take_tool_start(&home, Runtime::Codex, "toolu_1").unwrap(),
             None
         );
         assert_eq!(
             take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
-            Some(at)
+            Some(mark.clone())
         );
         assert_eq!(
             take_tool_start(&home, Runtime::Claude, "toolu_1").unwrap(),
             None
         );
 
-        save_tool_start(&home, Runtime::Claude, "old/1", at).unwrap();
-        save_tool_start(&home, Runtime::Codex, "new", at).unwrap();
+        let bare = ToolStart {
+            at,
+            git_dir: None,
+            head: None,
+        };
+        save_tool_start(&home, Runtime::Claude, "old/1", &bare).unwrap();
+        save_tool_start(&home, Runtime::Codex, "new", &bare).unwrap();
         let file = std::fs::File::options()
             .write(true)
             .open(tool_start_path(&home, Runtime::Claude, "old/1"))
@@ -321,7 +344,22 @@ mod tests {
         );
         assert_eq!(
             take_tool_start(&home, Runtime::Codex, "new").unwrap(),
-            Some(at)
+            Some(bare)
+        );
+        // A mark saved before marks carried HEAD still reads.
+        let path = tool_start_path(&home, Runtime::Claude, "older");
+        std::fs::write(
+            &path,
+            format!("{{\"at\":{}}}", serde_json::to_string(&at).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            take_tool_start(&home, Runtime::Claude, "older").unwrap(),
+            Some(ToolStart {
+                at,
+                git_dir: None,
+                head: None,
+            })
         );
     }
 }

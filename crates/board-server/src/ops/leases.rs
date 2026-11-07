@@ -22,6 +22,18 @@ fn matcher(glob: &str) -> Option<GlobMatcher> {
         .map(|g| g.compile_matcher())
 }
 
+/// Is one of the agents a T3 thread the other delegated (its `t3_parent` native id names
+/// the other's thread)? A parent and its delegated child do one piece of work, so their
+/// edits and leases never overlap each other.
+pub(crate) fn delegated_between(cx: &Ctx<'_>, a: &str, b: &str) -> Result<bool> {
+    cx.exists(
+        "SELECT 1 FROM agents WHERE \
+         (id = ?1 AND 't3:' || json_extract(native_ids, '$.t3_parent') = ?2) OR \
+         (id = ?2 AND 't3:' || json_extract(native_ids, '$.t3_parent') = ?1)",
+        params![a, b],
+    )
+}
+
 /// Does `glob` cover the repo-relative `path`?
 pub(crate) fn glob_matches(glob: &str, path: &str) -> bool {
     glob == path || matcher(glob).is_some_and(|m| m.is_match(path))
@@ -148,7 +160,10 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
     }
     let mut conflicts: Vec<Lease> = Vec::new();
     for lease in live_leases(cx, &req.repo)? {
-        if lease.agent == req.agent || !is_live(cx, lease.agent.as_str())? {
+        if lease.agent == req.agent
+            || !is_live(cx, lease.agent.as_str())?
+            || delegated_between(cx, req.agent.as_str(), lease.agent.as_str())?
+        {
             continue;
         }
         if req.globs.iter().any(|g| globs_overlap(g, &lease.glob)) {
@@ -324,7 +339,10 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
     let window_start = cx.now_ms() - cx.s.touch_ms();
     for path in paths {
         for (agent, glob, at) in &leases {
-            if glob_matches(glob, path) && is_live(cx, agent)? {
+            if glob_matches(glob, path)
+                && is_live(cx, agent)?
+                && !delegated_between(cx, me.as_str(), agent)?
+            {
                 out.push(Overlap {
                     path: path.clone(),
                     agent: parse_id(agent)?,
@@ -345,6 +363,9 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
             })?
             .collect::<rusqlite::Result<_>>()?;
         for (agent, at) in touches {
+            if delegated_between(cx, me.as_str(), &agent)? {
+                continue;
+            }
             out.push(Overlap {
                 path: path.clone(),
                 agent: parse_id(&agent)?,

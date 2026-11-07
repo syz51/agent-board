@@ -682,6 +682,142 @@ fn codex_shell_calls_record_the_files_they_changed() {
     assert_eq!(touch.body["paths"], json!(["docs/notes.md"]));
 }
 
+/// Runs `git` in `repo`, as a test user.
+fn git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Writes `files` in `repo` an hour ago and commits them on its branch.
+fn commit_files(repo: &std::path::Path, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        backdate(&path);
+    }
+    commit_all(repo);
+}
+
+/// Runs one shell call through PreToolUse and PostToolUse, with `during` as the command,
+/// and returns the paths it reported (`None`: no touch was sent).
+fn shell_call(e: &Env, id: &str, during: impl FnOnce()) -> Option<Value> {
+    let call = |event: &str| {
+        e.with(
+            event,
+            json!({"tool_name": "Bash", "tool_input": {"command": "git ..."}, "tool_use_id": id}),
+        )
+    };
+    let before = e.stub.requests_to("POST /v1/touches").len();
+    e.hook("pre-tool-use", "claude", call("PreToolUse"));
+    during();
+    e.hook("post-tool-use", "claude", call("PostToolUse"));
+    let touches = e.stub.requests_to("POST /v1/touches");
+    (touches.len() > before).then(|| touches.last().unwrap().body["paths"].clone())
+}
+
+#[test]
+fn shell_calls_leave_out_the_files_git_brought_in() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    commit_files(&e.repo, &[("src/a.rs", "a\n"), ("src/b.rs", "b\n")]);
+    // Another branch changes a.rs and adds c.rs.
+    assert!(
+        git(&e.repo, &["switch", "-q", "-c", "other"])
+            .status
+            .success()
+    );
+    commit_files(&e.repo, &[("src/a.rs", "a2\n"), ("src/c.rs", "c\n")]);
+    assert!(
+        git(&e.repo, &["switch", "-q", "feature/x"])
+            .status
+            .success()
+    );
+    for path in ["src/a.rs", "src/b.rs"] {
+        backdate(&e.repo.join(path));
+    }
+
+    // A checkout that merges a local change into a file the other branch changed: HEAD
+    // moves, and git writes the conflict into a.rs.
+    std::fs::write(e.repo.join("src/a.rs"), "a-local\n").unwrap();
+    backdate(&e.repo.join("src/a.rs"));
+    let paths = shell_call(&e, "toolu_switch", || {
+        let switch = git(&e.repo, &["checkout", "-q", "-m", "other"]);
+        assert!(
+            switch.status.success(),
+            "{}",
+            String::from_utf8_lossy(&switch.stderr)
+        );
+        std::fs::write(e.repo.join("src/mine.rs"), "mine\n").unwrap();
+    });
+    let status = String::from_utf8(git(&e.repo, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(status.contains("UU src/a.rs"), "{status}");
+    assert_eq!(
+        paths,
+        Some(json!(["src/mine.rs"])),
+        "HEAD moved: only the call's own file"
+    );
+    // Back to a clean feature/x.
+    assert!(
+        git(&e.repo, &["checkout", "-q", "-f", "feature/x"])
+            .status
+            .success()
+    );
+    std::fs::remove_file(e.repo.join("src/mine.rs")).unwrap();
+
+    // A conflicted merge stages what it brings in without moving HEAD.
+    commit_files(&e.repo, &[("src/a.rs", "a-mine\n")]);
+    let paths = shell_call(&e, "toolu_merge", || {
+        let merge = git(&e.repo, &["merge", "--no-edit", "other"]);
+        assert!(!merge.status.success(), "the merge stops on a conflict");
+        std::fs::write(e.repo.join("src/b.rs"), "b-edited\n").unwrap();
+    });
+    let status = String::from_utf8(git(&e.repo, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(
+        status.contains("UU src/a.rs") && status.contains("A  src/c.rs"),
+        "{status}"
+    );
+    assert_eq!(
+        paths,
+        Some(json!(["src/b.rs"])),
+        "neither the conflicted nor the merged file"
+    );
+
+    // A merge stopped before the call is the agent's to finish: what it resolves counts.
+    let git_dir = e.repo.join(".git");
+    for path in [
+        git_dir.join("MERGE_HEAD"),
+        e.repo.join("src/b.rs"),
+        e.repo.join("src/c.rs"),
+    ] {
+        backdate(&path);
+    }
+    let paths = shell_call(&e, "toolu_resolve", || {
+        std::fs::write(e.repo.join("src/a.rs"), "a-resolved\n").unwrap();
+    });
+    assert_eq!(paths, Some(json!(["src/a.rs"])));
+
+    // A rebase that stops on a conflict moves HEAD and stages the stopped commit.
+    assert!(git(&e.repo, &["reset", "-q", "--hard"]).status.success());
+    let paths = shell_call(&e, "toolu_rebase", || {
+        assert!(!git(&e.repo, &["rebase", "other"]).status.success());
+    });
+    let status = String::from_utf8(git(&e.repo, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(status.contains("src/a.rs"), "{status}");
+    assert_eq!(paths, None, "nothing of the call's own");
+}
+
 /// A task in doing, a delta snapshot and a handoff written an hour ago, with the agent's
 /// last change dated by the server (`None`: a server that does not date changes).
 fn doing_with_handoff(e: &Env, last_change_at: Option<chrono::DateTime<chrono::Utc>>) -> Handoff {
@@ -1009,6 +1145,60 @@ fn t3_thread_id_wins_over_the_hook_session() {
         &[("T3CODE_THREAD_ID", "thread-7")],
     );
     assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(t3));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_delegated_t3_thread_registers_its_parent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    let e = env();
+    // A `t3` that answers `thread show` as T3 does and logs each call.
+    let log = e.home.join("t3.log");
+    let t3 = e.home.join("t3");
+    std::fs::write(
+        &t3,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nprintf '%s' '{}'\n",
+            log.display(),
+            json!({"thread": {
+                "threadId": CHILD,
+                "parentThreadId": "parent-1",
+                "relationshipToParent": "subagent",
+            }})
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let t3 = t3.to_str().unwrap();
+    for (thread, parent) in [(CHILD, Some("parent-1")), ("thread-7", None)] {
+        let agent = format!("t3:{thread}");
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(&agent, DEVICE, AgentState::Running),
+        );
+        e.stub.on(
+            "GET /v1/snapshot",
+            snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+        );
+        e.hook_env(
+            "session-start",
+            "claude",
+            e.with("SessionStart", json!({"source": "startup"})),
+            &[("T3CODE_THREAD_ID", thread), ("T3CODE_CLI_PATH", t3)],
+        );
+        let register = e.stub.requests_to("POST /v1/agents").pop().unwrap();
+        assert_eq!(register.body["id"], agent);
+        assert_eq!(register.body["native_ids"]["t3_thread"], thread);
+        assert_eq!(
+            register.body["native_ids"]["t3_parent"].as_str(),
+            parent,
+            "{thread}"
+        );
+    }
+    // Only the delegated thread asked T3, once.
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls, format!("thread show --json --messages 0 {CHILD}\n"));
 }
 
 /// Runs a hook two `claude` processes deep, as a `claude -p` started from a T3 thread's

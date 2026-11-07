@@ -12,6 +12,7 @@
 //! - PreToolUse (shell calls only): prints nothing, which lets the call run.
 //! - StopFailure and SessionEnd: output is ignored.
 
+use std::collections::HashSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,7 +30,16 @@ use crate::client::{Client, SnapshotQuery, TaskQuery};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
-use crate::state::{self, AgentLocal};
+use crate::state::{self, AgentLocal, ToolStart};
+use crate::t3::T3Cli;
+
+/// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
+const DELEGATED_THREAD: &str = "thread:delegated-task:";
+/// Where T3 tells its threads its CLI is.
+const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
+/// Time for asking T3 for a delegated thread's parent (about 0.2 seconds measured);
+/// past it the agent registers without one.
+const PARENT_BUDGET: Duration = Duration::from_millis(400);
 
 /// Hard limit for the whole hook, start to output.
 const BUDGET: Duration = Duration::from_millis(1500);
@@ -172,7 +182,9 @@ struct Hook<'a> {
     input: &'a Value,
     local: AgentLocal,
     /// When the shell call this PostToolUse reports started, from its PreToolUse mark.
-    shell_start: Option<Timestamp>,
+    shell_start: Option<ToolStart>,
+    /// The `t3` binary from the configuration, if set.
+    t3_bin: Option<PathBuf>,
     now: Timestamp,
 }
 
@@ -193,7 +205,18 @@ async fn handle(
         if let Some(tool_use) = shell_call
             && Config::load(&home)?.require_login().is_ok()
         {
-            state::save_tool_start(&home, runtime, tool_use, Utc::now())?;
+            let at = Utc::now();
+            let cwd = input["cwd"]
+                .as_str()
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            let (git_dir, head) = match tokio::time::timeout(HEAD_BUDGET, git_head(&cwd)).await {
+                Ok(Some(found)) => (Some(found.git_dir), found.head),
+                _ => (None, None),
+            };
+            let start = ToolStart { at, git_dir, head };
+            state::save_tool_start(&home, runtime, tool_use, &start)?;
         }
         return Ok(Reply::Nothing);
     }
@@ -248,6 +271,7 @@ async fn handle(
         agent,
         input,
         shell_start,
+        t3_bin: config.t3_bin.clone(),
         now: Utc::now(),
     };
     let offline_until = state::load_offline_until(&hook.home);
@@ -426,8 +450,34 @@ impl Hook<'_> {
         self.keep(snap)
     }
 
+    /// The T3 thread that delegated this agent's thread, asked of T3 within
+    /// [`PARENT_BUDGET`] and only for a delegated thread; `None` otherwise or when T3 does
+    /// not answer in time.
+    async fn t3_parent(&self, thread: Option<&str>) -> Option<String> {
+        let thread = thread.filter(|t| t.starts_with(DELEGATED_THREAD))?;
+        let bin = self
+            .t3_bin
+            .clone()
+            .or_else(|| std::env::var_os(T3_CLI_ENV).map(PathBuf::from));
+        let t3 = T3Cli::locate(bin.as_deref());
+        match tokio::time::timeout(PARENT_BUDGET, t3.thread_parent(thread)).await {
+            Ok(Ok(parent)) => parent,
+            Ok(Err(err)) => {
+                tracing::debug!("parent of thread {thread}: {err:#}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("parent of thread {thread}: over budget");
+                None
+            }
+        }
+    }
+
     async fn session_start(&mut self) -> Result<Reply> {
-        let repo = detect_repo(self.cwd()).await?;
+        let thread = std::env::var(T3_THREAD_ENV).ok().filter(|_| !self.nested);
+        let (repo, parent) =
+            tokio::join!(detect_repo(self.cwd()), self.t3_parent(thread.as_deref()));
+        let repo = repo?;
         let mut native = std::collections::BTreeMap::new();
         if let Some(session) = self.input["session_id"].as_str() {
             let key = match self.runtime {
@@ -436,10 +486,13 @@ impl Hook<'_> {
             };
             native.insert(key.to_owned(), session.to_owned());
         }
-        if let Ok(thread) = std::env::var(T3_THREAD_ENV)
-            && !self.nested
-        {
+        if let Some(thread) = thread {
             native.insert("t3_thread".to_owned(), thread);
+        }
+        // The server keeps a delegated child's edits and its parent's out of each other's
+        // overlaps and alerts.
+        if let Some(parent) = parent {
+            native.insert("t3_parent".to_owned(), parent);
         }
         self.client
             .register(&board_proto::RegisterAgent {
@@ -520,11 +573,11 @@ impl Hook<'_> {
             // An edit tool names its files; a shell call's are found by scanning the work
             // tree, so another agent in the same checkout may have written them. Edit tools
             // never have a start mark, and a shell call names no files.
-            let (paths, scanned) = match (self.shell_start, repo.root.as_deref()) {
-                (Some(since), Some(root)) => {
+            let (paths, scanned) = match (&self.shell_start, repo.root.as_deref()) {
+                (Some(start), Some(root)) => {
                     // Bounded on its own, so a slow work tree never eats the server's budget.
                     let found =
-                        match tokio::time::timeout(SHELL_SCAN_BUDGET, changed_since(root, since))
+                        match tokio::time::timeout(SHELL_SCAN_BUDGET, shell_changes(root, start))
                             .await
                         {
                             Ok(Ok(changed)) => changed,
@@ -707,6 +760,120 @@ pub fn heartbeat_due(last: Option<Timestamp>, now: Timestamp) -> bool {
 const SHELL_TOOL: &str = "Bash";
 /// Time for listing the files a shell call changed; past it the call records none.
 const SHELL_SCAN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Time for reading HEAD before a shell call; past it the start mark carries none.
+const HEAD_BUDGET: Duration = Duration::from_millis(300);
+/// Files that mark a merge, cherry-pick, revert or rebase stopped in the work tree, each
+/// naming the commit being brought in.
+const IN_PROGRESS: [&str; 4] = [
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+];
+
+/// Where a work tree's git state lives and what it has checked out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitHead {
+    /// The work tree's own git directory (per worktree).
+    pub git_dir: PathBuf,
+    /// The commit at `HEAD`; `None` before the first commit.
+    pub head: Option<String>,
+}
+
+/// The git directory and `HEAD` commit of the work tree containing `dir`; `None` outside
+/// one. One `git rev-parse`, a few milliseconds.
+pub async fn git_head(dir: &Path) -> Option<GitHead> {
+    let out = tokio::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--absolute-git-dir", "--verify", "-q", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    // Before the first commit it prints the directory and exits 1; outside a repo, nothing.
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut lines = text.lines();
+    let git_dir = PathBuf::from(lines.next().filter(|l| !l.is_empty())?);
+    let head = lines.next().filter(|l| !l.is_empty()).map(str::to_owned);
+    Some(GitHead { git_dir, head })
+}
+
+/// What a shell call that started at `start` changed in the work tree `root`: the files
+/// [`changed_since`] finds, less those [`brought_in`] by git during the call.
+pub async fn shell_changes(root: &Path, start: &ToolStart) -> Result<Vec<(PathBuf, Timestamp)>> {
+    let (changed, brought) = tokio::join!(changed_since(root, start.at), brought_in(root, start));
+    let brought = brought?;
+    Ok(changed?
+        .into_iter()
+        .filter(|(path, _)| !brought.contains(path))
+        .collect())
+}
+
+/// Files under `root` that git itself wrote during a shell call that started at `start`,
+/// so they are not the call's edits: those that differ between `HEAD` before and after
+/// the call (a checkout, switch, merge, rebase, pull or reset moved it), and those that a
+/// merge, cherry-pick, revert or rebase that stopped during the call brings in (a
+/// conflicted merge stages them without moving `HEAD`). An error when git cannot say.
+pub async fn brought_in(root: &Path, start: &ToolStart) -> Result<HashSet<PathBuf>> {
+    let mut ranges: Vec<(String, String)> = Vec::new();
+    let Some(now) = git_head(root).await else {
+        return Ok(HashSet::new());
+    };
+    if let (Some(before), Some(after)) = (&start.head, &now.head)
+        && start.git_dir.as_deref() == Some(now.git_dir.as_path())
+        && before != after
+    {
+        ranges.push((before.clone(), after.clone()));
+    }
+    let since = start.at.trunc_subsecs(0);
+    if let Some(head) = &now.head {
+        for name in IN_PROGRESS {
+            let path = now.git_dir.join(name);
+            // Only one the call started: a merge stopped before it is the agent's to finish.
+            if modified_at(&path).is_none_or(|at| at < since) {
+                continue;
+            }
+            for commit in std::fs::read_to_string(&path)?.split_whitespace() {
+                ranges.push((head.clone(), commit.to_owned()));
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for (from, to) in ranges {
+        let diff = tokio::process::Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                &from,
+                &to,
+                "--",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        anyhow::ensure!(diff.status.success(), "git diff failed: {}", diff.status);
+        out.extend(
+            diff.stdout
+                .split(|b| *b == 0)
+                .filter_map(|p| std::str::from_utf8(p).ok())
+                .filter(|p| !p.is_empty())
+                .map(|p| root.join(p)),
+        );
+    }
+    Ok(out)
+}
 
 /// Files under the work tree `root` that `git status` lists as changed or untracked and
 /// that were modified at or after `since`: what a shell call that started then wrote.

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{glob_matches, globs_overlap};
+use crate::ops::leases::{delegated_between, glob_matches, globs_overlap};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
     agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events, load_agents,
@@ -645,6 +645,41 @@ const NEW_AGENT: u8 = 5;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
 const FILED: u8 = 6;
 
+/// Has `peer` touched (within the window) or leased a path the agent touched or leased?
+fn shares_paths(
+    cx: &Ctx<'_>,
+    peer: &str,
+    my_touches: &[(String, String, i64)],
+    my_leases: &[(String, String)],
+    window_start: i64,
+) -> Result<bool> {
+    let touches: Vec<(String, String)> = cx
+        .db
+        .prepare_cached("SELECT repo, path FROM touches WHERE agent = ?1 AND at > ?2")?
+        .query_map(params![peer, window_start], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let leases: Vec<(String, String)> = cx
+        .db
+        .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
+        .query_map(params![peer, cx.now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let touched = touches.iter().any(|(repo, path)| {
+        my_touches.iter().any(|(r, p, _)| r == repo && p == path)
+            || my_leases
+                .iter()
+                .any(|(r, g)| r == repo && glob_matches(g, path))
+    });
+    let leased = leases.iter().any(|(repo, glob)| {
+        my_touches
+            .iter()
+            .any(|(r, p, _)| r == repo && glob_matches(glob, p))
+            || my_leases
+                .iter()
+                .any(|(r, g)| r == repo && globs_overlap(g, glob))
+    });
+    Ok(touched || leased)
+}
+
 /// Events after `since` (up to `seq`) that concern the agent, as alerts.
 fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert>> {
     if since >= seq {
@@ -676,6 +711,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
 
     let mut handles = HashMap::new();
     let mut live = HashMap::<String, bool>::new();
+    let mut delegated = HashMap::<String, bool>::new();
     // Keyed so a repeated event yields one alert (the latest).
     let mut out: BTreeMap<(u8, String), Alert> = BTreeMap::new();
     let mut changed: BTreeMap<(String, String), (i64, BTreeSet<String>)> = BTreeMap::new();
@@ -696,6 +732,23 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
             }
         };
         let rank = |kind: u8| (kind, event.seq);
+        // Work the agent delegated, or was delegated, is its own: no overlap or peer alerts.
+        if matches!(
+            event.event_type,
+            EventType::AgentRegistered | EventType::FilesTouched | EventType::LeaseCreated
+        ) {
+            let related = match delegated.get(&event.actor) {
+                Some(r) => *r,
+                None => {
+                    let r = delegated_between(cx, me, &event.actor)?;
+                    delegated.insert(event.actor.clone(), r);
+                    r
+                }
+            };
+            if related {
+                continue;
+            }
+        }
         match event.event_type {
             EventType::TaskDone => {
                 let Some(done) = &event.task else { continue };
@@ -805,7 +858,14 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                     && p.get("repo").and_then(|r| r.as_str()) == agent.repo.as_deref();
                 let same_branch =
                     p.get("branch").and_then(|b| b.as_str()) == agent.branch.as_deref();
-                if actor_live && same_repo && same_branch && agent.branch.is_some() {
+                // Only a peer already working on the agent's files: the overlap alerts below
+                // cover one that gets there later.
+                if actor_live
+                    && same_repo
+                    && same_branch
+                    && agent.branch.is_some()
+                    && shares_paths(cx, &event.actor, &my_touches, &my_leases, window_start)?
+                {
                     out.insert(
                         (NEW_AGENT, event.actor.clone()),
                         Alert {
