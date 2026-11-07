@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use board_proto::{AgentId, Runtime, Snapshot, Timestamp};
+use board_proto::{AgentId, Runtime, Snapshot, TaskId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,10 @@ pub struct AgentLocal {
     pub reminded_for: Option<Timestamp>,
     /// Set while the server is unreachable and the cached snapshot was already injected.
     pub offline_notified: bool,
+    /// Tasks the `Stop` hook already reminded the agent to file what remains of, newest
+    /// last, so each is reminded about once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_reminded: Vec<TaskId>,
 }
 
 /// A file-system-safe name for an agent id.
@@ -189,26 +193,116 @@ pub fn prune_tool_starts(home: &Home, age: std::time::Duration) -> Result<()> {
 
 /// Removes the files in `dir` not written for `age`; a missing `dir` is fine.
 fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        entries => entries?,
+    let Some(entries) = read_dir_if_exists(dir)? else {
+        return Ok(());
     };
-    let now = std::time::SystemTime::now();
     for entry in entries {
-        let entry = entry?;
-        // Removed by another hook since the listing.
-        let modified = match entry.metadata() {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            metadata => metadata?.modified()?,
-        };
-        if now
-            .duration_since(modified)
-            .is_ok_and(|elapsed| elapsed > age)
-        {
-            remove_if_exists(&entry.path())?;
+        let path = entry?.path();
+        // `false` when another hook removed it since the listing.
+        if older_than(&path, age)? {
+            remove_if_exists(&path)?;
         }
     }
     Ok(())
+}
+
+/// A task the agent marked done through `board done` or the `task_done` tool, kept until
+/// the agent's next `Stop` hook reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoneMark {
+    pub task: TaskId,
+    pub at: Timestamp,
+}
+
+fn done_dir(home: &Home, agent: &AgentId) -> PathBuf {
+    home.state_dir().join("done").join(file_stem(agent))
+}
+
+/// Records that `agent` marked `task` done. One file per task, so parallel calls never
+/// write the same file.
+pub fn record_done(home: &Home, agent: &AgentId, task: &TaskId, at: Timestamp) -> Result<()> {
+    let mark = DoneMark {
+        task: task.clone(),
+        at,
+    };
+    write_json(
+        &done_dir(home, agent).join(format!("{}.json", safe_stem(task.as_str()))),
+        &mark,
+    )
+}
+
+/// The tasks `agent` marked done since the last call, oldest first, forgetting them. A
+/// mark that cannot be removed is still returned, and read again by the next call.
+pub fn take_done(home: &Home, agent: &AgentId) -> Result<Vec<DoneMark>> {
+    let Some(entries) = read_dir_if_exists(&done_dir(home, agent))? else {
+        return Ok(Vec::new());
+    };
+    let mut marks = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        // Not `write_atomic`'s temporary file, which a concurrent `record_done` renames.
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        if let Some(mark) = read_json::<DoneMark>(&path) {
+            marks.push(mark);
+        }
+        if let Err(err) = remove_if_exists(&path) {
+            tracing::debug!("removing done mark {}: {err:#}", path.display());
+        }
+    }
+    marks.sort_by_key(|m| m.at);
+    Ok(marks)
+}
+
+/// Removes done marks no `Stop` hook read for `age` (a session that ended mid-turn), and
+/// agents' directories left empty for as long.
+pub fn prune_done(home: &Home, age: std::time::Duration) -> Result<()> {
+    let Some(entries) = read_dir_if_exists(&home.state_dir().join("done"))? else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        // Judged before its old marks go: a directory changed recently may be about to get
+        // a mark (`record_done` creates it before writing).
+        let idle = older_than(&dir, age)?;
+        prune_dir(&dir, age)?;
+        if idle {
+            match std::fs::remove_dir(&dir) {
+                // Still holds marks, or another hook removed it first.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                    ) => {}
+                other => other?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The entries of `dir`; `None` when it does not exist.
+fn read_dir_if_exists(dir: &Path) -> Result<Option<std::fs::ReadDir>> {
+    match std::fs::read_dir(dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        entries => Ok(Some(entries?)),
+    }
+}
+
+/// True when `path` was last modified more than `age` ago; false when it is gone.
+fn older_than(path: &Path, age: std::time::Duration) -> Result<bool> {
+    let modified = match std::fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        metadata => metadata?.modified()?,
+    };
+    Ok(std::time::SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|elapsed| elapsed > age))
 }
 
 /// Until when this device's hooks skip the server after it failed to answer.
@@ -300,6 +394,55 @@ mod tests {
         prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "old"), None);
         assert_eq!(load_session(&home, Runtime::Codex, "new"), Some(nested));
+    }
+
+    #[test]
+    fn done_marks_are_taken_once_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let me: AgentId = "t3:thread-1".parse().unwrap();
+        let peer: AgentId = "t3:thread-2".parse().unwrap();
+        let t0 = chrono::Utc::now();
+        let (a, b): (TaskId, TaskId) =
+            ("factory-12".parse().unwrap(), "factory-9".parse().unwrap());
+        assert_eq!(take_done(&home, &me).unwrap(), vec![]);
+        prune_done(&home, std::time::Duration::from_secs(60)).unwrap();
+
+        record_done(&home, &me, &a, t0 + chrono::Duration::seconds(1)).unwrap();
+        record_done(&home, &me, &b, t0).unwrap();
+        record_done(&home, &peer, &a, t0).unwrap();
+        // A concurrent `record_done`'s temporary file is left alone.
+        let tmp = done_dir(&home, &me).join("factory-13.json.tmp42");
+        std::fs::write(&tmp, "{").unwrap();
+        // A stray file beside the agents' directories does not stop pruning.
+        std::fs::write(home.state_dir().join("done").join(".DS_Store"), "").unwrap();
+        let taken = take_done(&home, &me).unwrap();
+        assert_eq!(
+            taken.iter().map(|m| m.task.as_str()).collect::<Vec<_>>(),
+            ["factory-9", "factory-12"],
+            "oldest first"
+        );
+        assert_eq!(take_done(&home, &me).unwrap(), vec![], "taken once");
+        assert!(tmp.exists());
+
+        // Fresh marks and directories stay; old ones go with their emptied directory.
+        prune_done(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert!(done_dir(&home, &peer).exists());
+        std::fs::remove_file(&tmp).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        for path in [
+            done_dir(&home, &peer).join("factory-12.json"),
+            done_dir(&home, &peer),
+            done_dir(&home, &me),
+        ] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        prune_done(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert!(!done_dir(&home, &peer).exists());
+        assert!(!done_dir(&home, &me).exists());
     }
 
     #[test]

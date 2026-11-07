@@ -410,7 +410,9 @@ async fn snapshots_respect_their_caps() {
         "{full}"
     );
     assert!(full.contains("Claim before working"));
-    assert!(full.contains("File found work as a Proposal: task, auto=false."));
+    assert!(full.contains(
+        "Before task_done, file what is left as sub-tasks and found work as Proposal: tasks (auto=false)."
+    ));
     let delta = text(&snapshot(&t, me, "kind=delta&since=0").await).to_owned();
     assert!(
         delta.chars().count() <= caps.snapshot_delta_chars,

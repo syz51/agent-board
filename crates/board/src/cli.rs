@@ -69,7 +69,8 @@ pub enum Command {
     Take { id: TaskId },
     /// Change a task's fields or status.
     Update(UpdateArgs),
-    /// Mark a task done with evidence.
+    /// Mark a task done with evidence, only when every acceptance check passes; file what
+    /// remains first (sub-tasks, proposals).
     Done(DoneArgs),
     /// Add a note to a task.
     Note {
