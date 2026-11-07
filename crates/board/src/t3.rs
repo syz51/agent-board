@@ -6,6 +6,7 @@
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state.
+//! - `t3 thread list --json --project <project path>`: the project's threads, newest first.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,14 @@ pub trait T3: Send + Sync {
 
     /// The thread's state, or `None` when T3 does not know it.
     fn thread_info(&self, thread: &str) -> impl Future<Output = Result<Option<ThreadInfo>>> + Send;
+
+    /// Threads titled `title` in the project containing `project` that never ran (no run,
+    /// no items, not settled or archived), newest first.
+    fn unstarted_threads(
+        &self,
+        project: &Path,
+        title: &str,
+    ) -> impl Future<Output = Result<Vec<String>>> + Send;
 }
 
 /// The real `t3` binary.
@@ -130,6 +139,17 @@ impl T3 for T3Cli {
         let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
         Ok(Some(parse_thread_info(&value)))
     }
+
+    async fn unstarted_threads(&self, project: &Path, title: &str) -> Result<Vec<String>> {
+        let project = project.to_string_lossy();
+        let args = ["thread", "list", "--json", "--project", &project];
+        let (ok, stdout, stderr) = self.run(&args, None).await?;
+        if !ok {
+            bail!("t3 thread list failed: {}", stderr.trim());
+        }
+        let value: Value = serde_json::from_str(&stdout).context("t3 thread list --json")?;
+        Ok(parse_unstarted_threads(&value, title))
+    }
 }
 
 /// The thread id from `t3 thread start --json` (`{"threadId": …}` or
@@ -144,6 +164,25 @@ pub fn parse_thread_id(stdout: &str) -> Option<String> {
         Err(_) => stdout.lines().next().map(|l| l.trim().to_owned()),
     }?;
     (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+/// The ids of the threads titled `title` that never ran, from `t3 thread list --json` (an
+/// array of `{"threadId", "title", "latestRunId", "itemCount", "settled", …}`). A thread
+/// missing any of these fields is not counted.
+pub fn parse_unstarted_threads(value: &Value, title: &str) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| {
+            t["title"].as_str() == Some(title)
+                && t["latestRunId"].is_null()
+                && t["itemCount"].as_u64() == Some(0)
+                && t["settled"].as_bool() == Some(false)
+                && t["archived"].as_bool() != Some(true)
+        })
+        .filter_map(|t| t["threadId"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Reads `{"thread": {"archived": …, "providerInstanceId": …}}` from `t3 thread show --json`.
@@ -179,6 +218,25 @@ mod tests {
         assert_eq!(parse_thread_id("t-3\n").as_deref(), Some("t-3"));
         assert_eq!(parse_thread_id("{}"), None);
         assert_eq!(parse_thread_id(""), None);
+    }
+
+    #[test]
+    fn unstarted_threads_are_untouched_and_carry_the_title() {
+        let thread = |id: &str, title: &str, run: Value, items: u64, settled: bool| json!({"threadId": id, "title": title, "latestRunId": run, "itemCount": items, "settled": settled});
+        let list = json!([
+            thread("new", "f coordinator", Value::Null, 0, false),
+            thread("ran", "f coordinator", json!("run:1"), 3, false),
+            thread("items", "f coordinator", Value::Null, 1, false),
+            thread("settled", "f coordinator", Value::Null, 0, true),
+            thread("other", "g coordinator", Value::Null, 0, false),
+            {"threadId": "partial", "title": "f coordinator", "latestRunId": null},
+            thread("old", "f coordinator", Value::Null, 0, false),
+        ]);
+        assert_eq!(
+            parse_unstarted_threads(&list, "f coordinator"),
+            ["new", "old"]
+        );
+        assert!(parse_unstarted_threads(&json!({}), "f coordinator").is_empty());
     }
 
     #[test]

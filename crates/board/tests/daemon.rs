@@ -22,6 +22,7 @@ use serde_json::json;
 
 const REPO: &str = "github.com/syz51/agent-board";
 const NEW_THREAD: &str = "thread:project:p1:new";
+const ORPHAN: &str = "thread:project:p1:orphan";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
@@ -42,6 +43,11 @@ struct FakeT3 {
     threads: Arc<Mutex<BTreeMap<String, ThreadInfo>>>,
     /// `t3 thread start` fails while set.
     fail_start: Arc<AtomicBool>,
+    /// `t3 thread start` creates [`ORPHAN`] and then fails while set, as when the daemon is
+    /// killed mid-start.
+    die_after_create: Arc<AtomicBool>,
+    /// Threads that never ran, newest first, with their titles.
+    unstarted: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl FakeT3 {
@@ -80,6 +86,14 @@ impl T3 for FakeT3 {
         if self.fail_start.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread start failed: no such project");
         }
+        if self.die_after_create.load(Ordering::SeqCst) {
+            self.live(ORPHAN);
+            self.unstarted
+                .lock()
+                .unwrap()
+                .insert(0, (ORPHAN.to_owned(), title.to_owned()));
+            anyhow::bail!("t3 thread start timed out");
+        }
         self.live(NEW_THREAD);
         Ok(NEW_THREAD.to_owned())
     }
@@ -89,11 +103,23 @@ impl T3 for FakeT3 {
             thread: thread.to_owned(),
             message: message.to_owned(),
         });
+        self.unstarted.lock().unwrap().retain(|(t, _)| t != thread);
         Ok(())
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
         Ok(self.threads.lock().unwrap().get(thread).cloned())
+    }
+
+    async fn unstarted_threads(&self, _project: &Path, title: &str) -> Result<Vec<String>> {
+        Ok(self
+            .unstarted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t)| t == title)
+            .map(|(id, _)| id.clone())
+            .collect())
     }
 }
 
@@ -705,6 +731,70 @@ async fn a_failed_start_backs_off_instead_of_looping() {
         (5, 4),
         "claim, start, claim as the agent"
     );
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+}
+
+#[tokio::test]
+async fn a_start_that_died_after_creating_its_thread_reuses_that_thread() {
+    let mut e = env();
+    e.t3.die_after_create.store(true, Ordering::SeqCst);
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    let unstarted = |t3: &FakeT3| t3.unstarted.lock().unwrap().len();
+
+    // The start fails after T3 created the thread, leaving it empty.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!((starts(&e.t3), unstarted(&e.t3)), (1, 1));
+    assert!(!e.daemon.state.coordinators.contains_key(&factory()));
+
+    // The retry briefs that thread instead of starting a second one.
+    e.t3.die_after_create.store(false, Ordering::SeqCst);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1, "no second thread");
+    assert_eq!(unstarted(&e.t3), 0, "no idle thread is left behind");
+    let sends = e.t3.sends();
+    let [(thread, message)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, ORPHAN);
+    assert_eq!(message, &board::daemon::coordinator_message(&factory()));
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.last().unwrap().body["agent"], format!("t3:{ORPHAN}"));
+
+    // Another board's empty coordinator thread is never reused (threads that ran are
+    // filtered out by `parse_unstarted_threads`).
+    let mut e = env();
+    e.t3.unstarted
+        .lock()
+        .unwrap()
+        .push(("other".into(), "other coordinator".into()));
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    assert!(e.t3.sends().is_empty());
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
 }
 

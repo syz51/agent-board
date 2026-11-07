@@ -17,7 +17,7 @@
 //! until its repos, home devices, autopilot switch or status change.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -394,14 +394,23 @@ impl<T: T3> Daemon<T> {
             Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => return Ok(()),
             Err(err) => return Err(err),
         }
-        let started = self
-            .t3
-            .start_thread(
-                &project,
-                &format!("{slug} coordinator"),
-                &coordinator_message(slug),
-            )
-            .await;
+        let title = format!("{slug} coordinator");
+        let started = match self.unstarted_thread(&project, &title).await {
+            Some(thread) => {
+                tracing::warn!(
+                    "coordinator of {slug}: briefing thread {thread}, which an earlier start created but never sent its message (the daemon stopped or t3 failed mid-start)"
+                );
+                self.t3
+                    .send(&thread, &coordinator_message(slug))
+                    .await
+                    .map(|()| thread)
+            }
+            None => {
+                self.t3
+                    .start_thread(&project, &title, &coordinator_message(slug))
+                    .await
+            }
+        };
         let thread = match started {
             Ok(thread) => thread,
             Err(err) => {
@@ -431,6 +440,19 @@ impl<T: T3> Daemon<T> {
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.save()?;
         self.adopt(board, local, now).await
+    }
+
+    /// The newest thread titled `title` that never ran: what a start leaves behind when it
+    /// dies after T3 created the thread but before its message was sent. Reusing it keeps a
+    /// retried start from adding a second thread. A failed listing falls back to a new thread.
+    async fn unstarted_thread(&self, project: &Path, title: &str) -> Option<String> {
+        match self.t3.unstarted_threads(project, title).await {
+            Ok(threads) => threads.into_iter().next(),
+            Err(err) => {
+                tracing::warn!("listing the threads of {}: {err:#}", project.display());
+                None
+            }
+        }
     }
 
     /// Handles one event: queues its wake-ups and advances `last_seq`. Returns true when the
