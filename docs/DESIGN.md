@@ -91,7 +91,7 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
-  the coordinator never sees it ready and both start it.
+  the coordinator never sees it ready and the two never both start it.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.
@@ -277,7 +277,8 @@ registers without a repo).
   `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
   new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
   board, so a blocker on another board wakes the coordinator of the waiting task's board;
-  and the owner of a `blocked` task is woken when its last blocker is done. An answered ask wakes the agent
+  and the owner of a `blocked` task is woken when its last blocker is done (told to check
+  its blocked reason first when it has one). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
   reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are

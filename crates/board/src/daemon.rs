@@ -141,7 +141,8 @@ pub enum WakeAbout {
     Cleared { done: TaskId, ready: Vec<TaskId> },
     /// For the coordinator: another agent filed `task` as a proposal to review.
     Proposal { task: TaskId },
-    /// For the owner of the blocked `task`: `done` was its last blocker not done.
+    /// For the owner of the blocked `task`: `done` was its last blocker not done. The line
+    /// names only the task, so two blockers done close together make one line.
     Unblocked { done: TaskId, task: TaskId },
     /// The user answered `asker`'s ask: for the asker, or for the coordinator when the
     /// asker cannot be woken.
@@ -944,7 +945,12 @@ impl<T: T3> Daemon<T> {
                     let detail = self.client().task(done).await?;
                     let mut ready: BTreeMap<BoardSlug, Vec<TaskId>> = BTreeMap::new();
                     for blocked in &detail.blocks {
-                        let t = self.client().task(blocked).await?.task;
+                        // One gone since (its board deleted) does not hold up the rest.
+                        let t = match self.client().task(blocked).await {
+                            Ok(d) => d.task,
+                            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
+                            Err(err) => return Err(err),
+                        };
                         if t.ready && t.auto {
                             ready.entry(t.board.clone()).or_default().push(t.id);
                         } else if let Some(owner) = self.wakeable(t.owner.as_ref(), event)
@@ -1300,14 +1306,23 @@ impl<T: T3> Daemon<T> {
                     .then(|| format!("board {slug}: {} is a proposal to review", task.id))
             }
             // Still the agent's, still blocked, and nothing left to wait on.
-            WakeAbout::Unblocked { done, task } => {
+            WakeAbout::Unblocked { task, .. } => {
                 let task = self.client().task(task).await?.task;
                 let due = task.owner.as_ref() == Some(agent)
                     && task.status == TaskStatus::Blocked
                     && self.blockers_done(&task).await?;
+                // A blocked reason may name another wait, such as an ask.
+                let next = if task.blocked_reason.is_some() {
+                    format!(
+                        "check its blocked reason (task_show {}) before resuming",
+                        task.id
+                    )
+                } else {
+                    format!("resume it (task_update {} status=doing)", task.id)
+                };
                 due.then(|| {
                     format!(
-                        "board {slug}: {done} is done, the last blocker of your blocked {0}; resume it (task_update {0} status=doing)",
+                        "board {slug}: every blocker of your blocked {} is done; {next}",
                         task.id
                     )
                 })

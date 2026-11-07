@@ -118,8 +118,9 @@ the server sweeps temporary boards that are **idle**: no event on the board (nor
 it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
 `review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
 period counts from the server's start at the earliest, so time the server was down is not
-idle time. Each board is swept in its own transaction; one that fails is logged and tried
-again on the next sweep.
+idle time. Nor is a board idle while one of its tasks that is not done blocks an
+unfinished task on another board. Each board is swept in its own transaction; one that
+fails is logged and tried again on the next sweep.
 
 - An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
   `board_updated` with `fields: ["status"]` and actor `server`.
@@ -207,7 +208,10 @@ task blocked on it (`DESIGN.md`, "Waking it"). Deleting a board removes its task
 both ways: a task on another board that waited on one of them loses that blocker, with a
 `task_updated` event on its own board, by the deleting actor, with payload `{"fields":
 ["blockers"], "blockers_removed": [ids], "board_deleted": slug}` and its `version` raised,
-so a task left with no blocker to wait on is announced as ready.
+so an open task left with nothing to wait on is announced as ready (a done or dropped task
+loses the link without an event). A blocked task's owner is not woken by this and sees the
+change in its next snapshot. The temporary-board sweep never does this to a blocker that
+is not done (see "Temporary boards").
 
 ### Leases and touches
 

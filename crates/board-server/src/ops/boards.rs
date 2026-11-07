@@ -205,14 +205,16 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
     }
     const TASKS: &str = "SELECT id FROM tasks WHERE board = ?1";
     let s = slug.as_str();
-    // Tasks elsewhere that wait on this board's tasks, with the blockers they lose.
+    // Unfinished tasks elsewhere that wait on this board's tasks, with the blockers they
+    // lose. Finished ones lose the link too, unannounced: nothing waits on it any more.
     let mut dependents: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for row in cx
         .db
         .prepare_cached(
             "SELECT t.id, t.board, b.blocker FROM task_blockers b JOIN tasks t ON t.id = b.task \
              JOIN tasks bt ON bt.id = b.blocker \
-             WHERE bt.board = ?1 AND t.board != ?1 ORDER BY t.id, bt.number",
+             WHERE bt.board = ?1 AND t.board != ?1 AND t.status NOT IN ('done', 'dropped') \
+             ORDER BY t.id, bt.number",
         )?
         .query_map([s], |r| {
             Ok((
@@ -288,7 +290,9 @@ pub(crate) enum Swept {
     Deleted,
 }
 
-/// Idle temporary boards: no open ask and no task in `doing` with a live owner. Each comes
+/// Idle temporary boards: no open ask, no task in `doing` with a live owner, and no task not
+/// done that an unfinished task on another board waits on (deleting the board would let
+/// that task start without its prerequisite). Each comes
 /// with whether it is closed and when it was last active: the newest of its own change, its
 /// newest event and `since`, the server's start, so time the server was down does not
 /// count as idle.
@@ -308,6 +312,12 @@ fn idle_temporary(
                AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.board = b.slug AND a.status = 'open') \
                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
                                AND t.status = 'doing' AND {live}) \
+               AND NOT EXISTS (SELECT 1 FROM task_blockers tb \
+                               JOIN tasks bt ON bt.id = tb.blocker \
+                               JOIN tasks wt ON wt.id = tb.task \
+                               WHERE bt.board = b.slug AND bt.status != 'done' \
+                               AND wt.board != b.slug \
+                               AND wt.status NOT IN ('done', 'dropped')) \
              ORDER BY b.slug",
             live = live_sql("t.owner")
         ))?

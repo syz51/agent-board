@@ -677,7 +677,7 @@ async fn a_blocker_done_on_another_board_wakes_the_waiting_boards_coordinator_an
             ),
             (
                 "worker".to_owned(),
-                "board factory: other-3 is done, the last blocker of your blocked factory-13; resume it (task_update factory-13 status=doing)\nRun board_snapshot and continue."
+                "board factory: every blocker of your blocked factory-13 is done; resume it (task_update factory-13 status=doing)\nRun board_snapshot and continue."
                     .to_owned()
             ),
         ]

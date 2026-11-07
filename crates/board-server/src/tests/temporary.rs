@@ -729,4 +729,51 @@ async fn deleting_either_board_removes_a_link_across_boards() {
         last_event(&t).await["payload"]["fields"],
         json!(["deleted"])
     );
+
+    // A finished task that waited on the deleted board loses the link unannounced.
+    temporary_board(&t, "scratch3").await;
+    let old = t.task(A, "scratch3", "Old").await;
+    let finished = t
+        .task_with(
+            A,
+            json!({ "board": "kept", "title": "Finished", "blockers": [old] }),
+        )
+        .await;
+    t.patch(A, &finished, json!({ "status": "dropped" })).await;
+    let version = t.get_task(&finished).await["version"].clone();
+    close_and_delete(&t, "scratch3").await;
+    let task = t.get_task(&finished).await;
+    assert_eq!(
+        (&task["blockers"], &task["version"]),
+        (&json!([]), &version)
+    );
+    assert_eq!(
+        last_event(&t).await["payload"]["fields"],
+        json!(["deleted"])
+    );
+}
+
+#[tokio::test]
+async fn a_temporary_board_another_board_waits_on_is_not_swept() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.board("kept", &[REPO]).await;
+    temporary_board(&t, "scratch").await;
+    let blocker = t.task(A, "scratch", "Prerequisite").await;
+    let waiting = t
+        .task_with(
+            A,
+            json!({ "board": "kept", "title": "Waits", "blockers": [blocker] }),
+        )
+        .await;
+    t.advance(close_after() + delete_after());
+    assert_eq!(sweep(&t).await, TemporarySweep::default());
+    assert_eq!(status(&t, "scratch").await, "active");
+
+    // Once the waiting task is dropped, nothing waits on it: closed, then deleted.
+    t.patch(A, &waiting, json!({ "status": "dropped" })).await;
+    t.advance(close_after());
+    assert_eq!(slugs(&sweep(&t).await.closed), ["scratch"]);
+    t.advance(delete_after());
+    assert_eq!(slugs(&sweep(&t).await.deleted), ["scratch"]);
 }

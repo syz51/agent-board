@@ -742,6 +742,13 @@ async fn blockers_exist_and_stay_acyclic_across_boards() {
         .await;
     assert_eq!(s.as_u16(), 400, "{v}");
     assert!(v["next"].as_str().unwrap().contains("board=other"), "{v}");
+    // A mistyped board is named as missing rather than listed.
+    let (s, v) = t.patch(A, &a, json!({ "blockers": ["facotry-1"] })).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("no board facotry"),
+        "{v}"
+    );
     t.patch(A, &a, json!({ "blockers": [] })).await;
     let (s, v) = t
         .call(
@@ -759,6 +766,10 @@ async fn blockers_exist_and_stay_acyclic_across_boards() {
     assert_eq!(detail["blocks"], json!([b]));
     let v = t.patch(A, &c, json!({ "blockers": [a, b] })).await.1;
     assert_eq!(v["blockers"], json!([a, b]));
+    // The same set in another order changes nothing.
+    let version = v["version"].clone();
+    let v = t.patch(A, &c, json!({ "blockers": [b, a] })).await.1;
+    assert_eq!((&v["version"], &v["blockers"]), (&version, &json!([a, b])));
 }
 
 #[tokio::test]

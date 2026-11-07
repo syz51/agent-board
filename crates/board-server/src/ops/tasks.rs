@@ -169,13 +169,13 @@ fn check_blockers(cx: &Ctx<'_>, task: Option<&TaskId>, blockers: &[TaskId]) -> R
             ));
         }
         if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [blocker.as_str()])? {
-            return Err(invalid(
-                format!("blocker {blocker} does not exist"),
-                format!(
-                    "check the id; task_list board={} lists the tasks",
-                    blocker.board()
-                ),
-            ));
+            let board = blocker.board();
+            let next = if cx.exists("SELECT 1 FROM boards WHERE slug = ?1", [board.as_str()])? {
+                format!("check the id; task_list board={board} lists the tasks")
+            } else {
+                format!("there is no board {board}; check the id (board_status lists the boards)")
+            };
+            return Err(invalid(format!("blocker {blocker} does not exist"), next));
         }
         out.push(blocker.clone());
     }
@@ -770,7 +770,9 @@ pub(crate) fn update(
     let blockers = match &req.blockers {
         Some(new) => {
             let new = check_blockers(cx, Some(id), new)?;
-            if new != task.blockers {
+            // The same set in another order is no change.
+            let as_set = |list: &[TaskId]| list.iter().cloned().collect::<HashSet<TaskId>>();
+            if as_set(&new) != as_set(&task.blockers) {
                 fields.push("blockers");
             }
             new
