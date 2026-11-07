@@ -73,8 +73,10 @@ longer text goes, such as splitting a note or moving detail to the task body
 **Signals.** The server records every error it answers to an authenticated request that
 names an agent (`X-Board-Agent`), except expected answers: `version_conflict` (a normal
 retry), `not_found` from `GET /v1/agents/{id}` and `GET /v1/agents/{id}/handoff` (clients
-probe for them) and `claim_refused` from `POST /v1/boards/{slug}/coordinator` (the daemon
-renews it). It records the code, the
+probe for them), `claim_refused` from `POST /v1/tasks/{id}/claim` when another agent has the task (a message
+starting `claim refused:`; agents race for tasks, and stats count refusals as
+`claims_refused`) and `claim_refused` from
+`POST /v1/boards/{slug}/coordinator` (the daemon renews it). It records the code, the
 route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become
 `N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
 `signal_min_reports` errors from at least `signal_min_agents` agents within
@@ -100,7 +102,8 @@ server's minute sweep.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
-- `GET /v1/agents?board=&state=` → `[Agent]` list.
+- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
+  than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
@@ -407,7 +410,8 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
-  resuming from `Last-Event-ID`, else from `since`.
+  resuming from `Last-Event-ID`, else from `since`. Events older than 365 days are pruned
+  (the newest event always stays), so the events just after an old `since` may be gone.
 
 ### Administration (user only)
 

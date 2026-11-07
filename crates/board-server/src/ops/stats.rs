@@ -5,12 +5,40 @@ use serde::Deserialize;
 use crate::db::{Ctx, parse_json};
 use crate::error::{Result, invalid};
 
+/// The longest window stats read, in days. The server keeps the history they read
+/// (events and refused claims) this long; see [`prune_history`].
+pub(crate) const MAX_DAYS: u32 = 365;
+
+/// The most rows of each table that one [`prune_history`] transaction deletes, so pruning
+/// never holds the write lock for long.
+pub(crate) const PRUNE_BATCH: usize = 1_000;
+
+/// Deletes up to [`PRUNE_BATCH`] events and as many refused claims older than
+/// [`MAX_DAYS`], oldest first. The newest event always stays, so the feed's position
+/// (`max_seq`) holds. Returns how many events and refused claims went.
+pub(crate) fn prune_history(cx: &Ctx<'_>) -> Result<(usize, usize)> {
+    let before = cx.now_ms() - i64::from(MAX_DAYS) * 86_400_000;
+    // Events are appended in time order, so the oldest by sequence are the old ones; taking
+    // them by key reads at most one batch even when nothing is due.
+    let events = cx.db.execute(
+        "DELETE FROM events WHERE seq IN (SELECT seq FROM events ORDER BY seq LIMIT ?2) \
+         AND at < ?1 AND seq < (SELECT MAX(seq) FROM events)",
+        params![before, PRUNE_BATCH as i64],
+    )?;
+    let refusals = cx.db.execute(
+        "DELETE FROM claim_refusals WHERE id IN \
+         (SELECT id FROM claim_refusals WHERE at < ?1 ORDER BY at LIMIT ?2)",
+        params![before, PRUNE_BATCH as i64],
+    )?;
+    Ok((events, refusals))
+}
+
 pub(crate) fn validate_days(days: Option<u32>) -> Result<u32> {
     match days.unwrap_or(7) {
-        d @ 1..=365 => Ok(d),
+        d @ 1..=MAX_DAYS => Ok(d),
         d => Err(invalid(
             format!("days={d} is out of range"),
-            "send days between 1 and 365",
+            format!("send days between 1 and {MAX_DAYS}"),
         )),
     }
 }
