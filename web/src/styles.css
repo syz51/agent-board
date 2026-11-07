@@ -1622,9 +1622,10 @@ input[type="radio"] {
 }
 
 .asks-link:hover {
-  text-decoration: none;
-  background: var(--surface-3);
+  text-decoration: underline;
+  background: none;
 }
+
 
 .autopilot {
   display: flex;
@@ -1754,8 +1755,8 @@ input[type="radio"] {
 }
 
 .task-id {
-  color: var(--text-2);
-  font-size: var(--fs-sm);
+  color: var(--muted);
+  font-size: var(--fs-xs);
 }
 
 .task-main {
@@ -2941,6 +2942,10 @@ input[type="radio"] {
 
 .event-routine .event-line {
   font-size: var(--fs-sm);
+}
+
+.event-notable .event-node .icon {
+  stroke-width: 2.25;
 }
 
 .event-notable .event-node {
