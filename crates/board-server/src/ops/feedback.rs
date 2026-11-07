@@ -568,7 +568,7 @@ pub(crate) fn resolve(
         touch_agent(cx, agent)?;
     }
     let task = get_task(cx, id)?;
-    if task.feedback.is_none() {
+    if task.feedback.is_none() && task.board != cx.s.feedback_board {
         return Err(invalid(
             format!("{id} is not a feedback item"),
             format!("mark it done with task_done {id} and evidence"),
@@ -635,6 +635,9 @@ pub(crate) fn resolve(
         .or_else(|| task.owner.clone())
         .unwrap_or_else(|| task.created_by.clone());
     let now = cx.now_ms();
+    if task.feedback.is_none() {
+        adopt(cx, &task)?;
+    }
     cx.db.execute(
         "UPDATE feedback SET resolution = ?2, resolution_task = ?3, resolution_reason = ?4, \
          resolved_at = ?5, resolved_by = ?6 WHERE task = ?1",
@@ -674,6 +677,26 @@ pub(crate) fn resolve(
         }),
     )?;
     get_task(cx, id)
+}
+
+/// Makes a plain task on the feedback board (filed with `task_add`, or before feedback items
+/// existed) a feedback item about `other`, reported once by its creator, so it can be
+/// resolved and later reports of the same title find it.
+fn adopt(cx: &Ctx<'_>, task: &Task) -> Result<()> {
+    let about = "other";
+    cx.db.execute(
+        "INSERT INTO feedback (task, about, activity, source, signature, reports, reporters, \
+         last_reported_at) VALUES (?1, ?2, NULL, ?3, ?4, 1, ?5, ?6)",
+        params![
+            task.id.as_str(),
+            about,
+            enum_str(&FeedbackSource::Agent),
+            derived_signature(about, &task.title),
+            serde_json::to_string(&[&task.created_by]).expect("ids serialize"),
+            task.created_at.timestamp_millis(),
+        ],
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
