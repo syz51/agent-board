@@ -820,13 +820,13 @@ async fn task_history_shows_the_newest_events_oldest_first() {
     assert_ne!(history[0]["type"], "task_created");
 }
 
-fn pass_not_before(t: &T) -> usize {
+fn announce_not_before(t: &T) -> usize {
     t.state
         .db()
         .write(
             t.state.now(),
             t.state.settings(),
-            crate::ops::tasks::pass_not_before,
+            crate::ops::tasks::announce_not_before,
         )
         .unwrap()
 }
@@ -853,7 +853,7 @@ async fn a_task_waits_until_its_not_before() {
             .await,
         json!([])
     );
-    assert_eq!(pass_not_before(&t), 0, "not yet");
+    assert_eq!(announce_not_before(&t), 0, "not yet");
 
     // Ready as soon as the clock passes it, before the sweeper runs.
     t.advance(TimeDelta::days(2));
@@ -861,17 +861,17 @@ async fn a_task_waits_until_its_not_before() {
     let board = t.ok("GET", "/v1/boards/factory", None, None).await;
     assert_eq!(board["counts"]["ready"], 1);
 
-    // The sweeper clears it with an event by `server` that wakes the coordinator.
+    // The sweeper announces it once with an event by `server` that wakes the coordinator,
+    // and leaves the task as it is.
     let since = t.count("SELECT MAX(seq) FROM events");
-    let version = t.get_task(&waiting).await["version"].as_i64().unwrap();
-    assert_eq!(pass_not_before(&t), 1);
-    assert_eq!(pass_not_before(&t), 0, "once");
-    let task = t.get_task(&waiting).await;
-    assert!(task.get("not_before").is_none(), "{task}");
-    assert_eq!(task["version"], version + 1);
+    let before = t.get_task(&waiting).await;
+    assert_eq!(announce_not_before(&t), 1);
+    assert_eq!(announce_not_before(&t), 0, "once");
+    assert_eq!(t.get_task(&waiting).await, before);
     let page = t
         .ok("GET", &format!("/v1/events?since={since}"), None, None)
         .await;
+    assert_eq!(page["events"].as_array().unwrap().len(), 1, "{page}");
     let event = &page["events"][0];
     assert_eq!(
         (
@@ -881,22 +881,109 @@ async fn a_task_waits_until_its_not_before() {
         ),
         (Some("task_updated"), Some("server"), Some(waiting.as_str()))
     );
-    assert_eq!(event["payload"]["fields"], json!(["not_before"]));
+    assert_eq!(
+        event["payload"],
+        json!({ "fields": [], "not_before_passed": super::iso(at) })
+    );
+}
+
+#[tokio::test]
+async fn a_new_not_before_is_announced_again_and_closed_tasks_are_not() {
+    let t = setup().await;
+    let at = super::start() + TimeDelta::hours(1);
+    let id = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Twice", "not_before": super::iso(at) }),
+        )
+        .await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(announce_not_before(&t), 1);
+
+    // Moved later: waits again, and is announced again once that passes.
+    let later = super::start() + TimeDelta::hours(5);
+    t.patch(A, &id, json!({ "not_before": super::iso(later) }))
+        .await;
+    assert_eq!(t.get_task(&id).await["ready"], false);
+    assert_eq!(announce_not_before(&t), 0);
+    t.advance(TimeDelta::hours(4));
+    assert_eq!(announce_not_before(&t), 1);
+
+    // A task no longer open becomes due silently.
+    let closed = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Closed", "not_before": super::iso(super::start() + TimeDelta::hours(7)) }),
+        )
+        .await;
+    t.exec(&format!(
+        "UPDATE tasks SET status = 'blocked' WHERE id = '{closed}'"
+    ));
+    t.advance(TimeDelta::hours(2));
+    let since = t.count("SELECT MAX(seq) FROM events");
+    assert_eq!(announce_not_before(&t), 0);
+    assert_eq!(t.count("SELECT MAX(seq) FROM events"), since);
+}
+
+#[tokio::test]
+async fn claim_and_take_refuse_a_task_before_its_not_before() {
+    let t = setup().await;
+    let at = super::start() + TimeDelta::days(1);
+    let id = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Later", "not_before": super::iso(at) }),
+        )
+        .await;
+    let (s, v) = t.claim(A, &id).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().contains("waits until"),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("not_before"), "{v}");
+
+    t.register(B, Some(REPO), None).await;
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{id}/take"),
+            Some(B),
+            Some(json!({ "agent": B })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert_eq!(t.get_task(&id).await["status"], "open");
+
+    t.advance(TimeDelta::days(1));
+    let (s, v) = t.claim(A, &id).await;
+    assert!(s.is_success(), "{v}");
 }
 
 #[tokio::test]
 async fn not_before_is_set_and_cleared_by_update() {
     let t = setup().await;
     let id = t.task(A, "factory", "Hold").await;
+    // Sub-millisecond digits are dropped, as the column stores milliseconds.
     let at = super::start() + TimeDelta::days(14);
+    let precise = at + TimeDelta::microseconds(250);
     let (s, task) = t
-        .patch(A, &id, json!({ "not_before": super::iso(at) }))
+        .patch(
+            A,
+            &id,
+            json!({ "not_before": precise.to_rfc3339_opts(chrono::SecondsFormat::Micros, true) }),
+        )
         .await;
     assert!(s.is_success(), "{task}");
     assert_eq!(
         (task["ready"].as_bool(), task["not_before"].as_str()),
         (Some(false), Some(super::iso(at).as_str()))
     );
+    assert_eq!(t.get_task(&id).await["not_before"], task["not_before"]);
 
     // Absent leaves it alone.
     let (_, task) = t.patch(A, &id, json!({ "priority": "p1" })).await;

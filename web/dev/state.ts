@@ -38,7 +38,7 @@ export class DevState {
   private data: Fixtures;
   private listeners = new Set<(event: BoardEvent) => void>();
   private step = 0;
-  private nextTaskNumber = 30;
+  private nextTaskNumber = 31;
   private nextAskId = 10;
   private nextNoteId = 40;
 

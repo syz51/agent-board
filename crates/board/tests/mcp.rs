@@ -235,6 +235,23 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         json!({"agent": "claude:other", "kind": "decision", "text": "x"})
     );
 
+    // A JSON null clears not_before, as `none` does; absent leaves it alone.
+    stub.on(
+        "PATCH /v1/tasks/factory-12",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    for (id, args) in [
+        (6, json!({"id": "factory-12", "not_before": null})),
+        (7, json!({"id": "factory-12", "not_before": "none"})),
+        (8, json!({"id": "factory-12", "priority": "p2"})),
+    ] {
+        let updated = mcp.call(id, "task_update", args);
+        assert_ne!(updated["isError"], true, "{updated}");
+    }
+    let patches = stub.requests_to("PATCH /v1/tasks/factory-12");
+    let sent: Vec<Option<&Value>> = patches.iter().map(|p| p.body.get("not_before")).collect();
+    assert_eq!(sent, [Some(&Value::Null), Some(&Value::Null), None]);
+
     stub.on_error(
         "POST /v1/asks/5/withdraw",
         403,

@@ -530,7 +530,7 @@ async fn a_passed_not_before_wakes_the_coordinator() {
         .on("GET /v1/tasks/factory-7", detail("factory-7", true, &[]));
     // What the server's sweeper records when the clock passes the task's not_before.
     let mut passed = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
-    passed.payload = json!({ "fields": ["not_before"], "not_before": null });
+    passed.payload = json!({ "fields": [], "not_before_passed": "2026-11-07T00:00:00Z" });
     e.daemon.on_event(&passed, at()).await.unwrap();
     e.daemon.flush().await;
     assert_eq!(

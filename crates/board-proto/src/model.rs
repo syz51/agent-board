@@ -45,7 +45,8 @@ pub struct StatusCounts {
     pub review: u32,
     pub done: u32,
     pub dropped: u32,
-    /// Open, every blocker done, and no live owner. Computed, never stored.
+    /// Open, every blocker done, no live owner, and `not_before` (if any) passed. Computed,
+    /// never stored.
     pub ready: u32,
 }
 
@@ -97,8 +98,9 @@ pub struct Task {
     pub blockers: Vec<TaskId>,
     /// Open, every blocker done, no live owner, and `not_before` (if any) passed.
     pub ready: bool,
-    /// The task is not ready before this time. Once it passes, the server clears it with a
-    /// `task_updated` event (actor `server`), which wakes the coordinator.
+    /// The task is not ready, and cannot be claimed, before this time. Once it passes, the
+    /// server announces it with a `task_updated` event (actor `server`, no field changes),
+    /// which wakes the coordinator; the field itself stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
     /// May the coordinator start this task without the user? Defaults to true on autopilot

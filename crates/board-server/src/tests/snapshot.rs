@@ -459,7 +459,7 @@ async fn snapshots_list_tasks_waiting_for_their_not_before() {
     let full = snapshot(&t, "t3:alpha", "").await;
     assert!(
         text(&full).contains(
-            "waiting (not ready before):\n  factory-2 p2 \"Sooner\" until 2026-11-07 12:00Z\n  factory-1 p2 \"Later\" until 2026-11-21 12:00Z\n"
+            "waiting (2):\n  factory-2 p2 \"Sooner\" until 2026-11-07 12:00Z\n  factory-1 p2 \"Later\" until 2026-11-21 12:00Z\n"
         ),
         "{}",
         text(&full)
@@ -469,7 +469,7 @@ async fn snapshots_list_tasks_waiting_for_their_not_before() {
     t.advance(TimeDelta::days(2));
     let full = snapshot(&t, "t3:alpha", "").await;
     assert!(
-        text(&full).contains("waiting (not ready before):\n  factory-1 p2 \"Later\""),
+        text(&full).contains("waiting (1):\n  factory-1 p2 \"Later\""),
         "{}",
         text(&full)
     );

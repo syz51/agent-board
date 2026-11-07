@@ -62,10 +62,16 @@ struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     ready: Option<Ready>,
     /// Open tasks held by a `not_before` that has not passed, soonest first.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    waiting: Vec<Waiting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting: Option<WaitingList>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recent: Vec<Recent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WaitingList {
+    total: u32,
+    items: Vec<Waiting>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,7 +231,7 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         alerts,
         peers: Vec::new(),
         ready: None,
-        waiting: Vec::new(),
+        waiting: None,
         recent: Vec::new(),
     };
     let shown_now = board
@@ -452,16 +458,21 @@ fn fill_full(
         .filter_map(|t| t.not_before.filter(|at| *at > cx.now).map(|at| (at, t)))
         .collect();
     waiting.sort_by_key(|(at, _)| *at);
-    model.waiting = waiting
-        .into_iter()
-        .take(cx.s.snapshot_ready_items)
-        .map(|(at, t)| Waiting {
-            id: t.id.to_string(),
-            priority: priority_str(t.priority),
-            title: title(&t.title),
-            until: at.format("%Y-%m-%d %H:%MZ").to_string(),
-        })
-        .collect();
+    if !waiting.is_empty() {
+        model.waiting = Some(WaitingList {
+            total: waiting.len() as u32,
+            items: waiting
+                .into_iter()
+                .take(cx.s.snapshot_ready_items)
+                .map(|(at, t)| Waiting {
+                    id: t.id.to_string(),
+                    priority: priority_str(t.priority),
+                    title: title(&t.title),
+                    until: at.format("%Y-%m-%d %H:%MZ").to_string(),
+                })
+                .collect(),
+        });
+    }
     if !ready.is_empty() {
         model.ready = Some(Ready {
             total: ready.len() as u32,
@@ -908,7 +919,14 @@ fn render_capped(mut model: Model, format: SnapshotFormat, cap: usize) -> String
 
 /// Removes the bottom-most item; false when nothing more can be cut.
 fn cut_last(m: &mut Model) -> bool {
-    if m.recent.pop().is_some() || m.waiting.pop().is_some() {
+    if m.recent.pop().is_some() {
+        return true;
+    }
+    if let Some(waiting) = &mut m.waiting {
+        waiting.items.pop();
+        if waiting.items.is_empty() {
+            m.waiting = None;
+        }
         return true;
     }
     if let Some(ready) = &mut m.ready {
@@ -1085,9 +1103,13 @@ fn render_lines(m: &Model) -> String {
             );
         }
     }
-    if !m.waiting.is_empty() {
-        o.push_str("waiting (not ready before):\n");
-        for t in &m.waiting {
+    if let Some(w) = &m.waiting {
+        if w.items.len() < w.total as usize {
+            let _ = writeln!(o, "waiting ({} of {}):", w.items.len(), w.total);
+        } else {
+            let _ = writeln!(o, "waiting ({}):", w.total);
+        }
+        for t in &w.items {
             let _ = writeln!(
                 o,
                 "  {} {} {} until {}",
@@ -1205,12 +1227,12 @@ fn render_yaml(m: &Model) -> String {
             );
         }
     }
-    if !m.waiting.is_empty() {
-        o.push_str("waiting:\n");
-        for t in &m.waiting {
+    if let Some(w) = &m.waiting {
+        let _ = writeln!(o, "waiting:\n  total: {}\n  items:", w.total);
+        for t in &w.items {
             let _ = writeln!(
                 o,
-                "  - {{id: {}, priority: {}, title: {}, until: {}}}",
+                "    - {{id: {}, priority: {}, title: {}, until: {}}}",
                 t.id,
                 t.priority,
                 q(&t.title),

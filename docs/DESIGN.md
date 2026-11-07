@@ -79,7 +79,7 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice).
   Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
-  waiting for a date is `not_before`, which the server's sweeper clears once passed.
+  waiting for a date is `not_before`, which the server's sweeper announces once passed.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.

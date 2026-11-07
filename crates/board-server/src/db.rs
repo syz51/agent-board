@@ -272,7 +272,8 @@ pub(crate) fn live_sql(col: &str) -> String {
     )
 }
 
-/// SQL that is true when task `t` is ready: open, every blocker done, no live owner.
+/// SQL that is true when task `t` is ready: open, every blocker done, no live owner, and
+/// `not_before` (if any) passed.
 /// Expects the named parameters `:now` and `:cutoff`.
 pub(crate) fn ready_sql(t: &str) -> String {
     format!(

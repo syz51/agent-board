@@ -168,25 +168,27 @@ impl Output {
     }
 }
 
-/// Parses a `snake_case` enum value the way the wire format spells it.
-/// A `not_before` value: a date (`YYYY-MM-DD`, midnight UTC) or an RFC 3339 time; `none`
-/// means no wait.
-pub fn parse_not_before(value: &str) -> Result<Option<Timestamp>> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("none") {
+/// A `not_before` argument: absent leaves it alone (`None`); `none` clears it
+/// (`Some(None)`); otherwise a date (`YYYY-MM-DD`, midnight UTC) or an RFC 3339 time.
+pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>> {
+    let Some(value) = value.map(str::trim) else {
         return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
     }
     if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Ok(Some(at.to_utc()));
+        return Ok(Some(Some(at.to_utc())));
     }
     match chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        Ok(date) => Ok(Some(date.and_time(chrono::NaiveTime::MIN).and_utc())),
+        Ok(date) => Ok(Some(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()))),
         Err(_) => bail!(
             "not_before {value:?} is neither a date (YYYY-MM-DD) nor an RFC 3339 time; send one, or none to clear it"
         ),
     }
 }
 
+/// Parses a `snake_case` enum value the way the wire format spells it.
 pub fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_value(Value::String(value.to_owned()))
         .map_err(|_| format!("unknown value {value:?}"))

@@ -900,7 +900,7 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
     let e = env();
     let mut waiting = task_fixture("factory-7", "Later");
     waiting.ready = false;
-    waiting.not_before = Some("2026-11-21T00:00:00Z".parse().unwrap());
+    waiting.not_before = Some("2099-11-21T00:00:00Z".parse().unwrap());
     e.stub.on("POST /v1/tasks", &waiting);
     let out = e.run(&[
         "add",
@@ -908,17 +908,17 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
         "--board",
         "factory",
         "--not-before",
-        "2026-11-21",
+        "2099-11-21",
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        stdout(&out).contains("waits until 2026-11-21 00:00Z"),
+        stdout(&out).contains("waits until 2099-11-21 00:00Z"),
         "{}",
         stdout(&out)
     );
     assert_eq!(
         e.stub.requests_to("POST /v1/tasks")[0].body["not_before"],
-        "2026-11-21T00:00:00Z"
+        "2099-11-21T00:00:00Z"
     );
     let out = e.run(&[
         "add",
@@ -926,12 +926,12 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
         "--board",
         "factory",
         "--not-before",
-        "2026-11-21T09:30:00+08:00",
+        "2099-11-21T09:30:00+08:00",
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         e.stub.requests_to("POST /v1/tasks")[1].body["not_before"],
-        "2026-11-21T01:30:00Z"
+        "2099-11-21T01:30:00Z"
     );
 
     e.stub.on(
@@ -954,8 +954,13 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
     let body = &e.stub.requests_to("PATCH /v1/tasks/factory-7")[0].body;
     assert_eq!(body["not_before"], Value::Null);
     assert!(body.as_object().unwrap().contains_key("not_before"));
+    // A passed date is not shown as a wait.
+    let mut passed = waiting.clone();
+    passed.not_before = Some("2020-01-01T00:00:00Z".parse().unwrap());
+    e.stub.on("PATCH /v1/tasks/factory-7", &passed);
     let out = e.run(&["update", "factory-7", "--priority", "p1"]);
     assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("waits until"), "{}", stdout(&out));
     let body = &e.stub.requests_to("PATCH /v1/tasks/factory-7")[1].body;
     assert!(
         !body.as_object().unwrap().contains_key("not_before"),

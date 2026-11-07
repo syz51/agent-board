@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType, EvidenceKind, Note,
-    Priority, Task, TaskId, TaskStatus, UpdateTask,
+    Priority, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -291,38 +291,61 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     get_task(cx, &id)
 }
 
-/// Clears every `not_before` the clock has passed, each with a `task_updated` event by
-/// `server` so the coordinator learns the task may be ready. Run by the sweeper.
-pub(crate) fn pass_not_before(cx: &mut Ctx<'_>) -> Result<usize> {
-    let now = cx.now_ms();
-    let due: Vec<(TaskId, BoardSlug, i64)> = cx
+/// Announces every `not_before` the clock has passed, once: a `task_updated` event by
+/// `server` (no field changes; `not_before_passed` names the time) for open tasks, which
+/// wakes the coordinator. The task itself is left as it is. Run by the sweeper.
+pub(crate) fn announce_not_before(cx: &mut Ctx<'_>) -> Result<usize> {
+    let due: Vec<(TaskId, BoardSlug, i64, String)> = cx
         .db
         .prepare_cached(
-            "SELECT id, board, not_before FROM tasks WHERE not_before <= ?1 ORDER BY not_before, id",
+            "UPDATE tasks SET not_before_announced = 1 \
+             WHERE not_before <= ?1 AND not_before_announced = 0 \
+             RETURNING id, board, not_before, status",
         )?
-        .query_map([now], |r| {
+        .query_map([cx.now_ms()], |r| {
             Ok((
                 parse_id(&r.get::<_, String>(0)?)?,
                 parse_id(&r.get::<_, String>(1)?)?,
                 r.get(2)?,
+                r.get(3)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, board, at) in &due {
-        cx.db.execute(
-            "UPDATE tasks SET not_before = NULL, version = version + 1, updated_at = ?2 \
-             WHERE id = ?1",
-            params![id.as_str(), now],
-        )?;
+    let mut announced = 0;
+    for (id, board, at, status) in &due {
+        // Only an open task can become ready; for the rest the date no longer matters.
+        if status != "open" {
+            continue;
+        }
         cx.emit(
             Some(board),
             "server",
             EventType::TaskUpdated,
             Some(id),
-            serde_json::json!({ "fields": ["not_before"], "not_before": null, "passed": ts(*at) }),
+            serde_json::json!({ "fields": [], "not_before_passed": ts(*at) }),
         )?;
+        announced += 1;
     }
-    Ok(due.len())
+    Ok(announced)
+}
+
+/// Refuses to start a task whose `not_before` has not passed.
+fn check_not_before(cx: &Ctx<'_>, task: &Task) -> Result<()> {
+    match task.not_before {
+        Some(at) if at > cx.now => Err(bad_transition(
+            format!("{} waits until {}", task.id, at.format("%Y-%m-%d %H:%MZ")),
+            format!(
+                "pick a ready task (task_list ready=true), or clear its not_before (task_update {} not_before=none) if it should start now",
+                task.id
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A time as stored: whole milliseconds.
+fn to_millis(at: Timestamp) -> Timestamp {
+    ts(at.timestamp_millis())
 }
 
 /// Filters of `GET /v1/tasks`.
@@ -448,6 +471,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         ));
     }
     check_blockers_done(cx, id)?;
+    check_not_before(cx, &task)?;
     check_doing_limit(cx, agent, id)?;
     let now = cx.now_ms();
     let previous = task.owner.clone();
@@ -517,6 +541,7 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
     };
     if task.status == TaskStatus::Open {
         check_blockers_done(cx, id)?;
+        check_not_before(cx, &task)?;
     }
     if status == TaskStatus::Doing {
         check_doing_limit(cx, agent, id)?;
@@ -743,7 +768,7 @@ pub(crate) fn update(
     }
     // A time already passed means no wait, as on create.
     let not_before = match req.not_before {
-        Some(new) => new.filter(|&at| at > cx.now),
+        Some(new) => new.map(to_millis).filter(|&at| at > cx.now),
         None => task.not_before,
     };
     if not_before != task.not_before {
@@ -757,6 +782,7 @@ pub(crate) fn update(
     cx.db.execute(
         "UPDATE tasks SET status = ?2, owner = ?3, title = ?4, body = ?5, acceptance = ?6, \
          priority = ?7, auto = ?8, blocked_reason = ?9, version = version + 1, updated_at = ?10, \
+         not_before_announced = CASE WHEN not_before IS ?11 THEN not_before_announced ELSE 0 END, \
          not_before = ?11, \
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \

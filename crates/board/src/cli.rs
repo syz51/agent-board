@@ -507,12 +507,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blockers: a.blockers,
                 priority: a.priority,
                 auto: a.auto,
-                not_before: a
-                    .not_before
-                    .as_deref()
-                    .map(ops::parse_not_before)
-                    .transpose()?
-                    .flatten(),
+                not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
             };
             ops::task_add(&ctx()?, new).await?
         }
@@ -530,11 +525,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blockers,
                 blocked_reason: a.blocked_reason,
                 auto: a.auto,
-                not_before: a
-                    .not_before
-                    .as_deref()
-                    .map(ops::parse_not_before)
-                    .transpose()?,
+                not_before: ops::parse_not_before(a.not_before.as_deref())?,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }
