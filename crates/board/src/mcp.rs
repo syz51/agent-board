@@ -455,14 +455,14 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "feedback_resolve",
-        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item, forwarded elsewhere or declined, with a reason for the last two. It moves to done.",
+        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item, forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
         params: || {
             vec![
                 ("id", task_arg("The feedback item."), true),
                 (
                     "kind",
                     one_of(
-                        &["routed", "duplicate", "forwarded", "declined"],
+                        &["routed", "duplicate", "forwarded", "declined", "fixed"],
                         "How it is resolved.",
                     ),
                     true,
@@ -477,7 +477,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "reason",
                     s(
-                        "For forwarded and declined: where it went, or why not.",
+                        "For forwarded, declined and fixed: where it went, why not, or what changed.",
                         RESOLUTION_REASON_CHARS_MAX,
                     ),
                     false,

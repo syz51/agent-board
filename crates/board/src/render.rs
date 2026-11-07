@@ -439,7 +439,7 @@ pub fn stats(stats: &Stats) -> String {
          tasks: {} created · {} done ({} without a check) · median {} in doing\n\
          claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
          asks: {} created · {} answered · median {} to answer\n\
-         feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined",
+         feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined, {} fixed",
         stats.days,
         stats.tasks_created,
         stats.tasks_done,
@@ -457,6 +457,7 @@ pub fn stats(stats: &Stats) -> String {
         stats.feedback.resolved.duplicate,
         stats.feedback.resolved.forwarded,
         stats.feedback.resolved.declined,
+        stats.feedback.resolved.fixed,
     )
 }
 

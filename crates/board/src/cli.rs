@@ -211,6 +211,11 @@ pub enum Command {
             RESOLUTION_REASON_CHARS_MAX,
         ))]
         declined: Option<String>,
+        #[arg(long, group = "resolution", value_name = "WHAT CHANGED", help = at_most(
+            "You fixed the cause yourself: say what changed",
+            RESOLUTION_REASON_CHARS_MAX,
+        ))]
+        fixed: Option<String>,
     },
     /// Run the MCP server on stdio.
     Mcp,
@@ -605,10 +610,12 @@ impl Command {
             Self::Resolve {
                 forwarded,
                 declined,
+                fixed,
                 ..
             } => {
                 check_opt("reason", forwarded, RESOLUTION_REASON_CHARS_MAX)?;
                 check_opt("reason", declined, RESOLUTION_REASON_CHARS_MAX)?;
+                check_opt("reason", fixed, RESOLUTION_REASON_CHARS_MAX)?;
             }
             Self::Board(BoardCommand::Create { title, goal, .. }) => {
                 check_board_title(title)?;
@@ -874,12 +881,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             duplicate,
             forwarded,
             declined,
+            fixed,
         } => {
-            let (kind, task, reason) = match (routed, duplicate, forwarded, declined) {
+            let (kind, task, reason) = match (routed, duplicate, forwarded, declined, fixed) {
                 (Some(task), ..) => (ResolutionKind::Routed, Some(task), None),
                 (_, Some(task), ..) => (ResolutionKind::Duplicate, Some(task), None),
-                (_, _, Some(reason), _) => (ResolutionKind::Forwarded, None, Some(reason)),
-                (.., Some(reason)) => (ResolutionKind::Declined, None, Some(reason)),
+                (_, _, Some(reason), ..) => (ResolutionKind::Forwarded, None, Some(reason)),
+                (_, _, _, Some(reason), _) => (ResolutionKind::Declined, None, Some(reason)),
+                (.., Some(reason)) => (ResolutionKind::Fixed, None, Some(reason)),
                 _ => unreachable!("clap requires one resolution"),
             };
             let req = ResolveFeedback { kind, task, reason };

@@ -161,6 +161,13 @@ pub enum ResolutionKind {
     Forwarded,
     /// Not acted on (`reason` says why); later reports still add to it.
     Declined,
+    /// The resolver fixed the cause itself (`reason` says what changed); a later report
+    /// files a new item that recurs this one.
+    Fixed,
+    /// A kind added by a newer server, read by a client that predates it. The server never
+    /// stores or accepts it (`docs/API.md`, "Compatibility").
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,7 +176,7 @@ pub struct FeedbackResolution {
     /// The routed task, or the original of a duplicate; may be on another board.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
-    /// Required for `forwarded` and `declined`; untrusted for readers.
+    /// Required for `forwarded`, `declined` and `fixed`; untrusted for readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at: Timestamp,
@@ -392,6 +399,10 @@ pub enum EventType {
     AskCreated,
     AskAnswered,
     AskWithdrawn,
+    /// A type added by a newer server, read by a client that predates it. The server never
+    /// records it (`docs/API.md`, "Compatibility").
+    #[serde(other)]
+    Unknown,
 }
 
 /// One entry of the append-only event log, which is also the change feed.
