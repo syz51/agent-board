@@ -1,6 +1,8 @@
 /* agent-board web view. One token set, light and dark from the system preference.
-   Type: one sans family on a fixed scale (12 · 13 · 14 · 16 · 20 · 26), monospace only for
-   ids and code. Structure: hairline borders; shadows only on raised and overlay surfaces. */
+   Type: Inter (self-hosted, optical sizes; see ui/fonts.ts) on a fixed scale of roles:
+     11 badge · 12 caption · 13 meta/label · 14 body · 16 heading · 20 title · 28 display.
+   Ids and handles are sans with tabular figures; monospace is only for code, repos and
+   branches. Structure: hairline borders; shadows only on raised and overlay surfaces. */
 
 :root {
   color-scheme: light dark;
@@ -47,14 +49,21 @@
   --radius: 10px;
   --radius-sm: 6px;
 
-  --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI Variable", "Segoe UI", system-ui, Roboto, sans-serif;
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --fs-2xs: 11px;
   --fs-xs: 12px;
   --fs-sm: 13px;
   --fs-md: 14px;
   --fs-lg: 16px;
   --fs-xl: 20px;
-  --fs-2xl: 26px;
+  --fs-2xl: 28px;
+  /* Tracking per size, after Inter's dynamic metrics; the optical sizes do the rest. */
+  --track-sm: -0.003em;
+  --track-md: -0.006em;
+  --track-lg: -0.011em;
+  --track-xl: -0.017em;
+  --track-2xl: -0.021em;
 
   --side-w: 232px;
   --gutter: 16px;
@@ -120,7 +129,9 @@ body {
   background: var(--canvas);
   color: var(--text);
   font: 400 var(--fs-md)/1.5 var(--font);
-  font-feature-settings: "kern";
+  letter-spacing: var(--track-md);
+  font-optical-sizing: auto;
+  font-feature-settings: "kern", "calt", "cv05";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow-wrap: break-word;
@@ -141,11 +152,21 @@ a:hover {
 }
 
 code,
-pre,
-.slug {
+pre {
   font-family: var(--mono);
   font-size: 0.875em;
+  letter-spacing: 0;
   font-variant-ligatures: none;
+}
+
+/* Ids, slugs and handles: the text face with tabular, slashed figures, so they line up
+   and read as identifiers without switching families in every row. */
+.ident {
+  font-family: var(--font);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums slashed-zero;
+  letter-spacing: 0;
+  white-space: nowrap;
 }
 
 h1,
@@ -235,9 +256,9 @@ main:focus {
   gap: 9px;
   min-height: 32px;
   color: var(--text);
-  font-size: 15px;
+  font-size: var(--fs-lg);
   font-weight: 650;
-  letter-spacing: -0.015em;
+  letter-spacing: var(--track-lg);
   white-space: nowrap;
 }
 
@@ -299,9 +320,10 @@ main:focus {
   height: 18px;
   padding: 0 6px;
   border-radius: 9px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 650;
   line-height: 18px;
+  letter-spacing: 0;
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
@@ -497,8 +519,9 @@ main {
   background: var(--surface);
   border: 1px solid var(--line-strong);
   color: var(--text-2);
-  font-size: 10px;
-  font-weight: 650;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .side-empty {
@@ -510,7 +533,7 @@ main {
 @media (max-width: 720px) {
   :root {
     --fs-md: 15px;
-    --fs-2xl: 23px;
+    --fs-2xl: 24px;
   }
 
   .sidebar {
@@ -534,7 +557,8 @@ main {
     justify-content: center;
     gap: 3px;
     padding: 6px 2px;
-    font-size: 11.5px;
+    font-size: var(--fs-2xs);
+    letter-spacing: 0;
     font-weight: 500;
     border-radius: 0;
   }
@@ -627,8 +651,8 @@ main {
 .task-head h1 {
   font-size: var(--fs-2xl);
   font-weight: 650;
-  line-height: 1.2;
-  letter-spacing: -0.022em;
+  line-height: 1.15;
+  letter-spacing: var(--track-2xl);
   text-wrap: balance;
 }
 
@@ -658,19 +682,23 @@ main {
 }
 
 .section h2,
-.prop-group h2 {
+.prop-group h2,
+.waiting h2 {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   margin-bottom: 12px;
-  font-size: var(--fs-md);
+  font-size: var(--fs-lg);
   font-weight: 600;
+  letter-spacing: var(--track-lg);
   color: var(--text);
 }
 
 .section-count {
   color: var(--muted);
+  font-size: var(--fs-sm);
   font-weight: 500;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -705,7 +733,7 @@ main {
 .card-title {
   font-size: var(--fs-lg);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: var(--track-lg);
 }
 
 .card-title a {
@@ -829,7 +857,7 @@ main {
   display: inline-flex;
   align-items: center;
   min-height: 24px;
-  font-family: var(--mono);
+  font-variant-numeric: tabular-nums slashed-zero;
 }
 
 .tag-accent {
@@ -936,9 +964,9 @@ main {
   background: var(--surface-3);
   box-shadow: inset 0 0 0 1px var(--line-strong);
   color: var(--text-2);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
@@ -946,7 +974,7 @@ main {
 .avatar-lg {
   width: 30px;
   height: 30px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .owner {
@@ -1434,8 +1462,8 @@ input[type="radio"] {
 }
 
 .dialog h2 {
-  font-size: 17px;
-  letter-spacing: -0.01em;
+  font-size: var(--fs-lg);
+  letter-spacing: var(--track-lg);
 }
 
 .dialog-text {
@@ -1566,7 +1594,6 @@ input[type="radio"] {
 
 .coordinator .pill {
   height: 20px;
-  font-size: 11.5px;
 }
 
 .asks-link {
@@ -1606,12 +1633,6 @@ input[type="radio"] {
   margin-bottom: 32px;
 }
 
-.waiting h2 {
-  margin-bottom: 12px;
-  font-size: var(--fs-md);
-  font-weight: 600;
-}
-
 .ask-preview .row-link {
   display: grid;
   grid-template-columns: 96px minmax(0, 1fr) auto;
@@ -1628,9 +1649,10 @@ input[type="radio"] {
 }
 
 .ask-preview-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   font-weight: 500;
 }
 
@@ -1727,9 +1749,7 @@ input[type="radio"] {
 
 .task-id {
   color: var(--text-2);
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  font-size: var(--fs-sm);
 }
 
 .task-main {
@@ -1899,17 +1919,7 @@ input[type="radio"] {
     grid-area: updated;
   }
 
-  .waiting {
-  margin-bottom: 32px;
-}
-
-.waiting h2 {
-  margin-bottom: 12px;
-  font-size: var(--fs-md);
-  font-weight: 600;
-}
-
-.ask-preview .row-link {
+  .ask-preview .row-link {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
   }
@@ -2036,7 +2046,7 @@ input[type="radio"] {
   text-decoration: none;
 }
 
-.link-card code {
+.link-card .ident {
   color: var(--muted);
   font-size: var(--fs-xs);
 }
@@ -2113,8 +2123,9 @@ input[type="radio"] {
   border-radius: 50%;
   background: var(--surface-3);
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2279,6 +2290,18 @@ input[type="radio"] {
   overflow-wrap: anywhere;
 }
 
+/* On a phone the destination stays on one line, cut at the end; the link itself is whole. */
+@media (max-width: 720px) {
+  .link-target {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+}
+
 .md-link-blocked {
   color: var(--text-2);
 }
@@ -2324,12 +2347,12 @@ input[type="radio"] {
 .agent-handle {
   font-size: var(--fs-lg);
   font-weight: 600;
-  letter-spacing: -0.01em;
-  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--track-lg);
+  font-variant-numeric: tabular-nums slashed-zero;
 }
 
 .agent-facts code {
-  font-size: 12.5px;
+  font-size: var(--fs-xs);
 }
 
 .agent-facts {
@@ -2377,9 +2400,9 @@ input[type="radio"] {
   align-self: center;
 }
 
-.agent-task code {
+.agent-task .ident {
   color: var(--muted);
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
 }
 
 .agent-title {
@@ -2465,7 +2488,6 @@ input[type="radio"] {
 
 .waiting-board .group-head a {
   color: var(--text);
-  font-family: var(--mono);
 }
 
 .ask-card {
@@ -2697,9 +2719,8 @@ input[type="radio"] {
   text-decoration: underline;
 }
 
-.update-title code {
+.update-title .ident {
   color: var(--muted);
-  font-weight: 500;
   margin-right: 4px;
 }
 
@@ -2866,7 +2887,7 @@ input[type="radio"] {
   font-weight: 500;
 }
 
-.event-line code {
+.event-line .ident {
   font-size: var(--fs-sm);
 }
 
@@ -2889,8 +2910,8 @@ input[type="radio"] {
 .event-seq {
   min-width: 4ch;
   text-align: right;
-  font-family: var(--mono);
   font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums slashed-zero;
   padding-top: 1px;
 }
 

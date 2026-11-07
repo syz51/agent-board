@@ -100,7 +100,7 @@ export function BoardScreen({ slug }: { slug: string }) {
         <div class="page-title">
           <div class="title-line">
             <h1>{board.data?.title ?? slug}</h1>
-            <code class="slug">{slug}</code>
+            <span class="slug ident">{slug}</span>
             {board.data?.autopilot && <span class="tag tag-accent"><Icon name="bolt" />Autopilot</span>}
             {board.data?.temporary && <span class="tag">Temporary</span>}
           </div>
@@ -228,7 +228,7 @@ export function TaskRow(
     <li class="task-row">
       <PriorityBadge priority={task.priority} />
       <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
-      <code class="task-id">{task.id}</code>
+      <span class="task-id ident">{task.id}</span>
       <div class="task-main">
         <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
           <PlainText text={task.title} />

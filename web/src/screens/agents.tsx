@@ -137,7 +137,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             ? (
               <a href={`/tasks/${encodeURIComponent(task.id)}`}>
                 <StatusIcon status="doing" />
-                <code>{task.id}</code> <PlainText text={task.title} />
+                <span class="ident">{task.id}</span> <PlainText text={task.title} />
               </a>
             )
             : agent.title

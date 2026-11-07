@@ -130,7 +130,7 @@ function BoardCard(
         <h2 class="card-title">
           <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
         </h2>
-        <code class="slug">{board.slug}</code>
+        <span class="slug ident">{board.slug}</span>
         <span class="board-tags">
           {board.status !== "active" && (
             <span class={`pill board-${board.status}`}>
@@ -184,14 +184,12 @@ function BoardCard(
             )
             : <Who id={board.coordinator} agents={agents} />}
         </div>
-        <a
-          class={board.open_asks > 0 ? "asks-link has-asks" : "asks-link"}
-          href={`/asks?board=${encodeURIComponent(board.slug)}`}
-          aria-label={`${board.open_asks} open ask${board.open_asks === 1 ? "" : "s"}`}
-        >
-          <Icon name="inbox" />
-          {board.open_asks}
-        </a>
+        {board.open_asks > 0 && (
+          <a class="asks-link has-asks" href={`/asks?board=${encodeURIComponent(board.slug)}`}>
+            <Icon name="inbox" />
+            {board.open_asks} {board.open_asks === 1 ? "ask" : "asks"}
+          </a>
+        )}
         <AutopilotSwitch board={board} />
       </footer>
     </article>

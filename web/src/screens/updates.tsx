@@ -169,7 +169,7 @@ function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agen
     <article class="card update-card">
       <h4 class="update-title">
         <a href={`/tasks/${encodeURIComponent(item.task)}`}>
-          <code>{item.task}</code> <PlainText text={item.title} />
+          <span class="ident">{item.task}</span> <PlainText text={item.title} />
         </a>
       </h4>
       <p class="update-meta">
@@ -180,7 +180,7 @@ function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agen
         {item.parent && (
           <>
             {" · part of "}
-            <a href={`/tasks/${encodeURIComponent(item.parent)}`}><code>{item.parent}</code></a>
+            <a href={`/tasks/${encodeURIComponent(item.parent)}`}><span class="ident">{item.parent}</span></a>
           </>
         )}
       </p>

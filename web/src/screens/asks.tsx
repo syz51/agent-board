@@ -259,7 +259,7 @@ function AskCard(
           {ask.task && (
             <>
               <Icon name="chevron" />
-              <a href={`/tasks/${encodeURIComponent(ask.task)}`}><code>{ask.task}</code></a>
+              <a href={`/tasks/${encodeURIComponent(ask.task)}`}><span class="ident">{ask.task}</span></a>
             </>
           )}
         </span>

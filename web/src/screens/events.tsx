@@ -176,10 +176,10 @@ export function EventLine(
           <Who id={event.actor} agents={agents} />
           <span class="event-type" title={event.type}>{verb}</span>
           {showTask && event.task && (
-            <a href={`/tasks/${encodeURIComponent(event.task)}`}><code>{event.task}</code></a>
+            <a href={`/tasks/${encodeURIComponent(event.task)}`}><span class="ident">{event.task}</span></a>
           )}
           {showTask && !event.task && event.board && !PERSONAL.has(event.type) && (
-            <a href={`/boards/${encodeURIComponent(event.board)}`}><code>{event.board}</code></a>
+            <a href={`/boards/${encodeURIComponent(event.board)}`}><span class="ident">{event.board}</span></a>
           )}
           {suffix && <span class="event-type">{suffix}</span>}
         </p>

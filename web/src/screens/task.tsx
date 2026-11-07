@@ -289,7 +289,7 @@ function TaskRef({ id, related }: { id: string; related: Map<string, Task> }) {
   const task = related.get(id);
   return (
     <>
-      <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
+      <a href={`/tasks/${encodeURIComponent(id)}`}><span class="ident">{id}</span></a>
       {task && <StatusBadge status={task.status} ready={task.ready} />}
     </>
   );
@@ -309,7 +309,7 @@ function TaskLinks(
             <li key={id}>
               <a class="link-card" href={`/tasks/${encodeURIComponent(id)}`}>
                 {task && <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />}
-                <code>{id}</code>
+                <span class="ident">{id}</span>
                 {task && <PlainText text={task.title} class="link-card-title" />}
               </a>
             </li>
