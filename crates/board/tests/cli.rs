@@ -696,6 +696,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
         ask_answer_minutes_median: Some(4.0),
         doing_minutes_median: None,
         done_without_check_evidence: 1,
+        done_under_a_minute: Some(2),
         feedback: board_proto::FeedbackStats {
             reported: 6,
             filed: 2,
@@ -715,7 +716,7 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     assert_eq!(
         stdout(&out).trim(),
         "stats, last 7 days\n\
-         tasks: 5 created · 3 done (1 without a check) · median n/a in doing\n\
+         tasks: 5 created · 3 done (1 without a check, 2 under a minute in doing) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
          asks: 2 created · 1 answered · median 4m to answer\n\
          feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed"

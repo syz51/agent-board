@@ -23,8 +23,8 @@ use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    NamedParams, agent_boards, counts, find_handoff, get_agent, handle_of, is_live, json_ids,
-    latest_events, load_agents, load_events, load_tasks,
+    NamedParams, agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live,
+    json_ids, latest_events, load_agents, load_events, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -43,7 +43,9 @@ const ALERT_SCAN: u32 = 1000;
 /// request than a recent one: older events are skipped, and one alert says which.
 const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
-/// so traffic about other agents' work, on any board, does not use up the scan.
+/// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
+/// reminders (at most one per task a day) all pass, as a coordinator gets those of its
+/// board's tasks whose owner is gone.
 const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
@@ -51,6 +53,7 @@ const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
       AND (task IN (SELECT value FROM json_each(:mine)) \
            OR json_extract(payload, '$.previous_owner') = :me)) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
      OR (type = 'task_created' AND :any_mine))";
@@ -690,8 +693,10 @@ const CHANGED: u8 = 2;
 const ANSWERED: u8 = 3;
 const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
+/// A task left quiet in review: a reminder, so after the alerts about change.
+const QUIET_REVIEW: u8 = 6;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
-const FILED: u8 = 6;
+const FILED: u8 = 7;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -921,6 +926,62 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         },
                     );
                 }
+            }
+            EventType::TaskUpdated if event.payload.get("quiet_review").is_some() => {
+                let Some(task) = &event.task else { continue };
+                // The owner is reminded; when the owner is gone (such as an ended child),
+                // the board's coordinator is, so the wait is not lost.
+                let to_me = mine_ids.contains(task) || {
+                    let row: Option<(Option<String>, String, String, Option<String>)> = cx
+                        .db
+                        .query_row(
+                            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
+                             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
+                            [task.as_str()],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?;
+                    match row {
+                        Some((owner, board, status, state)) if status == "review" => {
+                            let board: BoardSlug = parse_id(&board)?;
+                            let gone = match &owner {
+                                Some(owner) => {
+                                    state.as_deref() == Some("ended") || !is_live(cx, owner)?
+                                }
+                                None => true,
+                            };
+                            gone && get_board(cx, &board)?
+                                .coordinator
+                                .is_some_and(|c| c.as_str() == me)
+                        }
+                        _ => false,
+                    }
+                };
+                if !to_me {
+                    continue;
+                }
+                let age = |key: &str| {
+                    event
+                        .payload
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                        .map_or_else(|| "a day".to_owned(), |at| ago(cx.now - at))
+                };
+                out.insert(
+                    (QUIET_REVIEW, task.to_string()),
+                    Alert {
+                        alert: format!(
+                            "{task} has sat in review for {} with no note from its owner for {}",
+                            age("in_review_since"),
+                            age("quiet_review")
+                        ),
+                        action: format!(
+                            "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
+                        ),
+                        rank: rank(QUIET_REVIEW),
+                    },
+                );
             }
             EventType::TaskUpdated | EventType::TaskReleased | EventType::NoteAdded => {
                 let Some(task) = &event.task else { continue };

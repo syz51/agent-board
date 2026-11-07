@@ -91,6 +91,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
+- **Waiting states**: `review` is where a task waits on CI or a reviewer, with a note naming
+  the PR; `blocked` is where it waits on another task or the user (an ask), or on anything
+  else with a `blocked_reason`; a wait for a date alone is an `open` task with `not_before`.
+  `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
+  which fits which wait. The sweeper announces a task in `review` a day with no note from
+  its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
+  when the owner is gone. Stats count dones that spent under a minute in `doing`, takeovers
+  and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
@@ -522,7 +530,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   normalized message. Agents rarely report a refusal they could work around; the error log
   does it for them.
 - **Measurement.** `GET /v1/stats` reports refused claims, stale takeovers, lease
-  conflicts, ask response times, time in `doing`, done-without-check counts, and feedback
+  conflicts, ask response times, time in `doing`, done-without-check counts, dones under a
+  minute in `doing`, and feedback
   reported, filed and resolved by kind.
 - **Review.** A periodic review (for example a weekly job) reads the feedback board and
   the stats, routes items to work, proposes changes to the defaults, the coordinator prompt

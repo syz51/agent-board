@@ -219,6 +219,14 @@ Reopening a closed board, or any change on it, starts the period again.
   <time>}`; the task itself is unchanged (same `version`, `not_before` kept). The daemon
   wakes the coordinator if the task is then ready. Setting a new `not_before` announces it
   again once that passes. `not_before` is absent from a `Task` without one.
+- Within a minute of a task in `review` passing `review_quiet_secs` with no note from its
+  owner, the server records one `task_updated` event by actor `server` with payload
+  `{"fields": [], "quiet_review": <time>, "in_review_since": <time>}`: `quiet_review` is the
+  owner's last note or the move to `review`, whichever is later, and `in_review_since` the
+  move. The task is unchanged. While it stays quiet the event repeats every
+  `review_quiet_secs`; a note from the owner or a new move to `review` restarts the clock.
+  The snapshot shows it as an alert to the owner, or to the board's coordinator when the
+  owner has ended or is not live.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
@@ -403,10 +411,11 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 - `GET /v1/snapshot?agent=&kind=full|delta|alerts&since=&format=lines|json|yaml` →
   `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
-  `text`. The server also advances the agent's cursor to the returned `seq`. One request
-  checks at most 1,000 events that can concern the agent for alerts; past that, `seq` is the
-  last one checked and the first alert says how many wait for the next request. Alerts read
-  only the last 10,000 events; an alert names the older ones skipped. `json` is
+  `text`. Alerts come from events since the cursor. The server also advances the agent's
+  cursor to the returned `seq`. One request checks at most 1,000 events that can concern the
+  agent for alerts; past that, `seq` is the last one checked and the first alert says how
+  many wait for the next request. Alerts read only the last 10,000 events; an alert names
+  the older ones skipped. `json` is
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
@@ -434,7 +443,10 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `days`, `tasks_created`, `tasks_done`, `claims_refused`, `tasks_taken_stale`,
   `lease_conflicts`, `asks_created`, `asks_answered`, `ask_answer_minutes_median`,
   `doing_minutes_median` (minutes, `null` when nothing was measured),
-  `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
+  `done_without_check_evidence`, `done_under_a_minute` (tasks done after under a minute in
+  `doing`, not counting feedback items or a done right after a takeover; `null` or absent
+  from servers that predate it) and `feedback`
+  `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
   it), each within the period. Without `--json` it prints
@@ -473,5 +485,6 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
+| Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

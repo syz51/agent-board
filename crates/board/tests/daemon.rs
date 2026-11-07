@@ -2198,6 +2198,22 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
 }
 
 #[test]
+fn the_coordinator_prompt_parks_waits_in_review_or_blocked() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "Park a task by what it waits on, and `task_note` what that is:",
+        "- CI or a review: `review`, with a note naming the PR.",
+        "- Another task, the user or anything else: `blocked`, with `blockers` or `blocked_reason`",
+        "- Only a date: release it to `open` and set `not_before`.",
+        "Never wait on CI in `doing`, and never do work off the board and claim it afterwards.",
+        "A task in review a day with no note from its owner raises an alert, again each quiet day, to the owner or, when the owner is gone, to you",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
 fn triage_and_owners_read_one_priority_scale() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let owner = words(&board::daemon::coordinator_message(&factory(), false));
