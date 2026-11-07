@@ -51,6 +51,9 @@ pub struct CreateBoard {
     pub autopilot: bool,
     #[serde(default)]
     pub home_devices: Vec<DeviceName>,
+    /// Close the board once idle and delete it later (see [`crate::Board::temporary`]).
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 /// `PATCH /v1/boards/{slug}`. Absent fields are left unchanged.
@@ -62,6 +65,9 @@ pub struct UpdateBoard {
     pub repos: Option<Vec<String>>,
     pub autopilot: Option<bool>,
     pub home_devices: Option<Vec<DeviceName>>,
+    /// Turning it on for a board that is not temporary is for the user only, since the
+    /// board is then deleted once idle.
+    pub temporary: Option<bool>,
 }
 
 /// `POST /v1/boards/{slug}/join`: the calling agent joins the board.
@@ -355,6 +361,7 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Board;
 
     #[test]
     fn update_task_tells_an_absent_not_before_from_null() {
@@ -377,5 +384,26 @@ mod tests {
         assert!(json.get("not_before").is_none());
         let json = serde_json::to_value(&cleared).unwrap();
         assert_eq!(json["not_before"], serde_json::Value::Null);
+    }
+
+    /// Peers that predate `temporary` neither send nor expect it.
+    #[test]
+    fn temporary_is_optional_on_the_wire() {
+        let create: CreateBoard =
+            serde_json::from_value(serde_json::json!({ "slug": "factory", "title": "Factory" }))
+                .unwrap();
+        assert!(!create.temporary);
+        let update: UpdateBoard = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(update.temporary, None);
+        let board: Board = serde_json::from_value(serde_json::json!({
+            "slug": "factory", "title": "Factory", "goal": "", "status": "active",
+            "repos": [], "autopilot": false, "coordinator": null, "home_devices": [],
+            "counts": { "open": 0, "doing": 0, "blocked": 0, "review": 0, "done": 0,
+                        "dropped": 0, "ready": 0 },
+            "open_asks": 0,
+            "created_at": "2026-11-06T12:00:00Z", "updated_at": "2026-11-06T12:00:00Z",
+        }))
+        .unwrap();
+        assert!(!board.temporary);
     }
 }

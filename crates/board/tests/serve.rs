@@ -69,6 +69,15 @@ fn serve_admin_and_client_work_together() {
         Some(1),
         "a live device name is refused"
     );
+    let out = board(
+        &home,
+        &cwd,
+        &[],
+        &["admin", "device", "phone", "--user", "--db", db_arg],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let user_token = stdout(&out).trim().to_owned();
 
     let port = free_port();
     let config = dir.path().join("server.toml");
@@ -135,6 +144,62 @@ fn serve_admin_and_client_work_together() {
     web.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("agent-board"));
+
+    // A temporary board: marked at creation; deleted only once closed, only by the user.
+    let user_home = dir.path().join("user-home");
+    std::fs::create_dir_all(&user_home).unwrap();
+    let mut login = Command::new(env!("CARGO_BIN_EXE_board"));
+    login
+        .args(["login", "--server", &url, "--device", "phone"])
+        .env("BOARD_HOME", &user_home)
+        .env("BOARD_KEYCHAIN", "0")
+        .env_remove("BOARD_TOKEN");
+    let out = run_with_stdin(login, &format!("{user_token}\n"));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let user = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_board"));
+        command
+            .args(args)
+            .current_dir(&cwd)
+            .env("BOARD_HOME", &user_home)
+            .env("BOARD_KEYCHAIN", "0")
+            .env_remove("BOARD_TOKEN")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("T3CODE_THREAD_ID");
+        detached(&command, "")
+    };
+    let out = client(&[
+        "board",
+        "create",
+        "scratch",
+        "--title",
+        "Scratch",
+        "--temporary",
+        "--json",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let created: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(created["temporary"], true);
+    let out = client(&["board", "delete", "scratch"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("only the user"), "{}", stderr(&out));
+    let out = user(&["board", "delete", "scratch"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("close it first"), "{}", stderr(&out));
+    let out = client(&["board", "update", "scratch", "--status", "closed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = user(&["board", "delete", "scratch"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "deleted scratch");
+    let out = client(&["boards", "--json"]);
+    let boards: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let slugs: Vec<&str> = boards
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, ["e2e"]);
 
     // Host admin: a consistent backup while the server runs; never over an existing file.
     let backup = dir.path().join("backup.db");

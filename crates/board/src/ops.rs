@@ -619,6 +619,7 @@ pub async fn boards(ctx: &Ctx) -> Result<Output> {
 
 pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
     let board = ctx.client.create_board(&body).await?;
+    check_temporary(&board, body.temporary, "created")?;
     Ok(Output::new(
         format!("created {}", render::board_line(&board)),
         &board,
@@ -627,9 +628,34 @@ pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
 
 pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Result<Output> {
     let board = ctx.client.update_board(slug, &body).await?;
+    if let Some(temporary) = body.temporary {
+        check_temporary(&board, temporary, "updated")?;
+    }
     Ok(Output::new(
         format!("updated {}", render::board_line(&board)),
         &board,
+    ))
+}
+
+/// A server that predates temporary boards ignores the flag, so a board meant to be
+/// temporary would never be deleted, or one meant to be kept would not be kept.
+fn check_temporary(board: &Board, wanted: bool, done: &str) -> Result<()> {
+    if board.temporary != wanted {
+        bail!(
+            "{done} board {slug}, but the server ignored temporary={wanted}: it predates \
+             temporary boards. Upgrade the server, then run board board update {slug} \
+             --temporary {wanted}",
+            slug = board.slug
+        );
+    }
+    Ok(())
+}
+
+pub async fn board_delete(ctx: &Ctx, slug: &BoardSlug) -> Result<Output> {
+    ctx.client.delete_board(slug).await?;
+    Ok(Output::new(
+        format!("deleted {slug}"),
+        &serde_json::json!({ "deleted": slug }),
     ))
 }
 

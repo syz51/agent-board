@@ -71,7 +71,16 @@ ecosystem is stronger.
 Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 
 - **Board**: one effort. Has repos (normalized origin URLs, so every checkout and worktree on
-  every device matches), an autopilot switch, a coordinator and its home devices.
+  every device matches), an autopilot switch, a coordinator and its home devices. Status is
+  `active`, `paused` or `closed`. A closed board without open asks may be deleted, which
+  removes its tasks and history: by the user at any time, or by the server for a board
+  marked `temporary` (for a test or a one-off; only the user marks an existing board). The
+  server closes a temporary board after a day idle and deletes it a week after that. Idle
+  means no event on the board, no open ask and no live owner of a task in `doing`; time
+  the server was down does not count. A task in `review` or `blocked` does not keep a
+  temporary board: an open ask is how a board waits on the user. Only the flag decides,
+  never the title, so a real board is never removed by accident. Ids are never reused: a
+  slug created again continues its task numbering, and ask ids are not handed out again.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
   computed when read (open, all blockers done, no live owner, `not_before` passed), never
   stored. Done requires

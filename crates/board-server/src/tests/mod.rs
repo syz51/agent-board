@@ -9,6 +9,7 @@ mod leases;
 mod snapshot;
 mod tasks;
 mod telegram;
+mod temporary;
 
 use std::sync::Arc;
 
@@ -81,15 +82,21 @@ impl T {
     }
 
     pub fn with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
+        Self::over(Db::open_in_memory().unwrap(), configure)
+    }
+
+    fn config(configure: impl FnOnce(&mut ServerConfig)) -> ServerConfig {
         let mut config = ServerConfig::new("unused.db");
         config.users = vec![USER.to_owned()];
         configure(&mut config);
+        config
+    }
+
+    /// A server over `db`, which must be new.
+    pub fn over(db: Db, configure: impl FnOnce(&mut ServerConfig)) -> Self {
+        let config = Self::config(configure);
         let clock = ManualClock::new(start());
-        let state = AppState::new(
-            Db::open_in_memory().unwrap(),
-            &config,
-            Arc::new(clock.clone()),
-        );
+        let state = AppState::new(db, &config, Arc::new(clock.clone()));
         let token = state.create_device(&"mac".parse().unwrap(), false).unwrap();
         let user_token = state
             .create_device(&"phone".parse().unwrap(), true)
@@ -100,6 +107,19 @@ impl T {
             clock,
             token,
             user_token,
+        }
+    }
+
+    /// The server started again, at the clock's current time, over `db`: this server's
+    /// database reopened. Tokens and the clock carry over.
+    pub fn restart(&self, db: Db) -> Self {
+        let state = AppState::new(db, &Self::config(|_| {}), Arc::new(self.clock.clone()));
+        Self {
+            app: app(state.clone()),
+            state,
+            clock: self.clock.clone(),
+            token: self.token.clone(),
+            user_token: self.user_token.clone(),
         }
     }
 
@@ -294,6 +314,18 @@ impl T {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// The first column of every row of a query, as strings.
+    pub fn strings(&self, sql: &str) -> Vec<String> {
+        self.state
+            .db()
+            .read(self.state.now(), self.state.settings(), |cx| {
+                let mut stmt = cx.db.prepare(sql)?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap()
     }
 
     pub fn count(&self, sql: &str) -> i64 {

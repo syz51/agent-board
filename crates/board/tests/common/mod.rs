@@ -371,6 +371,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         title: format!("{slug} board"),
         goal: String::new(),
         status: BoardStatus::Active,
+        temporary: false,
         repos: repos.iter().map(|r| (*r).to_owned()).collect(),
         autopilot: false,
         coordinator: None,
