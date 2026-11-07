@@ -178,7 +178,7 @@ const AREA: Record<string, string> = {
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
   asks: "[grid-area:asks]",
-  autopilot: "[grid-area:auto]",
+  autopilot: "[grid-area:pilot]",
 };
 
 const CELL_CLASS: Record<string, string> = {
@@ -191,7 +191,7 @@ const CELL_CLASS: Record<string, string> = {
 
 /** A repository-list row: name and goal with autopilot at the right, then one line of facts. */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[auto_auto_auto_minmax(0,1fr)_auto] @min-[760px]:[grid-template-areas:'name_name_name_name_auto'_'tasks_coord_asks_._.'] @min-[760px]:gap-x-6 @min-[760px]:gap-y-2.5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[auto_auto_auto_minmax(0,1fr)_auto] @min-[760px]:[grid-template-areas:'name_name_name_name_pilot'_'tasks_coord_asks_._.'] @min-[760px]:gap-x-6 @min-[760px]:gap-y-2.5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(

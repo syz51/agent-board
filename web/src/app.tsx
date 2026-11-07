@@ -96,10 +96,11 @@ export function Nav() {
           to={item.to}
           // Boards stays current on a board and a task; the router's own match would not.
           aria-current={item.match(path) ? "page" : undefined}
-          className="group/tab relative flex h-12 flex-none items-center border-b-2 border-transparent px-2 text-sm text-foreground hover:no-underline aria-[current=page]:border-tab-current aria-[current=page]:font-semibold max-md:h-11"
+          className="group/tab relative flex h-12 flex-none items-center border-b-2 border-transparent px-2 text-sm text-foreground hover:no-underline aria-[current=page]:border-tab-current aria-[current=page]:font-semibold max-md:h-11 max-md:px-0.5"
         >
-          <span className="flex items-center gap-2 rounded-md px-2 py-1.5 group-hover/tab:bg-secondary">
-            <Icon name={item.icon} className="text-muted-foreground" />
+          {/* Phones drop the icons so all four tabs fit on a 390px screen. */}
+          <span className="flex items-center gap-2 rounded-md px-2 py-1.5 group-hover/tab:bg-secondary max-md:gap-1.5 max-md:px-1.5">
+            <Icon name={item.icon} className="text-muted-foreground max-md:hidden" />
             <span>{item.label}</span>
             {item.to === "/asks" && open > 0 && (
               <span
