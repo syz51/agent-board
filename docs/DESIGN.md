@@ -307,7 +307,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File work you find with task_add. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). File found work as a Proposal: task. Notes and bodies: task_show <id>.
 </board>
 ```
 
@@ -327,6 +327,32 @@ the handoff after a compaction was 63% [51–74] with quoted text against 37% [2
 spotlighted, and the formats tied while tagged lines took about 35% fewer tokens. The
 switches it used, and the harness, stay on the `bench/formats` branch for reruns.
 
+## Proposals and triage
+
+Agents find work all the time; it becomes work only when an agent other than its finder
+agrees, after checking it.
+
+- **Proposal**: new scope outside the task being worked (found work, a goal-review filing, a
+  finding of a review report, a routed feedback item). It is a task with `auto=false` whose
+  body starts `Proposal:` and gives the problem, the evidence, the change and its size. A
+  coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
+- **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
+  its board at the start of its loop; its own go to a reviewer child briefed with the
+  evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
+  value against the board goal and cost.
+- **Verdict**: a `decision` note starting `verdict:` (accept, merge, decline, escalate) with
+  reasons and the evidence checked. Accept sets `auto`; merge and decline drop the task with
+  the reason; escalate asks the user and blocks it.
+- **Agreement**: one independent accept, or two for L proposals and for security-boundary,
+  destructive, irreversible or cross-repository changes. Split verdicts and decisions only
+  the user can make (direction, spending, security posture, publishing, deleting data, what
+  reaches their phone, this process) go to the user, one ask per batch with recommendations.
+- **Enforcement**: by convention for now (`prompts/coordinator.md`). Agent ids are asserted
+  by clients, so the server cannot prove independence; stats on verdicts and on the fate of
+  accepted proposals decide whether a server-side record is worth adding.
+- **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
+  task; the owner's coordinator verifies it.
+
 ## Feedback loop
 
 Rules, defaults and prompts are expected to change with use:
@@ -335,8 +361,8 @@ Rules, defaults and prompts are expected to change with use:
 - `GET /v1/stats` reports refused claims, stale takeovers, lease conflicts, ask response
   times, time in `doing` and done-without-check counts.
 - A periodic review (for example a weekly job) reads both, proposes changes to the defaults,
-  the coordinator prompt and the agents' instructions, and opens them as reviewed pull
-  requests.
+  the coordinator prompt and the agents' instructions, and files them as proposals (see
+  "Proposals and triage") before they become reviewed pull requests.
 
 ## Security
 

@@ -1544,3 +1544,21 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
     // Generic: no tool paths of one setup.
     assert!(!prompt.contains("factory/cli.js"));
 }
+
+#[test]
+fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
+    let prompt = board::daemon::coordinator_message(&factory());
+    for rule in [
+        "give a verdict on\n   each pending proposal another agent filed",
+        "won't do as proposals",
+        "unless it is a\n  pending proposal: that becomes `auto` only on an accept verdict",
+        "File them as proposals and delegate their review to a reviewer child",
+        "with `auto=false` and\n  a body starting `Proposal:`",
+        "**Reviewer**: never the proposer",
+        "a `decision` note starting `verdict:`",
+        "need accepts from two reviewers",
+        "Ask once per\n  batch, each item with a recommendation",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
