@@ -221,7 +221,7 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
 }
 
 /// Ids as one JSON array, for a batch query.
-fn json_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+pub(crate) fn json_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
     serde_json::to_string(&ids.collect::<Vec<_>>()).expect("strings serialize")
 }
 

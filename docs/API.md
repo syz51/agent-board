@@ -297,7 +297,9 @@ is not done (see "Temporary boards").
   for the caller (nor in its `files_touched` event, skipped when no path is left), and a
   peer's unscanned touch removes a matching scanned one before overlaps are computed; alerts
   then skip the scan's earlier event for that path. A scanned path never replaces the
-  caller's own unscanned touch of it.
+  caller's own unscanned touch of it. When a peer on the same device scanned the same path
+  with the same time, the writer is unknown: both touches are kept, but neither counts as
+  an overlap or alert between the two.
 
 ### Asks (decisions and actions for the user)
 
@@ -410,7 +412,10 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
   `[Snapshot]`. Rendered on the server (format in `DESIGN.md`, "Text format"), so every
   client injects the same text. `delta` and `alerts` with nothing relevant return empty
   `text`. Alerts come from events since the cursor. The server also advances the agent's
-  cursor to the returned `seq`. `json` is
+  cursor to the returned `seq`. One request checks at most 1,000 events that can concern the
+  agent for alerts; past that, `seq` is the last one checked and the first alert says how
+  many wait for the next request. Alerts read only the last 10,000 events; an alert names
+  the older ones skipped. `json` is
   compact, so all three formats share the same size caps.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),

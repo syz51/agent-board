@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{Glob, delegation_family, glob_matches, globs_overlap};
+use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live, latest_events,
-    load_agents, load_events, load_tasks,
+    NamedParams, agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live,
+    json_ids, latest_events, load_agents, load_events, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -37,8 +37,26 @@ sub-tasks and found work as Proposal: tasks (auto=false). Notes and bodies: task
 const TITLE_CHARS: usize = 80;
 /// Paths and globs are cut to this many characters in hook text.
 const PATH_CHARS: usize = 80;
-/// Events scanned for alerts per request.
-const ALERT_SCAN: u32 = 500;
+/// Events scanned for alerts per request; later ones wait for the next request.
+const ALERT_SCAN: u32 = 1000;
+/// Alerts look back at most this many events, so a cursor far behind costs no more per
+/// request than a recent one: older events are skipped, and one alert says which.
+const ALERT_WINDOW: i64 = 10_000;
+/// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
+/// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
+/// reminders (at most one per task a day) all pass, as a coordinator gets those of its
+/// board's tasks whose owner is gone.
+const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
+     (type IN ('files_touched', 'lease_created', 'agent_registered') \
+      AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
+     OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
+     OR (type IN ('task_updated', 'task_released', 'note_added') \
+      AND (task IN (SELECT value FROM json_each(:mine)) \
+           OR json_extract(payload, '$.previous_owner') = :me)) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
+     OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
+     OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
+     OR (type = 'task_created' AND :any_mine))";
 
 #[derive(Debug, Clone, Serialize)]
 struct Model {
@@ -218,7 +236,9 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         .as_ref()
         .map(|b| counts(cx, b).map(Counts::from))
         .transpose()?;
-    let alerts = alerts(cx, &agent, since, seq)?;
+    // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
+    // request resumes there. Everything else shows the board as of `seq`.
+    let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
 
     let mut model = Model {
         kind: req.kind,
@@ -279,13 +299,13 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         cx.db.execute(
             "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
              WHERE id = ?1",
-            params![agent.id.as_str(), seq, counts_json],
+            params![agent.id.as_str(), scanned_to, counts_json],
         )?;
     }
     Ok(Snapshot {
         kind: req.kind,
         text,
-        seq,
+        seq: scanned_to,
         at: cx.now,
     })
 }
@@ -683,7 +703,7 @@ fn shares_paths(
     cx: &Ctx<'_>,
     peer: &str,
     my_touches: &[(String, String, i64)],
-    my_leases: &[(String, String)],
+    my_globs: &[(&str, &str, Glob<'_>)],
     window_start: i64,
 ) -> Result<bool> {
     let touches: Vec<(String, String)> = cx
@@ -699,32 +719,33 @@ fn shares_paths(
     if touches.is_empty() && leases.is_empty() {
         return Ok(false);
     }
-    // Each glob compiled once for this call, not once per comparison.
-    let my_globs: Vec<(&str, Glob<'_>)> = my_leases
-        .iter()
-        .map(|(r, g)| (r.as_str(), Glob::new(g)))
-        .collect();
     let touched = touches.iter().any(|(repo, path)| {
         my_touches.iter().any(|(r, p, _)| r == repo && p == path)
-            || my_globs.iter().any(|(r, g)| r == repo && g.matches(path))
+            || my_globs
+                .iter()
+                .any(|(r, _, g)| r == repo && g.matches(path))
     });
     let leased = leases.iter().any(|(repo, glob)| {
         let glob = Glob::new(glob);
         my_touches
             .iter()
             .any(|(r, p, _)| r == repo && glob.matches(p))
-            || my_globs.iter().any(|(r, g)| r == repo && g.overlaps(&glob))
+            || my_globs
+                .iter()
+                .any(|(r, _, g)| r == repo && g.overlaps(&glob))
     });
     Ok(touched || leased)
 }
 
-/// Events after `since` (up to `seq`) that concern the agent, as alerts.
-fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert>> {
+/// Events after `since` (up to `seq`) that concern the agent, as alerts, and the sequence
+/// they were scanned to: `seq`, or the last event scanned when more than `ALERT_SCAN` events
+/// can concern the agent. Then the first alert says how many are left for the next request.
+/// Only the last `ALERT_WINDOW` events are read; an alert names the older ones skipped.
+fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Alert>, i64)> {
     if since >= seq {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), seq));
     }
-    let start = since.max(seq - i64::from(ALERT_SCAN));
-    let events = load_events(cx, "seq <= :seq", &vec![(":seq", &seq)], start, ALERT_SCAN)?;
+    let skipped_to = (seq - ALERT_WINDOW).max(since);
     let me = agent.id.as_str();
     let mine: Vec<Task> = load_tasks(
         cx,
@@ -746,6 +767,61 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
         .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
         .query_map(params![me, now], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    // (repo, glob, compiled): each of the agent's globs compiled once for the whole scan.
+    let my_globs: Vec<(&str, &str, Glob<'_>)> = my_leases
+        .iter()
+        .map(|(r, g)| (r.as_str(), g.as_str(), Glob::new(g)))
+        .collect();
+
+    let repos: BTreeSet<&str> = agent
+        .repo
+        .as_deref()
+        .into_iter()
+        .chain(my_touches.iter().map(|(r, _, _)| r.as_str()))
+        .chain(my_leases.iter().map(|(r, _)| r.as_str()))
+        .collect();
+    let watched: BTreeSet<&TaskId> = mine
+        .iter()
+        .flat_map(|t| t.blockers.iter())
+        .chain(mine_ids.iter().copied())
+        .collect();
+    let repos = json_ids(repos.into_iter());
+    let watched = json_ids(watched.into_iter().map(TaskId::as_str));
+    let mine_json = json_ids(mine_ids.iter().map(|t| t.as_str()));
+    let any_mine = !mine.is_empty();
+    let filter: NamedParams<'_> = vec![
+        (":seq", &seq),
+        (":me", &me),
+        (":repos", &repos),
+        (":watched", &watched),
+        (":mine", &mine_json),
+        (":any_mine", &any_mine),
+    ];
+    let events = load_events(cx, ALERT_FILTER, &filter, skipped_to, ALERT_SCAN)?;
+    let scanned_to = match events.last() {
+        Some(last) if events.len() == ALERT_SCAN as usize => last.seq,
+        _ => seq,
+    };
+    // Bounded by the window, like the scan.
+    let left: i64 = if scanned_to < seq {
+        let mut params = filter.clone();
+        params.push((":since", &scanned_to));
+        cx.db
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM events WHERE seq > :since AND {ALERT_FILTER}"
+            ))?
+            .query_row(params.as_slice(), |r| r.get(0))?
+    } else {
+        0
+    };
+
+    // Gone when a peer's edit showed a shell scan's path was the peer's, and no one's when
+    // both our shell scans found the same write.
+    let still_theirs_sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM touches t \
+         WHERE agent = ?1 AND repo = ?2 AND path = ?3 AND NOT {})",
+        shared_scan("?4")
+    );
 
     let mut handles = HashMap::new();
     let mut live = HashMap::<String, bool>::new();
@@ -969,7 +1045,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                     && same_repo
                     && same_branch
                     && agent.branch.is_some()
-                    && shares_paths(cx, &event.actor, &my_touches, &my_leases, window_start)?
+                    && shares_paths(cx, &event.actor, &my_touches, &my_globs, window_start)?
                 {
                     out.insert(
                         (NEW_AGENT, event.actor.clone()),
@@ -988,14 +1064,10 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                 };
                 let when = ago(cx.now - event.at);
                 for touched in str_list(&event.payload, "paths") {
-                    // Gone when a peer's edit showed a shell scan's path was the peer's.
                     let still_theirs: bool = cx
                         .db
-                        .prepare_cached(
-                            "SELECT EXISTS (SELECT 1 FROM touches \
-                         WHERE agent = ?1 AND repo = ?2 AND path = ?3)",
-                        )?
-                        .query_row(params![event.actor, repo, touched], |r| r.get(0))?;
+                        .prepare_cached(&still_theirs_sql)?
+                        .query_row(params![event.actor, repo, touched, me], |r| r.get(0))?;
                     if !still_theirs {
                         continue;
                     }
@@ -1010,9 +1082,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                             path(&touched),
                             since_ms(cx, at)
                         )
-                    } else if let Some((_, glob)) = my_leases
+                    } else if let Some((_, glob, _)) = my_globs
                         .iter()
-                        .find(|(r, g)| r == repo && glob_matches(g, &touched))
+                        .find(|(r, _, g)| *r == repo && g.matches(&touched))
                     {
                         format!(
                             "{actor} edited {} {when} ago, inside your lease {}",
@@ -1046,9 +1118,10 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                     if !still_held {
                         continue;
                     }
-                    let alert = if let Some((_, mine)) = my_leases
+                    let theirs = Glob::new(&glob);
+                    let alert = if let Some((_, mine, _)) = my_globs
                         .iter()
-                        .find(|(r, g)| r == repo && globs_overlap(g, &glob))
+                        .find(|(r, _, g)| *r == repo && g.overlaps(&theirs))
                     {
                         format!(
                             "{actor} leased {} {when} ago; it overlaps your lease {}",
@@ -1057,7 +1130,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
                         )
                     } else if let Some((_, p, at)) = my_touches
                         .iter()
-                        .find(|(r, p, _)| r == repo && glob_matches(&glob, p))
+                        .find(|(r, p, _)| r == repo && theirs.matches(p))
                     {
                         format!(
                             "{actor} leased {} {when} ago; you edited {} {} ago",
@@ -1108,7 +1181,31 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<Vec<Alert
     }
     let mut alerts: Vec<Alert> = out.into_values().collect();
     alerts.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.alert.cmp(&b.alert)));
-    Ok(alerts)
+    // First, so a size cap never cuts them.
+    if left > 0 {
+        alerts.insert(
+            0,
+            Alert {
+                alert: format!("{left} more events not checked for alerts yet"),
+                action: "board_snapshot again to check them".to_owned(),
+                rank: (0, scanned_to),
+            },
+        );
+    }
+    if skipped_to > since {
+        alerts.insert(
+            0,
+            Alert {
+                alert: format!(
+                    "events #{}-#{skipped_to} are too old to check for alerts",
+                    since + 1
+                ),
+                action: "board_snapshot for the current state".to_owned(),
+                rank: (0, skipped_to),
+            },
+        );
+    }
+    Ok((alerts, scanned_to))
 }
 
 fn record_change(
