@@ -165,16 +165,15 @@ function WaitingTasks({ groups, agents }: { groups: BoardTasks[]; agents: Map<st
           <ul class="task-list">
             {tasks.map((task) => (
               <li key={task.id} class="task-row">
-                <div class="task-line">
-                  <PriorityBadge priority={task.priority} />
-                  <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
-                    <code class="task-id">{task.id}</code> <PlainText text={task.title} />
-                  </a>
-                </div>
-                <div class="task-meta">
-                  <StatusBadge status={task.status} ready={task.ready} />
-                  <Owner task={task} agents={agents} />
-                  <span class="muted">
+                <PriorityBadge priority={task.priority} />
+                <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
+                  <code class="task-id">{task.id}</code> <PlainText text={task.title} />
+                </a>
+                <div class="task-facts">
+                  <span class="task-status"><StatusBadge status={task.status} ready={task.ready} /></span>
+                  <div class="task-meta">{!task.auto && <span class="chip">manual</span>}</div>
+                  <span class="task-owner"><Owner task={task} agents={agents} /></span>
+                  <span class="task-updated muted">
                     updated <RelTime at={task.updated_at} />
                   </span>
                 </div>
