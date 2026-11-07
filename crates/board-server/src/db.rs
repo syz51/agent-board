@@ -20,7 +20,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_events_actor.sql"),
     include_str!("../migrations/0005_telegram_chat_of_message.sql"),
     include_str!("../migrations/0006_task_not_before.sql"),
-    include_str!("../migrations/0007_touch_modified.sql"),
+    include_str!("../migrations/0007_board_temporary.sql"),
+    include_str!("../migrations/0008_touch_modified.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -344,6 +345,64 @@ mod tests {
             ),
             "github.com/myorg/repo a.rs 5; github.com/myorg/repo b.rs 1"
         );
+    }
+
+    #[test]
+    fn boards_and_asks_stored_before_temporary_boards_are_kept() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..6].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 't', '', 'closed', '[]', 0, '[]', 0, 0); \
+             INSERT INTO asks (id, board, task, agent, kind, question, options, status, answer, \
+             answered_via, created_at, answered_at, telegram_message_id, telegram_chat_id) \
+             VALUES (5, 'b', 'b-1', 't3:a', 'decision', 'Ship?', '[\"yes\"]', 'answered', \
+             'yes', 'telegram', 1, 2, 77, 88);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let temporary: bool = conn
+            .query_row("SELECT temporary FROM boards WHERE slug = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(!temporary);
+        // Asks keep every column, and a deleted ask's id is never handed out again.
+        let ask: String = conn
+            .query_row(
+                "SELECT concat_ws(' ', id, board, task, agent, kind, question, options, status, \
+                 answer, answered_via, created_at, answered_at, telegram_message_id, \
+                 telegram_chat_id) FROM asks",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ask,
+            "5 b b-1 t3:a decision Ship? [\"yes\"] answered yes telegram 1 2 77 88"
+        );
+        let new_ask = "INSERT INTO asks (board, agent, kind, question, options, status, \
+                       created_at) VALUES ('b', 't3:a', 'action', 'Log in', '[]', 'open', 3) \
+                       RETURNING id";
+        conn.execute("DELETE FROM asks", []).unwrap();
+        let id: i64 = conn.query_row(new_ask, [], |r| r.get(0)).unwrap();
+        assert_eq!(id, 6);
+        conn.execute("DELETE FROM asks", []).unwrap();
+        let id: i64 = conn.query_row(new_ask, [], |r| r.get(0)).unwrap();
+        assert_eq!(id, 7);
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'asks_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
     }
 
     #[test]

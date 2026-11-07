@@ -350,12 +350,117 @@ fn board_create_and_update_carry_autopilot_and_home_devices() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         e.stub.requests_to("POST /v1/boards")[0].body,
-        json!({"slug": "factory", "title": "Factory", "goal": "", "repos": ["github.com/o/r"], "autopilot": true, "home_devices": ["mac-air"]})
+        json!({"slug": "factory", "title": "Factory", "goal": "", "repos": ["github.com/o/r"], "autopilot": true, "home_devices": ["mac-air"], "temporary": false})
     );
     e.run(&["board", "update", "factory", "--autopilot", "false"]);
     assert_eq!(
         e.stub.requests_to("PATCH /v1/boards/factory")[0].body,
-        json!({"title": null, "goal": null, "status": null, "repos": null, "autopilot": false, "home_devices": null})
+        json!({"title": null, "goal": null, "status": null, "repos": null, "autopilot": false, "home_devices": null, "temporary": null})
+    );
+}
+
+#[test]
+fn temporary_boards_are_created_marked_and_deleted() {
+    let e = env();
+    let mut scratch = board_fixture("scratch", &[]);
+    scratch.temporary = true;
+    e.stub.on("POST /v1/boards", &scratch);
+    e.stub.on("PATCH /v1/boards/scratch", &scratch);
+    e.stub.on("GET /v1/boards", [&scratch]);
+
+    let out = e.run(&[
+        "board",
+        "create",
+        "scratch",
+        "--title",
+        "Scratch",
+        "--temporary",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("POST /v1/boards")[0].body["temporary"],
+        true
+    );
+    assert!(
+        stdout(&out).contains("scratch \"scratch board\" active · open 0")
+            && stdout(&out).trim_end().ends_with(" · temporary"),
+        "{}",
+        stdout(&out)
+    );
+
+    for (value, sent) in [("true", true), ("false", false)] {
+        let mut updated = scratch.clone();
+        updated.temporary = sent;
+        e.stub.on("PATCH /v1/boards/scratch", &updated);
+        let out = e.run(&["board", "update", "scratch", "--temporary", value]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let body = e
+            .stub
+            .requests_to("PATCH /v1/boards/scratch")
+            .pop()
+            .unwrap()
+            .body;
+        assert_eq!(body["temporary"], sent);
+        assert_eq!(body["status"], Value::Null);
+    }
+    let out = e.run(&["boards"]);
+    assert!(stdout(&out).contains(" · temporary"), "{}", stdout(&out));
+
+    // A server that predates temporary boards ignores the flag and returns no `temporary`:
+    // the user learns the board is there but will not be deleted.
+    let mut old = serde_json::to_value(board_fixture("scratch", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("temporary");
+    e.stub.on("POST /v1/boards", &old);
+    e.stub.on("PATCH /v1/boards/scratch", &old);
+    for args in [
+        &[
+            "board",
+            "create",
+            "scratch",
+            "--title",
+            "Scratch",
+            "--temporary",
+        ][..],
+        &["board", "update", "scratch", "--temporary", "true"][..],
+    ] {
+        let out = e.run(args);
+        assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains("board scratch, but the server ignored temporary=true")
+                && err.contains("board board update scratch --temporary true"),
+            "{err}"
+        );
+    }
+    // Without the flag, nothing is checked.
+    let out = e.run(&["board", "create", "scratch", "--title", "Scratch"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = e.run(&["board", "update", "scratch", "--title", "Scratch"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    e.stub.on_status("DELETE /v1/boards/scratch", 204, ());
+    let out = e.run(&["board", "delete", "scratch"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "deleted scratch");
+    assert_eq!(e.stub.requests_to("DELETE /v1/boards/scratch").len(), 1);
+    let out = e.run(&["--json", "board", "delete", "scratch"]);
+    let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json, json!({"deleted": "scratch"}));
+
+    // The server's refusal reaches the user with what to do next.
+    e.stub.on_error(
+        "DELETE /v1/boards/scratch",
+        400,
+        "invalid_transition",
+        "board scratch is active",
+        "only closed boards may be deleted; close it first",
+    );
+    let out = e.run(&["board", "delete", "scratch"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("board scratch is active") && err.contains("close it first"),
+        "{err}"
     );
 }
 
@@ -664,7 +769,7 @@ fn board_adopt_saves_the_adoption_and_switches_autopilot_on() {
     assert!(saved["requested_at"].is_string());
     assert_eq!(
         e.stub.requests_to("PATCH /v1/boards/infra")[0].body,
-        json!({"title": null, "goal": null, "status": null, "repos": null, "autopilot": true, "home_devices": null})
+        json!({"title": null, "goal": null, "status": null, "repos": null, "autopilot": true, "home_devices": null, "temporary": null})
     );
     // Then the lease is held for this device, so no other home device starts a thread.
     let claims = e.stub.requests_to("POST /v1/boards/infra/coordinator");

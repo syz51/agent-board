@@ -18,6 +18,12 @@ export const tags = {
 /** Lease and file-touch events change nothing the web view shows (they appear in the feed). */
 const IGNORED = new Set(["lease_created", "lease_released", "lease_expired", "files_touched"]);
 
+/** A board's deletion is recorded as `board_updated` with `fields: ["deleted"]`. */
+function isDeletion(event: BoardEvent): boolean {
+  const fields = (event.payload as { fields?: unknown } | null)?.fields;
+  return Array.isArray(fields) && fields.includes("deleted");
+}
+
 export function tagsForEvent(event: BoardEvent): string[] {
   if (IGNORED.has(event.type)) return [];
 
@@ -30,8 +36,15 @@ export function tagsForEvent(event: BoardEvent): string[] {
 
   switch (event.type) {
     case "board_created":
-    case "board_updated":
       onBoard(tags.boards);
+      break;
+    case "board_updated":
+      if (isDeletion(event)) {
+        // Its tasks, asks and memberships went with it.
+        onBoard(tags.boards, tags.tasks, tags.agents, tags.asks);
+      } else {
+        onBoard(tags.boards);
+      }
       break;
     case "board_joined":
       onBoard(tags.boards, tags.agents);

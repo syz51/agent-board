@@ -10,6 +10,7 @@ export interface BoardFixture {
   title: string;
   goal: string;
   status: "active" | "paused" | "closed";
+  temporary: boolean;
   repos: string[];
   autopilot: boolean;
   coordinator: string | null;
@@ -155,6 +156,7 @@ export function createFixtures(now: number): Fixtures {
       title: "Agent factory",
       goal: "Let coding threads work off a shared backlog without the user watching.",
       status: "active",
+      temporary: false,
       repos: ["github.com/example/factory"],
       autopilot: true,
       coordinator: id("t3:c2d0"),
@@ -167,6 +169,7 @@ export function createFixtures(now: number): Fixtures {
       title: "Board web view",
       goal: "A phone-friendly view of boards, agents and asks.",
       status: "active",
+      temporary: false,
       repos: ["github.com/example/board-web"],
       autopilot: false,
       coordinator: null,
@@ -179,6 +182,7 @@ export function createFixtures(now: number): Fixtures {
       title: "Docs refresh",
       goal: "Bring the user guide in line with v1.",
       status: "active",
+      temporary: false,
       repos: ["github.com/example/docs"],
       autopilot: true,
       coordinator: id("t3:61aa"),
@@ -191,6 +195,7 @@ export function createFixtures(now: number): Fixtures {
       title: "Sandbox",
       goal: "",
       status: "paused",
+      temporary: true,
       repos: [],
       autopilot: false,
       coordinator: null,

@@ -95,8 +95,15 @@ export function BoardScreen({ slug }: { slug: string }) {
         <h1>{board.data?.title ?? slug}</h1>
         <code class="muted">{slug}</code>
         {board.data?.autopilot && <span class="badge tone-doing">Autopilot</span>}
+        {board.data?.temporary && <span class="badge tone-open">Temporary</span>}
       </header>
       {board.data?.goal && <p class="lede"><PlainText text={board.data.goal} /></p>}
+      {board.data?.temporary && (
+        <p class="muted">
+          Temporary: the server closes this board once it is idle, and deletes it some time
+          after that.
+        </p>
+      )}
 
       <form class="filters" role="search" onSubmit={(event) => event.preventDefault()}>
         <label class="field field-grow">

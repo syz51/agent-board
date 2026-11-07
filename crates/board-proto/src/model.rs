@@ -22,6 +22,11 @@ pub struct Board {
     pub title: String,
     pub goal: String,
     pub status: BoardStatus,
+    /// A board for a test or a one-off: the server closes it once idle and deletes it
+    /// later (`docs/API.md`, "Temporary boards"). Absent from servers that predate it, so
+    /// it defaults to false.
+    #[serde(default)]
+    pub temporary: bool,
     /// Repo keys this board covers (normalized origin URLs such as
     /// `github.com/syz51/agent-board`).
     pub repos: Vec<String>,

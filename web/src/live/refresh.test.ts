@@ -50,6 +50,19 @@ describe("tagsForEvent", () => {
     expect(tagsForEvent(event("handoff_updated", { actor: "t3:c2d0" }))).toEqual([tags.handoff("t3:c2d0")]);
   });
 
+  test("a board change refreshes the board and the boards list", () => {
+    expect(tagsForEvent(event("board_updated", { payload: { fields: ["status"] } }))).toEqual([
+      tags.board("factory"),
+      tags.boards,
+    ]);
+  });
+
+  test("a board's deletion also refreshes the tasks, agents and asks that went with it", () => {
+    expect(
+      tagsForEvent(event("board_updated", { payload: { fields: ["deleted"], title: "Factory" } })),
+    ).toEqual([tags.board("factory"), tags.boards, tags.tasks, tags.agents, tags.asks]);
+  });
+
   test("agent changes refresh agents and boards, which show the coordinator", () => {
     expect(tagsForEvent(event("agent_state_changed", { board: null }))).toEqual([tags.agents, tags.boards]);
   });

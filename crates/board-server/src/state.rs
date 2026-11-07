@@ -18,6 +18,8 @@ pub struct AppState {
 struct Inner {
     db: Db,
     clock: Arc<dyn Clock>,
+    /// When this server started: the temporary-board sweep counts no idle time before it.
+    started: Timestamp,
     settings: Settings,
     users: Vec<String>,
     trust_identity_header: bool,
@@ -30,10 +32,12 @@ impl AppState {
     /// [`crate::ManualClock`].
     pub fn new(db: Db, config: &ServerConfig, clock: Arc<dyn Clock>) -> Self {
         let (shutdown, _) = watch::channel(false);
+        let started = now_ms(clock.as_ref());
         Self {
             inner: Arc::new(Inner {
                 db,
                 clock,
+                started,
                 settings: config.defaults.clone(),
                 users: config.users.clone(),
                 trust_identity_header: config.trust_identity_header,
@@ -49,6 +53,11 @@ impl AppState {
     /// The current time, truncated to the stored precision.
     pub fn now(&self) -> Timestamp {
         now_ms(self.inner.clock.as_ref())
+    }
+
+    /// When this server started, on its clock.
+    pub(crate) fn started(&self) -> Timestamp {
+        self.inner.started
     }
 
     /// Creates a device (a user device when `user`) and returns its token, shown once.

@@ -305,6 +305,10 @@ pub enum BoardCommand {
         /// A device allowed to host the coordinator, in order of preference.
         #[arg(long = "home-device")]
         home_devices: Vec<DeviceName>,
+        /// For a test or a one-off: the server closes the board once idle (a day by
+        /// default) and deletes it later (a week after closing by default).
+        #[arg(long)]
+        temporary: bool,
     },
     /// Change a board.
     Update {
@@ -323,7 +327,14 @@ pub enum BoardCommand {
         /// Replace the home devices; repeat for more.
         #[arg(long = "home-device")]
         home_devices: Option<Vec<DeviceName>>,
+        /// Whether the server closes the board once idle and deletes it later. Only the
+        /// user may turn it on for an existing board.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        temporary: Option<bool>,
     },
+    /// Delete a closed board without open asks, with its tasks, notes, asks and history.
+    /// User tokens only; it cannot be undone.
+    Delete { slug: BoardSlug },
     /// Make an existing T3 thread on this device the board's coordinator, then switch
     /// autopilot on. Run it on a home device whose daemon (`board watch`) then briefs the
     /// thread instead of starting a new one.
@@ -587,6 +598,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             repos,
             autopilot,
             home_devices,
+            temporary,
         }) => {
             let body = CreateBoard {
                 slug,
@@ -595,6 +607,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 repos,
                 autopilot,
                 home_devices,
+                temporary,
             };
             ops::board_create(&ctx()?, body).await?
         }
@@ -606,6 +619,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             repos,
             autopilot,
             home_devices,
+            temporary,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -614,9 +628,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 repos,
                 autopilot,
                 home_devices,
+                temporary,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
+        Command::Board(BoardCommand::Delete { slug }) => ops::board_delete(&ctx()?, &slug).await?,
         Command::Board(BoardCommand::Adopt { slug, thread }) => {
             let ctx = ctx()?;
             let t3 = crate::t3::T3Cli::locate(ctx.config.t3_bin.as_deref());

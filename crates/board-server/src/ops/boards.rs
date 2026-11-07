@@ -5,8 +5,8 @@ use board_proto::{
 use rusqlite::{OptionalExtension, params};
 
 use crate::config::Settings;
-use crate::db::{Ctx, enum_str};
-use crate::error::{Result, forbidden, invalid, refused};
+use crate::db::{Ctx, enum_str, live_sql, parse_id};
+use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{board_missing, get_board};
 use crate::text::{ago, check_line, check_text, normalize_repo};
@@ -73,8 +73,10 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
     }
     let now = cx.now_ms();
     cx.db.execute(
+        // A slug that was deleted before resumes its task numbering.
         "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
-         created_at, updated_at) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?7)",
+         temporary, next_number, created_at, updated_at) VALUES (?1, ?2, ?3, 'active', ?4, ?5, \
+         ?6, ?7, COALESCE((SELECT next_number FROM deleted_boards WHERE slug = ?1), 1), ?8, ?8)",
         params![
             req.slug.as_str(),
             req.title,
@@ -82,6 +84,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
             serde_json::to_string(&req.repos).expect("strings serialize"),
             req.autopilot,
             serde_json::to_string(&req.home_devices).expect("strings serialize"),
+            req.temporary,
             now,
         ],
     )?;
@@ -90,18 +93,33 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
         actor,
         EventType::BoardCreated,
         None,
-        serde_json::json!({ "title": req.title, "repos": req.repos, "autopilot": req.autopilot }),
+        serde_json::json!({
+            "title": req.title,
+            "repos": req.repos,
+            "autopilot": req.autopilot,
+            "temporary": req.temporary,
+        }),
     )?;
     get_board(cx, &req.slug)
 }
 
+/// Changes a board. Only the user may make a board temporary, since the sweep then
+/// deletes it once idle.
 pub(crate) fn update(
     cx: &mut Ctx<'_>,
     actor: &str,
     slug: &BoardSlug,
     req: UpdateBoard,
+    by_user: bool,
 ) -> Result<Board> {
     let before = get_board(cx, slug)?;
+    if req.temporary == Some(true) && !before.temporary && !by_user {
+        return Err(forbidden(
+            format!("only the user may make board {slug} temporary"),
+            "temporary boards are deleted once idle; ask the user (ask_user), or create a \
+             new board with temporary set",
+        ));
+    }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -128,12 +146,16 @@ pub(crate) fn update(
             .as_ref()
             .is_some_and(|v| *v != before.home_devices),
     );
+    set(
+        "temporary",
+        req.temporary.is_some_and(|v| v != before.temporary),
+    );
     if fields.is_empty() {
         return Ok(before);
     }
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
-         home_devices = ?7, updated_at = ?8 WHERE slug = ?1",
+         home_devices = ?7, updated_at = ?8, temporary = ?9 WHERE slug = ?1",
         params![
             slug.as_str(),
             req.title.unwrap_or(before.title),
@@ -144,6 +166,7 @@ pub(crate) fn update(
             serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
                 .expect("serializes"),
             cx.now_ms(),
+            req.temporary.unwrap_or(before.temporary),
         ],
     )?;
     cx.emit(
@@ -154,6 +177,157 @@ pub(crate) fn update(
         serde_json::json!({ "fields": fields }),
     )?;
     get_board(cx, slug)
+}
+
+/// Deletes a closed board without open asks, with its tasks, notes, evidence, asks,
+/// members and events. Records one `board_updated` event (`fields: ["deleted"]`), an
+/// existing type, so clients that predate deletion still read the feed. The slug keeps its
+/// task numbering for a board created later under it.
+pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<()> {
+    let board = get_board(cx, slug)?;
+    if board.status != BoardStatus::Closed {
+        return Err(bad_transition(
+            format!("board {slug} is {}", enum_str(&board.status)),
+            format!(
+                "only closed boards may be deleted; close it first (board board update {slug} \
+                 --status closed)"
+            ),
+        ));
+    }
+    if board.open_asks > 0 {
+        return Err(bad_transition(
+            format!("board {slug} has {} open asks", board.open_asks),
+            format!("answer them first (board asks --board {slug}), then delete the board"),
+        ));
+    }
+    const TASKS: &str = "SELECT id FROM tasks WHERE board = ?1";
+    let s = slug.as_str();
+    for sql in [
+        format!("DELETE FROM task_blockers WHERE task IN ({TASKS}) OR blocker IN ({TASKS})"),
+        format!("DELETE FROM notes WHERE task IN ({TASKS})"),
+        format!("DELETE FROM evidence WHERE task IN ({TASKS})"),
+        format!("DELETE FROM claim_refusals WHERE task IN ({TASKS})"),
+        // Leases belong to agents and expire on their own; only the task link goes.
+        format!("UPDATE leases SET task = NULL WHERE task IN ({TASKS})"),
+        // Lease events name a task but no board.
+        format!("DELETE FROM events WHERE board = ?1 OR task IN ({TASKS})"),
+        "DELETE FROM asks WHERE board = ?1".to_owned(),
+        // Parents are on the same board, so no task elsewhere refers to these.
+        "UPDATE tasks SET parent = NULL WHERE board = ?1".to_owned(),
+        "INSERT OR REPLACE INTO deleted_boards (slug, next_number) \
+         SELECT slug, next_number FROM boards WHERE slug = ?1"
+            .to_owned(),
+        "DELETE FROM tasks WHERE board = ?1".to_owned(),
+        "DELETE FROM board_members WHERE board = ?1".to_owned(),
+        "DELETE FROM boards WHERE slug = ?1".to_owned(),
+    ] {
+        cx.db.execute(&sql, [s])?;
+    }
+    cx.emit(
+        Some(slug),
+        actor,
+        EventType::BoardUpdated,
+        None,
+        serde_json::json!({ "fields": ["deleted"], "title": board.title }),
+    )?;
+    Ok(())
+}
+
+/// What the sweep did to one temporary board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Swept {
+    Closed,
+    Deleted,
+}
+
+/// Idle temporary boards: no open ask and no task in `doing` with a live owner. Each comes
+/// with whether it is closed and when it was last active: the newest of its own change, its
+/// newest event and `since`, the server's start, so time the server was down does not
+/// count as idle.
+fn idle_temporary(
+    cx: &Ctx<'_>,
+    since: i64,
+    only: Option<&BoardSlug>,
+) -> Result<Vec<(BoardSlug, bool, i64)>> {
+    let rows: Vec<(String, String, i64)> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT b.slug, b.status, MAX(:since, b.updated_at, COALESCE( \
+                 (SELECT e.at FROM events e WHERE e.board = b.slug ORDER BY e.seq DESC LIMIT 1), \
+                 0)) \
+             FROM boards b \
+             WHERE b.temporary = 1 AND (:only IS NULL OR b.slug = :only) \
+               AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.board = b.slug AND a.status = 'open') \
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
+                               AND t.status = 'doing' AND {live}) \
+             ORDER BY b.slug",
+            live = live_sql("t.owner")
+        ))?
+        .query_map(
+            rusqlite::named_params! {
+                ":now": cx.now_ms(),
+                ":cutoff": cx.stale_cutoff(),
+                ":since": since,
+                ":only": only.map(BoardSlug::as_str),
+            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter()
+        .map(|(slug, status, last)| {
+            Ok((
+                parse_id(&slug)?,
+                status == enum_str(&BoardStatus::Closed),
+                last,
+            ))
+        })
+        .collect()
+}
+
+/// What is due for a board last active at `last`: closing once idle for
+/// `temporary_close_after_secs`, deleting once closed and idle for
+/// `temporary_delete_after_secs`.
+fn due(cx: &Ctx<'_>, closed: bool, last: i64) -> Option<Swept> {
+    let idle = cx.now_ms() - last;
+    if closed {
+        (idle >= cx.s.temporary_delete_ms()).then_some(Swept::Deleted)
+    } else {
+        (idle >= cx.s.temporary_close_ms()).then_some(Swept::Closed)
+    }
+}
+
+/// Temporary boards due to be closed or deleted, given the server started at `since`.
+pub(crate) fn temporary_due(cx: &Ctx<'_>, since: i64) -> Result<Vec<BoardSlug>> {
+    Ok(idle_temporary(cx, since, None)?
+        .into_iter()
+        .filter(|&(_, closed, last)| due(cx, closed, last).is_some())
+        .map(|(slug, _, _)| slug)
+        .collect())
+}
+
+/// Closes or deletes one temporary board if that is still due. The sweep runs one
+/// transaction per board, so a failure on one does not hold up the others.
+pub(crate) fn sweep_temporary(
+    cx: &mut Ctx<'_>,
+    slug: &BoardSlug,
+    since: i64,
+) -> Result<Option<Swept>> {
+    let Some((_, closed, last)) = idle_temporary(cx, since, Some(slug))?.pop() else {
+        return Ok(None);
+    };
+    let swept = due(cx, closed, last);
+    match swept {
+        Some(Swept::Deleted) => delete(cx, "server", slug)?,
+        Some(Swept::Closed) => {
+            let close = UpdateBoard {
+                status: Some(BoardStatus::Closed),
+                ..UpdateBoard::default()
+            };
+            update(cx, "server", slug, close, false)?;
+        }
+        None => {}
+    }
+    Ok(swept)
 }
 
 pub(crate) fn join(

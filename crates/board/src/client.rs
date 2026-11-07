@@ -238,6 +238,12 @@ impl Client {
             .await
     }
 
+    /// Deletes a closed board (user tokens only); the server answers 204.
+    pub async fn delete_board(&self, slug: &BoardSlug) -> Result<()> {
+        self.send(self.request(Method::DELETE, &format!("/v1/boards/{slug}")))
+            .await
+    }
+
     pub async fn join(&self, slug: &BoardSlug) -> Result<Board> {
         let body = JoinBoard {
             agent: self.require_agent()?.clone(),

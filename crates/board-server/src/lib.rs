@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use board_proto::DeviceName;
+use board_proto::{BoardSlug, DeviceName};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -107,8 +107,9 @@ async fn shutdown_signal() {
     }
 }
 
-/// Every minute until shutdown, in one transaction: sweeps expired leases and announces
-/// passed `not_before` times.
+/// Every minute until shutdown: sweeps expired leases and announces passed `not_before`
+/// times in one transaction, then closes or deletes idle temporary boards, one transaction
+/// per board.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -125,10 +126,59 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                     if let Err(error) = swept {
                         tracing::error!(%error, "sweep failed");
                     }
+                    sweep_temporary(&state).await;
                 }
             }
         }
     })
+}
+
+/// What one sweep of temporary boards did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TemporarySweep {
+    pub closed: Vec<BoardSlug>,
+    pub deleted: Vec<BoardSlug>,
+    /// Boards whose transaction failed; logged, and tried again on the next sweep.
+    pub failed: Vec<BoardSlug>,
+}
+
+/// Closes or deletes the temporary boards that are due, each in its own transaction.
+pub(crate) async fn sweep_temporary(state: &AppState) -> TemporarySweep {
+    use ops::boards::Swept;
+    let since = state.started().timestamp_millis();
+    let mut out = TemporarySweep::default();
+    let due = match state
+        .read(move |cx| ops::boards::temporary_due(cx, since))
+        .await
+    {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::error!(%error, "temporary board sweep failed");
+            return out;
+        }
+    };
+    for slug in due {
+        let board = slug.clone();
+        match state
+            .write(move |cx| ops::boards::sweep_temporary(cx, &board, since))
+            .await
+        {
+            Ok(Some(Swept::Closed)) => {
+                tracing::info!(board = %slug, "closed idle temporary board");
+                out.closed.push(slug);
+            }
+            Ok(Some(Swept::Deleted)) => {
+                tracing::info!(board = %slug, "deleted idle temporary board");
+                out.deleted.push(slug);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(board = %slug, %error, "temporary board sweep failed");
+                out.failed.push(slug);
+            }
+        }
+    }
+    out
 }
 
 /// Creates a device (a user device when `user`) in the database at `db_path` and returns
