@@ -77,6 +77,36 @@ a desktop session (a login over SSH, or a locked Keychain), `board login` stores
 Each `$BOARD_HOME` keeps its own token, so a second login with another `BOARD_HOME` (for
 the `--user` token you answer asks with) does not replace the device's token.
 
+### Coordinators and the feedback board
+
+A board with autopilot on gets a coordinator thread on one of its home devices, in a T3
+project on that device. `board watch` finds the project in the device's
+`$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
+`[board_projects]` maps a board slug to a folder for a board without a mapped repo.
+
+The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
+and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
+task on the owner's board, forwards it to the setup's own channel, or declines it with a
+reason (`prompts/triage.md`). To give it one, pick a home device and a T3 project folder on
+it (for example the folder holding your `setups.toml`, the registry of setups and their
+owning boards), then:
+
+```toml
+# config.toml on the home device
+feedback_board = "board-feedback"   # optional; this is the default
+
+[board_projects]
+board-feedback = "/path/to/setups"
+```
+
+```sh
+board board update board-feedback --home-device laptop --autopilot on
+```
+
+The daemon on that device starts the `board-feedback coordinator` thread within a minute
+and wakes it as feedback arrives. Use the same `feedback_board` on every device, so the
+feedback agents file and the board the coordinator triages are one.
+
 ## 4. Backups
 
 `deploy/backup.sh` copies the database consistently with `board admin backup` and stores

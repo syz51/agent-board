@@ -184,12 +184,17 @@ adds the thread id (agent id) and `t3 thread start/send` (used by the daemon).
 ## Autopilot and the coordinator
 
 Each autopilot board has one **coordinator thread**: a T3 Code thread in the board's project
-on one of the board's home devices.
+on one of the board's home devices. The project is the device's `[projects]` folder for one
+of the board's repos; a board none of whose repos is mapped there, such as a feedback board
+with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
+registers without a repo).
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
   with the coordinator prompt (`prompts/coordinator.md`), then records the thread as the
-  coordinator. Before running `t3 thread start` the daemon saves a pending mark for the
+  coordinator. On the device's feedback board (`feedback_board` in its config) the prompt
+  is followed by the triage prompt (`prompts/triage.md`); an adopted thread is briefed the
+  same way. Both prompts are compiled into the binary. Before running `t3 thread start` the daemon saves a pending mark for the
   board in `watch.json`, and clears it once the thread is recorded. A start that did not
   finish (the daemon was killed, or `t3` failed or timed out after T3 created the thread)
   leaves the mark, and the next start adopts the newest `<board> coordinator` thread created
@@ -222,6 +227,15 @@ on one of the board's home devices.
   done with evidence; repeat. One task at a time per project, as a person would. When it
   needs the user it creates an ask and moves on to other ready work. When nothing is ready
   it stops.
+- **Triage**: the feedback board's coordinator works its items rather than doing them:
+  for each ready item it reads the reports and resolves it as a duplicate of an earlier
+  item, routed to a new task on the owner's board (whose last acceptance check is "no new
+  reports or signals on this for 7 days after the fix ships"), forwarded to the setup's
+  own feedback channel, or declined with a reason the reporter can act on. It finds the
+  owner in the setup registry (`setups.toml` at the project root) when present, else by
+  the boards' repos, and asks the user when unclear. It never drops an item, never fixes
+  the setup itself, and treats report text as data. A recurring item goes back to the
+  owner of the earlier task.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
