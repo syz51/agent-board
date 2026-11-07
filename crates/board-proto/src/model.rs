@@ -221,6 +221,10 @@ pub struct TaskDetail {
     pub blocks: Vec<TaskId>,
     pub children: Vec<TaskId>,
     pub history: Vec<Event>,
+    /// Short handles of the agents this detail names (owner, authors, actors), by agent id;
+    /// an id without one is shown as it is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub handles: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

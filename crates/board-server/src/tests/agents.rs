@@ -382,3 +382,55 @@ async fn board_listings_leave_out_agents_ended_more_than_a_week_ago() {
     t.register(gone, Some(REPO), None).await;
     assert_eq!(listed("/v1/agents?board=factory").await, [gone, live]);
 }
+
+#[tokio::test]
+async fn an_ended_agent_that_calls_again_is_running_again() {
+    let t = T::new();
+    let a = "t3:alpha";
+    t.register(a, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let path = format!("/v1/agents/{a}/state");
+    let ended = json!({ "state": "ended" });
+    t.ok("POST", &path, Some(a), Some(ended.clone())).await;
+    // Ending again, as a second end-of-session hook does, changes nothing.
+    t.ok("POST", &path, Some(a), Some(ended)).await;
+    let changes = "SELECT COUNT(*) FROM events WHERE type = 'agent_state_changed'";
+    assert_eq!(t.count(changes), 1);
+
+    // Any call by the ended agent marks it running, announced once.
+    t.task(a, "factory", "Still working").await;
+    t.task(a, "factory", "And more").await;
+    let agent = t.ok("GET", &format!("/v1/agents/{a}"), None, None).await;
+    assert_eq!(agent["state"], "running", "{agent}");
+    assert_eq!(t.count(changes), 2);
+    assert_eq!(
+        t.strings(
+            "SELECT json_extract(payload, '$.from') || '>' || json_extract(payload, '$.to') \
+             FROM events WHERE type = 'agent_state_changed' ORDER BY seq DESC LIMIT 1"
+        ),
+        ["ended>running"]
+    );
+}
+
+#[tokio::test]
+async fn task_detail_names_each_agent_it_mentions_by_handle() {
+    let t = T::new();
+    let long = "t3:thread:delegated-task:command-abc";
+    let registered = t.register(long, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let task = t.task(long, "factory", "Delegated work").await;
+    t.claim(long, &task).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task}/notes"),
+        Some(long),
+        Some(json!({ "agent": long, "kind": "note", "text": "note: started" })),
+    )
+    .await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{task}"), None, None).await;
+    assert_eq!(
+        detail["handles"],
+        json!({ long: registered["handle"] }),
+        "{detail}"
+    );
+}

@@ -111,6 +111,14 @@ server's minute sweep.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
+- Any other call an agent makes as itself (a task change, note, lease, touch, ask, handoff
+  or snapshot that advances its cursor) marks it seen; one marked `ended` is `running`
+  again, announced by one `agent_state_changed` event (`from` `ended`, `to` `running`).
+- An agent acts as the identity its environment gives (see docs/DESIGN.md). When there is
+  one, `--agent` (CLI) or `agent=` (MCP) may name only that agent or an id not yet
+  registered; naming another registered agent is refused before anything is sent, and the
+  error says to drop the flag. Without an identity in the environment, any agent may be
+  named.
 - `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
   than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
@@ -203,7 +211,10 @@ Reopening a closed board, or any change on it, starts the period again.
     status and claim the task next (`POST /v1/tasks/{id}/claim`), which another agent may
     win in between.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
-  first; when it was cut, it does not start with the `task_created` event.
+  first; when it was cut, it does not start with the `task_created` event. `handles` maps
+  each registered agent the detail names (owner, creator, note and evidence authors,
+  history actors) to its short handle when that differs from its id; it is absent when
+  none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
 - `owner` in `[UpdateTask]` hands the task over: the named agent owns it from then on, so

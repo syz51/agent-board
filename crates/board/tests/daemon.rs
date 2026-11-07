@@ -494,6 +494,7 @@ fn detail(id: &str, ready: bool, blocks: &[&str]) -> TaskDetail {
         blocks: blocks.iter().map(|b| b.parse().unwrap()).collect(),
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     }
 }
 

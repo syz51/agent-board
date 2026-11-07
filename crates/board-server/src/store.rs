@@ -299,6 +299,32 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         TASK_HISTORY_LIMIT,
     )?;
     history.reverse();
+    let named: HashSet<&str> = task
+        .owner
+        .iter()
+        .chain([&task.created_by])
+        .chain(notes.iter().map(|n| &n.agent))
+        .chain(evidence.iter().map(|e| &e.agent))
+        .map(AgentId::as_str)
+        .chain(history.iter().map(|e| e.actor.as_str()))
+        .chain(
+            task.feedback
+                .iter()
+                .filter_map(|f| f.resolution.as_ref())
+                .map(|r| r.by.as_str()),
+        )
+        .collect();
+    let mut handles = BTreeMap::new();
+    let mut stmt = cx
+        .db
+        .prepare_cached("SELECT handle FROM agents WHERE id = ?1")?;
+    for id in named {
+        let handle: Option<String> = stmt.query_row([id], |r| r.get(0)).optional()?;
+        if let Some(handle) = handle.filter(|h| h != id) {
+            handles.insert(id.to_owned(), handle);
+        }
+    }
+    drop(stmt);
     Ok(TaskDetail {
         task,
         notes,
@@ -306,6 +332,7 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         blocks,
         children,
         history,
+        handles,
     })
 }
 

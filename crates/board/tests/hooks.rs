@@ -1195,6 +1195,7 @@ fn mark_done(e: &Env, id: &str, agent: Option<&str>) {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     e.stub.on(&format!("GET /v1/tasks/{id}"), &detail);
     e.stub.on(

@@ -19,8 +19,30 @@ use crate::db::Ctx;
 use crate::error::Result;
 use crate::store::agent_missing;
 
-/// Checks that `agent` is registered and records that it was seen now.
+/// Checks that `agent` is registered and records that it was seen now. An agent marked
+/// ended that calls again is working after all: it is running again, announced once.
 pub(crate) fn touch_agent(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
+    mark_seen(cx, agent)?;
+    let revived = cx.db.execute(
+        "UPDATE agents SET state = 'running', paused_until = NULL \
+         WHERE id = ?1 AND state = 'ended'",
+        [agent.as_str()],
+    )?;
+    if revived > 0 {
+        cx.emit(
+            None,
+            agent.as_str(),
+            EventType::AgentStateChanged,
+            None,
+            serde_json::json!({ "from": "ended", "to": "running", "paused_until": null }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Checks that `agent` is registered and records that it was seen now, leaving its state
+/// alone: for the state change itself.
+pub(crate) fn mark_seen(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
     let updated = cx.db.execute(
         "UPDATE agents SET last_seen = ?1 WHERE id = ?2",
         params![cx.now_ms(), agent.as_str()],

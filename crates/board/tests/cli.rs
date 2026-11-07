@@ -127,6 +127,7 @@ fn done_reads_the_version_and_sends_paired_evidence() {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     e.stub.on("GET /v1/tasks/factory-12", &detail);
     e.stub.on(
@@ -187,6 +188,7 @@ fn show_frames_peer_text_and_escapes_tags() {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     e.stub.on("GET /v1/tasks/factory-12", &detail);
     let out = e.run(&["show", "factory-12"]);
@@ -207,6 +209,7 @@ fn show_reads_resolution_kinds_from_newer_servers() {
         blocks: vec![],
         children: vec![],
         history: vec![],
+        handles: Default::default(),
     };
     let mut detail = serde_json::to_value(&detail).unwrap();
     detail["task"]["feedback"] = json!({
@@ -1178,6 +1181,7 @@ fn update_owner_hands_the_task_over_and_catches_an_old_server() {
             blocks: vec![],
             children: vec![],
             history: vec![],
+            handles: Default::default(),
         },
     );
     let mut handed = task.clone();
@@ -1252,6 +1256,7 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
             blocks: vec![],
             children: vec![],
             history: vec![],
+            handles: Default::default(),
         },
     );
     e.stub.on(
@@ -1535,4 +1540,55 @@ fn a_server_on_another_build_gets_one_warning_and_version_names_the_commit() {
             || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
         "{commit}"
     );
+}
+
+#[test]
+fn agent_naming_another_registered_agent_is_refused_when_the_environment_has_one() {
+    let e = env();
+    const PEER: &str = "t3:thread-2";
+    e.stub.on(
+        &format!("GET /v1/agents/{}", enc(PEER)),
+        agent_fixture(PEER, DEVICE, board_proto::AgentState::Running),
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+
+    // This session is ME: acting as a registered peer is refused before anything is sent.
+    let out = e.run(&["--agent", PEER, "claim", "factory-12"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("drop --agent to act as yourself"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-12/claim")
+            .is_empty()
+    );
+
+    // Its own id, or an id no agent has registered (which registers it), still works.
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:new-thread", DEVICE, board_proto::AgentState::Running),
+    );
+    for agent in [ME, "t3:new-thread"] {
+        let out = e.run(&["--agent", agent, "claim", "factory-12"]);
+        assert!(out.status.success(), "{agent}: {}", stderr(&out));
+    }
+
+    // Without an identity in the environment, --agent works as before.
+    e.stub.clear();
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["--agent", PEER, "claim", "factory-12"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let claims = e.stub.requests_to("POST /v1/tasks/factory-12/claim");
+    assert_eq!(claims[0].agent.as_deref(), Some(PEER));
 }

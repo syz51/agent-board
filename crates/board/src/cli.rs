@@ -25,7 +25,8 @@ use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
     about = "Shared work board for coding-agent threads"
 )]
 pub struct Cli {
-    /// Act as this agent id instead of the one from the environment.
+    /// Act as this agent id instead of the one from the environment. When the environment
+    /// gives one, refused for another registered agent: leave it out to act as yourself.
     #[arg(long, global = true)]
     pub agent: Option<String>,
     /// Print JSON instead of text.
@@ -710,7 +711,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
     };
     cli.command.check_text_limits()?;
     if cli.command.acts_as_agent() {
-        ctx()?.ensure_registered().await?;
+        let ctx = ctx()?;
+        if cli.agent.is_some() {
+            ctx.refuse_borrowed(agent_from_env(None)?.as_ref(), "--agent")
+                .await?;
+        }
+        ctx.ensure_registered().await?;
     }
     let out: Output = match cli.command {
         Command::Login { server, device } => return login(&home, server, device),
