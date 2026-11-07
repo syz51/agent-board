@@ -701,6 +701,19 @@ async fn refused_claims_are_counted_but_are_not_signals() {
     assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 0);
     let stats = t.ok("GET", "/v1/stats", None, None).await;
     assert_eq!(stats["claims_refused"], 6);
+
+    // A claim past the doing limit is not a race: it is still recorded.
+    let task = t.task(A, "factory", "One too many").await;
+    let (s, v) = t.claim(A, &task).await;
+    assert_eq!(s.as_u16(), 409, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("you already have"),
+        "{v}"
+    );
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 1);
 }
 
 #[tokio::test]

@@ -725,25 +725,33 @@ pub(crate) struct ApiErrorSeen {
     pub message: String,
 }
 
-/// Errors that are an expected answer, not friction: clients probe for an agent or a
-/// handoff that may not exist, agents race for a task (refusals are counted in
-/// `claim_refusals` for the stats), and the daemon renews a coordinator lease another device
-/// may hold.
-const EXPECTED_ERRORS: &[(ErrorCode, &str)] = &[
-    (ErrorCode::NotFound, "GET /v1/agents/{id}"),
-    (ErrorCode::NotFound, "GET /v1/agents/{id}/handoff"),
-    (ErrorCode::ClaimRefused, "POST /v1/tasks/{id}/claim"),
+/// Errors that are an expected answer, not friction, by code, route and the start of the
+/// message: clients probe for an agent or a handoff that may not exist, agents race for a
+/// task (refusals are counted in `claim_refusals` for the stats; other refusals of a claim,
+/// such as the doing limit, still count), and the daemon renews a coordinator lease another
+/// device may hold.
+const EXPECTED_ERRORS: &[(ErrorCode, &str, &str)] = &[
+    (ErrorCode::NotFound, "GET /v1/agents/{id}", ""),
+    (ErrorCode::NotFound, "GET /v1/agents/{id}/handoff", ""),
+    (
+        ErrorCode::ClaimRefused,
+        "POST /v1/tasks/{id}/claim",
+        "claim refused:",
+    ),
     (
         ErrorCode::ClaimRefused,
         "POST /v1/boards/{slug}/coordinator",
+        "",
     ),
 ];
 
 /// Records an error answered to an agent. Once its signature reaches the signal threshold
 /// it files feedback (source `signal`); later ones add to that item while it is live.
 pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<TaskId>> {
-    if e.code == ErrorCode::VersionConflict || EXPECTED_ERRORS.contains(&(e.code, e.route.as_str()))
-    {
+    let expected = EXPECTED_ERRORS.iter().any(|(code, route, start)| {
+        *code == e.code && *route == e.route && e.message.starts_with(start)
+    });
+    if e.code == ErrorCode::VersionConflict || expected {
         return Ok(None);
     }
     let code = enum_str(&e.code);
