@@ -235,6 +235,19 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         Some("t3:thread-1")
     );
 
+    // claim=true asks the server to create the task claimed.
+    let mut doing = task_fixture("factory-20", "Mine");
+    doing.status = board_proto::TaskStatus::Doing;
+    stub.on("POST /v1/tasks", &doing);
+    let added = mcp.call(
+        40,
+        "task_add",
+        json!({"title": "Mine", "board": "factory", "claim": true}),
+    );
+    assert_ne!(added["isError"], true, "{added}");
+    assert!(text(&added).starts_with("added and claimed factory-20 doing"));
+    assert_eq!(stub.requests_to("POST /v1/tasks")[0].body["claim"], true);
+
     let noted = mcp.call(
         5,
         "task_note",

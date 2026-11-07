@@ -647,3 +647,86 @@ async fn the_sweeper_task_closes_idle_temporary_boards() {
     t.state.shutdown();
     task.await.unwrap();
 }
+
+async fn close_and_delete(t: &T, slug: &str) {
+    t.ok(
+        "PATCH",
+        &format!("/v1/boards/{slug}"),
+        None,
+        Some(json!({ "status": "closed" })),
+    )
+    .await;
+    let (s, v) = t
+        .as_user("DELETE", &format!("/v1/boards/{slug}"), None)
+        .await;
+    assert_eq!(s.as_u16(), 204, "{v}");
+}
+
+#[tokio::test]
+async fn deleting_either_board_removes_a_link_across_boards() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.board("kept", &[REPO]).await;
+
+    // The blocker's board goes: the task elsewhere loses the blocker and is announced, on
+    // its own board, so a coordinator hears it became ready.
+    temporary_board(&t, "scratch").await;
+    let blocker = t.task(A, "scratch", "Blocker").await;
+    let local = t.task(A, "kept", "Local").await;
+    let waiting = t
+        .task_with(
+            A,
+            json!({ "board": "kept", "title": "Waits", "blockers": [blocker, local] }),
+        )
+        .await;
+    let version = t.get_task(&waiting).await["version"].as_i64().unwrap();
+    close_and_delete(&t, "scratch").await;
+    let task = t.get_task(&waiting).await;
+    assert_eq!(
+        (&task["blockers"], task["version"].as_i64()),
+        (&json!([local]), Some(version + 1))
+    );
+    let event = last_event(&t).await;
+    assert_eq!(
+        (
+            &event["type"],
+            &event["board"],
+            &event["task"],
+            &event["payload"]
+        ),
+        (
+            &json!("task_updated"),
+            &json!("kept"),
+            &json!(waiting),
+            &json!({
+                "fields": ["blockers"], "blockers_removed": [blocker], "board_deleted": "scratch",
+            })
+        )
+    );
+    let (s, v) = t.patch(A, &waiting, json!({ "blockers": [] })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(t.get_task(&waiting).await["ready"], true);
+
+    // The waiting task's board goes: the blocker no longer blocks anything.
+    temporary_board(&t, "scratch2").await;
+    let dependent = t
+        .task_with(
+            A,
+            json!({ "board": "scratch2", "title": "Waits", "blockers": [local] }),
+        )
+        .await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{local}"), None, None).await;
+    assert_eq!(detail["blocks"], json!([dependent]));
+    close_and_delete(&t, "scratch2").await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{local}"), None, None).await;
+    assert_eq!(detail["blocks"], json!([]));
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM task_blockers WHERE task LIKE 'scratch%' OR blocker LIKE 'scratch%'"),
+        0
+    );
+    // Only the deletion event; the kept task is not announced again.
+    assert_eq!(
+        last_event(&t).await["payload"]["fields"],
+        json!(["deleted"])
+    );
+}
