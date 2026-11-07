@@ -125,7 +125,7 @@ export function EventLine(
 ) {
   const summary = summarize(event.payload);
   return (
-    <li class="event">
+    <li class="event" data-kind={event.type.split("_")[0]}>
       <div class="event-head">
         <span class="event-type">{event.type.replaceAll("_", " ")}</span>
         <Who id={event.actor} agents={agents} />
@@ -137,7 +137,7 @@ export function EventLine(
         )}
       </div>
       <span class="event-when">
-        <RelTime at={event.at} /> <span class="muted">#{event.seq}</span>
+        <RelTime at={event.at} /> <span class="event-seq">#{event.seq}</span>
       </span>
       {summary && <p class="event-payload">{summary}</p>}
     </li>

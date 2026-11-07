@@ -266,11 +266,18 @@ function AnswerForm({ ask }: { ask: Ask }) {
   const [text, setText] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiFailure | null>(null);
+  // Set when Send is pressed with nothing chosen or written; cleared by any answer.
+  const [missing, setMissing] = useState(false);
   const answer = text.trim() || choice || "";
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
-    if (!answer || pending) return;
+    if (pending) return;
+    if (!answer) {
+      setMissing(true);
+      document.getElementById(`${id}-text`)?.focus();
+      return;
+    }
     setPending(true);
     setError(null);
     try {
@@ -299,6 +306,7 @@ function AnswerForm({ ask }: { ask: Ask }) {
                 onChange={() => {
                   setChoice(option);
                   setText("");
+                  setMissing(false);
                 }}
               />
               <span class="option-text">{option}</span>
@@ -310,14 +318,25 @@ function AnswerForm({ ask }: { ask: Ask }) {
       <label class="field">
         <span>{ask.options.length > 0 ? "Or write your own answer" : "Your answer"}</span>
         <textarea
+          id={`${id}-text`}
           rows={3}
           value={text}
-          onInput={(event) => setText(event.currentTarget.value)}
+          aria-invalid={missing || undefined}
+          aria-describedby={missing ? `${id}-missing` : undefined}
+          onInput={(event) => {
+            setText(event.currentTarget.value);
+            setMissing(false);
+          }}
         />
       </label>
+      {missing && (
+        <p id={`${id}-missing`} class="field-error" role="alert">
+          {ask.options.length > 0 ? "Choose an answer or write your own first." : "Write an answer first."}
+        </p>
+      )}
       {error && <ErrorNotice error={error} compact />}
       <div class="answer-actions">
-        <button type="submit" class="button button-primary" disabled={!answer || pending}>
+        <button type="submit" class="button button-primary" disabled={pending}>
           {pending ? "Sending…" : "Send answer"}
         </button>
         {answer && !pending && <span class="muted answer-preview">Sends “{answer}”</span>}

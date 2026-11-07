@@ -54,15 +54,17 @@ const COUNT_ORDER = ["ready", "open", "doing", "blocked", "review", "done"] as c
 function BoardCard({ board, coordinator }: { board: Board; coordinator: Agent | undefined }) {
   return (
     <article class="card board-card">
-      <header class="card-head">
-        <h2 class="card-title">
-          <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
-        </h2>
-        <code class="muted">{board.slug}</code>
-        {board.status !== "active" && <span class="badge tone-dropped">{board.status}</span>}
-        {board.temporary && <span class="badge tone-open">temporary</span>}
-      </header>
-      {board.goal && <p class="board-goal"><PlainText text={board.goal} /></p>}
+      <div class="board-intro">
+        <header class="card-head">
+          <h2 class="card-title">
+            <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
+          </h2>
+          <code class="muted">{board.slug}</code>
+          {board.status !== "active" && <span class="badge tone-dropped">{board.status[0]?.toUpperCase()}{board.status.slice(1)}</span>}
+          {board.temporary && <span class="badge tone-open">Temporary</span>}
+        </header>
+        {board.goal && <p class="board-goal"><PlainText text={board.goal} /></p>}
+      </div>
 
       <dl class="counts">
         {COUNT_ORDER.map((key) => (
