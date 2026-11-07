@@ -228,7 +228,15 @@ be on the same board and must not form a cycle.
 
 ### Asks (decisions and actions for the user)
 
-- `POST /v1/asks` `[CreateAsk]` → `[Ask]`. Notifies the user (Telegram, if configured).
+- `POST /v1/asks` `[CreateAsk]` → `[CreatedAsk]`: the `[Ask]`, plus an optional `warning`.
+  Notifies the user (Telegram, if configured). When the board has other open asks younger
+  than `duplicate_ask_window_secs` (taken from the server's clock), the ask is still
+  created, and `warning` names each of them, newest first, with its id, task (or `no task`),
+  asker (`you` for the caller) and age, and says to keep one and withdraw the other when
+  one of them asks the same.
+  `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
+  `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
+  the answer unchanged.
 - `GET /v1/asks?status=open&board=` → `[Ask]` list.
 - `GET /v1/asks/{id}` → `[Ask]` in any status (the web view's `/asks/<id>` link).
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
@@ -370,5 +378,6 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Text limits | title 72, note 280, handoff field 200, question 1,000, body 4,000 characters |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
+| Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

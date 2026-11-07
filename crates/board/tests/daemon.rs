@@ -2038,6 +2038,11 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "need accepts from two reviewers",
         "Ask once per batch, each item with a recommendation",
         "The user's answer is the verdict",
+        // Work that waits on the user reaches them through an ask.
+        "Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal",
+        "A task blocked on the user gets an ask",
+        "never set a task `blocked` on the user without one",
+        "When `ask_user` warns of another open ask that asks the same, keep one and withdraw the other",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }

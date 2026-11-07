@@ -808,6 +808,23 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
         stdout(&out)
     );
 
+    // The server's warning of the board's other recent asks is relayed, also in `--json`.
+    let mut created = serde_json::to_value(open(9, "factory-4")).unwrap();
+    created["warning"] =
+        json!("board factory has 1 other open ask under 30 minutes old: #6 on factory-4");
+    e.stub.on("POST /v1/asks", &created);
+    e.stub.on("GET /v1/asks", Vec::<Ask>::new());
+    let text = stdout(&e.run(&["ask", "Which db?", "--task", "factory-4"]));
+    assert!(
+        text.contains(
+            "\nwarning: board factory has 1 other open ask under 30 minutes old: #6 on factory-4"
+        ),
+        "{text}"
+    );
+    let out = e.run(&["ask", "Which db?", "--task", "factory-4", "--json"]);
+    let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json, created);
+
     let mut withdrawn = open(5, "factory-3");
     withdrawn.status = AskStatus::Withdrawn;
     e.stub.on("POST /v1/asks/5/withdraw", &withdrawn);

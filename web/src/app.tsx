@@ -3,7 +3,7 @@ import { useRef } from "preact/hooks";
 import type { ConnectionState } from "./live/stream.ts";
 import { useConnection, useNow } from "./live/runtime.ts";
 import { AgentsScreen } from "./screens/agents.tsx";
-import { AskScreen, AsksScreen, useOpenAsks } from "./screens/asks.tsx";
+import { AskScreen, AsksScreen, useNeedsYouCount } from "./screens/asks.tsx";
 import { BoardScreen } from "./screens/board.tsx";
 import { BoardsScreen } from "./screens/boards.tsx";
 import { EventsScreen } from "./screens/events.tsx";
@@ -59,8 +59,8 @@ const NAV = [
 
 function Nav() {
   const { path } = useLocation();
-  const asks = useOpenAsks();
-  const open = asks.data?.length ?? 0;
+  // Open asks plus the tasks waiting on the user without one, as the page lists them.
+  const open = useNeedsYouCount();
   return (
     <nav class="nav" aria-label="Main">
       {NAV.map((item) => (
@@ -68,7 +68,7 @@ function Nav() {
           <Icon name={item.icon} />
           <span class="nav-label">{item.label}</span>
           {item.icon === "asks" && open > 0 && (
-            <span class="nav-count" aria-label={`${open} open`}>{open}</span>
+            <span class="nav-count" aria-label={`${open} waiting on you`}>{open}</span>
           )}
         </a>
       ))}
