@@ -177,10 +177,12 @@ be on the same board and must not form a cycle.
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
   limit. Optional: `scanned` (true when the paths were found by scanning the work tree after
   a shell call rather than named by an edit tool) and `modified` (path → modification time
-  the client saw; only paths in the request, else 400). A scanned path whose time equals a
-  peer's unscanned touch of it is the peer's write: it is not recorded for the caller (and
-  not in its `files_touched` event, which is skipped when no path is left), and a peer's
-  unscanned touch removes a matching scanned one before overlaps are computed.
+  the client saw; only paths in the request, else 400). A scanned path whose time equals an
+  unscanned touch of it by a peer on the same device is the peer's write: it is not recorded
+  for the caller (nor in its `files_touched` event, skipped when no path is left), and a
+  peer's unscanned touch removes a matching scanned one before overlaps are computed; alerts
+  then skip the scan's earlier event for that path. A scanned path never replaces the
+  caller's own unscanned touch of it.
 
 ### Asks (decisions and actions for the user)
 

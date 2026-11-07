@@ -346,14 +346,28 @@ fn codex_apply_patch_records_each_patched_file() {
         "tool_input": {"command": patch},
         "tool_response": "Success",
     });
-    let (_, text) = e.hook("post-tool-use", "codex", payload);
-    assert_eq!(text, "");
+    std::fs::create_dir_all(e.repo.join("src")).unwrap();
+    std::fs::write(e.repo.join("src/a.rs"), "y\n").unwrap();
+    // Run from another directory: the patch's relative paths are the payload cwd's.
+    let elsewhere = e.home.parent().unwrap();
+    let out = board(
+        &e.home,
+        elsewhere,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "codex"],
+        &payload.to_string(),
+    );
+    assert_eq!(stdout(&out), "");
     let touch = &e.stub.requests_to("POST /v1/touches")[0];
     assert_eq!(touch.agent.as_deref(), Some(codex_agent));
     assert_eq!(touch.body["paths"], json!(["src/a.rs", "docs/b.md"]));
+    assert_eq!(
+        touch.body["modified"],
+        json!({"src/a.rs": mtime(&e.repo.join("src/a.rs"))}),
+        "the patched file's time; the added one is not on disk here"
+    );
 }
 
-/// Sets a file's modification time well before any hook in the test ran.
 /// A file's modification time as the hook reports it.
 fn mtime(path: &std::path::Path) -> chrono::DateTime<chrono::Utc> {
     std::fs::symlink_metadata(path)
@@ -363,6 +377,7 @@ fn mtime(path: &std::path::Path) -> chrono::DateTime<chrono::Utc> {
         .into()
 }
 
+/// Sets a file's modification time well before any hook in the test ran.
 fn backdate(path: &std::path::Path) {
     let file = std::fs::File::options().write(true).open(path).unwrap();
     file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))

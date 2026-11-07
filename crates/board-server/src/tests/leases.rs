@@ -280,6 +280,31 @@ async fn a_peers_edit_found_by_a_shell_scan_is_not_the_scanners() {
     let result = send(A, "hooks/build.js", false, "2026-11-06T12:00:05Z").await;
     assert_eq!(result["overlaps"][0]["agent"], B, "{result}");
 
+    // A's alerts: B's real write of build.js, not B's scan of A's shell.js edit, whose
+    // files_touched event came before A's touch removed it.
+    let alerts = t.ok("GET", "/v1/snapshot?kind=alerts", Some(A), None).await;
+    let alerts = alerts["text"].as_str().unwrap();
+    assert!(alerts.contains("edited hooks/build.js"), "{alerts}");
+    assert!(!alerts.contains("hooks/shell.js"), "{alerts}");
+
+    // A scan never replaces the scanner's own earlier edit-tool touch, so a peer's matching
+    // write cannot remove it.
+    send(B, "src/own.rs", false, "2026-11-06T11:00:00Z").await;
+    send(B, "src/own.rs", true, edited).await;
+    send(A, "src/own.rs", false, edited).await;
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM touches WHERE agent = 't3:beta' AND path = 'src/own.rs'"),
+        1
+    );
+
+    // A peer on another device cannot share the work tree: its equal time proves nothing.
+    const C: &str = "t3:gamma";
+    t.register(C, Some(REPO), None).await;
+    send(C, "src/far.rs", true, edited).await;
+    t.exec("UPDATE agents SET device = 'pc' WHERE id = 't3:gamma'");
+    let result = send(A, "src/far.rs", false, edited).await;
+    assert_eq!(result["overlaps"][0]["agent"], C, "{result}");
+
     // Times only for paths in the request.
     let (status, _, _) = t
         .fail(
