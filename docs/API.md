@@ -73,8 +73,9 @@ longer text goes, such as splitting a note or moving detail to the task body
 **Signals.** The server records every error it answers to an authenticated request that
 names an agent (`X-Board-Agent`), except expected answers: `version_conflict` (a normal
 retry), `not_found` from `GET /v1/agents/{id}` and `GET /v1/agents/{id}/handoff` (clients
-probe for them) and `claim_refused` from `POST /v1/boards/{slug}/coordinator` (the daemon
-renews it). It records the code, the
+probe for them), `claim_refused` from `POST /v1/tasks/{id}/claim` (agents race for a task;
+stats count refusals as `claims_refused`) and `claim_refused` from
+`POST /v1/boards/{slug}/coordinator` (the daemon renews it). It records the code, the
 route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become
 `N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
 `signal_min_reports` errors from at least `signal_min_agents` agents within

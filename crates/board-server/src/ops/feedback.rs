@@ -726,11 +726,13 @@ pub(crate) struct ApiErrorSeen {
 }
 
 /// Errors that are an expected answer, not friction: clients probe for an agent or a
-/// handoff that may not exist, and the daemon renews a coordinator lease another device may
-/// hold.
+/// handoff that may not exist, agents race for a task (refusals are counted in
+/// `claim_refusals` for the stats), and the daemon renews a coordinator lease another device
+/// may hold.
 const EXPECTED_ERRORS: &[(ErrorCode, &str)] = &[
     (ErrorCode::NotFound, "GET /v1/agents/{id}"),
     (ErrorCode::NotFound, "GET /v1/agents/{id}/handoff"),
+    (ErrorCode::ClaimRefused, "POST /v1/tasks/{id}/claim"),
     (
         ErrorCode::ClaimRefused,
         "POST /v1/boards/{slug}/coordinator",
