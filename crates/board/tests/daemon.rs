@@ -2463,3 +2463,88 @@ async fn a_failed_agent_lookup_waits_for_its_back_off() {
     assert_eq!(e.stub.requests_to(&route).len(), 2);
     assert_eq!(threads(&e.t3), ["worker"]);
 }
+
+#[test]
+fn the_watch_lock_is_held_once_per_home_and_released_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path().join("home"));
+    let lock = board::daemon::lock_watch(&home).unwrap();
+    let err = board::daemon::lock_watch(&home).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!("pid {}", std::process::id())) && err.contains("already running"),
+        "{err}"
+    );
+    drop(lock);
+    board::daemon::lock_watch(&home).expect("free again once released");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_watch_on_the_same_home_exits_naming_the_first() {
+    use std::process::{Child, Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    stub.on_stream("GET /v1/events", vec![]);
+    let home = home_for(dir.path(), &stub.url);
+    let watch = |stderr: Stdio| -> Child {
+        Command::new(env!("CARGO_BIN_EXE_board"))
+            .arg("watch")
+            .env("BOARD_HOME", &home)
+            .env("BOARD_TOKEN", TOKEN)
+            .env("BOARD_KEYCHAIN", "0")
+            .env_remove("T3CODE_THREAD_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap()
+    };
+    let wait_connected = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stub.requests_to("GET /v1/events").len() < n {
+            assert!(Instant::now() < deadline, "the daemon never connected");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let stop = |mut child: Child| {
+        let killed = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{status:?}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "the daemon ignored SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let first = watch(Stdio::null());
+    wait_connected(1);
+    let second = watch(Stdio::piped()).wait_with_output().unwrap();
+    assert!(!second.status.success());
+    let message = stderr(&second);
+    assert!(
+        message.contains("already running") && message.contains(&format!("pid {}", first.id())),
+        "{message}"
+    );
+    assert_eq!(
+        stub.requests_to("GET /v1/events").len(),
+        1,
+        "the second never connected"
+    );
+
+    // Gone with the process: the next start (a launchd restart) takes it.
+    stop(first);
+    let third = watch(Stdio::null());
+    wait_connected(2);
+    stop(third);
+}

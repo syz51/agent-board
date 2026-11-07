@@ -508,7 +508,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   a restore drill is part of the tests.
 - Devices: `board login` stores the server URL and token; `board install claude` adds the
   hooks and MCP server to Claude Code's user settings; `board watch` runs under launchd or
-  systemd.
+  systemd, one per `$BOARD_HOME`: it holds a lock on `state/watch.lock` while it runs, and
+  a second one exits naming the first one's pid.
 
 ## Testing
 

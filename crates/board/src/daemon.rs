@@ -1557,8 +1557,57 @@ pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
     )
 }
 
-/// Runs the daemon until interrupted or stopped (or one pass with `once`).
+/// Proof that this process is the only `board watch` for its `$BOARD_HOME`: an exclusive
+/// lock on `state/watch.lock`, which holds the owner's pid. The system releases it when
+/// the process exits, however it exits, so a restart under launchd or systemd takes it.
+#[derive(Debug)]
+pub struct WatchLock {
+    _file: std::fs::File,
+}
+
+/// Takes the [`WatchLock`] of `home`, or says which process holds it.
+pub fn lock_watch(home: &Home) -> Result<WatchLock> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let dir = home.state_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("watch.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            // Best effort: the pid only names the holder in the message.
+            let _ = file.read_to_string(&mut holder);
+            let holder = match holder.trim().parse::<u32>() {
+                Ok(pid) => format!("pid {pid}"),
+                Err(_) => "another process".to_owned(),
+            };
+            anyhow::bail!(
+                "board watch is already running for {} ({holder} holds {}); stop it before starting another, or set BOARD_HOME to another device's home",
+                home.root().display(),
+                path.display()
+            );
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(err).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    file.set_len(0)?;
+    file.rewind()?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(WatchLock { _file: file })
+}
+
+/// Runs the daemon until interrupted or stopped (or one pass with `once`). Refuses to
+/// start while another daemon runs for the same `$BOARD_HOME`.
 pub async fn run(home: Home, once: bool) -> Result<()> {
+    let _lock = lock_watch(&home)?;
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
