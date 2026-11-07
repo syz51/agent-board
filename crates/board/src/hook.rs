@@ -239,7 +239,7 @@ async fn handle(
             tracing::debug!("pruning tool start marks: {err:#}");
         }
         // Done marks of turns whose Stop hook never ran (interrupted, or the session ended).
-        if let Err(err) = state::prune_done(&home, TOOL_START_AGE) {
+        if let Err(err) = state::prune_done(&home, DONE_MARK_AGE) {
             tracing::debug!("pruning done marks: {err:#}");
         }
     }
@@ -286,6 +286,19 @@ async fn handle(
         done_reminder: None,
         now: Utc::now(),
     };
+    // Turn boundaries for the done reminder hold whether or not the server answers.
+    match event {
+        HookEvent::UserPromptSubmit => hook.local.turn_started = Some(hook.now),
+        // A new or resumed session: done marks left over were from a turn whose Stop never
+        // ran. Compaction happens within a turn, so it keeps them and the turn's start.
+        HookEvent::SessionStart if input["source"] != "compact" => {
+            hook.local.turn_started = None;
+            if let Err(err) = state::take_done(&hook.home, &hook.agent) {
+                tracing::debug!("dropping done marks: {err:#}");
+            }
+        }
+        _ => {}
+    }
     let offline_until = state::load_offline_until(&hook.home);
     if offline_until.is_some_and(|until| until > hook.now) {
         let reply = hook.offline();
@@ -324,6 +337,8 @@ async fn handle(
 const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// How long the start mark of a shell call that never reached PostToolUse is kept.
 const TOOL_START_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How long a done mark no `Stop` hook read (an interrupted turn, an ended session) is kept.
+const DONE_MARK_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// Whether this session runs inside another agent session, which matters only when the
 /// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
@@ -590,7 +605,6 @@ impl Hook<'_> {
                 forked_from: None,
             })
             .await?;
-        self.local.turn_started = None;
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
@@ -621,7 +635,6 @@ impl Hook<'_> {
     }
 
     async fn user_prompt_submit(&mut self) -> Result<Reply> {
-        self.local.turn_started = Some(self.now);
         // After an outage, catch up with a full snapshot instead of a delta.
         let kind = if self.local.offline_notified {
             SnapshotKind::Full

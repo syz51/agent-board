@@ -1115,6 +1115,71 @@ fn stop_reminds_about_a_done_task_while_the_server_fails() {
     );
 }
 
+fn session_start(e: &Env, source: &str) {
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 1),
+    );
+    let payload = e.with("SessionStart", json!({"source": source}));
+    e.hook("session-start", "claude", payload);
+    // Later deltas are empty again.
+    nothing_doing(e);
+}
+
+#[test]
+fn done_reminders_keep_turn_boundaries_across_compaction_and_sessions() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "one");
+    mark_done(&e, "factory-9", None); // interrupted: no Stop
+    prompt(&e, "two");
+    mark_done(&e, "factory-10", None);
+    session_start(&e, "compact");
+    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
+    assert!(
+        reason.starts_with("board: you marked factory-10 done this turn."),
+        "compaction keeps the turn and its marks: {reason}"
+    );
+
+    mark_done(&e, "factory-11", None); // interrupted again
+    session_start(&e, "resume");
+    assert_eq!(
+        stop(&e),
+        None,
+        "a resumed session drops the earlier turn's marks"
+    );
+}
+
+#[test]
+fn done_reminders_keep_turn_boundaries_while_the_server_is_unreachable() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "one");
+    mark_done(&e, "factory-9", None); // interrupted: no Stop
+    // Hooks on this device skip the server for a while after it failed to answer.
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        json!({"until": until}).to_string(),
+    )
+    .unwrap();
+    prompt(&e, "two");
+    assert_eq!(stop(&e), None, "the offline prompt still starts a turn");
+    mark_done(&e, "factory-10", None);
+    let reply = stop(&e).expect("the reminder needs no server");
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("board: you marked factory-10 done this turn."),
+        "{reply}"
+    );
+}
+
 #[test]
 fn codex_stop_reminds_after_task_done_in_codex_shape() {
     let e = env();
