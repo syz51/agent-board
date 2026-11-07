@@ -500,7 +500,7 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert_eq!(
         e.t3.sends(),
         [(
@@ -518,7 +518,7 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 1);
 }
 
@@ -532,7 +532,7 @@ async fn a_passed_not_before_wakes_the_coordinator() {
     let mut passed = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
     passed.payload = json!({ "fields": [], "not_before_passed": "2026-11-07T00:00:00Z" });
     e.daemon.on_event(&passed, at()).await.unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert_eq!(
         e.t3.sends(),
         [(
@@ -561,7 +561,7 @@ async fn a_cleared_blocker_wakes_the_coordinator() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     let sends = e.t3.sends();
     assert_eq!(sends.len(), 1);
     assert!(
@@ -586,7 +586,7 @@ async fn a_paused_coordinator_is_not_woken_before_its_reset() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert!(e.t3.sends().is_empty());
 
     // After the reset: the event wakes it, and reconcile resumes it once.
@@ -598,7 +598,7 @@ async fn a_paused_coordinator_is_not_woken_before_its_reset() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(later).await;
     assert_eq!(e.t3.sends().len(), 1);
     e.daemon.reconcile(later).await.unwrap();
     e.daemon.reconcile(later).await.unwrap();
@@ -618,15 +618,12 @@ async fn a_paused_coordinator_is_not_woken_before_its_reset() {
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert!(e.t3.sends().is_empty());
 }
 
-#[tokio::test]
-async fn an_answered_ask_wakes_the_asking_worker_and_the_coordinator() {
-    let (mut e, _) = coordinator_env(AgentState::Idle, None);
-    e.daemon.reconcile(at()).await.unwrap();
-    let ask = |id: i64, agent: &str| Ask {
+fn answered_ask(id: i64, agent: &str) -> Ask {
+    Ask {
         id,
         board: "factory".parse().unwrap(),
         task: Some("factory-7".parse().unwrap()),
@@ -639,9 +636,27 @@ async fn an_answered_ask_wakes_the_asking_worker_and_the_coordinator() {
         answered_via: Some("web".into()),
         created_at: at(),
         answered_at: Some(at()),
-    };
-    e.stub
-        .on("GET /v1/asks", [ask(3, "t3:worker"), ask(4, "t3:remote")]);
+    }
+}
+
+fn answered(seq: i64, ask: i64) -> Event {
+    let mut answered = event(seq, EventType::AskAnswered, None, "user");
+    answered.payload = json!({ "ask": ask });
+    answered
+}
+
+#[tokio::test]
+async fn an_answered_ask_wakes_the_asker_only() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        "GET /v1/asks",
+        [
+            answered_ask(3, "t3:worker"),
+            answered_ask(4, "t3:remote"),
+            answered_ask(5, "t3:coord"),
+        ],
+    );
     e.stub.on(
         &format!("GET {}", agent_path("t3:worker")),
         agent_fixture("t3:worker", DEVICE, AgentState::Idle),
@@ -651,14 +666,12 @@ async fn an_answered_ask_wakes_the_asking_worker_and_the_coordinator() {
         agent_fixture("t3:remote", "mac-air", AgentState::Idle),
     );
 
-    let mut answered = event(30, EventType::AskAnswered, None, "user");
-    answered.payload = json!({"ask": 3});
-    e.daemon.on_event(&answered, at()).await.unwrap();
-    e.daemon.flush().await;
+    e.daemon.on_event(&answered(30, 3), at()).await.unwrap();
+    e.daemon.flush(at()).await;
     let sends = e.t3.sends();
     let threads: Vec<&str> = sends.iter().map(|(t, _)| t.as_str()).collect();
-    assert_eq!(threads, ["coord", "worker"]);
-    let message = &sends[1].1;
+    assert_eq!(threads, ["worker"], "not the coordinator");
+    let message = &sends[0].1;
     assert!(
         message.starts_with("the user answered ask #3 about factory-7: \"sqlite "),
         "{message}"
@@ -673,13 +686,209 @@ async fn an_answered_ask_wakes_the_asking_worker_and_the_coordinator() {
         ("answered", "factory")
     );
 
-    // A worker on another device is that device's daemon's to wake.
-    let mut remote = event(31, EventType::AskAnswered, None, "user");
-    remote.payload = json!({"ask": 4});
-    e.daemon.on_event(&remote, at()).await.unwrap();
-    e.daemon.flush().await;
+    // A worker on another device is that device's daemon's to wake, and nobody here is.
+    e.daemon.on_event(&answered(31, 4), at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1);
+
+    // The coordinator's own ask wakes the coordinator.
+    e.daemon.on_event(&answered(32, 5), at()).await.unwrap();
+    e.daemon.flush(at()).await;
     let threads: Vec<String> = e.t3.sends().into_iter().map(|(t, _)| t).collect();
-    assert_eq!(threads, ["coord", "worker", "coord"]);
+    assert_eq!(threads, ["worker", "coord"]);
+
+    // An ask withdrawn or reopened before the flush wakes nobody.
+    e.daemon.on_event(&answered(33, 3), at()).await.unwrap();
+    e.stub.on("GET /v1/asks", Vec::<Ask>::new());
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 2);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+fn task_now(id: &str, status: board_proto::TaskStatus, ready: bool, auto: bool) -> TaskDetail {
+    let mut d = detail(id, ready, &[]);
+    d.task.status = status;
+    d.task.auto = auto;
+    d
+}
+
+#[tokio::test]
+async fn a_queued_ready_line_is_checked_again_when_sent() {
+    use board_proto::TaskStatus;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    for (seq, id) in [(10, "factory-1"), (11, "factory-2"), (12, "factory-3")] {
+        e.stub
+            .on(&format!("GET /v1/tasks/{id}"), detail(id, true, &[]));
+        e.daemon
+            .on_event(
+                &event(seq, EventType::TaskReleased, Some(id), "t3:worker"),
+                at(),
+            )
+            .await
+            .unwrap();
+    }
+    e.stub.on(
+        "GET /v1/tasks/factory-9",
+        detail("factory-9", false, &["factory-4", "factory-5"]),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.stub
+        .on("GET /v1/tasks/factory-5", detail("factory-5", true, &[]));
+    e.daemon
+        .on_event(
+            &event(13, EventType::TaskDone, Some("factory-9"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+
+    // Before the flush: one claimed, one blocked, one done, one cleared task made manual.
+    e.stub.on(
+        "GET /v1/tasks/factory-1",
+        task_now("factory-1", TaskStatus::Doing, false, true),
+    );
+    e.stub.on(
+        "GET /v1/tasks/factory-2",
+        task_now("factory-2", TaskStatus::Blocked, false, true),
+    );
+    e.stub.on(
+        "GET /v1/tasks/factory-3",
+        task_now("factory-3", TaskStatus::Done, false, true),
+    );
+    e.stub.on(
+        "GET /v1/tasks/factory-5",
+        task_now("factory-5", TaskStatus::Open, true, false),
+    );
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-9 is done; its blocker cleared for factory-4\nRun board_snapshot and continue."
+                .to_owned()
+        )]
+    );
+
+    // Nothing left: a later flush sends nothing.
+    assert!(e.daemon.state.wakes.is_empty());
+    e.stub.on(
+        "GET /v1/tasks/factory-4",
+        task_now("factory-4", TaskStatus::Doing, false, true),
+    );
+    e.daemon
+        .on_event(
+            &event(14, EventType::TaskReleased, Some("factory-1"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn lines_for_a_running_agent_are_held_and_sent_as_one_message_when_it_is_idle() {
+    let (mut e, agent) = coordinator_env(AgentState::Running, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    for (seq, id) in [(10, "factory-1"), (11, "factory-2")] {
+        e.stub
+            .on(&format!("GET /v1/tasks/{id}"), detail(id, true, &[]));
+        e.daemon
+            .on_event(&event(seq, EventType::TaskCreated, Some(id), "user"), at())
+            .await
+            .unwrap();
+        e.daemon.flush(at()).await;
+    }
+    assert!(e.t3.sends().is_empty(), "held while it runs");
+    // Held lines survive a restart.
+    e.daemon.save().unwrap();
+    assert_eq!(saved_state(&e).wakes[&agent.parse().unwrap()].len(), 2);
+
+    let soon = at() + chrono::Duration::minutes(2);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    e.daemon.flush(soon).await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-1 is ready (p1)\nboard factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+                .to_owned()
+        )]
+    );
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // A thread that stays running past the hold limit gets its lines anyway.
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    e.daemon
+        .on_event(
+            &event(12, EventType::TaskCreated, Some("factory-1"), "user"),
+            soon,
+        )
+        .await
+        .unwrap();
+    e.daemon
+        .flush(soon + board::daemon::WAKE_HOLD_MAX - chrono::Duration::seconds(1))
+        .await;
+    assert_eq!(e.t3.sends().len(), 1);
+    e.daemon.flush(soon + board::daemon::WAKE_HOLD_MAX).await;
+    assert_eq!(e.t3.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_send_is_retried_on_the_next_flush_after_a_check() {
+    use board_proto::TaskStatus;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    for (seq, id) in [(10, "factory-1"), (11, "factory-2")] {
+        e.stub
+            .on(&format!("GET /v1/tasks/{id}"), detail(id, true, &[]));
+        e.daemon
+            .on_event(&event(seq, EventType::TaskCreated, Some(id), "user"), at())
+            .await
+            .unwrap();
+    }
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1, "tried once");
+
+    // Meanwhile factory-1 was claimed: the retry carries factory-2 only.
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    e.stub.on(
+        "GET /v1/tasks/factory-1",
+        task_now("factory-1", TaskStatus::Doing, false, true),
+    );
+    let next = at() + chrono::Duration::seconds(3);
+    e.daemon.flush(next).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    assert_eq!(
+        sends[1].1,
+        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+    );
+    e.daemon.flush(next).await;
+    assert_eq!(e.t3.sends().len(), 2, "sent once");
+
+    // A send that keeps failing is given up after the wake-up's time to live.
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon
+        .on_event(
+            &event(12, EventType::TaskCreated, Some("factory-2"), "user"),
+            next,
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(next).await;
+    assert!(!e.daemon.state.wakes.is_empty());
+    e.daemon.flush(next + board::daemon::WAKE_TTL).await;
+    assert!(e.daemon.state.wakes.is_empty());
 }
 
 #[tokio::test]
@@ -1084,7 +1293,7 @@ async fn an_event_that_failed_on_a_transient_error_is_retried() {
     e.daemon.catch_up(at()).await.unwrap();
     assert_eq!(e.daemon.state.last_seq, Some(10));
     assert_eq!(e.daemon.state.retry.len(), 1);
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert!(e.t3.sends().is_empty());
 
     // The server is back: the wake-up goes out.
@@ -1094,7 +1303,7 @@ async fn an_event_that_failed_on_a_transient_error_is_retried() {
         .retry_failed(at() + chrono::Duration::minutes(1))
         .await;
     assert!(e.daemon.state.retry.is_empty());
-    e.daemon.flush().await;
+    e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 1);
 
     // A refused request is not retried.
@@ -1314,7 +1523,7 @@ async fn an_adopted_thread_is_briefed_and_named_coordinator_instead_of_a_new_thr
         )
         .await
         .unwrap();
-    e.daemon.flush().await;
+    e.daemon.flush(at() + chrono::Duration::minutes(71)).await;
     let sends = e.t3.sends();
     assert_eq!(sends.len(), 2, "the brief, then one wake-up: {sends:?}");
     assert_eq!(

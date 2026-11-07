@@ -6,9 +6,14 @@
 //!   thread with `prompts/coordinator.md`, plus `prompts/triage.md` on the device's feedback
 //!   board, claim again as the thread's agent);
 //! - renews the coordinator lease while the thread is live;
-//! - wakes the coordinator when a task becomes ready, a blocker clears or an ask is
-//!   answered, and wakes a worker whose ask was answered;
+//! - wakes the coordinator when a task becomes ready or a blocker clears, and the asker
+//!   (worker or coordinator) when its ask is answered;
 //! - never wakes a paused agent before its `paused_until`.
+//!
+//! Wake-ups are queued as what they are about (a task, an ask), not as text. Each flush
+//! checks them again before sending: a task no longer ready and auto, or an ask no longer
+//! answered, drops its line. Lines for an agent that is running are held, then sent as one
+//! message once it is idle; a failed send is kept and checked again on the next flush.
 //!
 //! Wake-up messages contain only board-generated text and the user's own answers.
 //!
@@ -23,9 +28,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
-    ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, RegisterAgent, Runtime, TaskId,
-    Timestamp,
+    Agent, AgentId, AgentRole, AgentSource, AgentState, AskStatus, Board, BoardSlug, BoardStatus,
+    ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, Priority, RegisterAgent, Runtime,
+    TaskId, Timestamp,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -42,6 +47,12 @@ use crate::t3::{T3, T3Cli};
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
 /// The feedback board coordinator's triage instructions, after [`COORDINATOR_PROMPT`].
 pub const TRIAGE_PROMPT: &str = include_str!("../../../prompts/triage.md");
+
+/// Wake-ups for a running agent are held at most this long, then sent anyway: T3 gives a
+/// busy thread the message as its next turn, and a missed Stop hook must not silence it.
+pub const WAKE_HOLD_MAX: TimeDelta = TimeDelta::minutes(30);
+/// A wake-up not delivered this long after it was queued is dropped.
+pub const WAKE_TTL: TimeDelta = TimeDelta::hours(1);
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
@@ -76,6 +87,29 @@ pub struct WatchState {
     /// found again: the next start adopts the thread it created instead of adding another.
     #[serde(default)]
     pub pending_starts: BTreeMap<BoardSlug, Timestamp>,
+    /// Wake-ups not sent yet, by agent: held while the agent runs, or kept after a failed
+    /// send. Saved so a restart does not lose them.
+    #[serde(default)]
+    pub wakes: BTreeMap<AgentId, Vec<Wake>>,
+}
+
+/// A queued wake-up: what it is about, checked again and rendered when it is sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Wake {
+    pub board: BoardSlug,
+    pub about: WakeAbout,
+    pub queued_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WakeAbout {
+    /// For the coordinator: the task became ready.
+    Ready { task: TaskId },
+    /// For the coordinator: `done` cleared the last blocker of `ready`.
+    Cleared { done: TaskId, ready: Vec<TaskId> },
+    /// For the asker: the user answered its ask.
+    Answered { ask: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,8 +214,6 @@ pub struct Daemon<T: T3> {
     t3: T,
     pub state: WatchState,
     boards: BTreeMap<BoardSlug, Board>,
-    /// Wake-up lines waiting to be sent, by agent.
-    pending: BTreeMap<AgentId, Vec<String>>,
     /// Boards whose coordinator failed to start here, by board.
     failures: BTreeMap<BoardSlug, StartFailure>,
 }
@@ -195,7 +227,6 @@ impl<T: T3> Daemon<T> {
             t3,
             state,
             boards: BTreeMap::new(),
-            pending: BTreeMap::new(),
             failures: BTreeMap::new(),
         }
     }
@@ -675,23 +706,26 @@ impl<T: T3> Daemon<T> {
     /// Handles one event: queues its wake-ups and advances `last_seq`. Returns true when the
     /// boards should be reconciled. On an error nothing is queued and `last_seq` stays.
     pub async fn on_event(&mut self, event: &Event, now: Timestamp) -> Result<bool> {
-        let (reconcile, wakes) = self.examine(event, now).await?;
-        for (agent, line) in wakes {
-            let lines = self.pending.entry(agent).or_default();
-            if !lines.contains(&line) {
-                lines.push(line);
+        let (reconcile, wakes) = self.examine(event).await?;
+        for (agent, (board, about)) in wakes {
+            let queued = self.state.wakes.entry(agent).or_default();
+            if !queued.iter().any(|w| w.board == board && w.about == about) {
+                queued.push(Wake {
+                    board,
+                    about,
+                    queued_at: now,
+                });
             }
         }
         self.state.last_seq = Some(self.state.last_seq.unwrap_or(0).max(event.seq));
         Ok(reconcile)
     }
 
-    /// What one event calls for: a reconcile, and wake-up lines by agent. Only reads.
+    /// What one event calls for: a reconcile, and wake-ups by agent. Only reads.
     async fn examine(
         &self,
         event: &Event,
-        now: Timestamp,
-    ) -> Result<(bool, Vec<(AgentId, String)>)> {
+    ) -> Result<(bool, Vec<(AgentId, (BoardSlug, WakeAbout))>)> {
         let mut wakes = Vec::new();
         let Some(slug) = &event.board else {
             return Ok((false, wakes));
@@ -702,18 +736,18 @@ impl<T: T3> Daemon<T> {
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
             EventType::TaskCreated | EventType::TaskReleased | EventType::TaskUpdated => {
                 if let Some(task) = &event.task
-                    && self.coordinator_here(slug).is_some()
+                    && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
                     let detail = self.client().task(task).await?;
                     if detail.task.ready && detail.task.auto {
-                        let line = format!("{task} is ready ({})", priority(&detail.task.priority));
-                        wakes.extend(self.coordinator_wake(slug, &event.actor, line, now).await?);
+                        let about = WakeAbout::Ready { task: task.clone() };
+                        wakes.push((coordinator.clone(), (slug.clone(), about)));
                     }
                 }
             }
             EventType::TaskDone => {
                 if let Some(task) = &event.task
-                    && self.coordinator_here(slug).is_some()
+                    && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
                     let detail = self.client().task(task).await?;
                     let mut ready: Vec<TaskId> = Vec::new();
@@ -724,14 +758,29 @@ impl<T: T3> Daemon<T> {
                         }
                     }
                     if !ready.is_empty() {
-                        let ids: Vec<&str> = ready.iter().map(TaskId::as_str).collect();
-                        let line =
-                            format!("{task} is done; its blocker cleared for {}", ids.join(", "));
-                        wakes.extend(self.coordinator_wake(slug, &event.actor, line, now).await?);
+                        let about = WakeAbout::Cleared {
+                            done: task.clone(),
+                            ready,
+                        };
+                        wakes.push((coordinator.clone(), (slug.clone(), about)));
                     }
                 }
             }
-            EventType::AskAnswered => wakes = self.on_answer(slug, event, now).await?,
+            // Only the asker: the coordinator learns of answers to others' asks from the board.
+            EventType::AskAnswered => {
+                let Some(ask) = event.payload["ask"]
+                    .as_i64()
+                    .or_else(|| event.payload["id"].as_i64())
+                else {
+                    tracing::warn!("event #{}: ask_answered without an ask id", event.seq);
+                    return Ok((false, wakes));
+                };
+                if let Some(answered) = self.answered_ask(slug, ask).await?
+                    && let Some(asker) = self.wakeable(Some(&answered.agent), event)
+                {
+                    wakes.push((asker.clone(), (slug.clone(), WakeAbout::Answered { ask })));
+                }
+            }
             _ => {}
         }
         Ok((false, wakes))
@@ -743,44 +792,18 @@ impl<T: T3> Daemon<T> {
             && event.payload["fields"] == serde_json::json!(["coordinator"])
     }
 
-    async fn on_answer(
-        &self,
-        slug: &BoardSlug,
-        event: &Event,
-        now: Timestamp,
-    ) -> Result<Vec<(AgentId, String)>> {
-        let mut wakes = Vec::new();
-        let Some(id) = event.payload["ask"]
-            .as_i64()
-            .or_else(|| event.payload["id"].as_i64())
-        else {
-            tracing::warn!("event #{}: ask_answered without an ask id", event.seq);
-            return Ok(wakes);
-        };
+    /// `agent` when it is a T3 thread that did not cause `event`. Whether it is on this
+    /// device and awake is checked when the wake-up is sent.
+    fn wakeable<'a>(&self, agent: Option<&'a AgentId>, event: &Event) -> Option<&'a AgentId> {
+        agent.filter(|a| a.as_str() != event.actor && a.source() == AgentSource::T3)
+    }
+
+    /// Ask `id` on `slug`, while it is answered.
+    async fn answered_ask(&self, slug: &BoardSlug, id: i64) -> Result<Option<board_proto::Ask>> {
         let asks = self.client().asks(Some("answered"), Some(slug)).await?;
-        let Some(ask) = asks.into_iter().find(|a| a.id == id) else {
-            return Ok(wakes);
-        };
-        let about = ask
-            .task
-            .as_ref()
-            .map(|t| format!(" about {t}"))
-            .unwrap_or_default();
-        let answer = serde_json::to_string(ask.answer.as_deref().unwrap_or_default())?
-            .replace('<', "\\u003c")
-            .replace('>', "\\u003e");
-        let line = format!("the user answered ask #{id}{about}: {answer}");
-        wakes.extend(
-            self.wake(&ask.agent, &event.actor, line.clone(), now)
-                .await?,
-        );
-        if self.coordinator_here(slug).is_some()
-            && let Some(coordinator) = self.boards.get(slug).and_then(|b| b.coordinator.clone())
-            && coordinator != ask.agent
-        {
-            wakes.extend(self.wake(&coordinator, &event.actor, line, now).await?);
-        }
-        Ok(wakes)
+        Ok(asks
+            .into_iter()
+            .find(|a| a.id == id && a.status == AskStatus::Answered))
     }
 
     /// The coordinator of an autopilot board, when there is one.
@@ -791,50 +814,135 @@ impl<T: T3> Daemon<T> {
             .and_then(|b| b.coordinator.as_ref())
     }
 
-    async fn coordinator_wake(
-        &self,
-        slug: &BoardSlug,
-        actor: &str,
-        line: String,
-        now: Timestamp,
-    ) -> Result<Option<(AgentId, String)>> {
-        match self.coordinator_here(slug) {
-            Some(agent) => {
-                self.wake(agent, actor, format!("board {slug}: {line}"), now)
-                    .await
+    /// Sends the queued wake-ups, one message per agent, after checking each again. Wake-ups
+    /// for a running agent, and those whose send or check failed on a transient error, stay
+    /// queued for the next flush.
+    pub async fn flush(&mut self, now: Timestamp) {
+        for (agent, wakes) in std::mem::take(&mut self.state.wakes) {
+            let kept: Vec<Wake> = self
+                .deliver(&agent, wakes, now)
+                .await
+                .into_iter()
+                .filter(|w| {
+                    let fresh = now - w.queued_at < WAKE_TTL;
+                    if !fresh {
+                        tracing::warn!("waking {agent}: not delivered in time; dropped");
+                    }
+                    fresh
+                })
+                .collect();
+            if !kept.is_empty() {
+                self.state.wakes.insert(agent, kept);
             }
-            None => Ok(None),
         }
     }
 
-    /// `line` for `agent` when it is a T3 thread on this device that did not cause the event
-    /// and is not paused.
-    async fn wake(
-        &self,
-        agent: &AgentId,
-        actor: &str,
-        line: String,
-        now: Timestamp,
-    ) -> Result<Option<(AgentId, String)>> {
-        if agent.as_str() == actor || agent.source() != AgentSource::T3 {
-            return Ok(None);
-        }
+    /// Sends `agent` the wake-ups that still hold; returns those to try again.
+    async fn deliver(&self, agent: &AgentId, wakes: Vec<Wake>, now: Timestamp) -> Vec<Wake> {
         let info = match self.client().agent_info(agent).await {
             Ok(info) => info,
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        Ok(should_wake(&info, &self.ctx.device, now).then(|| (agent.clone(), line)))
-    }
-
-    /// Sends the queued wake-ups, one message per agent.
-    pub async fn flush(&mut self) {
-        for (agent, lines) in std::mem::take(&mut self.pending) {
-            let message = format!("{}\nRun board_snapshot and continue.", lines.join("\n"));
-            if let Err(err) = self.t3.send(agent.native(), &message).await {
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Vec::new(),
+            Err(err) => {
                 tracing::warn!("waking {agent}: {err:#}");
+                return if is_transient(&err) {
+                    wakes
+                } else {
+                    Vec::new()
+                };
+            }
+        };
+        // Another device's, or paused until a reset that has not come: not ours to wake now.
+        if !should_wake(&info, &self.ctx.device, now) {
+            return Vec::new();
+        }
+        if info.state == AgentState::Running
+            && wakes.iter().all(|w| now - w.queued_at < WAKE_HOLD_MAX)
+        {
+            return wakes;
+        }
+        let mut retry = Vec::new();
+        let mut sent = Vec::new();
+        let mut lines = Vec::new();
+        for wake in wakes {
+            match self.recheck(agent, &wake).await {
+                Ok(Some(line)) => {
+                    if !lines.contains(&line) {
+                        lines.push(line);
+                    }
+                    sent.push(wake);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("waking {agent}: {err:#}");
+                    if is_transient(&err) {
+                        retry.push(wake);
+                    }
+                }
             }
         }
+        if lines.is_empty() {
+            return retry;
+        }
+        let message = format!("{}\nRun board_snapshot and continue.", lines.join("\n"));
+        if let Err(err) = self.t3.send(agent.native(), &message).await {
+            tracing::warn!("waking {agent}: {err:#}; retrying on the next flush");
+            retry.extend(sent);
+        }
+        retry
+    }
+
+    /// The line for `wake` when what it is about still holds, else `None`.
+    async fn recheck(&self, agent: &AgentId, wake: &Wake) -> Result<Option<String>> {
+        let slug = &wake.board;
+        let coordinator = self.coordinator_here(slug) == Some(agent);
+        let line = match &wake.about {
+            WakeAbout::Ready { task } if coordinator => {
+                let task = self.client().task(task).await?.task;
+                (task.ready && task.auto).then(|| {
+                    format!(
+                        "board {slug}: {} is ready ({})",
+                        task.id,
+                        priority(&task.priority)
+                    )
+                })
+            }
+            WakeAbout::Cleared { done, ready } if coordinator => {
+                let mut still: Vec<TaskId> = Vec::new();
+                for id in ready {
+                    let t = self.client().task(id).await?.task;
+                    if t.ready && t.auto {
+                        still.push(t.id);
+                    }
+                }
+                let ids: Vec<&str> = still.iter().map(TaskId::as_str).collect();
+                (!ids.is_empty()).then(|| {
+                    format!(
+                        "board {slug}: {done} is done; its blocker cleared for {}",
+                        ids.join(", ")
+                    )
+                })
+            }
+            WakeAbout::Answered { ask } => match self.answered_ask(slug, *ask).await? {
+                Some(ask) if ask.agent == *agent => {
+                    let about = ask
+                        .task
+                        .as_ref()
+                        .map(|t| format!(" about {t}"))
+                        .unwrap_or_default();
+                    let answer = serde_json::to_string(ask.answer.as_deref().unwrap_or_default())?
+                        .replace('<', "\\u003c")
+                        .replace('>', "\\u003e");
+                    Some(format!(
+                        "the user answered ask #{}{about}: {answer}",
+                        ask.id
+                    ))
+                }
+                _ => None,
+            },
+            // The agent is no longer this board's coordinator.
+            WakeAbout::Ready { .. } | WakeAbout::Cleared { .. } => None,
+        };
+        Ok(line)
     }
 
     /// Handles every event after `last_seq` through the paged events endpoint.
@@ -933,7 +1041,7 @@ pub fn should_wake(agent: &Agent, device: &board_proto::DeviceName, now: Timesta
     }
 }
 
-fn priority(p: &board_proto::Priority) -> String {
+fn priority(p: &Priority) -> String {
     serde_json::to_value(p)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
@@ -966,7 +1074,7 @@ pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
 pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
     format!(
-        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready or an ask is answered. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
+        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready or one of your asks is answered. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
     )
 }
 
@@ -989,7 +1097,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         if reconcile {
             daemon.reconcile(Utc::now()).await?;
         }
-        daemon.flush().await;
+        daemon.flush(Utc::now()).await;
         return daemon.save();
     }
     daemon.follow(&mut shutdown).await
@@ -1086,7 +1194,7 @@ impl<T: T3> Daemon<T> {
                             reconcile_needed = false;
                             self.reconcile_logged().await;
                         }
-                        self.flush().await;
+                        self.flush(Utc::now()).await;
                         self.save()?;
                     }
                     _ = reconcile_tick.tick() => {
@@ -1109,7 +1217,7 @@ impl<T: T3> Daemon<T> {
     /// Sends what is queued and saves the state before exiting.
     async fn stop(&mut self) -> Result<()> {
         tracing::info!("stopping");
-        self.flush().await;
+        self.flush(Utc::now()).await;
         self.save()
     }
 

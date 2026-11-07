@@ -257,7 +257,19 @@ registers without a repo).
   that needs the user's decision gets an ask and waits `blocked`.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears or an ask is answered. Workers whose ask was answered are woken the same way.
+  `not_before` passes) or a blocker clears. An answered ask wakes the agent that asked,
+  worker or coordinator, and no one else. Wake-ups are queued as what they are about and
+  sent every few seconds, one message per agent:
+  - **Re-check**: at send time each line is checked again; a task no longer ready and
+    `auto` (claimed, blocked, done), an ask no longer answered, or a coordinator no longer
+    named drops its line, and an agent paused before its reset or on another device gets
+    nothing.
+  - **Hold**: lines for an agent whose state is running are held and sent together once it
+    is idle; after 30 minutes held they are sent anyway, since T3 gives a busy thread the
+    message as its next turn and a missed Stop hook must not silence it. Held lines are saved
+    with the daemon's state, so a restart keeps them.
+  - **Retry**: a failed `t3 send` keeps its lines for the next flush, which checks them
+    again first; a line not delivered within an hour is dropped.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.

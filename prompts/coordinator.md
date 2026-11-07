@@ -9,8 +9,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 1. Call `board_snapshot`. Read the alerts first and act on them.
 2. Pick the highest-priority ready task marked `auto`. If none is ready, run the goal review
    (below) when it is due. If it filed nothing ready, set your handoff, keeping the last task
-   you finished in it, and stop: the board wakes you when work becomes ready or an ask is
-   answered.
+   you finished in it, and stop: the board wakes you when work becomes ready or one of your
+   asks is answered.
 3. `task_claim` it, then `task_show` it and read its body and acceptance checks.
 4. Do it yourself, or delegate parts to child threads. Name the task ids in each brief, and
    tell each child to `task_claim` its task, keep its handoff current, file work it finds
