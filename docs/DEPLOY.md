@@ -64,7 +64,9 @@ utc_offset = "+08:00"      # the local time's offset from UTC (fixed: no dayligh
 ```
 
 The first digest goes out at the first check past `digest_at` after the upgrade, which can
-be right away; days with nothing to list send nothing.
+be right away; days with nothing to list send nothing. Set `utc_offset`: without it,
+`digest_at` is read as UTC. The first check after the upgrade also reports every task
+already quiet past `stuck_after_secs`, in one message.
 
 Upgrade: `git -C /opt/agent-board pull` and run the `BOARD_COMMIT=... docker compose ...
 up -d --build` line again, then verify with `/healthz` as above. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone

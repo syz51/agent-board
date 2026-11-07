@@ -74,7 +74,8 @@ fn new_code() -> String {
 
 /// Pairs `chat_id` when `code` is a live pairing code, and either no chat is paired or the
 /// code replaces the paired chat; every code is used up by a successful pairing. Message
-/// ids from earlier chats are forgotten, since Telegram numbers messages per chat. Returns
+/// ids from earlier chats are forgotten, since Telegram numbers messages per chat, and so
+/// are the stuck alerts and the digest sent there, so the new chat gets them too. Returns
 /// whether the chat was paired.
 pub(crate) fn redeem(cx: &mut Ctx<'_>, code: &str, chat_id: i64) -> Result<bool> {
     let code = code.trim().to_ascii_lowercase();
@@ -103,6 +104,8 @@ pub(crate) fn redeem(cx: &mut Ctx<'_>, code: &str, chat_id: i64) -> Result<bool>
          WHERE telegram_chat_id IS NOT NULL OR telegram_message_id IS NOT NULL",
         [],
     )?;
+    cx.db.execute("DELETE FROM telegram_stuck", [])?;
+    cx.db.execute("DELETE FROM telegram_digest", [])?;
     Ok(true)
 }
 
@@ -129,83 +132,93 @@ pub(crate) struct Stuck {
     pub status: String,
     /// The owner's handle, if the task has an owner.
     pub owner: Option<String>,
-    /// The newest event not by the server: its sequence, type, actor (a handle for an
-    /// agent) and time.
+    /// The newest event not by the server, or 0 when none is left (events are pruned
+    /// after a year); an alert is recorded against it.
     pub seq: i64,
-    pub last_type: String,
-    pub last_actor: String,
-    pub last_at: Timestamp,
+    /// That event's type and actor (a handle for an agent), when there is one.
+    pub last: Option<(String, String)>,
+    /// That event's time, else the task's last change.
+    pub quiet_since: Timestamp,
 }
 
-/// Claims the stuck alert for every task in doing or review, on a board that is not
-/// closed, whose newest event not by the server is at least `quiet_ms` old and not yet
-/// reported, and whose owner is not paused on a usage limit (that is reported apart).
-/// Forgets the alerts of tasks that left doing and review.
-pub(crate) fn claim_stuck(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stuck>> {
-    cx.db.execute(
-        "DELETE FROM telegram_stuck WHERE task NOT IN \
-         (SELECT id FROM tasks WHERE status IN ('doing', 'review'))",
-        [],
-    )?;
+/// Every task in doing or review, on a board that is not closed, whose newest event not by
+/// the server is at least `quiet_ms` old and not yet reported. Left out: tasks of a
+/// coordinator paused on a usage limit, since that pause has its own message.
+pub(crate) fn stuck(cx: &Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stuck>> {
     let now = cx.now_ms();
-    let stuck: Vec<Stuck> = cx
+    Ok(cx
         .db
         .prepare_cached(
-            "SELECT t.id, t.title, t.status, a.handle, e.seq, e.type, \
-               COALESCE(la.handle, e.actor), e.at \
+            "SELECT t.id, t.title, t.status, a.handle, COALESCE(e.seq, 0), e.type, \
+               COALESCE(la.handle, e.actor), COALESCE(e.at, t.updated_at) \
              FROM tasks t \
              JOIN boards b ON b.slug = t.board \
-             JOIN events e ON e.seq = (SELECT MAX(x.seq) FROM events x \
+             LEFT JOIN events e ON e.seq = (SELECT MAX(x.seq) FROM events x \
                WHERE x.task = t.id AND x.actor != 'server') \
              LEFT JOIN agents a ON a.id = t.owner \
              LEFT JOIN agents la ON la.id = e.actor \
              WHERE t.status IN ('doing', 'review') AND b.status != 'closed' \
-               AND e.at <= ?1 \
-               AND NOT (COALESCE(a.state, '') = 'paused' AND COALESCE(a.paused_until, 0) > ?2) \
+               AND COALESCE(e.at, t.updated_at) <= ?1 \
+               AND NOT (COALESCE(a.state, '') = 'paused' AND a.role = 'coordinator' \
+                 AND (a.paused_until IS NULL OR a.paused_until > ?2)) \
                AND NOT EXISTS (SELECT 1 FROM telegram_stuck s \
-                 WHERE s.task = t.id AND s.seq = e.seq) \
+                 WHERE s.task = t.id AND s.seq = COALESCE(e.seq, 0)) \
              ORDER BY t.board, t.number",
         )?
         .query_map(params![now - quiet_ms, now], |r| {
+            let kind: Option<String> = r.get(5)?;
+            let actor: Option<String> = r.get(6)?;
             Ok(Stuck {
                 id: parse_id(&r.get::<_, String>(0)?)?,
                 title: r.get(1)?,
                 status: r.get(2)?,
                 owner: r.get(3)?,
                 seq: r.get(4)?,
-                last_type: r.get(5)?,
-                last_actor: r.get(6)?,
-                last_at: ts(r.get(7)?),
+                last: kind.zip(actor),
+                quiet_since: ts(r.get(7)?),
             })
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    for task in &stuck {
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Records the stuck alerts sent, each against its task's newest event, so a task is
+/// reported again only after it changes. Forgets the alerts of tasks that left doing and
+/// review.
+pub(crate) fn record_stuck(cx: &mut Ctx<'_>, sent: &[(TaskId, i64)]) -> Result<()> {
+    cx.db.execute(
+        "DELETE FROM telegram_stuck WHERE task NOT IN \
+         (SELECT id FROM tasks WHERE status IN ('doing', 'review'))",
+        [],
+    )?;
+    let now = cx.now_ms();
+    for (task, seq) in sent {
         cx.db.execute(
             "INSERT INTO telegram_stuck (task, seq, sent_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT (task) DO UPDATE SET seq = excluded.seq, sent_at = excluded.sent_at",
-            params![task.id.as_str(), task.seq, now],
+            params![task.as_str(), seq, now],
         )?;
     }
-    Ok(stuck)
-}
-
-/// Gives back a stuck alert that could not be sent, so the next check tries again.
-pub(crate) fn release_stuck(cx: &mut Ctx<'_>, task: &TaskId, seq: i64) -> Result<()> {
-    cx.db.execute(
-        "DELETE FROM telegram_stuck WHERE task = ?1 AND seq = ?2",
-        params![task.as_str(), seq],
-    )?;
     Ok(())
 }
 
-/// Claims the digest of local date `day` (`YYYY-MM-DD`); false when it was already sent.
-pub(crate) fn claim_digest(cx: &mut Ctx<'_>, day: &str) -> Result<bool> {
-    let changed = cx.db.execute(
+/// The local date (`YYYY-MM-DD`) of the last digest sent, if any.
+pub(crate) fn digest_sent(cx: &Ctx<'_>) -> Result<Option<String>> {
+    Ok(cx
+        .db
+        .query_row("SELECT day FROM telegram_digest WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Records the digest of local date `day` as sent.
+pub(crate) fn record_digest(cx: &mut Ctx<'_>, day: &str) -> Result<()> {
+    cx.db.execute(
         "INSERT INTO telegram_digest (id, day) VALUES (1, ?1) \
-         ON CONFLICT (id) DO UPDATE SET day = excluded.day WHERE day != excluded.day",
+         ON CONFLICT (id) DO UPDATE SET day = excluded.day",
         [day],
     )?;
-    Ok(changed > 0)
+    Ok(())
 }
 
 /// What the daily digest lists: the web view's Needs you page, per board.
@@ -213,10 +226,8 @@ pub(crate) fn claim_digest(cx: &mut Ctx<'_>, day: &str) -> Result<bool> {
 pub(crate) struct Digest {
     /// Boards in slug order, each with its open asks and the tasks that wait on the user.
     pub boards: BTreeMap<String, (Vec<Ask>, Vec<Task>)>,
-    /// Tasks done since the user last marked updates seen.
+    /// Tasks done since the user last marked updates seen, as the Updates page counts them.
     pub done_since_seen: usize,
-    /// True when `done_since_seen` was cut at the updates limit.
-    pub more_done: bool,
 }
 
 impl Digest {
@@ -263,19 +274,8 @@ pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
                 .push(task);
         }
     }
-    let updates = crate::ops::updates::updates(cx, None, None)?;
     // Before the user first marks updates seen there is no cursor, and every done task
     // would count.
-    if updates.seen_at.is_some() {
-        digest.done_since_seen = updates.done.len();
-        digest.more_done = updates.more && updates.done.len() == board_proto::UPDATES_MAX;
-    }
+    digest.done_since_seen = crate::ops::updates::done_since_seen(cx)?.unwrap_or(0);
     Ok(digest)
-}
-
-/// Gives back the digest of `day` that could not be sent, so the next check tries again.
-pub(crate) fn release_digest(cx: &mut Ctx<'_>, day: &str) -> Result<()> {
-    cx.db
-        .execute("DELETE FROM telegram_digest WHERE day = ?1", [day])?;
-    Ok(())
 }
