@@ -229,8 +229,9 @@ registers without a repo).
   it stops.
 - **Triage**: the feedback board's coordinator works its items rather than doing them:
   for each ready item it reads the reports and resolves it as a duplicate of an earlier
-  item, routed to a new task on the owner's board (whose last acceptance check is "no new
-  reports or signals on this for 7 days after the fix ships"), forwarded to the setup's
+  item, routed to a new task on the owner's board (done once the fix is deployed where
+  agents use it; a later report of the same problem opens a new item that recurs this
+  one, so nobody waits to watch for repeats), forwarded to the setup's
   own feedback channel, or declined with a reason the reporter can act on. It finds the
   owner in the setup registry (`setups.toml` at the project root) when present, else by
   the boards' repos, and asks the user when unclear. It never drops an item, never fixes

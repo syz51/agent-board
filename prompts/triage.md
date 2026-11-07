@@ -20,8 +20,10 @@ never fix the setup yourself: its owner's board does.
 - **routed**: the owner should change something. Create a task on the owner's board with
   `task_add` (`board` set): an imperative title; a body that stands alone, says what is
   wrong and what to change, and cites this item's id and report count; and acceptance
-  checks, one per line, the last one exactly "no new reports or signals on this for 7 days
-  after the fix ships". Then `feedback_resolve` with kind `routed` and `task` the new id.
+  checks, one per line, that show the problem is gone where agents meet it, the last one
+  "the fix is deployed or installed where agents use it". Do not make the owner wait to
+  watch for repeats: a report after the routed task is done opens a new item that recurs
+  this one. Then `feedback_resolve` with kind `routed` and `task` the new id.
 - **forwarded**: the setup has its own feedback channel, such as a skill's
   `references/feedback.md` notes. File the report there as that channel describes, then
   `feedback_resolve` with kind `forwarded` and `reason` saying where it went.
