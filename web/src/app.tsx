@@ -1,95 +1,130 @@
-import { LocationProvider, Route, Router, useLocation } from "preact-iso";
-import { useRef } from "preact/hooks";
-import type { ConnectionState } from "./live/stream.ts";
-import { useConnection, useNow } from "./live/runtime.ts";
-import { AgentsScreen } from "./screens/agents.tsx";
-import { AskScreen, AsksScreen, useNeedsYouCount } from "./screens/asks.tsx";
-import { BoardScreen } from "./screens/board.tsx";
-import { BoardsScreen } from "./screens/boards.tsx";
-import { EventsScreen } from "./screens/events.tsx";
-import { TaskScreen } from "./screens/task.tsx";
-import { api } from "./api/client.ts";
-import { tags } from "./live/refresh.ts";
-import { useResource } from "./live/runtime.ts";
-import { unseenCount, useUpdates } from "./screens/updates.tsx";
-import { Empty, useTitle } from "./ui/common.tsx";
-import { BrandMark, Icon, type IconName } from "./ui/icons.tsx";
+import { useQuery } from "@tanstack/react-query";
+import { Link, Outlet, useRouter, useRouterState } from "@tanstack/react-router";
+import { useEffect, useRef } from "react";
+import { cn } from "@/lib/utils.ts";
+import { queries } from "@/live/query.ts";
+import { useConnection, useNow } from "@/live/runtime.ts";
+import type { ConnectionState } from "@/live/stream.ts";
+import { useNeedsYouCount } from "@/screens/asks.tsx";
+import { unseenCount, useUpdates } from "@/screens/updates.tsx";
+import { Empty, useTitle } from "@/ui/common.tsx";
+import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 
-export function App() {
-  return (
-    <LocationProvider>
-      <Shell />
-    </LocationProvider>
-  );
-}
-
-function Shell() {
+/**
+ * The app frame: a sidebar from 900px, a top bar below, and bottom tabs on phones (below
+ * 720px). Focus moves to the page on each navigation so screen readers announce it.
+ */
+export function Shell() {
   const main = useRef<HTMLElement>(null);
+  const router = useRouter();
+  useEffect(
+    () =>
+      router.subscribe("onResolved", (event) => {
+        if (event.fromLocation && event.pathChanged) main.current?.focus({ preventScroll: true });
+      }),
+    [router],
+  );
   return (
-    <div class="app">
-      <a class="skip" href="#main">Skip to content</a>
-      <header class="sidebar">
-        <a class="brand" href="/">
+    <div className="min-h-screen lg:grid lg:grid-cols-[232px_minmax(0,1fr)]">
+      <a
+        className="fixed -top-12 left-2 z-30 rounded-sm bg-card px-3 py-2 shadow-overlay focus:top-2"
+        href="#main"
+      >
+        Skip to content
+      </a>
+      <header className="sticky top-0 z-10 flex h-[52px] items-center gap-5 border-b bg-sidebar px-4 max-md:justify-between lg:h-screen lg:flex-col lg:items-stretch lg:gap-[22px] lg:border-r lg:border-b-0 lg:px-3 lg:py-4">
+        <Link
+          className="inline-flex min-h-8 items-center gap-2.25 text-base font-[650] tracking-[-0.011em] whitespace-nowrap text-foreground hover:no-underline lg:px-2"
+          to="/"
+        >
           <BrandMark />
           <span>agent-board</span>
-        </a>
+        </Link>
         <Nav />
         <BoardLinks />
         <ConnectionPill />
       </header>
-      <div class="main-col">
-      <ConnectionBanner />
-      <main id="main" ref={main} tabIndex={-1}>
-        <Router
-          onRouteChange={() => {
-            // Move focus to the new page so screen readers announce it.
-            main.current?.focus({ preventScroll: true });
-          }}
+      <div className="min-w-0">
+        <ConnectionBanner />
+        <main
+          id="main"
+          ref={main}
+          tabIndex={-1}
+          className="mx-auto max-w-[1000px] px-4 pt-6 pb-16 max-md:pb-[calc(92px+env(safe-area-inset-bottom))] lg:px-10 lg:pt-8 lg:pb-[72px]"
         >
-          <Route path="/" component={BoardsScreen} />
-          <Route path="/boards/:slug" component={BoardScreen} />
-          <Route path="/tasks/:id" component={TaskScreen} />
-          <Route path="/agents" component={AgentsScreen} />
-          <Route path="/asks" component={AsksScreen} />
-          <Route path="/asks/:id" component={AskScreen} />
-          <Route path="/events" component={EventsScreen} />
-          <Route default component={NotFound} />
-        </Router>
-      </main>
+          <Outlet />
+        </main>
       </div>
     </div>
   );
 }
 
-const NAV: { href: string; label: string; icon: IconName; match: (path: string) => boolean }[] = [
-  { href: "/", label: "Boards", icon: "boards", match: (path: string) => path === "/" || /^\/(boards|tasks)\//.test(path) },
-  { href: "/asks", label: "Needs you", icon: "inbox", match: (path: string) => path.startsWith("/asks") },
-  { href: "/agents", label: "Agents", icon: "agents", match: (path: string) => path.startsWith("/agents") },
-  { href: "/events", label: "Events", icon: "events", match: (path: string) => path.startsWith("/events") },
+function usePathname(): string {
+  return useRouterState({ select: (state) => state.location.pathname });
+}
+
+const NAV: {
+  to: "/" | "/asks" | "/agents" | "/events";
+  label: string;
+  icon: IconName;
+  match: (path: string) => boolean;
+}[] = [
+  {
+    to: "/",
+    label: "Boards",
+    icon: "boards",
+    match: (path) => path === "/" || /^\/(boards|tasks)\//.test(path),
+  },
+  { to: "/asks", label: "Needs you", icon: "inbox", match: (path) => path.startsWith("/asks") },
+  { to: "/agents", label: "Agents", icon: "agents", match: (path) => path.startsWith("/agents") },
+  { to: "/events", label: "Events", icon: "events", match: (path) => path.startsWith("/events") },
 ];
 
-function Nav() {
-  const { path } = useLocation();
+export function Nav() {
+  const path = usePathname();
   // Open asks plus the tasks waiting on the user without one, as the page lists them.
   const open = useNeedsYouCount();
   const updates = useUpdates();
   const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
-    <nav class="nav" aria-label="Main">
+    <nav
+      className="flex flex-1 gap-0.5 max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-10 max-md:h-[calc(60px+env(safe-area-inset-bottom))] max-md:gap-0 max-md:border-t max-md:bg-card max-md:px-1 max-md:pb-[env(safe-area-inset-bottom)] lg:flex-none lg:flex-col"
+      aria-label="Main"
+    >
       {NAV.map((item) => (
-        <a key={item.href} href={item.href} aria-current={item.match(path) ? "page" : undefined}>
+        <Link
+          key={item.to}
+          to={item.to}
+          // Boards stays current on a board and a task; the router's own match would not.
+          aria-current={item.match(path) ? "page" : undefined}
+          className="relative flex min-h-8 items-center gap-2.25 rounded-sm px-2.5 py-1.5 font-medium text-subtle-foreground hover:bg-secondary hover:text-foreground hover:no-underline aria-[current=page]:bg-secondary aria-[current=page]:font-semibold aria-[current=page]:text-foreground max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link max-md:[&>svg]:size-5.25"
+        >
           <Icon name={item.icon} />
-          <span class="nav-label">{item.label}</span>
-          {item.href === "/asks" && open > 0 && (
-            <span class="nav-count" aria-label={`${open} waiting on you`}>{open}</span>
+          <span>{item.label}</span>
+          {item.to === "/asks" && open > 0 && (
+            <span
+              className="ml-auto h-4.5 min-w-5 rounded-full bg-amber px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-background tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0"
+              aria-label={`${open} waiting on you`}
+            >
+              {open}
+            </span>
           )}
-          {item.href === "/asks" && unseen > 0 && (
+          {item.to === "/asks" && unseen > 0 && (
             <>
-              <span class="nav-dot" aria-hidden="true" title={`${unseen} unseen updates`} />
-              <span class="visually-hidden">, {unseen} unseen {unseen === 1 ? "update" : "updates"}</span>
+              <span
+                className={cn(
+                  "size-2.25 flex-none rounded-full bg-primary shadow-[0_0_0_2px_var(--card)] max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)]",
+                  open > 0 && "max-md:hidden",
+                )}
+                aria-hidden="true"
+                title={`${unseen} unseen updates`}
+              />
+              <span className="sr-only">
+                , {unseen} unseen {unseen === 1 ? "update" : "updates"}
+              </span>
             </>
           )}
-        </a>
+        </Link>
       ))}
     </nav>
   );
@@ -97,28 +132,47 @@ function Nav() {
 
 /** Each board, with its open asks, so a board is one click from anywhere on a wide screen. */
 function BoardLinks() {
-  const { path } = useLocation();
-  const boards = useResource("boards", [tags.boards], api.boards);
+  const path = usePathname();
+  const boards = useQuery(queries.boards());
   const list = (boards.data ?? []).filter((board) => board.status !== "closed");
   return (
-    <nav class="side-boards" aria-label="Boards">
-      <p class="side-label" aria-hidden="true">Boards</p>
+    <nav className="hidden min-h-0 flex-1 overflow-y-auto lg:block" aria-label="Boards">
+      <p className="px-2.5 pb-1.5 text-xs font-semibold text-muted-foreground" aria-hidden="true">
+        Boards
+      </p>
       {boards.data === undefined && (
-        <p class="side-empty">{boards.error ? "Boards are unavailable" : "Loading…"}</p>
+        <p className="px-2.5 py-1 text-meta text-muted-foreground">
+          {boards.error ? "Boards are unavailable" : "Loading…"}
+        </p>
       )}
-      <ul>
+      <ul className="grid gap-px">
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
           const here = path === href || path.startsWith(`/tasks/${board.slug}-`);
           return (
             <li key={board.slug}>
-              <a href={href} aria-current={here ? "page" : undefined}>
-                <span class="side-board-mark" aria-hidden="true">{board.title.trim()[0]?.toUpperCase() ?? "#"}</span>
-                <span class="side-board-title">{board.title}</span>
+              <Link
+                to="/boards/$slug"
+                params={{ slug: board.slug }}
+                aria-current={here ? "page" : undefined}
+                className="flex min-h-7.5 items-center gap-2.5 rounded-sm px-2.5 py-1 text-subtle-foreground hover:bg-secondary hover:no-underline aria-[current=page]:bg-secondary aria-[current=page]:font-[550] aria-[current=page]:text-foreground"
+              >
+                <span
+                  className="grid size-4.5 flex-none place-items-center rounded-[5px] border border-input bg-card text-2xs font-semibold tracking-normal text-subtle-foreground"
+                  aria-hidden="true"
+                >
+                  {board.title.trim()[0]?.toUpperCase() ?? "#"}
+                </span>
+                <span className="min-w-0 flex-1 truncate">{board.title}</span>
                 {board.open_asks > 0 && (
-                  <span class="side-count" aria-label={`${board.open_asks} open asks`}>{board.open_asks}</span>
+                  <span
+                    className="h-4.5 min-w-5 rounded-full bg-amber-soft px-1.5 text-center text-2xs leading-4.5 font-[650] tracking-normal text-amber tabular-nums"
+                    aria-label={`${board.open_asks} open asks`}
+                  >
+                    {board.open_asks}
+                  </span>
                 )}
-              </a>
+              </Link>
             </li>
           );
         })}
@@ -127,7 +181,7 @@ function BoardLinks() {
   );
 }
 
-function connectionText(state: ConnectionState, now: number): string {
+export function connectionText(state: ConnectionState, now: number): string {
   switch (state.kind) {
     case "live":
       return "Live";
@@ -146,9 +200,27 @@ function ConnectionPill() {
   const state = useConnection();
   const now = useNow(1000);
   return (
-    <span class={`conn conn-${state.kind}`} role="status">
-      <span class="conn-dot" aria-hidden="true" />
-      <span class="conn-text">{connectionText(state, now)}</span>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.75 text-meta whitespace-nowrap lg:mt-auto lg:border-t lg:px-2.5 lg:pt-2",
+        state.kind === "offline" || state.kind === "reconnecting"
+          ? "text-foreground"
+          : "text-muted-foreground",
+      )}
+      role="status"
+      data-state={state.kind}
+    >
+      <span
+        className={cn(
+          "size-1.75 rounded-full",
+          state.kind === "live" &&
+            "bg-status-ready shadow-[0_0_0_3px_color-mix(in_srgb,var(--status-ready)_20%,transparent)]",
+          (state.kind === "connecting" || state.kind === "reconnecting") && "bg-amber",
+          state.kind === "offline" && "bg-status-blocked",
+        )}
+        aria-hidden="true"
+      />
+      <span>{connectionText(state, now)}</span>
     </span>
   );
 }
@@ -157,7 +229,15 @@ function ConnectionBanner() {
   const state = useConnection();
   if (state.kind === "live" || state.kind === "connecting") return null;
   return (
-    <div class={`banner banner-${state.kind}`} role="status">
+    <div
+      className={cn(
+        "flex items-center gap-2.5 border-b px-6 py-2.5",
+        state.kind === "offline"
+          ? "border-error-border bg-error-soft text-error"
+          : "border-warn-border bg-warn-soft text-warn",
+      )}
+      role="status"
+    >
       <Icon name="plug" />
       {state.kind === "offline"
         ? "You're offline. What you see may be out of date; it refreshes when the connection returns."
@@ -166,11 +246,11 @@ function ConnectionBanner() {
   );
 }
 
-function NotFound() {
+export function NotFound() {
   useTitle("Not found");
   return (
     <Empty title="This page doesn't exist">
-      <a href="/">Go to boards</a>
+      <Link to="/">Go to boards</Link>
     </Empty>
   );
 }

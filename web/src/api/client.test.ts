@@ -44,17 +44,25 @@ describe("api client parsing", () => {
       if (pathname === "/v1/boards") return json(state.boards());
       if (pathname.startsWith("/v1/boards/")) return json(state.board(pathname.slice(11)));
       if (pathname === "/v1/tasks") return json(state.tasks(searchParams));
-      if (pathname.startsWith("/v1/tasks/")) return json(state.task(decodeURIComponent(pathname.slice(10))));
+      if (pathname.startsWith("/v1/tasks/"))
+        return json(state.task(decodeURIComponent(pathname.slice(10))));
       if (pathname === "/v1/agents") return json(state.agents(searchParams));
       if (pathname === "/v1/asks") return json(state.asks(searchParams));
       if (pathname.startsWith("/v1/asks/")) return json(state.ask(Number(pathname.slice(9))));
-      if (pathname === "/v1/events") return json(state.events(Number(searchParams.get("since")), 100, null));
+      if (pathname === "/v1/events")
+        return json(state.events(Number(searchParams.get("since")), 100, null));
       return json({ code: "not_found", message: url, next: null }, 404);
     });
 
     expect((await api.health()).seq).toBe(state.seq);
     const boards = await api.boards();
-    expect(boards.map((board) => board.slug)).toEqual(["factory", "web-view", "docs", "release-engineering", "sandbox"]);
+    expect(boards.map((board) => board.slug)).toEqual([
+      "factory",
+      "web-view",
+      "docs",
+      "release-engineering",
+      "sandbox",
+    ]);
     expect(boards[0]?.counts.ready).toBeGreaterThan(0);
     expect((await api.board("factory")).autopilot).toBe(true);
     expect((await api.tasks({ board: "factory" })).length).toBeGreaterThan(5);
@@ -63,7 +71,9 @@ describe("api client parsing", () => {
     expect(detail.notes.length).toBe(2);
     expect(detail.history.every((event) => event.task === "factory-12")).toBe(true);
     const agents = await api.agents();
-    expect(agents.find((agent) => agent.state === "paused")?.paused_until).toEqual(expect.any(String));
+    expect(agents.find((agent) => agent.state === "paused")?.paused_until).toEqual(
+      expect.any(String),
+    );
     expect(await api.handoff(agents[0]?.id ?? "")).toMatchObject({ next: "run the live suite" });
     expect((await api.asks({ status: "open" })).every((ask) => ask.status === "open")).toBe(true);
     expect((await api.ask(5)).answered_via).toBe("telegram");
@@ -78,7 +88,9 @@ describe("api client parsing", () => {
     expect(updates.done[2]).toMatchObject({ parent: "docs-1", summary: null });
     expect(updates.said.map((item) => item.id)).toEqual([5, 3, 4]);
     expect(updates.more).toBe(false);
-    expect((await api.updates({ board: "docs" })).done.map((item) => item.task)).toEqual(["docs-7"]);
+    expect((await api.updates({ board: "docs" })).done.map((item) => item.task)).toEqual([
+      "docs-7",
+    ]);
     const everything = await api.updates({ since: "2020-01-01T00:00:00Z" });
     expect(everything.said.length).toBe(5);
 
@@ -89,7 +101,13 @@ describe("api client parsing", () => {
   });
 
   test("decodes updates, a seen cursor and turn endings, and rejects bad ones", async () => {
-    const said = { id: 3, agent: "t3:c2d0", board: "factory", text: "Round done.", at: "2026-11-06T12:00:00Z" };
+    const said = {
+      id: 3,
+      agent: "t3:c2d0",
+      board: "factory",
+      text: "Round done.",
+      at: "2026-11-06T12:00:00Z",
+    };
     const done = {
       task: "factory-9",
       board: "factory",
@@ -98,12 +116,23 @@ describe("api client parsing", () => {
       summary: "Fixed.",
       owner: "t3:a91c",
       done_at: "2026-11-06T11:00:00Z",
-      evidence: [{ kind: "pr" as const, value: "https://github.com/example/factory/pull/41", exit_code: null, agent: "t3:a91c", at: "2026-11-06T11:00:00Z" }],
+      evidence: [
+        {
+          kind: "pr" as const,
+          value: "https://github.com/example/factory/pull/41",
+          exit_code: null,
+          agent: "t3:a91c",
+          at: "2026-11-06T11:00:00Z",
+        },
+      ],
     };
     const body = { seen_at: null, since: null, done: [done], said: [said], more: true };
     expect(await fakeFetch(() => json(body)).api.updates()).toEqual(body);
-    expect(await fakeFetch(() => json({ seen_at: "2026-11-06T12:00:00Z" })).api.markSeen("2026-11-06T12:00:00Z"))
-      .toEqual({ seen_at: "2026-11-06T12:00:00Z" });
+    expect(
+      await fakeFetch(() => json({ seen_at: "2026-11-06T12:00:00Z" })).api.markSeen(
+        "2026-11-06T12:00:00Z",
+      ),
+    ).toEqual({ seen_at: "2026-11-06T12:00:00Z" });
     expect(await fakeFetch(() => json([said])).api.agentSaid("t3:c2d0")).toEqual([said]);
 
     const { summary: _, owner: __, parent: ___, ...bare } = done;
@@ -111,13 +140,19 @@ describe("api client parsing", () => {
     expect(decoded.done[0]).toMatchObject({ summary: null, owner: null, parent: null });
 
     const badSaid = fakeFetch(() => json({ ...body, said: [{ ...said, id: "3" }] }));
-    expect((await failure(badSaid.api.updates())).message).toContain('said[0].id: expected an integer, got "3"');
+    expect((await failure(badSaid.api.updates())).message).toContain(
+      'said[0].id: expected an integer, got "3"',
+    );
     const badTime = fakeFetch(() => json({ ...body, done: [{ ...done, done_at: "earlier" }] }));
-    expect((await failure(badTime.api.updates())).message).toContain("done[0].done_at: expected an RFC 3339 time");
+    expect((await failure(badTime.api.updates())).message).toContain(
+      "done[0].done_at: expected an RFC 3339 time",
+    );
     const noMore = fakeFetch(() => json({ seen_at: null, since: null, done: [], said: [] }));
     expect((await failure(noMore.api.updates())).message).toContain("more: expected a boolean");
     const badCursor = fakeFetch(() => json({ seen_at: null }));
-    expect((await failure(badCursor.api.markSeen("2026-11-06T12:00:00Z"))).code).toBe("bad_response");
+    expect((await failure(badCursor.api.markSeen("2026-11-06T12:00:00Z"))).code).toBe(
+      "bad_response",
+    );
   });
 
   test("builds same-origin URLs, encodes path segments and drops empty params", async () => {
@@ -159,12 +194,21 @@ describe("api client parsing", () => {
       ["POST", "/v1/asks/7/answer", '{"answer":"The existing ops chat"}'],
       ["PUT", "/v1/updates/seen", '{"at":"2026-11-06T11:58:00Z"}'],
     ]);
-    expect((calls[1]?.init?.headers as Record<string, string>)["content-type"]).toBe("application/json");
+    expect((calls[1]?.init?.headers as Record<string, string>)["content-type"]).toBe(
+      "application/json",
+    );
   });
 
   test("turns an ApiError body into a failure with its message and next step", async () => {
     const { api } = fakeFetch(() =>
-      json({ code: "claim_refused", message: "t3:c2d0 owns factory-12", next: "pick another task from ready" }, 409)
+      json(
+        {
+          code: "claim_refused",
+          message: "t3:c2d0 owns factory-12",
+          next: "pick another task from ready",
+        },
+        409,
+      ),
     );
     const error = await failure(api.task("factory-12"));
     expect(error).toMatchObject({
@@ -176,12 +220,16 @@ describe("api client parsing", () => {
   });
 
   test("accepts error codes this version does not know", async () => {
-    const { api } = fakeFetch(() => json({ code: "rate_limited", message: "slow down", next: null }, 429));
+    const { api } = fakeFetch(() =>
+      json({ code: "rate_limited", message: "slow down", next: null }, 429),
+    );
     expect(await failure(api.boards())).toMatchObject({ code: "rate_limited", next: null });
   });
 
   test("describes an error that is not an ApiError, such as a proxy page", async () => {
-    const { api } = fakeFetch(() => new Response("<html>Bad gateway</html>", { status: 502, statusText: "Bad Gateway" }));
+    const { api } = fakeFetch(
+      () => new Response("<html>Bad gateway</html>", { status: 502, statusText: "Bad Gateway" }),
+    );
     const error = await failure(api.boards());
     expect(error.code).toBe("http_502");
     expect(error.message).toBe("The server answered 502 Bad Gateway.");
@@ -213,9 +261,13 @@ describe("api client parsing", () => {
   test("rejects unknown enum values and bad timestamps", async () => {
     const task = state.task("factory-12").task;
     const bad = fakeFetch(() => json([{ ...task, status: "archived" }]));
-    expect((await failure(bad.api.tasks({}))).message).toContain("[0].status: expected one of open, doing");
+    expect((await failure(bad.api.tasks({}))).message).toContain(
+      "[0].status: expected one of open, doing",
+    );
     const badTime = fakeFetch(() => json([{ ...task, updated_at: "yesterday" }]));
-    expect((await failure(badTime.api.tasks({}))).message).toContain("[0].updated_at: expected an RFC 3339 time");
+    expect((await failure(badTime.api.tasks({}))).message).toContain(
+      "[0].updated_at: expected an RFC 3339 time",
+    );
   });
 
   test("ignores fields it does not know and accepts absent optional fields", async () => {
@@ -248,17 +300,31 @@ describe("api client parsing", () => {
   test("keeps unknown event types for the feed", async () => {
     const { api } = fakeFetch(() =>
       json({
-        events: [{ seq: 4, at: "2026-11-06T12:00:00Z", board: null, actor: "server", type: "future_thing", task: null, payload: { a: 1 } }],
+        events: [
+          {
+            seq: 4,
+            at: "2026-11-06T12:00:00Z",
+            board: null,
+            actor: "server",
+            type: "future_thing",
+            task: null,
+            payload: { a: 1 },
+          },
+        ],
         next_since: 4,
-      })
+      }),
     );
     expect((await api.events({ since: 3 })).events[0]?.type).toBe("future_thing");
   });
 
   test("a missing handoff is null, other handoff errors still fail", async () => {
-    const missing = fakeFetch(() => json({ code: "not_found", message: "no handoff", next: null }, 404));
+    const missing = fakeFetch(() =>
+      json({ code: "not_found", message: "no handoff", next: null }, 404),
+    );
     expect(await missing.api.handoff("t3:x")).toBeNull();
-    const broken = fakeFetch(() => json({ code: "internal", message: "db locked", next: "retry" }, 500));
+    const broken = fakeFetch(() =>
+      json({ code: "internal", message: "db locked", next: "retry" }, 500),
+    );
     expect((await failure(broken.api.handoff("t3:x"))).code).toBe("internal");
   });
 });

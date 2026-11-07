@@ -48,8 +48,9 @@ One Rust binary, `board`, provides every role through subcommands: `serve`, `mcp
 | `board-server` | Storage, rules, API, SSE, snapshot rendering, web assets, notifier |
 | `board` | The binary: CLI, MCP server, hook handler, device daemon, configuration |
 
-The web view lives in `web/` (TypeScript), is built to `web/dist` and embedded in the
-binary at compile time.
+The web view lives in `web/` (TypeScript: React with TanStack Router and Query, Tailwind CSS
+and shadcn/ui, built with Bun; see `web/README.md`), is built to `web/dist` and embedded in
+the binary at compile time.
 
 ### Why Rust
 

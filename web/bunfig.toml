@@ -1,0 +1,3 @@
+# Component tests render into happy-dom.
+[test]
+preload = ["./test/setup.ts"]

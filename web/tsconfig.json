@@ -5,7 +5,6 @@
     "module": "Preserve",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "jsxImportSource": "preact",
     "types": ["bun"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -16,7 +15,8 @@
     "isolatedModules": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src", "dev", "build.ts"]
+  "include": ["src", "dev", "test", "build.ts", "eslint.config.ts"]
 }

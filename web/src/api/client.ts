@@ -52,10 +52,13 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
       response = await fetchImpl(path, {
         method,
         credentials: "same-origin",
-        headers: body === undefined ? { accept: "application/json" } : {
-          accept: "application/json",
-          "content-type": "application/json",
-        },
+        headers:
+          body === undefined
+            ? { accept: "application/json" }
+            : {
+                accept: "application/json",
+                "content-type": "application/json",
+              },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
     } catch (cause) {
@@ -80,7 +83,8 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
     try {
       return decode(parsed, "");
     } catch (cause) {
-      if (cause instanceof DecodeError) throw badResponse(response.status, path, cause.message, cause);
+      if (cause instanceof DecodeError)
+        throw badResponse(response.status, path, cause.message, cause);
       throw cause;
     }
   }
