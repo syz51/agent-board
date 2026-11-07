@@ -245,11 +245,16 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
     send_ask_to(state, bot, chat, id).await
 }
 
-/// Sends ask `id` to `chat` if it is still open and records the message, so replies to
-/// it answer the ask.
+/// Sends ask `id` to `chat` if it is still open and not yet sent, and records the
+/// message, so replies to it answer the ask.
 async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<()> {
     let (ask, text) = ask_text(state, id).await?;
-    if ask.status != AskStatus::Open {
+    let paired = bot.configured.is_none();
+    if ask.status != AskStatus::Open
+        || !state
+            .write(move |cx| asks::claim_telegram_send(cx, id, chat, paired))
+            .await?
+    {
         return Ok(());
     }
     let mut body = json!({ "chat_id": chat, "text": text });
@@ -453,8 +458,11 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
     let open = state
         .read(|cx| asks::list(cx, Some(board_proto::AskStatus::Open), None))
         .await?;
+    // One failed ask does not keep the others from the new chat.
     for ask in open {
-        send_ask_to(state, bot, chat, ask.id).await?;
+        if let Err(error) = send_ask_to(state, bot, chat, ask.id).await {
+            tracing::error!(%error, ask = ask.id, "telegram: sending an open ask failed");
+        }
     }
     Ok(())
 }
@@ -466,7 +474,7 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
         let reply = if !from_chat {
             "Not accepted from this chat.".to_owned()
         } else if let Some((id, index)) = query.data.as_deref().and_then(parse_callback) {
-            answer(state, id, Answer::Option(index)).await?
+            answer(state, id, Answer::Option(index)).await
         } else {
             "Unknown button.".to_owned()
         };
@@ -499,7 +507,7 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
     else {
         return Ok(());
     };
-    let reply = answer(state, id, Answer::Text(text)).await?;
+    let reply = answer(state, id, Answer::Text(text)).await;
     bot.send(json!({
         "chat_id": chat,
         "text": reply,
@@ -514,8 +522,11 @@ enum Answer {
     Text(String),
 }
 
-/// Answers an ask from Telegram; returns the acknowledgement to show.
-async fn answer(state: &AppState, id: i64, answer: Answer) -> Result<String> {
+/// Answers an ask from Telegram; returns the acknowledgement to show. When the answer
+/// cannot be recorded (say the database is busy), the ask stays open and the
+/// acknowledgement asks the user to answer again, since Telegram does not resend the
+/// update.
+async fn answer(state: &AppState, id: i64, answer: Answer) -> String {
     let result = state
         .write(move |cx| {
             let ask = get_ask(cx, id)?;
@@ -542,9 +553,14 @@ async fn answer(state: &AppState, id: i64, answer: Answer) -> Result<String> {
         })
         .await;
     match result {
-        Ok(text) => Ok(format!("Answered ask {id}: {text}")),
-        Err(Error::Api(e)) => Ok(format!("Ask {id}: {}", e.message)),
-        Err(other) => Err(other),
+        Ok(text) => format!("Answered ask {id}: {text}"),
+        Err(Error::Api(e)) => format!("Ask {id}: {}", e.message),
+        Err(error) => {
+            tracing::error!(%error, ask = id, "telegram: recording an answer failed");
+            format!(
+                "Ask {id}: the board could not record this answer; it is still open, so answer again."
+            )
+        }
     }
 }
 

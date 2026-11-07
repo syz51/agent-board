@@ -135,6 +135,26 @@ impl Client {
         }
     }
 
+    /// A client like [`Client::new`] with `timeout`, whose connections must open (TLS
+    /// included) within `connect`: a server that cannot be reached then fails as a connect
+    /// error well before `timeout`, which a hook tells apart from a slow answer.
+    pub fn with_connect_timeout(
+        base: &str,
+        token: String,
+        agent: Option<AgentId>,
+        timeout: Duration,
+        connect: Duration,
+    ) -> Result<Self> {
+        let mut client = Self::new(base, token, agent, Some(timeout))?;
+        client.http = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .timeout(timeout)
+            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(client)
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let mut req = self
             .http

@@ -108,8 +108,9 @@ async fn shutdown_signal() {
 }
 
 /// Every minute until shutdown: sweeps expired leases, prunes old API error records,
-/// announces passed `not_before` times and quiet reviews in one transaction, then closes or deletes idle temporary boards, one transaction
-/// per board.
+/// announces passed `not_before` times and quiet reviews in one transaction, then closes or
+/// deletes idle temporary boards, one transaction per board, then prunes history past the
+/// stats window in batches.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -129,10 +130,36 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                         tracing::error!(%error, "sweep failed");
                     }
                     sweep_temporary(&state).await;
+                    if let Err(error) = prune_history(&state).await {
+                        tracing::error!(%error, "pruning old history failed");
+                    }
                 }
             }
         }
     })
+}
+
+/// Batches of history one sweep prunes at most; a larger backlog waits for the next sweep.
+const PRUNE_BATCHES: usize = 100;
+
+/// Deletes events and refused claims past the stats window, one batch per transaction so
+/// other writes go between them, until a batch finds none due or the server stops. Returns
+/// how many events and refused claims went.
+pub(crate) async fn prune_history(state: &AppState) -> Result<(usize, usize), Error> {
+    let mut pruned = (0, 0);
+    for _ in 0..PRUNE_BATCHES {
+        if futures_util::FutureExt::now_or_never(state.stopped()).is_some() {
+            break;
+        }
+        let (events, refusals) = state.write(|cx| ops::stats::prune_history(cx)).await?;
+        pruned = (pruned.0 + events, pruned.1 + refusals);
+        // An event batch can come back short while due events remain behind one dated
+        // later (a clock that was ahead), so only an empty one ends the pass.
+        if events == 0 && refusals < ops::stats::PRUNE_BATCH {
+            break;
+        }
+    }
+    Ok(pruned)
 }
 
 /// What one sweep of temporary boards did.

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{delegation_family, glob_matches, globs_overlap};
+use crate::ops::leases::{Glob, delegation_family, glob_matches, globs_overlap};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
     agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live, latest_events,
@@ -601,20 +601,16 @@ fn describe(event: &Event) -> Option<String> {
     })
 }
 
+/// How many of the newest events [`recent`] looks through.
+pub(crate) const RECENT_SCAN: u32 = 200;
+/// Events by others on a board, for [`recent`].
+pub(crate) const RECENT_ON_BOARD: &str = "seq <= :seq AND board = :board AND actor != :me";
+/// Events by others on no board (edits and leases), for [`recent`].
+pub(crate) const RECENT_OFF_BOARD: &str = "seq <= :seq AND board IS NULL AND actor != :me";
+
 /// The latest events by others on the board, plus edits and leases in the agent's repo.
 fn recent(cx: &Ctx<'_>, agent: &Agent, board: &BoardSlug, seq: i64) -> Result<Vec<Recent>> {
-    let board_str = board.as_str();
-    let candidates = latest_events(
-        cx,
-        "seq <= :seq AND (board = :board OR board IS NULL) AND actor != :me",
-        &vec![
-            (":seq", &seq),
-            (":board", &board_str),
-            (":me", &agent.id.as_str()),
-        ],
-        0,
-        200,
-    )?;
+    let candidates = recent_candidates(cx, &agent.id, board, seq)?;
     let mut handles = HashMap::new();
     let mut out = Vec::new();
     for event in candidates {
@@ -637,6 +633,37 @@ fn recent(cx: &Ctx<'_>, agent: &Agent, board: &BoardSlug, seq: i64) -> Result<Ve
         });
     }
     Ok(out)
+}
+
+/// The newest [`RECENT_SCAN`] events up to `seq` by others than `me`, on `board` or on no
+/// board, newest first.
+pub(crate) fn recent_candidates(
+    cx: &Ctx<'_>,
+    me: &AgentId,
+    board: &BoardSlug,
+    seq: i64,
+) -> Result<Vec<Event>> {
+    let board = board.as_str();
+    let me = me.as_str();
+    // Two queries, each read backwards along `events_board`: one query with `board = :board
+    // OR board IS NULL` sorts every match of both in a temporary B-tree.
+    let mut candidates = latest_events(
+        cx,
+        RECENT_ON_BOARD,
+        &vec![(":seq", &seq), (":board", &board), (":me", &me)],
+        0,
+        RECENT_SCAN,
+    )?;
+    candidates.extend(latest_events(
+        cx,
+        RECENT_OFF_BOARD,
+        &vec![(":seq", &seq), (":me", &me)],
+        0,
+        RECENT_SCAN,
+    )?);
+    candidates.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
+    candidates.truncate(RECENT_SCAN as usize);
+    Ok(candidates)
 }
 
 /// Alert ranks: lower sorts first.
@@ -669,19 +696,24 @@ fn shares_paths(
         .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
         .query_map(params![peer, cx.now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    if touches.is_empty() && leases.is_empty() {
+        return Ok(false);
+    }
+    // Each glob compiled once for this call, not once per comparison.
+    let my_globs: Vec<(&str, Glob<'_>)> = my_leases
+        .iter()
+        .map(|(r, g)| (r.as_str(), Glob::new(g)))
+        .collect();
     let touched = touches.iter().any(|(repo, path)| {
         my_touches.iter().any(|(r, p, _)| r == repo && p == path)
-            || my_leases
-                .iter()
-                .any(|(r, g)| r == repo && glob_matches(g, path))
+            || my_globs.iter().any(|(r, g)| r == repo && g.matches(path))
     });
     let leased = leases.iter().any(|(repo, glob)| {
+        let glob = Glob::new(glob);
         my_touches
             .iter()
-            .any(|(r, p, _)| r == repo && glob_matches(glob, p))
-            || my_leases
-                .iter()
-                .any(|(r, g)| r == repo && globs_overlap(g, glob))
+            .any(|(r, p, _)| r == repo && glob.matches(p))
+            || my_globs.iter().any(|(r, g)| r == repo && g.overlaps(&glob))
     });
     Ok(touched || leased)
 }
