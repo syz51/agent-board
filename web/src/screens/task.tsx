@@ -83,7 +83,13 @@ function TaskView(
         </div>
         <div>
           <dt>Autopilot</dt>
-          <dd>{task.auto ? "May start without you" : "Needs you to start"}</dd>
+          <dd>
+            {task.auto
+              ? "May start without you"
+              : task.body.trimStart().startsWith("Proposal:")
+                ? "Proposal: waits for an agent's review"
+                : "Needs you to start"}
+          </dd>
         </div>
         {task.not_before && (
           <div>

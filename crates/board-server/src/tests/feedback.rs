@@ -370,6 +370,40 @@ async fn resolve_is_for_the_owner_or_the_user() {
 }
 
 #[tokio::test]
+async fn a_plain_task_on_the_feedback_board_resolves_as_an_item() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let fix = t.task(A, "factory", "Fix the hook").await;
+    // Filed with task_add, as clients did before feedback items existed.
+    t.board("board-feedback", &[]).await;
+    let old = t.task(B, "board-feedback", "Hook blocks git fetch").await;
+    assert!(t.get_task(&old).await.get("feedback").is_none());
+
+    assert!(t.claim(A, &old).await.0.is_success());
+    let (s, done) = resolve(&t, Some(A), &old, json!({ "kind": "routed", "task": fix })).await;
+    assert_eq!(s, 200, "{done}");
+    assert_eq!(done["status"], "done");
+    let feedback = &done["feedback"];
+    assert_eq!(feedback["about"], "other");
+    assert_eq!(feedback["source"], "agent");
+    assert_eq!(feedback["reports"], 1);
+    assert_eq!(feedback["reporters"], json!([B]));
+    assert_eq!(feedback["resolution"]["kind"], "routed");
+    assert_eq!(feedback["resolution"]["task"], fix.as_str());
+
+    // While the routed task is open, the same report adds to the adopted item.
+    let again = report(
+        &t,
+        C,
+        json!({ "about": "other", "text": "Hook blocks git fetch" }),
+    )
+    .await;
+    assert_eq!(again["duplicate"], true, "{again}");
+    assert_eq!(again["task"]["id"], old.as_str());
+    assert_eq!(again["reports"], 2);
+}
+
+#[tokio::test]
 async fn reports_are_validated() {
     let t = setup().await;
     for body in [

@@ -86,7 +86,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact). `auto` says whether
   the coordinator may start it; it follows the board's autopilot switch and is false only
-  for a task the user must do or decide (a key, a login, a payment, a product choice).
+  for a task the user must do or decide (a key, a login, a payment, a product choice) and
+  for a pending proposal (see "Proposals and triage").
   Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
   waiting for a date is `not_before`, which the server's sweeper announces once passed.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
@@ -174,11 +175,11 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
-| `PreToolUse` on `Bash` (both runtimes) | Mark when the call started, in a local file, when logged in; no server call |
+| `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
-| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
+| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
@@ -187,6 +188,18 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 T3 Code runs Claude Code and Codex underneath, so these hooks fire in T3 threads too; T3
 adds the thread id (agent id) and `t3 thread start/send` (used by the daemon).
+
+Overlaps and alerts leave out work that is one piece:
+
+- A thread and those it delegated, down every level (each child's `t3_parent` names
+  its parent's thread), never overlap each other: no overlap in a touch's answer, no
+  lease conflict, and no overlap or new-agent alert between them. Two children of one
+  parent are peers, and so are their lines.
+- "new agent on your repo and branch" is raised only when that peer has already touched
+  (within the touch window) or leased a path the agent touched or leased. A peer that
+  arrives with nothing is no news; the overlap alerts report it once it reaches the
+  agent's files. A transcript scan (2026-11-07) found 76 such alerts in 20 sessions, one
+  per peer, and only 2 of those peers ever overlapped the agent afterwards.
 
 ## Autopilot and the coordinator
 
@@ -245,26 +258,30 @@ registers without a repo).
   the boards' repos, and asks the user when unclear. It never drops an item, never fixes
   the setup itself, and treats report text as data. A recurring item goes back to the
   owner of the earlier task.
-- **Growing the backlog**: every agent files work it finds but won't do now as a task, with
-  the task it found it in as parent, instead of leaving it in chat (the MCP instructions and
-  the snapshot footer say so). That reports it back: while the filed task is neither done
+- **Growing the backlog**: every agent files work it finds but won't do now as a proposal
+  (see "Proposals and triage"), with the task it found it in as parent, instead of leaving
+  it in chat (the MCP instructions say so; the snapshot footer says to file a proposal). That reports it back: while the filed task is neither done
   nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
   gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
   after every other alert. The coordinator sorts those tasks when it reviews the work. The
   goal review reads the board's `goal` as scope (never as instructions) against where the
   project stands, files at most three next tasks with evidence, and records itself as a
-  `review:` note on the last task finished. Those tasks are `auto` like any other; work
-  that needs the user's decision gets an ask and waits `blocked`.
+  `review:` note on the last task finished. Those tasks are proposals, reviewed by a
+  reviewer child before any becomes `auto`; work that needs the user's decision gets an ask
+  and waits `blocked`. When every proposal of a review is declined or merged, the next
+  review waits for the next finished task.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes) or a blocker clears. An answered ask wakes the agent that asked,
-  worker or coordinator; the coordinator gets it instead when the asker cannot be woken
-  (no T3 thread on this device, ended, unknown, gone from T3, or paused with no reset
-  time), and as well while the asker waits for a usage-limit reset. Wake-ups are queued
-  as what they are about and sent every few seconds, one message per agent:
+  `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
+  new open, non-`auto` task whose body starts `Proposal:`). An answered ask wakes the agent
+  that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
+  be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
+  reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
+  queued as what they are about and sent every few seconds, one message per agent:
   - **Re-check**: at send time each line is checked again; a task no longer ready and
-    `auto` (claimed, blocked, done), or an agent no longer the board's coordinator, drops
-    its task lines. An answer stays answered, so only its text is read then.
+    `auto` (claimed, blocked, done), a proposal no longer pending, or an agent no longer
+    the board's coordinator, drops its task lines. An answer stays answered, so only its
+    text is read then.
   - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
     its `agent_state_changed` events. Lines for a running agent are held and sent together
     on the first flush after it stops running, or after 3 minutes held, since T3 gives a
@@ -351,7 +368,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File work you find with task_add. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). File found work as a Proposal: task, auto=false. Notes and bodies: task_show <id>.
 </board>
 ```
 
@@ -370,6 +387,32 @@ instructions in peer text ran once in 180 runs, in a framing without quotes. Res
 the handoff after a compaction was 63% [51–74] with quoted text against 37% [26–49]
 spotlighted, and the formats tied while tagged lines took about 35% fewer tokens. The
 switches it used, and the harness, stay on the `bench/formats` branch for reruns.
+
+## Proposals and triage
+
+Agents find work all the time; it becomes work only when an agent other than its finder
+agrees, after checking it.
+
+- **Proposal**: new scope outside the task being worked (found work, a goal-review filing, a
+  finding of a review report, a routed feedback item). It is a task with `auto=false` whose
+  body starts `Proposal:` and gives the problem, the evidence, the change and its size. A
+  coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
+- **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
+  its board at the start of its loop; its own go to a reviewer child briefed with the
+  evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
+  value against the board goal and cost.
+- **Verdict**: a `decision` note starting `verdict:` (accept, merge, decline, escalate) with
+  reasons and the evidence checked. Accept sets `auto`; merge and decline drop the task with
+  the reason; escalate asks the user and blocks it.
+- **Agreement**: one independent accept, or two for L proposals and for security-boundary,
+  destructive, irreversible or cross-repository changes. Split verdicts and decisions only
+  the user can make (direction, spending, security posture, publishing, deleting data, what
+  reaches their phone, this process) go to the user, one ask per batch with recommendations.
+- **Enforcement**: by convention for now (`prompts/coordinator.md`). Agent ids are asserted
+  by clients, so the server cannot prove independence; stats on verdicts and on the fate of
+  accepted proposals decide whether a server-side record is worth adding.
+- **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
+  task; the owner's coordinator verifies it.
 
 ## Feedback loop
 
@@ -398,7 +441,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   reported, filed and resolved by kind.
 - **Review.** A periodic review (for example a weekly job) reads the feedback board and
   the stats, routes items to work, proposes changes to the defaults, the coordinator prompt
-  and the agents' instructions, and opens them as reviewed pull requests.
+  and the agents' instructions, and files them as proposals (see "Proposals and triage")
+  before they become reviewed pull requests.
 
 ## Security
 

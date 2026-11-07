@@ -255,6 +255,7 @@ pub fn board(home: &Path, cwd: &Path, env: &[(&str, &str)], args: &[&str], stdin
         .env("BOARD_TOKEN", TOKEN)
         .env("BOARD_KEYCHAIN", "0")
         .env_remove("T3CODE_THREAD_ID")
+        .env_remove("T3CODE_CLI_PATH")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("BOARD_LOG")
         .stdin(Stdio::piped())

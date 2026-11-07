@@ -5,7 +5,8 @@
 //!   prints the new thread.
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
-//! - `t3 thread show --json --messages 1 <thread>`: the thread's state.
+//! - `t3 thread show --json --messages 1 <thread>`: the thread's state; with `--messages 0`
+//!   the hooks read a delegated thread's parent (`parentThreadId`).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
@@ -89,6 +90,25 @@ impl T3Cli {
                 .unwrap_or_else(|| PathBuf::from("t3"))
         });
         Self { bin }
+    }
+
+    /// The thread that delegated `thread` (`parentThreadId` of a thread T3 started for a
+    /// parent's `delegate_task`); `None` for a top-level thread or one T3 does not know.
+    pub async fn thread_parent(&self, thread: &str) -> Result<Option<String>> {
+        let (ok, stdout, stderr) = self
+            .run(
+                &["thread", "show", "--json", "--messages", "0", thread],
+                None,
+            )
+            .await?;
+        if !ok {
+            if is_unknown_thread(&stderr, thread) {
+                return Ok(None);
+            }
+            bail!("t3 thread show failed: {}", stderr.trim());
+        }
+        let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
+        Ok(parse_thread_parent(&value))
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
@@ -238,6 +258,18 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     }
 }
 
+/// Reads `{"thread": {"parentThreadId": …, "relationshipToParent": …}}`: the parent of a
+/// thread that has a relationship to one.
+pub fn parse_thread_parent(value: &Value) -> Option<String> {
+    let thread = &value["thread"];
+    thread["relationshipToParent"].as_str()?;
+    thread["parentThreadId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -306,6 +338,23 @@ mod tests {
             "x"
         ));
         assert!(!is_unknown_thread("Thread y is no longer available.", "x"));
+    }
+
+    #[test]
+    fn thread_parents_come_from_the_relationship() {
+        let child = json!({"thread": {
+            "threadId": "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1",
+            "parentThreadId": "b8745db9-8b9a-4047-8e1d-15b7ac1b2f40",
+            "relationshipToParent": "subagent",
+        }});
+        assert_eq!(
+            parse_thread_parent(&child).as_deref(),
+            Some("b8745db9-8b9a-4047-8e1d-15b7ac1b2f40")
+        );
+        let top = json!({"thread": {"threadId": "t-1", "parentThreadId": null}});
+        assert_eq!(parse_thread_parent(&top), None);
+        let unrelated = json!({"thread": {"parentThreadId": "p", "relationshipToParent": null}});
+        assert_eq!(parse_thread_parent(&unrelated), None);
     }
 
     #[test]

@@ -138,6 +138,8 @@ pub enum WakeAbout {
     Ready { task: TaskId },
     /// For the coordinator: `done` cleared the last blocker of `ready`.
     Cleared { done: TaskId, ready: Vec<TaskId> },
+    /// For the coordinator: another agent filed `task` as a proposal to review.
+    Proposal { task: TaskId },
     /// The user answered `asker`'s ask: for the asker, or for the coordinator when the
     /// asker cannot be woken.
     Answered { ask: i64, asker: AgentId },
@@ -918,8 +920,17 @@ impl<T: T3> Daemon<T> {
                     && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
                     let detail = self.client().task(task).await?;
-                    if detail.task.ready && detail.task.auto {
-                        wakes.push((coordinator.clone(), WakeAbout::Ready { task: task.clone() }));
+                    let about = if detail.task.ready && detail.task.auto {
+                        Some(WakeAbout::Ready { task: task.clone() })
+                    } else if event.event_type == EventType::TaskCreated
+                        && is_proposal(&detail.task)
+                    {
+                        Some(WakeAbout::Proposal { task: task.clone() })
+                    } else {
+                        None
+                    };
+                    if let Some(about) = about {
+                        wakes.push((coordinator.clone(), about));
                     }
                 }
             }
@@ -1257,6 +1268,11 @@ impl<T: T3> Daemon<T> {
                     )
                 })
             }
+            WakeAbout::Proposal { task } if coordinator => {
+                let task = self.client().task(task).await?.task;
+                is_proposal(&task)
+                    .then(|| format!("board {slug}: {} is a proposal to review", task.id))
+            }
             // An answer stays answered; only its text is read.
             WakeAbout::Answered { ask, asker } if asker == agent || coordinator => {
                 let ask = self.client().ask(*ask).await?;
@@ -1279,9 +1295,10 @@ impl<T: T3> Daemon<T> {
                 ))
             }
             // The agent is no longer this board's coordinator.
-            WakeAbout::Ready { .. } | WakeAbout::Cleared { .. } | WakeAbout::Answered { .. } => {
-                None
-            }
+            WakeAbout::Ready { .. }
+            | WakeAbout::Cleared { .. }
+            | WakeAbout::Proposal { .. }
+            | WakeAbout::Answered { .. } => None,
         };
         Ok(line)
     }
@@ -1382,6 +1399,14 @@ fn no_project(board: &Board) -> String {
          [board_projects]) in config.toml",
         board.repos.join(", ")
     )
+}
+
+/// A pending proposal: open, not `auto`, with a body starting `Proposal:`
+/// (prompts/coordinator.md "Proposals"). Its filing wakes the coordinator to review it.
+fn is_proposal(task: &board_proto::Task) -> bool {
+    task.status == board_proto::TaskStatus::Open
+        && !task.auto
+        && task.body.trim_start().starts_with("Proposal:")
 }
 
 fn priority(p: &Priority) -> String {

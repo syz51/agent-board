@@ -266,7 +266,9 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
   its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
   already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
-  when the task is not a feedback item or `task` does not exist.
+  when the task is not a feedback item or `task` does not exist. A plain task on the
+  feedback board (added with `task_add`, or filed before feedback items existed) is resolved
+  as an item about `other`, reported once by its creator, with the signature of its title.
 
 `Task.feedback` `[Feedback]`: `about`, `activity` (absent when not given), `source`,
 `signature`, `reports`, `reporters`, `last_reported_at`, `resolution` (absent until

@@ -410,7 +410,7 @@ async fn snapshots_respect_their_caps() {
         "{full}"
     );
     assert!(full.contains("Claim before working"));
-    assert!(full.contains("File work you find with task_add."));
+    assert!(full.contains("File found work as a Proposal: task, auto=false."));
     let delta = text(&snapshot(&t, me, "kind=delta&since=0").await).to_owned();
     assert!(
         delta.chars().count() <= caps.snapshot_delta_chars,
@@ -540,5 +540,43 @@ async fn snapshots_list_tasks_waiting_for_their_not_before() {
         text(&full).contains("ready (1):\n  factory-2 p2 \"Sooner\""),
         "{}",
         text(&full)
+    );
+}
+
+#[tokio::test]
+async fn a_new_peer_on_the_branch_alerts_only_when_it_shares_files() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register("t3:alpha", Some(REPO), Some("main")).await;
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some("t3:alpha"),
+        Some(json!({"agent": "t3:alpha", "repo": REPO, "paths": ["src/lib.rs"]})),
+    )
+    .await;
+    snapshot(&t, "t3:alpha", "kind=alerts").await;
+
+    // A peer that arrives with nothing of its own is no news: overlaps alert later.
+    t.register("t3:beta", Some(REPO), Some("main")).await;
+    assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=alerts").await), "");
+
+    // A peer that worked on the agent's files elsewhere and moves to its branch is.
+    t.register("t3:gamma", Some(REPO), Some("other")).await;
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some("t3:gamma"),
+        Some(json!({"agent": "t3:gamma", "repo": REPO, "paths": ["src/lib.rs"]})),
+    )
+    .await;
+    snapshot(&t, "t3:alpha", "kind=alerts").await;
+    t.register("t3:gamma", Some(REPO), Some("main")).await;
+    let alerts = snapshot(&t, "t3:alpha", "kind=alerts").await;
+    assert_eq!(
+        text(&alerts).matches("on your repo and branch").count(),
+        1,
+        "{}",
+        text(&alerts)
     );
 }
