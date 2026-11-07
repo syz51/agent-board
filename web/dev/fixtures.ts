@@ -335,7 +335,35 @@ export function createFixtures(now: number): Fixtures {
       auto: false,
     }, 2 * day, 3 * 60),
 
+    // A pending proposal: open, not auto, body starting `Proposal:` (after whitespace).
+    task({
+      id: "web-view-4",
+      title: "Cache rendered markdown per note",
+      status: "open",
+      priority: "p3",
+      auto: false,
+      created_by: id("claude:5be1"),
+      body: "\n  Proposal: rendering long notes repeats work on every refresh. Size S.",
+    }, 3 * 60, 3 * 60),
+
     task({ id: "docs-1", title: "Rewrite the install guide", status: "open", owner: null }, 5 * day, 5 * day),
+    // Blocked on the user with no ask: shown in Needs you.
+    task({
+      id: "docs-5",
+      title: "Publish the guide on the docs site",
+      status: "blocked",
+      priority: "p1",
+      blocked_reason: "Waits on the user to pick where the docs are hosted.",
+    }, 2 * day, 6 * 60),
+    // Not auto, but held until a date: not shown in Needs you before then.
+    task({
+      id: "docs-6",
+      title: "Renew the docs domain",
+      status: "open",
+      priority: "p3",
+      auto: false,
+      not_before: new Date(now + 3 * day * 60_000).toISOString(),
+    }, day, day),
     task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
     task(
       {
