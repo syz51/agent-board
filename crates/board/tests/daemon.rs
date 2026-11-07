@@ -2147,6 +2147,10 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "A task blocked on the user gets an ask",
         "never set a task `blocked` on the user without one",
         "When `ask_user` warns of another open ask that asks the same, keep one and withdraw the other",
+        // The user reviews waiting work from lists, so each item explains itself.
+        "Open each ask, and the body of each task you set non-auto or blocked on the user, with a brief in plain, short sentences",
+        "what it is, in one sentence; why it waits on the user; the options, each with its consequence; your recommendation",
+        "Agent detail goes below the brief",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
