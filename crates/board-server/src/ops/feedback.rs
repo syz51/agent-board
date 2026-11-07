@@ -17,7 +17,7 @@ use crate::error::{Result, bad_transition, forbidden, invalid};
 use crate::ops::tasks::status_str;
 use crate::ops::{boards, touch_agent};
 use crate::store::{find_board, find_task, get_task};
-use crate::text::{check_line, check_text, cut};
+use crate::text::{check_line, check_text_or, cut};
 
 /// Agents an item lists in `reporters`: the most recent ones.
 const REPORTERS_MAX: usize = 20;
@@ -74,11 +74,12 @@ pub(crate) fn validate_create(
             "say what cost you a step: the first line is the title",
         ));
     }
-    if let Some(long) = board_proto::TooLong::check("text", text, s.body_chars) {
-        let goes = "keep to what happened and what it cost, and add the rest as notes on the item";
-        return Err(invalid(long.message(), long.next_or(Some(goes))));
-    }
-    check_text("text", text, s.body_chars)?;
+    check_text_or(
+        "text",
+        text,
+        s.body_chars,
+        Some(board_proto::FEEDBACK_LONGER_TEXT_GOES),
+    )?;
     let first: String = text
         .split(['\n', '\r'])
         .next()
@@ -513,7 +514,7 @@ pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()> {
+pub(crate) fn validate_resolve(req: &ResolveFeedback) -> Result<()> {
     let kind = enum_str(&req.kind);
     match req.kind {
         ResolutionKind::Routed | ResolutionKind::Duplicate if req.task.is_none() => {
@@ -535,7 +536,7 @@ pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()
                     format!("{kind} needs a reason"),
                     format!(
                         "send reason (at most {} characters): {}",
-                        s.note_chars,
+                        board_proto::RESOLUTION_REASON_CHARS_MAX,
                         if req.kind == ResolutionKind::Forwarded {
                             "where it went"
                         } else {
@@ -554,7 +555,7 @@ pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()
         _ => {}
     }
     if let Some(reason) = &req.reason {
-        check_line("reason", reason, s.note_chars)?;
+        check_line("reason", reason, board_proto::RESOLUTION_REASON_CHARS_MAX)?;
     }
     Ok(())
 }
@@ -630,7 +631,7 @@ pub(crate) fn resolve(
     };
     let evidence = NewEvidence {
         kind: EvidenceKind::Artifact,
-        value: cut(&value, 500),
+        value: cut(&value, board_proto::EVIDENCE_VALUE_CHARS_MAX),
         exit_code: None,
     };
     // Evidence names an agent: the resolver, else the owner, else the reporter.

@@ -8,13 +8,23 @@ use crate::error::{Result, invalid};
 /// Checks a required single-line field such as a title: not blank, at most `max`
 /// characters, no control characters.
 pub(crate) fn check_line(field: &str, value: &str, max: usize) -> Result<()> {
+    check_line_or(field, value, max, board_proto::longer_text_goes(field))
+}
+
+/// [`check_line`] whose over-length hint says `goes` is where longer text goes.
+pub(crate) fn check_line_or(
+    field: &str,
+    value: &str,
+    max: usize,
+    goes: Option<&str>,
+) -> Result<()> {
     if value.trim().is_empty() {
         return Err(invalid(
             format!("{field} is empty"),
             format!("send a non-empty {field}"),
         ));
     }
-    check_len(field, value, max)?;
+    check_len(field, value, max, goes)?;
     if value.chars().any(char::is_control) {
         return Err(invalid(
             format!("{field} contains a line break or control character"),
@@ -27,7 +37,17 @@ pub(crate) fn check_line(field: &str, value: &str, max: usize) -> Result<()> {
 /// Checks an optional multi-line field: at most `max` characters; tabs and line breaks
 /// are the only control characters allowed.
 pub(crate) fn check_text(field: &str, value: &str, max: usize) -> Result<()> {
-    check_len(field, value, max)?;
+    check_text_or(field, value, max, board_proto::longer_text_goes(field))
+}
+
+/// [`check_text`] whose over-length hint says `goes` is where longer text goes.
+pub(crate) fn check_text_or(
+    field: &str,
+    value: &str,
+    max: usize,
+    goes: Option<&str>,
+) -> Result<()> {
+    check_len(field, value, max, goes)?;
     if value
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
@@ -41,9 +61,9 @@ pub(crate) fn check_text(field: &str, value: &str, max: usize) -> Result<()> {
 }
 
 /// Checks that `value` has at most `max` characters; the hint says where longer text goes.
-pub(crate) fn check_len(field: &str, value: &str, max: usize) -> Result<()> {
+fn check_len(field: &str, value: &str, max: usize, goes: Option<&str>) -> Result<()> {
     match board_proto::TooLong::check(field, value, max) {
-        Some(long) => Err(invalid(long.message(), long.next())),
+        Some(long) => Err(invalid(long.message(), long.next_or(goes))),
         None => Ok(()),
     }
 }
@@ -226,6 +246,24 @@ mod tests {
             err.next.as_deref().unwrap(),
             "shorten text to at most 280 characters, or split it across notes and put the \
              detail in the task body or task_done evidence"
+        );
+        // A field whose name means something else here takes its own hint, or none.
+        let next = |r: Result<()>| match r.unwrap_err() {
+            crate::Error::Api(err) => err.next.unwrap(),
+            other => panic!("{other}"),
+        };
+        assert_eq!(
+            next(check_line_or(
+                "title",
+                &"x".repeat(73),
+                72,
+                Some("put the detail in the goal")
+            )),
+            "shorten title to at most 72 characters, or put the detail in the goal"
+        );
+        assert_eq!(
+            next(check_line_or("title", &"x".repeat(201), 200, None)),
+            "shorten title to at most 200 characters"
         );
     }
 }

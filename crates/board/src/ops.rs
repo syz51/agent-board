@@ -191,15 +191,26 @@ pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>
 
 /// Text limits from the server defaults (`docs/API.md`, "Defaults"), which the MCP schemas
 /// state and the CLI checks before sending.
-pub fn limits() -> board_server::Settings {
-    board_server::Settings::default()
+pub fn limits() -> &'static board_server::Settings {
+    static LIMITS: std::sync::LazyLock<board_server::Settings> =
+        std::sync::LazyLock::new(board_server::Settings::default);
+    &LIMITS
 }
 
 /// Refuses `value` when it has more than `max` characters, with the server's message and
 /// hint, so over-long text fails before a request is sent.
 pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
+    check_chars_or(field, value, max, board_proto::longer_text_goes(field))
+}
+
+/// [`check_chars`] with `goes` saying where longer text goes, as the server says it.
+pub fn check_chars_or(field: &str, value: &str, max: usize, goes: Option<&str>) -> Result<()> {
     match board_proto::TooLong::check(field, value, max) {
-        Some(long) => bail!("{} (not sent)\nnext: {}", long.message(), long.next()),
+        Some(long) => bail!(
+            "{} (not sent)\nnext: {}",
+            long.message(),
+            long.next_or(goes)
+        ),
         None => Ok(()),
     }
 }

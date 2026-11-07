@@ -603,7 +603,7 @@ async fn resolve_feedback(
     } else {
         Some(caller.agent()?.clone())
     };
-    feedback::validate_resolve(&req, state.settings())?;
+    feedback::validate_resolve(&req)?;
     Ok(Json(
         state
             .write(move |cx| feedback::resolve(cx, &id, req, agent, by_user))

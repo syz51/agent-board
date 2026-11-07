@@ -1243,3 +1243,60 @@ fn an_unknown_enum_value_lists_the_accepted_ones() {
     );
     assert!(e.stub.requests().is_empty());
 }
+
+#[test]
+fn other_over_long_text_fails_before_any_request() {
+    let e = env();
+    let long = |n: usize| "x".repeat(n);
+    let cases: [(Vec<String>, &str, &str); 5] = [
+        (
+            vec!["done".into(), "factory-12".into(), "--pr".into(), long(501)],
+            "evidence value is 501 characters; the limit is 500",
+            "link to the log or artifact instead",
+        ),
+        (
+            vec![
+                "update".into(),
+                "factory-12".into(),
+                "--reason".into(),
+                long(501),
+            ],
+            "blocked_reason is 501 characters; the limit is 500",
+            "split it across notes",
+        ),
+        (
+            vec!["feedback".into(), long(4001)],
+            "text is 4001 characters; the limit is 4000",
+            "keep to what happened and what it cost",
+        ),
+        (
+            vec![
+                "resolve".into(),
+                "board-feedback-1".into(),
+                "--declined".into(),
+                long(281),
+            ],
+            "reason is 281 characters; the limit is 280",
+            "put the detail in a note on the item",
+        ),
+        (
+            vec![
+                "board".into(),
+                "create".into(),
+                "factory".into(),
+                "--title".into(),
+                long(73),
+            ],
+            "title is 73 characters; the limit is 72",
+            "put the detail in the goal",
+        ),
+    ];
+    for (args, message, goes) in cases {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = e.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains(message) && err.contains(goes), "{err}");
+        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+    }
+}

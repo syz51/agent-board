@@ -9,8 +9,9 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use board_proto::{
     ASK_OPTION_CHARS_MAX, AgentId, AskKind, BoardSlug, CreateFeedback, EVIDENCE_VALUE_CHARS_MAX,
-    FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind, PATH_CHARS_MAX, Priority, ResolutionKind,
-    ResolveFeedback, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
+    FEEDBACK_ABOUT_MAX, FeedbackActivity, NoteKind, PATH_CHARS_MAX, Priority,
+    RESOLUTION_REASON_CHARS_MAX, ResolutionKind, ResolveFeedback, SnapshotFormat, SnapshotKind,
+    TaskId, TaskStatus,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
@@ -48,9 +49,6 @@ const TASK_ID_MAX: usize = SLUG_MAX + 1 + 20;
 const AGENT_ID_MAX: usize = 7 + 256;
 /// An RFC 3339 time with offset and fraction, or a date.
 const TIME_MAX: usize = 40;
-/// Limits the server checks outside `Settings`: an evidence value and an ask option.
-const EVIDENCE_MAX: usize = EVIDENCE_VALUE_CHARS_MAX;
-const OPTION_MAX: usize = ASK_OPTION_CHARS_MAX;
 
 struct ToolSpec {
     name: &'static str,
@@ -289,7 +287,7 @@ const TOOLS: &[ToolSpec] = &[
                         "items": {
                             "type": "object",
                             "properties": {
-                                "command": {"type": "string", "maxLength": EVIDENCE_MAX},
+                                "command": {"type": "string", "maxLength": EVIDENCE_VALUE_CHARS_MAX},
                                 "exit_code": {"type": "integer"},
                             },
                             "required": ["command", "exit_code"],
@@ -297,11 +295,19 @@ const TOOLS: &[ToolSpec] = &[
                     }),
                     false,
                 ),
-                ("commits", strings("Commit SHAs.", EVIDENCE_MAX), false),
-                ("prs", strings("Pull request URLs.", EVIDENCE_MAX), false),
+                (
+                    "commits",
+                    strings("Commit SHAs.", EVIDENCE_VALUE_CHARS_MAX),
+                    false,
+                ),
+                (
+                    "prs",
+                    strings("Pull request URLs.", EVIDENCE_VALUE_CHARS_MAX),
+                    false,
+                ),
                 (
                     "artifacts",
-                    strings("Artifact links or paths.", EVIDENCE_MAX),
+                    strings("Artifact links or paths.", EVIDENCE_VALUE_CHARS_MAX),
                     false,
                 ),
             ]
@@ -392,9 +398,9 @@ const TOOLS: &[ToolSpec] = &[
                     "options",
                     strings(
                         &format!(
-                            "Suggested answers, recommended first; at most {OPTION_MAX} characters each."
+                            "Suggested answers, recommended first; at most {ASK_OPTION_CHARS_MAX} characters each."
                         ),
-                        OPTION_MAX,
+                        ASK_OPTION_CHARS_MAX,
                     ),
                     false,
                 ),
@@ -472,7 +478,7 @@ const TOOLS: &[ToolSpec] = &[
                     "reason",
                     s(
                         "For forwarded and declined: where it went, or why not.",
-                        limits().note_chars,
+                        RESOLUTION_REASON_CHARS_MAX,
                     ),
                     false,
                 ),

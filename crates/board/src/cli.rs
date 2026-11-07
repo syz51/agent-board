@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use board_proto::{
     ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
-    EVIDENCE_VALUE_CHARS_MAX, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind,
+    EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
+    FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
     ResolveFeedback, SnapshotFormat, SnapshotKind, TaskId, TaskStatus, UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
@@ -132,7 +133,11 @@ pub enum Command {
     /// Withdraw an open ask you made, such as a duplicate or one you no longer need.
     Withdraw { id: i64 },
     /// Answer an ask (user tokens only).
-    Answer { id: i64, answer: String },
+    Answer {
+        id: i64,
+        #[arg(help = at_most("The answer", limits().question_chars))]
+        answer: String,
+    },
     /// Join a board (default: the one for this repo).
     Join { board: Option<BoardSlug> },
     /// List boards.
@@ -167,17 +172,21 @@ pub enum Command {
     /// Report something in a setup that cost a step: the server files a feedback item, or
     /// adds the report to the live one with the same signature.
     Feedback {
-        /// The setup it is about, such as board, skills:rust or t3.
-        #[arg(long, default_value = "other")]
+        #[arg(long, default_value = "other", help = at_most(
+            "The setup it is about, such as board, skills:rust or t3",
+            FEEDBACK_ABOUT_MAX,
+        ))]
         about: String,
         /// What you were doing.
         #[arg(long, value_parser = enum_arg::<FeedbackActivity>())]
         activity: Option<FeedbackActivity>,
-        /// Default agent.
-        #[arg(long, value_parser = enum_arg::<FeedbackSource>())]
+        /// Default agent; signal is the server's own.
+        #[arg(long, value_parser = enum_arg_hiding::<FeedbackSource>(&["signal"]))]
         source: Option<FeedbackSource>,
-        /// Reports with equal signatures are one item (default: from about and the title).
-        #[arg(long)]
+        #[arg(long, help = at_most(
+            "Reports with equal signatures are one item (default: from about and the title)",
+            FEEDBACK_SIGNATURE_MAX,
+        ))]
         signature: Option<String>,
         #[arg(help = at_most("The first line becomes the title", limits().body_chars))]
         text: String,
@@ -194,12 +203,12 @@ pub enum Command {
         duplicate: Option<TaskId>,
         #[arg(long, group = "resolution", value_name = "REASON", help = at_most(
             "Handed on outside the board: say where",
-            limits().note_chars,
+            RESOLUTION_REASON_CHARS_MAX,
         ))]
         forwarded: Option<String>,
         #[arg(long, group = "resolution", value_name = "REASON", help = at_most(
             "Not acted on: say why",
-            limits().note_chars,
+            RESOLUTION_REASON_CHARS_MAX,
         ))]
         declined: Option<String>,
     },
@@ -253,7 +262,15 @@ fn enum_arg_hiding<T>(hidden: &[&str]) -> impl clap::builder::TypedValueParser<V
 where
     T: serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let values = ops::enum_values::<T>()
+    let values = ops::enum_values::<T>();
+    // Holds for unit-variant enums with derived `Deserialize`; the CLI test builds every
+    // command, so a flag of another kind of type fails there.
+    debug_assert!(
+        !values.is_empty() && values.iter().all(|v| parse_enum::<T>(v).is_ok()),
+        "{} is not a unit-variant enum with derived Deserialize",
+        std::any::type_name::<T>()
+    );
+    let values = values
         .iter()
         .map(|value| clap::builder::PossibleValue::new(*value).hide(hidden.contains(value)));
     clap::builder::PossibleValuesParser::new(values)
@@ -332,7 +349,8 @@ pub struct AddArgs {
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
     id: TaskId,
-    #[arg(long, value_parser = enum_arg::<TaskStatus>())]
+    /// Done goes through `board done`, with evidence.
+    #[arg(long, value_parser = enum_arg_hiding::<TaskStatus>(&["done"]))]
     status: Option<TaskStatus>,
     #[arg(long, help = at_most("New title", limits().title_chars))]
     title: Option<String>,
@@ -367,12 +385,14 @@ pub struct DoneArgs {
     /// Exit code of the matching --check.
     #[arg(long = "exit", allow_negative_numbers = true)]
     exits: Vec<i32>,
-    #[arg(long = "commit")]
+    #[arg(long = "commit", help = at_most("A commit SHA", EVIDENCE_VALUE_CHARS_MAX))]
     commits: Vec<String>,
-    #[arg(long = "pr")]
+    #[arg(long = "pr", help = at_most("A pull request URL", EVIDENCE_VALUE_CHARS_MAX))]
     prs: Vec<String>,
-    /// An artifact link or path, such as a log.
-    #[arg(long = "artifact")]
+    #[arg(long = "artifact", help = at_most(
+        "An artifact link or path, such as a log",
+        EVIDENCE_VALUE_CHARS_MAX,
+    ))]
     artifacts: Vec<String>,
 }
 
@@ -381,9 +401,9 @@ pub enum BoardCommand {
     /// Create a board.
     Create {
         slug: BoardSlug,
-        #[arg(long)]
+        #[arg(long, help = at_most("The board's title", limits().title_chars))]
         title: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", help = at_most("What the board is for", limits().body_chars))]
         goal: String,
         /// A repo key such as github.com/owner/repo; repeat for more.
         #[arg(long = "repo")]
@@ -401,9 +421,9 @@ pub enum BoardCommand {
     /// Change a board.
     Update {
         slug: BoardSlug,
-        #[arg(long)]
+        #[arg(long, help = at_most("New title", limits().title_chars))]
         title: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = at_most("New goal", limits().body_chars))]
         goal: Option<String>,
         #[arg(long, value_parser = enum_arg::<BoardStatus>())]
         status: Option<BoardStatus>,
@@ -514,6 +534,14 @@ impl Command {
     /// Refuses text over the server's limits before any request is sent.
     fn check_text_limits(&self) -> Result<()> {
         let l = limits();
+        let check_board_title = |title: &str| {
+            ops::check_chars_or(
+                "title",
+                title,
+                l.title_chars,
+                Some(board_proto::BOARD_TITLE_LONGER_TEXT_GOES),
+            )
+        };
         let check_all = |field, values: &[String], max| {
             values
                 .iter()
@@ -558,14 +586,39 @@ impl Command {
                 check_chars("question", question, l.question_chars)?;
                 check_all("option", options, ASK_OPTION_CHARS_MAX)?;
             }
-            Self::Feedback { text, .. } => check_chars("text", text.trim(), l.body_chars)?,
+            Self::Answer { answer, .. } => check_chars("answer", answer, l.question_chars)?,
+            Self::Feedback {
+                about,
+                signature,
+                text,
+                ..
+            } => {
+                check_chars("about", about, FEEDBACK_ABOUT_MAX)?;
+                check_opt("signature", signature, FEEDBACK_SIGNATURE_MAX)?;
+                ops::check_chars_or(
+                    "text",
+                    text.trim(),
+                    l.body_chars,
+                    Some(board_proto::FEEDBACK_LONGER_TEXT_GOES),
+                )?;
+            }
             Self::Resolve {
                 forwarded,
                 declined,
                 ..
             } => {
-                check_opt("reason", forwarded, l.note_chars)?;
-                check_opt("reason", declined, l.note_chars)?;
+                check_opt("reason", forwarded, RESOLUTION_REASON_CHARS_MAX)?;
+                check_opt("reason", declined, RESOLUTION_REASON_CHARS_MAX)?;
+            }
+            Self::Board(BoardCommand::Create { title, goal, .. }) => {
+                check_board_title(title)?;
+                check_chars("goal", goal, l.body_chars)?;
+            }
+            Self::Board(BoardCommand::Update { title, goal, .. }) => {
+                if let Some(title) = title {
+                    check_board_title(title)?;
+                }
+                check_opt("goal", goal, l.body_chars)?;
             }
             _ => {}
         }
@@ -887,5 +940,27 @@ pub fn expand_tilde(path: PathBuf) -> PathBuf {
     match path.strip_prefix("~") {
         Ok(rest) => dirs::home_dir().map_or(path.clone(), |h| h.join(rest)),
         Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::*;
+
+    #[test]
+    fn every_command_builds_with_its_enum_values() {
+        // Builds every value parser, which checks each enum flag's values parse.
+        Cli::command().debug_assert();
+        let update = Cli::command()
+            .find_subcommand_mut("update")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(
+            update.contains("[possible values: open, doing, blocked, review, dropped]"),
+            "done goes through board done: {update}"
+        );
     }
 }

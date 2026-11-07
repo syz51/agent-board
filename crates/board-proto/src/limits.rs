@@ -5,6 +5,16 @@
 pub const ASK_OPTION_CHARS_MAX: usize = 60;
 /// Longest evidence value (a check command, commit, PR or artifact), in characters.
 pub const EVIDENCE_VALUE_CHARS_MAX: usize = 500;
+/// Longest feedback resolution `reason`, in characters: with its prefix it stays one
+/// evidence value.
+pub const RESOLUTION_REASON_CHARS_MAX: usize = 280;
+
+/// Where a feedback report's text goes when it is over the limit.
+pub const FEEDBACK_LONGER_TEXT_GOES: &str =
+    "keep to what happened and what it cost, and add the rest as notes on the item";
+
+/// Where a board title's detail goes: boards have a goal, not a body.
+pub const BOARD_TITLE_LONGER_TEXT_GOES: &str = "put the detail in the goal";
 
 /// A text field over its length limit, counted in characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,12 +39,14 @@ impl<'a> TooLong<'a> {
         )
     }
 
-    /// The `invalid` error's `next` hint: shorten it, or where longer text goes.
+    /// The `invalid` error's `next` hint: shorten it, or where longer text goes for the
+    /// usual meaning of the field ([`longer_text_goes`]).
     pub fn next(&self) -> String {
         self.next_or(longer_text_goes(self.field))
     }
 
-    /// [`Self::next`] with `goes` saying where longer text goes instead.
+    /// [`Self::next`] with `goes` saying where longer text goes instead, for a field whose
+    /// name means something else here (a board's title, a feedback report's text).
     pub fn next_or(&self, goes: Option<&str>) -> String {
         let shorten = format!("shorten {} to at most {} characters", self.field, self.max);
         match goes {
@@ -44,13 +56,15 @@ impl<'a> TooLong<'a> {
     }
 }
 
-/// Where text that does not fit `field` belongs, for the fields agents fill most.
-fn longer_text_goes(field: &str) -> Option<&'static str> {
+/// Where text that does not fit `field` belongs, for the task, note, handoff, ask and
+/// feedback resolution fields agents fill most.
+pub fn longer_text_goes(field: &str) -> Option<&'static str> {
     Some(match field {
         "title" => "put the detail in the body",
-        "text" | "reason" | "blocked_reason" => {
+        "text" | "blocked_reason" => {
             "split it across notes and put the detail in the task body or task_done evidence"
         }
+        "reason" => "put the detail in a note on the item",
         "now" | "next" | "blockers" => "put the detail in a task note or the task body",
         "question" => "put the background in the task body and name the task in the ask",
         "option" => "explain the options in the question",

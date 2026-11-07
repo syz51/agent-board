@@ -265,7 +265,7 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
 
   `task` is required for routed and duplicate and refused for the others; `reason` (one
-  line, at most 500 characters) is required for forwarded and declined. The item moves to
+  line, at most 280 characters) is required for forwarded and declined. The item moves to
   `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
   its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
   already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
