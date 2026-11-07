@@ -15,7 +15,7 @@ import {
   useTitle,
   Who,
 } from "../ui/common.tsx";
-import { hueOf, Icon, StatusIcon } from "../ui/icons.tsx";
+import { Icon, StatusIcon } from "../ui/icons.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
 import { ConfirmDialog } from "../ui/confirm.tsx";
 
@@ -39,29 +39,8 @@ export function BoardsScreen() {
           )}
         </div>
       </header>
-      <Query resource={boards} label="Loading boards">
-        {(list) =>
-          list.length === 0
-            ? (
-              <Empty title="No boards yet">
-                Create one with <code>board create</code>; it appears here.
-              </Empty>
-            )
-            : (
-              <div class="board-grid">
-                {list.map((board) => (
-                  <BoardCard
-                    key={board.slug}
-                    board={board}
-                    coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
-                    agents={agents}
-                  />
-                ))}
-              </div>
-            )}
-      </Query>
       {openAsks.length > 0 && (
-        <section class="section" aria-labelledby="waiting-title">
+        <section class="waiting" aria-labelledby="waiting-title">
           <div class="section-head">
             <h2 id="waiting-title">Waiting on you</h2>
             <a class="section-link" href="/asks">
@@ -86,6 +65,27 @@ export function BoardsScreen() {
           </ul>
         </section>
       )}
+      <Query resource={boards} label="Loading boards">
+        {(list) =>
+          list.length === 0
+            ? (
+              <Empty title="No boards yet">
+                Create one with <code>board create</code>; it appears here.
+              </Empty>
+            )
+            : (
+              <div class="board-grid">
+                {list.map((board) => (
+                  <BoardCard
+                    key={board.slug}
+                    board={board}
+                    coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
+                    agents={agents}
+                  />
+                ))}
+              </div>
+            )}
+      </Query>
     </>
   );
 }
@@ -101,7 +101,7 @@ export function plainLine(text: string): string {
 
 const SEGMENTS = [
   { key: "done", label: "done" },
-  { key: "review", label: "in review" },
+  { key: "review", label: "review" },
   { key: "doing", label: "doing" },
   { key: "blocked", label: "blocked" },
   { key: "ready", label: "ready" },
@@ -127,14 +127,16 @@ function BoardCard(
   return (
     <article class="card board-card">
       <header class="board-card-head">
-        <span class="board-dot" style={{ "--hue": hueOf(board.slug) }} aria-hidden="true" />
         <h2 class="card-title">
           <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
         </h2>
         <code class="slug">{board.slug}</code>
         <span class="board-tags">
           {board.status !== "active" && (
-            <span class="tag">{board.status[0]?.toUpperCase()}{board.status.slice(1)}</span>
+            <span class={`pill board-${board.status}`}>
+              <span class="state-dot" aria-hidden="true" />
+              {board.status[0]?.toUpperCase()}{board.status.slice(1)}
+            </span>
           )}
           {board.temporary && <span class="tag">Temporary</span>}
         </span>

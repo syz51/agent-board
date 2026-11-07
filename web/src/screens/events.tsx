@@ -136,11 +136,11 @@ const KIND_ICON: Record<string, IconName> = {
   files: "file",
 };
 
-/** Events worth a second look: asks, finished or stuck work, failed checks. */
+/** Events that may need you: asks, blocked work, failed checks. */
 function isNotable(event: BoardEvent): boolean {
   const payload = (event.payload ?? {}) as Record<string, unknown>;
-  if (event.type === "ask_created" || event.type === "task_done") return true;
-  if (event.type === "task_updated" && (payload.to === "blocked" || payload.to === "review")) return true;
+  if (event.type === "ask_created") return true;
+  if (event.type === "task_updated" && payload.to === "blocked") return true;
   return event.type === "evidence_added" && typeof payload.exit_code === "number" && payload.exit_code !== 0;
 }
 

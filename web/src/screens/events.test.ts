@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { BoardEvent } from "../api/schema.ts";
 import { plainLine } from "./boards.tsx";
 import { describe as describeEvent, detail } from "./events.tsx";
+import { monogram } from "../ui/icons.tsx";
 
 const event = (type: string, payload: unknown, task: string | null = "factory-9"): BoardEvent => ({
   seq: 1,
@@ -36,5 +37,14 @@ describe("plainLine", () => {
     expect(plainLine("Log in to `desktop` so **bun publish** runs.\nSecond line")).toBe("Log in to desktop so bun publish runs.");
     expect(plainLine("See [the guide](https://example.com/guide)")).toBe("See the guide");
     expect(plainLine("</board> <script>x</script>")).toBe("</board> <script>x</script>");
+  });
+});
+
+describe("monogram", () => {
+  test("takes two characters after the runtime prefix", () => {
+    expect(monogram("t3:c2d0")).toBe("C2");
+    expect(monogram("claude:5be1")).toBe("5B");
+    expect(monogram("user")).toBe("US");
+    expect(monogram("::")).toBe("?");
   });
 });

@@ -137,9 +137,13 @@ export function PriorityMark({ priority, compact }: { priority: Priority; compac
   );
 }
 
-/** A stable hue per id, for the dot beside an agent's handle. */
-export function hueOf(id: string): number {
-  let hash = 0;
-  for (const char of id) hash = (hash * 31 + (char.codePointAt(0) ?? 0)) >>> 0;
-  return hash % 360;
+/** Two characters that tell agents apart at a glance: `t3:c2d0` → `C2`, `user` → `US`. */
+export function monogram(handle: string): string {
+  const tail = handle.includes(":") ? handle.slice(handle.indexOf(":") + 1) : handle;
+  return (tail.replace(/[^a-z0-9]/gi, "").slice(0, 2) || "?").toUpperCase();
+}
+
+/** A neutral monogram beside an agent's handle; the handle itself is always shown too. */
+export function Avatar({ handle, large }: { handle: string; large?: boolean }) {
+  return <span class={large ? "avatar avatar-lg" : "avatar"} aria-hidden="true">{monogram(handle)}</span>;
 }

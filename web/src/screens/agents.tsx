@@ -13,7 +13,7 @@ import {
   useAgents,
   useTitle,
 } from "../ui/common.tsx";
-import { hueOf, StatusIcon } from "../ui/icons.tsx";
+import { Avatar, StatusIcon } from "../ui/icons.tsx";
 
 const STATE_ORDER: Record<Agent["state"], number> = { running: 0, paused: 1, idle: 2, ended: 3 };
 const FILTERS = [
@@ -97,7 +97,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
     <article class="card agent-card">
       <div class="agent-who">
         <header class="agent-head">
-          <span class="avatar avatar-lg" style={{ "--hue": hueOf(agent.id) }} aria-hidden="true" />
+          <Avatar handle={agent.handle} large />
           <h2 class="agent-handle" title={agent.id}>{agent.handle}</h2>
           {agent.role === "coordinator" && <span class="tag">coordinator</span>}
         </header>
@@ -110,10 +110,13 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
           {agent.repo && (
             <div>
               <dt>Repo</dt>
-              <dd class="wrap">
-                <code>{agent.repo.replace(/^github\.com\//, "")}</code>
-                {agent.branch && <> <span class="muted">on</span> <code>{agent.branch}</code></>}
-              </dd>
+              <dd class="wrap"><code>{agent.repo.replace(/^github\.com\//, "")}</code></dd>
+            </div>
+          )}
+          {agent.branch && (
+            <div>
+              <dt>Branch</dt>
+              <dd class="wrap"><code>{agent.branch}</code></dd>
             </div>
           )}
           <div>

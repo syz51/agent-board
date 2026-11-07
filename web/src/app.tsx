@@ -12,7 +12,7 @@ import { api } from "./api/client.ts";
 import { tags } from "./live/refresh.ts";
 import { useResource } from "./live/runtime.ts";
 import { Empty, useTitle } from "./ui/common.tsx";
-import { BrandMark, hueOf, Icon, type IconName } from "./ui/icons.tsx";
+import { BrandMark, Icon, type IconName } from "./ui/icons.tsx";
 
 export function App() {
   return (
@@ -91,10 +91,12 @@ function BoardLinks() {
   const { path } = useLocation();
   const boards = useResource("boards", [tags.boards], api.boards);
   const list = (boards.data ?? []).filter((board) => board.status !== "closed");
-  if (list.length === 0) return null;
   return (
     <nav class="side-boards" aria-label="Boards">
       <p class="side-label" aria-hidden="true">Boards</p>
+      {boards.data === undefined && (
+        <p class="side-empty">{boards.error ? "Boards are unavailable" : "Loading…"}</p>
+      )}
       <ul>
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
@@ -102,7 +104,7 @@ function BoardLinks() {
           return (
             <li key={board.slug}>
               <a href={href} aria-current={here ? "page" : undefined}>
-                <span class="side-board-dot" style={{ "--hue": hueOf(board.slug) }} aria-hidden="true" />
+                <span class="side-board-mark" aria-hidden="true">{board.title.trim()[0]?.toUpperCase() ?? "#"}</span>
                 <span class="side-board-title">{board.title}</span>
                 {board.open_asks > 0 && (
                   <span class="side-count" aria-label={`${board.open_asks} open asks`}>{board.open_asks}</span>

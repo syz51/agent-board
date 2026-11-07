@@ -3,7 +3,7 @@ import { useEffect } from "preact/hooks";
 import type { ApiFailure } from "../api/client.ts";
 import { api } from "../api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "../api/schema.ts";
-import { hueOf, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
+import { Avatar, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
 import { tags } from "../live/refresh.ts";
 import { type Resource, useNow, useResource } from "../live/runtime.ts";
 
@@ -172,7 +172,7 @@ export function Who({ id, agents }: { id: string; agents: Map<string, Agent> }) 
   if (id === "user") return <span class="who who-user">you</span>;
   return (
     <span class="who" title={id}>
-      <span class="avatar" style={{ "--hue": hueOf(id) }} aria-hidden="true" />
+      <Avatar handle={agent ? agent.handle : id} />
       <span class="handle">{agent ? agent.handle : id}</span>
     </span>
   );

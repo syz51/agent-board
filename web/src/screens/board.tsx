@@ -221,7 +221,7 @@ function TaskRow(
     : null;
   return (
     <li class="task-row">
-      <PriorityBadge priority={task.priority} compact />
+      <PriorityBadge priority={task.priority} />
       <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
       <code class="task-id">{task.id}</code>
       <div class="task-main">
