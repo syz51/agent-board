@@ -183,7 +183,7 @@ const AREA: Record<string, string> = {
 
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-1",
-  tasks: "grid min-w-0",
+  tasks: "grid min-w-0 @min-[760px]:flex @min-[760px]:items-center @min-[760px]:gap-3",
   coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
   asks: "",
   autopilot: "flex flex-col items-end @min-[760px]:self-start",
@@ -225,7 +225,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
       ))}
       <ul className="divide-y">
         {table.getRowModel().rows.map((row) => (
-          <li key={row.id} className={cn(ROW_GRID, "items-center px-4 py-4 @min-[760px]:py-5")}>
+          <li key={row.id} className={cn(ROW_GRID, "items-center px-4 py-3.5")}>
             {row.getAllCells().map((cell) => (
               <div key={cell.id} className={cn(AREA[cell.column.id], CELL_CLASS[cell.column.id])}>
                 <table.FlexRender cell={cell} />
@@ -277,7 +277,7 @@ function TaskTally({ board }: { board: Board }) {
   return (
     <>
       <div
-        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary @min-[760px]:hidden"
+        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary @min-[760px]:w-24 @min-[760px]:shrink-0"
         aria-hidden="true"
       >
         {SEGMENTS.map(
