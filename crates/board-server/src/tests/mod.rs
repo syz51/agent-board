@@ -7,6 +7,7 @@ mod boards;
 mod events;
 mod feedback;
 mod leases;
+mod query_cost;
 mod snapshot;
 mod tasks;
 mod telegram;
