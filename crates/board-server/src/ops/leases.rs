@@ -10,7 +10,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, forbidden, invalid, not_found};
 use crate::ops::{expires, touch_agent};
-use crate::store::{LEASE_COLUMNS, handle_of, is_live, lease_row, live_leases};
+use crate::store::{LEASE_COLUMNS, get_board, handle_of, is_live, lease_row, live_leases};
 use crate::text::{check_path, normalize_repo};
 
 /// Longest lease a request may ask for.
@@ -137,7 +137,7 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
 }
 
 pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult> {
-    let req = valid.req;
+    let mut req = valid.req;
     touch_agent(cx, &req.agent)?;
     let board = match &req.task {
         Some(task) => Some(
@@ -158,6 +158,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         ),
         None => None,
     };
+    if let Some(board) = &board {
+        req.repo = lease_repo(cx, board, req.task.as_ref(), req.repo)?;
+    }
     let ttl_ms = req
         .ttl_secs
         .map_or(cx.s.lease_ms(), |s| i64::from(s) * 1000);
@@ -232,6 +235,35 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         }),
     )?;
     Ok(LeaseResult { leases, conflicts })
+}
+
+/// The repo a lease for a task on `board` goes to. Peers working the task are on the
+/// board's repos, so a lease from a checkout of another repo would warn nobody: it moves to
+/// the board's repo when the board lists one, and is refused when it lists several. A board
+/// without repos takes the caller's.
+fn lease_repo(
+    cx: &Ctx<'_>,
+    board: &board_proto::BoardSlug,
+    task: Option<&board_proto::TaskId>,
+    repo: String,
+) -> Result<String> {
+    let repos = get_board(cx, board)?.repos;
+    match repos.as_slice() {
+        [] => Ok(repo),
+        list if list.contains(&repo) => Ok(repo),
+        [only] => Ok(only.clone()),
+        list => Err(invalid(
+            format!(
+                "board {board} of task {} lists {}, not {repo}",
+                task.map_or("", |t| t.as_str()),
+                list.join(", ")
+            ),
+            format!(
+                "run lease_paths from a checkout of one of {}, or leave task out to lease in {repo}",
+                list.join(", ")
+            ),
+        )),
+    }
 }
 
 pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> {

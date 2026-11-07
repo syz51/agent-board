@@ -614,13 +614,23 @@ pub async fn lease_paths(
         .client
         .lease(&CreateLeases {
             agent: ctx.agent()?.clone(),
-            repo,
+            repo: repo.clone(),
             globs,
-            task,
+            task: task.clone(),
             ttl_secs,
         })
         .await?;
-    Ok(Output::new(render::lease_result(&result), &result))
+    let mut text = render::lease_result(&result);
+    // The server moves a task's lease to its board's repo when this checkout is another.
+    if let (Some(task), Some(lease)) = (&task, result.leases.first())
+        && lease.repo != repo
+    {
+        text = format!(
+            "leased in {}, the repo of {task}'s board, not this checkout's {repo}\n{text}",
+            lease.repo
+        );
+    }
+    Ok(Output::new(text, &result))
 }
 
 pub struct NewAsk {

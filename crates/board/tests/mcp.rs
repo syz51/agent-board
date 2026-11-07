@@ -385,3 +385,62 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(bad["isError"], true);
     assert!(text(&bad).starts_with("error: invalid arguments"));
 }
+
+#[test]
+fn lease_paths_says_when_the_lease_went_to_the_tasks_board_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let lease = |repo: &str| board_proto::LeaseResult {
+        leases: vec![board_proto::Lease {
+            id: 7,
+            agent: "t3:thread-1".parse().unwrap(),
+            task: Some("factory-12".parse().unwrap()),
+            repo: repo.to_owned(),
+            glob: "src/**".into(),
+            expires_at: at(),
+        }],
+        conflicts: vec![],
+    };
+    stub.on("POST /v1/leases", lease("github.com/acme/app"));
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = git_repo(dir.path(), "git@github.com:acme/dotfiles.git");
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let moved = mcp.call(
+        2,
+        "lease_paths",
+        json!({"globs": ["src/**"], "task": "factory-12"}),
+    );
+    assert!(
+        text(&moved).starts_with(
+            "leased in github.com/acme/app, the repo of factory-12's board, not this checkout's github.com/acme/dotfiles\n"
+        ),
+        "{moved}"
+    );
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/dotfiles"
+    );
+
+    // Leased where it was asked: the reply only lists the lease, with its repo.
+    stub.on("POST /v1/leases", lease("github.com/acme/dotfiles"));
+    let kept = mcp.call(
+        3,
+        "lease_paths",
+        json!({"globs": ["src/**"], "task": "factory-12"}),
+    );
+    assert!(
+        text(&kept).starts_with("lease #7 github.com/acme/dotfiles \"src/**\""),
+        "{kept}"
+    );
+}
