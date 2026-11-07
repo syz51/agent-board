@@ -98,7 +98,7 @@ pub struct Task {
     /// Open, every blocker done, and no live owner.
     pub ready: bool,
     /// May the coordinator start this task without the user? Defaults to true on autopilot
-    /// boards.
+    /// boards; false is only for tasks the user must do or decide.
     pub auto: bool,
     pub created_by: AgentId,
     /// Incremented on every change; updates must send the version they read.

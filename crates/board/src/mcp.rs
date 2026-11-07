@@ -142,7 +142,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "auto",
                     b(
-                        "May the coordinator start it without the user? Default: the board's autopilot.",
+                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide; waiting on a task is a blocker.",
                     ),
                     false,
                 ),
@@ -176,7 +176,13 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 ("blocked_reason", s("Why it is blocked."), false),
-                ("auto", b("May the coordinator start it?"), false),
+                (
+                    "auto",
+                    b(
+                        "May the coordinator start it? Set false only when the user must act or decide; waiting on a task is a blocker, waiting on the user an ask plus blocked.",
+                    ),
+                    false,
+                ),
             ]
         },
     },
