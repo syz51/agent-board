@@ -427,7 +427,10 @@ pub fn lease_result(result: &LeaseResult) -> String {
         ));
     }
     if lines.is_empty() {
-        return "no leases".into();
+        lines.push("no leases".into());
+    }
+    if let Some(warning) = &result.warning {
+        lines.insert(0, format!("warning: {warning}"));
     }
     lines.join("\n")
 }

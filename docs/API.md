@@ -294,7 +294,11 @@ is not done (see "Temporary boards").
 
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
   peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
-  `globs` is leased once.
+  `globs` is leased once. Each lease in the answer names its repo. With a `task` whose
+  board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
+  `warning` (absent otherwise) names the board's repos: peers working the task there get no
+  warning from this lease. `lease_paths` (MCP) and `board lease` print it as a `warning:` line
+  above the leases.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at

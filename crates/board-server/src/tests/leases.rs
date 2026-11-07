@@ -500,3 +500,56 @@ async fn one_write_found_by_two_peers_shell_scans_is_neither_ones_overlap() {
     let far = scan(B, "src/d.rs", written).await;
     assert_eq!(agents_in(&far["overlaps"]), vec![A, C], "{far}");
 }
+
+#[tokio::test]
+async fn a_task_lease_outside_its_boards_repos_warns_and_stays_put() {
+    const OTHER: &str = "github.com/acme/dotfiles";
+    const SECOND: &str = "github.com/acme/site";
+    let t = T::new();
+    t.register(A, Some(OTHER), None).await;
+    t.board("factory", &[REPO]).await;
+    t.board("pair", &[REPO, SECOND]).await;
+    t.board("loose", &[]).await;
+    let one = t.task(A, "factory", "One repo").await;
+    let two = t.task(A, "pair", "Two repos").await;
+    let free = t.task(A, "loose", "No repos").await;
+    let lease = |repo: &str, task: Option<&str>| json!({ "agent": A, "repo": repo, "globs": ["src/**"], "task": task });
+
+    // From a checkout of a repo the task's board does not list, the lease is still the
+    // caller's, in the repo it named, and the answer warns, naming the board's repos.
+    for (task, listed) in [(&one, vec![REPO]), (&two, vec![REPO, SECOND])] {
+        let v = t
+            .ok(
+                "POST",
+                "/v1/leases",
+                Some(A),
+                Some(lease(OTHER, Some(task))),
+            )
+            .await;
+        assert_eq!(v["leases"][0]["repo"], OTHER, "{v}");
+        let warning = v["warning"].as_str().unwrap();
+        assert!(
+            warning.contains(task.as_str()) && warning.contains(OTHER),
+            "{v}"
+        );
+        for repo in listed {
+            assert!(warning.contains(repo), "{v}");
+        }
+    }
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE repo = '{OTHER}'"
+        )),
+        1
+    );
+
+    // A listed repo, a board without repos, and no task: no warning.
+    for body in [
+        lease(SECOND, Some(&two)),
+        lease(OTHER, Some(&free)),
+        lease(OTHER, None),
+    ] {
+        let v = t.ok("POST", "/v1/leases", Some(A), Some(body)).await;
+        assert!(v.get("warning").is_none(), "{v}");
+    }
+}

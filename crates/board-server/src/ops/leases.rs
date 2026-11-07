@@ -7,7 +7,7 @@ use board_proto::{
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::{OptionalExtension, params};
 
-use crate::db::{Ctx, parse_id, ts};
+use crate::db::{Ctx, parse_id, parse_json, ts};
 use crate::error::{Result, forbidden, invalid, not_found};
 use crate::ops::{expires, touch_agent};
 use crate::store::{LEASE_COLUMNS, handle_of, is_live, lease_row, live_leases};
@@ -139,13 +139,15 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
 pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult> {
     let req = valid.req;
     touch_agent(cx, &req.agent)?;
-    let board = match &req.task {
-        Some(task) => Some(
-            cx.db
+    let (board, warning) = match &req.task {
+        Some(task) => {
+            let (board, repos) = cx
+                .db
                 .query_row(
-                    "SELECT board FROM tasks WHERE id = ?1",
+                    "SELECT t.board, b.repos FROM tasks t JOIN boards b ON b.slug = t.board \
+                     WHERE t.id = ?1",
                     [task.as_str()],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -153,10 +155,21 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
                         format!("task {task} does not exist"),
                         "check the task id, or leave task out",
                     )
-                })
-                .and_then(|b| Ok(parse_id::<board_proto::BoardSlug>(&b)?))?,
-        ),
-        None => None,
+                })?;
+            let board = parse_id::<board_proto::BoardSlug>(&board)?;
+            let repos: Vec<String> = parse_json(&repos)?;
+            let warning = (!repos.is_empty() && !repos.contains(&req.repo)).then(|| {
+                format!(
+                    "task {task} is on board {board}, which lists {}, not {}: peers working \
+                     the task there get no warning from this lease; if you edit one of those \
+                     repos, lease its files from a checkout of it",
+                    repos.join(", "),
+                    req.repo
+                )
+            });
+            (Some(board), warning)
+        }
+        None => (None, None),
     };
     let ttl_ms = req
         .ttl_secs
@@ -231,7 +244,11 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             "conflicts": conflicts.len(),
         }),
     )?;
-    Ok(LeaseResult { leases, conflicts })
+    Ok(LeaseResult {
+        leases,
+        conflicts,
+        warning,
+    })
 }
 
 pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> {

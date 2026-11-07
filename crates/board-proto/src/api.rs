@@ -411,6 +411,10 @@ pub struct CreateLeases {
 pub struct LeaseResult {
     pub leases: Vec<crate::Lease>,
     pub conflicts: Vec<crate::Lease>,
+    /// Set when the lease's `task` is on a board that lists repos and not the lease's repo,
+    /// so peers working the task in those repos get no warning; says what to do instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Paths one `POST /v1/touches` accepts.
