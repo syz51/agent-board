@@ -46,13 +46,19 @@ export interface BoardTasks {
 /**
  * Tasks that wait on the user with no open ask, by board: blocked tasks, and open tasks
  * not marked `auto`. Left out: pending proposals and feedback items (agents review and
- * triage those), and open tasks held by a `not_before` still ahead. Exported for tests.
+ * triage those), open tasks held by a `not_before` still ahead, and tasks on closed
+ * boards. Exported for tests.
  */
-export function waitingTasks(tasks: Task[], openAsks: Ask[], now: number): BoardTasks[] {
+export function waitingTasks(
+  tasks: Task[],
+  openAsks: Ask[],
+  now: number,
+  closedBoards: ReadonlySet<string> = new Set(),
+): BoardTasks[] {
   const asked = new Set(openAsks.flatMap((ask) => (ask.task ? [ask.task] : [])));
   const byBoard = new Map<string, Task[]>();
   for (const task of tasks) {
-    if (asked.has(task.id)) continue;
+    if (asked.has(task.id) || closedBoards.has(task.board)) continue;
     const waits = task.status === "blocked" ||
       (task.status === "open" && !task.auto && !isProposal(task) && task.feedback === null &&
         (task.not_before === null || Date.parse(task.not_before) <= now));
@@ -71,8 +77,14 @@ export function waitingTasks(tasks: Task[], openAsks: Ask[], now: number): Board
 }
 
 /** What the Needs you page lists across boards: the open asks and the waiting tasks. */
-export function needsYouCount(openAsks: Ask[], tasks: Task[], now: number): number {
-  return waitingTasks(tasks, openAsks, now).reduce((sum, group) => sum + group.tasks.length, openAsks.length);
+export function needsYouCount(
+  openAsks: Ask[],
+  tasks: Task[],
+  now: number,
+  closedBoards: ReadonlySet<string> = new Set(),
+): number {
+  return waitingTasks(tasks, openAsks, now, closedBoards)
+    .reduce((sum, group) => sum + group.tasks.length, openAsks.length);
 }
 
 /**
@@ -82,8 +94,15 @@ export function needsYouCount(openAsks: Ask[], tasks: Task[], now: number): numb
 export function useNeedsYouCount(): number {
   const asks = useOpenAsks();
   const tasks = useCandidateTasks();
+  const closed = useClosedBoards();
   const now = useNow(60_000);
-  return needsYouCount(asks.data ?? [], tasks.data ?? [], now);
+  return needsYouCount(asks.data ?? [], tasks.data ?? [], now, closed);
+}
+
+/** Slugs of closed boards, from the boards screen's cached query; none until it loads. */
+function useClosedBoards(): ReadonlySet<string> {
+  const boards = useResource("boards", [tags.boards], api.boards);
+  return new Set((boards.data ?? []).filter((item) => item.status === "closed").map((item) => item.slug));
 }
 
 /** Open and blocked tasks on every board, shared by the page and the navigation badge. */
@@ -103,6 +122,7 @@ export function AsksScreen() {
   const board = location.query.board ?? "";
   const asks = useOpenAsks();
   const tasks = useCandidateTasks();
+  const closed = useClosedBoards();
   const now = useNow(60_000);
   const agents = agentIndex(useAgents().data);
 
@@ -117,32 +137,33 @@ export function AsksScreen() {
         )}
       </header>
       <Query resource={asks} label="Loading asks">
-        {(list) => (
-          <Query resource={tasks} label="Loading tasks">
-            {(taskList) => {
-              const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
-              const waiting = waitingTasks(taskList, list, now).filter((group) => !board || group.board === board);
-              if (shown.length === 0 && waiting.length === 0) {
-                return (
-                  <Empty title="Nothing needs you">
-                    Agents' questions and requests appear here, and on Telegram if it is set up,
-                    with tasks that wait on you.
-                  </Empty>
-                );
-              }
-              return (
-                <>
-                  {shown.length > 0 && (
-                    <div class="ask-list">
-                      {shown.map((ask) => <AskCard key={ask.id} ask={ask} agents={agents} />)}
-                    </div>
-                  )}
-                  {waiting.length > 0 && <WaitingTasks groups={waiting} agents={agents} />}
-                </>
-              );
-            }}
-          </Query>
-        )}
+        {(list) => {
+          const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
+          return (
+            <>
+              {shown.length > 0 && (
+                <div class="ask-list">
+                  {shown.map((ask) => <AskCard key={ask.id} ask={ask} agents={agents} />)}
+                </div>
+              )}
+              {/* Its own frame: asks stay answerable while tasks load or fail. */}
+              <Query resource={tasks} label="Loading tasks">
+                {(taskList) => {
+                  const waiting = waitingTasks(taskList, list, now, closed)
+                    .filter((group) => !board || group.board === board);
+                  if (waiting.length > 0) return <WaitingTasks groups={waiting} agents={agents} />;
+                  if (shown.length > 0) return null;
+                  return (
+                    <Empty title="Nothing needs you">
+                      Agents' questions and requests appear here, and on Telegram if it is set up,
+                      with tasks that wait on you.
+                    </Empty>
+                  );
+                }}
+              </Query>
+            </>
+          );
+        }}
       </Query>
     </>
   );
@@ -151,14 +172,12 @@ export function AsksScreen() {
 /** Tasks that wait on the user without an open ask, one group per board. */
 function WaitingTasks({ groups, agents }: { groups: BoardTasks[]; agents: Map<string, Agent> }) {
   return (
-    <section class="section" aria-labelledby="waiting-tasks">
-      <h2 id="waiting-tasks">Tasks waiting on you</h2>
-      <p class="lede">
-        Blocked tasks and tasks only you can start. Their agents have not asked yet.
-      </p>
+    <section class="section" aria-labelledby="needs-you-tasks">
+      <h2 id="needs-you-tasks">Tasks waiting on you</h2>
+      <p class="lede">Blocked tasks and tasks only you can start, with no open ask.</p>
       {groups.map(({ board, tasks }) => (
-        <section key={board} class="task-group" aria-labelledby={`waiting-${board}`}>
-          <h3 id={`waiting-${board}`} class="group-title">
+        <section key={board} class="task-group" aria-labelledby={`needs-you-board-${board}`}>
+          <h3 id={`needs-you-board-${board}`} class="group-title">
             <a href={`/boards/${encodeURIComponent(board)}`}>{board}</a>{" "}
             <span class="group-count">{tasks.length}</span>
           </h3>

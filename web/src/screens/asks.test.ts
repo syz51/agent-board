@@ -61,6 +61,16 @@ describe("needsYouCount", () => {
     expect(needsYouCount(asks.filter((ask) => ask.id !== 8), candidates(), now)).toBe(5);
   });
 
+  test("tasks on closed boards are left out", () => {
+    expect(ids(candidates()).docs).toEqual(["docs-5"]);
+    const closed = new Set(["docs"]);
+    expect(waitingTasks(candidates(), openAsks(), now, closed).map((group) => group.board)).toEqual([
+      "factory",
+      "web-view",
+    ]);
+    expect(needsYouCount(openAsks(), candidates(), now, closed)).toBe(5);
+  });
+
   test("before the tasks load, it counts the open asks", () => {
     expect(needsYouCount(openAsks(), [], now)).toBe(3);
     expect(needsYouCount([], [], now)).toBe(0);

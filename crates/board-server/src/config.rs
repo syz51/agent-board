@@ -327,6 +327,10 @@ impl Settings {
         secs_ms(self.temporary_delete_after_secs)
     }
 
+    pub(crate) fn duplicate_ask_ms(&self) -> i64 {
+        secs_ms(self.duplicate_ask_window_secs)
+    }
+
     pub(crate) fn touch_ms(&self) -> i64 {
         secs_ms(self.touch_window_secs)
     }
@@ -403,6 +407,7 @@ mod tests {
             "signal_min_reports",
             "signal_min_agents",
             "signal_window_days",
+            "duplicate_ask_window_secs",
         ] {
             assert!(
                 ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 0")).is_err(),

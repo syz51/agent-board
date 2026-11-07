@@ -2013,7 +2013,7 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal",
         "A task blocked on the user gets an ask",
         "never set a task `blocked` on the user without one",
-        "when `ask_user` warns of another open ask on the board, withdraw yours if it repeats it",
+        "When `ask_user` warns of another open ask that asks the same, keep one and withdraw the other",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }

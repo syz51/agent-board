@@ -82,12 +82,11 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
 
 /// Names the board's other open asks younger than `duplicate_ask_window_secs`, newest first.
 fn recent_open_asks_warning(cx: &Ctx<'_>, ask: &Ask) -> Result<Option<String>> {
-    let window = cx.s.duplicate_ask_window_secs;
-    let since = cx.now_ms() - i64::try_from(window.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let since = cx.now_ms() - cx.s.duplicate_ask_ms();
     let board = ask.board.as_str();
     let mut recent = load_asks(
         cx,
-        "board = :board AND status = 'open' AND id != :id AND created_at >= :since",
+        "board = :board AND status = 'open' AND id != :id AND created_at > :since",
         &vec![(":board", &board), (":id", &ask.id), (":since", &since)],
     )?;
     if recent.is_empty() {
@@ -110,15 +109,19 @@ fn recent_open_asks_warning(cx: &Ctx<'_>, ask: &Ask) -> Result<Option<String>> {
             format!("#{} on {task} by {by}, {age} ago", other.id)
         })
         .collect();
-    let minutes = window.div_ceil(60);
+    let window = cx.s.duplicate_ask_window_secs;
+    let (count, unit) = if window.is_multiple_of(60) {
+        (window / 60, "minute")
+    } else {
+        (window, "second")
+    };
     Ok(Some(format!(
-        "board {board} has {} other open {} under {minutes} minutes old: {}. Ask the user once per \
-         batch: if ask #{} repeats one, withdraw it (ask_withdraw; CLI: board withdraw {}); \
-         put later questions for this board in one ask.",
+        "board {board} has {} other open {} under {count} {unit}{} old: {}. If ask #{} repeats \
+         one of them, keep one and withdraw the other (ask_withdraw; CLI: board withdraw <id>).",
         recent.len(),
         if recent.len() == 1 { "ask" } else { "asks" },
+        if count == 1 { "" } else { "s" },
         named.join("; "),
-        ask.id,
         ask.id,
     )))
 }

@@ -211,7 +211,8 @@ be on the same board and must not form a cycle.
   Notifies the user (Telegram, if configured). When the board has other open asks younger
   than `duplicate_ask_window_secs` (taken from the server's clock), the ask is still
   created, and `warning` names each of them, newest first, with its id, task (or `no task`),
-  asker (`you` for the caller) and age, and says to withdraw this ask if it repeats one.
+  asker (`you` for the caller) and age, and says to keep one and withdraw the other when
+  one of them asks the same.
   `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
   `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
   the answer unchanged.

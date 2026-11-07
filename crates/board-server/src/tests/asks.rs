@@ -228,7 +228,10 @@ async fn an_ask_warns_of_the_boards_other_open_asks_under_30_minutes_old() {
         "{warning}"
     );
     assert!(
-        warning.contains(&format!("board withdraw {second_id}")),
+        warning.ends_with(&format!(
+            "If ask #{second_id} repeats one of them, keep one and withdraw the other \
+             (ask_withdraw; CLI: board withdraw <id>)."
+        )),
         "{warning}"
     );
     assert_eq!(
@@ -262,6 +265,16 @@ async fn an_ask_warns_of_the_boards_other_open_asks_under_30_minutes_old() {
         "{warning}"
     );
     assert!(!warning.contains(&format!("#{second_id} ")), "{warning}");
+
+    // An ask exactly 30 minutes old is no longer named.
+    t.advance(TimeDelta::minutes(29));
+    let sixth = ask(A, "factory", None).await;
+    let warning = sixth["warning"].as_str().unwrap();
+    assert!(
+        warning.starts_with("board factory has 1 other open ask under 30 minutes old: #"),
+        "{warning}"
+    );
+    assert!(!warning.contains(&format!("#{third_id} ")), "{warning}");
 
     // Once the others are 30 minutes old, nothing is named.
     t.advance(TimeDelta::minutes(31));
