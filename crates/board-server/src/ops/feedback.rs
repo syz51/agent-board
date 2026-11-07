@@ -75,12 +75,14 @@ pub(crate) fn validate_create(
         ));
     }
     check_text("text", text, s.body_chars)?;
-    let first = text
-        .lines()
+    let first: String = text
+        .split(['\n', '\r'])
         .next()
         .unwrap_or_default()
         .trim()
-        .replace('\t', " ");
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let title = cut(&first, s.title_chars);
     let signature = match req.signature.as_deref().map(str::trim) {
         Some(sig) => {
@@ -120,7 +122,7 @@ pub(crate) fn normalize(text: &str, quotes: bool) -> String {
         let tail = &word[core.len()..];
         if core.parse::<AgentId>().is_ok() {
             out.push_str("AGENT");
-        } else if core.parse::<TaskId>().is_ok() {
+        } else if core.chars().any(|c| c.is_alphabetic()) && core.parse::<TaskId>().is_ok() {
             out.push_str("ID");
         } else {
             let mut digits = false;
@@ -183,6 +185,9 @@ pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
             false,
         ),
     };
+    if !duplicate {
+        record_report(cx, &task.id, &r.reporter)?;
+    }
     let reports = task.feedback.as_ref().map_or(1, |f| f.reports);
     Ok(FeedbackResult {
         task,
@@ -219,8 +224,9 @@ fn prior(cx: &Ctx<'_>, signature: &str) -> Result<Prior> {
     })
 }
 
-/// The item that takes reports for feedback item `id`, if it is live: not resolved,
-/// declined, a duplicate of a live item, or routed to a task that is not done or dropped.
+/// The item that takes reports for feedback item `id`, if it is live: unresolved and not
+/// done or dropped, declined, a duplicate of a live item, or routed to a task that is not
+/// done or dropped.
 fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> {
     let row: Option<(Option<String>, Option<String>)> = cx
         .db
@@ -236,7 +242,8 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
     let kind: Option<ResolutionKind> = kind.map(|k| parse_enum(&k)).transpose()?;
     let target: Option<TaskId> = target.map(|t| parse_id(&t)).transpose()?;
     Ok(match (kind, target) {
-        (None | Some(ResolutionKind::Declined), _) => Some(id.clone()),
+        (None, _) => task_open(cx, id)?.then(|| id.clone()),
+        (Some(ResolutionKind::Declined), _) => Some(id.clone()),
         (Some(ResolutionKind::Duplicate), Some(original))
             if depth < DUPLICATE_DEPTH_MAX && is_feedback(cx, &original)? =>
         {
@@ -341,7 +348,6 @@ fn file(
             recurs.as_ref().map(TaskId::as_str),
         ],
     )?;
-    record_report(cx, &id, &r.reporter)?;
     cx.emit(
         Some(&board.slug),
         actor,
@@ -404,13 +410,15 @@ fn add_report(
             note,
         ],
     )?;
-    cx.db.execute(
-        "UPDATE tasks SET version = version + 1, updated_at = ?2 WHERE id = ?1",
-        params![item.as_str(), now],
-    )?;
     record_report(cx, item, reporter)?;
+    // The count is not a field anyone edits: it leaves the version alone, so an owner's
+    // update does not conflict with reports, and is announced with the hourly note.
     let board = item.board();
     if note {
+        cx.db.execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![item.as_str(), now],
+        )?;
         let routed = match (kind.as_deref(), target) {
             (Some("routed"), Some(task)) => {
                 let task: TaskId = parse_id(&task)?;
@@ -435,14 +443,14 @@ fn add_report(
             Some(item),
             serde_json::json!({ "note": note_id, "kind": "feedback" }),
         )?;
+        cx.emit(
+            Some(&board),
+            actor,
+            EventType::TaskUpdated,
+            Some(item),
+            serde_json::json!({ "fields": ["feedback"], "reports": reports }),
+        )?;
     }
-    cx.emit(
-        Some(&board),
-        actor,
-        EventType::TaskUpdated,
-        Some(item),
-        serde_json::json!({ "fields": ["feedback"], "reports": reports }),
-    )?;
     get_task(cx, item)
 }
 
@@ -681,9 +689,25 @@ pub(crate) struct ApiErrorSeen {
     pub message: String,
 }
 
+/// Errors that are an expected answer, not friction: clients probe for an agent or a
+/// handoff that may not exist, and the daemon renews a coordinator lease another device may
+/// hold.
+const EXPECTED_ERRORS: &[(ErrorCode, &str)] = &[
+    (ErrorCode::NotFound, "GET /v1/agents/{id}"),
+    (ErrorCode::NotFound, "GET /v1/agents/{id}/handoff"),
+    (
+        ErrorCode::ClaimRefused,
+        "POST /v1/boards/{slug}/coordinator",
+    ),
+];
+
 /// Records an error answered to an agent. Once its signature reaches the signal threshold
 /// it files feedback (source `signal`); later ones add to that item while it is live.
 pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<TaskId>> {
+    if e.code == ErrorCode::VersionConflict || EXPECTED_ERRORS.contains(&(e.code, e.route.as_str()))
+    {
+        return Ok(None);
+    }
     let code = enum_str(&e.code);
     let template = cut(&normalize(&e.message, true), TEMPLATE_MAX);
     let hash = crate::auth::hex(&Sha256::digest(format!("{} {template}", e.route)));
@@ -703,7 +727,16 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         Prior::Gone(earlier) => Some(earlier),
         Prior::None => None,
     };
-    let from = now - cx.s.signal_window_ms();
+    // Errors that an earlier item took (before its fix) do not count towards a new one.
+    let mut from = now - cx.s.signal_window_ms();
+    if let Some(earlier) = &earlier {
+        let last: i64 = cx.db.query_row(
+            "SELECT last_reported_at FROM feedback WHERE task = ?1",
+            [earlier.as_str()],
+            |r| r.get(0),
+        )?;
+        from = from.max(last + 1);
+    }
     let count: u32 = cx.db.query_row(
         "SELECT COUNT(*) FROM api_errors WHERE signature = ?1 AND at >= ?2",
         params![signature, from],
@@ -747,6 +780,11 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     let excess = agents.len().saturating_sub(REPORTERS_MAX);
     let reporters = agents[excess..].to_vec();
     let task = file(cx, &report, "server", reporters, count, earlier)?;
+    cx.db.execute(
+        "INSERT INTO feedback_reports (task, agent, at) SELECT ?1, agent, at FROM api_errors \
+         WHERE signature = ?2 AND at >= ?3 ORDER BY id",
+        params![task.id.as_str(), report.signature, from],
+    )?;
     Ok(Some(task.id))
 }
 
@@ -810,5 +848,12 @@ mod tests {
             derived_signature("board", "Claims take 30s"),
             "board:claims take Ns"
         );
+        // A date is numbers whatever its digits, never a task id.
+        for date in ["2026-11-17", "2026-11-07"] {
+            assert_eq!(
+                normalize(&format!("waits until {date}"), true),
+                "waits until N-N-N"
+            );
+        }
     }
 }

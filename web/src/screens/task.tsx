@@ -279,13 +279,8 @@ function TaskLinks(
           const task = related.get(id);
           return (
             <li key={id}>
-              <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
-              {task && (
-                <>
-                  <StatusBadge status={task.status} ready={task.ready} />
-                  <PlainText text={task.title} />
-                </>
-              )}
+              <TaskRef id={id} related={related} />
+              {task && <PlainText text={task.title} />}
             </li>
           );
         })}

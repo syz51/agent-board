@@ -115,11 +115,8 @@ async fn unknown_api() -> Error {
 /// except version conflicts, for the feedback signals (`ops::feedback::record_error`).
 /// Recording never changes the answer; a failure to record is logged.
 async fn record_errors(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let agent = req
-        .headers()
-        .get(AGENT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<AgentId>().ok());
+    let named_agent = req.headers().contains_key(AGENT_HEADER);
+    let headers = named_agent.then(|| req.headers().clone());
     let route = format!(
         "{} {}",
         req.method(),
@@ -128,9 +125,10 @@ async fn record_errors(State(state): State<AppState>, req: Request, next: Next) 
             .map_or("(no route)", MatchedPath::as_str)
     );
     let response = next.run(req).await;
-    if let Some(agent) = agent
+    if let Some(headers) = headers
         && let Some(error) = response.extensions().get::<ApiError>()
-        && error.code != ErrorCode::VersionConflict
+        // Only authenticated callers: a request without a valid token never writes.
+        && let Some(agent) = authenticated_agent(&state, headers).await
     {
         let seen = feedback::ApiErrorSeen {
             agent,
@@ -146,6 +144,15 @@ async fn record_errors(State(state): State<AppState>, req: Request, next: Next) 
         }
     }
     response
+}
+
+/// The agent a request speaks for, once its credentials check out as for a handler.
+async fn authenticated_agent(state: &AppState, headers: HeaderMap) -> Option<AgentId> {
+    let mut request = Request::new(());
+    *request.headers_mut() = headers;
+    let (mut parts, ()) = request.into_parts();
+    let caller = Caller::from_request_parts(&mut parts, state).await.ok()?;
+    caller.agent().ok().cloned()
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {

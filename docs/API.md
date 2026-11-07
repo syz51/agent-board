@@ -46,15 +46,20 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 `next` tells an agent what to do, for example `"claim refused: t3:c2d0 owns factory-12
 (seen 2m ago); pick another task from ready"`.
 
-**Signals.** The server records every error it answers to a request that names an agent
-(`X-Board-Agent`), except `version_conflict` (a normal retry): its code, the route template
-(`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become `N`, task ids `ID`,
-agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
+**Signals.** The server records every error it answers to an authenticated request that
+names an agent (`X-Board-Agent`), except expected answers: `version_conflict` (a normal
+retry), `not_found` from `GET /v1/agents/{id}` and `GET /v1/agents/{id}/handoff` (clients
+probe for them) and `claim_refused` from `POST /v1/boards/{slug}/coordinator` (the daemon
+renews it). It records the code, the
+route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become
+`N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
 `signal_min_reports` errors from at least `signal_min_agents` agents within
 `signal_window_days`, the server files feedback itself (see "Feedback") with source
 `signal`, about `board` and signature `signal:<code>:<hash>`, giving the count, the agents,
 the window, the route and the template. Later errors add reports to that item while it is
-live. Records older than the window are deleted by the server's minute sweep.
+live. Once it is no longer live (its fix is done), only errors after its last report count
+towards a new item, which `recurs` it. Records older than the window are deleted by the
+server's minute sweep.
 
 ## Endpoints
 
@@ -235,13 +240,15 @@ use, autopilot off). Items get `auto` from that board's autopilot.
 - A report whose signature matches a **live** item adds to it instead of filing a new one
   (`duplicate: true`): `reports` grows by one, the reporter joins `reporters` (the latest
   20), and at most once an hour a `feedback` note says it was reported again, naming the
-  routed task and its status when routed. The event is `task_updated` with
-  `{"fields": ["feedback"], "reports": n}`. The newest item with the signature is live
-  while it is unresolved, declined, a duplicate of a live item (the link is followed), or
-  routed to a task that is not done or dropped.
+  routed task and its status when routed, with a `task_updated` event
+  `{"fields": ["feedback"], "reports": n}`. A report leaves the task's `version` alone, so
+  it never makes the owner's update conflict. The newest item with the signature is live
+  while it is unresolved and not done or dropped, declined, a duplicate of a live item (the
+  link is followed), or routed to a task that is not done or dropped.
 - Otherwise a new item is filed (`task_created` with a `feedback` payload). When the newest
-  item with the signature is no longer live (its routed task is done or dropped, or it was
-  forwarded), the new item's `recurs` names it: the fix did not hold, or it came back.
+  item with the signature is no longer live (its routed task is done or dropped, it was
+  forwarded, or it was closed without a resolution), the new item's `recurs` names it: the
+  fix did not hold, or it came back.
 - `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
   The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
   next step. `kind` is one of:

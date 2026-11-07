@@ -156,9 +156,10 @@ descriptions under 300 characters):
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,
 `ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
 
-Every string parameter declares a `maxLength` equal to the server's limit (title 72, note
-280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a runtime can
-refuse an oversized argument before the call. The server's instructions ask agents to
+Every string parameter declares a `maxLength` equal to the server's default limit (title
+72, note 280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a
+runtime can refuse an oversized argument before the call; a server configured with other
+limits still checks its own. The server's instructions ask agents to
 report, with `feedback`, anything in a setup that cost them a step and then carry on;
 `task_note` no longer offers the `feedback` kind.
 

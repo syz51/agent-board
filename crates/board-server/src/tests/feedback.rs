@@ -88,8 +88,8 @@ async fn two_reports_with_the_same_signature_are_one_item() {
     assert_eq!(second["task"]["feedback"]["reports"], 2);
     assert_eq!(second["task"]["feedback"]["reporters"], json!([A, B]));
     assert_eq!(
-        second["task"]["version"].as_i64(),
-        Some(task["version"].as_i64().unwrap() + 1)
+        second["task"]["version"], task["version"],
+        "a report leaves the version alone, so the owner's updates do not conflict"
     );
     assert_eq!(t.count("SELECT COUNT(*) FROM tasks"), 1);
     assert_eq!(notes(&t, &id).await.len(), 1, "the first repeat is noted");
@@ -255,6 +255,18 @@ async fn a_report_after_the_routed_task_is_done_opens_a_new_item_naming_the_old_
     .await;
     assert_eq!(to_original["task"]["id"], declined_id.as_str());
     assert_eq!(to_original["reports"], 3);
+
+    // An item dropped without a resolution takes no more reports: a new one recurs it.
+    let body = json!({ "about": "hooks", "text": "Hooks print twice" });
+    let dropped = report(&t, A, body.clone()).await;
+    let dropped_id = dropped["task"]["id"].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .patch(A, &dropped_id, json!({ "status": "dropped" }))
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let again = report(&t, B, body).await;
+    assert_eq!(again["duplicate"], false);
+    assert_eq!(again["task"]["feedback"]["recurs"], dropped_id.as_str());
 }
 
 #[tokio::test]
@@ -394,6 +406,15 @@ async fn reports_are_validated() {
     assert_eq!(title.chars().count(), 72);
     assert!(title.ends_with('…'));
     assert_eq!(filed["task"]["feedback"]["source"], "capture");
+    // A bare carriage return ends the title.
+    let filed = report(
+        &t,
+        A,
+        json!({ "about": "hooks", "text": "Hook hangs\rsee log" }),
+    )
+    .await;
+    assert_eq!(filed["task"]["title"], "Hook hangs");
+    assert_eq!(filed["task"]["feedback"]["signature"], "hooks:hook hangs");
 }
 
 #[tokio::test]
@@ -404,6 +425,17 @@ async fn three_identical_agent_errors_from_two_agents_file_one_signal_item() {
     t.fail("GET", &missing(2), Some(A), None).await;
     // Without the agent header, and version conflicts, are not recorded.
     t.fail("GET", &missing(3), None, None).await;
+    // Nor is anything from a caller without a valid token, whatever agent it names.
+    for (bearer, agent) in [("Bearer nope", B), ("", C)] {
+        let mut headers = vec![("x-board-agent", agent)];
+        if !bearer.is_empty() {
+            headers.push(("authorization", bearer));
+        }
+        let (status, _) = t.send("GET", &missing(3), &headers, None).await;
+        assert_eq!(status.as_u16(), 401);
+        let (status, _) = t.send("GET", "/v1/nowhere", &headers, None).await;
+        assert!(status.is_client_error());
+    }
     t.board("factory", &[]).await;
     let task = t.task(A, "factory", "Versioned").await;
     for _ in 0..3 {
@@ -452,9 +484,56 @@ async fn three_identical_agent_errors_from_two_agents_file_one_signal_item() {
 
     // Later occurrences add to the one item.
     t.fail("GET", &missing(5), Some(C), None).await;
-    let item = t.get_task(item["id"].as_str().unwrap()).await;
+    let id = item["id"].as_str().unwrap().to_owned();
+    let item = t.get_task(&id).await;
     assert_eq!(item["feedback"]["reports"], 4);
     assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 1);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM feedback_reports"),
+        4,
+        "every counted error is a report"
+    );
+
+    // Expected answers are not friction: probing for an agent or a handoff.
+    for agent in [A, B, C] {
+        let probe = format!("/v1/agents/{}", agent.replace(':', "%3A"));
+        t.fail("GET", &format!("{probe}/handoff"), Some(agent), None)
+            .await;
+        t.fail("GET", "/v1/agents/t3%3Anobody", Some(agent), None)
+            .await;
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 1);
+
+    // Once its fix is done, errors from before the fix do not file a new item; three new
+    // ones from two agents do, and it recurs the old one.
+    let work = t.task(A, "factory", "Fix the lookup").await;
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{id}/resolve"),
+            Some(json!({ "kind": "routed", "task": work })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    assert!(t.claim(A, &work).await.0.is_success());
+    assert!(t.done(A, &work, check(0)).await.0.is_success());
+    t.advance(TimeDelta::minutes(1));
+    t.fail("GET", &missing(6), Some(A), None).await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 1);
+    t.fail("GET", &missing(7), Some(B), None).await;
+    t.fail("GET", &missing(8), Some(A), None).await;
+    let items = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=board-feedback&status=open",
+            None,
+            None,
+        )
+        .await;
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["feedback"]["recurs"], id.as_str());
+    assert_eq!(items[0]["feedback"]["reports"], 3);
 
     // Old records are pruned by the sweeper.
     t.advance(TimeDelta::days(8));
