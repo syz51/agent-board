@@ -12,7 +12,7 @@
   say what to do next.
 - Checks before every commit: `cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo test --workspace`; for `web/`, its type check and
-  build. Add tests with every behavior change.
+  build; for `deploy/`, `shellcheck deploy/*.sh`. Add tests with every behavior change.
 - Time comes from an injectable clock so expiry and staleness are testable.
 
 ## Merging

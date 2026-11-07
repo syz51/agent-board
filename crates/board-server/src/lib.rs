@@ -224,9 +224,16 @@ pub fn telegram_pair(db_path: &Path, replace: bool) -> Result<String, Error> {
     db.create_telegram_pairing(replace, SystemClock.now())
 }
 
-/// Writes a consistent copy of the database at `db_path` to `out_path` (`VACUUM INTO`),
-/// which must not exist yet.
+/// Writes a consistent copy of the database at `db_path`, which must exist, to `out_path`
+/// (`VACUUM INTO`), which must not exist yet.
 pub fn backup(db_path: &Path, out_path: &Path) -> Result<(), Error> {
+    // Opening a missing file would create an empty database and back that up.
+    if !db_path.is_file() {
+        return Err(Error::Config(format!(
+            "{} is not a database file; pass the server's database (`db` in server.toml)",
+            db_path.display()
+        )));
+    }
     if out_path.exists() {
         return Err(Error::Config(format!(
             "{} already exists; choose a new backup path",

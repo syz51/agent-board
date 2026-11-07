@@ -432,6 +432,43 @@ async fn an_ended_agent_that_calls_again_is_running_again() {
 }
 
 #[tokio::test]
+async fn registering_an_agent_that_is_not_running_announces_it_running() {
+    let t = T::new();
+    let a = "t3:alpha";
+    t.register(a, Some(REPO), None).await;
+    let path = format!("/v1/agents/{a}/state");
+    let changes = "SELECT COUNT(*) FROM events WHERE type = 'agent_state_changed'";
+    let last = "SELECT json_extract(payload, '$.from') || '>' || json_extract(payload, '$.to') \
+                FROM events WHERE type = 'agent_state_changed' ORDER BY seq DESC LIMIT 1";
+    // Registering a running agent again is no state change.
+    t.register(a, Some(REPO), None).await;
+    assert_eq!(t.count(changes), 0);
+
+    // A T3 thread resumed after its idle session was closed registers on session start:
+    // running again, announced once.
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    t.register(a, Some(REPO), None).await;
+    t.register(a, Some(REPO), None).await;
+    let agent = t.ok("GET", &format!("/v1/agents/{a}"), None, None).await;
+    assert_eq!(agent["state"], "running", "{agent}");
+    assert_eq!(t.count(changes), 2);
+    assert_eq!(t.strings(last), ["ended>running"]);
+
+    let until = (t.state.now() + TimeDelta::hours(6)).to_rfc3339();
+    t.ok(
+        "POST",
+        &path,
+        Some(a),
+        Some(json!({ "state": "paused", "paused_until": until })),
+    )
+    .await;
+    t.register(a, Some(REPO), None).await;
+    assert_eq!(t.count(changes), 4);
+    assert_eq!(t.strings(last), ["paused>running"]);
+}
+
+#[tokio::test]
 async fn task_detail_names_each_agent_it_mentions_by_handle() {
     let t = T::new();
     let long = "t3:thread:delegated-task:command-abc";
