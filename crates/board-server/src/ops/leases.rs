@@ -94,22 +94,11 @@ impl<'a> Glob<'a> {
     }
 }
 
-/// Does `glob` cover the repo-relative `path`? Compiles `glob`: to compare it more than
-/// once, use [`Glob`].
-pub(crate) fn glob_matches(glob: &str, path: &str) -> bool {
-    Glob::new(glob).matches(path)
-}
-
 /// The directory part of a glob before its first wildcard, such as `crates/board/` for
 /// `crates/board/*.rs`.
 fn static_dir(glob: &str) -> &str {
     let literal = glob.find(['*', '?', '[', '{']).map_or(glob, |i| &glob[..i]);
     literal.rfind('/').map_or("", |i| &literal[..=i])
-}
-
-/// Could some path match both globs? See [`Glob::overlaps`].
-pub(crate) fn globs_overlap(a: &str, b: &str) -> bool {
-    Glob::new(a).overlaps(&Glob::new(b))
 }
 
 pub(crate) struct ValidLeases {
@@ -413,6 +402,11 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
     let globs: Vec<Glob<'_>> = leases.iter().map(|(_, g, _)| Glob::new(g)).collect();
     let family = delegation_family(cx, me.as_str())?;
     let window_start = cx.now_ms() - cx.s.touch_ms();
+    let touches_sql = format!(
+        "SELECT agent, at FROM touches t WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
+         AND at > ?4 AND NOT {} ORDER BY at DESC",
+        shared_scan("?3")
+    );
     for path in paths {
         for ((agent, _, at), glob) in leases.iter().zip(&globs) {
             if glob.matches(path) && is_live(cx, agent)? && !family.contains(agent) {
@@ -427,11 +421,7 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
         }
         let touches: Vec<(String, i64)> = cx
             .db
-            .prepare_cached(&format!(
-                "SELECT agent, at FROM touches t WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
-                 AND at > ?4 AND NOT {} ORDER BY at DESC",
-                shared_scan("?3")
-            ))?
+            .prepare_cached(&touches_sql)?
             .query_map(params![repo, path, me.as_str(), window_start], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
@@ -483,6 +473,14 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glob_matches(glob: &str, path: &str) -> bool {
+        Glob::new(glob).matches(path)
+    }
+
+    fn globs_overlap(a: &str, b: &str) -> bool {
+        Glob::new(a).overlaps(&Glob::new(b))
+    }
 
     #[test]
     fn glob_overlap() {

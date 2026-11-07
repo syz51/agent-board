@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{Glob, delegation_family, glob_matches, globs_overlap, shared_scan};
+use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    NamedParams, agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events,
-    load_agents, load_events, load_tasks,
+    NamedParams, agent_boards, counts, find_handoff, get_agent, handle_of, is_live, json_ids,
+    latest_events, load_agents, load_events, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -698,7 +698,7 @@ fn shares_paths(
     cx: &Ctx<'_>,
     peer: &str,
     my_touches: &[(String, String, i64)],
-    my_leases: &[(String, String)],
+    my_globs: &[(&str, &str, Glob<'_>)],
     window_start: i64,
 ) -> Result<bool> {
     let touches: Vec<(String, String)> = cx
@@ -714,21 +714,20 @@ fn shares_paths(
     if touches.is_empty() && leases.is_empty() {
         return Ok(false);
     }
-    // Each glob compiled once for this call, not once per comparison.
-    let my_globs: Vec<(&str, Glob<'_>)> = my_leases
-        .iter()
-        .map(|(r, g)| (r.as_str(), Glob::new(g)))
-        .collect();
     let touched = touches.iter().any(|(repo, path)| {
         my_touches.iter().any(|(r, p, _)| r == repo && p == path)
-            || my_globs.iter().any(|(r, g)| r == repo && g.matches(path))
+            || my_globs
+                .iter()
+                .any(|(r, _, g)| r == repo && g.matches(path))
     });
     let leased = leases.iter().any(|(repo, glob)| {
         let glob = Glob::new(glob);
         my_touches
             .iter()
             .any(|(r, p, _)| r == repo && glob.matches(p))
-            || my_globs.iter().any(|(r, g)| r == repo && g.overlaps(&glob))
+            || my_globs
+                .iter()
+                .any(|(r, _, g)| r == repo && g.overlaps(&glob))
     });
     Ok(touched || leased)
 }
@@ -763,6 +762,11 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
         .query_map(params![me, now], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    // (repo, glob, compiled): each of the agent's globs compiled once for the whole scan.
+    let my_globs: Vec<(&str, &str, Glob<'_>)> = my_leases
+        .iter()
+        .map(|(r, g)| (r.as_str(), g.as_str(), Glob::new(g)))
+        .collect();
 
     let repos: BTreeSet<&str> = agent
         .repo
@@ -776,9 +780,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         .flat_map(|t| t.blockers.iter())
         .chain(mine_ids.iter().copied())
         .collect();
-    let repos = serde_json::to_string(&repos).expect("serializes");
-    let watched = serde_json::to_string(&watched).expect("serializes");
-    let mine_json = serde_json::to_string(&mine_ids).expect("serializes");
+    let repos = json_ids(repos.into_iter());
+    let watched = json_ids(watched.into_iter().map(TaskId::as_str));
+    let mine_json = json_ids(mine_ids.iter().map(|t| t.as_str()));
     let any_mine = !mine.is_empty();
     let filter: NamedParams<'_> = vec![
         (":seq", &seq),
@@ -805,6 +809,14 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
     } else {
         0
     };
+
+    // Gone when a peer's edit showed a shell scan's path was the peer's, and no one's when
+    // both our shell scans found the same write.
+    let still_theirs_sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM touches t \
+         WHERE agent = ?1 AND repo = ?2 AND path = ?3 AND NOT {})",
+        shared_scan("?4")
+    );
 
     let mut handles = HashMap::new();
     let mut live = HashMap::<String, bool>::new();
@@ -972,7 +984,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     && same_repo
                     && same_branch
                     && agent.branch.is_some()
-                    && shares_paths(cx, &event.actor, &my_touches, &my_leases, window_start)?
+                    && shares_paths(cx, &event.actor, &my_touches, &my_globs, window_start)?
                 {
                     out.insert(
                         (NEW_AGENT, event.actor.clone()),
@@ -991,15 +1003,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 };
                 let when = ago(cx.now - event.at);
                 for touched in str_list(&event.payload, "paths") {
-                    // Gone when a peer's edit showed a shell scan's path was the peer's, and
-                    // no one's when both our shell scans found the same write.
                     let still_theirs: bool = cx
                         .db
-                        .prepare_cached(&format!(
-                            "SELECT EXISTS (SELECT 1 FROM touches t \
-                             WHERE agent = ?1 AND repo = ?2 AND path = ?3 AND NOT {})",
-                            shared_scan("?4")
-                        ))?
+                        .prepare_cached(&still_theirs_sql)?
                         .query_row(params![event.actor, repo, touched, me], |r| r.get(0))?;
                     if !still_theirs {
                         continue;
@@ -1015,9 +1021,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                             path(&touched),
                             since_ms(cx, at)
                         )
-                    } else if let Some((_, glob)) = my_leases
+                    } else if let Some((_, glob, _)) = my_globs
                         .iter()
-                        .find(|(r, g)| r == repo && glob_matches(g, &touched))
+                        .find(|(r, _, g)| *r == repo && g.matches(&touched))
                     {
                         format!(
                             "{actor} edited {} {when} ago, inside your lease {}",
@@ -1051,9 +1057,10 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     if !still_held {
                         continue;
                     }
-                    let alert = if let Some((_, mine)) = my_leases
+                    let theirs = Glob::new(&glob);
+                    let alert = if let Some((_, mine, _)) = my_globs
                         .iter()
-                        .find(|(r, g)| r == repo && globs_overlap(g, &glob))
+                        .find(|(r, _, g)| *r == repo && g.overlaps(&theirs))
                     {
                         format!(
                             "{actor} leased {} {when} ago; it overlaps your lease {}",
@@ -1062,7 +1069,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         )
                     } else if let Some((_, p, at)) = my_touches
                         .iter()
-                        .find(|(r, p, _)| r == repo && glob_matches(&glob, p))
+                        .find(|(r, p, _)| r == repo && theirs.matches(p))
                     {
                         format!(
                             "{actor} leased {} {when} ago; you edited {} {} ago",
