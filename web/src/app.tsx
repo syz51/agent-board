@@ -25,7 +25,7 @@ export function Shell() {
   return (
     <div className="min-h-screen bg-background">
       <a
-        className="fixed -top-20 left-2 z-30 rounded-sm bg-card px-3 py-2 shadow-overlay focus:top-2"
+        className="fixed -top-12 left-2 z-30 rounded-sm bg-card px-3 py-2 opacity-0 shadow-overlay focus:top-2 focus:opacity-100"
         href="#main"
       >
         Skip to content
