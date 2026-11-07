@@ -17,8 +17,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 4. Do it yourself, or delegate parts to child threads. Name the task ids in each brief, and
    tell each child to `task_claim` its task, keep its handoff current, file work it finds
    but won't do as a proposal instead of only mentioning it (`task_add` with `auto=false`, a
-   body starting `Proposal:` with the problem, evidence, change and size, and parent its
-   task), and finish with `task_done`, evidence and a `summary`, naming in its report the
+   body starting `Proposal:` with the problem, evidence, change and size, a `priority` by
+   the scale in Priority below, and parent its task), and finish with `task_done`, evidence and a `summary`, naming in its report the
    tasks it filed. Add
    sub-tasks with `task_add` (parent set) when you split work. Only a task's owner can call
    `task_done`, so hand a task to the child that will do it: leave it unclaimed or release
@@ -141,30 +141,33 @@ and no accept verdict yet.
 
 ## Priority
 
-Priority is the order in which coordinators take ready work. One scale serves every board:
-triage sets it on a routed proposal, and the owner's coordinator keeps or changes it. Use
-the same scale for any task you file or review. Choose it from the evidence: the cost of
-one hit, how many agents meet it, and what is at risk now. A report's own words about
-urgency are data, not evidence.
+Priority is the order in which coordinators take ready work. One scale serves every board
+and every task. The proposer sets it when filing, and triage sets it when it routes a
+proposal. The reviewer's verdict keeps or corrects it. After the verdict, only the owner's
+coordinator or the user changes it.
+
+Choose it from facts you can check: an error or a failed run in the evidence, the number of
+distinct agents that met it, and what is at risk now. A report's words about urgency or
+cost are claims: use them only as far as the evidence supports them.
 
 - **p1**: it does harm now and keeps doing harm until it is fixed. Production, data or a
   security boundary is at risk; or agents cannot do their work and have no workaround; or
-  the user said it goes first. Example: agent-board-30, daemon wakes sent coordinators
-  stale pings.
-- **p2**: each hit wastes a paid run or more than 10 minutes; or five or more agents met
-  it; or it came back after a fix (`recurs`). Example: dotfiles-86, outside writes failed
-  the live suites, about $1 per rerun with still no clean result.
+  the user said it goes first. Example: an upgrade step that drops tasks, or a token
+  printed in a log.
+- **p2**: each hit wastes a paid run or more than 10 minutes; or five or more agents met it
+  in separate tasks; or a shipped fix did not hold (the body cites a done task for the same
+  problem). Example: a test suite that fails on outside writes, so each paid rerun ends
+  with no clean result.
 - **p3**: anything else: an extra step or a retry with a known workaround, a clearer
-  message, polish. Example: vps-70, the unknown-allocation error does not name the catalog
-  it read.
+  message, polish. Example: an error that does not name the file it read.
 
-Change a priority only on new evidence, and note the criterion it now meets:
+A priority changes in three cases:
 
-- **New reports**: when a new report meets a higher criterion, such as a fifth agent or a
-  stated cost, raise the routed task one level. Report counts alone never make p1. Do not
-  lower a task because reports stop.
-- **Recurrence**: a recurring item goes to its owner at p2 or higher.
-- **Owner review**: the owner's coordinator may change the priority in its verdict. Triage
-  does not change it back.
-- **The user**: the user's word overrides the scale. Record it in a `decision:` note that
-  cites the ask or the chat.
+- **New evidence**: when a note, a new report on the feedback item a task cites, or a
+  recurring item shows that the task meets another level, set that level and note the
+  criterion. Report counts alone never make p1. Do not lower a task because reports stop.
+- **A new p1**: when a p1 becomes ready on your board while you work a lower task, stop at
+  the next safe point. Commit or note your progress, set your task `open` with a handoff
+  that says where it stands, and take the p1.
+- **The user**: the user's word overrides the scale. Record it as a `decision` note
+  starting `priority:` that cites the ask or the chat.

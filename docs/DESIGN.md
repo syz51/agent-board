@@ -450,23 +450,17 @@ agrees, after checking it.
   accepted proposals decide whether a server-side record is worth adding.
 - **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
   task; the owner's coordinator verifies it.
-- **Priority**: one scale orders work on every board. It is defined once, in the
-  "Priority" section of `prompts/coordinator.md`. The triage coordinator reads that file
-  before `prompts/triage.md`, so triage and owners apply the same text. The definition is
-  priority by impact and urgency, as in ITIL, set at triage, as Bugzilla projects set
-  their priority field:
-  - p1 is harm now: production, data or a security boundary at risk, agents blocked with no
-    workaround, or the user's word.
-  - p2 is real cost per hit: a wasted paid run or over 10 minutes, five or more agents, or a
-    fix that did not hold.
-  - p3 is everything else.
-
-  A priority changes only on new evidence. New reports raise it one level at a time, and
-  report counts never make p1. The owner's verdict stands over triage's choice, and the user's word over both.
-  Feedback items themselves stay filed at p2 by the server. Triage claims each one within
-  minutes (median 77 s over the first 81 items), so their priority orders no queue.
-  Setting it on the server would add code that decides nothing. Report counts also predict
-  value poorly: the item with the second most reports, 24 from 7 agents, was declined.
+- **Priority**: one scale orders work on every board. The "Priority" section of
+  `prompts/coordinator.md` defines p1, p2 and p3 by criteria a coordinator can check from
+  a task and its evidence, says how a priority changes, and is the only copy. The triage
+  coordinator reads that file before `prompts/triage.md`, so triage, proposers and owners
+  apply one text. The scale follows the impact-and-urgency matrix of IT service
+  management: p1 is harm that goes on until fixed, p2 is a real cost per hit or wide
+  reach, p3 is the rest. As in bug trackers that split severity from priority, priority is
+  the fix order and is set at review, not by the reporter: report text is a claim, and
+  counts alone never make p1. The server keeps filing feedback items at p2 and does not
+  rank them: triage claims each item within minutes, so an item's own priority orders no
+  queue, and the routed task's priority is the one that counts.
 
 ## Feedback loop
 
