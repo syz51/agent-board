@@ -286,7 +286,9 @@ is not done (see "Temporary boards").
   for the caller (nor in its `files_touched` event, skipped when no path is left), and a
   peer's unscanned touch removes a matching scanned one before overlaps are computed; alerts
   then skip the scan's earlier event for that path. A scanned path never replaces the
-  caller's own unscanned touch of it.
+  caller's own unscanned touch of it. When a peer on the same device scanned the same path
+  with the same time, the writer is unknown: both touches are kept, but neither counts as
+  an overlap or alert between the two.
 
 ### Asks (decisions and actions for the user)
 

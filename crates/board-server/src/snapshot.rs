@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Ctx, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
-use crate::ops::leases::{delegation_family, glob_matches, globs_overlap};
+use crate::ops::leases::{delegation_family, glob_matches, globs_overlap, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
     NamedParams, agent_boards, counts, find_handoff, get_agent, handle_of, is_live, latest_events,
@@ -952,14 +952,16 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 };
                 let when = ago(cx.now - event.at);
                 for touched in str_list(&event.payload, "paths") {
-                    // Gone when a peer's edit showed a shell scan's path was the peer's.
+                    // Gone when a peer's edit showed a shell scan's path was the peer's, and
+                    // no one's when both our shell scans found the same write.
                     let still_theirs: bool = cx
                         .db
-                        .prepare_cached(
-                            "SELECT EXISTS (SELECT 1 FROM touches \
-                         WHERE agent = ?1 AND repo = ?2 AND path = ?3)",
-                        )?
-                        .query_row(params![event.actor, repo, touched], |r| r.get(0))?;
+                        .prepare_cached(&format!(
+                            "SELECT EXISTS (SELECT 1 FROM touches t \
+                             WHERE agent = ?1 AND repo = ?2 AND path = ?3 AND NOT {})",
+                            shared_scan("?4")
+                        ))?
+                        .query_row(params![event.actor, repo, touched, me], |r| r.get(0))?;
                     if !still_theirs {
                         continue;
                     }

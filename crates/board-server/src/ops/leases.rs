@@ -270,6 +270,20 @@ pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
     Ok(req)
 }
 
+/// SQL that is true when a peer's touch `t` and the agent `me`'s touch of the same path
+/// were both found by shell scans on one device with the same modification time: one write
+/// that happened during both agents' shell calls, so neither can say whose it was. Such a
+/// pair never counts as an overlap between the two; other peers still see both touches.
+pub(crate) fn shared_scan(me: &str) -> String {
+    format!(
+        "(t.scanned = 1 AND EXISTS (SELECT 1 FROM touches m WHERE m.agent = {me} \
+           AND m.repo = t.repo AND m.path = t.path AND m.scanned = 1 \
+           AND m.modified = t.modified) \
+         AND t.agent IN (SELECT id FROM agents \
+           WHERE device = (SELECT device FROM agents WHERE id = {me})))"
+    )
+}
+
 /// Records touched files, renews the agent's leases in the repo, and reports peers that
 /// leased or touched the same paths recently.
 pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
@@ -378,10 +392,11 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
         }
         let touches: Vec<(String, i64)> = cx
             .db
-            .prepare_cached(
-                "SELECT agent, at FROM touches WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
-                 AND at > ?4 ORDER BY at DESC",
-            )?
+            .prepare_cached(&format!(
+                "SELECT agent, at FROM touches t WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
+                 AND at > ?4 AND NOT {} ORDER BY at DESC",
+                shared_scan("?3")
+            ))?
             .query_map(params![repo, path, me.as_str(), window_start], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
