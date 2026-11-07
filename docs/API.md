@@ -146,7 +146,12 @@ be on the same board and must not form a cycle.
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
-  limit.
+  limit. Optional: `scanned` (true when the paths were found by scanning the work tree after
+  a shell call rather than named by an edit tool) and `modified` (path → modification time
+  the client saw; only paths in the request, else 400). A scanned path whose time equals a
+  peer's unscanned touch of it is the peer's write: it is not recorded for the caller (and
+  not in its `files_touched` event, which is skipped when no path is left), and a peer's
+  unscanned touch removes a matching scanned one before overlaps are computed.
 
 ### Asks (decisions and actions for the user)
 

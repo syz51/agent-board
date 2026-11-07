@@ -227,6 +227,14 @@ pub struct Touches {
     pub agent: AgentId,
     pub repo: String,
     pub paths: Vec<String>,
+    /// The paths were found by scanning the work tree after a shell call, not named by an
+    /// edit tool, so another agent in the same checkout may have written them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scanned: bool,
+    /// Modification times the client saw, by path (a subset of `paths`). A scanned path
+    /// whose time equals a peer's edit-tool touch of it is the peer's write.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modified: BTreeMap<String, Timestamp>,
 }
 
 /// Answer to `POST /v1/touches`: peers that leased or touched any of the paths recently.
@@ -355,6 +363,14 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touches_from_older_clients_are_unscanned_without_times() {
+        let old = serde_json::json!({"agent": "t3:a", "repo": "github.com/o/r", "paths": ["x"]});
+        let touches: Touches = serde_json::from_value(old.clone()).unwrap();
+        assert!(!touches.scanned && touches.modified.is_empty());
+        assert_eq!(serde_json::to_value(&touches).unwrap(), old);
+    }
 
     #[test]
     fn update_task_tells_an_absent_not_before_from_null() {

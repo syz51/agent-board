@@ -513,37 +513,47 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let tool = self.input["tool_name"].as_str().unwrap_or_default();
         let mut lines = Vec::new();
-        let mut paths = edited_paths(tool, &self.input["tool_input"]);
+        let edited = edited_paths(tool, &self.input["tool_input"]);
         let shell_start = self.shell_start;
-        if !paths.is_empty() || shell_start.is_some() {
+        if !edited.is_empty() || shell_start.is_some() {
             let repo = detect_repo(self.cwd()).await?;
+            let mut scanned = Vec::new();
             if let (Some(since), Some(root)) = (shell_start, repo.root.as_deref()) {
                 // Bounded on its own, so a slow work tree never eats the server's budget.
                 match tokio::time::timeout(SHELL_SCAN_BUDGET, changed_since(root, since)).await {
-                    Ok(Ok(changed)) => paths.extend(changed),
+                    Ok(Ok(changed)) => scanned = changed,
                     Ok(Err(err)) => tracing::debug!("files changed by the shell call: {err:#}"),
                     Err(_) => tracing::debug!("files changed by the shell call: over budget"),
                 }
             }
             if let Some(key) = repo.key.clone() {
-                // A path the server would refuse would fail the whole request.
-                let rel: Vec<String> = paths
-                    .iter()
-                    .filter_map(|p| repo.relative(p))
-                    .filter(|p| {
-                        p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control)
-                    })
-                    .collect();
-                for chunk in rel.chunks(TOUCH_PATHS_MAX) {
-                    let result = self
-                        .client
-                        .touches(&Touches {
-                            agent: self.agent.clone(),
-                            repo: key.clone(),
-                            paths: chunk.to_vec(),
+                // Named by an edit tool, then found by the scan: the server credits a
+                // scanned file to a peer whose edit gave it the same modification time.
+                for (paths, is_scanned) in [(edited, false), (scanned, true)] {
+                    // A path the server would refuse would fail the whole request.
+                    let rel: Vec<(String, Option<Timestamp>)> = paths
+                        .iter()
+                        .filter_map(|p| Some((repo.relative(p)?, modified_at(p))))
+                        .filter(|(p, _)| {
+                            p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control)
                         })
-                        .await?;
-                    lines.extend(render::overlaps(&result));
+                        .collect();
+                    for chunk in rel.chunks(TOUCH_PATHS_MAX) {
+                        let result = self
+                            .client
+                            .touches(&Touches {
+                                agent: self.agent.clone(),
+                                repo: key.clone(),
+                                paths: chunk.iter().map(|(p, _)| p.clone()).collect(),
+                                scanned: is_scanned,
+                                modified: chunk
+                                    .iter()
+                                    .filter_map(|(p, at)| Some((p.clone(), (*at)?)))
+                                    .collect(),
+                            })
+                            .await?;
+                        lines.extend(render::overlaps(&result));
+                    }
                 }
             }
         }
@@ -715,6 +725,12 @@ pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<PathBuf>
                 .is_ok_and(|modified| DateTime::<Utc>::from(modified) >= since)
         })
         .collect())
+}
+
+/// A file's modification time, without following a symlink; `None` when it is gone.
+fn modified_at(path: &Path) -> Option<Timestamp> {
+    let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
 }
 
 /// Files a tool call edited: Claude Code's `Edit`, `Write`, `MultiEdit` and

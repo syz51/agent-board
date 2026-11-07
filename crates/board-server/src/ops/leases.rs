@@ -216,6 +216,16 @@ pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
     }
     req.paths.sort();
     req.paths.dedup();
+    if let Some(extra) = req
+        .modified
+        .keys()
+        .find(|path| req.paths.binary_search(path).is_err())
+    {
+        return Err(invalid(
+            format!("modified names {extra:?}, which is not in paths"),
+            "send modification times only for paths in the request",
+        ));
+    }
     Ok(req)
 }
 
@@ -224,12 +234,38 @@ pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
 pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
     touch_agent(cx, &req.agent)?;
     let now = cx.now_ms();
+    let me = req.agent.as_str();
+    let mut recorded = Vec::with_capacity(req.paths.len());
     for path in &req.paths {
+        let modified = req.modified.get(path).map(|at| at.timestamp_millis());
+        // A scanned path with the time of a peer's edit-tool touch is the peer's write,
+        // made during the caller's shell call. When the peer's touch comes second, it
+        // removes the scanned one instead.
+        if let Some(modified) = modified {
+            let peer_wrote: bool = cx.db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM touches WHERE repo = ?1 AND path = ?2 \
+                 AND agent != ?3 AND scanned = ?4 AND modified = ?5)",
+                params![req.repo, path, me, !req.scanned, modified],
+                |r| r.get(0),
+            )?;
+            if peer_wrote && req.scanned {
+                continue;
+            }
+            if peer_wrote {
+                cx.db.execute(
+                    "DELETE FROM touches WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
+                     AND scanned = 1 AND modified = ?4",
+                    params![req.repo, path, me, modified],
+                )?;
+            }
+        }
         cx.db.execute(
-            "INSERT INTO touches (agent, repo, path, at) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (agent, repo, path) DO UPDATE SET at = ?4",
-            params![req.agent.as_str(), req.repo, path, now],
+            "INSERT INTO touches (agent, repo, path, at, scanned, modified) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent, repo, path) DO UPDATE SET at = ?4, scanned = ?5, modified = ?6",
+            params![me, req.repo, path, now, req.scanned, modified],
         )?;
+        recorded.push(path.clone());
     }
     cx.db.execute(
         "UPDATE leases SET expires_at = MAX(expires_at, ?4) \
@@ -242,17 +278,19 @@ pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
         ],
     )?;
     let overlaps = overlaps(cx, &req.agent, &req.repo, &req.paths)?;
-    cx.emit(
-        None,
-        req.agent.as_str(),
-        EventType::FilesTouched,
-        None,
-        serde_json::json!({
-            "repo": req.repo,
-            "paths": req.paths,
-            "overlaps": overlaps.len(),
-        }),
-    )?;
+    if !recorded.is_empty() {
+        cx.emit(
+            None,
+            me,
+            EventType::FilesTouched,
+            None,
+            serde_json::json!({
+                "repo": req.repo,
+                "paths": recorded,
+                "overlaps": overlaps.len(),
+            }),
+        )?;
+    }
     Ok(TouchResult { overlaps })
 }
 

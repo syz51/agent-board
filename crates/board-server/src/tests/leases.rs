@@ -232,3 +232,64 @@ async fn repeated_globs_are_leased_once() {
     assert_eq!(globs, ["src/**", "docs/**"]);
     assert_eq!(t.count("SELECT count(*) FROM leases"), 2);
 }
+
+#[tokio::test]
+async fn a_peers_edit_found_by_a_shell_scan_is_not_the_scanners() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let send = |agent: &'static str, path: &'static str, scanned: bool, modified: &str| {
+        let t = &t;
+        let body = json!({
+            "agent": agent, "repo": REPO, "paths": [path], "scanned": scanned,
+            "modified": { path: modified },
+        });
+        async move { t.ok("POST", "/v1/touches", Some(agent), Some(body)).await }
+    };
+    let paths = |t: &T, agent: &str| {
+        t.count(&format!(
+            "SELECT COUNT(*) FROM touches WHERE agent = '{agent}'"
+        ))
+    };
+    let edited = "2026-11-06T12:00:00.250Z";
+
+    // B's shell scan reports first, then A's Edit of the same write: A is not warned
+    // about B, and B's scanned touch is gone.
+    send(B, "hooks/shell.js", true, edited).await;
+    let result = send(A, "hooks/shell.js", false, edited).await;
+    assert_eq!(result["overlaps"], json!([]), "{result}");
+    assert_eq!(paths(&t, B), 0);
+
+    // A's Edit reports first, then B's scan finds the same write: not recorded for B, and
+    // B learns A touched it.
+    send(A, "hooks/run.js", false, edited).await;
+    let since = t.count("SELECT MAX(seq) FROM events");
+    let result = send(B, "hooks/run.js", true, edited).await;
+    assert_eq!(result["overlaps"][0]["agent"], A, "{result}");
+    assert_eq!(paths(&t, B), 0);
+    assert_eq!(
+        t.count("SELECT MAX(seq) FROM events"),
+        since,
+        "no files_touched"
+    );
+
+    // A file B's command wrote itself has its own time: recorded for B, and A's later edit
+    // is a real overlap.
+    send(B, "hooks/build.js", true, "2026-11-06T12:00:01Z").await;
+    assert_eq!(paths(&t, B), 1);
+    let result = send(A, "hooks/build.js", false, "2026-11-06T12:00:05Z").await;
+    assert_eq!(result["overlaps"][0]["agent"], B, "{result}");
+
+    // Times only for paths in the request.
+    let (status, _, _) = t
+        .fail(
+            "POST",
+            "/v1/touches",
+            Some(A),
+            Some(json!({
+                "agent": A, "repo": REPO, "paths": ["a.rs"], "modified": { "b.rs": edited },
+            })),
+        )
+        .await;
+    assert_eq!(status, 400);
+}

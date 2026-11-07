@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_events_actor.sql"),
     include_str!("../migrations/0005_telegram_chat_of_message.sql"),
     include_str!("../migrations/0006_task_not_before.sql"),
+    include_str!("../migrations/0007_touch_modified.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
