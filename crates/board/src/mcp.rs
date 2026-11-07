@@ -238,7 +238,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_update",
-        description: "Change a task: status (blocked, review, open, dropped...), title, body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before. Done goes through task_done.",
+        description: "Change a task: status (blocked, review, open, dropped...), title, body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -279,6 +279,14 @@ const TOOLS: &[ToolSpec] = &[
                     s(
                         "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.",
                         TIME_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "owner",
+                    s(
+                        "Hand the task to this agent id, such as the child doing it, or back to yourself when it is gone. Owner, the board's coordinator or the user only; not for open or closed tasks.",
+                        AGENT_ID_MAX,
                     ),
                     false,
                 ),
@@ -663,6 +671,7 @@ impl BoardMcp {
                     blocked_reason: a.blocked_reason,
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?,
+                    owner: a.owner,
                 };
                 ops::task_update(&ctx, &a.id, changes).await?
             }
@@ -813,6 +822,7 @@ struct UpdateArgs {
     /// `null` clears it, as `none` does.
     #[serde(default, deserialize_with = "null_as_none")]
     not_before: Option<String>,
+    owner: Option<AgentId>,
 }
 
 /// Reads a present `null` as the string `none`, so it clears like the CLI's `none`.

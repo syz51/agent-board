@@ -1163,6 +1163,47 @@ fn board_adopt_undoes_the_adoption_when_another_device_wins_the_lease() {
 }
 
 #[test]
+fn update_owner_hands_the_task_over_and_catches_an_old_server() {
+    let e = env();
+    let mut task = task_fixture("factory-7", "Hand me over");
+    task.status = board_proto::TaskStatus::Doing;
+    task.owner = Some("t3:me".parse().unwrap());
+    e.stub.on(
+        "GET /v1/tasks/factory-7",
+        TaskDetail {
+            task: task.clone(),
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            history: vec![],
+        },
+    );
+    let mut handed = task.clone();
+    handed.owner = Some("t3:child".parse().unwrap());
+    e.stub.on("PATCH /v1/tasks/factory-7", &handed);
+    let out = e.run(&["update", "factory-7", "--owner", "t3:child"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = &e.stub.requests_to("PATCH /v1/tasks/factory-7")[0].body;
+    assert_eq!(body["owner"], "t3:child");
+
+    // An old server ignores owner and answers with the owner unchanged.
+    e.stub.on("PATCH /v1/tasks/factory-7", &task);
+    let out = e.run(&["update", "factory-7", "--owner", "t3:child"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("predates handovers"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("t3:me still owns it"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
     let e = env();
     let mut waiting = task_fixture("factory-7", "Later");

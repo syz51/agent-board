@@ -381,6 +381,9 @@ pub struct UpdateArgs {
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.
     #[arg(long)]
     not_before: Option<String>,
+    /// Hand the task to this agent id (owner, the board's coordinator or the user only).
+    #[arg(long)]
+    owner: Option<board_proto::AgentId>,
 }
 
 #[derive(Debug, Args)]
@@ -756,6 +759,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blocked_reason: a.blocked_reason,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?,
+                owner: a.owner,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }

@@ -239,6 +239,11 @@ pub struct UpdateTask {
         deserialize_with = "present"
     )]
     pub not_before: Option<Option<Timestamp>>,
+    /// Hand the task over: the agent that owns it from now on. Absent leaves the owner as
+    /// the status change sets it. Sent only when set; a server that predates it ignores it
+    /// and answers with the owner unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<AgentId>,
 }
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
@@ -612,6 +617,28 @@ mod tests {
         assert!(json.get("not_before").is_none());
         let json = serde_json::to_value(&cleared).unwrap();
         assert_eq!(json["not_before"], serde_json::Value::Null);
+    }
+
+    /// `owner` is optional and sent only when set, so older peers see the same requests.
+    #[test]
+    fn update_task_owner_is_sent_only_when_set() {
+        let base = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        let absent: UpdateTask = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.owner, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("owner")
+                .is_none()
+        );
+        let mut set = base;
+        set["owner"] = serde_json::json!("t3:b");
+        let set: UpdateTask = serde_json::from_value(set.clone()).unwrap();
+        assert_eq!(set.owner.as_ref().map(AgentId::as_str), Some("t3:b"));
+        assert_eq!(serde_json::to_value(&set).unwrap()["owner"], "t3:b");
+        let mut bad = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        bad["owner"] = serde_json::json!("");
+        assert!(serde_json::from_value::<UpdateTask>(bad).is_err());
     }
 
     /// Stats and tasks from servers that predate feedback items still parse.

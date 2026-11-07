@@ -20,7 +20,12 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    body starting `Proposal:` with the problem, evidence, change and size, and parent its
    task), and finish with `task_done`, evidence and a `summary`, naming in its report the
    tasks it filed. Add
-   sub-tasks with `task_add` (parent set) when you split work.
+   sub-tasks with `task_add` (parent set) when you split work. Only a task's owner can call
+   `task_done`, so hand a task to the child that will do it: leave it unclaimed or release
+   it before dispatching so the child claims it, or, if you must hold it meanwhile, hand it
+   over with `task_update owner=<child id>` as soon as the child shows among the peers.
+   When a child ends with a task still its own, hand it back to yourself the same way and
+   finish it.
 5. Review the result against every acceptance check. Run the checks yourself; do not take a
    child's word for them. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
