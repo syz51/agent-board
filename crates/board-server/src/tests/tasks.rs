@@ -700,7 +700,7 @@ async fn versions_must_match() {
 }
 
 #[tokio::test]
-async fn blockers_stay_on_the_board_and_acyclic() {
+async fn blockers_exist_and_stay_acyclic_across_boards() {
     let t = setup().await;
     t.board("other", &[]).await;
     let a = t.task(A, "factory", "A").await;
@@ -723,9 +723,33 @@ async fn blockers_stay_on_the_board_and_acyclic() {
     assert!(v["message"].as_str().unwrap().contains("cycle"), "{v}");
     let (s, v) = t.patch(A, &a, json!({ "blockers": [a] })).await;
     assert_eq!(s.as_u16(), 400, "{v}");
+    // A blocker on another board is accepted, and a cycle through it is still refused.
     let (s, v) = t.patch(A, &a, json!({ "blockers": [foreign] })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["blockers"], json!([foreign]));
+    let (s, v) = t.patch(A, &foreign, json!({ "blockers": [c] })).await;
     assert_eq!(s.as_u16(), 400, "{v}");
-    assert!(v["message"].as_str().unwrap().contains("board"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("cycle"), "{v}");
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "title": "Ghost", "blockers": ["other-99"],
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("board=other"), "{v}");
+    // A mistyped board is named as missing rather than listed.
+    let (s, v) = t.patch(A, &a, json!({ "blockers": ["facotry-1"] })).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("no board facotry"),
+        "{v}"
+    );
+    t.patch(A, &a, json!({ "blockers": [] })).await;
     let (s, v) = t
         .call(
             "POST",
@@ -742,6 +766,10 @@ async fn blockers_stay_on_the_board_and_acyclic() {
     assert_eq!(detail["blocks"], json!([b]));
     let v = t.patch(A, &c, json!({ "blockers": [a, b] })).await.1;
     assert_eq!(v["blockers"], json!([a, b]));
+    // The same set in another order changes nothing.
+    let version = v["version"].clone();
+    let v = t.patch(A, &c, json!({ "blockers": [b, a] })).await.1;
+    assert_eq!((&v["version"], &v["blockers"]), (&version, &json!([a, b])));
 }
 
 #[tokio::test]
@@ -774,6 +802,15 @@ async fn titles_and_text_are_checked() {
         )
         .await;
     assert_eq!(s.as_u16(), 400);
+    // Notes run past 280 characters with evidence in them; 500 is the default limit.
+    assert_eq!(defaults().note_chars, 500);
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "finding", "text": "x".repeat(450) })),
+    )
+    .await;
     let note = t
         .ok(
             "POST",
@@ -1011,4 +1048,220 @@ async fn not_before_is_set_and_cleared_by_update() {
         )
         .await;
     assert_eq!(t.get_task(&now).await["ready"], true);
+}
+
+/// The events recorded for `task`, oldest first, as `(type, payload)`.
+async fn events_of(t: &T, task: &str) -> Vec<(String, Value)> {
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["task"] == task)
+        .map(|e| (e["type"].as_str().unwrap().to_owned(), e["payload"].clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_task_created_with_claim_starts_in_doing_owned_by_its_creator() {
+    let t = setup().await;
+    let v = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "agent": A, "board": "factory", "title": "Mine", "claim": true })),
+        )
+        .await;
+    let id = v["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (&v["status"], &v["owner"], &v["ready"], &v["version"]),
+        (&json!("doing"), &json!(A), &json!(false), &json!(1))
+    );
+    // Never ready, so nothing announces it to a coordinator; created then claimed.
+    let ready = t.ok("GET", "/v1/tasks?ready=true", None, None).await;
+    assert!(ready.as_array().unwrap().is_empty(), "{ready}");
+    let events = events_of(&t, &id).await;
+    let types: Vec<&str> = events.iter().map(|(ty, _)| ty.as_str()).collect();
+    assert_eq!(types, ["task_created", "task_claimed"]);
+    assert_eq!(events[0].1["claimed"], true);
+    assert_eq!(events[1].1, json!({ "previous_owner": null }));
+    // It is the owner's like any claimed task: B may not move it, A may finish it.
+    let (s, _) = t.patch(B, &id, json!({ "status": "review" })).await;
+    assert_eq!(s.as_u16(), 403);
+    let (s, v) = t.done(A, &id, check(0)).await;
+    assert!(s.is_success(), "{v}");
+    let stats = t.ok("GET", "/v1/stats?days=1", None, None).await;
+    assert_eq!(stats["doing_minutes_median"].as_f64(), Some(0.0));
+
+    // Without claim, nothing changes: open, no owner, ready.
+    let plain = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "agent": A, "board": "factory", "title": "Plain", "claim": false })),
+        )
+        .await;
+    assert_eq!(
+        (&plain["status"], &plain["owner"], &plain["ready"]),
+        (&json!("open"), &Value::Null, &json!(true))
+    );
+}
+
+#[tokio::test]
+async fn claim_on_create_is_refused_at_the_doing_limit_and_creates_nothing() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 1).await;
+    let first = t.task(A, "factory", "First").await;
+    assert!(t.claim(A, &first).await.0.is_success());
+    let before = t.count("SELECT COUNT(*) FROM tasks");
+    let seq = t.ok("GET", "/healthz", None, None).await["seq"].clone();
+
+    let body = json!({ "agent": A, "board": "factory", "title": "Second", "claim": true });
+    let (code, err, v) = t
+        .fail("POST", "/v1/tasks", Some(A), Some(body.clone()))
+        .await;
+    assert_eq!((code, err.as_str()), (409, "claim_refused"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&first), "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(next.contains("review or blocked first"), "{v}");
+    assert!(next.contains(&first), "{v}");
+    // Nothing was written: no task, no event, and the number is not used up.
+    assert_eq!(t.count("SELECT COUNT(*) FROM tasks"), before);
+    assert_eq!(t.ok("GET", "/healthz", None, None).await["seq"], seq);
+
+    // Once the first is in review, the same request succeeds with the next number.
+    assert!(
+        t.patch(A, &first, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    let v = t.ok("POST", "/v1/tasks", Some(A), Some(body)).await;
+    assert_eq!(
+        (&v["id"], &v["status"]),
+        (&json!("factory-2"), &json!("doing"))
+    );
+}
+
+#[tokio::test]
+async fn claim_on_create_needs_its_blockers_done_and_no_wait() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let blocker = t.task(B, "other", "Elsewhere").await;
+    let create = |extra: Value| {
+        let mut body = json!({ "agent": A, "board": "factory", "title": "Mine", "claim": true });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(create(json!({ "blockers": [blocker] }))),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid_transition"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&blocker), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("without claim"), "{v}");
+    let later = super::iso(crate::clock::Clock::now(&t.clock) + TimeDelta::hours(1));
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(create(json!({ "not_before": later }))),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid_transition"), "{v}");
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM tasks WHERE board = 'factory'"),
+        0
+    );
+
+    // A done blocker, even on another board, does not hold it.
+    assert!(t.claim(B, &blocker).await.0.is_success());
+    assert!(t.done(B, &blocker, check(0)).await.0.is_success());
+    let v = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(create(json!({ "blockers": [blocker] }))),
+        )
+        .await;
+    assert_eq!(
+        (&v["status"], &v["blockers"]),
+        (&json!("doing"), &json!([blocker]))
+    );
+}
+
+#[tokio::test]
+async fn a_blocker_on_another_board_holds_the_task_until_it_is_done() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let blocker = t.task(B, "other", "Elsewhere").await;
+    let waiting = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Waits", "blockers": [blocker] }),
+        )
+        .await;
+    let task = t.get_task(&waiting).await;
+    assert_eq!(
+        (&task["ready"], &task["blockers"]),
+        (&json!(false), &json!([blocker]))
+    );
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{blocker}"), None, None)
+        .await;
+    assert_eq!(detail["blocks"], json!([waiting]));
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["counts"]["ready"], 0);
+    let (s, v) = t.claim(A, &waiting).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&blocker), "{v}");
+
+    // A task blocked on it waits too, with no reason needed.
+    let owned = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Owned", "claim": true }),
+        )
+        .await;
+    let (s, v) = t
+        .patch(
+            A,
+            &owned,
+            json!({ "status": "blocked", "blockers": [blocker] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    assert!(t.claim(B, &blocker).await.0.is_success());
+    assert!(t.done(B, &blocker, check(0)).await.0.is_success());
+    assert_eq!(t.get_task(&waiting).await["ready"], true);
+    let ready = t
+        .ok("GET", "/v1/tasks?board=factory&ready=true", None, None)
+        .await;
+    assert_eq!(ready[0]["id"], json!(waiting));
+    // The owner's snapshot says its blocker cleared, though the event is on another board.
+    let snap = t
+        .ok(
+            "GET",
+            &format!("/v1/snapshot?agent={A}&kind=alerts"),
+            Some(A),
+            None,
+        )
+        .await;
+    let text = snap["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{text}"
+    );
 }

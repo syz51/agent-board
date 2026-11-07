@@ -73,12 +73,12 @@ describe("api client parsing", () => {
 
     const updates = await api.updates();
     expect(updates.since).toBe(updates.seen_at);
-    expect(updates.done.map((item) => item.task)).toEqual(["factory-9", "web-view-4", "docs-5"]);
+    expect(updates.done.map((item) => item.task)).toEqual(["factory-9", "web-view-5", "docs-7"]);
     expect(updates.done[1]?.evidence.map((item) => item.kind)).toEqual(["pr", "commit", "check"]);
     expect(updates.done[2]).toMatchObject({ parent: "docs-1", summary: null });
     expect(updates.said.map((item) => item.id)).toEqual([5, 3, 4]);
     expect(updates.more).toBe(false);
-    expect((await api.updates({ board: "docs" })).done.map((item) => item.task)).toEqual(["docs-5"]);
+    expect((await api.updates({ board: "docs" })).done.map((item) => item.task)).toEqual(["docs-7"]);
     const everything = await api.updates({ since: "2020-01-01T00:00:00Z" });
     expect(everything.said.length).toBe(5);
 
@@ -224,6 +224,25 @@ describe("api client parsing", () => {
     const [decoded] = await api.tasks({});
     expect(decoded?.blocked_reason).toBeNull();
     expect(decoded).not.toHaveProperty("new_field");
+  });
+
+  test("reads fixed and resolution kinds it does not know", async () => {
+    const task = state.task("factory-12").task;
+    const item = (kind: string) => ({
+      ...task,
+      feedback: {
+        about: "board",
+        source: "agent",
+        signature: "board:x",
+        reports: 1,
+        reporters: ["t3:a"],
+        last_reported_at: "2026-11-06T12:00:00Z",
+        resolution: { kind, reason: "changed x", at: "2026-11-06T12:00:00Z", by: "t3:a" },
+      },
+    });
+    const { api } = fakeFetch(() => json([item("fixed"), item("future_kind")]));
+    const kinds = (await api.tasks({})).map((t) => t.feedback?.resolution?.kind);
+    expect(kinds).toEqual(["fixed", "unknown"]);
   });
 
   test("keeps unknown event types for the feed", async () => {

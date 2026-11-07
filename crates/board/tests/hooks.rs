@@ -1051,6 +1051,234 @@ fn codex_stop_always_prints_json() {
     assert_eq!(reply, Some(json!({})));
 }
 
+/// Marks `id` done as the agent would from its shell (`board done`), with the identity the
+/// hooks resolve: `env` names it, or `agent` passes it explicitly.
+fn mark_done(e: &Env, id: &str, agent: Option<&str>) {
+    let detail = board_proto::TaskDetail {
+        task: task_fixture(id, "Do it"),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        history: vec![],
+    };
+    e.stub.on(&format!("GET /v1/tasks/{id}"), &detail);
+    e.stub.on(
+        &format!("POST /v1/tasks/{id}/done"),
+        task_fixture(id, "Do it"),
+    );
+    let mut args = vec!["done", id, "--check", "cargo test", "--exit", "0"];
+    let env: &[(&str, &str)] = match agent {
+        Some(agent) => {
+            e.stub.on(
+                &format!("GET /v1/agents/{}", enc(agent)),
+                agent_fixture(agent, DEVICE, AgentState::Running),
+            );
+            args.extend(["--agent", agent]);
+            &[]
+        }
+        None => {
+            e.stub.on(
+                &format!("GET /v1/agents/{}", enc(CLAUDE_AGENT)),
+                agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+            );
+            &[("CLAUDE_CODE_SESSION_ID", SESSION)]
+        }
+    };
+    let out = board(&e.home, &e.repo, env, &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+/// No task in doing, so only the done reminder can speak.
+fn nothing_doing(e: &Env) {
+    e.agent_ok();
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "", 1),
+    );
+}
+
+#[test]
+fn stop_reminds_once_per_task_marked_done_this_turn() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "go");
+    assert_eq!(stop(&e), None, "no reminder without a done task");
+
+    prompt(&e, "finish it");
+    mark_done(&e, "factory-12", None);
+    let reply = stop(&e).expect("a done task gets the reminder");
+    assert_eq!(reply["decision"], "block");
+    assert_eq!(
+        reply["reason"],
+        "board: you marked factory-12 done this turn. Before you stop, file anything still to do: sub-tasks for its scope, Proposal: tasks for found work, a blocked task with an ask for the user's part; name them in your reply."
+    );
+    assert_eq!(stop(&e), None, "once per task");
+
+    // Reopened and done again in a later turn: still once per task. Another task speaks.
+    prompt(&e, "redo it");
+    mark_done(&e, "factory-12", None);
+    mark_done(&e, "factory-13", None);
+    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
+    assert!(
+        reason.starts_with("board: you marked factory-13 done this turn."),
+        "{reason}"
+    );
+}
+
+#[test]
+fn stop_stays_quiet_about_dones_while_stop_hook_active_and_from_earlier_turns() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "go");
+    mark_done(&e, "factory-12", None);
+    let continued = e.with("Stop", json!({"stop_hook_active": true}));
+    assert_eq!(e.hook("stop", "claude", continued).1, "");
+    assert_eq!(
+        stop(&e),
+        None,
+        "the continued turn's done is not carried over"
+    );
+
+    // A turn whose Stop never ran (interrupted) leaves its mark to the next turn.
+    mark_done(&e, "factory-13", None);
+    prompt(&e, "next");
+    assert_eq!(stop(&e), None, "a done from an earlier turn");
+}
+
+#[test]
+fn stop_puts_the_done_and_handoff_reminders_in_one_block() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    mark_done(&e, "factory-11", None);
+    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
+    let (done, handoff) = reason.split_once('\n').expect("two lines");
+    assert!(
+        done.starts_with("board: you marked factory-11 done"),
+        "{reason}"
+    );
+    assert!(
+        handoff.starts_with("board: factory-12 is in doing") && handoff.contains("handoff_set"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn stop_reminds_about_a_done_task_while_the_server_fails() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "go");
+    mark_done(&e, "factory-12", None);
+    e.stub
+        .on_error(&state_path(), 500, "internal", "boom", "retry");
+    let reply = stop(&e).expect("the reminder needs no server");
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("board: you marked factory-12 done"),
+        "{reply}"
+    );
+}
+
+fn session_start(e: &Env, source: &str) {
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 1),
+    );
+    let payload = e.with("SessionStart", json!({"source": source}));
+    e.hook("session-start", "claude", payload);
+    // Later deltas are empty again.
+    nothing_doing(e);
+}
+
+#[test]
+fn done_reminders_keep_turn_boundaries_across_compaction_and_sessions() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "one");
+    mark_done(&e, "factory-9", None); // interrupted: no Stop
+    prompt(&e, "two");
+    mark_done(&e, "factory-10", None);
+    session_start(&e, "compact");
+    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
+    assert!(
+        reason.starts_with("board: you marked factory-10 done this turn."),
+        "compaction keeps the turn and its marks: {reason}"
+    );
+
+    mark_done(&e, "factory-11", None); // interrupted again
+    session_start(&e, "resume");
+    assert_eq!(
+        stop(&e),
+        None,
+        "a resumed session drops the earlier turn's marks"
+    );
+}
+
+#[test]
+fn done_reminders_keep_turn_boundaries_while_the_server_is_unreachable() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "one");
+    mark_done(&e, "factory-9", None); // interrupted: no Stop
+    // Hooks on this device skip the server for a while after it failed to answer.
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        json!({"until": until}).to_string(),
+    )
+    .unwrap();
+    prompt(&e, "two");
+    assert_eq!(stop(&e), None, "the offline prompt still starts a turn");
+    mark_done(&e, "factory-10", None);
+    let reply = stop(&e).expect("the reminder needs no server");
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("board: you marked factory-10 done this turn."),
+        "{reply}"
+    );
+}
+
+#[test]
+fn codex_stop_reminds_after_task_done_in_codex_shape() {
+    let e = env();
+    let codex_agent = "codex:thr_9";
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(codex_agent)),
+        agent_fixture(codex_agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    mark_done(&e, "factory-12", Some(codex_agent));
+    let payload = |active: bool| {
+        json!({
+            "session_id": "thr_9", "transcript_path": null, "cwd": e.repo, "hook_event_name": "Stop",
+            "model": "gpt-5.5-codex", "turn_id": "t", "stop_hook_active": active, "last_assistant_message": "ok",
+        })
+    };
+    let (reply, _) = e.hook("stop", "codex", payload(false));
+    let reply = reply.expect("JSON output");
+    assert_eq!(reply.as_object().unwrap().len(), 2, "{reply}");
+    assert_eq!(reply["decision"], "block");
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("board: you marked factory-12 done"),
+        "{reply}"
+    );
+    let (reply, _) = e.hook("stop", "codex", payload(true));
+    assert_eq!(reply, Some(json!({})), "continued: valid empty Stop output");
+}
+
 #[test]
 fn stop_failure_on_a_usage_limit_pauses_until_the_reset() {
     let e = env();

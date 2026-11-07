@@ -229,6 +229,8 @@ pub struct Settings {
     pub signal_min_agents: u32,
     /// ...within this many days. Older error records are pruned.
     pub signal_window_days: u32,
+    /// Creating an ask warns of the board's other open asks younger than this.
+    pub duplicate_ask_window_secs: u64,
 }
 
 impl Default for Settings {
@@ -249,14 +251,15 @@ impl Default for Settings {
             snapshot_recent_items: 3,
             snapshot_peer_items: 8,
             title_chars: 72,
-            note_chars: 280,
-            handoff_field_chars: 200,
+            note_chars: 500,
+            handoff_field_chars: 300,
             question_chars: 1000,
             body_chars: 4000,
             feedback_board: "board-feedback".parse().expect("a valid slug"),
             signal_min_reports: 3,
             signal_min_agents: 2,
             signal_window_days: 7,
+            duplicate_ask_window_secs: 30 * 60,
         }
     }
 }
@@ -285,6 +288,7 @@ impl Settings {
             ("signal_min_reports", u64::from(self.signal_min_reports)),
             ("signal_min_agents", u64::from(self.signal_min_agents)),
             ("signal_window_days", u64::from(self.signal_window_days)),
+            ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -321,6 +325,10 @@ impl Settings {
 
     pub(crate) fn temporary_delete_ms(&self) -> i64 {
         secs_ms(self.temporary_delete_after_secs)
+    }
+
+    pub(crate) fn duplicate_ask_ms(&self) -> i64 {
+        secs_ms(self.duplicate_ask_window_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {
@@ -399,6 +407,7 @@ mod tests {
             "signal_min_reports",
             "signal_min_agents",
             "signal_window_days",
+            "duplicate_ask_window_secs",
         ] {
             assert!(
                 ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 0")).is_err(),

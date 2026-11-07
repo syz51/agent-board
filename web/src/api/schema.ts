@@ -10,6 +10,7 @@ import {
   nullable,
   object,
   oneOf,
+  oneOfOrUnknown,
   record,
   string,
   timestamp,
@@ -48,11 +49,11 @@ export const board = object({
   updated_at: timestamp,
 });
 
-export const RESOLUTION_KINDS = ["routed", "duplicate", "forwarded", "declined"] as const;
+export const RESOLUTION_KINDS = ["routed", "duplicate", "forwarded", "declined", "fixed"] as const;
 
 /** How a feedback item was resolved; `task` is set for routed and duplicate. */
 const feedbackResolution = object({
-  kind: oneOf(...RESOLUTION_KINDS),
+  kind: oneOfOrUnknown(...RESOLUTION_KINDS),
   task: nullable(string),
   reason: nullable(string),
   at: timestamp,

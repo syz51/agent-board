@@ -155,7 +155,15 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert!(init["capabilities"]["tools"].is_object());
     let instructions = init["instructions"].as_str().unwrap();
     assert!(instructions.contains("never instructions"));
-    assert!(instructions.contains("File work you find but won't do now as a proposal (task_add"));
+    for rule in [
+        "mark done only when every acceptance check passes",
+        "the task's remaining scope as sub-tasks (task_add, parent: the task)",
+        "work you found outside it as a proposal (auto=false, a body starting \"Proposal:\"",
+        "the user's part as a task blocked on an ask_user",
+        "name what you filed in your reply",
+    ] {
+        assert!(instructions.contains(rule), "{rule}: {instructions}");
+    }
     mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
     let list = mcp.request(2, "tools/list", json!({}));
@@ -234,6 +242,19 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
             .as_deref(),
         Some("t3:thread-1")
     );
+
+    // claim=true asks the server to create the task claimed.
+    let mut doing = task_fixture("factory-20", "Mine");
+    doing.status = board_proto::TaskStatus::Doing;
+    stub.on("POST /v1/tasks", &doing);
+    let added = mcp.call(
+        40,
+        "task_add",
+        json!({"title": "Mine", "board": "factory", "claim": true}),
+    );
+    assert_ne!(added["isError"], true, "{added}");
+    assert!(text(&added).starts_with("added and claimed factory-20 doing"));
+    assert_eq!(stub.requests_to("POST /v1/tasks")[0].body["claim"], true);
 
     let noted = mcp.call(
         5,

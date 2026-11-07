@@ -13,10 +13,10 @@ import {
   PriorityBadge,
   Query,
   RelTime,
-  StatusBadge,
   useAgents,
   useTitle,
 } from "../ui/common.tsx";
+import { Icon, StatusIcon } from "../ui/icons.tsx";
 
 const DONE_WINDOW_MS = 30 * 86_400_000;
 
@@ -29,14 +29,14 @@ export interface TaskFilters {
 }
 
 export interface TaskGroup {
-  key: "open" | "doing" | "blocked" | "review" | "done";
+  key: "ready" | "open" | "doing" | "blocked" | "review" | "done";
   title: string;
   tasks: Task[];
 }
 
 /**
- * Group a board's tasks for display: open (ready first), doing, blocked, review, and done
- * in the last 30 days. Dropped tasks are not shown. Exported for tests.
+ * Group a board's tasks for display: doing, review, blocked, ready, open tasks still
+ * waiting, and done in the last 30 days. Dropped tasks are not shown. Exported for tests.
  */
 export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): TaskGroup[] {
   const q = filters.q.trim().toLowerCase();
@@ -51,21 +51,24 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     return !q || task.title.toLowerCase().includes(q) || task.id.toLowerCase().includes(q);
   });
   const of = (status: Task["status"]) => visible.filter((task) => task.status === status);
-  const open = of("open").sort((a, b) => Number(b.ready) - Number(a.ready));
+  const open = of("open");
   const done = of("done").sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   return [
-    { key: "open", title: "Open", tasks: open },
     { key: "doing", title: "Doing", tasks: of("doing") },
-    { key: "blocked", title: "Blocked", tasks: of("blocked") },
     { key: "review", title: "Review", tasks: of("review") },
-    { key: "done", title: "Done, last 30 days", tasks: done },
+    { key: "blocked", title: "Blocked", tasks: of("blocked") },
+    { key: "ready", title: "Ready", tasks: open.filter((task) => task.ready) },
+    { key: "open", title: "Waiting", tasks: open.filter((task) => !task.ready) },
+    { key: "done", title: "Done in the last 30 days", tasks: done },
   ];
 }
 
 export function BoardScreen({ slug }: { slug: string }) {
   const location = useLocation();
   const now = useNow(60_000);
-  const board = useResource(`board:${slug}`, [tags.board(slug), tags.boards], () => api.board(slug));
+  // The board comes from the list the sidebar already holds: one request for both.
+  const boards = useResource("boards", [tags.boards], api.boards);
+  const board = { data: boards.data?.find((item) => item.slug === slug) };
   const tasks = useResource(`tasks:${slug}`, [tags.board(slug)], () => api.tasks({ board: slug }));
   const agentList = useAgents().data;
   const agents = agentIndex(agentList);
@@ -90,33 +93,40 @@ export function BoardScreen({ slug }: { slug: string }) {
     <>
       <nav class="crumbs" aria-label="Breadcrumb">
         <a href="/">Boards</a>
+        <Icon name="chevron" />
+        <span aria-current="page">{board.data?.title ?? slug}</span>
       </nav>
       <header class="page-head">
-        <h1>{board.data?.title ?? slug}</h1>
-        <code class="muted">{slug}</code>
-        {board.data?.autopilot && <span class="badge tone-doing">Autopilot</span>}
-        {board.data?.temporary && <span class="badge tone-open">Temporary</span>}
+        <div class="page-title">
+          <div class="title-line">
+            <h1>{board.data?.title ?? slug}</h1>
+            <code class="slug">{slug}</code>
+            {board.data?.autopilot && <span class="tag tag-accent"><Icon name="bolt" />Autopilot</span>}
+            {board.data?.temporary && <span class="tag">Temporary</span>}
+          </div>
+          {board.data?.goal && <p class="page-sub"><PlainText text={board.data.goal} /></p>}
+        </div>
       </header>
-      {board.data?.goal && <p class="lede"><PlainText text={board.data.goal} /></p>}
       {board.data?.temporary && (
-        <p class="muted">
+        <p class="hint">
           Temporary: the server closes this board once it is idle, and deletes it some time
           after that.
         </p>
       )}
 
-      <form class="filters" role="search" onSubmit={(event) => event.preventDefault()}>
-        <label class="field field-grow">
-          <span>Search</span>
+      <form class="toolbar" role="search" onSubmit={(event) => event.preventDefault()}>
+        <label class="search">
+          <Icon name="search" />
+          <span class="sr-only">Search tasks</span>
           <input
             type="search"
             value={filters.q}
-            placeholder="Title or id"
+            placeholder="Search by title or id"
             onInput={(event) => setFilter("q", event.currentTarget.value)}
           />
         </label>
-        <label class="field">
-          <span>Priority</span>
+        <label class="select">
+          <span class="select-label">Priority</span>
           <select
             value={filters.priority}
             onChange={(event) => setFilter("priority", event.currentTarget.value)}
@@ -127,8 +137,8 @@ export function BoardScreen({ slug }: { slug: string }) {
             <option value="p3">P3</option>
           </select>
         </label>
-        <label class="field">
-          <span>Owner</span>
+        <label class="select">
+          <span class="select-label">Owner</span>
           <select
             value={filters.owner}
             onChange={(event) => setFilter("owner", event.currentTarget.value)}
@@ -140,7 +150,7 @@ export function BoardScreen({ slug }: { slug: string }) {
             ))}
           </select>
         </label>
-        <label class="check">
+        <label class="toggle">
           <input
             type="checkbox"
             checked={filters.readyOnly}
@@ -156,25 +166,31 @@ export function BoardScreen({ slug }: { slug: string }) {
           const groups = groupTasks(list, filters, now).filter((group) => group.tasks.length > 0);
           if (groups.length === 0) {
             return filtered
-              ? <Empty title="No tasks match these filters" />
+              ? <Empty title="No tasks match these filters" icon="search" />
               : (
-                <Empty title="No tasks on this board yet">
-                  Agents add tasks with <code>task_add</code>.
+                <Empty title="No tasks on this board yet" icon="task">
+                  Agents add tasks with <code>task_add</code>; they appear here as they do.
                 </Empty>
               );
           }
-          return groups.map((group) => (
-            <section key={group.key} class="task-group" aria-labelledby={`group-${group.key}`}>
-              <h2 id={`group-${group.key}`} class="group-title">
-                {group.title} <span class="group-count">{group.tasks.length}</span>
-              </h2>
-              <ul class="task-list">
-                {group.tasks.map((task) => (
-                  <TaskRow key={task.id} task={task} agents={agents} done={done} now={now} />
-                ))}
-              </ul>
-            </section>
-          ));
+          return (
+            <div class="task-board">
+              {groups.map((group) => (
+                <section key={group.key} class="task-group" aria-labelledby={`group-${group.key}`}>
+                  <h2 id={`group-${group.key}`} class="group-head">
+                    <StatusIcon status={group.key} />
+                    {group.title}
+                    <span class="group-count">{group.tasks.length}</span>
+                  </h2>
+                  <ul class="task-list">
+                    {group.tasks.map((task) => (
+                      <TaskRow key={task.id} task={task} agents={agents} done={done} now={now} />
+                    ))}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          );
         }}
       </Query>
     </>
@@ -188,16 +204,21 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function TaskRow(
+/**
+ * One task as a row: priority, status, id, title with its tags, owner and last update.
+ * `done` holds the ids of done tasks, so finished blockers drop out; without it, as on
+ * Needs you where done tasks are not loaded, blockers are not listed.
+ */
+export function TaskRow(
   { task, agents, done, now }: {
     task: Task;
     agents: Map<string, Agent>;
-    done: ReadonlySet<string>;
+    done?: ReadonlySet<string>;
     now: number;
   },
 ) {
   // Blockers already done no longer hold the task up.
-  const blockers = task.blockers.filter((id) => !done.has(id));
+  const blockers = done ? task.blockers.filter((id) => !done.has(id)) : [];
   // Only a date still ahead holds an open task up.
   const waitsUntil = task.status === "open" && task.not_before !== null &&
       Date.parse(task.not_before) > now
@@ -205,41 +226,41 @@ function TaskRow(
     : null;
   return (
     <li class="task-row">
-      <div class="task-line">
-        <PriorityBadge priority={task.priority} />
+      <PriorityBadge priority={task.priority} />
+      <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
+      <code class="task-id">{task.id}</code>
+      <div class="task-main">
         <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
-          <code class="task-id">{task.id}</code> <PlainText text={task.title} />
+          <PlainText text={task.title} />
         </a>
-      </div>
-      <div class="task-meta">
-        <StatusBadge status={task.status} ready={task.ready} />
-        <Owner task={task} agents={agents} />
         {blockers.length > 0 && (
-          <span class="blockers">
+          <span class="tag">
             blocked by{" "}
             {blockers.map((id, index) => (
               <Fragment key={id}>
                 {index > 0 && ", "}
-                <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
+                <a href={`/tasks/${encodeURIComponent(id)}`}>{id}</a>
               </Fragment>
             ))}
           </span>
         )}
-        {task.auto && <span class="chip">auto</span>}
+        {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
+        {!task.auto && <span class="tag tag-manual" title="Autopilot leaves this task for you to start">manual</span>}
         {waitsUntil && (
-          <span class="chip">
+          <span class="tag">
             waits until <AbsTime at={waitsUntil} />
           </span>
         )}
-        <span class="muted">
-          updated <RelTime at={task.updated_at} />
-        </span>
+        {task.blocked_reason && (
+          <p class="blocked-reason">
+            <PlainText text={task.blocked_reason} />
+          </p>
+        )}
       </div>
-      {task.blocked_reason && (
-        <p class="blocked-reason">
-          <PlainText text={task.blocked_reason} />
-        </p>
-      )}
+      <span class="task-owner"><Owner task={task} agents={agents} /></span>
+      <span class="task-updated" title="Updated">
+        <RelTime at={task.updated_at} />
+      </span>
     </li>
   );
 }

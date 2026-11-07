@@ -10,7 +10,7 @@ use crate::db::{Ctx, enum_str, parse_id};
 use crate::error::{Result, conflict, invalid};
 use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{agent_missing, find_handoff, get_agent, load_agents};
-use crate::text::{check_line, check_text, normalize_repo};
+use crate::text::{check_line, check_line_or, check_text, normalize_repo};
 
 /// A validated registration.
 pub(crate) struct Registration {
@@ -20,7 +20,8 @@ pub(crate) struct Registration {
 
 pub(crate) fn validate_register(req: RegisterAgent) -> Result<Registration> {
     if let Some(title) = &req.title {
-        check_line("title", title, 200)?;
+        // A thread's title: there is no body to move detail to.
+        check_line_or("title", title, 200, None)?;
     }
     if let Some(branch) = &req.branch {
         check_line("branch", branch, 200)?;

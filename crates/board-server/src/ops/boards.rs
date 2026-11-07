@@ -1,15 +1,17 @@
 use board_proto::{
-    Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType,
+    Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType, TaskId,
     UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
+use std::collections::BTreeMap;
 
 use crate::config::Settings;
 use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{board_missing, get_board};
-use crate::text::{ago, check_line, check_text, normalize_repo};
+use crate::text::{ago, check_line_or, check_text, normalize_repo};
+use board_proto::BOARD_TITLE_LONGER_TEXT_GOES;
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
     if repos.len() > 20 {
@@ -45,7 +47,12 @@ fn check_devices(devices: Vec<DeviceName>) -> Result<Vec<DeviceName>> {
 }
 
 pub(crate) fn validate_create(mut req: CreateBoard, s: &Settings) -> Result<CreateBoard> {
-    check_line("title", &req.title, s.title_chars)?;
+    check_line_or(
+        "title",
+        &req.title,
+        s.title_chars,
+        Some(BOARD_TITLE_LONGER_TEXT_GOES),
+    )?;
     check_text("goal", &req.goal, s.body_chars)?;
     req.repos = check_repos(req.repos)?;
     req.home_devices = check_devices(req.home_devices)?;
@@ -54,7 +61,12 @@ pub(crate) fn validate_create(mut req: CreateBoard, s: &Settings) -> Result<Crea
 
 pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<UpdateBoard> {
     if let Some(title) = &req.title {
-        check_line("title", title, s.title_chars)?;
+        check_line_or(
+            "title",
+            title,
+            s.title_chars,
+            Some(BOARD_TITLE_LONGER_TEXT_GOES),
+        )?;
     }
     if let Some(goal) = &req.goal {
         check_text("goal", goal, s.body_chars)?;
@@ -181,7 +193,9 @@ pub(crate) fn update(
 
 /// Deletes a closed board without open asks, with its tasks, notes, evidence, asks,
 /// members and events. Records one `board_updated` event (`fields: ["deleted"]`), an
-/// existing type, so clients that predate deletion still read the feed. The slug keeps its
+/// existing type, so clients that predate deletion still read the feed. Tasks on other
+/// boards that waited on one of its tasks lose that blocker, each with a `task_updated`
+/// event on its own board, so a task that becomes ready is announced. The slug keeps its
 /// task numbering for a board created later under it.
 pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<()> {
     let board = get_board(cx, slug)?;
@@ -202,6 +216,32 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
     }
     const TASKS: &str = "SELECT id FROM tasks WHERE board = ?1";
     let s = slug.as_str();
+    // Unfinished tasks elsewhere that wait on this board's tasks, with the blockers they
+    // lose. Finished ones lose the link too, unannounced: nothing waits on it any more.
+    let mut dependents: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for row in cx
+        .db
+        .prepare_cached(
+            "SELECT t.id, t.board, b.blocker FROM task_blockers b JOIN tasks t ON t.id = b.task \
+             JOIN tasks bt ON bt.id = b.blocker \
+             WHERE bt.board = ?1 AND t.board != ?1 AND t.status NOT IN ('done', 'dropped') \
+             ORDER BY t.id, bt.number",
+        )?
+        .query_map([s], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+    {
+        let (task, board, blocker) = row?;
+        dependents
+            .entry(task)
+            .or_insert_with(|| (board, Vec::new()))
+            .1
+            .push(blocker);
+    }
     for sql in [
         format!("DELETE FROM task_blockers WHERE task IN ({TASKS}) OR blocker IN ({TASKS})"),
         format!("DELETE FROM notes WHERE task IN ({TASKS})"),
@@ -233,6 +273,25 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         None,
         serde_json::json!({ "fields": ["deleted"], "title": board.title }),
     )?;
+    let now = cx.now_ms();
+    for (task, (board, removed)) in dependents {
+        cx.db.execute(
+            "UPDATE tasks SET version = version + 1, updated_at = ?2 WHERE id = ?1",
+            params![task, now],
+        )?;
+        let (task, board): (TaskId, BoardSlug) = (parse_id(&task)?, parse_id(&board)?);
+        cx.emit(
+            Some(&board),
+            actor,
+            EventType::TaskUpdated,
+            Some(&task),
+            serde_json::json!({
+                "fields": ["blockers"],
+                "blockers_removed": removed,
+                "board_deleted": slug,
+            }),
+        )?;
+    }
     Ok(())
 }
 
@@ -243,7 +302,9 @@ pub(crate) enum Swept {
     Deleted,
 }
 
-/// Idle temporary boards: no open ask and no task in `doing` with a live owner. Each comes
+/// Idle temporary boards: no open ask, no task in `doing` with a live owner, and no task not
+/// done that an unfinished task on another board waits on (deleting the board would let
+/// that task start without its prerequisite). Each comes
 /// with whether it is closed and when it was last active: the newest of its own change, its
 /// newest event and `since`, the server's start, so time the server was down does not
 /// count as idle.
@@ -263,6 +324,12 @@ fn idle_temporary(
                AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.board = b.slug AND a.status = 'open') \
                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
                                AND t.status = 'doing' AND {live}) \
+               AND NOT EXISTS (SELECT 1 FROM task_blockers tb \
+                               JOIN tasks bt ON bt.id = tb.blocker \
+                               JOIN tasks wt ON wt.id = tb.task \
+                               WHERE bt.board = b.slug AND bt.status != 'done' \
+                               AND wt.board != b.slug \
+                               AND wt.status NOT IN ('done', 'dropped')) \
              ORDER BY b.slug",
             live = live_sql("t.owner")
         ))?

@@ -5,6 +5,27 @@ daemon and the web view all use it. Bodies are JSON; their types are in
 `crates/board-proto` (named in brackets below), with `snake_case` fields and enum values and
 RFC 3339 UTC timestamps.
 
+## Compatibility
+
+Within `/v1`, changes are additive, because clients run for hours (`board mcp`, the daemon)
+and are upgraded separately from the server:
+
+- New endpoints, and new request fields that are optional.
+- New response fields: clients ignore fields they do not know, and a field a client expects
+  but an older server lacks gets a default (`#[serde(default)]`).
+- New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`) and
+  `EventType` (`Event.type`): clients read a value they do not know as `unknown`
+  (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
+  so the item or event still reads and renders. The server never stores `unknown` and
+  refuses it in a request (400 `invalid`); a server rolled back past a kind it stored reads
+  that kind as `unknown` too. `ResolutionKind` became open in the same release that added
+  `fixed`, so clients from before that release fail to read an item resolved `fixed`:
+  restart `board mcp` processes and daemons after upgrading.
+
+Every other enum is closed: a new value would fail every read that carries it in a client
+that predates it. Add one only after making the enum open as above and waiting until running
+clients have been restarted on a version that reads it.
+
 ## Authentication
 
 | Caller | How | May call |
@@ -44,7 +65,10 @@ Every error is `[ApiError]` `{code, message, next}` with these statuses:
 | 500 | `internal` |
 
 `next` tells an agent what to do, for example `"claim refused: t3:c2d0 owns factory-12
-(seen 2m ago); pick another task from ready"`.
+(seen 2m ago); pick another task from ready"`. For text over a limit the message is
+`"<field> is <n> characters; the limit is <max>"` and `next` says to shorten it or where
+longer text goes, such as splitting a note or moving detail to the task body
+(`board_proto::TooLong`).
 
 **Signals.** The server records every error it answers to an authenticated request that
 names an agent (`X-Board-Agent`), except expected answers: `version_conflict` (a normal
@@ -112,7 +136,8 @@ server's minute sweep.
 - `DELETE /v1/boards/{slug}` → 204. User only. Refused with 400 `invalid_transition` unless
   the board is `closed` and has no open asks. Deletes the board with its tasks, blockers,
   notes, evidence, asks, members, refused-claim records and events (including lease events
-  that name its tasks); leases that named one of its tasks keep running without it. One
+  that name its tasks); leases that named one of its tasks keep running without it. Tasks
+  on other boards that one of its tasks blocked lose that blocker (see "Tasks"). One
   event is then recorded for the board: `board_updated` with `{"fields": ["deleted"],
   "title": …}`, an existing type, so clients that predate deletion still read the feed. The
   slug may be used again, and its task numbers continue where the deleted board's stopped,
@@ -129,8 +154,9 @@ the server sweeps temporary boards that are **idle**: no event on the board (nor
 it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
 `review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
 period counts from the server's start at the earliest, so time the server was down is not
-idle time. Each board is swept in its own transaction; one that fails is logged and tried
-again on the next sweep.
+idle time. Nor is a board idle while one of its tasks that is not done blocks an
+unfinished task on another board. Each board is swept in its own transaction; one that
+fails is logged and tried again on the next sweep.
 
 - An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
   `board_updated` with `fields: ["status"]` and actor `server`.
@@ -151,6 +177,19 @@ Reopening a closed board, or any change on it, starts the period again.
   event's payload has `title`, `priority` and, when set, `parent`. While the new task is
   neither done nor dropped, an agent with an unfinished task anywhere above it, other than
   its creator, sees it in its snapshot alerts (`<agent> filed <ids> under your task <id>`).
+  - `claim: true` creates the task in `doing` owned by `agent`, in the same transaction, so
+    it is never `ready` and no coordinator is woken for it: an agent that files work it
+    starts at once no longer races the coordinator for it. It is checked as a claim is,
+    before anything is written: 409 `claim_refused` at the caller's `doing` limit (the
+    error names the task in `doing` and says to move it to `review` or `blocked` first), and
+    400 `invalid_transition` while a blocker is not done or `not_before` is ahead. A refused
+    request creates nothing and uses no task number. The `task_created` payload then also
+    has `"claimed": true`, and a `task_claimed` event (`previous_owner: null`) follows.
+  - Compatibility: `claim` is sent only when true, so older clients' requests are
+    unchanged. Request bodies are read without rejecting unknown fields, so a server that
+    predates `claim` ignores it and answers with an `open` task; the CLI and MCP see that
+    status and claim the task next (`POST /v1/tasks/{id}/claim`), which another agent may
+    win in between.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
@@ -201,7 +240,18 @@ that changes the owner, the `task_updated` event lists `owner` in `fields` and c
 `owner` and `previous_owner`.
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
-be on the same board and must not form a cycle.
+exist and must not form a cycle; they may be on any board. A task is not `ready`, and
+cannot be claimed, until every blocker is done, wherever it is. `GET /v1/tasks/{id}` lists
+the tasks waiting on it in `blocks`, from every board, and a blocker's `task_done` event,
+on its own board's feed, wakes the waiting task's board coordinator and the owner of a
+task blocked on it (`DESIGN.md`, "Waking it"). Deleting a board removes its tasks' links
+both ways: a task on another board that waited on one of them loses that blocker, with a
+`task_updated` event on its own board, by the deleting actor, with payload `{"fields":
+["blockers"], "blockers_removed": [ids], "board_deleted": slug}` and its `version` raised,
+so an open task left with nothing to wait on is announced as ready (a done or dropped task
+loses the link without an event). A blocked task's owner is not woken by this and sees the
+change in its next snapshot. The temporary-board sweep never does this to a blocker that
+is not done (see "Temporary boards").
 
 ### Leases and touches
 
@@ -223,7 +273,15 @@ be on the same board and must not form a cycle.
 
 ### Asks (decisions and actions for the user)
 
-- `POST /v1/asks` `[CreateAsk]` → `[Ask]`. Notifies the user (Telegram, if configured).
+- `POST /v1/asks` `[CreateAsk]` → `[CreatedAsk]`: the `[Ask]`, plus an optional `warning`.
+  Notifies the user (Telegram, if configured). When the board has other open asks younger
+  than `duplicate_ask_window_secs` (taken from the server's clock), the ask is still
+  created, and `warning` names each of them, newest first, with its id, task (or `no task`),
+  asker (`you` for the caller) and age, and says to keep one and withdraw the other when
+  one of them asks the same.
+  `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
+  `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
+  the answer unchanged.
 - `GET /v1/asks?status=open&board=` → `[Ask]` list.
 - `GET /v1/asks/{id}` → `[Ask]` in any status (the web view's `/asks/<id>` link).
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
@@ -289,8 +347,8 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   link is followed), or routed to a task that is not done or dropped.
 - Otherwise a new item is filed (`task_created` with a `feedback` payload). When the newest
   item with the signature is no longer live (its routed task is done or dropped, it was
-  forwarded, or it was closed without a resolution), the new item's `recurs` names it: the
-  fix did not hold, or it came back.
+  forwarded or fixed, or it was closed without a resolution), the new item's `recurs` names
+  it: the fix did not hold, or it came back.
 - `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
   The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
   next step. `kind` is one of:
@@ -299,9 +357,13 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   - `duplicate`: `task` is the original item, which takes later reports.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
+  - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the
+    file and line, or the setting). It is not live: a later report opens a new item that
+    `recurs` this one.
 
   `task` is required for routed and duplicate and refused for the others; `reason` (one
-  line, at most 280 characters) is required for forwarded and declined. The item moves to
+  line, at most 280 characters) is required for forwarded, declined and fixed. Any other
+  `kind` is 400 `invalid`. The item moves to
   `done` with artifact evidence naming the resolution (`feedback routed to factory-12`), and
   its `task_done` event carries `resolution`. 400 `invalid_transition` when the item is
   already done or dropped (reopen it first; reopening clears the resolution); 400 `invalid`
@@ -337,7 +399,9 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 
 ### CLI output for scripts
 
-`--json` prints the server's answer unchanged, pretty-printed. Scripts, such as a weekly
+`--json` prints the server's answer as this `board` read it, pretty-printed: fields it does
+not know are left out, fields an older server lacks get their defaults, and values of open
+enums it does not know read `unknown` (see "Compatibility"). Scripts, such as a weekly
 review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 
 - `board stats [--days N] --json` → `[Stats]` from `GET /v1/stats?days=N` (default 7):
@@ -346,7 +410,8 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `doing_minutes_median` (minutes, `null` when nothing was measured),
   `done_without_check_evidence` and `feedback` `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
-  `duplicate`, `forwarded`, `declined`), each within the period. Without `--json` it prints
+  `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
+  it), each within the period. Without `--json` it prints
   a four-line summary.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
@@ -354,7 +419,7 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
-  --declined <reason>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
+  --declined <reason> | --fixed <what changed>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
 
 All exit 1 with the error on stderr when the server refuses or cannot be reached.
 
@@ -378,8 +443,9 @@ Content-Security-Policy that allows only this origin and forbids framing, plus
 | Idle temporary board closed after (`temporary_close_after_secs`) | 1 day |
 | Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
-| Text limits | title 72, note 280, handoff field 200, question 1,000, body 4,000 characters |
+| Text limits | title 72, note 500, handoff field 300, question 1,000, body 4,000 characters; outside settings, ask option 60 and evidence value 500 |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
+| Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

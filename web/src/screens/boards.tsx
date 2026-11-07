@@ -10,21 +10,61 @@ import {
   Empty,
   ErrorNotice,
   Query,
+  RelTime,
   useAgents,
   useTitle,
+  Who,
 } from "../ui/common.tsx";
+import { Icon, StatusIcon } from "../ui/icons.tsx";
+import { newestFirst, useOpenAsks } from "./asks.tsx";
 import { ConfirmDialog } from "../ui/confirm.tsx";
 
 export function BoardsScreen() {
   useTitle("Boards");
   const boards = useResource("boards", [tags.boards], api.boards);
   const agents = agentIndex(useAgents().data);
+  const asks = useOpenAsks();
+  const openAsks = asks.data ?? [];
 
   return (
     <>
       <header class="page-head">
-        <h1>Boards</h1>
+        <div class="page-title">
+          <h1>Boards</h1>
+          {boards.data && (
+            <p class="page-sub">
+              {boards.data.length} board{boards.data.length === 1 ? "" : "s"}
+              {openAsks.length > 0 && <> · {openAsks.length} waiting on you</>}
+            </p>
+          )}
+        </div>
       </header>
+      {openAsks.length > 0 && (
+        <section class="waiting" aria-labelledby="waiting-title">
+          <div class="section-head">
+            <h2 id="waiting-title">Waiting on you</h2>
+            <a class="section-link" href="/asks">
+              All asks <Icon name="arrow" />
+            </a>
+          </div>
+          <ul class="list ask-preview">
+            {newestFirst(openAsks).slice(0, 4).map((ask) => (
+              <li key={ask.id}>
+                <a class="row-link" href={`/asks/${ask.id}`}>
+                  <span class={`kind kind-${ask.kind}`}>
+                    <Icon name={ask.kind === "action" ? "hand" : "question"} />
+                    {ask.kind === "action" ? "Action" : "Decision"}
+                  </span>
+                  <span class="ask-preview-text">{plainLine(ask.question)}</span>
+                  <span class="ask-preview-meta">
+                    {ask.board} · <RelTime at={ask.created_at} />
+                  </span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       <Query resource={boards} label="Loading boards">
         {(list) =>
           list.length === 0
@@ -40,6 +80,7 @@ export function BoardsScreen() {
                     key={board.slug}
                     board={board}
                     coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
+                    agents={agents}
                   />
                 ))}
               </div>
@@ -49,56 +90,110 @@ export function BoardsScreen() {
   );
 }
 
-const COUNT_ORDER = ["ready", "open", "doing", "blocked", "review", "done"] as const;
+/** The first line of agent markdown without its markup, for a one-line preview. */
+export function plainLine(text: string): string {
+  const line = text.trim().split("\n")[0] ?? "";
+  return line
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__|`|~~)/g, "")
+    .replace(/^#+\s*/, "");
+}
 
-function BoardCard({ board, coordinator }: { board: Board; coordinator: Agent | undefined }) {
+const SEGMENTS = [
+  { key: "done", label: "done" },
+  { key: "review", label: "review" },
+  { key: "doing", label: "doing" },
+  { key: "blocked", label: "blocked" },
+  { key: "ready", label: "ready" },
+  { key: "waiting", label: "waiting" },
+] as const;
+
+function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
+  return {
+    done: counts.done,
+    review: counts.review,
+    doing: counts.doing,
+    blocked: counts.blocked,
+    ready: counts.ready,
+    waiting: Math.max(0, counts.open - counts.ready),
+  };
+}
+
+function BoardCard(
+  { board, coordinator, agents }: { board: Board; coordinator: Agent | undefined; agents: Map<string, Agent> },
+) {
+  const counts = segmentCounts(board.counts);
+  const total = SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
   return (
     <article class="card board-card">
-      <header class="card-head">
+      <header class="board-card-head">
         <h2 class="card-title">
           <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
         </h2>
-        <code class="muted">{board.slug}</code>
-        {board.status !== "active" && <span class="badge tone-dropped">{board.status}</span>}
-        {board.temporary && <span class="badge tone-open">temporary</span>}
+        <code class="slug">{board.slug}</code>
+        <span class="board-tags">
+          {board.status !== "active" && (
+            <span class={`pill board-${board.status}`}>
+              <span class="state-dot" aria-hidden="true" />
+              {board.status[0]?.toUpperCase()}{board.status.slice(1)}
+            </span>
+          )}
+          {board.temporary && <span class="tag">Temporary</span>}
+        </span>
       </header>
-      {board.goal && <p class="board-goal"><PlainText text={board.goal} /></p>}
+      <p class={board.goal ? "board-goal" : "board-goal muted"}>
+        {board.goal ? <PlainText text={board.goal} /> : "No goal written."}
+      </p>
 
-      <dl class="counts">
-        {COUNT_ORDER.map((key) => (
-          <div key={key} class={`count count-${key}${board.counts[key] === 0 ? " is-zero" : ""}`}>
-            <dt>{key}</dt>
-            <dd>{board.counts[key]}</dd>
-          </div>
-        ))}
-      </dl>
+      <div class="progress" aria-hidden="true">
+        {SEGMENTS.map((segment) =>
+          counts[segment.key] > 0 && (
+            <span
+              key={segment.key}
+              class={`progress-seg seg-${segment.key}`}
+              style={{ flexGrow: counts[segment.key] }}
+            />
+          )
+        )}
+      </div>
+      {total === 0
+        ? <p class="tally muted">No tasks yet</p>
+        : (
+          <ul class="tally" aria-label="Tasks by status">
+            {SEGMENTS.map((segment) =>
+              counts[segment.key] > 0 && (
+                <li key={segment.key}>
+                  <StatusIcon status={segment.key === "waiting" ? "open" : segment.key} />
+                  <strong>{counts[segment.key]}</strong> {segment.label}
+                </li>
+              )
+            )}
+          </ul>
+        )}
 
-      <div class="board-foot">
+      <footer class="board-foot">
+        <div class="coordinator">
+          {board.coordinator === null
+            ? <span class="muted">{board.autopilot ? "No coordinator running" : "No coordinator"}</span>
+            : coordinator
+            ? (
+              <>
+                <Who id={coordinator.id} agents={agents} />
+                <AgentStateBadge agent={coordinator} />
+              </>
+            )
+            : <Who id={board.coordinator} agents={agents} />}
+        </div>
         <a
           class={board.open_asks > 0 ? "asks-link has-asks" : "asks-link"}
           href={`/asks?board=${encodeURIComponent(board.slug)}`}
+          aria-label={`${board.open_asks} open ask${board.open_asks === 1 ? "" : "s"}`}
         >
-          {board.open_asks === 0
-            ? "No open asks"
-            : `${board.open_asks} open ask${board.open_asks === 1 ? "" : "s"}`}
+          <Icon name="inbox" />
+          {board.open_asks}
         </a>
         <AutopilotSwitch board={board} />
-      </div>
-
-      <div class="coordinator">
-        <span class="label">Coordinator</span>
-        {board.coordinator === null
-          ? <span class="muted">{board.autopilot ? "None running" : "None"}</span>
-          : coordinator
-          ? (
-            <>
-              <span class="handle" title={coordinator.id}>{coordinator.handle}</span>
-              <AgentStateBadge agent={coordinator} />
-              <span class="muted">on {coordinator.device}</span>
-            </>
-          )
-          : <span class="handle">{board.coordinator}</span>}
-      </div>
+      </footer>
     </article>
   );
 }
@@ -137,7 +232,7 @@ function AutopilotSwitch({ board }: { board: Board }) {
       >
         <span class="switch-track" aria-hidden="true"><span class="switch-thumb" /></span>
         <span class="switch-label">
-          Autopilot <strong>{pending ? "…" : board.autopilot ? "on" : "off"}</strong>
+          Autopilot<span class="sr-only"> {pending ? "…" : board.autopilot ? "on" : "off"}</span>
         </span>
       </button>
       <ConfirmDialog

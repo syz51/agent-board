@@ -6,11 +6,13 @@
 
 mod api;
 mod ids;
+mod limits;
 mod model;
 mod repo;
 
 pub use api::*;
 pub use ids::*;
+pub use limits::*;
 pub use model::*;
 pub use repo::{REPO_KEY_MAX, normalize_repo};
 

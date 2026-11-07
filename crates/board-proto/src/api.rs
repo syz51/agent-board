@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, AskKind, BoardSlug, BoardStatus, DeviceName, Event, Evidence,
-    EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind, Runtime,
-    Said, Task, TaskId, TaskStatus, Timestamp,
+    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
+    Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind,
+    Runtime, Said, Task, TaskId, TaskStatus, Timestamp,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -130,6 +130,9 @@ pub struct ResolvedCounts {
     pub duplicate: u32,
     pub forwarded: u32,
     pub declined: u32,
+    /// Absent from servers that predate the `fixed` kind.
+    #[serde(default)]
+    pub fixed: u32,
 }
 
 /// Longest feedback `about`.
@@ -173,7 +176,8 @@ pub struct ResolveFeedback {
     /// Required for `routed` and `duplicate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
-    /// Required for `forwarded` and `declined`; at most 280 characters.
+    /// Required for `forwarded`, `declined` and `fixed`; at most
+    /// [`crate::RESOLUTION_REASON_CHARS_MAX`] characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -198,6 +202,11 @@ pub struct CreateTask {
     /// Not ready before this time; a time already passed is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
+    /// Create the task in `doing`, owned by `agent`, in the same transaction, so no other
+    /// agent can claim it first. Sent only when true: a server that predates it ignores
+    /// the field and creates the task `open`, which the client sees in the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claim: bool,
 }
 
 fn default_priority() -> Priority {
@@ -443,6 +452,18 @@ pub struct CreateAsk {
     pub options: Vec<String>,
 }
 
+/// The answer to `POST /v1/asks`: the new ask, and a warning when it may repeat another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatedAsk {
+    #[serde(flatten)]
+    pub ask: Ask,
+    /// Set when the board has other open asks younger than the server's
+    /// `duplicate_ask_window_secs`: names each (id, task, asker, age) and what to do.
+    /// Absent otherwise, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// `POST /v1/asks/{id}/answer` (user only).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnswerAsk {
@@ -611,6 +632,87 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&create).unwrap(),
             serde_json::json!({ "about": "board", "text": "Slow" })
+        );
+    }
+
+    /// Older clients never send `claim`, and a request without it is the same on the wire.
+    #[test]
+    fn claim_is_optional_on_the_wire() {
+        let old = serde_json::json!({ "board": "factory", "agent": "t3:a", "title": "Fix" });
+        let create: CreateTask = serde_json::from_value(old.clone()).unwrap();
+        assert!(!create.claim);
+        assert_eq!(
+            serde_json::to_value(&create).unwrap()["claim"],
+            serde_json::Value::Null
+        );
+        let claimed = CreateTask {
+            claim: true,
+            ..create
+        };
+        assert_eq!(serde_json::to_value(&claimed).unwrap()["claim"], true);
+    }
+
+    /// Resolution counts from servers that predate `fixed` still parse.
+    #[test]
+    fn resolved_counts_without_fixed_parse() {
+        let counts: ResolvedCounts = serde_json::from_value(serde_json::json!({
+            "routed": 1, "duplicate": 2, "forwarded": 3, "declined": 4,
+        }))
+        .unwrap();
+        assert_eq!((counts.declined, counts.fixed), (4, 0));
+        let counts: ResolvedCounts = serde_json::from_value(serde_json::json!({
+            "routed": 0, "duplicate": 0, "forwarded": 0, "declined": 0, "fixed": 5,
+        }))
+        .unwrap();
+        assert_eq!(counts.fixed, 5);
+    }
+
+    /// A resolution kind or event type added by a newer server reads as `Unknown`, so a
+    /// running client can still read the item or the event; known values are unchanged.
+    #[test]
+    fn newer_resolution_kinds_and_event_types_read_as_unknown() {
+        let resolution: crate::FeedbackResolution = serde_json::from_value(serde_json::json!({
+            "kind": "rerouted_somewhere", "reason": "x",
+            "at": "2026-11-07T12:00:00Z", "by": "t3:a",
+        }))
+        .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unknown);
+        let fixed: ResolutionKind = serde_json::from_value(serde_json::json!("fixed")).unwrap();
+        assert_eq!(fixed, ResolutionKind::Fixed);
+        assert_eq!(serde_json::to_value(fixed).unwrap(), "fixed");
+        let event: crate::Event = serde_json::from_value(serde_json::json!({
+            "seq": 1, "at": "2026-11-07T12:00:00Z", "board": null, "actor": "server",
+            "type": "board_renamed", "task": null, "payload": {},
+        }))
+        .unwrap();
+        assert_eq!(event.event_type, crate::EventType::Unknown);
+        let done: crate::EventType =
+            serde_json::from_value(serde_json::json!("task_done")).unwrap();
+        assert_eq!(done, crate::EventType::TaskDone);
+    }
+
+    /// A created ask is an `Ask` on the wire; `warning` is an optional extra field.
+    #[test]
+    fn a_created_ask_is_an_ask_with_an_optional_warning() {
+        let ask = serde_json::json!({
+            "id": 3, "board": "factory", "task": "factory-2", "agent": "t3:a",
+            "kind": "decision", "question": "Ship it?", "options": ["yes"],
+            "status": "open", "answer": null, "answered_via": null,
+            "created_at": "2026-11-06T12:00:00Z", "answered_at": null,
+        });
+        // From a server that predates the warning.
+        let created: CreatedAsk = serde_json::from_value(ask.clone()).unwrap();
+        assert_eq!((created.ask.id, &created.warning), (3, &None));
+        assert_eq!(serde_json::to_value(&created).unwrap(), ask);
+        // Older clients read the answer as a plain `Ask`.
+        let mut warned = ask;
+        warned["warning"] = serde_json::json!("board factory has another open ask");
+        let plain: Ask = serde_json::from_value(warned.clone()).unwrap();
+        assert_eq!(plain.id, 3);
+        let created: CreatedAsk = serde_json::from_value(warned).unwrap();
+        assert_eq!(
+            created.warning.as_deref(),
+            Some("board factory has another open ask")
         );
     }
 

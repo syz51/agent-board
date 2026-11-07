@@ -629,6 +629,94 @@ async fn a_cleared_blocker_wakes_the_coordinator() {
     );
 }
 
+/// A blocker on another board: its done event comes from that board, and wakes the
+/// coordinator of the waiting task's board and the owner of a task blocked on it.
+#[tokio::test]
+async fn a_blocker_done_on_another_board_wakes_the_waiting_boards_coordinator_and_owner() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    let mut done = detail(
+        "other-3",
+        false,
+        &["factory-12", "factory-13", "factory-14"],
+    );
+    done.task.status = board_proto::TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/other-3", &done);
+    e.stub
+        .on("GET /v1/tasks/factory-12", detail("factory-12", true, &[]));
+    // Blocked by the worker on other-3 alone; and one that still waits on factory-2.
+    let mut blocked = detail("factory-13", false, &[]);
+    blocked.task.status = board_proto::TaskStatus::Blocked;
+    blocked.task.owner = Some("t3:worker".parse().unwrap());
+    blocked.task.blockers = vec!["other-3".parse().unwrap()];
+    e.stub.on("GET /v1/tasks/factory-13", &blocked);
+    let mut still = blocked.clone();
+    still.task.id = "factory-14".parse().unwrap();
+    still.task.blockers = vec!["other-3".parse().unwrap(), "factory-2".parse().unwrap()];
+    e.stub.on("GET /v1/tasks/factory-14", &still);
+    e.stub
+        .on("GET /v1/tasks/factory-2", detail("factory-2", false, &[]));
+
+    let mut ev = event(20, EventType::TaskDone, Some("other-3"), "t3:elsewhere");
+    ev.board = Some("other".parse().unwrap());
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    let mut sends = e.t3.sends();
+    sends.sort();
+    assert_eq!(
+        sends,
+        [
+            (
+                "coord".to_owned(),
+                "board factory: other-3 is done; its blocker cleared for factory-12\nRun board_snapshot and continue."
+                    .to_owned()
+            ),
+            (
+                "worker".to_owned(),
+                "board factory: every blocker of your blocked factory-13 is done; resume it (task_update factory-13 status=doing)\nRun board_snapshot and continue."
+                    .to_owned()
+            ),
+        ]
+    );
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // Checked again when sent: an owner who resumed already, or a task claimed meanwhile,
+    // is not woken.
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    blocked.task.status = board_proto::TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks/factory-13", &blocked);
+    let mut claimed = detail("factory-12", false, &[]);
+    claimed.task.status = board_proto::TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks/factory-12", &claimed);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 2);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+/// A task created with `claim` is in doing when the daemon reads it: no ready wake.
+#[tokio::test]
+async fn a_task_created_claimed_wakes_no_one() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut claimed = detail("factory-4", false, &[]);
+    claimed.task.status = board_proto::TaskStatus::Doing;
+    claimed.task.owner = Some("t3:worker".parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-4", &claimed);
+    for (seq, kind) in [(10, EventType::TaskCreated), (11, EventType::TaskClaimed)] {
+        e.daemon
+            .on_event(&event(seq, kind, Some("factory-4"), "t3:worker"), at())
+            .await
+            .unwrap();
+    }
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
 #[tokio::test]
 async fn a_paused_coordinator_is_not_woken_before_its_reset() {
     let reset = at() + chrono::Duration::hours(1);
@@ -1566,6 +1654,35 @@ async fn an_event_that_failed_on_a_transient_error_is_retried() {
     assert!(e.stub.requests().is_empty(), "dropped without a request");
 }
 
+/// An event type a newer server added is read as unknown and passed over: the daemon keeps
+/// its place in the feed and still handles the events after it.
+#[tokio::test]
+async fn an_event_type_from_a_newer_server_is_passed_over() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.state.last_seq = Some(9);
+    let mut newer =
+        serde_json::to_value(event(10, EventType::TaskCreated, Some("factory-4"), "user")).unwrap();
+    newer["type"] = json!("board_renamed");
+    let known =
+        serde_json::to_value(event(11, EventType::TaskCreated, Some("factory-5"), "user")).unwrap();
+    e.stub.on(
+        "GET /v1/events",
+        json!({ "events": [newer, known], "next_since": 11 }),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-5", detail("factory-5", true, &[]));
+    e.daemon.catch_up(at()).await.unwrap();
+    assert_eq!(e.daemon.state.last_seq, Some(11));
+    assert!(e.stub.requests_to("GET /v1/tasks/factory-4").is_empty());
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends().len(),
+        1,
+        "the known event still wakes the coordinator"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
@@ -1993,7 +2110,7 @@ fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
-        "`task_done` with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
+        "with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
         "finish with `task_done`, evidence and a `summary`",
         "The user does not read this chat as it happens",
         "end every turn with a short status",
@@ -2025,6 +2142,11 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "need accepts from two reviewers",
         "Ask once per batch, each item with a recommendation",
         "The user's answer is the verdict",
+        // Work that waits on the user reaches them through an ask.
+        "Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal",
+        "A task blocked on the user gets an ask",
+        "never set a task `blocked` on the user without one",
+        "When `ask_user` warns of another open ask that asks the same, keep one and withdraw the other",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
@@ -2037,6 +2159,18 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "(`board` set, `auto=false`): an imperative title; a body that starts `Proposal:`"
     ));
     assert!(triage.contains("You are not its reviewer"));
+}
+
+#[test]
+fn the_coordinator_prompt_files_what_remains_before_task_done() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "6. File what the task still needs as sub-tasks first (`task_add`, parent set).",
+        "Call `task_done` only when every acceptance check passes, with evidence",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose

@@ -13,6 +13,7 @@ import {
   useAgents,
   useTitle,
 } from "../ui/common.tsx";
+import { Avatar, StatusIcon } from "../ui/icons.tsx";
 import { CollapsibleMarkdown } from "./updates.tsx";
 
 const STATE_ORDER: Record<Agent["state"], number> = { running: 0, paused: 1, idle: 2, ended: 3 };
@@ -46,7 +47,16 @@ export function AgentsScreen() {
   return (
     <>
       <header class="page-head">
-        <h1>Agents</h1>
+        <div class="page-title">
+          <h1>Agents</h1>
+          {agents.data && (
+            <p class="page-sub">
+              {agents.data.filter((agent) => agent.state === "running").length} running ·{" "}
+              {agents.data.filter((agent) => agent.state === "paused").length} paused ·{" "}
+              {agents.data.filter((agent) => agent.state === "idle").length} idle
+            </p>
+          )}
+        </div>
       </header>
       <nav class="segmented" aria-label="Filter agents by state">
         {FILTERS.map((filter) => (
@@ -71,7 +81,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div class="agent-grid">
+            <div class="agent-list">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -86,45 +96,57 @@ export function AgentsScreen() {
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
     <article class="card agent-card">
-      <header class="card-head">
-        <h2 class="card-title handle" title={agent.id}>{agent.handle}</h2>
-        <AgentStateBadge agent={agent} />
-        {agent.role === "coordinator" && <span class="chip">coordinator</span>}
-      </header>
-      {agent.title && <p class="agent-title"><PlainText text={agent.title} /></p>}
-      <dl class="facts facts-compact">
-        <div>
-          <dt>Device</dt>
-          <dd>{agent.device} · {agent.runtime}</dd>
-        </div>
-        {agent.repo && (
+      <div class="agent-who">
+        <header class="agent-head">
+          <Avatar handle={agent.handle} large />
+          <h2 class="agent-handle" title={agent.id}>{agent.handle}</h2>
+          <AgentStateBadge agent={agent} />
+        </header>
+        <dl class="agent-facts">
+          {agent.role === "coordinator" && (
+            <div>
+              <dt>Role</dt>
+              <dd>Coordinator</dd>
+            </div>
+          )}
           <div>
-            <dt>Repo</dt>
-            <dd class="wrap">
-              <code>{agent.repo}</code>
-              {agent.branch && <> · <code>{agent.branch}</code></>}
-            </dd>
+            <dt>Device</dt>
+            <dd>{agent.device} · {agent.runtime}</dd>
           </div>
-        )}
-        <div>
-          <dt>Working on</dt>
-          <dd>
-            {task
-              ? (
-                <a href={`/tasks/${encodeURIComponent(task.id)}`}>
-                  <code>{task.id}</code> <PlainText text={task.title} />
-                </a>
-              )
-              : <span class="muted">no task in doing</span>}
-          </dd>
-        </div>
-        <div>
-          <dt>Last seen</dt>
-          <dd><RelTime at={agent.last_seen} /></dd>
-        </div>
-      </dl>
-      {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
-      {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
+          {agent.repo && (
+            <div>
+              <dt>Repo</dt>
+              <dd class="wrap"><code>{agent.repo.replace(/^github\.com\//, "")}</code></dd>
+            </div>
+          )}
+          {agent.branch && (
+            <div>
+              <dt>Branch</dt>
+              <dd class="wrap"><code>{agent.branch}</code></dd>
+            </div>
+          )}
+          <div>
+            <dt>Last seen</dt>
+            <dd><RelTime at={agent.last_seen} /></dd>
+          </div>
+        </dl>
+      </div>
+      <div class="agent-work">
+        <p class="agent-task">
+          {task
+            ? (
+              <a href={`/tasks/${encodeURIComponent(task.id)}`}>
+                <StatusIcon status="doing" />
+                <code>{task.id}</code> <PlainText text={task.title} />
+              </a>
+            )
+            : agent.title
+            ? <span class="agent-title"><PlainText text={agent.title} /></span>
+            : <span class="muted">No task in doing</span>}
+        </p>
+        {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
+        {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
+      </div>
     </article>
   );
 }
@@ -138,13 +160,13 @@ function HandoffView({ agentId }: { agentId: string }) {
   if (handoff.error && handoff.data === undefined) {
     return <ErrorNotice error={handoff.error} retry={handoff.retry} compact />;
   }
-  if (handoff.data === undefined) return <p class="muted handoff">Loading handoff…</p>;
-  if (handoff.data === null) return <p class="muted handoff">No handoff written.</p>;
+  if (handoff.data === undefined) return <p class="muted handoff handoff-empty">Loading handoff…</p>;
+  if (handoff.data === null) return <p class="muted handoff handoff-empty">No handoff written yet.</p>;
   const { now, next, blockers, updated_at } = handoff.data;
   return (
     <section class="handoff" aria-label="Handoff">
       <p class="handoff-head">
-        Handoff · <RelTime at={updated_at} />
+        Handoff <span class="muted">· <RelTime at={updated_at} /></span>
       </p>
       <dl class="handoff-fields">
         <div>

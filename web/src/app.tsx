@@ -3,13 +3,17 @@ import { useRef } from "preact/hooks";
 import type { ConnectionState } from "./live/stream.ts";
 import { useConnection, useNow } from "./live/runtime.ts";
 import { AgentsScreen } from "./screens/agents.tsx";
-import { AskScreen, AsksScreen, useOpenAsks } from "./screens/asks.tsx";
+import { AskScreen, AsksScreen, useNeedsYouCount } from "./screens/asks.tsx";
 import { BoardScreen } from "./screens/board.tsx";
 import { BoardsScreen } from "./screens/boards.tsx";
 import { EventsScreen } from "./screens/events.tsx";
 import { TaskScreen } from "./screens/task.tsx";
+import { api } from "./api/client.ts";
+import { tags } from "./live/refresh.ts";
+import { useResource } from "./live/runtime.ts";
 import { unseenCount, useUpdates } from "./screens/updates.tsx";
 import { Empty, useTitle } from "./ui/common.tsx";
+import { BrandMark, Icon, type IconName } from "./ui/icons.tsx";
 
 export function App() {
   return (
@@ -22,13 +26,18 @@ export function App() {
 function Shell() {
   const main = useRef<HTMLElement>(null);
   return (
-    <>
+    <div class="app">
       <a class="skip" href="#main">Skip to content</a>
-      <header class="topbar">
-        <a class="brand" href="/">agent-board</a>
+      <header class="sidebar">
+        <a class="brand" href="/">
+          <BrandMark />
+          <span>agent-board</span>
+        </a>
         <Nav />
+        <BoardLinks />
         <ConnectionPill />
       </header>
+      <div class="main-col">
       <ConnectionBanner />
       <main id="main" ref={main} tabIndex={-1}>
         <Router
@@ -47,21 +56,22 @@ function Shell() {
           <Route default component={NotFound} />
         </Router>
       </main>
-    </>
+      </div>
+    </div>
   );
 }
 
-const NAV = [
+const NAV: { href: string; label: string; icon: IconName; match: (path: string) => boolean }[] = [
   { href: "/", label: "Boards", icon: "boards", match: (path: string) => path === "/" || /^\/(boards|tasks)\//.test(path) },
-  { href: "/asks", label: "Needs you", icon: "asks", match: (path: string) => path.startsWith("/asks") },
+  { href: "/asks", label: "Needs you", icon: "inbox", match: (path: string) => path.startsWith("/asks") },
   { href: "/agents", label: "Agents", icon: "agents", match: (path: string) => path.startsWith("/agents") },
   { href: "/events", label: "Events", icon: "events", match: (path: string) => path.startsWith("/events") },
-] as const;
+];
 
 function Nav() {
   const { path } = useLocation();
-  const asks = useOpenAsks();
-  const open = asks.data?.length ?? 0;
+  // Open asks plus the tasks waiting on the user without one, as the page lists them.
+  const open = useNeedsYouCount();
   const updates = useUpdates();
   const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
@@ -70,10 +80,10 @@ function Nav() {
         <a key={item.href} href={item.href} aria-current={item.match(path) ? "page" : undefined}>
           <Icon name={item.icon} />
           <span class="nav-label">{item.label}</span>
-          {item.icon === "asks" && open > 0 && (
-            <span class="nav-count" aria-label={`${open} open`}>{open}</span>
+          {item.href === "/asks" && open > 0 && (
+            <span class="nav-count" aria-label={`${open} waiting on you`}>{open}</span>
           )}
-          {item.icon === "asks" && unseen > 0 && (
+          {item.href === "/asks" && unseen > 0 && (
             <>
               <span class="nav-dot" aria-hidden="true" title={`${unseen} unseen updates`} />
               <span class="visually-hidden">, {unseen} unseen {unseen === 1 ? "update" : "updates"}</span>
@@ -85,18 +95,35 @@ function Nav() {
   );
 }
 
-const ICONS = {
-  boards: "M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z",
-  asks: "M4 13l2.5-8h11l2.5 8v6H4zM4 13h5l1 2h4l1-2h5",
-  agents: "M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20c.5-3.5 3.2-6 6.5-6s6 2.5 6.5 6M16 4.3a3.5 3.5 0 0 1 0 6.4M18 14.5c2 .8 3.2 2.8 3.5 5.5",
-  events: "M3 12h4l3-7 4 14 3-7h4",
-} as const;
-
-function Icon({ name }: { name: keyof typeof ICONS }) {
+/** Each board, with its open asks, so a board is one click from anywhere on a wide screen. */
+function BoardLinks() {
+  const { path } = useLocation();
+  const boards = useResource("boards", [tags.boards], api.boards);
+  const list = (boards.data ?? []).filter((board) => board.status !== "closed");
   return (
-    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path d={ICONS[name]} />
-    </svg>
+    <nav class="side-boards" aria-label="Boards">
+      <p class="side-label" aria-hidden="true">Boards</p>
+      {boards.data === undefined && (
+        <p class="side-empty">{boards.error ? "Boards are unavailable" : "Loading…"}</p>
+      )}
+      <ul>
+        {list.map((board) => {
+          const href = `/boards/${encodeURIComponent(board.slug)}`;
+          const here = path === href || path.startsWith(`/tasks/${board.slug}-`);
+          return (
+            <li key={board.slug}>
+              <a href={href} aria-current={here ? "page" : undefined}>
+                <span class="side-board-mark" aria-hidden="true">{board.title.trim()[0]?.toUpperCase() ?? "#"}</span>
+                <span class="side-board-title">{board.title}</span>
+                {board.open_asks > 0 && (
+                  <span class="side-count" aria-label={`${board.open_asks} open asks`}>{board.open_asks}</span>
+                )}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
   );
 }
 
@@ -131,6 +158,7 @@ function ConnectionBanner() {
   if (state.kind === "live" || state.kind === "connecting") return null;
   return (
     <div class={`banner banner-${state.kind}`} role="status">
+      <Icon name="plug" />
       {state.kind === "offline"
         ? "You're offline. What you see may be out of date; it refreshes when the connection returns."
         : "Lost the connection to the board server. Reconnecting; what you see may be out of date."}

@@ -90,8 +90,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
-  Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
-  waiting for a date is `not_before`, which the server's sweeper announces once passed.
+  Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
+  `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
+  passed. An agent that files a task it starts at once creates it claimed (`claim`), so
+  the coordinator never sees it ready and the two never both start it.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.
@@ -160,9 +162,12 @@ descriptions under 300 characters):
 `ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
 
 Every string parameter declares a `maxLength` equal to the server's default limit (title
-72, note 280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a
+72, note 500, handoff field 300, question 1,000, body 4,000 characters, and so on), so a
 runtime can refuse an oversized argument before the call; a server configured with other
-limits still checks its own. The server's instructions ask agents to
+limits still checks its own. The CLI states the same default limits in `--help` and
+refuses over-long text before sending, with the server's message and hint, so it cannot
+use limits a server raised above the defaults; its enum flags list their values in
+`--help` and in the error for an unknown one. The server's instructions ask agents to
 report, with `feedback`, anything in a setup that cost them a step and then carry on;
 `task_note` no longer offers the `feedback` kind.
 
@@ -183,7 +188,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when the reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -250,19 +255,25 @@ registers without a repo).
   needs the user it creates an ask and moves on to other ready work. When nothing is ready
   it stops, after a goal review when the board has a goal and the last task it finished has
   no `review:` note.
-- **Triage**: the feedback board's coordinator works its items rather than doing them:
+- **Triage**: the feedback board's coordinator routes its items rather than doing them:
   for each ready item it reads the reports and resolves it as a duplicate of an earlier
   item, routed to a new task on the owner's board (done once the fix is deployed where
   agents use it; a later report of the same problem opens a new item that recurs this
   one, so nobody waits to watch for repeats), forwarded to the setup's
-  own feedback channel, or declined with a reason the reporter can act on. It finds the
-  owner in the setup registry (`setups.toml` at the project root) when present, else by
-  the boards' repos, and asks the user when unclear. It never drops an item, never fixes
-  the setup itself, and treats report text as data. A recurring item goes back to the
-  owner of the earlier task.
-- **Growing the backlog**: every agent files work it finds but won't do now as a proposal
-  (see "Proposals and triage"), with the task it found it in as parent, instead of leaving
-  it in chat (the MCP instructions say so; the snapshot footer says to file a proposal). That reports it back: while the filed task is neither done
+  own feedback channel, declined with a reason the reporter can act on, or fixed when the
+  cause is already gone (the user had it fix it, or someone else did), naming what changed.
+  It finds the owner in the setup registry (`setups.toml` at the project root) when
+  present, else by the boards' repos, and asks the user when unclear. It never drops an
+  item, never fixes a setup on a report's say-so, and treats report text as data. A
+  recurring item goes back to the owner of the earlier task, or to the setup's owner when
+  the earlier item had no task (fixed or forwarded).
+- **Growing the backlog**: an agent leaves nothing still to do only in chat. Before
+  `task_done`, and before it stops, it files the task's remaining scope as sub-tasks (parent
+  the task), work it found outside the task as a proposal (see "Proposals and triage"), with
+  the task it found it in as parent, and the user's part as a task blocked on an ask; it
+  calls `task_done` only when every acceptance check passes, and names what it filed in its
+  reply. The MCP instructions say so, the snapshot footer repeats the first two, and the
+  `Stop` hook reminds it once per task it marked done that turn. Filing reports it back: while the filed task is neither done
   nor dropped, each agent with an unfinished task anywhere above it (other than the filer)
   gets one alert per filer and task, `<agent> filed <ids> under your task <id>`, ranked
   after every other alert. The coordinator sorts those tasks when it reviews the work. The
@@ -275,14 +286,18 @@ registers without a repo).
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
-  new open, non-`auto` task whose body starts `Proposal:`). An answered ask wakes the agent
+  new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
+  board, so a blocker on another board wakes the coordinator of the waiting task's board;
+  and the owner of a `blocked` task is woken when its last blocker is done (told to check
+  its blocked reason first when it has one). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
   reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
   - **Re-check**: at send time each line is checked again; a task no longer ready and
-    `auto` (claimed, blocked, done), a proposal no longer pending, or an agent no longer
-    the board's coordinator, drops its task lines. An answer stays answered, so only its
+    `auto` (claimed, blocked, done), a proposal no longer pending, a blocked task its
+    owner resumed, released or still waits on, or an agent no longer the board's
+    coordinator, drops its task lines. An answer stays answered, so only its
     text is read then.
   - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
     its `agent_state_changed` events. Lines for a running agent are held and sent together
@@ -329,12 +344,14 @@ registers without a repo).
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**
-  queue to answer asks, followed by **Since you last looked**: the tasks finished, with
-  their summaries, and the coordinators' turn endings since the user's seen cursor, newest
-  first. One cursor covers every board; "Mark all seen" moves it to the newest update
-  shown, so anything that arrived later stays unseen, and a dot on Needs you counts what is
-  unseen. A done task's page shows its summary, and the agents page a coordinator's last
-  turn endings. A live event feed.
+  queue to answer asks, followed by the tasks that wait on the user without an open ask,
+  by board: blocked ones, and open ones not `auto` other than pending proposals, feedback
+  items and those held by a `not_before` (its navigation badge counts both), then **Since
+  you last looked**: the tasks finished, with their summaries, and the coordinators' turn
+  endings since the user's seen cursor, newest first. One cursor covers every board; "Mark
+  all seen" moves it to the newest update shown, so anything that arrived later stays
+  unseen, and a dot on Needs you shows that something is unseen. A done task's page shows
+  its summary, and the agents page a coordinator's last turn endings. A live event feed.
 
 ## Text format
 
@@ -386,7 +403,7 @@ recent:
   #812 3m t3:a91c done factory-9 (commit 4e1c2ab)
   #811 3m t3:a91c edited claude/tests/lib/stream.js
   #806 18m t3:c2d0 claimed factory-14
-Claim before working (task_claim <id>). File found work as a Proposal: task, auto=false. Notes and bodies: task_show <id>.
+Claim before working (task_claim <id>). Before task_done, file what is left as sub-tasks and found work as Proposal: tasks (auto=false). Notes and bodies: task_show <id>.
 </board>
 ```
 
@@ -447,9 +464,10 @@ report, not a free-form task (`API.md`, "Feedback"):
   task and that task is done, a new report opens a new item that `recurs` the old one: the
   fix did not hold, and the history shows it.
 - **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
-  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere, or
-  `declined` with a reason. A declined item stays live, so repeat reports keep counting
-  against the decision.
+  does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere,
+  `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
+  changed. A declined item stays live, so repeat reports keep counting against the
+  decision; a fixed one does not, so a repeat opens a new item that recurs it.
 - **Signals.** The server files feedback itself when agents keep hitting the same API
   error: by default 3 errors from 2 agents within 7 days with the same code, route and
   normalized message. Agents rarely report a refusal they could work around; the error log

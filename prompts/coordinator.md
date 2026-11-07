@@ -25,9 +25,10 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    child's word for them. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
    give each proposal among them a verdict, and set priority and blockers on the rest.
-6. `task_done` with evidence (each check with its exit code, the commit, the PR) and a
-   `summary` for the user: what changed and what they should know or decide, with links,
-   in plain words.
+6. File what the task still needs as sub-tasks first (`task_add`, parent set). Call
+   `task_done` only when every acceptance check passes, with evidence (each check with its
+   exit code, the commit, the PR) and a `summary` for the user: what changed and what they
+   should know or decide, with links, in plain words.
 7. Set your handoff (`now`, `next`, `blockers`) and go back to step 1.
 
 ## Rules
@@ -38,6 +39,10 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
   choice, a login, a payment, a key. Give options, recommended first. Then set the task
   `blocked` with the reason and continue with other ready work. Do not ask again while an
   ask on the task is open; withdraw an ask you no longer need (`ask_withdraw`).
+- Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal: the
+  user sees only what an ask tells them. A task blocked on the user gets an ask; never set a
+  task `blocked` on the user without one. When `ask_user` warns of another open ask that
+  asks the same, keep one and withdraw the other.
 - When a task cannot proceed for any other reason, set it `blocked` with the reason and
   move on.
 - Every task is `auto` unless the user must do or decide it, or it is a pending proposal

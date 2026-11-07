@@ -12,11 +12,11 @@ use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
     AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
-    CreateFeedback, CreateLeases, CreateTask, DeviceInfo, DeviceName, DeviceToken, DoneTask,
-    ErrorCode, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note, PutHandoff, RegisterAgent,
-    ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task,
-    TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask,
-    Updates,
+    CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
+    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note, PutHandoff,
+    RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -664,7 +664,7 @@ async fn resolve_feedback(
     } else {
         Some(caller.agent()?.clone())
     };
-    feedback::validate_resolve(&req, state.settings())?;
+    feedback::validate_resolve(&req)?;
     Ok(Json(
         state
             .write(move |cx| feedback::resolve(cx, &id, req, agent, by_user))
@@ -705,7 +705,7 @@ async fn create_ask(
     State(state): State<AppState>,
     caller: Caller,
     Body(req): Body<CreateAsk>,
-) -> Result<Json<Ask>> {
+) -> Result<Json<CreatedAsk>> {
     caller.act_as(&req.agent)?;
     asks::validate_create(&req, state.settings())?;
     Ok(Json(state.write(move |cx| asks::create(cx, req)).await?))

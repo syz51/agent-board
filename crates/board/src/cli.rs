@@ -5,16 +5,18 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName, FeedbackActivity,
-    FeedbackSource, NoteKind, Priority, ResolutionKind, ResolveFeedback, SnapshotFormat,
-    SnapshotKind, TaskId, TaskStatus, UpdateBoard,
+    ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
+    EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
+    FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
+    ResolveFeedback, SnapshotFormat, SnapshotKind, TaskId, TaskStatus, UpdateBoard,
 };
+use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::client::TaskQuery;
 use crate::config::{Config, Home, TokenStore, store_token};
 use crate::identity::agent_from_env;
-use crate::ops::{self, Ctx, Output, parse_enum};
+use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,22 +69,28 @@ pub enum Command {
     Take { id: TaskId },
     /// Change a task's fields or status.
     Update(UpdateArgs),
-    /// Mark a task done with evidence.
+    /// Mark a task done with evidence, only when every acceptance check passes; file what
+    /// remains first (sub-tasks, proposals).
     Done(DoneArgs),
     /// Add a note to a task.
     Note {
         id: TaskId,
+        #[arg(help = at_most(
+            "The note: start with its kind and cite evidence. Split longer text across notes, \
+             or put it in the task body or task_done evidence",
+            limits().note_chars,
+        ))]
         text: String,
-        #[arg(long, default_value = "note", value_parser = parse_enum::<NoteKind>)]
+        #[arg(long, default_value = "note", value_parser = enum_arg_hiding::<NoteKind>(&["feedback"]))]
         kind: NoteKind,
     },
     /// Show your handoff, or replace it with --now and --next.
     Handoff {
-        #[arg(long, requires = "next")]
+        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_field_chars))]
         now: Option<String>,
-        #[arg(long, requires = "now")]
+        #[arg(long, requires = "now", help = at_most("The first concrete action", limits().handoff_field_chars))]
         next: Option<String>,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", help = at_most("What blocks you, if anything", limits().handoff_field_chars))]
         blockers: String,
         /// Show another agent's handoff.
         #[arg(long, conflicts_with = "now")]
@@ -99,15 +107,21 @@ pub enum Command {
     },
     /// Ask the user for a decision or an action.
     Ask {
+        #[arg(help = at_most(
+            "The question; it stands alone. Put background in the task body and name the task",
+            limits().question_chars,
+        ))]
         question: String,
         #[arg(long)]
         board: Option<BoardSlug>,
         #[arg(long)]
         task: Option<TaskId>,
-        #[arg(long, default_value = "decision", value_parser = parse_enum::<AskKind>)]
+        #[arg(long, default_value = "decision", value_parser = enum_arg::<AskKind>())]
         kind: AskKind,
-        /// A suggested answer, recommended first; repeat for more.
-        #[arg(long = "option")]
+        #[arg(long = "option", help = at_most(
+            "A suggested answer, recommended first; repeat for more",
+            ASK_OPTION_CHARS_MAX,
+        ))]
         options: Vec<String>,
     },
     /// List asks.
@@ -120,7 +134,11 @@ pub enum Command {
     /// Withdraw an open ask you made, such as a duplicate or one you no longer need.
     Withdraw { id: i64 },
     /// Answer an ask (user tokens only).
-    Answer { id: i64, answer: String },
+    Answer {
+        id: i64,
+        #[arg(help = at_most("The answer", limits().question_chars))]
+        answer: String,
+    },
     /// Join a board (default: the one for this repo).
     Join { board: Option<BoardSlug> },
     /// List boards.
@@ -145,9 +163,9 @@ pub enum Command {
     },
     /// Print your board snapshot.
     Snapshot {
-        #[arg(long, default_value = "full", value_parser = parse_enum::<SnapshotKind>)]
+        #[arg(long, default_value = "full", value_parser = enum_arg::<SnapshotKind>())]
         kind: SnapshotKind,
-        #[arg(long, default_value = "lines", value_parser = parse_enum::<SnapshotFormat>)]
+        #[arg(long, default_value = "lines", value_parser = enum_arg::<SnapshotFormat>())]
         format: SnapshotFormat,
         #[arg(long)]
         since: Option<i64>,
@@ -155,20 +173,23 @@ pub enum Command {
     /// Report something in a setup that cost a step: the server files a feedback item, or
     /// adds the report to the live one with the same signature.
     Feedback {
-        /// The setup it is about, such as board, skills:rust or t3.
-        #[arg(long, default_value = "other")]
+        #[arg(long, default_value = "other", help = at_most(
+            "The setup it is about, such as board, skills:rust or t3",
+            FEEDBACK_ABOUT_MAX,
+        ))]
         about: String,
-        /// What you were doing: explore, research, design, plan, build, review, operate or
-        /// other.
-        #[arg(long, value_parser = parse_enum::<FeedbackActivity>)]
+        /// What you were doing.
+        #[arg(long, value_parser = enum_arg::<FeedbackActivity>())]
         activity: Option<FeedbackActivity>,
-        /// agent (default) or capture.
-        #[arg(long, value_parser = parse_enum::<FeedbackSource>)]
+        /// Default agent; signal is the server's own.
+        #[arg(long, value_parser = enum_arg_hiding::<FeedbackSource>(&["signal"]))]
         source: Option<FeedbackSource>,
-        /// Reports with equal signatures are one item (default: from about and the title).
-        #[arg(long)]
+        #[arg(long, help = at_most(
+            "Reports with equal signatures are one item (default: from about and the title)",
+            FEEDBACK_SIGNATURE_MAX,
+        ))]
         signature: Option<String>,
-        /// The first line becomes the title.
+        #[arg(help = at_most("The first line becomes the title", limits().body_chars))]
         text: String,
     },
     /// Resolve a feedback item you own (or as the user); it moves to done.
@@ -181,12 +202,21 @@ pub enum Command {
         /// The same as an earlier item, which takes later reports.
         #[arg(long, group = "resolution", value_name = "TASK")]
         duplicate: Option<TaskId>,
-        /// Handed on outside the board: say where.
-        #[arg(long, group = "resolution", value_name = "REASON")]
+        #[arg(long, group = "resolution", value_name = "REASON", help = at_most(
+            "Handed on outside the board: say where",
+            RESOLUTION_REASON_CHARS_MAX,
+        ))]
         forwarded: Option<String>,
-        /// Not acted on: say why.
-        #[arg(long, group = "resolution", value_name = "REASON")]
+        #[arg(long, group = "resolution", value_name = "REASON", help = at_most(
+            "Not acted on: say why",
+            RESOLUTION_REASON_CHARS_MAX,
+        ))]
         declined: Option<String>,
+        #[arg(long, group = "resolution", value_name = "WHAT CHANGED", help = at_most(
+            "You fixed the cause yourself: say what changed",
+            RESOLUTION_REASON_CHARS_MAX,
+        ))]
+        fixed: Option<String>,
     },
     /// Run the MCP server on stdio.
     Mcp,
@@ -218,6 +248,41 @@ pub enum Command {
     Admin(AdminCommand),
 }
 
+/// Help for a text argument, with the server's limit.
+fn at_most(what: &str, max: usize) -> String {
+    format!("{what}. At most {max} characters")
+}
+
+/// Parses an enum flag the way the wire format spells it, listing its values in `--help`
+/// and in the error for an unknown one.
+fn enum_arg<T>() -> impl clap::builder::TypedValueParser<Value = T>
+where
+    T: serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    enum_arg_hiding(&[])
+}
+
+/// [`enum_arg`] that accepts but does not list the `hidden` values, which are kept only
+/// for older callers.
+fn enum_arg_hiding<T>(hidden: &[&str]) -> impl clap::builder::TypedValueParser<Value = T>
+where
+    T: serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let values = ops::enum_values::<T>();
+    // Holds for unit-variant enums with derived `Deserialize`; the CLI test builds every
+    // command, so a flag of another kind of type fails there.
+    debug_assert!(
+        !values.is_empty() && values.iter().all(|v| parse_enum::<T>(v).is_ok()),
+        "{} is not a unit-variant enum with derived Deserialize",
+        std::any::type_name::<T>()
+    );
+    let values = values
+        .iter()
+        .map(|value| clap::builder::PossibleValue::new(*value).hide(hidden.contains(value)));
+    clap::builder::PossibleValuesParser::new(values)
+        .map(|value| parse_enum::<T>(&value).expect("a listed value parses"))
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RuntimeArg {
     Claude,
@@ -243,7 +308,7 @@ pub struct LsArgs {
     ready: bool,
     #[arg(long)]
     board: Option<BoardSlug>,
-    #[arg(long, value_parser = parse_enum::<TaskStatus>)]
+    #[arg(long, value_parser = enum_arg::<TaskStatus>())]
     status: Option<TaskStatus>,
     #[arg(long)]
     owner: Option<board_proto::AgentId>,
@@ -256,20 +321,26 @@ pub struct LsArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
+    #[arg(help = at_most(
+        "Imperative title, no status or ids; put detail in --body",
+        limits().title_chars,
+    ))]
     title: String,
     #[arg(long)]
     board: Option<BoardSlug>,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help = at_most("Markdown that stands alone", limits().body_chars))]
     body: String,
-    /// How done is checked: one observable check per line.
-    #[arg(long = "accept", default_value = "")]
+    #[arg(long = "accept", default_value = "", help = at_most(
+        "How done is checked: one observable check per line",
+        limits().body_chars,
+    ))]
     acceptance: String,
     #[arg(long)]
     parent: Option<TaskId>,
-    /// A task that must be done first; repeat for more.
+    /// A task that must be done first, on any board; repeat for more.
     #[arg(long = "blocker")]
     blockers: Vec<TaskId>,
-    #[arg(long, value_parser = parse_enum::<Priority>)]
+    #[arg(long, value_parser = enum_arg::<Priority>())]
     priority: Option<Priority>,
     /// May the coordinator start it without the user? Default: the board's autopilot. Set
     /// false only when the user must act or decide, or for a proposal (a body starting
@@ -279,25 +350,29 @@ pub struct AddArgs {
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time.
     #[arg(long)]
     not_before: Option<String>,
+    /// Create it in doing, owned by you, so no other agent starts it first.
+    #[arg(long)]
+    claim: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
     id: TaskId,
-    #[arg(long, value_parser = parse_enum::<TaskStatus>)]
+    /// Done goes through `board done`, with evidence.
+    #[arg(long, value_parser = enum_arg_hiding::<TaskStatus>(&["done"]))]
     status: Option<TaskStatus>,
-    #[arg(long)]
+    #[arg(long, help = at_most("New title", limits().title_chars))]
     title: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = at_most("New body", limits().body_chars))]
     body: Option<String>,
-    #[arg(long = "accept")]
+    #[arg(long = "accept", help = at_most("New acceptance checks", limits().body_chars))]
     acceptance: Option<String>,
-    #[arg(long, value_parser = parse_enum::<Priority>)]
+    #[arg(long, value_parser = enum_arg::<Priority>())]
     priority: Option<Priority>,
     /// Comma-separated blockers; an empty value clears them.
     #[arg(long)]
     blockers: Option<String>,
-    #[arg(long = "reason")]
+    #[arg(long = "reason", help = at_most("Why it is blocked", limits().note_chars))]
     blocked_reason: Option<String>,
     /// May the coordinator start it? Set false only when the user must act or decide, or for
     /// a pending proposal; set a proposal true only on an accept verdict.
@@ -311,17 +386,22 @@ pub struct UpdateArgs {
 #[derive(Debug, Args)]
 pub struct DoneArgs {
     id: TaskId,
-    /// A check command that was run; pair each with --exit.
-    #[arg(long = "check")]
+    #[arg(long = "check", help = at_most(
+        "A check command that was run; pair each with --exit",
+        EVIDENCE_VALUE_CHARS_MAX,
+    ))]
     checks: Vec<String>,
     /// Exit code of the matching --check.
     #[arg(long = "exit", allow_negative_numbers = true)]
     exits: Vec<i32>,
-    #[arg(long = "commit")]
+    #[arg(long = "commit", help = at_most("A commit SHA", EVIDENCE_VALUE_CHARS_MAX))]
     commits: Vec<String>,
-    #[arg(long = "pr")]
+    #[arg(long = "pr", help = at_most("A pull request URL", EVIDENCE_VALUE_CHARS_MAX))]
     prs: Vec<String>,
-    #[arg(long = "artifact")]
+    #[arg(long = "artifact", help = at_most(
+        "An artifact link or path, such as a log",
+        EVIDENCE_VALUE_CHARS_MAX,
+    ))]
     artifacts: Vec<String>,
     /// For the user: what changed and what they should know (at most 600 characters).
     #[arg(long)]
@@ -333,9 +413,9 @@ pub enum BoardCommand {
     /// Create a board.
     Create {
         slug: BoardSlug,
-        #[arg(long)]
+        #[arg(long, help = at_most("The board's title", limits().title_chars))]
         title: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", help = at_most("What the board is for", limits().body_chars))]
         goal: String,
         /// A repo key such as github.com/owner/repo; repeat for more.
         #[arg(long = "repo")]
@@ -353,11 +433,11 @@ pub enum BoardCommand {
     /// Change a board.
     Update {
         slug: BoardSlug,
-        #[arg(long)]
+        #[arg(long, help = at_most("New title", limits().title_chars))]
         title: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = at_most("New goal", limits().body_chars))]
         goal: Option<String>,
-        #[arg(long, value_parser = parse_enum::<BoardStatus>)]
+        #[arg(long, value_parser = enum_arg::<BoardStatus>())]
         status: Option<BoardStatus>,
         /// Replace the repos; repeat for more.
         #[arg(long = "repo")]
@@ -463,6 +543,102 @@ fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
 }
 
 impl Command {
+    /// Refuses text over the server's limits before any request is sent.
+    fn check_text_limits(&self) -> Result<()> {
+        let l = limits();
+        let check_board_title = |title: &str| {
+            ops::check_chars_or(
+                "title",
+                title,
+                l.title_chars,
+                Some(board_proto::BOARD_TITLE_LONGER_TEXT_GOES),
+            )
+        };
+        let check_all = |field, values: &[String], max| {
+            values
+                .iter()
+                .try_for_each(|value| check_chars(field, value, max))
+        };
+        let check_opt = |field, value: &Option<String>, max| {
+            value
+                .as_deref()
+                .map_or(Ok(()), |value| check_chars(field, value, max))
+        };
+        match self {
+            Self::Add(a) => {
+                check_chars("title", &a.title, l.title_chars)?;
+                check_chars("body", &a.body, l.body_chars)?;
+                check_chars("acceptance", &a.acceptance, l.body_chars)?;
+            }
+            Self::Update(a) => {
+                check_opt("title", &a.title, l.title_chars)?;
+                check_opt("body", &a.body, l.body_chars)?;
+                check_opt("acceptance", &a.acceptance, l.body_chars)?;
+                check_opt("blocked_reason", &a.blocked_reason, l.note_chars)?;
+            }
+            Self::Done(a) => {
+                for values in [&a.checks, &a.commits, &a.prs, &a.artifacts] {
+                    check_all("evidence value", values, EVIDENCE_VALUE_CHARS_MAX)?;
+                }
+            }
+            Self::Note { text, .. } => check_chars("text", text, l.note_chars)?,
+            Self::Handoff {
+                now,
+                next,
+                blockers,
+                ..
+            } => {
+                check_opt("now", now, l.handoff_field_chars)?;
+                check_opt("next", next, l.handoff_field_chars)?;
+                check_chars("blockers", blockers, l.handoff_field_chars)?;
+            }
+            Self::Ask {
+                question, options, ..
+            } => {
+                check_chars("question", question, l.question_chars)?;
+                check_all("option", options, ASK_OPTION_CHARS_MAX)?;
+            }
+            Self::Answer { answer, .. } => check_chars("answer", answer, l.question_chars)?,
+            Self::Feedback {
+                about,
+                signature,
+                text,
+                ..
+            } => {
+                check_chars("about", about, FEEDBACK_ABOUT_MAX)?;
+                check_opt("signature", signature, FEEDBACK_SIGNATURE_MAX)?;
+                ops::check_chars_or(
+                    "text",
+                    text.trim(),
+                    l.body_chars,
+                    Some(board_proto::FEEDBACK_LONGER_TEXT_GOES),
+                )?;
+            }
+            Self::Resolve {
+                forwarded,
+                declined,
+                fixed,
+                ..
+            } => {
+                check_opt("reason", forwarded, RESOLUTION_REASON_CHARS_MAX)?;
+                check_opt("reason", declined, RESOLUTION_REASON_CHARS_MAX)?;
+                check_opt("reason", fixed, RESOLUTION_REASON_CHARS_MAX)?;
+            }
+            Self::Board(BoardCommand::Create { title, goal, .. }) => {
+                check_board_title(title)?;
+                check_chars("goal", goal, l.body_chars)?;
+            }
+            Self::Board(BoardCommand::Update { title, goal, .. }) => {
+                if let Some(title) = title {
+                    check_board_title(title)?;
+                }
+                check_opt("goal", goal, l.body_chars)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Commands that act as the calling agent, which must then be registered.
     fn acts_as_agent(&self) -> bool {
         matches!(
@@ -524,6 +700,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         let ctx = Ctx::load(home.clone(), agent()?, None)?;
         Ok(loaded.get_or_init(|| ctx).clone())
     };
+    cli.command.check_text_limits()?;
     if cli.command.acts_as_agent() {
         ctx()?.ensure_registered().await?;
     }
@@ -560,6 +737,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 priority: a.priority,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
+                claim: a.claim,
             };
             ops::task_add(&ctx()?, new).await?
         }
@@ -711,12 +889,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             duplicate,
             forwarded,
             declined,
+            fixed,
         } => {
-            let (kind, task, reason) = match (routed, duplicate, forwarded, declined) {
+            let (kind, task, reason) = match (routed, duplicate, forwarded, declined, fixed) {
                 (Some(task), ..) => (ResolutionKind::Routed, Some(task), None),
                 (_, Some(task), ..) => (ResolutionKind::Duplicate, Some(task), None),
-                (_, _, Some(reason), _) => (ResolutionKind::Forwarded, None, Some(reason)),
-                (.., Some(reason)) => (ResolutionKind::Declined, None, Some(reason)),
+                (_, _, Some(reason), ..) => (ResolutionKind::Forwarded, None, Some(reason)),
+                (_, _, _, Some(reason), _) => (ResolutionKind::Declined, None, Some(reason)),
+                (.., Some(reason)) => (ResolutionKind::Fixed, None, Some(reason)),
                 _ => unreachable!("clap requires one resolution"),
             };
             let req = ResolveFeedback { kind, task, reason };
@@ -777,5 +957,27 @@ pub fn expand_tilde(path: PathBuf) -> PathBuf {
     match path.strip_prefix("~") {
         Ok(rest) => dirs::home_dir().map_or(path.clone(), |h| h.join(rest)),
         Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::*;
+
+    #[test]
+    fn every_command_builds_with_its_enum_values() {
+        // Builds every value parser, which checks each enum flag's values parse.
+        Cli::command().debug_assert();
+        let update = Cli::command()
+            .find_subcommand_mut("update")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(
+            update.contains("[possible values: open, doing, blocked, review, dropped]"),
+            "done goes through board done: {update}"
+        );
     }
 }

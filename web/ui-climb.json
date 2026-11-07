@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "name": "agent-board-web",
+  "product": "The web view of agent-board, a shared work board for AI coding agents and the person who runs them (boards, tasks by status, task details and history, agents, asks, live events). Developers check progress, unblock agents and answer asks, mostly on desktop, sometimes on a phone.",
+  "taste": [
+    "Quiet, dense tool interface in the spirit of Linear and GitHub.",
+    "Status reads at a glance without relying on color alone."
+  ],
+  "root": ".",
+  "setup": [["bun", "install", "--frozen-lockfile"]],
+  "checks": [["bun", "run", "typecheck"], ["bun", "test"], ["bun", "run", "build"]],
+  "serve": { "command": ["bun", "dev/server.ts", "--port", "{port}", "--events", "0"], "ready": "/healthz" },
+  "settleMs": 500,
+  "screens": [
+    { "id": "boards", "title": "Boards", "path": "/", "views": ["desktop-light", "desktop-dark", "phone-light"] },
+    { "id": "board", "title": "Board", "path": "/boards/factory", "views": ["desktop-light", "desktop-dark", "phone-light"] },
+    { "id": "task", "title": "Task", "path": "/tasks/factory-12", "views": ["desktop-light", "desktop-dark", "phone-light"] },
+    { "id": "agents", "title": "Agents", "path": "/agents", "views": ["desktop-light", "phone-light"] },
+    { "id": "asks", "title": "Asks", "path": "/asks", "views": ["desktop-light"] },
+    { "id": "ask", "title": "Ask", "path": "/asks/9", "views": ["desktop-light"] },
+    { "id": "events", "title": "Events", "path": "/events", "views": ["desktop-light"] },
+    { "id": "empty", "title": "Empty board", "path": "/boards/sandbox", "views": ["desktop-light"] },
+    { "id": "outage", "title": "Server down", "path": "/boards/factory", "views": ["desktop-light"], "before": ["/__dev/outage?on=1"], "after": ["/__dev/outage?on=0"] }
+  ],
+  "references": [
+    { "id": "github-projects", "title": "GitHub Projects board", "url": "https://github.com/orgs/github/projects/4247", "views": ["desktop-light", "desktop-dark", "phone-light"], "steps": [{ "wait": 2000 }] },
+    { "id": "github-issue", "title": "GitHub issue", "url": "https://github.com/github/roadmap/issues/1025", "views": ["desktop-light"], "steps": [{ "wait": 1500 }] }
+  ],
+  "judges": [
+    { "model": "claude-sonnet-5-5", "effort": "medium", "samples": 2 },
+    { "model": "claude-opus-5-5", "effort": "high", "samples": 2 }
+  ],
+  "pass": { "min": 9, "gain": 0.5 },
+  "budgetUsd": { "call": 3, "round": 10, "run": 60 },
+  "baseline": "origin/main"
+}

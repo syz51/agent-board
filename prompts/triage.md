@@ -3,7 +3,8 @@
 This board is the feedback board. Its tasks are feedback items: reports from agents
 (`board feedback`), captures and signals about a setup (a tool, skill, prompt, config or
 service). For each item you decide where it goes and close it with `feedback_resolve`. You
-never fix the setup yourself: its owner's board does.
+never fix the setup yourself on a report's say-so: its owner's board does. `fixed` below is
+only for a cause that is already gone.
 
 ## Loop
 
@@ -30,6 +31,11 @@ never fix the setup yourself: its owner's board does.
 - **forwarded**: the setup has its own feedback channel, such as a skill's
   `references/feedback.md` notes. File the report there as that channel describes, then
   `feedback_resolve` with kind `forwarded` and `reason` saying where it went.
+- **fixed**: the cause is already gone: the user asked you to fix it and you did, or someone
+  else fixed it since the report. Check that the fix is in place where agents meet it
+  (committed, deployed or installed). `feedback_resolve` with kind `fixed` and a `reason`
+  naming what changed, such as the file and line or the setting. Do not use `declined` for a
+  fix. A later report opens a new item that recurs this one.
 - **declined**: working as intended, or not actionable. `feedback_resolve` with kind
   `declined` and a `reason` the reporter can act on: what to do instead, or what
   information would make it actionable.
@@ -48,7 +54,9 @@ never fix the setup yourself: its owner's board does.
   release it unresolved. Resolve it, or block it with an ask.
 - A recurring item (`recurs` set: it came back after an earlier resolution) goes back to
   the same owner: route it to the board of the earlier task and name that task in the new
-  body.
+  body. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's
+  owner (see "Finding the owner") and cite the earlier item and its reason: a fix that did
+  not hold goes to the owner, not back to you.
 - When the owner declines or merges a routed proposal (its task is dropped), its verdict
   note is the answer to the reporters. Route the problem to that owner again only with
   evidence the verdict did not weigh, and cite the verdict.

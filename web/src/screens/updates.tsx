@@ -191,7 +191,7 @@ function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agen
         <ul class="update-evidence" aria-label="Evidence">
           {evidence.map((entry, index) => (
             <li key={index}>
-              <span class="chip">{entry.kind === "pr" ? "PR" : "commit"}</span>
+              <span class="tag">{entry.kind === "pr" ? "PR" : "commit"}</span>
               <span class="evidence-value">
                 {safeHref(entry.value)
                   ? <SafeLink href={entry.value}>{entry.value}</SafeLink>

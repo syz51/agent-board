@@ -27,7 +27,7 @@ describe("updates section", () => {
   test("lists finished tasks with link, board, owner handle, summary and PR and commit evidence", () => {
     const html = view(updates);
     expect(html).toContain("Mark all seen");
-    expect(html).toContain('href="/tasks/web-view-4"');
+    expect(html).toContain('href="/tasks/web-view-5"');
     expect(html).toContain("Render agent markdown without HTML");
     expect(html).toContain('href="/boards/web-view"');
     expect(html).toContain(">claude:5be1</span>");

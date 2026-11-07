@@ -126,7 +126,7 @@ pub(crate) fn load_tasks(cx: &Ctx<'_>, filter: &str, extra: &NamedParams<'_>) ->
 fn complete_task(cx: &Ctx<'_>, mut task: Task) -> Result<Task> {
     let mut stmt = cx.db.prepare_cached(
         "SELECT b.blocker, bt.status FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
-         WHERE b.task = ?1 ORDER BY bt.number",
+         WHERE b.task = ?1 ORDER BY bt.number, bt.board",
     )?;
     let mut all_done = true;
     task.blockers = stmt
@@ -207,7 +207,7 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
     let blocks = task_ids(
         cx,
         "SELECT b.task FROM task_blockers b JOIN tasks t ON t.id = b.task \
-         WHERE b.blocker = ?1 ORDER BY t.number",
+         WHERE b.blocker = ?1 ORDER BY t.number, t.board",
         id,
     )?;
     let children = task_ids(

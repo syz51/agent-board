@@ -358,7 +358,7 @@ export function createFixtures(now: number): Fixtures {
     }, 2 * day, 3 * 60),
 
     task({
-      id: "web-view-4",
+      id: "web-view-5",
       title: "Render agent markdown without HTML",
       status: "done",
       owner: id("claude:5be1"),
@@ -367,10 +367,38 @@ export function createFixtures(now: number): Fixtures {
         "Agent markdown is now parsed into tokens and rendered as elements, so raw HTML shows as text.\n\n- Links work only for `http`, `https` and `mailto`.\n- **Review the PR** before the next deploy: it adds a CSP meta to `dist/index.html`.",
     }, 2 * day, 2 * 60),
 
+    // A pending proposal: open, not auto, body starting `Proposal:` (after whitespace).
+    task({
+      id: "web-view-4",
+      title: "Cache rendered markdown per note",
+      status: "open",
+      priority: "p3",
+      auto: false,
+      created_by: id("claude:5be1"),
+      body: "\n  Proposal: rendering long notes repeats work on every refresh. Size S.",
+    }, 3 * 60, 3 * 60),
+
     task({ id: "docs-1", title: "Rewrite the install guide", status: "open", owner: null }, 5 * day, 5 * day),
-    task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
+    // Blocked on the user with no ask: shown in Needs you.
     task({
       id: "docs-5",
+      title: "Publish the guide on the docs site",
+      status: "blocked",
+      priority: "p1",
+      blocked_reason: "Waits on the user to pick where the docs are hosted.",
+    }, 2 * day, 6 * 60),
+    // Not auto, but held until a date: not shown in Needs you before then.
+    task({
+      id: "docs-6",
+      title: "Renew the docs domain",
+      status: "open",
+      priority: "p3",
+      auto: false,
+      not_before: new Date(now + 3 * day * 60_000).toISOString(),
+    }, day, day),
+    task({ id: "docs-2", title: "Document the hook contract", status: "done", owner: id("t3:61aa") }, 5 * day, day),
+    task({
+      id: "docs-7",
       parent: "docs-1",
       title: "Fix broken links in the CLI reference",
       status: "done",
@@ -549,16 +577,16 @@ export function createFixtures(now: number): Fixtures {
     { task: "factory-9", kind: "commit", value: "4e1c2ab", exit_code: null, agent: id("t3:a91c"), at: ago(3) },
     { task: "factory-9", kind: "check", value: "bun test claude/tests", exit_code: 0, agent: id("t3:a91c"), at: ago(4) },
     {
-      task: "web-view-4",
+      task: "web-view-5",
       kind: "pr",
       value: "https://github.com/example/board-web/pull/12",
       exit_code: null,
       agent: id("claude:5be1"),
       at: ago(2 * 60 + 5),
     },
-    { task: "web-view-4", kind: "commit", value: "9b3f0d1", exit_code: null, agent: id("claude:5be1"), at: ago(2 * 60 + 6) },
-    { task: "web-view-4", kind: "check", value: "bun run check", exit_code: 0, agent: id("claude:5be1"), at: ago(2 * 60 + 7) },
-    { task: "docs-5", kind: "commit", value: "c71e2a8", exit_code: null, agent: id("t3:61aa"), at: ago(5 * 60) },
+    { task: "web-view-5", kind: "commit", value: "9b3f0d1", exit_code: null, agent: id("claude:5be1"), at: ago(2 * 60 + 6) },
+    { task: "web-view-5", kind: "check", value: "bun run check", exit_code: 0, agent: id("claude:5be1"), at: ago(2 * 60 + 7) },
+    { task: "docs-7", kind: "commit", value: "c71e2a8", exit_code: null, agent: id("t3:61aa"), at: ago(5 * 60) },
     {
       task: "factory-13",
       kind: "pr",
