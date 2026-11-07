@@ -147,8 +147,10 @@ start it again.
 ## 5. Upgrade
 
 Run `deploy/upgrade.sh` from a clone of this repository on a device that reaches every
-host over SSH. It moves the server and every home device to one pinned revision, a full
-commit SHA on `origin/main` or a `v*` release tag:
+host over SSH. It moves the server and every home device to one pinned revision: a full
+commit SHA on `main`, or a `v*` release tag whose commit is on `main`. Both are checked
+against the repository the hosts install from (`BOARD_GIT_URL`, default this one on
+GitHub), not against the clone's own remotes.
 
 ```sh
 deploy/upgrade.sh 0123456789abcdef0123456789abcdef01234567          # print the plan only
@@ -159,36 +161,51 @@ The hosts come from `~/.config/agent-board/upgrade.conf` (or `--config FILE`), w
 outside the repository:
 
 ```text
-# server <ssh-target> [clone=/opt/agent-board] [data=/var/lib/agent-board] [port=7377] [identity=FILE]
-server board-host
+# server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
+server root@board-host
 # device local | <ssh-target> [identity=FILE]
 device local
 device user@laptop identity=~/.ssh/id_ed25519_board
 ```
 
+`db` is the server's database (`db` in `server.toml`); it must sit in the directory
+`compose.yaml` mounts, which has the same path inside the container.
+
 Without `--yes` the script prints each host's current and new revision and changes
 nothing. With `--yes` it:
 
-1. Refuses a revision older than any host's current one, so two upgrades run close
-   together cannot install the older build last. `--rollback` allows it on purpose.
-2. On the server, takes a lock in the clone, then writes a fresh backup to
-   `<data>/pre-upgrade-<UTC time>.db` with `board admin backup` and checks it is not
-   empty. It keeps the five newest of these copies; the backup timer keeps the history.
-3. Checks out the revision (a detached `HEAD`), runs `BOARD_COMMIT=<commit> docker compose
-   ... up -d --build`, and waits until `/healthz` reports the new commit.
-4. On each device, runs `cargo install --git ... --rev <sha> --locked --force board`,
-   restarts `board watch` (launchd or the systemd user unit), and checks `cargo install
-   --list`.
-5. Prints each device's revision, the previous revisions, and the rollback command.
+1. Takes a lock in the server's clone and holds it until the last device is done, so a
+   second run waits instead of racing this one. A lock over two hours old is from a run
+   that died, and is replaced.
+2. Refuses a revision older than any host's current one, so a late run cannot install an
+   older build. `--rollback` allows it on purpose.
+3. On the server, checks out the revision (a detached `HEAD`) and builds the image while
+   the old server keeps running. A failed build puts the clone back.
+4. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
+   admin backup` in the running container, and checks it is not empty. It keeps the five
+   newest of these copies; the backup timer keeps the history.
+5. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
+   reports that commit.
+6. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
+   it is already installed, restarts `board watch` (launchd or the systemd user unit), and
+   checks `cargo install --list`.
+7. Prints each device's revision, the previous ones, and the rollback command.
 
 It stops at the first failed step and says what to do next. A failed server step leaves
-every device unchanged. After a failed device, fix it and run the same command again: hosts
-already at the revision are skipped. Rolling back moves the code only; migrations do not
-run backwards, so a rollback across a migration needs the pre-upgrade backup restored as in
-section 4.
+every device unchanged. After any failure, fix the cause and run the same command again:
+the server is skipped once it runs the revision, devices already at it only restart `board
+watch`, and the rollback command still names the revision from before the first run.
+Rolling back moves the code only; migrations do not run backwards, so a rollback across a
+migration needs the pre-upgrade backup restored as in section 4.
 
-SSH runs with `BatchMode=yes`, `StrictHostKeyChecking=yes` and no agent or port forwarding,
-so each host must already be in `known_hosts` and reachable with a key. The server target
-needs to run `docker compose` and own the clone; on a root-only host that is `root`.
-Devices need `cargo` (looked up in `~/.cargo/bin` too) and the `board watch` service from
-`board install launchd` or `board install systemd`.
+The backup runs in the server's container, so a server whose container is not running
+cannot be upgraded this way: stop it, copy the database, and run the section 2 commands
+by hand.
+
+SSH runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, keepalives and no agent or
+port forwarding, so each host must already be in `known_hosts` and reachable with a key.
+The server target must run `docker compose`, own the clone, and read and write the data
+directory (mode 0700, owned by the container's user), so it is `root`. Devices need
+`cargo` (looked up in `~/.cargo/bin` too) and the `board watch` service from `board
+install launchd` or `board install systemd`; a service that runs another `board` binary
+than cargo's is not upgraded by this.

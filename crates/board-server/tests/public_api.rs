@@ -93,6 +93,16 @@ async fn a_file_database_serves_and_backs_up() {
     assert_eq!(counts(&out), live);
     let error = backup(&db_path, &out).unwrap_err();
     assert!(error.to_string().contains("already exists"), "{error}");
+    let missing = dir.path().join("missing.db");
+    let error = backup(&missing, &dir.path().join("other.db")).unwrap_err();
+    assert!(
+        error.to_string().contains("is not a database file"),
+        "{error}"
+    );
+    assert!(
+        !missing.exists(),
+        "the backup created the database it was asked to copy"
+    );
 
     // The backup opens as a board database and serves the same tasks.
     drop(router);

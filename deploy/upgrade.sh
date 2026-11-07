@@ -3,21 +3,22 @@
 #
 #   deploy/upgrade.sh [--yes] [--rollback] [--config FILE] REV
 #
-# REV is a full commit SHA on origin/main or a v* release tag. Without --yes the script
-# prints the plan (each host: current revision -> new revision) and changes nothing.
-# With --yes it backs up the database, moves the server's clone to REV, rebuilds the
-# container and waits for /healthz, then installs the board CLI at REV on each device
-# and restarts its `board watch` daemon. It stops at the first failure and says what to
-# do next. It refuses a REV older than a host's current one unless --rollback is given.
+# REV is a full commit SHA on main or a v* release tag whose commit is on main. Without
+# --yes the script prints the plan (each host: current revision -> new revision) and
+# changes nothing. With --yes it locks the server, builds the new image, backs up the
+# database, restarts the server and waits for /healthz, then installs the board CLI at REV
+# on each device and restarts its `board watch` daemon. It stops at the first failure and
+# says what to do next. It refuses a REV older than a host's current one unless
+# --rollback is given.
 #
 # Hosts come from a config file outside the repository (docs/DEPLOY.md, "Upgrade"):
-#   server <ssh-target> [clone=/opt/agent-board] [data=/var/lib/agent-board] [port=7377] [identity=FILE]
+#   server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
 #   device local
 #   device <ssh-target> [identity=FILE]
 set -euo pipefail
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -62,22 +63,31 @@ else
     die "'$rev' is not a full 40-character commit SHA or a v* release tag (such as v0.2.0): pass one of those"
 fi
 
+# Devices install from this repository, and the server fetches from it, so the revision
+# is checked against it rather than against this clone's own remotes.
 git_url=${BOARD_GIT_URL:-https://github.com/syz51/agent-board}
-[[ $git_url =~ ^https://[A-Za-z0-9./_-]+$ ]] || die "BOARD_GIT_URL must be a plain https URL"
+[[ $git_url =~ ^(https://|/)[A-Za-z0-9./_-]+$ ]] ||
+    die "BOARD_GIT_URL must be a plain https URL or an absolute path"
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-git -C "$repo" fetch --quiet --tags origin ||
-    die "git fetch in $repo failed: check that this clone can reach origin"
+git -C "$repo" fetch --quiet "$git_url" main ||
+    die "git fetch of main from $git_url failed: check the network and run again"
+main_tip=$(git -C "$repo" rev-parse FETCH_HEAD)
 if [ "$kind" = sha ]; then
-    git -C "$repo" cat-file -e "$rev^{commit}" 2>/dev/null ||
-        die "$rev is not a commit in origin: pass a commit on origin/main"
-    git -C "$repo" merge-base --is-ancestor "$rev" origin/main ||
-        die "$rev is not on origin/main: merge it first, or pass a commit that is"
-    sha=$rev
+    sha=$(git -C "$repo" rev-parse --verify --quiet "$rev^{commit}") ||
+        die "$rev is not a commit on main of $git_url: pass one that is"
 else
-    sha=$(git -C "$repo" rev-parse --verify --quiet "refs/tags/$rev^{commit}") ||
-        die "tag $rev does not exist in origin: pass an existing v* tag"
+    refs=$(git -C "$repo" ls-remote "$git_url" "refs/tags/$rev" "refs/tags/$rev^{}") ||
+        die "git ls-remote $git_url failed: check the network and run again"
+    # An annotated tag lists its commit on the ^{} line.
+    sha=$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ { print $1; exit }')
+    [ -n "$sha" ] || sha=$(printf '%s\n' "$refs" | awk 'NR == 1 { print $1 }')
+    [ -n "$sha" ] || die "tag $rev does not exist in $git_url: pass an existing v* tag"
+    git -C "$repo" cat-file -e "$sha^{commit}" 2>/dev/null ||
+        die "tag $rev points at $sha, which is not on main of $git_url"
 fi
+git -C "$repo" merge-base --is-ancestor "$sha" "$main_tip" ||
+    die "$rev is not on main of $git_url: merge it first, or pass a commit that is"
 short=${sha:0:12}
 
 # --- Hosts ---------------------------------------------------------------------------
@@ -88,7 +98,7 @@ target_re='^[A-Za-z0-9_][A-Za-z0-9._@-]*$'
 path_re='^/[A-Za-z0-9._/-]+$'
 server=""
 clone=/opt/agent-board
-data=/var/lib/agent-board
+db=/var/lib/agent-board/board.db
 port=7377
 server_id=""
 devices=()
@@ -109,9 +119,9 @@ while read -r role target opts || [ -n "${role:-}" ]; do
             [[ $value =~ $path_re ]] || die "$config line $n: clone must be an absolute path"
             clone=$value
             ;;
-        server:data)
-            [[ $value =~ $path_re ]] || die "$config line $n: data must be an absolute path"
-            data=$value
+        server:db)
+            [[ $value =~ $path_re ]] || die "$config line $n: db must be an absolute path"
+            db=$value
             ;;
         server:port)
             [[ $value =~ ^[0-9]{1,5}$ ]] || die "$config line $n: port must be a number"
@@ -150,8 +160,10 @@ run_on() {
         printf '%s\n' "$remote" | sh -s -- "$@"
         return
     fi
+    # Keepalives hold the connection through a long, quiet cargo build.
     local opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no
-        -o ForwardX11=no -o ClearAllForwardings=yes -o ConnectTimeout=15)
+        -o ForwardX11=no -o ClearAllForwardings=yes -o ConnectTimeout=15
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
     if [ -n "$identity" ]; then
         opts+=(-i "$identity" -o IdentitiesOnly=yes)
     fi
@@ -165,19 +177,38 @@ older_than() {
         git -C "$repo" merge-base --is-ancestor "$sha" "$1"
 }
 
+# --- Lock ------------------------------------------------------------------------------
+
+# An applying run holds the server's lock from before it reads the hosts' revisions until
+# its last device, so a second run waits instead of racing it to an older build.
+token="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+locked=0
+release() {
+    if [ $locked = 1 ]; then
+        run_on "$server" "$server_id" server-unlock "$clone" "$token" ||
+            echo "upgrade: could not release the lock: remove $clone/.git/agent-board-upgrade.lock on $server" >&2
+    fi
+}
+if [ $yes = 1 ]; then
+    trap release EXIT
+    trap 'exit 130' INT TERM HUP
+    run_on "$server" "$server_id" server-lock "$clone" "$token" ||
+        die "could not take the upgrade lock on $server (see above): nothing was changed"
+    locked=1
+fi
+
 # --- Plan ------------------------------------------------------------------------------
 
 status=$(run_on "$server" "$server_id" server-status "$clone" "$port") ||
     die "could not read the server's revision: check that 'ssh $server' works without a prompt"
-server_prev=${status%% *}
-server_running=${status#* }
+read -r server_prev server_running server_recorded <<<"$status"
 [[ $server_prev =~ $sha_re ]] || die "the server reported '$status', not a revision"
 
 device_prev=()
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     prev=$(run_on "${devices[$i]}" "${device_ids[$i]}" device-status) ||
-        die "could not read board's revision on ${devices[$i]}: check that 'ssh ${devices[$i]}' works without a prompt"
+        die "could not read board's revision on ${devices[$i]} (see above): nothing was changed"
     device_prev+=("$prev")
     i=$((i + 1))
 done
@@ -206,7 +237,7 @@ i=0
 while [ $i -lt ${#devices[@]} ]; do
     prev=${device_prev[$i]}
     if [ "$prev" = "$sha" ]; then
-        echo "  device ${devices[$i]}: $short (already there)"
+        echo "  device ${devices[$i]}: $short (already there; board watch restarts)"
     else
         echo "  device ${devices[$i]}: ${prev:0:12} -> $short"
     fi
@@ -222,39 +253,45 @@ if [ $yes = 0 ]; then
     exit 0
 fi
 
-rollback_hint="to roll back the code: $0 --rollback --yes $server_prev (the database backup is printed above; migrations do not run backwards)"
+# The revision to roll back to: the server's before this run, or, when an earlier run
+# already moved it, the one that run recorded.
+back=$server_prev
+if [ "$back" = "$sha" ]; then
+    back=$server_recorded
+fi
+if [[ $back =~ $sha_re ]]; then
+    rollback_hint="to roll back the code: $(printf '%q' "$0") --config $(printf '%q' "$config") --rollback --yes $back (pre-upgrade backups are in $(dirname "$db") on the server; migrations do not run backwards)"
+else
+    rollback_hint="the server records no earlier revision to roll back to"
+fi
 
 # --- Apply -----------------------------------------------------------------------------
 
 if [ $server_skip = 0 ]; then
     echo "server $server: upgrading"
-    run_on "$server" "$server_id" server-upgrade "$clone" "$data" "$port" "$sha" ||
-        die "the server upgrade stopped (see above); no device was changed. Previous server revision: $server_prev. $rollback_hint"
+    run_on "$server" "$server_id" server-upgrade "$clone" "$port" "$db" "$git_url" "$sha" "$token" ||
+        die "the server upgrade stopped (see above); no device was changed. $rollback_hint"
 fi
 
+device_now=()
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     host=${devices[$i]}
-    if [ "${device_prev[$i]}" != "$sha" ]; then
+    if [ "${device_prev[$i]}" = "$sha" ]; then
+        echo "device $host: restarting board watch"
+    else
         echo "device $host: installing"
-        run_on "$host" "${device_ids[$i]}" device-upgrade "$git_url" "$sha" >/dev/null ||
-            die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
     fi
+    now=$(run_on "$host" "${device_ids[$i]}" device-upgrade "$git_url" "$sha") ||
+        die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+    device_now+=("$now")
     i=$((i + 1))
 done
 
 echo "done: the server runs $short; cargo install --list on each device shows:"
 i=0
 while [ $i -lt ${#devices[@]} ]; do
-    now=$(run_on "${devices[$i]}" "${device_ids[$i]}" device-status) || now="(could not read)"
-    echo "  ${devices[$i]}: $now"
+    echo "  ${devices[$i]}: ${device_now[$i]} (was ${device_prev[$i]:0:12})"
     i=$((i + 1))
 done
-echo "previous revisions: server ${server_prev:0:12}$(
-    i=0
-    while [ $i -lt ${#devices[@]} ]; do
-        printf ', %s %s' "${devices[$i]}" "${device_prev[$i]:0:12}"
-        i=$((i + 1))
-    done
-)"
 echo "$rollback_hint"

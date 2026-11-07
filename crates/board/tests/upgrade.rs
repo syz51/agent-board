@@ -1,6 +1,6 @@
 //! Tests for `deploy/upgrade.sh` against stub `ssh`, `docker`, `curl`, `cargo` and
-//! service managers. Git is real: an origin repository, the operator's clone the script
-//! runs from, and the server's clone it moves.
+//! service managers. Git is real: an origin repository the hosts install from, the
+//! operator's clone the script runs from, and the server's clone it moves.
 #![cfg(unix)]
 
 use std::fs;
@@ -31,12 +31,17 @@ case "$*" in
     echo db > "$2"
     echo "server backup" >> "$STATE/log"
     ;;
-*"up -d --build"*)
-    [ -z "${STUB_FAIL_UP:-}" ] || { echo "build failed" >&2; exit 1; }
-    echo "$BOARD_COMMIT" > "$STATE/running"
-    echo "server up $BOARD_COMMIT" >> "$STATE/log"
+*" build board")
+    [ -z "${STUB_FAIL_BUILD:-}" ] || { echo "build failed" >&2; exit 1; }
+    echo "$BOARD_COMMIT" > "$STATE/built"
+    echo "server build $BOARD_COMMIT" >> "$STATE/log"
     ;;
-*) exit 9 ;;
+*" up -d board")
+    [ -z "${STUB_FAIL_UP:-}" ] || { echo "start failed" >&2; exit 1; }
+    cp "$STATE/built" "$STATE/running"
+    echo "server up $(cat "$STATE/running")" >> "$STATE/log"
+    ;;
+*) echo "unexpected docker $*" >&2; exit 9 ;;
 esac
 "#,
     ),
@@ -52,6 +57,7 @@ printf '{"ok":true,"version":"0.1.0","commit":"%s","schema_version":11}' "$(cat 
 f="$STATE/cargo-${STUB_HOST:-local}"
 case "$*" in
 "install --list")
+    [ -z "${STUB_FAIL_LIST:-}" ] || { echo "error: cannot read the install list" >&2; exit 101; }
     [ -s "$f" ] || exit 0
     sha=$(cat "$f")
     printf 'board v0.1.0 (https://github.com/syz51/agent-board?rev=%s#%.8s):\n    board\n' "$sha" "$sha"
@@ -61,24 +67,24 @@ install*)
     echo "$2" > "$f"
     echo "${STUB_HOST:-local} install $2 commit=$BOARD_COMMIT" >> "$STATE/log"
     ;;
-*) exit 9 ;;
+*) echo "unexpected cargo $*" >&2; exit 9 ;;
 esac
 "#,
     ),
     (
         "launchctl",
-        "#!/bin/sh\necho \"${STUB_HOST:-local} restart\" >> \"$STATE/log\"\n",
+        "#!/bin/sh\n[ -z \"${STUB_FAIL_RESTART:-}\" ] || exit 1\necho \"${STUB_HOST:-local} restart\" >> \"$STATE/log\"\n",
     ),
     (
         "systemctl",
-        "#!/bin/sh\necho \"${STUB_HOST:-local} restart\" >> \"$STATE/log\"\n",
+        "#!/bin/sh\n[ -z \"${STUB_FAIL_RESTART:-}\" ] || exit 1\necho \"${STUB_HOST:-local} restart\" >> \"$STATE/log\"\n",
     ),
 ];
 
 struct Env {
     _dir: tempfile::TempDir,
     root: PathBuf,
-    /// Commits on origin/main, oldest first.
+    /// Commits on origin's main, oldest first.
     main: Vec<String>,
     /// A commit pushed to a side branch only.
     side: String,
@@ -148,9 +154,9 @@ impl Env {
         fs::write(
             root.join("hosts.conf"),
             format!(
-                "# hosts\nserver board-host clone={} data={} port=7377\n\ndevice local\ndevice laptop identity=~/.ssh/key\n",
+                "# hosts\nserver board-host clone={} db={} port=7377\n\ndevice local\ndevice laptop identity=~/.ssh/key\n",
                 root.join("server").display(),
-                root.join("data").display()
+                root.join("data/board.db").display()
             ),
         )
         .unwrap();
@@ -184,8 +190,25 @@ impl Env {
         fs::read_to_string(self.state(name)).unwrap_or_default()
     }
 
+    fn clear_log(&self) {
+        fs::write(self.state("log"), "").unwrap();
+    }
+
     fn server_head(&self) -> String {
         git(&self.root.join("server"), &["rev-parse", "HEAD"])
+    }
+
+    fn lock(&self) -> PathBuf {
+        self.root.join("server/.git/agent-board-upgrade.lock")
+    }
+
+    fn backups(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.root.join("data"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     fn run(&self, args: &[&str], extra: &[(&str, &str)]) -> Output {
@@ -202,10 +225,17 @@ impl Env {
             .env("PATH", path)
             .env("HOME", self.root.join("home"))
             .env("STATE", self.root.join("state"))
+            .env("BOARD_GIT_URL", self.root.join("origin.git"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("STUB_FAIL_UP")
-            .env_remove("BOARD_GIT_URL");
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for var in [
+            "STUB_FAIL_BUILD",
+            "STUB_FAIL_UP",
+            "STUB_FAIL_LIST",
+            "STUB_FAIL_RESTART",
+        ] {
+            cmd.env_remove(var);
+        }
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -218,6 +248,20 @@ fn text(out: &Output) -> (String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Runs and expects failure; returns stderr.
+fn fails(out: Output) -> String {
+    let (stdout, err) = text(&out);
+    assert!(!out.status.success(), "succeeded: {stdout}");
+    err
+}
+
+/// Runs and expects success; returns stdout.
+fn succeeds(out: Output) -> String {
+    let (stdout, err) = text(&out);
+    assert!(out.status.success(), "{stdout}\n{err}");
+    stdout
 }
 
 #[test]
@@ -237,9 +281,7 @@ fn a_rev_that_is_not_a_full_sha_or_release_tag_is_refused_before_any_remote_comm
         "$(id)",
         "x v1.2.3",
     ] {
-        let out = env.run(&["--yes", rev], &[]);
-        let (_, err) = text(&out);
-        assert!(!out.status.success(), "{rev} was accepted");
+        let err = fails(env.run(&["--yes", rev], &[]));
         assert!(
             err.contains("not a full 40-character commit SHA"),
             "{rev}: {err}"
@@ -249,41 +291,47 @@ fn a_rev_that_is_not_a_full_sha_or_release_tag_is_refused_before_any_remote_comm
 }
 
 #[test]
-fn a_commit_off_main_or_missing_and_an_unknown_tag_are_refused() {
+fn a_commit_off_main_a_missing_commit_and_an_unpushed_tag_are_refused() {
     let env = Env::new();
-    let out = env.run(&["--yes", &env.side], &[]);
-    assert!(!out.status.success());
-    assert!(
-        text(&out).1.contains("is not on origin/main"),
-        "{}",
-        text(&out).1
-    );
+    let err = fails(env.run(&["--yes", &env.side], &[]));
+    assert!(err.contains("is not on main of"), "{err}");
 
-    let out = env.run(&["--yes", &"a".repeat(40)], &[]);
-    assert!(!out.status.success());
-    assert!(
-        text(&out).1.contains("is not a commit in origin"),
-        "{}",
-        text(&out).1
-    );
+    let err = fails(env.run(&["--yes", &"a".repeat(40)], &[]));
+    assert!(err.contains("is not a commit on main of"), "{err}");
 
-    let out = env.run(&["--yes", "v9.9.9"], &[]);
-    assert!(!out.status.success());
-    assert!(
-        text(&out).1.contains("tag v9.9.9 does not exist"),
-        "{}",
-        text(&out).1
-    );
+    let err = fails(env.run(&["--yes", "v9.9.9"], &[]));
+    assert!(err.contains("tag v9.9.9 does not exist"), "{err}");
+
+    // A tag in the operator's clone that the hosts' repository does not have.
+    git(&env.root.join("work"), &["tag", "v0.3.0", &env.main[1]]);
+    let err = fails(env.run(&["--yes", "v0.3.0"], &[]));
+    assert!(err.contains("tag v0.3.0 does not exist"), "{err}");
     assert_eq!(env.read("log"), "");
+}
+
+#[test]
+fn a_release_tag_resolves_to_its_commit() {
+    let env = Env::new();
+    let work = env.root.join("work");
+    git(
+        &work,
+        &["tag", "-a", "-m", "release", "v0.2.0", &env.main[1]],
+    );
+    git(&work, &["push", "-q", "origin", "v0.2.0"]);
+    git(&work, &["tag", "-d", "v0.2.0"]);
+    let stdout = succeeds(env.run(&["v0.2.0"], &[]));
+    let new = &env.main[1];
+    assert!(
+        stdout.contains(&format!("upgrade to {} (v0.2.0, {new})", &new[..12])),
+        "{stdout}"
+    );
 }
 
 #[test]
 fn without_yes_it_prints_the_plan_and_changes_nothing() {
     let env = Env::new();
     let (old, new) = (&env.main[0], &env.main[1]);
-    let out = env.run(&[new], &[]);
-    let (stdout, err) = text(&out);
-    assert!(out.status.success(), "{err}");
+    let stdout = succeeds(env.run(&[new], &[]));
     let (o, n) = (&old[..12], &new[..12]);
     assert!(
         stdout.contains(&format!("server board-host: {o} (running {o}) -> {n}")),
@@ -299,7 +347,7 @@ fn without_yes_it_prints_the_plan_and_changes_nothing() {
     );
     assert!(stdout.contains("plan only: nothing changed"), "{stdout}");
 
-    // Only the read-only status steps ran.
+    // Only the read-only status steps ran, without the lock.
     assert_eq!(
         env.read("log"),
         "board-host server-status\nlaptop device-status\n"
@@ -308,11 +356,11 @@ fn without_yes_it_prints_the_plan_and_changes_nothing() {
     assert_eq!(env.read("running"), o);
     assert_eq!(env.read("cargo-local").trim(), old);
     assert_eq!(env.read("cargo-laptop").trim(), old);
-    assert_eq!(fs::read_dir(env.root.join("data")).unwrap().count(), 0);
+    assert!(env.backups().is_empty());
 }
 
 #[test]
-fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
+fn with_yes_it_builds_backs_up_and_upgrades_the_server_then_every_device() {
     let env = Env::new();
     let (old, new) = (&env.main[0], &env.main[1]);
     // Six older copies: the run adds one and keeps the newest five.
@@ -324,9 +372,7 @@ fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
         )
         .unwrap();
     }
-    let out = env.run(&["--yes", new], &[]);
-    let (stdout, err) = text(&out);
-    assert!(out.status.success(), "{stdout}\n{err}");
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
 
     let n = &new[..12];
     let log = env.read("log");
@@ -334,9 +380,11 @@ fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
     assert_eq!(
         steps,
         [
+            "board-host server-lock".to_string(),
             "board-host server-status".to_string(),
             "laptop device-status".to_string(),
             "board-host server-upgrade".to_string(),
+            format!("server build {n}"),
             "server backup".to_string(),
             format!("server up {n}"),
             format!("local install {new} commit={n}"),
@@ -344,23 +392,30 @@ fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
             "laptop device-upgrade".to_string(),
             format!("laptop install {new} commit={n}"),
             "laptop restart".to_string(),
-            "laptop device-status".to_string(),
+            "board-host server-unlock".to_string(),
         ]
     );
     assert_eq!(&env.server_head(), new);
+    assert!(!env.lock().exists(), "the lock was not released");
     assert!(stdout.contains(&format!("\"commit\":\"{n}\"")), "{stdout}");
-    assert!(stdout.contains(&format!("  local: {new}")), "{stdout}");
-    assert!(stdout.contains(&format!("  laptop: {new}")), "{stdout}");
     assert!(
-        stdout.contains(&format!("--rollback --yes {old}")),
+        stdout.contains(&format!("  local: {new} (was {})", &old[..12])),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  laptop: {new} (was ")),
+        "{stdout}"
+    );
+    let config = env.root.join("hosts.conf");
+    assert!(
+        stdout.contains(&format!(
+            "--config {} --rollback --yes {old}",
+            config.display()
+        )),
         "{stdout}"
     );
 
-    let mut backups: Vec<String> = fs::read_dir(env.root.join("data"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    backups.sort();
+    let backups = env.backups();
     assert_eq!(backups.len(), 5, "{backups:?}");
     assert!(
         backups[0].starts_with("pre-upgrade-20260103"),
@@ -377,6 +432,7 @@ fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
         "StrictHostKeyChecking=yes",
         "ForwardAgent=no",
         "ClearAllForwardings=yes",
+        "ServerAliveInterval=30",
     ] {
         assert!(ssh.lines().all(|l| l.contains(opt)), "{opt} missing: {ssh}");
     }
@@ -389,26 +445,21 @@ fn with_yes_it_backs_up_then_upgrades_the_server_and_every_device() {
         "{ssh}"
     );
 
-    // A second run finds every host at the rev and changes nothing.
-    fs::write(env.state("log"), "").unwrap();
-    let out = env.run(&["--yes", new], &[]);
-    assert!(out.status.success(), "{}", text(&out).1);
-    assert!(!env.read("log").contains("upgrade"), "{}", env.read("log"));
-}
-
-#[test]
-fn a_release_tag_resolves_to_its_commit() {
-    let env = Env::new();
-    let work = env.root.join("work");
-    git(&work, &["tag", "v0.2.0", &env.main[1]]);
-    git(&work, &["push", "-q", "origin", "v0.2.0"]);
-    git(&work, &["tag", "-d", "v0.2.0"]);
-    let out = env.run(&["v0.2.0"], &[]);
-    let (stdout, err) = text(&out);
-    assert!(out.status.success(), "{err}");
-    let new = &env.main[1];
+    // A second run finds every host at the rev: it installs nothing but restarts the
+    // daemons, and still names the revision before the first run for a rollback.
+    env.clear_log();
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    let log = env.read("log");
     assert!(
-        stdout.contains(&format!("upgrade to {} (v0.2.0, {new})", &new[..12])),
+        !log.contains("install") && !log.contains("server-upgrade"),
+        "{log}"
+    );
+    assert!(
+        log.contains("local restart") && log.contains("laptop restart"),
+        "{log}"
+    );
+    assert!(
+        stdout.contains(&format!("--rollback --yes {old}")),
         "{stdout}"
     );
 }
@@ -418,54 +469,105 @@ fn an_older_rev_is_refused_unless_rolling_back() {
     let env = Env::new();
     let (old, new) = (&env.main[0], &env.main[1]);
     env.at(new);
-    let out = env.run(&["--yes", old], &[]);
-    assert!(!out.status.success());
-    let err = text(&out).1;
+    let err = fails(env.run(&["--yes", old], &[]));
     assert!(
         err.contains("older than the revision on: server local laptop"),
         "{err}"
     );
     assert!(err.contains("--rollback"), "{err}");
     assert_eq!(&env.server_head(), new);
+    assert!(!env.lock().exists(), "a refused run kept the lock");
 
-    let out = env.run(&["--rollback", "--yes", old], &[]);
-    assert!(out.status.success(), "{}", text(&out).1);
+    succeeds(env.run(&["--rollback", "--yes", old], &[]));
     assert_eq!(&env.server_head(), old);
     assert_eq!(env.read("cargo-laptop").trim(), old);
 }
 
 #[test]
-fn a_failed_server_step_stops_before_any_device() {
+fn a_failed_build_puts_the_clone_back_and_changes_no_device() {
     let env = Env::new();
     let (old, new) = (&env.main[0], &env.main[1]);
-    let out = env.run(&["--yes", new], &[("STUB_FAIL_UP", "1")]);
-    assert!(!out.status.success());
-    let err = text(&out).1;
-    assert!(err.contains("the image build or start failed"), "{err}");
+    let err = fails(env.run(&["--yes", new], &[("STUB_FAIL_BUILD", "1")]));
+    assert!(err.contains("the image build failed"), "{err}");
     assert!(err.contains("no device was changed"), "{err}");
     assert!(err.contains(&format!("--rollback --yes {old}")), "{err}");
+    assert_eq!(&env.server_head(), old, "the clone was left at the new rev");
+    assert!(env.backups().is_empty(), "a failed build took a backup");
     assert_eq!(env.read("cargo-local").trim(), old);
     assert_eq!(env.read("cargo-laptop").trim(), old);
-    assert!(!env.read("log").contains("install"));
-    // The lock is released for the next run.
+    assert!(!env.lock().exists(), "the lock was not released");
+}
+
+#[test]
+fn after_a_failed_start_the_rerun_still_rolls_back_to_the_old_rev() {
+    let env = Env::new();
+    let (old, new) = (&env.main[0], &env.main[1]);
+    let err = fails(env.run(&["--yes", new], &[("STUB_FAIL_UP", "1")]));
+    assert!(err.contains("the new container did not start"), "{err}");
+    assert!(err.contains(&format!("--rollback --yes {old}")), "{err}");
+    assert_eq!(&env.server_head(), new);
+
+    // The clone is at the new rev now; the rollback target comes from the server's record.
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    assert_eq!(env.read("running").trim(), &new[..12]);
     assert!(
-        !env.root
-            .join("server/.git/agent-board-upgrade.lock")
-            .exists()
+        stdout.contains(&format!("--rollback --yes {old}")),
+        "{stdout}"
     );
 }
 
 #[test]
-fn a_held_lock_stops_the_server_step_before_the_backup() {
+fn a_device_whose_daemon_did_not_restart_is_restarted_on_the_rerun() {
     let env = Env::new();
-    fs::create_dir(env.root.join("server/.git/agent-board-upgrade.lock")).unwrap();
-    let out = env.run(&["--yes", &env.main[1]], &[]);
-    assert!(!out.status.success());
+    let new = &env.main[1];
+    let err = fails(env.run(&["--yes", new], &[("STUB_FAIL_RESTART", "1")]));
+    assert!(err.contains("board watch did not restart"), "{err}");
+    assert!(err.contains("local stopped"), "{err}");
+    assert_eq!(env.read("cargo-local").trim(), new);
+
+    env.clear_log();
+    succeeds(env.run(&["--yes", new], &[]));
+    let log = env.read("log");
+    assert!(log.contains("local restart"), "{log}");
+    assert!(!log.contains("local install"), "{log}");
+}
+
+#[test]
+fn a_device_whose_cargo_fails_stops_the_plan_before_any_change() {
+    let env = Env::new();
+    let err = fails(env.run(&["--yes", &env.main[1]], &[("STUB_FAIL_LIST", "1")]));
+    assert!(err.contains("cannot read the install list"), "{err}");
     assert!(
-        text(&out).1.contains("another upgrade holds"),
-        "{}",
-        text(&out).1
+        err.contains("could not read board's revision on local"),
+        "{err}"
     );
+    assert_eq!(env.server_head(), env.main[0]);
+    assert!(!env.read("log").contains("server-upgrade"));
+    assert!(!env.lock().exists(), "the lock was not released");
+}
+
+#[test]
+fn a_held_lock_stops_the_run_and_a_stale_one_is_replaced() {
+    let env = Env::new();
+    fs::create_dir(env.lock()).unwrap();
+    fs::write(env.lock().join("owner"), "20260101T000000Z-1").unwrap();
+    let err = fails(env.run(&["--yes", &env.main[1]], &[]));
+    assert!(err.contains("upgrade 20260101T000000Z-1 holds"), "{err}");
     assert!(!env.read("log").contains("backup"));
     assert_eq!(env.server_head(), env.main[0]);
+    assert!(env.lock().exists(), "another run's lock was removed");
+
+    // A lock over two hours old is from a run that died.
+    let touched = Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(env.lock())
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let out = env.run(&["--yes", &env.main[1]], &[]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("replacing the lock"), "{err}");
+    assert_eq!(env.server_head(), env.main[1]);
+    assert!(!env.lock().exists());
 }
