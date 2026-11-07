@@ -339,7 +339,7 @@ async fn devices_register_agents_only_as_themselves() {
 }
 
 #[tokio::test]
-async fn listings_leave_out_agents_ended_more_than_a_week_ago() {
+async fn board_listings_leave_out_agents_ended_more_than_a_week_ago() {
     let t = T::new();
     t.board("factory", &[REPO]).await;
     let (live, gone) = ("t3:live", "t3:gone");
@@ -372,8 +372,9 @@ async fn listings_leave_out_agents_ended_more_than_a_week_ago() {
     // asking for ended agents still lists it, and it stays a member of the board.
     t.advance(TimeDelta::minutes(2));
     assert_eq!(listed("/v1/agents?board=factory").await, [live]);
-    assert_eq!(listed("/v1/agents").await, [live]);
-    assert_eq!(listed("/v1/agents?state=ended").await, [gone]);
+    assert_eq!(listed("/v1/agents?board=factory&state=ended").await, [gone]);
+    // Without a board the listing stays complete: clients use it to name agents.
+    assert_eq!(listed("/v1/agents").await, [gone, live]);
     let agent = t.ok("GET", &format!("/v1/agents/{gone}"), None, None).await;
     assert_eq!(agent["boards"], json!(["factory"]));
 

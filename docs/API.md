@@ -102,8 +102,8 @@ server's minute sweep.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
-- `GET /v1/agents?board=&state=` → `[Agent]` list. Agents that ended more than 7 days ago
-  are left out unless `state=ended`; they stay members of their boards.
+- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
+  than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.

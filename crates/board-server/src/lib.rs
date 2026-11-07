@@ -141,13 +141,19 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
 const PRUNE_BATCHES: usize = 100;
 
 /// Deletes events and refused claims past the stats window, one batch per transaction so
-/// other writes go between them. Returns how many events and refused claims went.
+/// other writes go between them, until a batch finds none due or the server stops. Returns
+/// how many events and refused claims went.
 pub(crate) async fn prune_history(state: &AppState) -> Result<(usize, usize), Error> {
     let mut pruned = (0, 0);
     for _ in 0..PRUNE_BATCHES {
+        if futures_util::FutureExt::now_or_never(state.stopped()).is_some() {
+            break;
+        }
         let (events, refusals) = state.write(|cx| ops::stats::prune_history(cx)).await?;
         pruned = (pruned.0 + events, pruned.1 + refusals);
-        if events < ops::stats::PRUNE_BATCH && refusals < ops::stats::PRUNE_BATCH {
+        // An event batch can come back short while due events remain behind one dated
+        // later (a clock that was ahead), so only an empty one ends the pass.
+        if events == 0 && refusals < ops::stats::PRUNE_BATCH {
             break;
         }
     }

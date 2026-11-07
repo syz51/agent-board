@@ -38,7 +38,7 @@ pub(crate) fn validate_days(days: Option<u32>) -> Result<u32> {
         d @ 1..=MAX_DAYS => Ok(d),
         d => Err(invalid(
             format!("days={d} is out of range"),
-            "send days between 1 and 365",
+            format!("send days between 1 and {MAX_DAYS}"),
         )),
     }
 }

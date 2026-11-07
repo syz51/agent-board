@@ -207,9 +207,15 @@ async fn history_past_the_stats_window_is_pruned_in_batches_keeping_the_newest_e
 
     const B: &str = "t3:beta";
     let t = T::new();
-    // A backlog of old events, more than two batches, and a refused claim.
+    // A backlog of old events, more than two batches, and a refused claim. The first is
+    // dated 30 days ahead (a clock that ran fast), so the first batch comes back short.
     t.state
         .write(|cx| {
+            cx.db.execute(
+                "INSERT INTO events (at, board, actor, type, task, payload) \
+                 VALUES (?1, NULL, 'user', 'board_created', NULL, '{}')",
+                [cx.now_ms() + 30 * 86_400_000],
+            )?;
             cx.db.execute(
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2500) \
                  INSERT INTO events (at, board, actor, type, task, payload) \
@@ -241,17 +247,17 @@ async fn history_past_the_stats_window_is_pruned_in_batches_keeping_the_newest_e
 
     // Past it, one transaction takes one batch, and a sweep takes the whole backlog.
     t.advance(TimeDelta::days(1));
-    let old = t.count(&format!("SELECT COUNT(*) FROM events WHERE seq < {recent}"));
+    let old = t.count(&format!("SELECT COUNT(*) FROM events WHERE seq < {recent}")) - 1;
     assert!(old > 2 * PRUNE_BATCH as i64, "{old}");
     let batch = t
         .state
         .write(|cx| crate::ops::stats::prune_history(cx))
         .await
         .unwrap();
-    assert_eq!(batch, (PRUNE_BATCH, 1));
+    assert_eq!(batch, (PRUNE_BATCH - 1, 1));
     let (events, refusals) = crate::prune_history(&t.state).await.unwrap();
-    assert_eq!((events as i64 + PRUNE_BATCH as i64, refusals), (old, 0));
-    assert_eq!(t.count("SELECT COUNT(*) FROM events"), kept);
+    assert_eq!((events as i64 + PRUNE_BATCH as i64 - 1, refusals), (old, 0));
+    assert_eq!(t.count("SELECT COUNT(*) FROM events"), kept + 1);
     assert_eq!(t.count("SELECT COUNT(*) FROM claim_refusals"), 0);
     assert_eq!(t.count("SELECT MAX(seq) FROM events"), max_seq);
 
