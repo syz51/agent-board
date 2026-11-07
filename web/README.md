@@ -11,9 +11,9 @@ page sends no credentials of its own.
 |---|---|
 | `/` | Boards: counts, open asks, autopilot switch (confirmed before `PATCH /v1/boards/{slug}`), coordinator handle, state and paused-until time |
 | `/boards/<slug>` | Tasks grouped as open (ready first), doing, blocked, review, and done in the last 30 days, with owner, priority, unfinished blockers and blocked reason; filters for text, priority, owner and ready-only, kept in the URL |
-| `/tasks/<id>` | Body (sanitized markdown), acceptance, blockers, blocks, parent and subtasks, evidence, notes, history |
-| `/agents` | State, device, runtime, role, repo and branch, current task, handoff, last seen; filter by state |
-| `/asks` | Needs you: open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`) |
+| `/tasks/<id>` | Summary for the user when done, body (sanitized markdown), acceptance, blockers, blocks, parent and subtasks, evidence, notes, history |
+| `/agents` | State, device, runtime, role, repo and branch, current task, handoff, last seen; for a coordinator, its three latest turn endings, collapsed (`GET /v1/agents/{id}/said`); filter by state |
+| `/asks` | Needs you: open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`); below them, "Since you last looked": tasks done with their summary and PR and commit evidence, and coordinators' turn endings, long ones collapsed (`GET /v1/updates`), with "Mark all seen" (`PUT /v1/updates/seen` with the newest shown item's time). A dot on Needs you in the navigation marks unseen updates |
 | `/asks/<id>` | One ask; the deep link that Telegram messages carry |
 | `/events` | The live event feed, filterable by board, with older pages on demand |
 
@@ -62,7 +62,8 @@ them off), `--latency <ms>` and `--dist`. While it runs, these URLs control it:
 - `/__dev/emit`: produce one simulated event now.
 
 The fixtures (`dev/fixtures.ts`) include hostile agent text: `<script>`, `javascript:` links,
-`</board>` and remote images. They show up on `factory-20` and ask #9.
+`</board>` and remote images. They show up on `factory-20`, ask #9 and the docs coordinator's turn ending. The
+updates seen cursor starts 8 hours back; "Mark all seen" moves it, until the server restarts.
 
 ## How live updates work
 
@@ -71,7 +72,8 @@ The fixtures (`dev/fixtures.ts`) include hostile agent text: `<script>`, `javasc
   (1, 2, 5, 10, then 15 s), passing the last `seq` it saw, and drops replayed duplicates.
   It also reacts to the browser's `offline` and `online` events.
 - `src/live/refresh.ts` maps each event to cache tags (`board:<slug>`, `task:<id>`,
-  `agents`, `asks`, and so on). Events in a 150 ms burst are batched.
+  `agents`, `asks`, `updates`, and so on). Updates record no event of their own: they refresh
+  on `task_done`, `task_updated`, `agent_state_changed` and a board's deletion. Events in a 150 ms burst are batched.
 - `src/live/cache.ts` refetches the shown queries that carry an invalidated tag. Queries
   that are not shown are marked stale and refetched when they are next shown. After a
   reconnect, or an event the view cannot read, everything shown is refetched. No replica of

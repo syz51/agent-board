@@ -8,6 +8,7 @@ import { BoardScreen } from "./screens/board.tsx";
 import { BoardsScreen } from "./screens/boards.tsx";
 import { EventsScreen } from "./screens/events.tsx";
 import { TaskScreen } from "./screens/task.tsx";
+import { unseenCount, useUpdates } from "./screens/updates.tsx";
 import { Empty, useTitle } from "./ui/common.tsx";
 
 export function App() {
@@ -61,6 +62,8 @@ function Nav() {
   const { path } = useLocation();
   const asks = useOpenAsks();
   const open = asks.data?.length ?? 0;
+  const updates = useUpdates();
+  const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
     <nav class="nav" aria-label="Main">
       {NAV.map((item) => (
@@ -69,6 +72,12 @@ function Nav() {
           <span class="nav-label">{item.label}</span>
           {item.icon === "asks" && open > 0 && (
             <span class="nav-count" aria-label={`${open} open`}>{open}</span>
+          )}
+          {item.icon === "asks" && unseen > 0 && (
+            <>
+              <span class="nav-dot" aria-hidden="true" title={`${unseen} unseen updates`} />
+              <span class="visually-hidden">, {unseen} unseen {unseen === 1 ? "update" : "updates"}</span>
+            </>
           )}
         </a>
       ))}
