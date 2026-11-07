@@ -95,7 +95,8 @@ pub(crate) fn redeem(cx: &mut Ctx<'_>, code: &str, chat_id: i64) -> Result<bool>
         params![chat_id, cx.now_ms()],
     )?;
     cx.db.execute(
-        "UPDATE asks SET telegram_message_id = NULL WHERE telegram_message_id IS NOT NULL",
+        "UPDATE asks SET telegram_message_id = NULL, telegram_chat_id = NULL \
+         WHERE telegram_message_id IS NOT NULL",
         [],
     )?;
     Ok(true)

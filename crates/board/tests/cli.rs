@@ -488,6 +488,91 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
 }
 
+#[test]
+fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
+    let e = env();
+    let open = |id: i64, task: &str| Ask {
+        id,
+        board: "factory".parse().unwrap(),
+        task: Some(task.parse().unwrap()),
+        agent: ME.parse().unwrap(),
+        kind: AskKind::Decision,
+        question: "Which db?".into(),
+        options: vec![],
+        status: AskStatus::Open,
+        answer: None,
+        answered_via: None,
+        created_at: at(),
+        answered_at: None,
+    };
+    let mut theirs = open(8, "factory-3");
+    theirs.agent = "t3:c2d0".parse().unwrap();
+    e.stub.on(
+        "GET /v1/asks",
+        [
+            open(5, "factory-3"),
+            open(6, "factory-4"),
+            open(7, "factory-3"),
+            theirs.clone(),
+        ],
+    );
+    e.stub.on("POST /v1/asks", open(7, "factory-3"));
+    let out = e.run(&["ask", "Which db?", "--task", "factory-3"]);
+    let text = stdout(&out);
+    assert!(text.contains("ask #7 decision open on factory"), "{text}");
+    assert!(
+        text.contains(
+            "warning: factory-3 already has open asks: #5 by you, #8 by t3:c2d0. Withdraw yours"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("#6") && !text.contains("#7 by"), "{text}");
+    let q = e.stub.requests_to("GET /v1/asks")[0].query_pairs();
+    assert_eq!(
+        (q["status"].as_str(), q["board"].as_str()),
+        ("open", "factory")
+    );
+
+    // Only another agent's ask: named, with nothing to withdraw.
+    e.stub.on("GET /v1/asks", [theirs]);
+    let text = stdout(&e.run(&["ask", "Which db?", "--task", "factory-3"]));
+    assert!(
+        text.contains("warning: factory-3 already has open ask: #8 by t3:c2d0.")
+            && !text.contains("Withdraw"),
+        "{text}"
+    );
+
+    // The check is advisory: when it fails, the ask still stands.
+    e.stub.on_error(
+        "GET /v1/asks",
+        500,
+        "internal",
+        "database is locked",
+        "retry",
+    );
+    let out = e.run(&["ask", "Which db?", "--task", "factory-3"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("warning: could not check factory-3 for other open asks"),
+        "{}",
+        stdout(&out)
+    );
+
+    let mut withdrawn = open(5, "factory-3");
+    withdrawn.status = AskStatus::Withdrawn;
+    e.stub.on("POST /v1/asks/5/withdraw", &withdrawn);
+    let out = e.run(&["withdraw", "5"]);
+    assert!(
+        stdout(&out).contains("withdrew ask #5 decision withdrawn"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/asks/5/withdraw")[0].body,
+        json!({ "agent": ME })
+    );
+}
+
 #[cfg(unix)]
 const ADOPT_REPO: &str = "github.com/example/infra";
 

@@ -147,7 +147,12 @@ be on the same board and must not form a cycle.
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
   `cli`, `web` or `telegram`. The `ask_answered` event's payload names the ask (`id`) and
   the asking `agent`, and the asker's next alerts include the answer.
-- `POST /v1/asks/{id}/withdraw` `[TaskAction]` → `[Ask]`. The asking agent only.
+- `POST /v1/asks/{id}/withdraw` `[TaskAction]` → `[Ask]` with status `withdrawn`. The
+  asking agent only (403 otherwise); 400 `invalid_transition` unless the ask is open. It
+  leaves the open queue, and its Telegram message is edited to say so and loses its
+  buttons. The CLI (`board withdraw <id>`) and MCP (`ask_withdraw`) call it. After `ask_user`
+  makes an ask on a task, it lists the task's other open asks and names them, with who
+  asked, in a warning, so the agent can withdraw its own duplicates.
 
 ### Snapshots and events
 

@@ -501,10 +501,11 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         (None, Some(task)) => task.board(),
         _ => ctx.resolve_board(ask.board.clone()).await?,
     };
+    let agent = ctx.agent()?.clone();
     let created = ctx
         .client
         .create_ask(&CreateAsk {
-            agent: ctx.agent()?.clone(),
+            agent: agent.clone(),
             board,
             task: ask.task,
             kind: ask.kind,
@@ -512,12 +513,55 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             options: ask.options,
         })
         .await?;
+    let mut text = format!(
+        "{}; the user is notified. Continue with other ready work; the answer wakes you.",
+        render::ask_line(&created)
+    );
+    if let Some(task) = &created.task {
+        // Advisory: the ask is made either way, so a failed check is reported, not raised.
+        match ctx.client.asks(Some("open"), Some(&created.board)).await {
+            Ok(open) => {
+                let others: Vec<_> = open
+                    .iter()
+                    .filter(|other| other.id != created.id && other.task.as_ref() == Some(task))
+                    .collect();
+                if !others.is_empty() {
+                    let named: Vec<String> = others
+                        .iter()
+                        .map(|other| {
+                            let by = if other.agent == agent {
+                                "you".to_owned()
+                            } else {
+                                other.agent.to_string()
+                            };
+                            format!("#{} by {by}", other.id)
+                        })
+                        .collect();
+                    text.push_str(&format!(
+                        "\nwarning: {task} already has open {}: {}.",
+                        if others.len() == 1 { "ask" } else { "asks" },
+                        named.join(", ")
+                    ));
+                    if others.iter().any(|other| other.agent == agent) {
+                        text.push_str(
+                            " Withdraw yours that this one replaces (ask_withdraw; CLI: board withdraw <id>).",
+                        );
+                    }
+                }
+            }
+            Err(err) => text.push_str(&format!(
+                "\nwarning: could not check {task} for other open asks: {err:#}"
+            )),
+        }
+    }
+    Ok(Output::new(text, &created))
+}
+
+pub async fn ask_withdraw(ctx: &Ctx, id: i64) -> Result<Output> {
+    let ask = ctx.client.withdraw_ask(id).await?;
     Ok(Output::new(
-        format!(
-            "{}; the user is notified. Continue with other ready work; the answer wakes you.",
-            render::ask_line(&created)
-        ),
-        &created,
+        format!("withdrew {}", render::ask_line(&ask)),
+        &ask,
     ))
 }
 

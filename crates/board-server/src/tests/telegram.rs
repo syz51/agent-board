@@ -514,3 +514,60 @@ async fn pairing_codes_expire_and_a_configured_chat_wins() {
     t.state.shutdown();
     notifier.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_withdrawn_ask_is_marked_in_telegram() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    let mut config = TelegramConfig::new(CHAT);
+    config.bot_token = Some(TOKEN.to_owned());
+    config.api_base = api_base;
+    let notifier = spawn_telegram(t.state.clone(), config)
+        .unwrap()
+        .expect("a token is set");
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let id = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "kind": "decision",
+                "question": "Publish now?", "options": ["yes", "later"],
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    fake.wait("sendMessage", 1).await;
+    t.ok(
+        "POST",
+        &format!("/v1/asks/{id}/withdraw"),
+        Some(A),
+        Some(json!({ "agent": A })),
+    )
+    .await;
+    let edits = fake.wait("editMessageText", 1).await;
+    assert_eq!(
+        (
+            edits[0]["chat_id"].as_i64(),
+            edits[0]["message_id"].as_i64()
+        ),
+        (Some(CHAT), Some(1001))
+    );
+    let text = edits[0]["text"].as_str().unwrap();
+    assert!(text.contains("Publish now?"), "{text}");
+    assert!(
+        text.ends_with("Withdrawn by the agent; no answer is needed."),
+        "{text}"
+    );
+    assert!(!text.contains("answer freely"), "{text}");
+    assert!(edits[0].get("reply_markup").is_none(), "the buttons go");
+
+    t.state.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), notifier)
+        .await
+        .expect("the notifier stops on shutdown")
+        .unwrap();
+}

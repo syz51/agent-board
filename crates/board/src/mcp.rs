@@ -292,6 +292,17 @@ const TOOLS: &[ToolSpec] = &[
         },
     },
     ToolSpec {
+        name: "ask_withdraw",
+        description: "Withdraw an open ask you made, such as a duplicate or one you no longer need; it leaves the user's queue.",
+        params: || {
+            vec![(
+                "id",
+                json!({"type": "integer", "description": "The ask number, such as 12 for ask #12."}),
+                true,
+            )]
+        },
+    },
+    ToolSpec {
         name: "board_join",
         description: "Join a board so its state appears in your snapshot and you can work its tasks. Defaults to the board for this repo.",
         params: || vec![("board", s("Board slug."), false)],
@@ -486,6 +497,10 @@ impl BoardMcp {
                 };
                 ops::ask_user(&ctx, ask).await?
             }
+            "ask_withdraw" => {
+                let a: AskIdArgs = parse(args)?;
+                ops::ask_withdraw(&ctx, a.id).await?
+            }
             "board_join" => {
                 let a: BoardArgs = parse(args)?;
                 ops::join(&ctx, a.board).await?
@@ -619,6 +634,11 @@ struct AskArgs {
     board: Option<BoardSlug>,
 }
 
+#[derive(Deserialize)]
+struct AskIdArgs {
+    id: i64,
+}
+
 impl ServerHandler for BoardMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -675,6 +695,7 @@ mod tests {
                 "handoff_set",
                 "lease_paths",
                 "ask_user",
+                "ask_withdraw",
                 "board_join",
             ]
         );
