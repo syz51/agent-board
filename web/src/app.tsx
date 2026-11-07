@@ -27,7 +27,7 @@ export function Shell() {
   return (
     <div className="min-h-screen bg-background lg:grid lg:grid-cols-[224px_minmax(0,1fr)] lg:bg-sidebar">
       <a
-        className="fixed -top-12 left-2 z-30 rounded-sm bg-card px-3 py-2 shadow-overlay focus:top-2"
+        className="fixed -top-12 left-2 z-30 rounded-sm bg-card px-3 py-2 focus:top-2 focus:shadow-overlay"
         href="#main"
       >
         Skip to content
