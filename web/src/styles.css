@@ -434,13 +434,24 @@ main {
   line-height: 20px;
 }
 
+/* Each tone has its own shape, so state reads without color. */
 .badge::before {
   content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+  flex: none;
+  width: 11px;
+  height: 11px;
   background: currentColor;
+  -webkit-mask: var(--badge-icon) center / contain no-repeat;
+  mask: var(--badge-icon) center / contain no-repeat;
 }
+
+.tone-ready { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3C/svg%3E"); }
+.tone-open { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27 stroke-dasharray=%272.6 2.2%27/%3E%3C/svg%3E"); }
+.tone-doing { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3Cpath d=%27M8 4.2a3.8 3.8 0 0 1 0 7.6z%27 fill=%27%23000%27 stroke=%27none%27/%3E%3C/svg%3E"); }
+.tone-review { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3Cpath d=%27M8 4.2a3.8 3.8 0 1 1-3.8 3.8H8z%27 fill=%27%23000%27 stroke=%27none%27/%3E%3C/svg%3E"); }
+.tone-done { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3Cpath d=%27m5.3 8.2 1.8 1.8 3.6-3.8%27/%3E%3C/svg%3E"); }
+.tone-blocked { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3Cpath d=%27M4 12 12 4%27/%3E%3C/svg%3E"); }
+.tone-dropped { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3Cpath d=%27m5.8 5.8 4.4 4.4m0-4.4-4.4 4.4%27/%3E%3C/svg%3E"); }
 
 .tone-ready { color: var(--ready); background: var(--ready-bg); }
 .tone-doing { color: var(--doing); background: var(--doing-bg); }
@@ -449,6 +460,7 @@ main {
 .tone-done { color: var(--done); background: var(--done-bg); }
 .tone-open,
 .tone-dropped { color: var(--open); background: var(--open-bg); }
+.badge:not([class*="tone-"]) { --badge-icon: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27 fill=%27none%27 stroke=%27%23000%27 stroke-width=%271.8%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276.1%27/%3E%3C/svg%3E"); }
 
 .chip {
   display: inline-block;
@@ -611,7 +623,14 @@ main {
   color: var(--muted);
   background: var(--surface-2);
   border-color: var(--border);
-  cursor: default;
+  cursor: not-allowed;
+}
+
+/* A disabled primary still reads as the main action, just not yet available. */
+.button-primary:disabled {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .button-primary {
@@ -891,8 +910,20 @@ input[type="radio"] {
 }
 
 .asks-link.has-asks {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 10px;
+  border-radius: 999px;
   color: var(--blocked);
+  background: var(--blocked-bg);
   font-weight: 600;
+}
+
+.asks-link.has-asks::after {
+  content: "→";
+  font-weight: 500;
 }
 
 .autopilot .notice {
@@ -937,16 +968,19 @@ input[type="radio"] {
   border-radius: var(--radius);
 }
 
+/* Phones: priority and title, then status and the facts on a second line. */
 .task-row {
-  padding: 9px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  padding: 10px 14px;
   border-top: 1px solid var(--border);
-}
-
-.task-row:hover {
-  background: var(--surface-2);
+  font-size: 13.5px;
 }
 
 .task-row:first-child {
+  border-top: 0;
   border-radius: var(--radius) var(--radius) 0 0;
 }
 
@@ -958,19 +992,20 @@ input[type="radio"] {
   border-radius: var(--radius);
 }
 
-.task-row:first-child {
-  border-top: 0;
+.task-row:hover {
+  background: var(--surface-2);
 }
 
-.task-line {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
+.task-row .prio {
+  flex: none;
 }
 
 .task-title {
+  flex: 1 1 calc(100% - 46px);
+  min-width: 0;
   color: var(--text);
   text-decoration: none;
+  font-size: 15px;
   font-weight: 540;
 }
 
@@ -978,51 +1013,35 @@ input[type="radio"] {
   text-decoration: underline;
 }
 
-.task-id {
-  color: var(--muted);
-  font-weight: 500;
-  white-space: nowrap;
+.task-facts {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding-left: 36px;
 }
 
 .task-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 12px;
-  margin: 6px 0 0 36px;
-  font-size: 13.5px;
+  gap: 4px 8px;
   color: var(--muted);
 }
 
-/* Wide screens: one line per task, title left and facts right, like an issue list. */
-@media (min-width: 721px) {
-  .task-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    column-gap: 16px;
-  }
+.task-meta:empty {
+  display: none;
+}
 
-  .task-line {
-    flex: 1 1 320px;
-    min-width: 0;
-  }
+.task-updated {
+  white-space: nowrap;
+}
 
-  /* A fixed start keeps the status badges in one column. */
-  .task-meta {
-    flex: 0 0 auto;
-    min-width: 400px;
-    max-width: 100%;
-    margin: 0 0 0 auto;
-  }
-
-  .task-meta > :last-child {
-    margin-left: auto;
-  }
-
-  .blocked-reason {
-    flex-basis: 100%;
-  }
+.task-id {
+  color: var(--muted);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .owner {
@@ -1032,9 +1051,37 @@ input[type="radio"] {
 }
 
 .blocked-reason {
-  margin: 4px 0 0 36px;
-  font-size: 13.5px;
+  flex-basis: 100%;
+  margin: 0;
+  padding-left: 36px;
   color: var(--blocked);
+}
+
+/* Wide screens: one line per task in fixed columns, so status, owner and time scan down. */
+@media (min-width: 721px) {
+  .task-row {
+    display: grid;
+    grid-template-columns: 28px 84px minmax(0, 1fr) auto 116px 124px;
+    align-items: center;
+    gap: 4px 12px;
+    padding: 8px 14px;
+  }
+
+  .task-facts {
+    display: contents;
+  }
+
+  .task-row > .prio { grid-area: 1 / 1; }
+  .task-status { grid-area: 1 / 2; }
+  .task-title { grid-area: 1 / 3; }
+  .task-meta { grid-area: 1 / 4; display: flex; justify-content: flex-end; }
+  .task-owner { grid-area: 1 / 5; }
+  .task-updated { grid-area: 1 / 6; text-align: right; }
+
+  .blocked-reason {
+    grid-area: 2 / 3 / auto / -1;
+    padding: 0;
+  }
 }
 
 /* Task detail */
@@ -1533,6 +1580,7 @@ p.handoff {
 
   .segmented a {
     flex: 1 1 0;
+    min-height: 36px;
     justify-content: center;
     padding: 0 2px;
     border: 0;
@@ -1550,11 +1598,6 @@ p.handoff {
 
   .count:nth-child(n + 4) {
     border-top: 1px solid var(--border);
-  }
-
-  .task-meta,
-  .blocked-reason {
-    margin-left: 0;
   }
 
   .filters .field {

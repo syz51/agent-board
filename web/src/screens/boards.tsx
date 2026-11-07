@@ -59,8 +59,8 @@ function BoardCard({ board, coordinator }: { board: Board; coordinator: Agent | 
           <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
         </h2>
         <code class="muted">{board.slug}</code>
-        {board.status !== "active" && <span class="badge tone-dropped">{board.status}</span>}
-        {board.temporary && <span class="badge tone-open">temporary</span>}
+        {board.status !== "active" && <span class="badge tone-dropped">{board.status[0]?.toUpperCase()}{board.status.slice(1)}</span>}
+        {board.temporary && <span class="badge tone-open">Temporary</span>}
       </header>
       {board.goal && <p class="board-goal"><PlainText text={board.goal} /></p>}
 

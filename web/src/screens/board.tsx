@@ -205,33 +205,33 @@ function TaskRow(
     : null;
   return (
     <li class="task-row">
-      <div class="task-line">
-        <PriorityBadge priority={task.priority} />
-        <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
-          <code class="task-id">{task.id}</code> <PlainText text={task.title} />
-        </a>
-      </div>
-      <div class="task-meta">
-        <StatusBadge status={task.status} ready={task.ready} />
-        <Owner task={task} agents={agents} />
-        {blockers.length > 0 && (
-          <span class="blockers">
-            blocked by{" "}
-            {blockers.map((id, index) => (
-              <Fragment key={id}>
-                {index > 0 && ", "}
-                <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
-              </Fragment>
-            ))}
-          </span>
-        )}
-        {task.auto && <span class="chip">auto</span>}
-        {waitsUntil && (
-          <span class="chip">
-            waits until <AbsTime at={waitsUntil} />
-          </span>
-        )}
-        <span class="muted">
+      <PriorityBadge priority={task.priority} />
+      <a class="task-title" href={`/tasks/${encodeURIComponent(task.id)}`}>
+        <code class="task-id">{task.id}</code> <PlainText text={task.title} />
+      </a>
+      <div class="task-facts">
+        <span class="task-status"><StatusBadge status={task.status} ready={task.ready} /></span>
+        <div class="task-meta">
+          {blockers.length > 0 && (
+            <span class="blockers">
+              blocked by{" "}
+              {blockers.map((id, index) => (
+                <Fragment key={id}>
+                  {index > 0 && ", "}
+                  <a href={`/tasks/${encodeURIComponent(id)}`}><code>{id}</code></a>
+                </Fragment>
+              ))}
+            </span>
+          )}
+          {task.auto && <span class="chip">auto</span>}
+          {waitsUntil && (
+            <span class="chip">
+              waits until <AbsTime at={waitsUntil} />
+            </span>
+          )}
+        </div>
+        <span class="task-owner"><Owner task={task} agents={agents} /></span>
+        <span class="task-updated muted">
           updated <RelTime at={task.updated_at} />
         </span>
       </div>
