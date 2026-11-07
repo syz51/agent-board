@@ -89,7 +89,7 @@ describe("needsYouCount", () => {
 describe("pending proposals", () => {
   const base = candidates().find((task) => task.id === "web-view-4") as Task;
 
-  test("the server marks an open non-auto task whose trimmed body starts with Proposal:", () => {
+  test("the dev server marks an open non-auto task whose trimmed body starts with Proposal:", () => {
     expect(base.body.startsWith("Proposal:")).toBe(false);
     expect(base.proposal).toBe(true);
     expect(base.ready).toBe(false);

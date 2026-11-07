@@ -194,6 +194,9 @@ struct TaskLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<&'static str>,
     title: String,
+    /// Who filed it: shown for proposals, which the filer must not review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -479,22 +482,11 @@ fn fill_full(
     )?
     .into_iter()
     .partition(|t| t.ready);
-    let (proposals, held): (Vec<Task>, Vec<Task>) = held.into_iter().partition(|t| t.proposal);
-    if !proposals.is_empty() {
-        model.proposals = Some(Ready {
-            total: proposals.len() as u32,
-            items: proposals
-                .iter()
-                .take(cx.s.snapshot_ready_items)
-                .map(|t| TaskLine {
-                    id: t.id.to_string(),
-                    status: None,
-                    priority: Some(priority_str(t.priority)),
-                    title: title(&t.title),
-                })
-                .collect(),
-        });
-    }
+    // A proposal held by a `not_before` still ahead is listed under waiting, with its time.
+    let (proposals, held): (Vec<Task>, Vec<Task>) = held
+        .into_iter()
+        .partition(|t| t.proposal && t.not_before.is_none_or(|at| at <= cx.now));
+    model.proposals = task_list(cx, &proposals, true)?;
     let mut waiting: Vec<(board_proto::Timestamp, Task)> = held
         .into_iter()
         .filter_map(|t| t.not_before.filter(|at| *at > cx.now).map(|at| (at, t)))
@@ -515,24 +507,37 @@ fn fill_full(
                 .collect(),
         });
     }
-    if !ready.is_empty() {
-        model.ready = Some(Ready {
-            total: ready.len() as u32,
-            items: ready
-                .iter()
-                .take(cx.s.snapshot_ready_items)
-                .map(|t| TaskLine {
-                    id: t.id.to_string(),
-                    status: None,
-                    priority: Some(priority_str(t.priority)),
-                    title: title(&t.title),
-                })
-                .collect(),
-        });
-    }
+    model.ready = task_list(cx, &ready, false)?;
 
     model.recent = recent(cx, agent, board, model.seq)?;
     Ok(())
+}
+
+/// The first `snapshot_ready_items` of `tasks` with the total, or `None` when empty; `by`
+/// adds who filed each.
+fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    let items = tasks
+        .iter()
+        .take(cx.s.snapshot_ready_items)
+        .map(|t| {
+            Ok(TaskLine {
+                id: t.id.to_string(),
+                status: None,
+                priority: Some(priority_str(t.priority)),
+                title: title(&t.title),
+                by: by
+                    .then(|| handle_of(cx, t.created_by.as_str()))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Some(Ready {
+        total: tasks.len() as u32,
+        items,
+    }))
 }
 
 /// A peer's current task: its task in `doing`, else the task it changed last (closed
@@ -554,6 +559,7 @@ fn peer_task(cx: &Ctx<'_>, peer: &AgentId) -> Result<Option<TaskLine>> {
         status: Some(status_str(t.status)),
         priority: None,
         title: title(&t.title),
+        by: None,
     }))
 }
 
@@ -1477,10 +1483,11 @@ fn render_lines(m: &Model) -> String {
         for t in &p.items {
             let _ = writeln!(
                 o,
-                "  {} {} {}",
+                "  {} {} {} by {}",
                 t.id,
                 t.priority.unwrap_or(""),
-                quote(&t.title)
+                quote(&t.title),
+                t.by.as_deref().unwrap_or("")
             );
         }
     }
@@ -1609,10 +1616,11 @@ fn render_yaml(m: &Model) -> String {
         for t in &p.items {
             let _ = writeln!(
                 o,
-                "    - {{id: {}, priority: {}, title: {}}}",
+                "    - {{id: {}, priority: {}, title: {}, by: {}}}",
                 t.id,
                 t.priority.unwrap_or(""),
-                q(&t.title)
+                q(&t.title),
+                q(t.by.as_deref().unwrap_or(""))
             );
         }
     }

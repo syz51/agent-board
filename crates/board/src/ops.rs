@@ -377,7 +377,7 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
         .await?;
     if !new.claim {
         let mut text = format!("added {}", render::task_line(&task));
-        if board_proto::is_pending_proposal(task.status, task.auto, &task.body) {
+        if task.is_pending_proposal() {
             text.push_str(
                 "\npending proposal: not ready work. Another agent reviews it with a `verdict:` \
                  note; an accept sets auto, which makes it claimable.",

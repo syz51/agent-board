@@ -163,7 +163,14 @@ fn configure(conn: &Connection) -> Result<()> {
         "is_proposal_body",
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |f| Ok(board_proto::is_proposal_body(&f.get::<String>(0)?)),
+        |f| {
+            // Borrowed: bodies run to 4,000 characters, and only the prefix is read.
+            let body = f
+                .get_raw(0)
+                .as_str()
+                .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+            Ok(board_proto::is_proposal_body(body))
+        },
     )?;
     Ok(())
 }
@@ -297,7 +304,10 @@ pub(crate) fn live_sql(col: &str) -> String {
 
 /// SQL that is true when task `t` is a pending proposal (`board_proto::is_pending_proposal`).
 pub(crate) fn proposal_sql(t: &str) -> String {
-    format!("({t}.status = 'open' AND {t}.auto = 0 AND is_proposal_body({t}.body))")
+    format!(
+        "({t}.status = 'open' AND {t}.auto = 0 AND is_proposal_body({t}.body) \
+         AND NOT EXISTS (SELECT 1 FROM feedback pf WHERE pf.task = {t}.id))"
+    )
 }
 
 /// SQL that is true when task `t` is ready: open, every blocker done, no live owner,

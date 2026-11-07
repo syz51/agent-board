@@ -213,7 +213,12 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
             .is_some_and(|o| live_owners.contains(o.as_str()));
         task.owner_stale = task.owner.is_some() && !owner_live;
         let waiting = task.not_before.is_some_and(|at| at > cx.now);
-        task.proposal = board_proto::is_pending_proposal(task.status, task.auto, &task.body);
+        task.proposal = board_proto::is_pending_proposal(
+            task.status,
+            task.auto,
+            &task.body,
+            with_feedback.contains(task.id.as_str()),
+        );
         task.ready = task.status == TaskStatus::Open
             && all_done
             && !owner_live

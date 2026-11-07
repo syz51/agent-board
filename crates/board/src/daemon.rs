@@ -1840,11 +1840,10 @@ fn no_project(board: &Board) -> String {
     )
 }
 
-/// A pending proposal (`board_proto::is_pending_proposal`; prompts/coordinator.md
-/// "Proposals"). Its filing wakes the coordinator to review it. Derived here rather than
-/// read from `Task::proposal`, which servers before it do not send.
+/// A pending proposal (prompts/coordinator.md "Proposals"). Its filing wakes the
+/// coordinator to review it.
 fn is_proposal(task: &board_proto::Task) -> bool {
-    board_proto::is_pending_proposal(task.status, task.auto, &task.body)
+    task.is_pending_proposal()
 }
 
 fn priority(p: &Priority) -> String {

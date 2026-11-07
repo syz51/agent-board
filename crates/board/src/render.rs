@@ -102,11 +102,12 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
             line.push_str(" (stale)");
         }
     }
-    if task.ready {
-        line.push_str(" ready");
-    }
-    if task.proposal {
+    // From the task's fields, not `proposal`: servers that predate it send none and call a
+    // pending proposal ready.
+    if task.is_pending_proposal() {
         line.push_str(" proposal");
+    } else if task.ready {
+        line.push_str(" ready");
     }
     if !task.blockers.is_empty() {
         let ids: Vec<&str> = task.blockers.iter().map(|b| b.as_str()).collect();

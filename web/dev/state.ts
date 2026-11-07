@@ -568,9 +568,13 @@ export class DevState {
   private toTask(task: Fixtures["tasks"][number]): Task {
     const done = (id: string) => this.data.tasks.find((item) => item.id === id)?.status === "done";
     const owner = this.data.agents.find((item) => item.id === task.owner);
-    // `is_pending_proposal` in crates/board-proto/src/model.rs.
+    // The dev server stands in for the Rust one, so it mirrors `is_pending_proposal` in
+    // crates/board-proto/src/model.rs; the web view itself only reads `proposal`.
     const proposal =
-      task.status === "open" && !task.auto && task.body.trimStart().startsWith("Proposal:");
+      task.status === "open" &&
+      !task.auto &&
+      task.feedback === null &&
+      task.body.trimStart().startsWith("Proposal:");
     return {
       ...task,
       owner_stale: owner !== undefined && this.stale(owner),

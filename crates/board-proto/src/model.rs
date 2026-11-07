@@ -83,11 +83,17 @@ pub fn is_proposal_body(body: &str) -> bool {
     body.trim_start().starts_with(PROPOSAL_PREFIX)
 }
 
-/// A pending proposal: open, not `auto`, with a proposal body. It is not ready and cannot
-/// be claimed; another agent records a `verdict:` note, and an accept sets `auto`, which
-/// makes it work.
-pub fn is_pending_proposal(status: TaskStatus, auto: bool, body: &str) -> bool {
-    status == TaskStatus::Open && !auto && is_proposal_body(body)
+/// A proposal not yet accepted: not `auto`, with a proposal body, and not a feedback item
+/// (whose body is a reporter's text, triaged instead). It cannot move to `doing`; another
+/// agent records a `verdict:` note, and an accept sets `auto`, which makes it work.
+pub fn is_unaccepted_proposal(auto: bool, body: &str, feedback: bool) -> bool {
+    !auto && !feedback && is_proposal_body(body)
+}
+
+/// A pending proposal: an [unaccepted proposal](is_unaccepted_proposal) that is open. It
+/// is not ready and cannot be claimed.
+pub fn is_pending_proposal(status: TaskStatus, auto: bool, body: &str, feedback: bool) -> bool {
+    status == TaskStatus::Open && is_unaccepted_proposal(auto, body, feedback)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -131,7 +137,8 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
     /// May the coordinator start this task without the user? Defaults to true on autopilot
-    /// boards; false is only for tasks the user must do or decide.
+    /// boards; false is for tasks the user must do or decide, and for proposals until an
+    /// accept verdict (the server stores a new proposal with false).
     pub auto: bool,
     pub created_by: AgentId,
     /// Incremented on every change; updates must send the version they read.
@@ -147,6 +154,14 @@ pub struct Task {
     /// servers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+impl Task {
+    /// [`is_pending_proposal`] from the task's own fields. Clients use it rather than
+    /// `proposal`, which servers that predate it never send.
+    pub fn is_pending_proposal(&self) -> bool {
+        is_pending_proposal(self.status, self.auto, &self.body, self.feedback.is_some())
+    }
 }
 
 /// What the reporter was doing when a setup cost it a step.
@@ -472,18 +487,20 @@ mod tests {
 
     #[test]
     fn a_pending_proposal_is_open_not_auto_with_a_proposal_body() {
+        use TaskStatus::{Blocked, Open};
         assert!(is_proposal_body("Proposal: cache builds"));
         assert!(is_proposal_body("\n  Proposal: cache builds"));
         assert!(!is_proposal_body("Fix it. Proposal: later"));
         assert!(!is_proposal_body("proposal: lower case"));
-        assert!(is_pending_proposal(TaskStatus::Open, false, " Proposal: x"));
-        assert!(!is_pending_proposal(TaskStatus::Open, true, "Proposal: x"));
-        assert!(!is_pending_proposal(
-            TaskStatus::Doing,
-            false,
-            "Proposal: x"
-        ));
-        assert!(!is_pending_proposal(TaskStatus::Open, false, "Ship it"));
+        assert!(is_pending_proposal(Open, false, " Proposal: x", false));
+        assert!(!is_pending_proposal(Open, true, "Proposal: x", false));
+        assert!(!is_pending_proposal(Blocked, false, "Proposal: x", false));
+        assert!(!is_pending_proposal(Open, false, "Ship it", false));
+        // A feedback item is triaged, whatever its reporter wrote.
+        assert!(!is_pending_proposal(Open, false, "Proposal: x", true));
+        // A blocked proposal is not pending, but still not accepted.
+        assert!(is_unaccepted_proposal(false, "Proposal: x", false));
+        assert!(!is_unaccepted_proposal(true, "Proposal: x", false));
     }
 
     /// Servers that predate `proposal` send none: it reads as false, and old clients

@@ -83,8 +83,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   never the title, so a real board is never removed by accident. Ids are never reused: a
   slug created again continues its task numbering, and ask ids are not handed out again.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
-  computed when read (open, all blockers done, no live owner, `not_before` passed), never
-  stored. Done requires
+  computed when read (open, all blockers done, no live owner, `not_before` passed, not a
+  pending proposal), never stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact), and may carry a
   `summary` for the user: what changed and what they should know or decide. Reopening
   clears it. `auto` says whether
@@ -494,8 +494,10 @@ agrees, after checking it.
   coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
   The server enforces the gate, with one definition in `board-proto`
   (`is_pending_proposal`): it stores a new proposal with `auto=false` whatever was asked,
-  refuses to create it claimed, keeps it out of `ready` and refuses claims until an accept
-  sets `auto`, and lists it apart from ready work in snapshots (`Task.proposal`, API.md).
+  refuses to create it claimed, keeps it out of `ready` and out of `doing` (by claim or by a
+  status change) until an accept sets `auto`, and lists it apart from ready work in
+  snapshots, with who filed it (`Task.proposal`, API.md). Feedback items are triaged
+  instead, whatever their text.
 - **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
   its board at the start of its loop; its own go to a reviewer child briefed with the
   evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs

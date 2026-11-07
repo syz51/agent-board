@@ -1652,14 +1652,35 @@ async fn a_pending_proposal_waits_for_a_verdict_before_it_is_work() {
     assert_eq!(others.as_array().unwrap().len(), 1);
     assert_eq!(others[0]["id"], work.as_str());
 
-    // Claiming it is refused with what to do instead.
-    let (s, v) = t.claim(B, &proposal).await;
+    // Claiming it is refused like other work that is not ready yet, and the hint does not
+    // tell the claimant, who may be the proposer, to accept it itself.
+    let (s, v) = t.claim(A, &proposal).await;
     assert_eq!(
         (s.as_u16(), v["code"].as_str()),
-        (409, Some("claim_refused")),
+        (400, Some("invalid_transition")),
         "{v}"
     );
-    assert!(v["next"].as_str().unwrap().contains("verdict"), "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(next.contains("pick other ready work"), "{v}");
+    assert!(next.contains("did not file it"), "{v}");
+    assert!(!next.contains("auto=true"), "{v}");
+    // Nor can it reach doing through blocked.
+    let (s, v) = t
+        .patch(
+            A,
+            &proposal,
+            json!({ "status": "blocked", "blocked_reason": "parked" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.patch(A, &proposal, json!({ "status": "doing" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let (s, v) = t.patch(A, &proposal, json!({ "status": "open" })).await;
+    assert!(s.is_success(), "{v}");
 
     // An accept sets auto: then it is ready work and claimable.
     let (s, v) = t.patch(B, &proposal, json!({ "auto": true })).await;

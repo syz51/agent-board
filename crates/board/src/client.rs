@@ -396,7 +396,12 @@ impl Client {
     // Tasks
 
     pub async fn tasks(&self, q: &TaskQuery) -> Result<Vec<Task>> {
-        self.get_query("/v1/tasks", q).await
+        let mut tasks: Vec<Task> = self.get_query("/v1/tasks", q).await?;
+        // Servers that predate the `proposal` filter ignore it and return every task.
+        if let Some(want) = q.proposal {
+            tasks.retain(|t| t.is_pending_proposal() == want);
+        }
+        Ok(tasks)
     }
 
     pub async fn create_task(&self, body: &CreateTask) -> Result<Task> {

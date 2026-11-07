@@ -645,15 +645,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         ));
     }
     if task.proposal {
-        return Err(refused(
-            format!(
-                "{id} is a pending proposal: it becomes work only once another agent accepts it"
-            ),
-            format!(
-                "record a verdict first (task_note {id} kind=decision \"verdict: accept ...; or merge, decline, escalate\"); \
-                 an accept sets auto (task_update {id} auto=true), then claim it"
-            ),
-        ));
+        return Err(unaccepted_proposal(id));
     }
     check_blockers_done(cx, id)?;
     check_not_before(cx, &task)?;
@@ -886,6 +878,18 @@ fn check_handover(
 }
 
 /// How to take a stale owner's task, through MCP or the CLI.
+/// The refusal of an unaccepted proposal moving to doing. The hint keeps the claimant,
+/// who may be the proposer, from accepting it itself.
+fn unaccepted_proposal(id: &TaskId) -> Error {
+    bad_transition(
+        format!(
+            "{id} is a proposal not yet accepted: it becomes work only once another agent accepts it"
+        ),
+        "pick other ready work (task_list ready=true); an agent that did not file it reviews it \
+         with a `verdict:` decision note, and an accept sets auto",
+    )
+}
+
 fn take_hint(id: &TaskId) -> String {
     format!("task_claim {id} take=true, or board take {id}")
 }
@@ -991,6 +995,17 @@ pub(crate) fn update(
             ));
         }
         require_status_rights(cx, &task, agent, by_user, "move")?;
+        // The proposal gate holds on every way into doing, not only claim: a proposal
+        // moved to blocked and on to doing is still unaccepted.
+        if to == TaskStatus::Doing
+            && board_proto::is_unaccepted_proposal(
+                req.auto.unwrap_or(task.auto),
+                req.body.as_deref().unwrap_or(&task.body),
+                task.feedback.is_some(),
+            )
+        {
+            return Err(unaccepted_proposal(id));
+        }
         match to {
             // Open means unowned, whatever it was before.
             TaskStatus::Open => owner = None,

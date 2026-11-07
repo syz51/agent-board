@@ -262,8 +262,8 @@ Reopening a closed board, or any change on it, starts the period again.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
-  `not_before` has not passed. A pending proposal is refused with 409 `claim_refused`
-  until a verdict sets it `auto`. A claim
+  `not_before` has not passed. A pending proposal is refused the same way, with 400
+  `invalid_transition`, until a verdict sets it `auto`. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
   board coordinator or user only (as status changes below).
@@ -300,13 +300,20 @@ Moving it to `doing` makes the caller the owner, within the caller's `doing` lim
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
 `owner` and `previous_owner`.
 
-Pending proposals: a task is one while it is `open`, not `auto`, and its body starts
-`Proposal:` after leading whitespace (`board_proto::is_pending_proposal`, one definition
-for the server, the daemon and the web view). `Task.proposal` says so; it is computed when
-read and absent from servers that predate it (read it as `false`). A pending proposal is
-never `ready`, cannot be claimed, and the snapshot lists it under `proposals`, apart from
-ready work. It becomes work when another agent records a `verdict:` note and an accept sets
-`auto` (`DESIGN.md`, "Proposals and triage").
+Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
+body is a reporter's text, triaged instead), and its body starts `Proposal:` after leading
+whitespace (`board_proto::is_pending_proposal`, one definition for the server, the daemon,
+the CLI and the web view). The rule reads the task as it is now: an edit that sets `auto`
+or removes the prefix ends it. `Task.proposal` says so; it is computed when read and absent
+from servers that predate it (clients apply the rule to the task's fields instead). A
+pending proposal is never `ready` and cannot be claimed. No other path takes an
+unaccepted proposal (not `auto`, with the prefix, whatever its status) into `doing`:
+`PATCH` to `doing`, from `blocked` say, is refused with 400 `invalid_transition` unless
+the same request sets `auto`. The snapshot lists pending proposals under `proposals`,
+apart from ready work, with who filed each (an agent does not review its own); one held by
+a `not_before` still ahead is listed under `waiting` instead. A proposal becomes work when
+another agent records a `verdict:` note and an accept sets `auto` (`DESIGN.md`,
+"Proposals and triage").
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
 exist and must not form a cycle; they may be on any board. A task is not `ready`, and
