@@ -251,13 +251,13 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 font-serif text-[18px] leading-snug font-semibold">
+      <div className="flex min-w-0 items-center gap-x-2.5 [&>:not(.ident)]:shrink-0">
+        <h2 className="max-w-full font-serif text-[18px] leading-snug font-semibold">
           <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
             {board.title}
           </Link>
         </h2>
-        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
+        <span className="ident min-w-0 truncate text-meta text-muted-foreground">{board.slug}</span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}

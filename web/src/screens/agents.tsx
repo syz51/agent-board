@@ -95,7 +95,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="divide-y border-t border-foreground/80">
+            <div className="divide-y">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}

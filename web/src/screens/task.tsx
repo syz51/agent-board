@@ -119,7 +119,7 @@ function TaskView({
   return (
     <article>
       <header className="mb-9">
-        <h1 className="max-w-[30ch] font-serif text-display font-semibold tracking-[-0.012em] text-balance max-md:text-display-phone">
+        <h1 className="font-serif text-display font-semibold tracking-[-0.012em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
@@ -130,12 +130,12 @@ function TaskView({
         </p>
       </header>
 
-      <div className="grid gap-9 lg:grid-cols-[minmax(0,1fr)_224px] lg:items-start lg:gap-10">
+      <div className="grid gap-9 lg:grid-cols-[minmax(0,1fr)_248px] lg:items-start lg:gap-10">
         <aside
           className="order-2 grid gap-5 border-t pt-5 lg:sticky lg:top-24 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-6"
           aria-label="Properties"
         >
-          <Facts className="gap-3.5 text-meta [&_dt]:text-xs [&>div]:grid-cols-1 [&>div]:gap-0.5 max-lg:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
+          <Facts className="gap-3.5 text-meta [&_dt]:text-xs [&>div]:grid-cols-[84px_minmax(0,1fr)] max-lg:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
             <div>
               <dt>Status</dt>
               <dd>

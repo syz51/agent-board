@@ -245,7 +245,7 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 
 /** The task groups, one after another down the page like a document's sections. */
 export function TaskBoard({ children }: { children: ReactNode }) {
-  return <div className="grid gap-9">{children}</div>;
+  return <div className="grid gap-6">{children}</div>;
 }
 
 /** A group of tasks under a ruled serif heading with its count. */
@@ -267,7 +267,7 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex items-center gap-2 border-b border-foreground/80 pb-2 font-serif text-title font-semibold"
+        className="flex items-center gap-2 border-b border-foreground/80 pb-1.5 font-serif text-[17px] leading-snug font-semibold"
       >
         {heading}
         <span className="self-end pb-px font-sans text-meta font-medium text-muted-foreground tabular-nums">
