@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use board_proto::{
     AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX, TouchResult,
     Touches,
@@ -20,6 +22,41 @@ fn matcher(glob: &str) -> Option<GlobMatcher> {
         .build()
         .ok()
         .map(|g| g.compile_matcher())
+}
+
+/// How many delegations deep [`delegation_family`] follows, so a cycle of `t3_parent`
+/// ids ends.
+const DELEGATION_DEPTH: i64 = 8;
+
+/// The T3 threads that delegated `agent`, up the chain, and those it delegated, down every
+/// branch (each `t3_parent` native id names the thread that delegated it), without `agent`.
+/// A thread and those it delegates do one piece of work, so their edits and leases never
+/// overlap each other. Siblings are not family: parallel children can collide.
+pub(crate) fn delegation_family(cx: &Ctx<'_>, agent: &str) -> Result<HashSet<String>> {
+    let mut family: HashSet<String> = cx
+        .db
+        .prepare_cached(
+            "WITH RECURSIVE \
+             up(id, depth) AS ( \
+               SELECT ?1, 0 \
+               UNION \
+               SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
+               FROM agents a JOIN up ON a.id = up.id \
+               WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
+                 AND up.depth < ?2), \
+             down(id, depth) AS ( \
+               SELECT ?1, 0 \
+               UNION \
+               SELECT a.id, down.depth + 1 \
+               FROM agents a JOIN down \
+                 ON 't3:' || json_extract(a.native_ids, '$.t3_parent') = down.id \
+               WHERE down.depth < ?2) \
+             SELECT id FROM up UNION SELECT id FROM down",
+        )?
+        .query_map(params![agent, DELEGATION_DEPTH], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    family.remove(agent);
+    Ok(family)
 }
 
 /// Does `glob` cover the repo-relative `path`?
@@ -66,7 +103,7 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
         }
     }
     // Drop repeats anywhere in the list, keeping the first of each.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     req.globs.retain(|glob| seen.insert(glob.clone()));
     if let Some(ttl) = req.ttl_secs
         && (ttl == 0 || ttl > MAX_LEASE_SECS)
@@ -147,8 +184,12 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         )?);
     }
     let mut conflicts: Vec<Lease> = Vec::new();
+    let family = delegation_family(cx, req.agent.as_str())?;
     for lease in live_leases(cx, &req.repo)? {
-        if lease.agent == req.agent || !is_live(cx, lease.agent.as_str())? {
+        if lease.agent == req.agent
+            || !is_live(cx, lease.agent.as_str())?
+            || family.contains(lease.agent.as_str())
+        {
             continue;
         }
         if req.globs.iter().any(|g| globs_overlap(g, &lease.glob)) {
@@ -321,10 +362,11 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let family = delegation_family(cx, me.as_str())?;
     let window_start = cx.now_ms() - cx.s.touch_ms();
     for path in paths {
         for (agent, glob, at) in &leases {
-            if glob_matches(glob, path) && is_live(cx, agent)? {
+            if glob_matches(glob, path) && is_live(cx, agent)? && !family.contains(agent) {
                 out.push(Overlap {
                     path: path.clone(),
                     agent: parse_id(agent)?,
@@ -345,6 +387,9 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
             })?
             .collect::<rusqlite::Result<_>>()?;
         for (agent, at) in touches {
+            if family.contains(&agent) {
+                continue;
+            }
             out.push(Overlap {
                 path: path.clone(),
                 agent: parse_id(&agent)?,
