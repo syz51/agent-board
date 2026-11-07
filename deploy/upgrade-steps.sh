@@ -65,8 +65,9 @@ server-upgrade)
     [ "$(cat "$git_dir/agent-board-upgrade.lock/owner" 2>/dev/null)" = "$token" ] ||
         fail "this run no longer holds the upgrade lock in $clone: run again"
     data=$(dirname "$db")
-    [ -r "$data" ] && [ -w "$data" ] ||
+    if [ ! -r "$data" ] || [ ! -w "$data" ]; then
         fail "$(id -un) cannot read and write $data, where the backup goes: run the server steps as root"
+    fi
     git diff --quiet HEAD -- ||
         fail "$clone has local changes: commit or discard them, then run again (nothing was changed)"
     prev=$(git rev-parse HEAD)
