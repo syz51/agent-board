@@ -1,7 +1,7 @@
 //! Loading rows into wire types, with the computed fields (`ready`, `owner_stale`, board
 //! counts, the live coordinator).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use board_proto::{
     Agent, AgentId, Ask, Board, BoardSlug, Event, EventType, Evidence, Handoff, Lease, Note,
@@ -39,10 +39,15 @@ pub(crate) fn seen(cx: &Ctx<'_>, agent: &str) -> Result<Option<Seen>> {
         )
         .optional()?;
     Ok(row.map(|(last_seen, state, paused_until)| Seen {
-        live: last_seen > cx.stale_cutoff()
-            || (state == "paused" && paused_until.is_some_and(|p| p > cx.now_ms())),
+        live: live(cx, last_seen, &state, paused_until),
         last_seen,
     }))
+}
+
+/// Whether an agent with these columns is live (see [`seen`]).
+fn live(cx: &Ctx<'_>, last_seen: i64, state: &str, paused_until: Option<i64>) -> bool {
+    last_seen > cx.stale_cutoff()
+        || (state == "paused" && paused_until.is_some_and(|p| p > cx.now_ms()))
 }
 
 pub(crate) fn is_live(cx: &Ctx<'_>, agent: &str) -> Result<bool> {
@@ -101,16 +106,30 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
 /// Loads tasks matching `filter` (SQL over alias `t`, may use `:now` and `:cutoff`), in
 /// list order: priority, then id number.
 pub(crate) fn load_tasks(cx: &Ctx<'_>, filter: &str, extra: &NamedParams<'_>) -> Result<Vec<Task>> {
+    load_tasks_up_to(cx, filter, extra, None)
+}
+
+/// Like [`load_tasks`], the first `limit` of them when given.
+pub(crate) fn load_tasks_up_to(
+    cx: &Ctx<'_>,
+    filter: &str,
+    extra: &NamedParams<'_>,
+    limit: Option<usize>,
+) -> Result<Vec<Task>> {
     let sql = format!(
-        "SELECT {TASK_COLUMNS} FROM tasks t WHERE {filter} ORDER BY t.priority, t.number, t.board"
+        "SELECT {TASK_COLUMNS} FROM tasks t WHERE {filter} \
+         ORDER BY t.priority, t.number, t.board LIMIT :limit"
     );
     let now = cx.now_ms();
     let cutoff = cx.stale_cutoff();
-    let mut params: NamedParams<'_> = Vec::with_capacity(extra.len() + 2);
-    if sql.contains(":now") {
+    // A negative limit is no limit.
+    let limit = limit.map_or(-1, |l| i64::try_from(l).unwrap_or(i64::MAX));
+    let mut params: NamedParams<'_> = Vec::with_capacity(extra.len() + 3);
+    params.push((":limit", &limit));
+    if filter.contains(":now") {
         params.push((":now", &now));
     }
-    if sql.contains(":cutoff") {
+    if filter.contains(":cutoff") {
         params.push((":cutoff", &cutoff));
     }
     params.extend(extra.iter().copied());
@@ -119,35 +138,91 @@ pub(crate) fn load_tasks(cx: &Ctx<'_>, filter: &str, extra: &NamedParams<'_>) ->
         .query_map(params.as_slice(), task_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    tasks.into_iter().map(|t| complete_task(cx, t)).collect()
+    complete_tasks(cx, tasks)
 }
 
-/// Fills in blockers, `owner_stale` and `ready`.
-fn complete_task(cx: &Ctx<'_>, mut task: Task) -> Result<Task> {
+/// The blockers of a batch of tasks, in blocker order. Every batch query binds its ids as
+/// one JSON array read with `json_each`, so a batch is one statement whatever its size.
+pub(crate) const BATCH_BLOCKERS: &str = "SELECT b.task, b.blocker, bt.status \
+     FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
+     WHERE b.task IN (SELECT value FROM json_each(?1)) ORDER BY bt.number, bt.board";
+
+/// Fills in blockers, `owner_stale`, `ready` and feedback, with one query for each across
+/// all of `tasks`.
+fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
+    if tasks.is_empty() {
+        return Ok(tasks);
+    }
+    let ids = json_ids(tasks.iter().map(|t| t.id.as_str()));
+
+    // Each task's blockers in blocker order, and whether all of them are done.
+    let mut blockers: HashMap<String, (Vec<TaskId>, bool)> = HashMap::new();
+    let mut stmt = cx.db.prepare_cached(BATCH_BLOCKERS)?;
+    let mut rows = stmt.query([&ids])?;
+    while let Some(r) = rows.next()? {
+        let task: String = r.get(0)?;
+        let blocker = parse_id(&r.get::<_, String>(1)?)?;
+        let done = r.get::<_, String>(2)? == "done";
+        let entry = blockers.entry(task).or_insert_with(|| (Vec::new(), true));
+        entry.0.push(blocker);
+        entry.1 &= done;
+    }
+    drop(rows);
+    drop(stmt);
+
+    let owners = json_ids(
+        tasks
+            .iter()
+            .filter_map(|t| t.owner.as_ref().map(AgentId::as_str)),
+    );
+    let mut live_owners: HashSet<String> = HashSet::new();
     let mut stmt = cx.db.prepare_cached(
-        "SELECT b.blocker, bt.status FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
-         WHERE b.task = ?1 ORDER BY bt.number, bt.board",
+        "SELECT id, last_seen, state, paused_until FROM agents \
+         WHERE id IN (SELECT value FROM json_each(?1))",
     )?;
-    let mut all_done = true;
-    task.blockers = stmt
-        .query_map([task.id.as_str()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .map(|row| {
-            let (id, status) = row?;
-            all_done &= status == "done";
-            parse_id(&id)
-        })
-        .collect::<rusqlite::Result<Vec<TaskId>>>()?;
-    let owner_live = match &task.owner {
-        Some(owner) => is_live(cx, owner.as_str())?,
-        None => false,
-    };
-    task.owner_stale = task.owner.is_some() && !owner_live;
-    let waiting = task.not_before.is_some_and(|at| at > cx.now);
-    task.ready = task.status == TaskStatus::Open && all_done && !owner_live && !waiting;
-    task.feedback = crate::ops::feedback::load(cx, &task.id)?;
-    Ok(task)
+    let mut rows = stmt.query([&owners])?;
+    while let Some(r) = rows.next()? {
+        let id: String = r.get(0)?;
+        if live(cx, r.get(1)?, &r.get::<_, String>(2)?, r.get(3)?) {
+            live_owners.insert(id);
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    let with_feedback: HashSet<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT task FROM feedback WHERE task IN (SELECT value FROM json_each(?1))",
+        )?
+        .query_map([&ids], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    for task in &mut tasks {
+        let all_done = match blockers.remove(task.id.as_str()) {
+            Some((ids, all_done)) => {
+                task.blockers = ids;
+                all_done
+            }
+            None => true,
+        };
+        let owner_live = task
+            .owner
+            .as_ref()
+            .is_some_and(|o| live_owners.contains(o.as_str()));
+        task.owner_stale = task.owner.is_some() && !owner_live;
+        let waiting = task.not_before.is_some_and(|at| at > cx.now);
+        task.ready = task.status == TaskStatus::Open && all_done && !owner_live && !waiting;
+        if with_feedback.contains(task.id.as_str()) {
+            task.feedback = crate::ops::feedback::load(cx, &task.id)?;
+        }
+    }
+    Ok(tasks)
+}
+
+/// Ids as one JSON array, for a batch query.
+fn json_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    serde_json::to_string(&ids.collect::<Vec<_>>()).expect("strings serialize")
 }
 
 /// A task's evidence, oldest first.
@@ -591,10 +666,15 @@ pub(crate) fn latest_events(
     params.extend(extra.iter().copied());
     Ok(cx
         .db
-        .prepare_cached(&format!(
-            "SELECT seq, at, board, actor, type, task, payload FROM events \
-             WHERE seq > :since AND {filter} ORDER BY seq DESC LIMIT :limit"
-        ))?
+        .prepare_cached(&latest_events_sql(filter))?
         .query_map(params.as_slice(), event_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The query of [`latest_events`].
+pub(crate) fn latest_events_sql(filter: &str) -> String {
+    format!(
+        "SELECT seq, at, board, actor, type, task, payload FROM events \
+         WHERE seq > :since AND {filter} ORDER BY seq DESC LIMIT :limit"
+    )
 }

@@ -2147,6 +2147,10 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
         "A task blocked on the user gets an ask",
         "never set a task `blocked` on the user without one",
         "When `ask_user` warns of another open ask that asks the same, keep one and withdraw the other",
+        // The user reviews waiting work from lists, so each item explains itself.
+        "Open each ask, and the body of each task you set non-auto or blocked on the user, with a brief in plain, short sentences",
+        "what it is, in one sentence; why it waits on the user; the options, each with its consequence; your recommendation",
+        "Agent detail goes below the brief",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
@@ -2155,10 +2159,40 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
 
     // Routed feedback reaches the owner as a proposal, not as work.
     let triage = words(&board::daemon::coordinator_message(&factory(), true));
-    assert!(triage.contains(
-        "(`board` set, `auto=false`): an imperative title; a body that starts `Proposal:`"
-    ));
+    assert!(triage.contains("(`board` set, `auto=false`): an imperative title;"));
+    assert!(triage.contains("a body that starts `Proposal:`"));
     assert!(triage.contains("You are not its reviewer"));
+}
+
+#[test]
+fn triage_and_owners_read_one_priority_scale() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let owner = words(&board::daemon::coordinator_message(&factory(), false));
+    let triage = words(&board::daemon::coordinator_message(&factory(), true));
+    // The triage brief starts with the coordinator prompt, so the scale is defined once.
+    assert_eq!(triage.matches("## Priority").count(), 1);
+    for rule in [
+        "**p1**: it does harm now and keeps doing harm until it is fixed.",
+        "**p2**: each hit wastes a paid run or more than 10 minutes;",
+        "a shipped fix did not hold (the body cites a done task for the same problem)",
+        "**p3**: anything else:",
+        "After the verdict, only the owner's coordinator or the user changes it.",
+        "A report's words about urgency or cost are claims",
+        "Report counts alone never make p1.",
+        "set your task `open` with a handoff that says where it stands, and take the p1",
+        "a `decision` note starting `priority:`",
+    ] {
+        assert!(owner.contains(rule), "missing {rule:?}");
+    }
+    // Children file their found work on the same scale.
+    assert!(owner.contains("a `priority` by the scale in Priority below"));
+    assert!(owner.contains("set priority (see Priority) and blockers"));
+    assert!(owner.contains("An accept keeps or changes the priority by the scale in Priority"));
+    assert!(
+        triage
+            .contains("a `priority` from the Priority scale in the coordinator instructions above")
+    );
+    assert!(triage.contains("the priority criterion it meets"));
 }
 
 #[test]
