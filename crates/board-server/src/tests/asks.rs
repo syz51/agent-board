@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{T, USER};
+use super::{T, USER, defaults};
 
 const A: &str = "t3:alpha";
 
@@ -126,7 +126,7 @@ async fn ask_fields_are_validated() {
     let body = |question: &str, options: Vec<String>| json!({ "agent": A, "board": "factory", "kind": "action", "question": question, "options": options });
     for bad in [
         body("  ", vec![]),
-        body(&"q".repeat(1001), vec![]),
+        body(&"q".repeat(defaults().question_chars + 1), vec![]),
         body("ok?", (0..9).map(|i| i.to_string()).collect()),
         body("ok?", vec!["x".repeat(61)]),
         body("ok?", vec!["two\nlines".to_owned()]),

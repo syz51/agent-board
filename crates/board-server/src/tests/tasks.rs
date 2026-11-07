@@ -2,7 +2,7 @@ use board_proto::TaskStatus;
 use chrono::TimeDelta;
 use serde_json::{Value, json};
 
-use super::{REPO, T, check};
+use super::{REPO, T, check, defaults, stale_after};
 use crate::ops::tasks::transition_allowed;
 
 const A: &str = "t3:alpha";
@@ -309,7 +309,7 @@ async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
 
     // A stale owner's task is taken first, which is logged.
     let doing = task_in(&t, TaskStatus::Doing).await;
-    t.advance(TimeDelta::hours(25));
+    t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), None).await;
     let (s, v) = move_as(&t, B, false, &doing, "dropped").await;
     assert_eq!(s, 403, "{v}");
@@ -330,7 +330,7 @@ async fn take_refuses_an_open_task_while_a_blocker_is_open() {
     t.exec(&format!(
         "UPDATE tasks SET owner = '{A}' WHERE id = '{waiting}'"
     ));
-    t.advance(TimeDelta::hours(25));
+    t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), None).await;
     let take = |task: String| {
         let t = &t;
@@ -440,7 +440,7 @@ async fn done_requires_evidence() {
 
 #[tokio::test]
 async fn claims_follow_ownership_blockers_and_the_doing_limit() {
-    let t = setup().await;
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 1).await;
     let first = t.task(A, "factory", "First").await;
     let second = t.task(A, "factory", "Second").await;
     let waiting = t
@@ -539,7 +539,7 @@ async fn stale_owners_can_be_taken_over() {
     let id = t.task(A, "factory", "Long job").await;
     assert!(t.claim(A, &id).await.0.is_success());
 
-    t.advance(TimeDelta::hours(23));
+    t.advance(stale_after() - TimeDelta::hours(1));
     t.register(B, Some(REPO), Some("main")).await;
     assert_eq!(t.get_task(&id).await["owner_stale"], false);
     let (s, v) = t
@@ -554,7 +554,8 @@ async fn stale_owners_can_be_taken_over() {
         (s.as_u16(), v["code"].as_str()),
         (409, Some("claim_refused"))
     );
-    assert!(v["message"].as_str().unwrap().contains("24h"), "{v}");
+    let after = format!("after {}h unseen", stale_after().num_hours());
+    assert!(v["message"].as_str().unwrap().contains(&after), "{v}");
 
     t.advance(TimeDelta::hours(1) + TimeDelta::minutes(1));
     let task = t.get_task(&id).await;
@@ -600,7 +601,7 @@ async fn stale_owners_can_be_taken_over() {
     )
     .await;
     assert!(t.claim(B, &other).await.0.is_success());
-    let until = (t.state.now() + TimeDelta::hours(30)).to_rfc3339();
+    let until = (t.state.now() + stale_after() + TimeDelta::hours(6)).to_rfc3339();
     t.ok(
         "POST",
         &format!("/v1/agents/{B}/state"),
@@ -608,7 +609,7 @@ async fn stale_owners_can_be_taken_over() {
         Some(json!({ "state": "paused", "paused_until": until })),
     )
     .await;
-    t.advance(TimeDelta::hours(25));
+    t.advance(stale_after() + TimeDelta::hours(1));
     assert_eq!(t.get_task(&other).await["owner_stale"], false);
     t.advance(TimeDelta::hours(6));
     assert_eq!(t.get_task(&other).await["owner_stale"], true);
@@ -654,7 +655,7 @@ async fn ready_is_computed_from_blockers_and_owners() {
         "UPDATE tasks SET owner = '{B}' WHERE id = '{waiting}'"
     ));
     assert_eq!(t.get_task(&waiting).await["ready"], false);
-    t.advance(TimeDelta::hours(25));
+    t.advance(stale_after() + TimeDelta::hours(1));
     t.register(A, Some(REPO), Some("main")).await;
     assert_eq!(t.get_task(&waiting).await["ready"], true);
 
@@ -746,7 +747,7 @@ async fn blockers_stay_on_the_board_and_acyclic() {
 #[tokio::test]
 async fn titles_and_text_are_checked() {
     let t = setup().await;
-    for title in ["", "two\nlines", &"x".repeat(73)] {
+    for title in ["", "two\nlines", &"x".repeat(defaults().title_chars + 1)] {
         let (s, v) = t
             .call(
                 "POST",
@@ -768,7 +769,7 @@ async fn titles_and_text_are_checked() {
             &format!("/v1/tasks/{id}/notes"),
             Some(A),
             Some(json!({
-                "agent": A, "kind": "finding", "text": "x".repeat(281),
+                "agent": A, "kind": "finding", "text": "x".repeat(defaults().note_chars + 1),
             })),
         )
         .await;

@@ -1,7 +1,7 @@
 use chrono::TimeDelta;
 use serde_json::{Value, json};
 
-use super::{REPO, T};
+use super::{REPO, T, iso, lease_ttl, stale_after, start, touch_window};
 use crate::ops::leases::sweep_expired;
 
 const A: &str = "t3:alpha";
@@ -33,7 +33,7 @@ async fn overlapping_leases_report_live_peers() {
     t.register(B, Some(REPO), None).await;
     let first = lease(&t, A, &["crates/board-server/**"]).await;
     assert_eq!(first["conflicts"], json!([]));
-    assert_eq!(first["leases"][0]["expires_at"], "2026-11-06T12:45:00Z");
+    assert_eq!(first["leases"][0]["expires_at"], iso(start() + lease_ttl()));
 
     let second = lease(&t, B, &["crates/board-server/src/*.rs", "web/**"]).await;
     assert_eq!(second["leases"].as_array().unwrap().len(), 2);
@@ -50,9 +50,12 @@ async fn overlapping_leases_report_live_peers() {
     assert_eq!(disjoint["conflicts"], json!([]));
 
     // A stale holder does not conflict.
-    t.advance(TimeDelta::hours(25));
+    t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), None).await;
-    t.exec("UPDATE leases SET expires_at = expires_at + 100000000");
+    t.exec(&format!(
+        "UPDATE leases SET expires_at = expires_at + {}",
+        (stale_after() * 2).num_milliseconds()
+    ));
     let later = lease(&t, B, &["crates/board-server/src/lib.rs"]).await;
     assert_eq!(later["conflicts"], json!([]));
 }
@@ -65,13 +68,17 @@ async fn leases_renew_expire_and_release() {
     let id = lease(&t, A, &["src/**"]).await["leases"][0]["id"]
         .as_i64()
         .unwrap();
-    t.advance(TimeDelta::minutes(30));
+    let half = TimeDelta::seconds(lease_ttl().num_seconds() / 2);
+    t.advance(half);
     // Re-leasing the same glob renews the same lease.
     let renewed = lease(&t, A, &["src/**"]).await;
     assert_eq!(renewed["leases"][0]["id"], id);
-    assert_eq!(renewed["leases"][0]["expires_at"], "2026-11-06T13:15:00Z");
+    assert_eq!(
+        renewed["leases"][0]["expires_at"],
+        iso(start() + half + lease_ttl())
+    );
     // A touch in the repo renews it too.
-    t.advance(TimeDelta::minutes(30));
+    t.advance(half);
     t.ok(
         "POST",
         "/v1/touches",
@@ -82,7 +89,7 @@ async fn leases_renew_expire_and_release() {
     )
     .await;
     assert_eq!(sweep(&t), 0);
-    t.advance(TimeDelta::minutes(44));
+    t.advance(lease_ttl() - TimeDelta::minutes(1));
     assert_eq!(sweep(&t), 0);
     assert_eq!(
         lease(&t, B, &["src/main.rs"]).await["conflicts"]
@@ -190,8 +197,8 @@ async fn touches_report_peer_leases_and_recent_touches() {
     assert_eq!(overlaps[1]["at"], "2026-11-06T12:00:00Z");
     assert!(overlaps[0]["handle"].as_str().unwrap().starts_with("t3:"));
 
-    // Touches older than the window do not count; the lease (renewed by A) still does.
-    t.advance(TimeDelta::minutes(61));
+    // Once the touch is older than the window and A's lease has expired, nothing overlaps.
+    t.advance(touch_window().max(lease_ttl()) + TimeDelta::minutes(1));
     let overlaps = touch(B, &["src/parse.rs"]).await["overlaps"].clone();
     assert_eq!(
         overlaps,
