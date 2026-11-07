@@ -860,3 +860,52 @@ fn sweep_quiet_reviews(t: &T) -> usize {
         )
         .unwrap()
 }
+
+#[tokio::test]
+async fn snapshots_list_pending_proposals_apart_from_ready_work() {
+    let t = T::new();
+    let me = t.register("t3:alpha", Some(REPO), None).await;
+    let handle = me["handle"].as_str().unwrap();
+    t.board("factory", &[REPO]).await;
+    t.task_with(
+        "t3:alpha",
+        json!({ "board": "factory", "title": "Ordinary", "auto": true }),
+    )
+    .await;
+    t.task_with(
+        "t3:alpha",
+        json!({ "board": "factory", "title": "Cache builds", "body": "Proposal: cache them." }),
+    )
+    .await;
+    // A proposal held by a date waits, with its time, like other held work.
+    let later = super::iso(t.state.now() + chrono::TimeDelta::days(3));
+    t.task_with(
+        "t3:alpha",
+        json!({ "board": "factory", "title": "Later idea", "body": "Proposal: later.",
+                "not_before": later }),
+    )
+    .await;
+    let full = snapshot(&t, "t3:alpha", "").await;
+    let text = text(&full);
+    assert!(text.contains("ready 1"), "{text}");
+    assert!(
+        text.contains("ready (1):\n  factory-1 p2 \"Ordinary\"\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            &format!("proposals to review (1), not ready work:\n  factory-2 p2 \"Cache builds\" by {handle}\n")
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("waiting (1):\n  factory-3 p2 \"Later idea\" until "),
+        "{text}"
+    );
+    let yaml = snapshot(&t, "t3:alpha", "format=yaml").await;
+    let yaml = yaml["text"].as_str().unwrap();
+    assert!(
+        yaml.contains(&format!("proposals:\n  total: 1\n  items:\n    - {{id: factory-2, priority: p2, title: \"Cache builds\", by: \"{handle}\"}}")),
+        "{yaml}"
+    );
+}

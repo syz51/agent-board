@@ -141,7 +141,16 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "ready",
-                    b("Only ready tasks (open, blockers done, no live owner, not_before passed)."),
+                    b(
+                        "Only ready tasks (open, blockers done, no live owner, not_before passed, not a pending proposal).",
+                    ),
+                    false,
+                ),
+                (
+                    "proposals",
+                    b(
+                        "Only pending proposals: open, not auto, a body starting \"Proposal:\"; they wait for another agent's verdict.",
+                    ),
                     false,
                 ),
                 ("mine", b("Only tasks you own."), false),
@@ -205,7 +214,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "auto",
                     b(
-                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide, or for a proposal (a body starting \"Proposal:\") until another agent accepts it; waiting on a task is a blocker.",
+                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide; waiting on a task is a blocker. A proposal (a body starting \"Proposal:\") is always stored not auto until another agent accepts it.",
                     ),
                     false,
                 ),
@@ -647,6 +656,7 @@ impl BoardMcp {
                     status: a.status,
                     owner: a.owner,
                     ready: a.ready.then_some(true),
+                    proposal: a.proposals.then_some(true),
                     mine: a.mine.then_some(true),
                     limit: a.limit,
                 };
@@ -787,6 +797,8 @@ struct ListArgs {
     owner: Option<AgentId>,
     #[serde(default)]
     ready: bool,
+    #[serde(default)]
+    proposals: bool,
     #[serde(default)]
     mine: bool,
     limit: Option<u32>,

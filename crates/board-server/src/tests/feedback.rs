@@ -774,3 +774,23 @@ async fn deleting_the_feedback_board_deletes_its_items() {
     assert_eq!(again["duplicate"], false);
     assert_eq!(again["task"]["id"], "board-feedback-2", "numbers continue");
 }
+
+#[tokio::test]
+async fn a_report_worded_as_a_proposal_is_still_triaged() {
+    let t = setup().await;
+    let item = report(
+        &t,
+        A,
+        json!({ "about": "Board", "text": "Proposal: make the hook quieter.", "activity": "build" }),
+    )
+    .await;
+    let id = item["task"]["id"].as_str().unwrap().to_owned();
+    // The reporter's wording does not make the item a pending proposal: triage claims it.
+    let task = t.get_task(&id).await;
+    assert_eq!(
+        (&task["proposal"], &task["ready"]),
+        (&json!(false), &json!(true)),
+        "{task}"
+    );
+    assert!(t.claim(B, &id).await.0.is_success());
+}

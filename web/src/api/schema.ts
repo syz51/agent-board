@@ -14,6 +14,7 @@ import {
   record,
   string,
   timestamp,
+  withDefault,
 } from "./decode.ts";
 
 export const TASK_STATUSES = ["open", "doing", "blocked", "review", "done", "dropped"] as const;
@@ -88,6 +89,11 @@ export const task = object({
   owner_stale: boolean,
   blockers: array(string),
   ready: boolean,
+  /**
+   * A pending proposal: open, not `auto`, with a body starting `Proposal:`. Agents review it
+   * with a `verdict:` note; it is never ready work.
+   */
+  proposal: withDefault(boolean, false),
   /** Not ready before this time; the server clears it once passed. */
   not_before: nullable(timestamp),
   auto: boolean,

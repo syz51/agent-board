@@ -90,6 +90,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
             .map(|o| parse_id(&o))
             .transpose()?,
         owner_stale: false,
+        proposal: false,
         blockers: Vec::new(),
         ready: false,
         not_before: r.get::<_, Option<i64>>(15)?.map(ts),
@@ -212,7 +213,17 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
             .is_some_and(|o| live_owners.contains(o.as_str()));
         task.owner_stale = task.owner.is_some() && !owner_live;
         let waiting = task.not_before.is_some_and(|at| at > cx.now);
-        task.ready = task.status == TaskStatus::Open && all_done && !owner_live && !waiting;
+        task.proposal = board_proto::is_pending_proposal(
+            task.status,
+            task.auto,
+            &task.body,
+            with_feedback.contains(task.id.as_str()),
+        );
+        task.ready = task.status == TaskStatus::Open
+            && all_done
+            && !owner_live
+            && !waiting
+            && !task.proposal;
         if with_feedback.contains(task.id.as_str()) {
             task.feedback = crate::ops::feedback::load(cx, &task.id)?;
         }

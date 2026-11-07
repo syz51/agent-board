@@ -83,6 +83,10 @@ struct Model {
     /// Open tasks held by a `not_before` that has not passed, soonest first.
     #[serde(skip_serializing_if = "Option::is_none")]
     waiting: Option<WaitingList>,
+    /// Pending proposals on the board: they wait for an agent's verdict and are not ready
+    /// work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposals: Option<Ready>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recent: Vec<Recent>,
 }
@@ -190,6 +194,9 @@ struct TaskLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<&'static str>,
     title: String,
+    /// Who filed it: shown for proposals, which the filer must not review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -253,6 +260,7 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
         peers: Vec::new(),
         ready: None,
         waiting: None,
+        proposals: None,
         recent: Vec::new(),
     };
     let shown_now = board
@@ -474,6 +482,11 @@ fn fill_full(
     )?
     .into_iter()
     .partition(|t| t.ready);
+    // A proposal held by a `not_before` still ahead is listed under waiting, with its time.
+    let (proposals, held): (Vec<Task>, Vec<Task>) = held
+        .into_iter()
+        .partition(|t| t.proposal && t.not_before.is_none_or(|at| at <= cx.now));
+    model.proposals = task_list(cx, &proposals, true)?;
     let mut waiting: Vec<(board_proto::Timestamp, Task)> = held
         .into_iter()
         .filter_map(|t| t.not_before.filter(|at| *at > cx.now).map(|at| (at, t)))
@@ -494,24 +507,37 @@ fn fill_full(
                 .collect(),
         });
     }
-    if !ready.is_empty() {
-        model.ready = Some(Ready {
-            total: ready.len() as u32,
-            items: ready
-                .iter()
-                .take(cx.s.snapshot_ready_items)
-                .map(|t| TaskLine {
-                    id: t.id.to_string(),
-                    status: None,
-                    priority: Some(priority_str(t.priority)),
-                    title: title(&t.title),
-                })
-                .collect(),
-        });
-    }
+    model.ready = task_list(cx, &ready, false)?;
 
     model.recent = recent(cx, agent, board, model.seq)?;
     Ok(())
+}
+
+/// The first `snapshot_ready_items` of `tasks` with the total, or `None` when empty; `by`
+/// adds who filed each.
+fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    let items = tasks
+        .iter()
+        .take(cx.s.snapshot_ready_items)
+        .map(|t| {
+            Ok(TaskLine {
+                id: t.id.to_string(),
+                status: None,
+                priority: Some(priority_str(t.priority)),
+                title: title(&t.title),
+                by: by
+                    .then(|| handle_of(cx, t.created_by.as_str()))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Some(Ready {
+        total: tasks.len() as u32,
+        items,
+    }))
 }
 
 /// A peer's current task: its task in `doing`, else the task it changed last (closed
@@ -533,6 +559,7 @@ fn peer_task(cx: &Ctx<'_>, peer: &AgentId) -> Result<Option<TaskLine>> {
         status: Some(status_str(t.status)),
         priority: None,
         title: title(&t.title),
+        by: None,
     }))
 }
 
@@ -1241,6 +1268,13 @@ fn cut_last(m: &mut Model) -> bool {
     if m.recent.pop().is_some() {
         return true;
     }
+    if let Some(proposals) = &mut m.proposals {
+        proposals.items.pop();
+        if proposals.items.is_empty() {
+            m.proposals = None;
+        }
+        return true;
+    }
     if let Some(waiting) = &mut m.waiting {
         waiting.items.pop();
         if waiting.items.is_empty() {
@@ -1439,6 +1473,24 @@ fn render_lines(m: &Model) -> String {
             );
         }
     }
+    if let Some(p) = &m.proposals {
+        let shown = if p.items.len() < p.total as usize {
+            format!("{} of {}", p.items.len(), p.total)
+        } else {
+            p.total.to_string()
+        };
+        let _ = writeln!(o, "proposals to review ({shown}), not ready work:");
+        for t in &p.items {
+            let _ = writeln!(
+                o,
+                "  {} {} {} by {}",
+                t.id,
+                t.priority.unwrap_or(""),
+                quote(&t.title),
+                t.by.as_deref().unwrap_or("")
+            );
+        }
+    }
     if !m.recent.is_empty() {
         o.push_str("recent:\n");
         for e in &m.recent {
@@ -1556,6 +1608,19 @@ fn render_yaml(m: &Model) -> String {
                 t.priority,
                 q(&t.title),
                 q(&t.until)
+            );
+        }
+    }
+    if let Some(p) = &m.proposals {
+        let _ = writeln!(o, "proposals:\n  total: {}\n  items:", p.total);
+        for t in &p.items {
+            let _ = writeln!(
+                o,
+                "    - {{id: {}, priority: {}, title: {}, by: {}}}",
+                t.id,
+                t.priority.unwrap_or(""),
+                q(&t.title),
+                q(t.by.as_deref().unwrap_or(""))
             );
         }
     }
