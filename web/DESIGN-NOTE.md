@@ -11,8 +11,7 @@ and white raised cards for boards, tasks and agents, with task groups laid out a
 - **Board as columns**: each status group is a tinted lane with its count, holding one
   card per task (status and title, then id, priority, owner and last update). Lanes sit
   side by side in one row that scrolls sideways, takes keyboard focus and fades at its
-  right edge while more lanes lie off screen; on a
-  phone they stack.
+  right edge while more lanes lie off screen; on a phone they stack.
 - **Boards as cards**: a grid of board cards, three across on a wide screen: name and
   slug, goal, the task bar with counts in words, coordinator and asks, autopilot at the
   foot.
