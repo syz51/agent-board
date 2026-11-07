@@ -289,6 +289,95 @@ fn post_tool_use_records_touches_warns_on_overlap_and_throttles_heartbeats() {
 }
 
 #[test]
+fn post_tool_use_with_nothing_to_send_skips_the_server_and_the_keychain() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 20),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    // The token comes from the Keychain, through a `security` that logs each run and finds
+    // nothing, then from the file.
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = e.home.join("security.log");
+    let security = bin.join("security");
+    std::fs::write(
+        &security,
+        format!("#!/bin/sh\necho run >> '{}'\nexit 44\n", log.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(e.home.join("token"), format!("{TOKEN}\n")).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let keychain = [
+        ("PATH", path.as_str()),
+        ("BOARD_TOKEN", ""),
+        ("BOARD_KEYCHAIN", "1"),
+    ];
+    let runs = || {
+        std::fs::read_to_string(&log)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    let post = |tool: Value| {
+        let (_, text) = e.hook_env(
+            "post-tool-use",
+            "claude",
+            e.with("PostToolUse", tool),
+            &keychain,
+        );
+        text
+    };
+
+    // The first call in a minute heartbeats.
+    post(json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}));
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 1);
+    let looked_up = runs();
+    if cfg!(target_os = "macos") {
+        assert_eq!(looked_up, 1, "the heartbeat needs the token");
+    }
+
+    // Within the minute, a read and a shell call that changed nothing send nothing.
+    e.stub.clear();
+    assert_eq!(
+        post(json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}})),
+        ""
+    );
+    let shell =
+        json!({"tool_name": "Bash", "tool_use_id": "toolu_quiet", "tool_input": {"command": "ls"}});
+    e.hook_env(
+        "pre-tool-use",
+        "claude",
+        e.with("PreToolUse", shell.clone()),
+        &keychain,
+    );
+    assert_eq!(post(shell), "");
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
+    assert_eq!(
+        runs(),
+        looked_up,
+        "no Keychain lookup without a server call"
+    );
+
+    // An edit still reports its file.
+    std::fs::write(e.repo.join("README.md"), "x").unwrap();
+    post(json!({"tool_name": "Write", "tool_input": {"file_path": e.repo.join("README.md")}}));
+    assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 1);
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 0);
+}
+
+#[test]
 fn edit_tool_touches_carry_the_files_modification_time() {
     let e = env();
     e.agent_ok();
@@ -589,6 +678,51 @@ fn session_start_prunes_old_shell_marks_outside_t3_and_without_login() {
         .collect();
     assert_eq!(left.len(), 1, "{left:?}");
     assert!(left[0].to_string_lossy().contains("toolu_5fnew"));
+}
+
+#[test]
+fn session_start_prunes_agent_files_untouched_for_a_week() {
+    let (e, start) = cached_env();
+    let backdate = |path: &std::path::Path, days: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600))
+            .unwrap();
+    };
+    let gone = ["t3_3agone.json", "codex_3agone.json"];
+    let recent = "claude_3arecent.json";
+    for dir in ["state", "cache"] {
+        for name in gone.iter().chain([&recent]) {
+            std::fs::write(e.home.join(dir).join(name), "{}").unwrap();
+        }
+        for name in gone {
+            backdate(&e.home.join(dir).join(name), 8);
+        }
+        backdate(&e.home.join(dir).join(recent), 6);
+    }
+    // Named state files are not an agent's, however old.
+    std::fs::write(e.home.join("state/watch.json"), "{}").unwrap();
+    backdate(&e.home.join("state/watch.json"), 30);
+
+    let (reply, _) = e.hook("session-start", "claude", start);
+    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    for dir in ["state", "cache"] {
+        let mut left: Vec<String> = std::fs::read_dir(e.home.join(dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        left.sort();
+        // This agent's own files, written by the SessionStart that pruned.
+        let mut want = vec![recent.to_owned(), format!("claude_3a{SESSION}.json")];
+        if dir == "state" {
+            want.push("watch.json".into());
+        }
+        want.sort();
+        assert_eq!(left, want, "{dir}");
+    }
 }
 
 #[test]
@@ -1350,8 +1484,8 @@ fn pre_compact_keeps_the_agent_and_task_ids() {
     );
 }
 
-#[test]
-fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
+/// An env whose agent has a cached full snapshot (seq 812) from a first `SessionStart`.
+fn cached_env() -> (Env, Value) {
     let e = env();
     e.stub.on(
         "POST /v1/agents",
@@ -1363,50 +1497,134 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
     );
     let start = e.with("SessionStart", json!({"source": "startup"}));
     e.hook("session-start", "claude", start.clone());
+    (e, start)
+}
 
-    e.stub.hang(Duration::from_secs(10));
+fn breaker(e: &Env) -> Value {
+    std::fs::read(e.home.join("state/offline.json"))
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or(Value::Null)
+}
+
+/// Runs a hook and returns its reply and how long it took.
+fn timed(e: &Env, event: &str, payload: &Value) -> (Option<Value>, Duration) {
     let began = Instant::now();
-    let (reply, _) = e.hook("session-start", "claude", start.clone());
-    let elapsed = began.elapsed();
+    let (reply, _) = e.hook(event, "claude", payload.clone());
+    (reply, began.elapsed())
+}
+
+#[test]
+fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
+    let (e, start) = cached_env();
+    e.stub.hang(Duration::from_secs(10));
+    let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     let text = context(&reply, "SessionStart");
     assert!(
-        text.starts_with("board server unreachable: cached snapshot from "),
+        text.starts_with(
+            "board server slow (no answer within the hook's 1.5 s): cached snapshot from "
+        ),
         "{text}"
     );
     assert!(
         text.contains(" ago (seq 812)") && text.ends_with(SNAPSHOT),
         "{text}"
     );
+    assert!(!text.contains("fail"), "board tools still work: {text}");
+    assert_eq!(
+        breaker(&e),
+        json!({"strikes": 1}),
+        "one slow reply opens nothing"
+    );
 
-    // Later hooks on this device skip the server for a while instead of waiting again.
-    let began = Instant::now();
-    let (reply, _) = e.hook("session-start", "claude", start.clone());
-    let elapsed = began.elapsed();
+    // The next hook tries the server again at once.
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "skipped the server: {elapsed:?}"
+    );
+    assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    assert_eq!(breaker(&e), json!({"strikes": 2}));
+
+    // Three slow replies in a row: hooks skip the server for a few seconds, still "slow".
+    timed(&e, "session-start", &start);
+    let open = breaker(&e);
+    assert_eq!(open["slow"], true, "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    let left = until - chrono::Utc::now();
+    assert!(
+        left > chrono::Duration::zero() && left <= chrono::Duration::seconds(10),
+        "{open}"
+    );
+    let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(
         elapsed < Duration::from_millis(500),
         "waited again: {elapsed:?}"
     );
-    assert!(context(&reply, "SessionStart").contains("cached snapshot"));
-    let marked: Value =
-        serde_json::from_slice(&std::fs::read(e.home.join("state/offline.json")).unwrap()).unwrap();
-    assert!(marked["until"].is_string(), "{marked}");
+    assert!(context(&reply, "SessionStart").starts_with("board server slow"));
 
-    // Once the backoff has passed, the server is tried again.
+    // Once it has passed and the server answers in time, the breaker closes.
     std::fs::write(
         e.home.join("state/offline.json"),
-        r#"{"until":"2000-01-01T00:00:00Z"}"#,
+        r#"{"until":"2000-01-01T00:00:00Z","slow":true,"strikes":2}"#,
     )
     .unwrap();
-    let began = Instant::now();
-    e.hook("session-start", "claude", start.clone());
-    assert!(
-        began.elapsed() >= Duration::from_millis(900),
-        "an expired backoff waits on the server again"
-    );
+    e.stub.hang(Duration::ZERO);
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    assert_eq!(breaker(&e), json!({}));
+}
 
-    // A closed port fails fast and falls back the same way.
-    std::fs::remove_file(e.home.join("state/offline.json")).unwrap();
+#[cfg(unix)]
+#[test]
+fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (e, start) = cached_env();
+    // A `git` that takes most of the budget to name the remote, as on a busy Mac.
+    let real = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .map(|dir| std::path::Path::new(dir).join("git"))
+        .find(|git| git.is_file())
+        .expect("git on PATH");
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\ncase \"$3\" in remote) sleep 0.9;; esac\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    e.stub.hang(Duration::from_secs(10));
+    let began = Instant::now();
+    let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
+    let elapsed = began.elapsed();
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    // On a very slow runner the hook's own guard may answer first, with nothing.
+    if reply.is_some() {
+        assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    }
+    assert_eq!(
+        breaker(&e),
+        Value::Null,
+        "the server had too little time to judge it"
+    );
+}
+
+#[test]
+fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
+    let (e, start) = cached_env();
+    // A closed port: the connection is refused.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
@@ -1415,8 +1633,34 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
         format!("server = \"{url}\"\ndevice = \"{DEVICE}\"\n"),
     )
     .unwrap();
-    let (reply, _) = e.hook("session-start", "claude", start);
-    assert!(context(&reply, "SessionStart").contains("cached snapshot"));
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let text = context(&reply, "SessionStart");
+    assert!(
+        text.starts_with("board server unreachable: cached snapshot from ")
+            && text.contains(" ago (seq 812); claims and updates fail until it is back.")
+            && text.ends_with(SNAPSHOT),
+        "{text}"
+    );
+    let open = breaker(&e);
+    assert!(open.get("slow").is_none(), "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    let left = until - chrono::Utc::now();
+    assert!(
+        left > chrono::Duration::seconds(50) && left <= chrono::Duration::seconds(60),
+        "{open}"
+    );
+
+    // Later hooks on this device skip the server while the backoff lasts.
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("server = \"{}\"\ndevice = \"{DEVICE}\"\n", e.stub.url),
+    )
+    .unwrap();
+    e.stub.clear();
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
     let (_, text) = e.hook(
         "post-tool-use",
         "claude",
@@ -1426,6 +1670,41 @@ fn unreachable_server_falls_back_to_the_cached_snapshot_within_budget() {
         ),
     );
     assert_eq!(text, "", "mid-turn hooks stay quiet offline");
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
+
+    // A breaker file from before slow replies were told apart still reads as unreachable.
+    let until = chrono::Utc::now() + chrono::Duration::minutes(1);
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        json!({"until": until}).to_string(),
+    )
+    .unwrap();
+    let (reply, _) = timed(&e, "session-start", &start);
+    assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
+}
+
+#[test]
+fn a_connect_that_hangs_counts_as_unreachable() {
+    let (e, start) = cached_env();
+    // TEST-NET-1 (RFC 5737): packets to it are dropped, so the connect hangs, as to a tailnet
+    // peer that is asleep; where a network refuses it at once, it is unreachable all the same.
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!("server = \"http://192.0.2.1:9\"\ndevice = \"{DEVICE}\"\n"),
+    )
+    .unwrap();
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let text = context(&reply, "SessionStart");
+    assert!(text.starts_with("board server unreachable"), "{text}");
+    let open = breaker(&e);
+    assert!(open.get("slow").is_none(), "{open}");
+    let until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(open["until"].clone()).unwrap();
+    assert!(
+        until - chrono::Utc::now() > chrono::Duration::seconds(50),
+        "{open}"
+    );
 }
 
 #[test]
