@@ -24,7 +24,9 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    child's word for them. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
    give each proposal among them a verdict, and set priority and blockers on the rest.
-6. `task_done` with evidence: each check with its exit code, the commit, the PR.
+6. File what the task still needs as sub-tasks first (`task_add`, parent set). Call
+   `task_done` only when every acceptance check passes, with evidence: each check with its
+   exit code, the commit, the PR.
 7. Set your handoff (`now`, `next`, `blockers`) and go back to step 1.
 
 ## Rules

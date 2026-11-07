@@ -426,6 +426,13 @@ pub async fn task_done(ctx: &Ctx, id: &TaskId, evidence: Evidence) -> Result<Out
             },
         )
         .await?;
+    // For the Stop hook's reminder to file what remains (`hook::done_reminder`). The server
+    // has the task done either way, so a failed write costs only the reminder.
+    if let Err(err) =
+        crate::state::record_done(&ctx.home, ctx.agent()?, &task.id, chrono::Utc::now())
+    {
+        tracing::warn!("recording {} done for the Stop hook: {err:#}", task.id);
+    }
     Ok(Output::new(
         format!("done {}", render::task_line(&task)),
         &task,

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use board_proto::{AgentId, Runtime, Snapshot, Timestamp};
+use board_proto::{AgentId, Runtime, Snapshot, TaskId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,10 @@ pub struct AgentLocal {
     pub reminded_for: Option<Timestamp>,
     /// Set while the server is unreachable and the cached snapshot was already injected.
     pub offline_notified: bool,
+    /// Tasks the `Stop` hook already reminded the agent to file what remains of, newest
+    /// last, so each is reminded about once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_reminded: Vec<TaskId>,
 }
 
 /// A file-system-safe name for an agent id.
@@ -206,6 +210,72 @@ fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
             .is_ok_and(|elapsed| elapsed > age)
         {
             remove_if_exists(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// A task the agent marked done through `board done` or the `task_done` tool, kept until
+/// the agent's next `Stop` hook reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoneMark {
+    pub task: TaskId,
+    pub at: Timestamp,
+}
+
+fn done_dir(home: &Home, agent: &AgentId) -> PathBuf {
+    home.state_dir().join("done").join(file_stem(agent))
+}
+
+/// Records that `agent` marked `task` done. One file per task, so parallel calls never
+/// write the same file.
+pub fn record_done(home: &Home, agent: &AgentId, task: &TaskId, at: Timestamp) -> Result<()> {
+    let mark = DoneMark {
+        task: task.clone(),
+        at,
+    };
+    write_json(
+        &done_dir(home, agent).join(format!("{}.json", safe_stem(task.as_str()))),
+        &mark,
+    )
+}
+
+/// The tasks `agent` marked done since the last call, oldest first, forgetting them.
+pub fn take_done(home: &Home, agent: &AgentId) -> Result<Vec<DoneMark>> {
+    let entries = match std::fs::read_dir(done_dir(home, agent)) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut marks = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if let Some(mark) = read_json::<DoneMark>(&path) {
+            marks.push(mark);
+        }
+        remove_if_exists(&path)?;
+    }
+    marks.sort_by_key(|m| m.at);
+    Ok(marks)
+}
+
+/// Removes done marks no `Stop` hook read for `age` (a session that ended mid-turn) and
+/// the agents' directories they leave empty.
+pub fn prune_done(home: &Home, age: std::time::Duration) -> Result<()> {
+    let entries = match std::fs::read_dir(home.state_dir().join("done")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let dir = entry?.path();
+        prune_dir(&dir, age)?;
+        match std::fs::remove_dir(&dir) {
+            // Still holds marks, or another hook removed it first.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) => {}
+            other => other?,
         }
     }
     Ok(())

@@ -6,8 +6,8 @@
 //! - SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure (Claude Code):
 //!   `{"hookSpecificOutput": {"hookEventName":
 //!   <event>, "additionalContext": <text>}}` on both runtimes.
-//! - Stop: `{"decision": "block", "reason": <text>}` continues the turn with the reason;
-//!   Codex requires JSON on stdout, so it gets `{}` otherwise.
+//! - Stop: `{"decision": "block", "reason": <text>}` continues the turn with the reason on
+//!   both runtimes; Codex requires JSON on stdout, so it gets `{}` otherwise.
 //! - PreCompact (Claude Code): plain stdout becomes compaction instructions.
 //! - PreToolUse (shell calls only): prints nothing, which lets the call run.
 //! - StopFailure and SessionEnd: output is ignored.
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use board_proto::{
     AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat,
-    SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
+    SnapshotKind, TOUCH_PATHS_MAX, TaskId, TaskStatus, Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -30,7 +30,7 @@ use crate::client::{Client, SnapshotQuery, TaskQuery};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
-use crate::state::{self, AgentLocal, ToolStart};
+use crate::state::{self, AgentLocal, DoneMark, ToolStart};
 use crate::t3::T3Cli;
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
@@ -185,6 +185,8 @@ struct Hook<'a> {
     shell_start: Option<ToolStart>,
     /// At `SessionStart`, the T3 thread that delegated this agent's thread.
     t3_parent: Option<String>,
+    /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
+    done_reminder: Option<String>,
     now: Timestamp,
 }
 
@@ -236,6 +238,10 @@ async fn handle(
         if let Err(err) = state::prune_tool_starts(&home, TOOL_START_AGE) {
             tracing::debug!("pruning tool start marks: {err:#}");
         }
+        // Done marks of turns whose Stop hook never ran (interrupted, or the session ended).
+        if let Err(err) = state::prune_done(&home, TOOL_START_AGE) {
+            tracing::debug!("pruning done marks: {err:#}");
+        }
     }
     let config = Config::load(&home)?;
     let Ok((server, device)) = config.require_login() else {
@@ -277,6 +283,7 @@ async fn handle(
         input,
         shell_start,
         t3_parent,
+        done_reminder: None,
         now: Utc::now(),
     };
     let offline_until = state::load_offline_until(&hook.home);
@@ -301,7 +308,7 @@ async fn handle(
         // The server answered with an error: it is reachable, so the cache is no better.
         Ok(Err(err)) if crate::client::error_code(&err).is_some() => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            Reply::Nothing
+            hook.local_stop()
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
@@ -443,8 +450,52 @@ impl Hook<'_> {
             HookEvent::SessionStart => self.cached_snapshot(),
             HookEvent::UserPromptSubmit if !self.local.offline_notified => self.cached_snapshot(),
             HookEvent::PreCompact => self.compact_instructions(None),
-            _ => Reply::Nothing,
+            _ => self.local_stop(),
         }
+    }
+
+    /// At `Stop` without the server's answer: the done reminder, which needs no server.
+    fn local_stop(&mut self) -> Reply {
+        if self.event != HookEvent::Stop {
+            return Reply::Nothing;
+        }
+        if self.done_reminder.is_none() {
+            self.prepare_done_reminder();
+        }
+        self.done_reminder
+            .take()
+            .map_or(Reply::Nothing, Reply::Block)
+    }
+
+    /// Sets `done_reminder`; a state file that cannot be read costs only the reminder, never
+    /// the handoff check or the offline backoff.
+    fn prepare_done_reminder(&mut self) {
+        match self.take_done_reminder() {
+            Ok(text) => self.done_reminder = text,
+            Err(err) => tracing::debug!("reading done marks: {err:#}"),
+        }
+    }
+
+    /// Reads the tasks this agent marked done since the last `Stop` and returns the reminder
+    /// to file what remains of them, once per task.
+    ///
+    /// The signal is the mark `ops::task_done` writes in this device's state after the server
+    /// accepted the done, rather than server events since the turn began. Every done this
+    /// agent makes goes through it (the `task_done` tool and `board done`), on this device,
+    /// under the same agent id the hooks resolve, and it needs no server call, so it holds
+    /// within the hook's budget, offline, and on a busy board whose events would take pages to
+    /// read. Each `Stop` takes the marks, so the next one sees only later dones; marks older
+    /// than the turn (`UserPromptSubmit`) are from a turn whose `Stop` never ran.
+    fn take_done_reminder(&mut self) -> Result<Option<String>> {
+        let marks = state::take_done(&self.home, &self.agent)?;
+        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(done_reminder(
+            marks,
+            self.local.turn_started,
+            &mut self.local.done_reminded,
+        ))
     }
 
     fn cached_snapshot(&mut self) -> Reply {
@@ -678,11 +729,31 @@ impl Hook<'_> {
         })
     }
 
+    /// Both reminders go in one block: the turn continues once, and the `Stop` that follows
+    /// has `stop_hook_active` and stays quiet, so a second block would never be seen.
     async fn stop(&mut self) -> Result<Reply> {
+        // Before any server call, so it survives a server that fails (`local_stop`).
+        self.prepare_done_reminder();
         self.set_state(AgentState::Idle, None).await?;
         if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
             return Ok(Reply::Nothing);
         }
+        let handoff = self.handoff_reminder().await?;
+        let text: Vec<String> = self
+            .done_reminder
+            .take()
+            .into_iter()
+            .chain(handoff)
+            .collect();
+        Ok(if text.is_empty() {
+            Reply::Nothing
+        } else {
+            Reply::Block(text.join("\n"))
+        })
+    }
+
+    /// The handoff reminder: when a task is in `doing` and the handoff is missing or stale.
+    async fn handoff_reminder(&mut self) -> Result<Option<String>> {
         let doing = self
             .client
             .tasks(&TaskQuery {
@@ -692,7 +763,7 @@ impl Hook<'_> {
             })
             .await?;
         let Some(task) = doing.first() else {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         };
         let handoff = self.client.handoff(&self.agent).await?;
         let turn = self.local.turn_started;
@@ -713,13 +784,13 @@ impl Hook<'_> {
             },
         };
         let Some(since) = stale_since else {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         };
         if self.local.reminded_for == Some(since) {
-            return Ok(Reply::Nothing);
+            return Ok(None);
         }
         self.local.reminded_for = Some(since);
-        Ok(Reply::Block(format!(
+        Ok(Some(format!(
             "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
             task.id
         )))
@@ -771,6 +842,39 @@ impl Hook<'_> {
             self.agent
         ))
     }
+}
+
+/// How many reminded tasks the hook state keeps; a task done again after it fell out is
+/// reminded about again.
+const DONE_REMINDED_KEPT: usize = 100;
+
+/// The reminder for tasks marked done this turn (marks at or after `turn_started`, any when
+/// the turn's start is unknown) not reminded about before, which it records in `reminded`.
+fn done_reminder(
+    marks: Vec<DoneMark>,
+    turn_started: Option<Timestamp>,
+    reminded: &mut Vec<TaskId>,
+) -> Option<String> {
+    let mut ids: Vec<TaskId> = Vec::new();
+    for mark in marks {
+        if turn_started.is_none_or(|t| mark.at >= t)
+            && !reminded.contains(&mark.task)
+            && !ids.contains(&mark.task)
+        {
+            ids.push(mark.task);
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    reminded.extend(ids.iter().cloned());
+    let excess = reminded.len().saturating_sub(DONE_REMINDED_KEPT);
+    reminded.drain(..excess);
+    let ids: Vec<&str> = ids.iter().map(TaskId::as_str).collect();
+    Some(format!(
+        "board: you marked {} done this turn. Before you stop, file anything still to do: sub-tasks for its scope, Proposal: tasks for found work, a blocked task with an ask for the user's part; name them in your reply.",
+        ids.join(", ")
+    ))
 }
 
 /// Runs `git` off the async threads, so the hook's deadline can still fire.
@@ -1229,6 +1333,48 @@ mod tests {
     }
 
     #[test]
+    fn done_reminders_cover_this_turns_tasks_once_each() {
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let mark = |task: &str, mins: i64| DoneMark {
+            task: task.parse().unwrap(),
+            at: t0 + chrono::Duration::minutes(mins),
+        };
+        let mut reminded = Vec::new();
+        assert_eq!(done_reminder(vec![], Some(t0), &mut reminded), None);
+        let text = done_reminder(
+            vec![
+                mark("factory-11", -1),
+                mark("factory-12", 1),
+                mark("factory-13", 2),
+            ],
+            Some(t0),
+            &mut reminded,
+        )
+        .unwrap();
+        assert!(
+            text.starts_with("board: you marked factory-12, factory-13 done this turn."),
+            "{text}"
+        );
+        assert_eq!(reminded.len(), 2, "the earlier turn's task is not recorded");
+        assert_eq!(
+            done_reminder(vec![mark("factory-12", 5)], Some(t0), &mut reminded),
+            None
+        );
+        // Unknown turn start (no prompt since the session started): any mark counts.
+        assert!(done_reminder(vec![mark("factory-11", -1)], None, &mut reminded).is_some());
+        // Bounded: the oldest fall out.
+        for n in 0..DONE_REMINDED_KEPT {
+            done_reminder(
+                vec![mark(&format!("other-{}", n + 1), 1)],
+                Some(t0),
+                &mut reminded,
+            );
+        }
+        assert_eq!(reminded.len(), DONE_REMINDED_KEPT);
+        assert!(!reminded.iter().any(|id| id.as_str() == "factory-12"));
+    }
+
+    #[test]
     fn replies_render_per_runtime() {
         let ctx = render_reply(
             HookEvent::UserPromptSubmit,
@@ -1252,5 +1398,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(block, json!({"decision": "block", "reason": "r"}));
+        let codex = render_reply(HookEvent::Stop, Runtime::Codex, Reply::Block("r".into()));
+        assert_eq!(
+            serde_json::from_str::<Value>(&codex.unwrap()).unwrap(),
+            json!({"decision": "block", "reason": "r"}),
+            "Codex takes the same block shape"
+        );
     }
 }
