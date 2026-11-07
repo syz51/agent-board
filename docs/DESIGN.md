@@ -88,8 +88,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
-  Waiting on another task is a blocker; waiting on the user is an ask and `blocked`;
-  waiting for a date is `not_before`, which the server's sweeper announces once passed.
+  Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
+  `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
+  passed. An agent that files a task it starts at once creates it claimed (`claim`), so
+  the coordinator never sees it ready and the two never both start it.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots.
@@ -275,14 +277,18 @@ registers without a repo).
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
   `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
-  new open, non-`auto` task whose body starts `Proposal:`). An answered ask wakes the agent
+  new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
+  board, so a blocker on another board wakes the coordinator of the waiting task's board;
+  and the owner of a `blocked` task is woken when its last blocker is done (told to check
+  its blocked reason first when it has one). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, ended, unknown, gone from T3, or paused with no
   reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
   - **Re-check**: at send time each line is checked again; a task no longer ready and
-    `auto` (claimed, blocked, done), a proposal no longer pending, or an agent no longer
-    the board's coordinator, drops its task lines. An answer stays answered, so only its
+    `auto` (claimed, blocked, done), a proposal no longer pending, a blocked task its
+    owner resumed, released or still waits on, or an agent no longer the board's
+    coordinator, drops its task lines. An answer stays answered, so only its
     text is read then.
   - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
     its `agent_state_changed` events. Lines for a running agent are held and sent together
