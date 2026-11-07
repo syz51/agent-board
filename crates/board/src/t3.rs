@@ -121,8 +121,7 @@ impl T3 for T3Cli {
             )
             .await?;
         if !ok {
-            let lower = stderr.to_ascii_lowercase();
-            if lower.contains("not found") || lower.contains("unknown thread") {
+            if is_unknown_thread(&stderr, thread) {
                 return Ok(None);
             }
             bail!("t3 thread show failed: {}", stderr.trim());
@@ -144,6 +143,20 @@ pub fn parse_thread_id(stdout: &str) -> Option<String> {
         Err(_) => stdout.lines().next().map(|l| l.trim().to_owned()),
     }?;
     (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+/// Whether `t3 thread show` failed because T3 does not know the thread: older versions say
+/// "not found" or "unknown thread", 0.1.8 says "Thread <id> is no longer available." T3
+/// says "no longer available" of environments and connections too, so that wording counts
+/// only with the thread's id.
+pub fn is_unknown_thread(stderr: &str, thread: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("unknown thread")
+        || lower.contains(&format!(
+            "thread {} is no longer available",
+            thread.to_ascii_lowercase()
+        ))
 }
 
 /// Reads `{"thread": {"archived": …, "providerInstanceId": …}}` from `t3 thread show --json`.
@@ -179,6 +192,23 @@ mod tests {
         assert_eq!(parse_thread_id("t-3\n").as_deref(), Some("t-3"));
         assert_eq!(parse_thread_id("{}"), None);
         assert_eq!(parse_thread_id(""), None);
+    }
+
+    #[test]
+    fn unknown_threads_are_recognised_in_every_wording() {
+        assert!(is_unknown_thread(
+            "Thread mcp:X is no longer available.\n",
+            "mcp:X"
+        ));
+        assert!(is_unknown_thread("error: thread not found", "x"));
+        assert!(is_unknown_thread("Unknown thread x", "x"));
+        assert!(!is_unknown_thread("connection refused", "x"));
+        // A transient failure elsewhere in T3 does not make the thread unknown.
+        assert!(!is_unknown_thread(
+            "This environment is no longer available.",
+            "x"
+        ));
+        assert!(!is_unknown_thread("Thread y is no longer available.", "x"));
     }
 
     #[test]

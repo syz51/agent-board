@@ -536,3 +536,325 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
         json!({ "agent": ME })
     );
 }
+
+#[cfg(unix)]
+const ADOPT_REPO: &str = "github.com/example/infra";
+
+/// An env whose device has a project for [`ADOPT_REPO`] and a fake `t3` that knows the
+/// threads `live`, `other-live` and `archived`.
+#[cfg(unix)]
+fn adopt_env() -> Env {
+    use std::os::unix::fs::PermissionsExt as _;
+    let e = env();
+    let t3 = e.home.join("fake-t3");
+    std::fs::write(
+        &t3,
+        r#"#!/bin/sh
+# t3 thread show --json --messages 1 <thread>
+for arg; do thread=$arg; done
+case "$thread" in
+  live|other-live) echo "{\"thread\":{\"threadId\":\"$thread\",\"archived\":false,\"providerInstanceId\":\"claudeAgent\"}}" ;;
+  archived) echo '{"thread":{"threadId":"archived","archived":true}}' ;;
+  *) echo "Thread $thread is no longer available." >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "{config}t3_bin = \"{}\"\n\n[projects]\n\"{ADOPT_REPO}\" = \"/src/infra\"\n",
+            t3.display()
+        ),
+    )
+    .unwrap();
+    e.stub
+        .on("POST /v1/boards/infra/coordinator", adopt_board(true, None));
+    e
+}
+
+#[cfg(unix)]
+fn save_adoption_file(e: &Env, thread: &str) {
+    std::fs::create_dir_all(e.home.join("state")).unwrap();
+    std::fs::write(
+        e.home.join("state/adopt-infra.json"),
+        json!({"thread": thread, "requested_at": "2026-11-07T00:00:00Z"}).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn adopt_board(autopilot: bool, coordinator: Option<&str>) -> board_proto::Board {
+    let mut board = board_fixture("infra", &[ADOPT_REPO]);
+    board.autopilot = autopilot;
+    board.coordinator = coordinator.map(|c| c.parse().unwrap());
+    board.home_devices = vec![DEVICE.parse().unwrap()];
+    board
+}
+
+#[cfg(unix)]
+fn adoption_file(e: &Env) -> Option<Value> {
+    let text = std::fs::read_to_string(e.home.join("state/adopt-infra.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+#[cfg(unix)]
+#[test]
+fn board_adopt_saves_the_adoption_and_switches_autopilot_on() {
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    e.stub.on("PATCH /v1/boards/infra", adopt_board(true, None));
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with(&format!(
+            "adopting t3:live as the coordinator of infra: the daemon on {DEVICE} (board watch) \
+             briefs the thread"
+        )),
+        "{}",
+        stdout(&out)
+    );
+    let saved = adoption_file(&e).expect("adoption saved");
+    assert_eq!(saved["thread"], "live");
+    assert!(saved["requested_at"].is_string());
+    assert_eq!(
+        e.stub.requests_to("PATCH /v1/boards/infra")[0].body,
+        json!({"title": null, "goal": null, "status": null, "repos": null, "autopilot": true, "home_devices": null})
+    );
+    // Then the lease is held for this device, so no other home device starts a thread.
+    let claims = e.stub.requests_to("POST /v1/boards/infra/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body, json!({"device": DEVICE, "agent": null}));
+    assert_eq!(claims[0].agent, None, "the device's claim");
+
+    // Already on autopilot without a coordinator: saved, no second switch.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(true, None));
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+    assert!(e.stub.requests_to("PATCH /v1/boards/infra").is_empty());
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .len(),
+        1
+    );
+
+    // A coordinator that has ended is replaced, as when none is named.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    e.stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:old")),
+        agent_fixture("t3:old", DEVICE, board_proto::AgentState::Ended),
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+
+    // The thread already coordinates the board: nothing to do, and an older request for
+    // another thread is cleared so it never replaces this one.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:live")));
+    save_adoption_file(&e, "other-live");
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).starts_with("t3:live already coordinates infra"));
+    assert_eq!(adoption_file(&e), None);
+    assert!(e.stub.requests_to("PATCH /v1/boards/infra").is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty()
+    );
+
+    // `--json` prints the board the server returned.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    e.stub.on("PATCH /v1/boards/infra", adopt_board(true, None));
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live", "--json"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["autopilot"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
+    let refused = |e: &Env, thread: &str, expected: &str| {
+        let out = board(
+            &e.home,
+            &e.cwd,
+            &[],
+            &["board", "adopt", "infra", thread],
+            "",
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+        let err = stderr(&out);
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(adoption_file(e), None, "no adoption saved");
+        assert!(
+            e.stub.requests_to("PATCH /v1/boards/infra").is_empty(),
+            "autopilot untouched"
+        );
+    };
+
+    // Another live coordinator.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    e.stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:old")),
+        agent_fixture("t3:old", "mac-air", board_proto::AgentState::Idle),
+    );
+    refused(
+        &e,
+        "live",
+        "t3:old coordinates board infra now; switch autopilot off",
+    );
+
+    // Unknown and archived threads.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    refused(&e, "gone", "T3 on this device knows no thread gone");
+    refused(&e, "archived", "thread archived is archived");
+
+    // This device is not a home device.
+    let e = adopt_env();
+    let mut away = adopt_board(false, None);
+    away.home_devices = vec!["mac-air".parse().unwrap()];
+    e.stub.on("GET /v1/boards/infra", &away);
+    refused(
+        &e,
+        "live",
+        &format!("this device ({DEVICE}) is not a home device of board infra"),
+    );
+
+    // No project for the board's repos on this device.
+    let e = adopt_env();
+    let mut elsewhere = adopt_board(false, None);
+    elsewhere.repos = vec!["github.com/o/other".into()];
+    e.stub.on("GET /v1/boards/infra", &elsewhere);
+    refused(
+        &e,
+        "live",
+        "config.toml has no [projects] path for any repo of board infra",
+    );
+
+    // A closed board.
+    let e = adopt_env();
+    let mut closed = adopt_board(false, None);
+    closed.status = board_proto::BoardStatus::Closed;
+    e.stub.on("GET /v1/boards/infra", &closed);
+    refused(&e, "live", "board infra is closed: only active boards");
+
+    // The daemon here still keeps another live thread as the coordinator (its lease lapsed
+    // or autopilot was just switched off): adopting now would race it.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    std::fs::create_dir_all(e.home.join("state")).unwrap();
+    std::fs::write(
+        e.home.join("state/watch.json"),
+        json!({"last_seq": 1, "coordinators": {"infra": {
+            "thread": "other-live", "agent": "t3:other-live",
+            "started_at": "2026-11-07T00:00:00Z", "renewed_at": "2026-11-07T00:00:00Z",
+            "resumed_after": null, "registered": true}}})
+        .to_string(),
+    )
+    .unwrap();
+    refused(
+        &e,
+        "live",
+        "the daemon on this device still keeps thread other-live as the coordinator",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn board_adopt_undoes_the_adoption_when_another_device_wins_the_lease() {
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    e.stub.on("PATCH /v1/boards/infra", adopt_board(true, None));
+    e.stub.on_error(
+        "POST /v1/boards/infra/coordinator",
+        409,
+        "claim_refused",
+        "device mac-air holds the coordinator lease of infra for 45m more",
+        "wait",
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("another device runs the coordinator of board infra")
+            && err.contains("mac-air holds the coordinator lease")
+            && err.contains("switch autopilot off"),
+        "{err}"
+    );
+    assert_eq!(
+        adoption_file(&e),
+        None,
+        "nothing left for this daemon to act on"
+    );
+
+    // Autopilot cannot be switched on: the adoption is undone too.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    e.stub.on_error(
+        "PATCH /v1/boards/infra",
+        403,
+        "forbidden",
+        "only the user may",
+        "ask the user",
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["board", "adopt", "infra", "live"],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert_eq!(adoption_file(&e), None);
+}
