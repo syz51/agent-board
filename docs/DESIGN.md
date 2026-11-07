@@ -301,9 +301,12 @@ registers without a repo).
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**
-  queue to answer asks; **Updates**, the tasks finished and the coordinators' turn endings
-  since the user last looked (one seen cursor for the user, moved forward only when the
-  page has shown them), newest first; a live event feed.
+  queue to answer asks, followed by **Since you last looked**: the tasks finished, with
+  their summaries, and the coordinators' turn endings since the user's seen cursor, newest
+  first. One cursor covers every board; "Mark all seen" moves it to the newest update
+  shown, so anything that arrived later stays unseen, and a dot on Needs you counts what is
+  unseen. A done task's page shows its summary, and the agents page a coordinator's last
+  turn endings. A live event feed.
 
 ## Text format
 
