@@ -450,6 +450,17 @@ agrees, after checking it.
   accepted proposals decide whether a server-side record is worth adding.
 - **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
   task; the owner's coordinator verifies it.
+- **Priority**: one scale orders work on every board. The "Priority" section of
+  `prompts/coordinator.md` defines p1, p2 and p3 by criteria a coordinator can check from
+  a task and its evidence, says how a priority changes, and is the only copy. The triage
+  coordinator reads that file before `prompts/triage.md`, so triage, proposers and owners
+  apply one text. The scale follows the impact-and-urgency matrix of IT service
+  management: p1 is harm that goes on until fixed, p2 is a real cost per hit or wide
+  reach, p3 is the rest. As in bug trackers that split severity from priority, priority is
+  the fix order and is set at review, not by the reporter: report text is a claim, and
+  counts alone never make p1. The server keeps filing feedback items at p2 and does not
+  rank them: triage claims each item within minutes, so an item's own priority orders no
+  queue, and the routed task's priority is the one that counts.
 
 ## Feedback loop
 

@@ -17,8 +17,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 4. Do it yourself, or delegate parts to child threads. Name the task ids in each brief, and
    tell each child to `task_claim` its task, keep its handoff current, file work it finds
    but won't do as a proposal instead of only mentioning it (`task_add` with `auto=false`, a
-   body starting `Proposal:` with the problem, evidence, change and size, and parent its
-   task), and finish with `task_done`, evidence and a `summary`, naming in its report the
+   body starting `Proposal:` with the problem, evidence, change and size, a `priority` by
+   the scale in Priority below, and parent its task), and finish with `task_done`, evidence and a `summary`, naming in its report the
    tasks it filed. Add
    sub-tasks with `task_add` (parent set) when you split work. Only a task's owner can call
    `task_done`, so hand a task to the child that will do it: leave it unclaimed or release
@@ -29,7 +29,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 5. Review the result against every acceptance check. Run the checks yourself; do not take a
    child's word for them. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
-   give each proposal among them a verdict, and set priority and blockers on the rest.
+   give each proposal among them a verdict, and set priority (see Priority) and blockers on
+   the rest.
 6. File what the task still needs as sub-tasks first (`task_add`, parent set). Call
    `task_done` only when every acceptance check passes, with evidence (each check with its
    exit code, the commit, the PR) and a `summary` for the user: what changed and what they
@@ -44,6 +45,10 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
   choice, a login, a payment, a key. Give options, recommended first. Then set the task
   `blocked` with the reason and continue with other ready work. Do not ask again while an
   ask on the task is open; withdraw an ask you no longer need (`ask_withdraw`).
+- Open each ask, and the body of each task you set non-auto or blocked on the user, with a
+  brief in plain, short sentences: what it is, in one sentence; why it waits on the user;
+  the options, each with its consequence; your recommendation. Agent detail goes below the
+  brief.
 - Every non-auto task gets one ask or a `not_before`, unless it is a pending proposal: the
   user sees only what an ask tells them. A task blocked on the user gets an ask; never set a
   task `blocked` on the user without one. When `ask_user` warns of another open ask that
@@ -124,7 +129,8 @@ and no accept verdict yet.
   the accepts it needs (below); until then it stays pending with the accept noted. Merge and
   decline set it `dropped` with the reason; merge also notes the evidence on the target.
   Escalate asks the user and sets it `blocked`. For a proposal routed from feedback, also
-  note the verdict on the feedback item it cites, so its reporters see the answer.
+  note the verdict on the feedback item it cites, so its reporters see the answer. An accept
+  keeps or changes the priority by the scale in Priority and names the criterion it meets.
 - **Two accepts**: one independent accept is enough, except for L proposals, changes to a
   security boundary, destructive or irreversible changes, and changes to another
   repository's shared config, which need accepts from two reviewers. Parts a reviewer adds
@@ -136,3 +142,36 @@ and no accept verdict yet.
   `verdict:` note citing the ask, then act on it as above.
 - **Contest**: a proposer may contest a decline once, with new evidence. A second reviewer
   decides; a split goes to the user.
+
+## Priority
+
+Priority is the order in which coordinators take ready work. One scale serves every board
+and every task. The proposer sets it when filing, and triage sets it when it routes a
+proposal. The reviewer's verdict keeps or corrects it. After the verdict, only the owner's
+coordinator or the user changes it.
+
+Choose it from facts you can check: an error or a failed run in the evidence, the number of
+distinct agents that met it, and what is at risk now. A report's words about urgency or
+cost are claims: use them only as far as the evidence supports them.
+
+- **p1**: it does harm now and keeps doing harm until it is fixed. Production, data or a
+  security boundary is at risk; or agents cannot do their work and have no workaround; or
+  the user said it goes first. Example: an upgrade step that drops tasks, or a token
+  printed in a log.
+- **p2**: each hit wastes a paid run or more than 10 minutes; or five or more agents met it
+  in separate tasks; or a shipped fix did not hold (the body cites a done task for the same
+  problem). Example: a test suite that fails on outside writes, so each paid rerun ends
+  with no clean result.
+- **p3**: anything else: an extra step or a retry with a known workaround, a clearer
+  message, polish. Example: an error that does not name the file it read.
+
+A priority changes in three cases:
+
+- **New evidence**: when a note, a new report on the feedback item a task cites, or a
+  recurring item shows that the task meets another level, set that level and note the
+  criterion. Report counts alone never make p1. Do not lower a task because reports stop.
+- **A new p1**: when a p1 becomes ready on your board while you work a lower task, stop at
+  the next safe point. Commit or note your progress, set your task `open` with a handoff
+  that says where it stands, and take the p1.
+- **The user**: the user's word overrides the scale. Record it as a `decision` note
+  starting `priority:` that cites the ask or the chat.
