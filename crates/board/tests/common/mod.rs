@@ -19,6 +19,7 @@ use board_proto::{
     StatusCounts, Task, TaskStatus,
 };
 use chrono::{TimeZone as _, Utc};
+use futures_util::StreamExt as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -65,6 +66,9 @@ struct StubState {
     requests: Vec<Recorded>,
     /// Delay applied to every request (an overloaded or hanging server).
     hang: Option<Duration>,
+    /// Routes answered as a server-sent event stream: the events after the request's
+    /// `since`, then nothing more while the connection stays open.
+    streams: BTreeMap<String, Vec<board_proto::Event>>,
 }
 
 #[derive(Clone)]
@@ -145,6 +149,25 @@ impl Stub {
         self
     }
 
+    /// Delays the answers to `route` by `delay`, as a server stalled on it would.
+    pub fn delay(&self, route: &str, delay: Duration) -> &Self {
+        if let Some(canned) = self.state.lock().unwrap().routes.get_mut(route) {
+            canned.delay = delay;
+        }
+        self
+    }
+
+    /// Answers `route` as an event stream carrying the `events` after the request's
+    /// `since`, then staying open and silent: no event and no keep-alive.
+    pub fn on_stream(&self, route: &str, events: Vec<board_proto::Event>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(route.to_owned(), events);
+        self
+    }
+
     /// Delays every answer, as a hanging server would.
     pub fn hang(&self, delay: Duration) {
         self.state.lock().unwrap().hang = Some(delay);
@@ -189,7 +212,12 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         .unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let route = format!("{method} {path}");
-    let (canned, hang) = {
+    let since: i64 = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("since="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let (canned, hang, stream) = {
         let mut st = state.lock().unwrap();
         st.requests.push(Recorded {
             method,
@@ -201,8 +229,35 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             body,
         });
         let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
-        (once.or_else(|| st.routes.get(&route).cloned()), st.hang)
+        let stream = st.streams.get(&route).map(|events| {
+            events
+                .iter()
+                .filter(|e| e.seq > since)
+                .map(|e| {
+                    format!(
+                        "id: {}\ndata: {}\n\n",
+                        e.seq,
+                        serde_json::to_string(e).unwrap()
+                    )
+                })
+                .collect::<String>()
+        });
+        (
+            once.or_else(|| st.routes.get(&route).cloned()),
+            st.hang,
+            stream,
+        )
     };
+    if let Some(text) = stream {
+        let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>(text)])
+            .chain(futures_util::stream::pending());
+        let mut resp = Response::new(Body::from_stream(chunks));
+        resp.headers_mut().insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return resp;
+    }
     if let Some(delay) = hang {
         tokio::time::sleep(delay).await;
     }

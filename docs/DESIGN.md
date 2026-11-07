@@ -316,6 +316,13 @@ registers without a repo).
     delivered it.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
+  - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
+    reconcile gets 90 seconds and a flush's checks 30, and a stop request cuts any step
+    short; the state is saved first, so a cut-short last flush loses nothing. A stream
+    with no bytes for 45 seconds (the server sends a keep-alive every 15) is reopened
+    after the last event handled. A queue backing off after a failed check or send costs
+    no request until its retry time, and the event retries stop at the first that still
+    fails.
 - **Reporting to the user**: a coordinator's chat is a poor channel to the user, because a
   wake arrives as the thread's next turn and buries whatever the last turn said. So what
   the user should read goes to the board instead: every `task_done` carries a `summary`,

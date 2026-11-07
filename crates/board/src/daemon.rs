@@ -67,8 +67,6 @@ const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
-const RECONCILE_EVERY: Duration = Duration::from_secs(60);
-const FLUSH_EVERY: Duration = Duration::from_secs(3);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -81,6 +79,39 @@ const RECONNECT_FIRST: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 /// A connection that stayed open this long resets the reconnect delay.
 const STREAM_HEALTHY: Duration = Duration::from_secs(60);
+
+/// How often the daemon acts, and how long each step may take, so a server or `t3` that
+/// stops answering holds up only that step. Tests shorten them.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    /// Coordinators are checked this often.
+    pub reconcile_every: Duration,
+    /// Queued wake-ups are sent this often.
+    pub flush_every: Duration,
+    /// An event stream with no bytes for this long (the server sends a keep-alive every 15
+    /// seconds) is taken as dead and opened again after `last_seq`.
+    pub stream_idle: Duration,
+    /// A reconcile still running after this long is stopped and runs again on its next tick.
+    pub reconcile_budget: Duration,
+    /// Checking the queued wake-ups before a flush sends them stops after this long; the
+    /// queues not checked by then back off.
+    pub flush_budget: Duration,
+    /// The last flush before exiting gets this long; what it does not send stays saved.
+    pub stop_budget: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            reconcile_every: Duration::from_secs(60),
+            flush_every: Duration::from_secs(3),
+            stream_idle: Duration::from_secs(45),
+            reconcile_budget: Duration::from_secs(90),
+            flush_budget: Duration::from_secs(30),
+            stop_budget: Duration::from_secs(10),
+        }
+    }
+}
 
 /// What the daemon remembers between runs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -364,6 +395,7 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
+    pub timing: Timing,
 }
 
 impl<T: T3> Daemon<T> {
@@ -377,6 +409,7 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             agents: BTreeMap::new(),
+            timing: Timing::default(),
         }
     }
 
@@ -1037,13 +1070,26 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Sends the queued wake-ups, one message per agent, after checking each again. The
-    /// sends run side by side, each given [`WAKE_SEND_TIMEOUT`], so a hanging T3 holds the
-    /// daemon up once per flush, not once per agent.
+    /// checks share [`Timing::flush_budget`]; the sends run side by side, each given
+    /// [`WAKE_SEND_TIMEOUT`], so a hanging T3 holds the daemon up once per flush, not once
+    /// per agent.
     pub async fn flush(&mut self, now: Timestamp) {
+        let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
         let mut outgoing = Vec::new();
         for (agent, queue) in std::mem::take(&mut self.state.wakes) {
-            if let Some(out) = self.prepare(agent, queue, now).await {
-                outgoing.push(out);
+            // `prepare` changes nothing of this queue before its last await, so a check cut
+            // short leaves the queue as it was.
+            let mut kept = queue.clone();
+            match tokio::time::timeout_at(deadline, self.prepare(agent.clone(), queue, now)).await {
+                Ok(Some(out)) => outgoing.push(out),
+                Ok(None) => {}
+                Err(_) => {
+                    let delay = back_off(&mut kept, now);
+                    tracing::warn!(
+                        "waking {agent}: checking its wake-ups ran out of time; trying again in {delay}"
+                    );
+                    self.requeue(agent, kept);
+                }
             }
         }
         let sends = outgoing
@@ -1067,6 +1113,11 @@ impl<T: T3> Daemon<T> {
         mut queue: WakeQueue,
         now: Timestamp,
     ) -> Option<Outgoing> {
+        // Checked first: during an outage a backing-off queue costs no request.
+        if queue.backoff.as_ref().is_some_and(|b| now < b.retry_at) {
+            self.requeue(agent, queue);
+            return None;
+        }
         let seen = match self.seen(&agent, now).await {
             Ok(Some(seen)) => seen,
             // Unknown to the server: its answers go to the coordinator.
@@ -1116,10 +1167,6 @@ impl<T: T3> Daemon<T> {
                 self.forward_answers(&agent, &mut queue.wakes);
                 return None;
             }
-        }
-        if queue.backoff.as_ref().is_some_and(|b| now < b.retry_at) {
-            self.requeue(agent, queue);
-            return None;
         }
         let backoff = queue.backoff.clone();
         let mut sent = Vec::new();
@@ -1402,16 +1449,26 @@ impl<T: T3> Daemon<T> {
     /// Handles again the events that failed on a transient error, dropping those older than
     /// [`RETRY_EVENTS_FOR`] or failing for good. Returns true when the boards should be
     /// reconciled.
+    /// After one fails on a transient error again, the rest wait for the next tick
+    /// untried, so a server that is still down costs one request timeout, not one per event.
     pub async fn retry_failed(&mut self, now: Timestamp) -> bool {
         let mut reconcile = false;
+        let mut failing = false;
         for event in std::mem::take(&mut self.state.retry) {
             if now - event.at > RETRY_EVENTS_FOR {
                 tracing::warn!("event #{}: still failing; dropped", event.seq);
                 continue;
             }
+            if failing {
+                self.state.retry.push(event);
+                continue;
+            }
             match self.on_event(&event, now).await {
                 Ok(again) => reconcile |= again,
-                Err(err) if is_transient(&err) => self.state.retry.push(event),
+                Err(err) if is_transient(&err) => {
+                    failing = true;
+                    self.state.retry.push(event);
+                }
                 Err(err) => tracing::warn!("event #{}: {err:#}; dropped", event.seq),
             }
         }
@@ -1504,7 +1561,7 @@ pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
 pub async fn run(home: Home, once: bool) -> Result<()> {
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
-    let ctx = Ctx::load(home, None, None)?;
+    let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
     let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
     let mut daemon = Daemon::new(ctx, t3);
     if daemon.state.last_seq.is_none() {
@@ -1512,8 +1569,8 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         let health = daemon.client().health().await?;
         daemon.state.last_seq = health["seq"].as_i64();
     }
-    daemon.reconcile(Utc::now()).await?;
     if once {
+        daemon.reconcile(Utc::now()).await?;
         let mut reconcile = daemon.retry_failed(Utc::now()).await;
         reconcile |= daemon.catch_up(Utc::now()).await?;
         if reconcile {
@@ -1525,40 +1582,67 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     daemon.follow(&mut shutdown).await
 }
 
-/// Ctrl-C, or SIGTERM from launchd or systemd stopping the service.
+/// A request to stop: Ctrl-C, SIGTERM from launchd or systemd stopping the service, or a
+/// [`Stopper`]. Once asked, it stays asked.
 pub struct Shutdown {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
+    asked: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Asks the daemon following a [`Shutdown`] to stop.
+pub struct Stopper(tokio::sync::watch::Sender<bool>);
+
+impl Stopper {
+    pub fn stop(&self) {
+        self.0.send_replace(true);
+    }
 }
 
 impl Shutdown {
+    /// Stops on Ctrl-C or SIGTERM.
     pub fn listen() -> Result<Self> {
+        let (stopper, shutdown) = Self::manual();
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            Ok(Self {
-                interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
-                terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
-            })
+            let mut interrupt = signal(SignalKind::interrupt()).context("listening for SIGINT")?;
+            let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+                stopper.stop();
+            });
         }
         #[cfg(not(unix))]
-        Ok(Self {})
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                stopper.stop();
+            }
+        });
+        Ok(shutdown)
+    }
+
+    /// Stops when the returned [`Stopper`] says so.
+    pub fn manual() -> (Stopper, Self) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (Stopper(tx), Self { asked: rx })
     }
 
     /// Resolves when the daemon is asked to stop.
     pub async fn wait(&mut self) {
-        #[cfg(unix)]
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-        }
-        #[cfg(not(unix))]
-        if tokio::signal::ctrl_c().await.is_err() {
+        // Every stopper gone without asking: never.
+        if self.asked.wait_for(|asked| *asked).await.is_err() {
             std::future::pending::<()>().await;
         }
     }
+}
+
+/// What the follow loop does next.
+enum Step {
+    Event(String),
+    Flush,
+    Reconcile,
 }
 
 /// Sleeps `delay` unless asked to stop (true), then doubles it up to the cap.
@@ -1572,10 +1656,13 @@ async fn wait_to_reconnect(shutdown: &mut Shutdown, delay: &mut Duration) -> boo
 }
 
 impl<T: T3> Daemon<T> {
-    async fn follow(&mut self, shutdown: &mut Shutdown) -> Result<()> {
+    /// Follows the event stream, flushing and reconciling on their ticks, until `shutdown`
+    /// asks it to stop. Each step races the request to stop, so a step that waits on a
+    /// server or `t3` never delays the exit.
+    pub async fn follow(&mut self, shutdown: &mut Shutdown) -> Result<()> {
         let mut delay = RECONNECT_FIRST;
-        let mut reconcile_tick = tokio::time::interval(RECONCILE_EVERY);
-        let mut flush_tick = tokio::time::interval(FLUSH_EVERY);
+        let mut reconcile_tick = tokio::time::interval(self.timing.reconcile_every);
+        let mut flush_tick = tokio::time::interval(self.timing.flush_every);
         let mut reconcile_needed = false;
         loop {
             let client = self.client().clone();
@@ -1594,16 +1681,13 @@ impl<T: T3> Daemon<T> {
                 }
             };
             let opened = tokio::time::Instant::now();
-            let mut stream = resp.bytes_stream().eventsource();
+            let mut stream = Box::pin(idle_limited(resp, self.timing.stream_idle).eventsource());
             loop {
-                tokio::select! {
+                let step = tokio::select! {
                     item = stream.next() => match item {
                         Some(Ok(message)) => {
                             delay = RECONNECT_FIRST;
-                            match serde_json::from_str::<Event>(&message.data) {
-                                Ok(event) => reconcile_needed |= self.handle(&event, Utc::now()).await,
-                                Err(err) => tracing::warn!("unreadable event: {err}"),
-                            }
+                            Step::Event(message.data)
                         }
                         Some(Err(err)) => {
                             tracing::warn!("event stream: {err}");
@@ -1611,19 +1695,17 @@ impl<T: T3> Daemon<T> {
                         }
                         None => break,
                     },
-                    _ = flush_tick.tick() => {
-                        if reconcile_needed {
-                            reconcile_needed = false;
-                            self.reconcile_logged().await;
-                        }
-                        self.flush(Utc::now()).await;
-                        self.save()?;
-                    }
-                    _ = reconcile_tick.tick() => {
-                        reconcile_needed |= self.retry_failed(Utc::now()).await;
-                        self.reconcile_logged().await;
-                    }
+                    _ = flush_tick.tick() => Step::Flush,
+                    _ = reconcile_tick.tick() => Step::Reconcile,
                     () = shutdown.wait() => return self.stop().await,
+                };
+                let done = tokio::select! {
+                    done = self.step(step, &mut reconcile_needed) => Some(done),
+                    () = shutdown.wait() => None,
+                };
+                match done {
+                    Some(done) => done?,
+                    None => return self.stop().await,
                 }
             }
             if opened.elapsed() >= STREAM_HEALTHY {
@@ -1636,16 +1718,80 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Sends what is queued and saves the state before exiting.
+    async fn step(&mut self, step: Step, reconcile_needed: &mut bool) -> Result<()> {
+        match step {
+            Step::Event(data) => match serde_json::from_str::<Event>(&data) {
+                Ok(event) => *reconcile_needed |= self.handle(&event, Utc::now()).await,
+                Err(err) => tracing::warn!("unreadable event: {err}"),
+            },
+            Step::Flush => {
+                if std::mem::take(reconcile_needed) {
+                    self.reconcile_logged().await;
+                }
+                self.flush(Utc::now()).await;
+                self.save()?;
+            }
+            Step::Reconcile => {
+                *reconcile_needed |= self.retry_failed(Utc::now()).await;
+                self.reconcile_logged().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends what is queued and saves the state before exiting. The state is saved first,
+    /// so a flush cut short by [`Timing::stop_budget`] loses nothing: what it did not
+    /// settle is sent on the next start.
     async fn stop(&mut self) -> Result<()> {
         tracing::info!("stopping");
-        self.flush(Utc::now()).await;
+        self.save()?;
+        let budget = self.timing.stop_budget;
+        if tokio::time::timeout(budget, self.flush(Utc::now()))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "stopping: sending the queued wake-ups took over {}s; the rest wait for the next start",
+                budget.as_secs()
+            );
+            return Ok(());
+        }
         self.save()
     }
 
     async fn reconcile_logged(&mut self) {
-        if let Err(err) = self.reconcile(Utc::now()).await {
-            tracing::warn!("reconcile: {err:#}");
+        let budget = self.timing.reconcile_budget;
+        match tokio::time::timeout(budget, self.reconcile(Utc::now())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!("reconcile: {err:#}"),
+            Err(_) => tracing::warn!(
+                "reconcile: still running after {}s; stopped until the next tick",
+                budget.as_secs()
+            ),
         }
     }
+}
+
+/// The body of an event stream, ending in an error once no bytes (events or keep-alives)
+/// came for `idle`: a half-open connection then reconnects instead of waiting forever.
+fn idle_limited(
+    resp: reqwest::Response,
+    idle: Duration,
+) -> impl futures_util::Stream<Item = std::io::Result<impl AsRef<[u8]>>> {
+    let body = Box::pin(resp.bytes_stream());
+    futures_util::stream::unfold(Some(body), move |body| async move {
+        let mut body = body?;
+        match tokio::time::timeout(idle, body.next()).await {
+            Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(body))),
+            Ok(Some(Err(err))) => Some((Err(std::io::Error::other(err)), Some(body))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("nothing received for {}s", idle.as_secs_f32()),
+                )),
+                None,
+            )),
+        }
+    })
 }
