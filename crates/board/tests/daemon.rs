@@ -911,7 +911,10 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
         panic!("{sends:?}");
     };
     assert_eq!(thread, ORPHAN);
-    assert_eq!(message, &board::daemon::coordinator_message(&factory()));
+    assert_eq!(
+        message,
+        &board::daemon::coordinator_message(&factory(), false)
+    );
     assert!(
         e.t3.listed
             .lock()
@@ -1532,7 +1535,7 @@ async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
 
 #[test]
 fn the_coordinator_prompt_says_how_to_run_a_climb() {
-    let prompt = board::daemon::coordinator_message(&factory());
+    let prompt = board::daemon::coordinator_message(&factory(), false);
     for rule in [
         "A climb is a task whose acceptance is a score command",
         "note starting `score:`",
@@ -1547,7 +1550,7 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
 
 #[test]
 fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
-    let prompt = board::daemon::coordinator_message(&factory());
+    let prompt = board::daemon::coordinator_message(&factory(), false);
     for rule in [
         "give a verdict on\n   each pending proposal another agent filed",
         "won't do as proposals",
@@ -1561,4 +1564,132 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+    // Routed feedback reaches the owner as a proposal, not as work.
+    let triage = board::daemon::coordinator_message(&factory(), true);
+    assert!(
+        triage.contains("`auto=false`): an imperative title; a body that starts\n  `Proposal:`")
+    );
+}
+
+/// Reconciles once with `config` on a home device of the autopilot `board`, whose
+/// coordinator lease is free, and returns the fake `t3` and the stub.
+async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
+    board.autopilot = true;
+    board.home_devices = vec![DEVICE.parse().unwrap()];
+    let slug = board.slug.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on("GET /v1/boards", [board.clone()]);
+    stub.on(&format!("POST /v1/boards/{slug}/coordinator"), board);
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    let t3 = FakeT3::default();
+    let ctx = Ctx {
+        home: Home::at(dir.path().join("home")),
+        device: DEVICE.parse().unwrap(),
+        client: Client::new(&stub.url, TOKEN.into(), None, None).unwrap(),
+        config: Config {
+            server: Some(stub.url.clone()),
+            device: Some(DEVICE.parse().unwrap()),
+            ..config
+        },
+        repo: RepoInfo::default(),
+    };
+    Daemon::new(ctx, t3.clone()).reconcile(at()).await.unwrap();
+    (t3, stub)
+}
+
+fn started(t3: &FakeT3) -> (PathBuf, String) {
+    let calls = t3.calls();
+    let [
+        Call::Start {
+            project, message, ..
+        },
+    ] = calls.as_slice()
+    else {
+        panic!("{calls:?}");
+    };
+    (project.clone(), message.clone())
+}
+
+#[tokio::test]
+async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
+    let config = Config {
+        board_projects: [("board-feedback".parse().unwrap(), "/src/feedback".into())].into(),
+        ..Config::default()
+    };
+    let (t3, stub) = start_with(board_fixture("board-feedback", &[]), config).await;
+    let (project, _) = started(&t3);
+    assert_eq!(project, Path::new("/src/feedback"));
+    let register = &stub.requests_to("POST /v1/agents")[0].body;
+    assert_eq!(register["role"], "coordinator");
+    assert_eq!(register["repo"], serde_json::Value::Null);
+    assert_eq!(register["cwd"], "/src/feedback");
+
+    // A board repo under [projects] wins over [board_projects].
+    let config = Config {
+        projects: projects(),
+        board_projects: [(factory(), "/src/elsewhere".into())].into(),
+        ..Config::default()
+    };
+    let (t3, stub) = start_with(board_fixture("factory", &[REPO]), config).await;
+    assert_eq!(started(&t3).0, Path::new("/src/agent-board"));
+    assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
+}
+
+#[tokio::test]
+async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
+    let triage = board::daemon::TRIAGE_PROMPT;
+    assert!(triage.starts_with("# Triage"));
+
+    // The default feedback board.
+    let config = Config {
+        board_projects: [("board-feedback".parse().unwrap(), "/src/feedback".into())].into(),
+        ..Config::default()
+    };
+    let (t3, _) = start_with(board_fixture("board-feedback", &[]), config).await;
+    let message = started(&t3).1;
+    assert!(
+        message.starts_with(board::daemon::COORDINATOR_PROMPT),
+        "{message}"
+    );
+    assert!(message.contains(triage), "{message}");
+    assert!(message.ends_with(
+        "You are the coordinator of board board-feedback. Start now: call board_snapshot."
+    ));
+    assert_eq!(
+        message,
+        board::daemon::coordinator_message(&"board-feedback".parse().unwrap(), true)
+    );
+
+    // Another board is not; nor is `board-feedback` when the device names another one.
+    let (t3, _) = start_with(
+        board_fixture("factory", &[REPO]),
+        Config {
+            projects: projects(),
+            ..Config::default()
+        },
+    )
+    .await;
+    assert!(!started(&t3).1.contains("# Triage"));
+    let config = Config {
+        feedback_board: Some("fb".parse().unwrap()),
+        board_projects: [
+            ("board-feedback".parse().unwrap(), "/src/feedback".into()),
+            ("fb".parse().unwrap(), "/src/fb".into()),
+        ]
+        .into(),
+        ..Config::default()
+    };
+    let (t3, _) = start_with(board_fixture("board-feedback", &[]), config.clone()).await;
+    assert!(!started(&t3).1.contains("# Triage"));
+    let (t3, _) = start_with(board_fixture("fb", &[]), config).await;
+    assert!(started(&t3).1.contains(triage));
+
+    // An adopted thread is briefed the same way.
+    let adopted = board::daemon::adoption_message(&"fb".parse().unwrap(), true);
+    assert!(adopted.contains(triage));
+    assert!(!board::daemon::adoption_message(&factory(), false).contains("# Triage"));
 }
