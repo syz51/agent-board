@@ -25,6 +25,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_feedback.sql"),
     include_str!("../migrations/0010_user_updates.sql"),
     include_str!("../migrations/0011_query_indexes.sql"),
+    include_str!("../migrations/0012_telegram_alerts.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

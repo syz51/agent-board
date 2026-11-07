@@ -53,6 +53,19 @@ and send the new code from that chat; the paired chat keeps working until then, 
 asks are sent again to the new one. Setting `[telegram] chat_id` in `server.toml` instead
 skips pairing and always wins over a paired chat.
 
+The same chat gets two scheduled alerts (docs/DESIGN.md, "Scheduled alerts"). Both are on
+by default; set them in `[telegram]` and restart the container:
+
+```toml
+[telegram]
+stuck_after_secs = 14400   # report a doing or review task quiet this long, once; 0 = off
+digest_at = "09:00"        # daily Needs you digest at this local time; "off" = off
+utc_offset = "+08:00"      # the local time's offset from UTC (fixed: no daylight saving)
+```
+
+The first digest goes out at the first check past `digest_at` after the upgrade, which can
+be right away; days with nothing to list send nothing.
+
 Upgrade: `git -C /opt/agent-board pull` and run the `BOARD_COMMIT=... docker compose ...
 up -d --build` line again, then verify with `/healthz` as above. Migrations run on start. Since pairing came in, `BOARD_TELEGRAM_TOKEN` alone
 starts the notifier, without a `[telegram]` table; it sends nothing until a chat is paired

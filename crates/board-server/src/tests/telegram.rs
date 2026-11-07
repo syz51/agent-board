@@ -7,6 +7,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
+use chrono::TimeDelta;
+
 use super::T;
 use crate::telegram::spawn_with;
 use crate::{TelegramConfig, spawn_telegram};
@@ -279,9 +281,15 @@ async fn a_lagging_notifier_replays_missed_asks_once() {
     let mut config = TelegramConfig::new(CHAT);
     config.bot_token = Some(TOKEN.to_owned());
     config.api_base = api_base;
-    let notifier = spawn_with(t.state.clone(), config, events_rx, since)
-        .unwrap()
-        .expect("a token is set");
+    let notifier = spawn_with(
+        t.state.clone(),
+        config,
+        events_rx,
+        since,
+        Duration::from_secs(60),
+    )
+    .unwrap()
+    .expect("a token is set");
 
     let sent = fake.wait("sendMessage", 3).await;
     for (message, n) in sent.iter().zip(0..) {
@@ -722,4 +730,253 @@ async fn a_send_claim_holds_only_for_the_current_chat() {
 
     // A configured chat is not checked against the paired one.
     assert!(claim(other, 9, false).await.unwrap());
+}
+
+/// A notifier for a configured chat that checks the scheduled alerts every 20 ms, with the
+/// digest off unless `configure` sets it. Events before it starts are not notified.
+fn scheduled(
+    t: &T,
+    api_base: String,
+    configure: impl FnOnce(&mut TelegramConfig),
+) -> tokio::task::JoinHandle<()> {
+    let mut config = TelegramConfig::new(CHAT);
+    config.bot_token = Some(TOKEN.to_owned());
+    config.api_base = api_base;
+    config.digest_at = None;
+    configure(&mut config);
+    let events = t.state.db().subscribe();
+    let since = t
+        .state
+        .db()
+        .read(t.state.now(), t.state.settings(), |cx| cx.max_seq())
+        .unwrap();
+    spawn_with(
+        t.state.clone(),
+        config,
+        events,
+        since,
+        Duration::from_millis(20),
+    )
+    .unwrap()
+    .expect("a token is set")
+}
+
+/// The texts sent so far, after letting the notifier run several checks.
+async fn sent_after_checks(fake: &Fake) -> Vec<String> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fake.calls("sendMessage")
+        .iter()
+        .map(|m| m["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn stuck_after() -> TimeDelta {
+    TimeDelta::seconds(i64::try_from(TelegramConfig::default().stuck_after_secs).unwrap())
+}
+
+#[tokio::test]
+async fn a_quiet_task_is_reported_stuck_once_until_it_changes() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::with(|c| c.public_url = Some("https://board.example".to_owned()));
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let id = t.task(A, "factory", "Ship the parser").await;
+    assert!(t.claim(A, &id).await.0.is_success());
+    let notifier = scheduled(&t, api_base, |_| {});
+
+    // Just under the threshold: nothing.
+    t.advance(stuck_after() - TimeDelta::minutes(1));
+    assert!(sent_after_checks(&fake).await.is_empty());
+
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 1).await;
+    assert_eq!(sent[0]["chat_id"], CHAT);
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(&format!("Stuck: {id} has been in doing for 4 h 1 min")),
+        "{text}"
+    );
+    assert!(text.contains("with no update (owner t3:"), "{text}");
+    assert!(text.contains("Ship the parser"), "{text}");
+    assert!(text.contains("Last: task_claimed by "), "{text}");
+    assert!(
+        text.contains(&format!("https://board.example/tasks/{id}")),
+        "{text}"
+    );
+    // Still quiet: no repeat.
+    t.advance(stuck_after());
+    assert_eq!(sent_after_checks(&fake).await.len(), 1);
+
+    // A note is a change: the task is reported again once it goes quiet again.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": "note: still parsing" })),
+    )
+    .await;
+    t.advance(stuck_after() - TimeDelta::minutes(1));
+    assert_eq!(sent_after_checks(&fake).await.len(), 1);
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 2).await;
+    let text = sent[1]["text"].as_str().unwrap();
+    assert!(text.contains("Last: note_added by "), "{text}");
+
+    // Finished: never again.
+    assert!(t.done(A, &id, super::check(0)).await.0.is_success());
+    t.advance(stuck_after() * 3);
+    assert_eq!(sent_after_checks(&fake).await.len(), 2);
+    notifier.abort();
+}
+
+#[tokio::test]
+async fn finished_and_paused_tasks_are_not_reported() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let done = t.task(A, "factory", "Finish quickly").await;
+    assert!(t.claim(A, &done).await.0.is_success());
+    let paused = t.task(A, "factory", "Wait for the reset").await;
+    let notifier = scheduled(&t, api_base, |_| {});
+
+    // Done before the threshold, and the done event itself: no message.
+    assert!(t.done(A, &done, super::check(0)).await.0.is_success());
+    assert!(t.claim(A, &paused).await.0.is_success());
+    // The owner stops on a usage limit: the pause has its own message.
+    let until = (t.state.now() + stuck_after() * 3).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE agents SET state = 'paused', paused_until = {until} WHERE id = '{A}'"
+    ));
+    t.advance(stuck_after() * 2);
+    assert_eq!(sent_after_checks(&fake).await, Vec::<String>::new());
+    // Past the reset the paused task is reported; the done one never is.
+    t.advance(stuck_after() * 2);
+    let sent = fake.wait("sendMessage", 1).await;
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(text.starts_with(&format!("Stuck: {paused} ")), "{text}");
+    assert_eq!(sent_after_checks(&fake).await.len(), 1);
+    notifier.abort();
+}
+
+#[tokio::test]
+async fn the_digest_goes_out_once_a_day_at_the_set_time() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::with(|c| c.public_url = Some("https://board.example".to_owned()));
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    t.board("zeta", &[]).await;
+    let asked = t.task(A, "factory", "Pick a licence").await;
+    let ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "task": asked, "kind": "decision",
+                "question": "MIT or Apache?\nDetails follow.", "options": ["MIT", "Apache"],
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let waits = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Sign the form", "auto": false }),
+        )
+        .await;
+    let proposal = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Cache builds", "auto": false,
+                    "body": "Proposal: cache the builds." }),
+        )
+        .await;
+    let ready = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Ordinary work", "auto": true }),
+        )
+        .await;
+    let blocked = t.task(A, "zeta", "Renew the domain").await;
+    let (s, v) = t
+        .patch(
+            A,
+            &blocked,
+            json!({ "status": "blocked", "blocked_reason": "waits on the registrar" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // 12:00 UTC is 14:00 at +02:00; the digest is set for 15:00 there.
+    let notifier = scheduled(&t, api_base, |c| {
+        c.digest_at = chrono::NaiveTime::from_hms_opt(15, 0, 0);
+        c.utc_offset = "+02:00".parse().unwrap();
+    });
+    assert!(sent_after_checks(&fake).await.is_empty());
+
+    t.advance(TimeDelta::hours(1));
+    let sent = fake.wait("sendMessage", 1).await;
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Needs you, 2026-11-06: 1 open ask, 2 tasks waiting on you."),
+        "{text}"
+    );
+    let factory = text.find("\nfactory\n").expect(text);
+    let zeta = text.find("\nzeta\n").expect(text);
+    assert!(factory < zeta, "{text}");
+    assert!(
+        text.contains(&format!("· ask {ask}: MIT or Apache?\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("· {waits} waits on you: Sign the form")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("· {blocked} blocked: Renew the domain")),
+        "{text}"
+    );
+    // A task with an open ask is listed as the ask; proposals and auto work are not listed.
+    for id in [&asked, &proposal, &ready] {
+        assert!(!text.contains(&format!("· {id} ")), "{id}: {text}");
+    }
+    assert!(text.ends_with("https://board.example/asks"), "{text}");
+    // Once a day.
+    t.advance(TimeDelta::hours(8));
+    assert_eq!(sent_after_checks(&fake).await.len(), 1);
+    // The next local day, at 15:00 again.
+    t.advance(TimeDelta::hours(14));
+    assert_eq!(sent_after_checks(&fake).await.len(), 1);
+    t.advance(TimeDelta::hours(2));
+    let sent = fake.wait("sendMessage", 2).await;
+    assert!(
+        sent[1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Needs you, 2026-11-07:"),
+        "{}",
+        sent[1]["text"]
+    );
+    notifier.abort();
+}
+
+#[tokio::test]
+async fn an_empty_digest_is_skipped() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ordinary work", "auto": true }),
+    )
+    .await;
+    let notifier = scheduled(&t, api_base, |c| {
+        c.digest_at = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+    });
+    t.advance(TimeDelta::days(1));
+    assert_eq!(sent_after_checks(&fake).await, Vec::<String>::new());
+    notifier.abort();
 }

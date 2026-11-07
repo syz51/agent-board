@@ -3,6 +3,10 @@
 //! from that chat only. A withdrawn ask's message is edited to say so and loses its
 //! buttons. No public endpoint is needed.
 //!
+//! Every minute it also reports tasks in doing or review that went quiet past
+//! `stuck_after_secs`, once until they change, and sends a daily Needs you digest at
+//! `digest_at` (skipped when there is nothing to list).
+//!
 //! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
 //! the first private chat that sends `/start <code>` with a live code from `board admin
 //! telegram-pair` becomes it (a `--replace` code takes over from a paired chat). Asks
@@ -13,7 +17,8 @@
 
 use std::time::Duration;
 
-use board_proto::{AgentRole, AskStatus, Event, EventType};
+use board_proto::{AgentRole, AskStatus, Event, EventType, Timestamp};
+use chrono::{FixedOffset, NaiveTime, TimeDelta};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -30,6 +35,21 @@ use crate::store::{find_task, get_agent, get_ask, get_board};
 /// Long-poll timeout passed to `getUpdates`.
 const POLL_SECS: u64 = 25;
 const RETRY: Duration = Duration::from_secs(5);
+/// How often the stuck alert and the digest are checked.
+const CHECK_EVERY: Duration = Duration::from_secs(60);
+/// Room for the digest text: Telegram takes at most 4,096 characters per message.
+const DIGEST_CHARS: usize = 3_500;
+/// Longest ask question or task title in the digest, in characters.
+const DIGEST_LINE_CHARS: usize = 140;
+
+/// When the scheduled alerts go out, from `[telegram]`.
+#[derive(Debug, Clone, Copy)]
+struct Schedule {
+    /// 0 turns the stuck alert off.
+    stuck_after_secs: u64,
+    digest_at: Option<NaiveTime>,
+    utc_offset: FixedOffset,
+}
 
 #[derive(Clone)]
 struct Bot {
@@ -125,16 +145,18 @@ pub fn spawn_telegram(state: AppState, config: TelegramConfig) -> Result<Option<
     let since = state
         .db()
         .read(state.now(), state.settings(), |cx| cx.max_seq())?;
-    spawn_with(state, config, events, since)
+    spawn_with(state, config, events, since, CHECK_EVERY)
 }
 
-/// [`spawn_telegram`] notifying from `events`, starting after event `since`; tests pass a
-/// small channel here to make the notifier lag.
+/// [`spawn_telegram`] notifying from `events`, starting after event `since`, and checking the
+/// scheduled alerts every `check_every`; tests pass a small channel here to make the
+/// notifier lag, and a short period.
 pub(crate) fn spawn_with(
     state: AppState,
     config: TelegramConfig,
     events: broadcast::Receiver<Event>,
     since: i64,
+    check_every: Duration,
 ) -> Result<Option<JoinHandle<()>>> {
     let Some(token) = config.token() else {
         return Ok(None);
@@ -159,10 +181,21 @@ pub(crate) fn spawn_with(
              and send the bot `/start <code>` in a private chat"
         );
     }
+    let schedule = Schedule {
+        stuck_after_secs: config.stuck_after_secs,
+        digest_at: config.digest_at,
+        utc_offset: config.utc_offset,
+    };
     let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
+    let alerts = tokio::spawn(alert_loop(
+        state.clone(),
+        bot.clone(),
+        schedule,
+        check_every,
+    ));
     let poll = tokio::spawn(poll_loop(state, bot));
     Ok(Some(tokio::spawn(async move {
-        let _ = tokio::join!(notify, poll);
+        let _ = tokio::join!(notify, alerts, poll);
     })))
 }
 
@@ -379,6 +412,199 @@ async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()>
     bot.send(json!({ "chat_id": chat, "text": text }))
         .await
         .map(|_| ())
+}
+
+/// Checks the stuck alert and the digest every `every` until the state shuts down.
+async fn alert_loop(state: AppState, bot: Bot, schedule: Schedule, every: Duration) {
+    // The first check waits a period, so a starting server does not alert before it settles.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = state.stopped() => return,
+            _ = tick.tick() => {}
+        }
+        let chat = match bot.chat(&state).await {
+            Ok(Some(chat)) => chat,
+            // Nothing is claimed without a chat, so a chat paired later gets the alerts.
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(%error, "telegram: reading the chat failed");
+                continue;
+            }
+        };
+        if schedule.stuck_after_secs > 0
+            && let Err(error) = send_stuck(&state, &bot, chat, &schedule).await
+        {
+            tracing::error!(%error, "telegram: the stuck-task check failed");
+        }
+        if let Some(at) = schedule.digest_at
+            && let Err(error) = send_digest(&state, &bot, chat, at, schedule.utc_offset).await
+        {
+            tracing::error!(%error, "telegram: the digest failed");
+        }
+    }
+}
+
+/// Reports each task that went quiet past the threshold once; a report that cannot be sent
+/// is tried again at the next check.
+async fn send_stuck(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule) -> Result<()> {
+    let quiet_ms =
+        i64::try_from(schedule.stuck_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let stuck = state
+        .write(move |cx| telegram_ops::claim_stuck(cx, quiet_ms))
+        .await?;
+    for task in stuck {
+        let text = stuck_text(state, &task, schedule.utc_offset);
+        if let Err(error) = bot.send(json!({ "chat_id": chat, "text": text })).await {
+            tracing::error!(%error, task = %task.id, "telegram: a stuck alert failed; retrying");
+            let (id, seq) = (task.id, task.seq);
+            state
+                .write(move |cx| telegram_ops::release_stuck(cx, &id, seq))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn stuck_text(state: &AppState, task: &telegram_ops::Stuck, offset: FixedOffset) -> String {
+    let owner = task
+        .owner
+        .as_deref()
+        .map_or_else(|| "no owner".to_owned(), |h| format!("owner {h}"));
+    let mut text = format!(
+        "Stuck: {} has been in {} for {} with no update ({owner}).\n{}\nLast: {} by {} at {}.",
+        task.id,
+        task.status,
+        span(state.now() - task.last_at),
+        task.title,
+        task.last_type,
+        task.last_actor,
+        local(task.last_at, offset),
+    );
+    if let Some(url) = state.public_url() {
+        text.push_str(&format!("\n{url}/tasks/{}", task.id));
+    }
+    text
+}
+
+/// Sends the digest of the local day once its time has passed, unless it was sent that
+/// day; nothing is sent when nothing needs the user. A digest that cannot be sent is tried
+/// again at the next check.
+async fn send_digest(
+    state: &AppState,
+    bot: &Bot,
+    chat: i64,
+    at: NaiveTime,
+    offset: FixedOffset,
+) -> Result<()> {
+    let now = state.now().with_timezone(&offset);
+    if now.time() < at {
+        return Ok(());
+    }
+    let day = now.date_naive().to_string();
+    let claim = day.clone();
+    if !state
+        .write(move |cx| telegram_ops::claim_digest(cx, &claim))
+        .await?
+    {
+        return Ok(());
+    }
+    let digest = state.read(telegram_ops::digest).await?;
+    if digest.is_empty() {
+        return Ok(());
+    }
+    let text = digest_text(state, &digest, &day);
+    if let Err(error) = bot.send(json!({ "chat_id": chat, "text": text })).await {
+        state
+            .write(move |cx| telegram_ops::release_digest(cx, &day))
+            .await?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn digest_text(state: &AppState, digest: &telegram_ops::Digest, day: &str) -> String {
+    let (asks, tasks) = digest
+        .boards
+        .values()
+        .fold((0, 0), |(a, t), (asks, tasks)| {
+            (a + asks.len(), t + tasks.len())
+        });
+    let mut text = format!(
+        "Needs you, {day}: {asks} open {}, {tasks} {} waiting on you.\n",
+        plural(asks, "ask", "asks"),
+        plural(tasks, "task", "tasks"),
+    );
+    let mut lines = Vec::new();
+    for (board, (asks, tasks)) in &digest.boards {
+        lines.push(format!("\n{board}"));
+        for ask in asks {
+            let question = ask.question.lines().next().unwrap_or_default();
+            lines.push(format!("· ask {}: {}", ask.id, cut(question)));
+        }
+        for task in tasks {
+            let status = match task.status {
+                board_proto::TaskStatus::Blocked => "blocked",
+                _ => "waits on you",
+            };
+            lines.push(format!("· {} {status}: {}", task.id, cut(&task.title)));
+        }
+    }
+    let mut left = lines.len();
+    for line in lines {
+        if text.chars().count() + line.chars().count() > DIGEST_CHARS {
+            text.push_str(&format!("\n… and {left} more."));
+            break;
+        }
+        text.push_str(&line);
+        text.push('\n');
+        left -= 1;
+    }
+    if digest.done_since_seen > 0 {
+        let more = if digest.more_done { "+" } else { "" };
+        text.push_str(&format!(
+            "\nDone since you last looked: {}{more} {}.",
+            digest.done_since_seen,
+            plural(digest.done_since_seen, "task", "tasks"),
+        ));
+    }
+    if let Some(url) = state.public_url() {
+        text.push_str(&format!("\n{url}/asks"));
+    }
+    text
+}
+
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// `text` cut to `DIGEST_LINE_CHARS` characters.
+fn cut(text: &str) -> String {
+    if text.chars().count() <= DIGEST_LINE_CHARS {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(DIGEST_LINE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// A time as the user reads it: local, to the minute.
+fn local(at: Timestamp, offset: FixedOffset) -> String {
+    at.with_timezone(&offset)
+        .format("%Y-%m-%d %H:%M %:z")
+        .to_string()
+}
+
+/// A duration in days and hours, or hours and minutes under a day.
+fn span(d: TimeDelta) -> String {
+    let minutes = d.num_minutes().max(0);
+    let (days, hours, mins) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    if days > 0 {
+        format!("{days} d {hours} h")
+    } else {
+        format!("{hours} h {mins} min")
+    }
 }
 
 async fn poll_loop(state: AppState, bot: Bot) {

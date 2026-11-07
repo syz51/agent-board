@@ -1,11 +1,15 @@
-//! Telegram pairing: one-time codes created on the host, redeemed by `/start <code>` from
-//! a private chat, which then becomes the notifier's chat.
+//! Telegram state: pairing (one-time codes created on the host, redeemed by `/start <code>`
+//! from a private chat, which then becomes the notifier's chat) and the scheduled alerts.
 
+use std::collections::{BTreeMap, HashSet};
+
+use board_proto::{Ask, AskStatus, Task, TaskId, TaskStatus, Timestamp};
 use rusqlite::{OptionalExtension, params};
 
 use crate::auth::hash_token;
-use crate::db::Ctx;
+use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, invalid};
+use crate::store::load_tasks;
 
 /// How long a pairing code stays valid.
 pub(crate) const CODE_TTL_MS: i64 = 15 * 60 * 1000;
@@ -115,4 +119,163 @@ mod tests {
         }
         assert_ne!(new_code(), new_code());
     }
+}
+
+/// A task in doing or review that has gone quiet, as the stuck alert reports it.
+#[derive(Debug)]
+pub(crate) struct Stuck {
+    pub id: TaskId,
+    pub title: String,
+    pub status: String,
+    /// The owner's handle, if the task has an owner.
+    pub owner: Option<String>,
+    /// The newest event not by the server: its sequence, type, actor (a handle for an
+    /// agent) and time.
+    pub seq: i64,
+    pub last_type: String,
+    pub last_actor: String,
+    pub last_at: Timestamp,
+}
+
+/// Claims the stuck alert for every task in doing or review, on a board that is not
+/// closed, whose newest event not by the server is at least `quiet_ms` old and not yet
+/// reported, and whose owner is not paused on a usage limit (that is reported apart).
+/// Forgets the alerts of tasks that left doing and review.
+pub(crate) fn claim_stuck(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stuck>> {
+    cx.db.execute(
+        "DELETE FROM telegram_stuck WHERE task NOT IN \
+         (SELECT id FROM tasks WHERE status IN ('doing', 'review'))",
+        [],
+    )?;
+    let now = cx.now_ms();
+    let stuck: Vec<Stuck> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.id, t.title, t.status, a.handle, e.seq, e.type, \
+               COALESCE(la.handle, e.actor), e.at \
+             FROM tasks t \
+             JOIN boards b ON b.slug = t.board \
+             JOIN events e ON e.seq = (SELECT MAX(x.seq) FROM events x \
+               WHERE x.task = t.id AND x.actor != 'server') \
+             LEFT JOIN agents a ON a.id = t.owner \
+             LEFT JOIN agents la ON la.id = e.actor \
+             WHERE t.status IN ('doing', 'review') AND b.status != 'closed' \
+               AND e.at <= ?1 \
+               AND NOT (COALESCE(a.state, '') = 'paused' AND COALESCE(a.paused_until, 0) > ?2) \
+               AND NOT EXISTS (SELECT 1 FROM telegram_stuck s \
+                 WHERE s.task = t.id AND s.seq = e.seq) \
+             ORDER BY t.board, t.number",
+        )?
+        .query_map(params![now - quiet_ms, now], |r| {
+            Ok(Stuck {
+                id: parse_id(&r.get::<_, String>(0)?)?,
+                title: r.get(1)?,
+                status: r.get(2)?,
+                owner: r.get(3)?,
+                seq: r.get(4)?,
+                last_type: r.get(5)?,
+                last_actor: r.get(6)?,
+                last_at: ts(r.get(7)?),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for task in &stuck {
+        cx.db.execute(
+            "INSERT INTO telegram_stuck (task, seq, sent_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (task) DO UPDATE SET seq = excluded.seq, sent_at = excluded.sent_at",
+            params![task.id.as_str(), task.seq, now],
+        )?;
+    }
+    Ok(stuck)
+}
+
+/// Gives back a stuck alert that could not be sent, so the next check tries again.
+pub(crate) fn release_stuck(cx: &mut Ctx<'_>, task: &TaskId, seq: i64) -> Result<()> {
+    cx.db.execute(
+        "DELETE FROM telegram_stuck WHERE task = ?1 AND seq = ?2",
+        params![task.as_str(), seq],
+    )?;
+    Ok(())
+}
+
+/// Claims the digest of local date `day` (`YYYY-MM-DD`); false when it was already sent.
+pub(crate) fn claim_digest(cx: &mut Ctx<'_>, day: &str) -> Result<bool> {
+    let changed = cx.db.execute(
+        "INSERT INTO telegram_digest (id, day) VALUES (1, ?1) \
+         ON CONFLICT (id) DO UPDATE SET day = excluded.day WHERE day != excluded.day",
+        [day],
+    )?;
+    Ok(changed > 0)
+}
+
+/// What the daily digest lists: the web view's Needs you page, per board.
+#[derive(Debug, Default)]
+pub(crate) struct Digest {
+    /// Boards in slug order, each with its open asks and the tasks that wait on the user.
+    pub boards: BTreeMap<String, (Vec<Ask>, Vec<Task>)>,
+    /// Tasks done since the user last marked updates seen.
+    pub done_since_seen: usize,
+    /// True when `done_since_seen` was cut at the updates limit.
+    pub more_done: bool,
+}
+
+impl Digest {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.boards.is_empty() && self.done_since_seen == 0
+    }
+}
+
+/// The Needs you items, by the web view's rule (`web/src/screens/asks.tsx`): open asks, and
+/// tasks without an open ask on a board that is not closed that are blocked, or open,
+/// not auto, not a proposal, not a feedback item and past any `not_before`.
+pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
+    let mut digest = Digest::default();
+    let asks = crate::ops::asks::list(cx, Some(AskStatus::Open), None)?;
+    let asked: HashSet<String> = asks
+        .iter()
+        .filter_map(|a| a.task.as_ref().map(ToString::to_string))
+        .collect();
+    for ask in asks {
+        digest
+            .boards
+            .entry(ask.board.to_string())
+            .or_default()
+            .0
+            .push(ask);
+    }
+    let tasks = load_tasks(
+        cx,
+        "(t.status = 'blocked' OR (t.status = 'open' AND t.auto = 0)) \
+         AND t.board IN (SELECT slug FROM boards WHERE status != 'closed')",
+        &Vec::new(),
+    )?;
+    for task in tasks {
+        let waits = task.status == TaskStatus::Blocked
+            || (!task.body.trim_start().starts_with("Proposal:")
+                && task.feedback.is_none()
+                && task.not_before.is_none_or(|at| at <= cx.now));
+        if waits && !asked.contains(task.id.as_str()) {
+            digest
+                .boards
+                .entry(task.board.to_string())
+                .or_default()
+                .1
+                .push(task);
+        }
+    }
+    let updates = crate::ops::updates::updates(cx, None, None)?;
+    // Before the user first marks updates seen there is no cursor, and every done task
+    // would count.
+    if updates.seen_at.is_some() {
+        digest.done_since_seen = updates.done.len();
+        digest.more_done = updates.more && updates.done.len() == board_proto::UPDATES_MAX;
+    }
+    Ok(digest)
+}
+
+/// Gives back the digest of `day` that could not be sent, so the next check tries again.
+pub(crate) fn release_digest(cx: &mut Ctx<'_>, day: &str) -> Result<()> {
+    cx.db
+        .execute("DELETE FROM telegram_digest WHERE day = ?1", [day])?;
+    Ok(())
 }
