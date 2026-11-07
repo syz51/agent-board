@@ -499,6 +499,17 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         (None, Some(task)) => task.board(),
         _ => ctx.resolve_board(ask.board.clone()).await?,
     };
+    let open_on_task: Vec<i64> = match &ask.task {
+        Some(task) => ctx
+            .client
+            .asks(Some("open"), Some(&board))
+            .await?
+            .into_iter()
+            .filter(|open| open.task.as_ref() == Some(task))
+            .map(|open| open.id)
+            .collect(),
+        None => Vec::new(),
+    };
     let created = ctx
         .client
         .create_ask(&CreateAsk {
@@ -510,12 +521,26 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             options: ask.options,
         })
         .await?;
+    let mut text = format!(
+        "{}; the user is notified. Continue with other ready work; the answer wakes you.",
+        render::ask_line(&created)
+    );
+    if !open_on_task.is_empty() {
+        let ids: Vec<String> = open_on_task.iter().map(|id| format!("#{id}")).collect();
+        text.push_str(&format!(
+            "\nwarning: ask {} is already open on {}. If this one replaces it, withdraw the old one (ask_withdraw).",
+            ids.join(", "),
+            created.task.as_ref().map(ToString::to_string).unwrap_or_default()
+        ));
+    }
+    Ok(Output::new(text, &created))
+}
+
+pub async fn ask_withdraw(ctx: &Ctx, id: i64) -> Result<Output> {
+    let ask = ctx.client.withdraw_ask(id).await?;
     Ok(Output::new(
-        format!(
-            "{}; the user is notified. Continue with other ready work; the answer wakes you.",
-            render::ask_line(&created)
-        ),
-        &created,
+        format!("withdrew {}", render::ask_line(&ask)),
+        &ask,
     ))
 }
 

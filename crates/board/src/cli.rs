@@ -116,6 +116,8 @@ pub enum Command {
         #[arg(long)]
         board: Option<BoardSlug>,
     },
+    /// Withdraw an open ask you made, such as a duplicate or one you no longer need.
+    Withdraw { id: i64 },
     /// Answer an ask (user tokens only).
     Answer { id: i64, answer: String },
     /// Join a board (default: the one for this repo).
@@ -558,6 +560,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let status = (status != "all").then_some(status.as_str());
             ops::asks(&ctx()?, status, board.as_ref()).await?
         }
+        Command::Withdraw { id } => ops::ask_withdraw(&ctx()?, id).await?,
         Command::Answer { id, answer } => ops::answer(&ctx()?, id, &answer).await?,
         Command::Join { board } => ops::join(&ctx()?, board).await?,
         Command::Boards => ops::boards(&ctx()?).await?,

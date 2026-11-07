@@ -334,6 +334,15 @@ impl Client {
             .await
     }
 
+    /// Withdraws an open ask this agent made.
+    pub async fn withdraw_ask(&self, id: i64) -> Result<Ask> {
+        let body = TaskAction {
+            agent: self.require_agent()?.clone(),
+        };
+        self.with_body(Method::POST, &format!("/v1/asks/{id}/withdraw"), &body)
+            .await
+    }
+
     // Stats
 
     pub async fn stats(&self, days: u32) -> Result<Stats> {

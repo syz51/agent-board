@@ -143,7 +143,7 @@ descriptions under 300 characters):
 
 `board_snapshot`, `board_status`, `task_list`, `task_show`, `task_add`, `task_claim`,
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,
-`board_join`.
+`ask_withdraw`, `board_join`.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
@@ -202,7 +202,8 @@ on one of the board's home devices.
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
   moves the pairing to another chat once redeemed; message ids from the old chat are
-  forgotten then. Everything else from other chats is ignored.
+  forgotten then. Everything else from other chats is ignored. When the agent withdraws an
+  ask, its message is edited to say so and its buttons are removed.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

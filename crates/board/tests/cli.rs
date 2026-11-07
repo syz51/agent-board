@@ -487,3 +487,52 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 2);
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
 }
+
+#[test]
+fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
+    let e = env();
+    let open = |id: i64, task: &str| Ask {
+        id,
+        board: "factory".parse().unwrap(),
+        task: Some(task.parse().unwrap()),
+        agent: ME.parse().unwrap(),
+        kind: AskKind::Decision,
+        question: "Which db?".into(),
+        options: vec![],
+        status: AskStatus::Open,
+        answer: None,
+        answered_via: None,
+        created_at: at(),
+        answered_at: None,
+    };
+    e.stub
+        .on("GET /v1/asks", [open(5, "factory-3"), open(6, "factory-4")]);
+    e.stub.on("POST /v1/asks", open(7, "factory-3"));
+    let out = e.run(&["ask", "Which db?", "--task", "factory-3"]);
+    let text = stdout(&out);
+    assert!(text.contains("ask #7 decision open on factory"), "{text}");
+    assert!(
+        text.contains("warning: ask #5 is already open on factory-3"),
+        "{text}"
+    );
+    assert!(!text.contains("#6"), "{text}");
+    let q = e.stub.requests_to("GET /v1/asks")[0].query_pairs();
+    assert_eq!(
+        (q["status"].as_str(), q["board"].as_str()),
+        ("open", "factory")
+    );
+
+    let mut withdrawn = open(5, "factory-3");
+    withdrawn.status = AskStatus::Withdrawn;
+    e.stub.on("POST /v1/asks/5/withdraw", &withdrawn);
+    let out = e.run(&["withdraw", "5"]);
+    assert!(
+        stdout(&out).contains("withdrew ask #5 decision withdrawn"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/asks/5/withdraw")[0].body,
+        json!({ "agent": ME })
+    );
+}

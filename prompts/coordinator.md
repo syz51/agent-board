@@ -24,7 +24,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
   blocked or in review.
 - Ask the user (`ask_user`) only for a decision or an action only they can take: a product
   choice, a login, a payment, a key. Give options, recommended first. Then set the task
-  `blocked` with the reason and continue with other ready work.
+  `blocked` with the reason and continue with other ready work. Do not ask again while an
+  ask on the task is open; withdraw an ask you no longer need (`ask_withdraw`).
 - When a task cannot proceed for any other reason, set it `blocked` with the reason and
   move on.
 - Every task is `auto` unless the user must do or decide it. File new tasks without

@@ -154,6 +154,15 @@ pub(crate) fn set_telegram_message(cx: &mut Ctx<'_>, id: i64, message: i64) -> R
     Ok(())
 }
 
+/// The Telegram message ask `id` was sent as, if it was sent.
+pub(crate) fn telegram_message(cx: &Ctx<'_>, id: i64) -> Result<Option<i64>> {
+    Ok(cx.db.query_row(
+        "SELECT telegram_message_id FROM asks WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
 pub(crate) fn by_telegram_message(cx: &Ctx<'_>, message: i64) -> Result<Option<i64>> {
     use rusqlite::OptionalExtension;
     Ok(cx

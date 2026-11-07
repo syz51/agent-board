@@ -1,6 +1,7 @@
 //! Telegram notifier: sends each new ask to the chat, with its options as buttons, and
 //! long-polls the Bot API for answers (a button press, or a reply to the ask's message)
-//! from that chat only. No public endpoint is needed.
+//! from that chat only. A withdrawn ask's message is edited to say so and loses its
+//! buttons. No public endpoint is needed.
 //!
 //! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
 //! the first private chat that sends `/start <code>` with a live code from `board admin
@@ -221,6 +222,7 @@ async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
 async fn notify(state: &AppState, bot: &Bot, event: &Event) {
     let result = match event.event_type {
         EventType::AskCreated => send_ask(state, bot, event).await,
+        EventType::AskWithdrawn => mark_withdrawn(state, bot, event).await,
         EventType::AgentStateChanged => report_paused(state, bot, event).await,
         _ => Ok(()),
     };
@@ -245,6 +247,49 @@ async fn send_ask(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
 
 /// Sends ask `id` to `chat` and records the message, so replies to it answer the ask.
 async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<()> {
+    let (ask, text) = ask_text(state, id).await?;
+    let mut body = json!({ "chat_id": chat, "text": text });
+    if !ask.options.is_empty() {
+        let rows: Vec<Value> = ask
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, option)| {
+                json!([{ "text": option, "callback_data": format!("ask:{}:{i}", ask.id) }])
+            })
+            .collect();
+        body["reply_markup"] = json!({ "inline_keyboard": rows });
+    }
+    let message = bot.send(body).await?;
+    state
+        .write(move |cx| asks::set_telegram_message(cx, id, message.message_id))
+        .await
+}
+
+/// Marks a withdrawn ask's message as withdrawn and drops its buttons, so the user
+/// does not answer it.
+async fn mark_withdrawn(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
+    let Some(id) = event.payload.get("id").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    let Some(message) = state.read(move |cx| asks::telegram_message(cx, id)).await? else {
+        return Ok(());
+    };
+    let Some(chat) = bot.chat(state).await? else {
+        return Ok(());
+    };
+    let (_, mut text) = ask_text(state, id).await?;
+    text.push_str("\n\nWithdrawn by the agent; no answer is needed.");
+    bot.call::<Value>(
+        "editMessageText",
+        &json!({ "chat_id": chat, "message_id": message, "text": text }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Ask `id` and the text of its Telegram message.
+async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String)> {
     let (ask, board, task, handle) = state
         .read(move |cx| {
             let ask = get_ask(cx, id)?;
@@ -281,22 +326,7 @@ async fn send_ask_to(state: &AppState, bot: &Bot, chat: i64, id: i64) -> Result<
     if let Some(url) = state.public_url() {
         text.push_str(&format!("\n{url}/asks/{}", ask.id));
     }
-    let mut body = json!({ "chat_id": chat, "text": text });
-    if !ask.options.is_empty() {
-        let rows: Vec<Value> = ask
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, option)| {
-                json!([{ "text": option, "callback_data": format!("ask:{}:{i}", ask.id) }])
-            })
-            .collect();
-        body["reply_markup"] = json!({ "inline_keyboard": rows });
-    }
-    let message = bot.send(body).await?;
-    state
-        .write(move |cx| asks::set_telegram_message(cx, id, message.message_id))
-        .await
+    Ok((ask, text))
 }
 
 /// Reports a coordinator that stopped on a usage limit.

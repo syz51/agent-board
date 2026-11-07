@@ -179,6 +179,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
             "handoff_set",
             "lease_paths",
             "ask_user",
+            "ask_withdraw",
             "board_join",
         ]
     );
@@ -232,6 +233,21 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(
         req.body,
         json!({"agent": "claude:other", "kind": "decision", "text": "x"})
+    );
+
+    stub.on_error(
+        "POST /v1/asks/5/withdraw",
+        403,
+        "forbidden",
+        "ask #5 was made by t3:c2d0",
+        "only the asking agent can withdraw it",
+    );
+    let refused = mcp.call(7, "ask_withdraw", json!({"id": 5}));
+    assert_eq!(refused["isError"], true);
+    assert!(text(&refused).starts_with("error: forbidden: ask #5 was made by t3:c2d0"));
+    assert_eq!(
+        stub.requests_to("POST /v1/asks/5/withdraw")[0].body,
+        json!({"agent": "t3:thread-1"})
     );
 
     let bad = mcp.call(6, "task_show", json!({"id": "not an id"}));
