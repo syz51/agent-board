@@ -15,6 +15,7 @@ import {
   useTitle,
   Who,
 } from "../ui/common.tsx";
+import { Icon } from "../ui/icons.tsx";
 
 const VIA: Record<string, string> = { web: "the web view", telegram: "Telegram", cli: "the CLI" };
 
@@ -37,9 +38,12 @@ export function AsksScreen() {
   return (
     <>
       <header class="page-head">
-        <h1>Needs you</h1>
+        <div class="page-title">
+          <h1>Needs you</h1>
+          <p class="page-sub">Questions and requests from agents, newest first.</p>
+        </div>
         {board && (
-          <a class="chip chip-remove" href="/asks" aria-label={`Remove board filter ${board}`}>
+          <a class="tag tag-remove" href="/asks" aria-label={`Remove board filter ${board}`}>
             board: {board} <span aria-hidden="true">×</span>
           </a>
         )}
@@ -49,7 +53,7 @@ export function AsksScreen() {
           const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
           if (shown.length === 0) {
             return (
-              <Empty title="Nothing needs you">
+              <Empty title="Nothing needs you" icon="inbox">
                 Agents' questions and requests appear here, and on Telegram if it is set up.
               </Empty>
             );
@@ -77,6 +81,8 @@ export function AskScreen({ id }: { id: string }) {
     <>
       <nav class="crumbs" aria-label="Breadcrumb">
         <a href="/asks">Needs you</a>
+        <Icon name="chevron" />
+        <span aria-current="page">Ask #{id}</span>
       </nav>
       {valid
         ? (
@@ -94,27 +100,31 @@ function AskCard(
 ) {
   const Heading = standalone ? "h1" : "h2";
   return (
-    <article class={`card ask-card ask-${ask.status}`}>
+    <article class={`card ask-card ask-${ask.status} ask-kind-${ask.kind}`}>
       <header class="ask-meta">
-        <span class={ask.kind === "action" ? "badge tone-blocked" : "badge tone-review"}>
+        <span class={`kind kind-${ask.kind}`}>
+          <Icon name={ask.kind === "action" ? "hand" : "question"} />
           {ask.kind === "action" ? "Action" : "Decision"}
         </span>
         <Heading class="ask-title">
           {standalone ? <>Ask #{ask.id}</> : <a href={`/asks/${ask.id}`}>Ask #{ask.id}</a>}
         </Heading>
-        <span class="muted">
-          <Who id={ask.agent} agents={agents} /> · <RelTime at={ask.created_at} />
+        <span class="ask-from">
+          <Who id={ask.agent} agents={agents} />
+          <span class="muted">
+            <RelTime at={ask.created_at} />
+          </span>
+        </span>
+        <span class="ask-context">
+          <a href={`/boards/${encodeURIComponent(ask.board)}`}>{ask.board}</a>
+          {ask.task && (
+            <>
+              <Icon name="chevron" />
+              <a href={`/tasks/${encodeURIComponent(ask.task)}`}><code>{ask.task}</code></a>
+            </>
+          )}
         </span>
       </header>
-      <p class="ask-context">
-        <a href={`/boards/${encodeURIComponent(ask.board)}`}>{ask.board}</a>
-        {ask.task && (
-          <>
-            {" · "}
-            <a href={`/tasks/${encodeURIComponent(ask.task)}`}><code>{ask.task}</code></a>
-          </>
-        )}
-      </p>
       <div class="ask-question agent-text">
         <Markdown text={ask.question} />
       </div>
@@ -183,7 +193,7 @@ function AnswerForm({ ask }: { ask: Ask }) {
                 }}
               />
               <span class="option-text">{option}</span>
-              {index === 0 && <span class="chip">recommended</span>}
+              {index === 0 && <span class="tag tag-accent">Recommended</span>}
             </label>
           ))}
         </fieldset>
@@ -192,7 +202,7 @@ function AnswerForm({ ask }: { ask: Ask }) {
         <span>{ask.options.length > 0 ? "Or write your own answer" : "Your answer"}</span>
         <textarea
           id={`${id}-text`}
-          rows={3}
+          rows={2}
           value={text}
           aria-invalid={missing || undefined}
           aria-describedby={missing ? `${id}-missing` : undefined}

@@ -3,6 +3,7 @@ import { useEffect } from "preact/hooks";
 import type { ApiFailure } from "../api/client.ts";
 import { api } from "../api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "../api/schema.ts";
+import { hueOf, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
 import { tags } from "../live/refresh.ts";
 import { type Resource, useNow, useResource } from "../live/runtime.ts";
 
@@ -26,6 +27,7 @@ export function ErrorNotice(
 ) {
   return (
     <div class={compact ? "notice notice-error compact" : "notice notice-error"} role="alert">
+      {!compact && <span class="notice-icon"><Icon name="plug" /></span>}
       <div class="notice-body">
         <p class="notice-title">{error.message}</p>
         {error.next && <p class="notice-next">{error.next}</p>}
@@ -39,9 +41,12 @@ export function ErrorNotice(
   );
 }
 
-export function Empty({ title, children }: { title: string; children?: ComponentChildren }) {
+export function Empty(
+  { title, children, icon = "boards" }: { title: string; children?: ComponentChildren; icon?: IconName },
+) {
   return (
     <div class="state state-empty">
+      <span class="state-icon"><Icon name={icon} /></span>
       <p class="state-title">{title}</p>
       {children && <p class="state-detail">{children}</p>}
     </div>
@@ -111,35 +116,19 @@ export function RelTime({ at }: { at: string }) {
   );
 }
 
-const STATUS_LABEL: Record<TaskStatus, string> = {
-  open: "Open",
-  doing: "Doing",
-  blocked: "Blocked",
-  review: "Review",
-  done: "Done",
-  dropped: "Dropped",
-};
-
 export function StatusBadge({ status, ready }: { status: TaskStatus; ready?: boolean }) {
-  if (status === "open" && ready) return <span class="badge tone-ready">Ready</span>;
-  return <span class={`badge tone-${status}`}>{STATUS_LABEL[status]}</span>;
+  return <StatusPill status={status === "open" && ready ? "ready" : status} />;
 }
 
-export function PriorityBadge({ priority }: { priority: Priority }) {
-  return <span class={`prio prio-${priority}`}>{priority.toUpperCase()}</span>;
+export function PriorityBadge({ priority, compact }: { priority: Priority; compact?: boolean }) {
+  return <PriorityMark priority={priority} {...(compact ? { compact } : {})} />;
 }
-
-const AGENT_STATE_TONE: Record<Agent["state"], string> = {
-  running: "tone-doing",
-  idle: "tone-open",
-  paused: "tone-blocked",
-  ended: "tone-dropped",
-};
 
 export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
   const now = useNow();
   return (
-    <span class={`badge ${AGENT_STATE_TONE[agent.state]}`}>
+    <span class={`pill agent-${agent.state}`}>
+      <span class="state-dot" aria-hidden="true" />
       {agent.state === "paused" && agent.paused_until
         ? (
           <>
@@ -156,13 +145,13 @@ export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "pause
 
 /** An owner's handle, flagged when stale on work that is still open. */
 export function Owner({ task, agents }: { task: Pick<Task, "owner" | "owner_stale" | "status">; agents: Map<string, Agent> }) {
-  if (!task.owner) return <span class="muted">unowned</span>;
+  if (!task.owner) return <span class="muted unowned">Unowned</span>;
   const closed = task.status === "done" || task.status === "dropped";
   return (
     <span class="owner">
       <Who id={task.owner} agents={agents} />
       {task.owner_stale && !closed && (
-        <span class="badge tone-blocked" title="Not seen for 24 hours; another agent may take this task">stale</span>
+        <span class="tag tag-warn" title="Not seen for 24 hours; another agent may take this task">stale</span>
       )}
     </span>
   );
@@ -180,7 +169,13 @@ export function agentIndex(agents: Agent[] | undefined): Map<string, Agent> {
 /** An agent's handle, or the id when the agent is unknown; `user` and `server` as is. */
 export function Who({ id, agents }: { id: string; agents: Map<string, Agent> }) {
   const agent = agents.get(id);
-  return <span class="handle" title={id}>{agent ? agent.handle : id}</span>;
+  if (id === "user") return <span class="who who-user">you</span>;
+  return (
+    <span class="who" title={id}>
+      <span class="avatar" style={{ "--hue": hueOf(id) }} aria-hidden="true" />
+      <span class="handle">{agent ? agent.handle : id}</span>
+    </span>
+  );
 }
 
 /** `factory-12` → `factory`. */
