@@ -274,7 +274,11 @@ export function AskScreen() {
       </Crumbs>
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
-          {(data) => <AskCard ask={data} agents={agents} standalone />}
+          {(data) => (
+            <div className="max-w-[720px]">
+              <AskCard ask={data} agents={agents} standalone />
+            </div>
+          )}
         </QueryFrame>
       ) : (
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
@@ -456,8 +460,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     </Label>
                     <Textarea
                       id={`${id}-text`}
-                      rows={2}
-                      className="min-h-[62px] bg-card text-sm dark:bg-card"
+                      rows={1}
+                      className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}

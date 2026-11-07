@@ -13,7 +13,7 @@ import {
   useAgents,
   useTitle,
 } from "@/ui/common.tsx";
-import { Avatar, StatusIcon } from "@/ui/icons.tsx";
+import { Avatar, Icon, StatusIcon } from "@/ui/icons.tsx";
 import { CollapsibleMarkdown } from "./updates.tsx";
 
 const route = getRouteApi("/agents");
@@ -243,8 +243,12 @@ function SaidView({ agentId }: { agentId: string }) {
   const latest = said.data?.[0];
   const note = "text-muted-foreground mb-1 text-xs";
   return (
-    <details className="text-sm">
-      <summary className="min-h-7 cursor-pointer py-0.5 text-meta text-muted-foreground hover:text-foreground">
+    <details className="group/said text-sm">
+      <summary className="-mx-1.5 inline-flex min-h-7 cursor-pointer list-none items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-meta font-medium text-subtle-foreground hover:bg-secondary hover:text-foreground [&::-webkit-details-marker]:hidden">
+        <Icon
+          name="chevron"
+          className="size-3.5 transition-transform group-open/said:rotate-90 motion-reduce:transition-none"
+        />
         Recent turn endings
         {latest && (
           <>

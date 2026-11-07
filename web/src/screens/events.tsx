@@ -17,7 +17,7 @@ import {
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon, type IconName } from "@/ui/icons.tsx";
+import { Icon, type IconName, StatusIcon, type StatusKey } from "@/ui/icons.tsx";
 import { FilterSelect, FilterToggle } from "@/ui/filters.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
 
@@ -127,40 +127,78 @@ const KIND_ICON: Record<string, IconName> = {
   files: "file",
 };
 
-/** Events that went wrong: blocked work and failed checks. Asks get their own kind colour. */
-function isNotable(event: BoardEvent): boolean {
-  const payload = (event.payload ?? {}) as Record<string, unknown>;
-  if (event.type === "task_updated" && payload.to === "blocked") return true;
-  return (
-    event.type === "evidence_added" &&
-    typeof payload.exit_code === "number" &&
-    payload.exit_code !== 0
-  );
-}
-
-/** Routine bookkeeping that reads better quietly. */
-const ROUTINE = new Set([
-  "handoff_updated",
-  "agent_state_changed",
-  "lease_created",
-  "lease_released",
-  "lease_expired",
-  "files_touched",
-  "note_added",
-]);
-
 /** Events about the agent itself, where the board adds nothing. */
 const PERSONAL = new Set(["handoff_updated", "agent_state_changed"]);
 
-type Weight = "ask-action" | "ask-decision" | "notable" | "routine" | "normal";
-
-const NODE: Record<Weight, string> = {
-  "ask-action": "text-amber border-amber/40 bg-amber-soft",
-  "ask-decision": "text-status-review border-status-review/40 bg-status-review-soft",
-  notable: "text-status-blocked border-status-blocked/40 bg-status-blocked-soft [&_svg]:stroke-2",
-  routine: "[&_svg]:size-3.25",
-  normal: "",
+const TASK_STATUS: Record<string, StatusKey> = {
+  open: "open",
+  doing: "doing",
+  blocked: "blocked",
+  review: "review",
+  done: "done",
+  dropped: "dropped",
 };
+
+/**
+ * One rule for every event's mark: it shows the state the event leaves behind. Task events
+ * show the task's new status with the board's status symbol; asks show their kind; evidence
+ * shows a pass or a failure; everything else shows a grey symbol of what it is about.
+ * Exported for tests.
+ */
+export function eventMark(event: BoardEvent): {
+  status?: StatusKey;
+  icon?: IconName;
+  tone: string;
+} {
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  const to = typeof payload.to === "string" ? TASK_STATUS[payload.to] : undefined;
+  switch (event.type) {
+    case "task_created":
+      return { status: "open", tone: "" };
+    case "task_claimed":
+      return { status: "doing", tone: "" };
+    case "task_done":
+      return { status: "done", tone: "" };
+    case "task_updated":
+      return to ? { status: to, tone: "" } : { icon: "task", tone: "text-muted-foreground" };
+    case "ask_created":
+      return payload.kind === "action"
+        ? { icon: "hand", tone: "text-amber" }
+        : { icon: "question", tone: "text-status-review" };
+    case "ask_answered":
+      return { icon: "check", tone: "text-status-ready" };
+    case "evidence_added":
+      return typeof payload.exit_code === "number" && payload.exit_code !== 0
+        ? { icon: "cross", tone: "text-status-blocked" }
+        : { icon: "shield", tone: "text-muted-foreground" };
+    default:
+      return {
+        icon: KIND_ICON[event.type.split("_")[0] ?? ""] ?? "events",
+        tone: "text-muted-foreground",
+      };
+  }
+}
+
+/** The mark itself: a status symbol or an icon, on the same neutral node for every event. */
+export function EventMark({ event, className }: { event: BoardEvent; className?: string }) {
+  const mark = eventMark(event);
+  return (
+    <span
+      className={cn(
+        "grid size-6 flex-none place-items-center rounded-full border bg-card",
+        mark.tone,
+        className,
+      )}
+      aria-hidden="true"
+    >
+      {mark.status ? (
+        <StatusIcon status={mark.status} className="size-3.5" />
+      ) : (
+        <Icon name={mark.icon ?? "events"} className="size-3.5" />
+      )}
+    </span>
+  );
+}
 
 export function EventLine({
   event,
@@ -174,57 +212,16 @@ export function EventLine({
   const summary = detail(event);
   const [verb, suffix] = describe(event);
   const kind = event.type.split("_")[0] ?? "";
-  const askKind =
-    event.type === "ask_created" && (event.payload as { kind?: unknown } | null)?.kind === "action"
-      ? "action"
-      : "decision";
-  const weight: Weight =
-    event.type === "ask_created"
-      ? `ask-${askKind}`
-      : isNotable(event)
-        ? "notable"
-        : ROUTINE.has(event.type)
-          ? "routine"
-          : "normal";
-  // Events that went wrong get the glyph of what went wrong: the blocked mark, or a cross
-  // for a failed check, so failure reads apart from routine work and the two apart.
-  const icon: IconName =
-    event.type === "ask_created"
-      ? askKind === "action"
-        ? "hand"
-        : "question"
-      : weight === "notable"
-        ? event.type === "evidence_added"
-          ? "cross"
-          : "minus"
-        : (KIND_ICON[kind] ?? "events");
-  const routine = weight === "routine";
   return (
     <li
       className="relative grid grid-cols-[28px_minmax(0,1fr)_auto] items-start gap-x-3 py-1.75 max-[520px]:grid-cols-[28px_minmax(0,1fr)]"
       data-kind={kind}
-      data-weight={weight}
     >
-      <span
-        className={cn(
-          "m-0.5 grid size-6 place-items-center rounded-full border border-background bg-secondary text-subtle-foreground",
-          NODE[weight],
-        )}
-        aria-hidden="true"
-      >
-        <Icon name={icon} className="size-3.5" />
-      </span>
+      <EventMark event={event} className="m-0.5" />
       <div className="grid min-w-0 gap-0.5 pt-1">
-        <p
-          className={cn(
-            "flex flex-wrap items-center gap-x-1.5 gap-y-0.5",
-            routine ? "text-meta text-subtle-foreground" : "text-foreground",
-          )}
-        >
+        <p className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-foreground">
           <Who id={event.actor} agents={agents} />
-          <span className="font-medium" title={event.type}>
-            {verb}
-          </span>
+          <span title={event.type}>{verb}</span>
           {showTask && event.task && (
             <Link to="/tasks/$id" params={{ id: event.task }}>
               <span className="ident text-meta">{event.task}</span>
@@ -235,10 +232,10 @@ export function EventLine({
               <span className="ident text-meta">{event.board}</span>
             </Link>
           )}
-          {suffix && <span className="font-medium">{suffix}</span>}
+          {suffix && <span>{suffix}</span>}
         </p>
         {summary && (
-          <p className="text-meta [overflow-wrap:anywhere] text-subtle-foreground">{summary}</p>
+          <p className="text-meta [overflow-wrap:anywhere] text-muted-foreground">{summary}</p>
         )}
       </div>
       <span className="inline-flex gap-2 pt-1.25 text-meta whitespace-nowrap text-muted-foreground tabular-nums max-[520px]:col-start-2 max-[520px]:pt-0">

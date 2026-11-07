@@ -111,14 +111,14 @@ export function Nav() {
           )}
           {item.to === "/asks" && unseen > 0 && (
             <>
-              <span
-                className={cn(
-                  "size-2.25 flex-none rounded-full bg-primary shadow-[0_0_0_2px_var(--card)] max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)]",
-                  open > 0 && "max-md:hidden",
-                )}
-                aria-hidden="true"
-                title={`${unseen} unseen updates`}
-              />
+              {/* One mark at a time: the count when something waits, else a dot for news. */}
+              {open === 0 && (
+                <span
+                  className="ml-auto size-2 flex-none rounded-full bg-primary max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                  aria-hidden="true"
+                  title={`${unseen} unseen updates`}
+                />
+              )}
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}
               </span>

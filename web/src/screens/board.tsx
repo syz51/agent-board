@@ -139,50 +139,55 @@ export function BoardScreen() {
         </p>
       )}
 
-      <form
-        className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-        role="search"
-        onSubmit={(event) => event.preventDefault()}
-      >
-        <SearchField
-          label="Search tasks"
-          placeholder="Search by title or id"
-          value={filters.q}
-          onChange={(value) => setFilter("q", value)}
-          className="max-md:col-span-2"
-        />
-        <FilterSelect
-          label="Priority"
-          value={filters.priority}
-          onChange={(value) => setFilter("priority", value)}
+      {/* No filters on a board without tasks; disabled until its tasks have loaded. */}
+      {(filtered || tasks.data === undefined || tasks.data.length > 0) && (
+        <form
+          className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+          role="search"
+          onSubmit={(event) => event.preventDefault()}
         >
-          <NativeSelectOption value="">Any</NativeSelectOption>
-          <NativeSelectOption value="p1">P1</NativeSelectOption>
-          <NativeSelectOption value="p2">P2</NativeSelectOption>
-          <NativeSelectOption value="p3">P3</NativeSelectOption>
-        </FilterSelect>
-        <FilterSelect
-          label="Owner"
-          value={filters.owner}
-          onChange={(value) => setFilter("owner", value)}
-          className="max-md:col-span-2"
-        >
-          <NativeSelectOption value="">Anyone</NativeSelectOption>
-          <NativeSelectOption value="none">Unowned</NativeSelectOption>
-          {ownerOptions(tasks.data ?? [], agents).map((agent) => (
-            <NativeSelectOption key={agent.id} value={agent.id}>
-              {agent.label}
-            </NativeSelectOption>
-          ))}
-        </FilterSelect>
-        <FilterToggle
-          checked={filters.readyOnly}
-          onChange={(checked) => setFilter("ready", checked ? "1" : "")}
-          className="max-md:col-start-3 max-md:row-start-1"
-        >
-          Ready only
-        </FilterToggle>
-      </form>
+          <fieldset className="contents" disabled={tasks.data === undefined}>
+            <SearchField
+              label="Search tasks"
+              placeholder="Search by title or id"
+              value={filters.q}
+              onChange={(value) => setFilter("q", value)}
+              className="max-md:col-span-2"
+            />
+            <FilterSelect
+              label="Priority"
+              value={filters.priority}
+              onChange={(value) => setFilter("priority", value)}
+            >
+              <NativeSelectOption value="">Any</NativeSelectOption>
+              <NativeSelectOption value="p1">P1</NativeSelectOption>
+              <NativeSelectOption value="p2">P2</NativeSelectOption>
+              <NativeSelectOption value="p3">P3</NativeSelectOption>
+            </FilterSelect>
+            <FilterSelect
+              label="Owner"
+              value={filters.owner}
+              onChange={(value) => setFilter("owner", value)}
+              className="max-md:col-span-2"
+            >
+              <NativeSelectOption value="">Anyone</NativeSelectOption>
+              <NativeSelectOption value="none">Unowned</NativeSelectOption>
+              {ownerOptions(tasks.data ?? [], agents).map((agent) => (
+                <NativeSelectOption key={agent.id} value={agent.id}>
+                  {agent.label}
+                </NativeSelectOption>
+              ))}
+            </FilterSelect>
+            <FilterToggle
+              checked={filters.readyOnly}
+              onChange={(checked) => setFilter("ready", checked ? "1" : "")}
+              className="max-md:col-start-3 max-md:row-start-1"
+            >
+              Ready only
+            </FilterToggle>
+          </fieldset>
+        </form>
+      )}
 
       <QueryFrame query={tasks} label="Loading tasks">
         {(list) => {

@@ -9,13 +9,13 @@ import { Switch } from "@/components/ui/switch.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
-import { PlainText } from "@/text/markdown.tsx";
 import {
   AgentStateBadge,
   agentIndex,
   AskKind,
   Empty,
   ErrorNotice,
+  ExpandableLine,
   listClass,
   PageHeader,
   QueryFrame,
@@ -272,13 +272,11 @@ function BoardName({ board }: { board: Board }) {
           </Badge>
         )}
       </div>
-      <p className="truncate text-meta text-muted-foreground">
-        {board.goal ? (
-          <PlainText className="whitespace-nowrap" text={board.goal} />
-        ) : (
-          "No goal written."
-        )}
-      </p>
+      {board.goal ? (
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
+      ) : (
+        <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
+      )}
     </>
   );
 }
@@ -338,11 +336,7 @@ function TaskTally({ board }: { board: Board }) {
 
 function Coordinator({ board, coordinator, agents }: BoardRowData) {
   if (board.coordinator === null) {
-    return (
-      <span className="text-muted-foreground">
-        {board.autopilot ? "No coordinator running" : "No coordinator"}
-      </span>
-    );
+    return <span className="text-muted-foreground">No coordinator</span>;
   }
   if (!coordinator) return <Who id={board.coordinator} agents={agents} />;
   return (
@@ -358,7 +352,10 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">No asks</span>
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
+        <span aria-hidden="true">–</span>
+        <span className="sr-only">No asks</span>
+      </span>
     );
   }
   return (

@@ -1,5 +1,5 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { type ReactNode, useEffect } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import type { ApiFailure } from "@/api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "@/api/schema.ts";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
@@ -57,9 +57,9 @@ export function ErrorNotice({
         <AlertTitle className="col-start-1 line-clamp-none font-semibold">
           {error.message}
         </AlertTitle>
-        <AlertDescription className="col-start-1 text-error">
-          {error.next && <p>{error.next}</p>}
-          <p className="text-xs opacity-85">
+        <AlertDescription className="col-start-1 text-foreground!">
+          {error.next && <p className="first-letter:uppercase">{error.next}</p>}
+          <p className="text-xs text-muted-foreground">
             {error.status > 0 ? `HTTP ${error.status} · ` : ""}
             <code>{error.code}</code>
           </p>
@@ -241,7 +241,18 @@ export function Owner({
   task: Pick<Task, "owner" | "owner_stale" | "status">;
   agents: Map<string, Agent>;
 }) {
-  if (!task.owner) return <span className="text-meta text-muted-foreground">Unowned</span>;
+  if (!task.owner) {
+    return (
+      <span className="inline-flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground">
+        <span
+          data-slot="avatar-empty"
+          className="size-5 flex-none rounded-full border border-dashed border-input"
+          aria-hidden="true"
+        />
+        Unowned
+      </span>
+    );
+  }
   const closed = task.status === "done" || task.status === "dropped";
   return (
     <span className="inline-flex min-w-0 items-center gap-2">
@@ -370,5 +381,34 @@ export function AskKind({ kind }: { kind: "action" | "decision" }) {
       <Icon name={kind === "action" ? "hand" : "question"} className="size-3.5" />
       {kind === "action" ? "Action" : "Decision"}
     </span>
+  );
+}
+
+/**
+ * One line of agent text, cut to the width with an ellipsis. It is a button: a click, tap,
+ * Enter or Space shows the whole text, so it can be read without hovering.
+ */
+export function ExpandableLine({
+  text,
+  className,
+}: {
+  text: string;
+  className?: string | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <button
+      type="button"
+      className={cn(
+        "block min-h-6 w-full min-w-0 cursor-pointer rounded-xs text-left text-inherit",
+        open ? "whitespace-pre-wrap" : "truncate",
+        className,
+      )}
+      aria-expanded={open}
+      title={open ? undefined : text}
+      onClick={() => setOpen(!open)}
+    >
+      {text}
+    </button>
   );
 }
