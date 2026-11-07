@@ -70,7 +70,23 @@ export function waitingTasks(tasks: Task[], openAsks: Ask[], now: number): Board
     }));
 }
 
-/** Open and blocked tasks on every board. */
+/** What the Needs you page lists across boards: the open asks and the waiting tasks. */
+export function needsYouCount(openAsks: Ask[], tasks: Task[], now: number): number {
+  return waitingTasks(tasks, openAsks, now).reduce((sum, group) => sum + group.tasks.length, openAsks.length);
+}
+
+/**
+ * The navigation badge's count, from the page's own cached queries. Until the tasks load
+ * it counts the open asks only.
+ */
+export function useNeedsYouCount(): number {
+  const asks = useOpenAsks();
+  const tasks = useCandidateTasks();
+  const now = useNow(60_000);
+  return needsYouCount(asks.data ?? [], tasks.data ?? [], now);
+}
+
+/** Open and blocked tasks on every board, shared by the page and the navigation badge. */
 function useCandidateTasks() {
   return useResource("tasks:needs-you", [tags.tasks], async () => {
     const [open, blocked] = await Promise.all([

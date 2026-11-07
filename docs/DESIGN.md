@@ -318,7 +318,7 @@ registers without a repo).
   evidence and history; agents with their state, current task and handoff; a **Needs you**
   queue to answer asks, followed by the tasks that wait on the user without an open ask,
   by board: blocked ones, and open ones not `auto` other than pending proposals, feedback
-  items and those held by a `not_before`; a live event feed.
+  items and those held by a `not_before` (its navigation badge counts both); a live event feed.
 
 ## Text format
 
