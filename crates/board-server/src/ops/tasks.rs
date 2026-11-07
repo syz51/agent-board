@@ -281,12 +281,16 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     )?;
     set_blockers(cx, &id, &blockers)?;
     join_board(cx, &req.board, &req.agent)?;
+    let mut payload = serde_json::json!({ "title": req.title, "priority": req.priority });
+    if let Some(parent) = &req.parent {
+        payload["parent"] = parent.as_str().into();
+    }
     cx.emit(
         Some(&req.board),
         req.agent.as_str(),
         EventType::TaskCreated,
         Some(&id),
-        serde_json::json!({ "title": req.title, "priority": req.priority }),
+        payload,
     )?;
     get_task(cx, &id)
 }

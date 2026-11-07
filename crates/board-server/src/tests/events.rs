@@ -171,3 +171,30 @@ async fn event_stream_resumes_from_last_event_id() {
         .await;
     assert_eq!((s.as_u16(), v["code"].as_str()), (400, Some("invalid")));
 }
+
+#[tokio::test]
+async fn task_created_names_the_parent_when_set() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let root = t.task(A, "factory", "Root").await;
+    let sub = t
+        .task_with(
+            A,
+            json!({"board": "factory", "title": "Sub", "parent": root}),
+        )
+        .await;
+    let page = t.ok("GET", "/v1/events?board=factory", None, None).await;
+    let created: Vec<(&str, &Value)> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "task_created")
+        .map(|e| (e["task"].as_str().unwrap(), &e["payload"]))
+        .collect();
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].0, root);
+    assert!(created[0].1.get("parent").is_none(), "{}", created[0].1);
+    assert_eq!(created[1].0, sub);
+    assert_eq!(created[1].1["parent"], json!(root));
+}
