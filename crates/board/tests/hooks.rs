@@ -580,6 +580,8 @@ fn stop_reminds_once_about_a_stale_handoff() {
     e.agent_ok();
     let mut task = task_fixture("factory-12", "Do it");
     task.status = TaskStatus::Doing;
+    // The task changed after the handoff, say through `board update` in a shell call.
+    task.updated_at = chrono::Utc::now();
     e.stub.on("GET /v1/tasks", [task]);
     e.stub.on(
         "GET /v1/snapshot",
@@ -624,6 +626,91 @@ fn stop_reminds_once_about_a_stale_handoff() {
     let continued = e.with("Stop", json!({"stop_hook_active": true}));
     let (_, text) = e.hook("stop", "claude", continued);
     assert_eq!(text, "");
+}
+
+/// A doing task last changed before a handoff an hour old, and that handoff.
+fn quiet_doing_task(e: &Env) {
+    e.agent_ok();
+    let mut task = task_fixture("factory-12", "Do it");
+    task.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", [task]);
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    let handoff = Handoff {
+        agent: CLAUDE_AGENT.parse().unwrap(),
+        now: "waiting on the user".into(),
+        next: "x".into(),
+        blockers: String::new(),
+        version: 2,
+        updated_at: chrono::Utc::now() - chrono::Duration::hours(1),
+    };
+    e.stub.on(
+        &format!("GET /v1/agents/{}/handoff", enc(CLAUDE_AGENT)),
+        &handoff,
+    );
+}
+
+#[test]
+fn stop_skips_the_handoff_demand_when_nothing_changed_since_it() {
+    let e = env();
+    quiet_doing_task(&e);
+    let stop = e.with(
+        "Stop",
+        json!({"stop_hook_active": false, "last_assistant_message": "Still waiting."}),
+    );
+    for prompt in ["status?", "and now?"] {
+        e.hook(
+            "user-prompt-submit",
+            "claude",
+            e.with("UserPromptSubmit", json!({"prompt": prompt})),
+        );
+        let read = e.with(
+            "PostToolUse",
+            json!({"tool_name": "mcp__board__task_show", "tool_input": {"id": "factory-12"}, "tool_use_id": "toolu_1"}),
+        );
+        e.hook("post-tool-use", "claude", read);
+        let (_, text) = e.hook("stop", "claude", stop.clone());
+        assert_eq!(text, "", "a turn that only read and replied stops quietly");
+    }
+}
+
+#[test]
+fn stop_demands_a_handoff_after_board_changes_or_file_edits() {
+    for edits_a_file in [false, true] {
+        let e = env();
+        quiet_doing_task(&e);
+        let call = if edits_a_file {
+            json!({
+                "tool_name": "Edit",
+                "tool_input": {"file_path": e.repo.join("src/lib.rs"), "old_string": "a", "new_string": "b"},
+                "tool_use_id": "toolu_3",
+            })
+        } else {
+            json!({"tool_name": "mcp__board__task_note", "tool_input": {"id": "factory-12", "text": "note: x"}, "tool_use_id": "toolu_2"})
+        };
+        e.hook(
+            "user-prompt-submit",
+            "claude",
+            e.with("UserPromptSubmit", json!({"prompt": "go"})),
+        );
+        e.hook(
+            "post-tool-use",
+            "claude",
+            e.with("PostToolUse", call.clone()),
+        );
+        let stop = e.with(
+            "Stop",
+            json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
+        );
+        let (reply, _) = e.hook("stop", "claude", stop);
+        let reply = reply.unwrap_or_else(|| panic!("no demand after {call}"));
+        assert_eq!(reply["decision"], "block", "{call}");
+        assert!(reply["reason"].as_str().unwrap().contains("factory-12"));
+    }
 }
 
 #[test]

@@ -162,7 +162,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call. Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts |
-| `Stop` | Mark idle; remind once if a task in `doing` has a handoff older than the turn |
+| `Stop` | Mark idle; remind once per turn when a task is in `doing` and there is no handoff, or the handoff predates the agent's last change: a file edit or board-changing MCP call (`task_*` writes, `lease_paths`, `ask_user`, `board_join`) seen by `PostToolUse`, or the task's own last update. A turn that only read or replied stops quietly |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release leases |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
