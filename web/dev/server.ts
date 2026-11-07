@@ -120,10 +120,26 @@ async function rebuild(): Promise<void> {
 
 if (!args.dist) {
   await rebuild();
+  // One build at a time, since each replaces the output directory; changes during a build
+  // start one more build after it.
   let pending: ReturnType<typeof setTimeout> | undefined;
+  let building: Promise<void> | undefined;
+  let again = false;
+  const run = async () => {
+    if (building) {
+      again = true;
+      return;
+    }
+    do {
+      again = false;
+      building = rebuild();
+      await building;
+    } while (again);
+    building = undefined;
+  };
   const changed = () => {
     clearTimeout(pending);
-    pending = setTimeout(() => void rebuild(), 100);
+    pending = setTimeout(() => void run(), 100);
   };
   watch(join(root, "src"), { recursive: true }, changed);
   watch(join(root, "index.html"), changed);

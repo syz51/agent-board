@@ -10,6 +10,8 @@ function Dialog({
   onOpenChange,
   className,
   children,
+  onClose,
+  onClick,
   ...props
 }: Omit<React.ComponentProps<"dialog">, "open"> & {
   open: boolean;
@@ -36,12 +38,26 @@ function Dialog({
         "fixed inset-0 m-auto w-full max-w-[calc(100%-2rem)] rounded-lg border bg-background p-6 text-foreground shadow-overlay backdrop:bg-black/50 open:animate-in open:fade-in-0 open:zoom-in-95 sm:max-w-lg",
         className,
       )}
-      onClose={() => onOpenChange(false)}
-      onClick={(event) => {
-        // A click on the backdrop lands on the dialog element itself.
-        if (event.target === ref.current) onOpenChange(false);
-      }}
       {...props}
+      onClose={(event) => {
+        onClose?.(event);
+        // Closed by Escape: tell the owner. A close the owner asked for needs no answer.
+        if (open) onOpenChange(false);
+      }}
+      onClick={(event) => {
+        onClick?.(event);
+        // A click on the backdrop lands on the dialog element itself, outside its box; a
+        // click on the dialog's own padding does too, but inside it.
+        const dialog = ref.current;
+        if (!dialog || event.target !== dialog) return;
+        const box = dialog.getBoundingClientRect();
+        const inside =
+          event.clientX >= box.left &&
+          event.clientX <= box.right &&
+          event.clientY >= box.top &&
+          event.clientY <= box.bottom;
+        if (!inside) onOpenChange(false);
+      }}
     >
       {open && children}
     </dialog>

@@ -52,4 +52,26 @@ describe("answer form", () => {
     expect(requests[0]!.url).toEndWith(`/v1/asks/${withOptions.id}/answer`);
     expect(requests[0]!.body).toEqual({ answer: option });
   });
+
+  test("a second submit before the first settles sends nothing more", async () => {
+    let requests = 0;
+    let settle!: () => void;
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      requests++;
+      await new Promise<void>((resolve) => (settle = resolve));
+      return Response.json(state.ask(withOptions.id));
+    }) as typeof fetch;
+    await renderInApp(<AnswerForm ask={withOptions} />);
+    const field = screen.getByRole("textbox", { name: "Or write your own answer" });
+    await act(() => fireEvent.change(field, { target: { value: "Later" } }));
+    const form = screen.getByRole("button", { name: "Send answer" }).closest("form")!;
+    // Two presses of Enter in the same tick, before React renders the pending state.
+    await act(async () => {
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+    });
+    await waitFor(() => expect(requests).toBe(1));
+    await act(async () => settle());
+    expect(requests).toBe(1);
+  });
 });

@@ -397,7 +397,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
       noValidate
       onSubmit={(event) => {
         event.preventDefault();
-        if (!mutation.isPending) void form.handleSubmit();
+        // The form's state, not this render's: a second Enter can come before the re-render.
+        if (!form.state.isSubmitting) void form.handleSubmit();
       }}
     >
       <form.Subscribe

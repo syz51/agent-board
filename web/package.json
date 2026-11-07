@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "bun@1.4.4",
   "scripts": {
-    "dev": "bun dev/server.ts",
+    "dev": "bun --watch dev/server.ts",
     "build": "bun run build.ts",
     "preview": "bun run build.ts && bun dev/server.ts --dist",
     "typecheck": "bun node_modules/typescript-native/bin/tsc --noEmit -p .",

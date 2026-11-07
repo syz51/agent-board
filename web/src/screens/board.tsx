@@ -95,6 +95,12 @@ export function BoardScreen() {
   const tasks = useQuery(queries.boardTasks(slug));
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
+  // One set per task list, so the memoized rows keep their identity between renders.
+  const done = useMemo(
+    () =>
+      new Set((tasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id)),
+    [tasks.data],
+  );
   useTitle(board?.title ?? slug);
 
   const filters = filtersOf(search);
@@ -180,9 +186,6 @@ export function BoardScreen() {
 
       <QueryFrame query={tasks} label="Loading tasks">
         {(list) => {
-          const done = new Set(
-            list.filter((task) => task.status === "done").map((task) => task.id),
-          );
           const groups = groupTasks(list, filters, now).filter((group) => group.tasks.length > 0);
           if (groups.length === 0) {
             return filtered ? (

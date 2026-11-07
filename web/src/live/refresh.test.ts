@@ -313,6 +313,21 @@ describe("query tags", () => {
     }
   });
 
+  test("a burst of events during the first load fetches again only once", async () => {
+    const client = createQueryClient();
+    const first = deferred<string>();
+    let calls = 0;
+    show(client, "asks", [tags.asks], () =>
+      ++calls === 1 ? first.promise : Promise.resolve("after the burst"),
+    );
+    await flush();
+    for (let i = 0; i < 5; i++) void invalidateTags(client, [tags.asks]);
+    first.resolve("before the burst");
+    await flush();
+    await flush();
+    expect(calls).toBe(2);
+  });
+
   test("invalidating every query refetches every shown one after a reconnect", async () => {
     const client = createQueryClient();
     const counts = { a: 0, b: 0 };
@@ -336,6 +351,41 @@ describe("event feed", () => {
     addToFeed(client, event("task_done", { seq: 5 }));
     addToFeed(client, event("note_added", { seq: 4 }));
     expect(client.getQueryData(key)?.map((item) => item.seq)).toEqual([5, 4, 3]);
+  });
+
+  test("a live event during the feed's first load joins it once the load lands", async () => {
+    const client = createQueryClient();
+    const key = queries.events().queryKey;
+    const page = deferred<BoardEvent[]>();
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => page.promise,
+      meta: { tags: [] },
+    });
+    observer.subscribe(() => {});
+    await flush();
+    addToFeed(client, event("task_done", { seq: 5 }));
+    page.resolve([event("task_created", { seq: 3 })]);
+    await flush();
+    expect(client.getQueryData(key)?.map((item) => item.seq)).toEqual([5, 3]);
+  });
+
+  test("a live event during a failed first load is left to the retry", async () => {
+    const client = createQueryClient();
+    const key = queries.events().queryKey;
+    const page = deferred<BoardEvent[]>();
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => page.promise,
+      meta: { tags: [] },
+    });
+    observer.subscribe(() => {});
+    await flush();
+    addToFeed(client, event("task_done", { seq: 5 }));
+    page.reject(new ApiFailure(500, "internal", "db locked", "retry"));
+    await flush();
+    expect(client.getQueryData(key)).toBeUndefined();
+    expect(observer.getCurrentResult().error?.message).toBe("db locked");
   });
 
   test("merging keeps older pages and live events, ordered by sequence", () => {

@@ -33,6 +33,9 @@ export function createQueryClient(): QueryClient {
   });
 }
 
+/** First loads that already fetch again once they settle, so a burst of events asks once. */
+const awaitingFirstLoad = new WeakSet<Query>();
+
 /**
  * Refetch the shown queries carrying any of these tags; mark the rest stale. A refetch
  * cancels one in flight, so the last event wins; a first load is not cancelled, so it is
@@ -42,8 +45,12 @@ export function invalidateTags(client: QueryClient, eventTags: Iterable<string>)
   const wanted = new Set(eventTags);
   const predicate = (query: Query) => (query.meta?.tags ?? []).some((tag) => wanted.has(tag));
   for (const query of client.getQueryCache().findAll({ predicate, fetchStatus: "fetching" })) {
-    if (query.state.data !== undefined) continue;
-    const again = () => void client.invalidateQueries({ queryKey: query.queryKey, exact: true });
+    if (query.state.data !== undefined || awaitingFirstLoad.has(query)) continue;
+    awaitingFirstLoad.add(query);
+    const again = () => {
+      awaitingFirstLoad.delete(query);
+      void client.invalidateQueries({ queryKey: query.queryKey, exact: true });
+    };
     query.promise?.then(again, again);
   }
   return client.invalidateQueries({ predicate });
@@ -181,9 +188,21 @@ export const queries = {
     }),
 };
 
-/** Add a live event to the feed, if the feed has loaded; its first load includes it anyway. */
+/**
+ * Add a live event to the feed. During the feed's first load the event waits for it: that
+ * load stops at the sequence number it started from, so it may not include the event.
+ */
 export function addToFeed(client: QueryClient, event: BoardEvent): void {
   const key = queries.events().queryKey;
-  if (client.getQueryData(key) === undefined) return;
-  client.setQueryData(key, (current) => mergeEvents(current ?? [], [event]));
+  const merge = () =>
+    client.setQueryData(key, (current) => current && mergeEvents(current, [event]));
+  if (client.getQueryData(key) !== undefined) {
+    merge();
+    return;
+  }
+  // A failed first load shows its error, and its retry fetches the event anyway.
+  client
+    .getQueryCache()
+    .find({ queryKey: key })
+    ?.promise?.then(merge, () => undefined);
 }
