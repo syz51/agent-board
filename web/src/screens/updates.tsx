@@ -2,30 +2,32 @@
 // since the user's seen cursor (`GET /v1/updates`). A coordinator's closing message can be
 // followed at once by a wake-up that starts its next turn, so this is where the user reads it.
 
-import type { ComponentChildren } from "preact";
-import { useId, useState } from "preact/hooks";
-import { type Api, ApiFailure, api, UPDATES_MAX } from "../api/client.ts";
-import type { Agent, DoneUpdate, Said, Updates } from "../api/schema.ts";
-import { tags } from "../live/refresh.ts";
-import { cache, useResource } from "../live/runtime.ts";
-import { Markdown, PlainText, SafeLink, safeHref } from "../text/markdown.tsx";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { type ReactNode, useId, useMemo, useState } from "react";
+import { type Api, api, UPDATES_MAX } from "@/api/client.ts";
+import type { Agent, DoneUpdate, Said, Updates } from "@/api/schema.ts";
+import { Alert, AlertDescription } from "@/components/ui/alert.tsx";
+import { Badge } from "@/components/ui/badge.tsx";
+import { Button } from "@/components/ui/button.tsx";
+import { cn } from "@/lib/utils.ts";
+import { fetching, invalidateTags, queries } from "@/live/query.ts";
+import { tags } from "@/live/refresh.ts";
+import { Markdown, PlainText, SafeLink, safeHref } from "@/text/markdown.tsx";
 import {
   agentIndex,
   Empty,
   ErrorNotice,
-  Query,
+  QueryFrame,
   RelTime,
+  SectionTitle,
   useAgents,
   Who,
-} from "../ui/common.tsx";
+} from "@/ui/common.tsx";
 
 /** Updates since the seen cursor, for one board or all; shared with the navigation dot. */
 export function useUpdates(board = "") {
-  return useResource(
-    board ? `updates:${board}` : "updates",
-    [tags.updates],
-    () => api.updates(board ? { board } : {}),
-  );
+  return useQuery(queries.updates(board));
 }
 
 export function unseenCount(updates: Updates): number {
@@ -35,7 +37,10 @@ export function unseenCount(updates: Updates): number {
 /** The time of the newest update listed, as the server wrote it; null when none is. */
 export function newestAt(updates: Updates): string | null {
   let newest: string | null = null;
-  for (const at of [...updates.done.map((item) => item.done_at), ...updates.said.map((item) => item.at)]) {
+  for (const at of [
+    ...updates.done.map((item) => item.done_at),
+    ...updates.said.map((item) => item.at),
+  ]) {
     if (newest === null || Date.parse(at) > Date.parse(newest)) newest = at;
   }
   return newest;
@@ -45,120 +50,142 @@ export function newestAt(updates: Updates): string | null {
  * Mark everything shown as seen: the cursor moves to the newest shown update, not to now,
  * so updates that arrived after the list loaded stay unseen.
  */
-export async function markShownSeen(client: Pick<Api, "markSeen">, updates: Updates): Promise<void> {
+export async function markShownSeen(
+  client: Pick<Api, "markSeen">,
+  updates: Updates,
+): Promise<void> {
   const at = newestAt(updates);
   if (at !== null) await client.markSeen(at);
 }
 
 export function UpdatesSection({ board }: { board: string }) {
   const updates = useUpdates(board);
-  const agents = agentIndex(useAgents().data);
+  const agentList = useAgents().data;
+  const agents = useMemo(() => agentIndex(agentList), [agentList]);
   const titleId = useId();
   return (
-    <section class="section updates" aria-labelledby={titleId}>
-      <h2 id={titleId}>Since you last looked</h2>
-      <Query resource={updates} label="Loading updates">
+    <section className="mt-9" aria-labelledby={titleId}>
+      <SectionTitle id={titleId}>Since you last looked</SectionTitle>
+      <QueryFrame query={updates} label="Loading updates">
         {(data) => <UpdatesView updates={data} agents={agents} board={board} />}
-      </Query>
+      </QueryFrame>
     </section>
   );
 }
 
 /** The lists themselves; exported for tests. */
-export function UpdatesView(
-  { updates, agents, board, client = api }: {
-    updates: Updates;
-    agents: Map<string, Agent>;
-    /** A board filter: the cursor is shared, so marking seen needs every board shown. */
-    board: string;
-    client?: Pick<Api, "markSeen">;
-  },
-) {
+export function UpdatesView({
+  updates,
+  agents,
+  board,
+  client = api,
+}: {
+  updates: Updates;
+  agents: Map<string, Agent>;
+  /** A board filter: the cursor is shared, so marking seen needs every board shown. */
+  board: string;
+  client?: Pick<Api, "markSeen">;
+}) {
   const total = unseenCount(updates);
   return (
     <>
-      <div class="updates-bar">
-        <p class="muted updates-since">
-          {updates.since ? <>Since <RelTime at={updates.since} /></> : "Everything kept so far"}
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <p className="text-muted-foreground">
+          {updates.since ? (
+            <>
+              Since <RelTime at={updates.since} />
+            </>
+          ) : (
+            "Everything kept so far"
+          )}
           {board && <> · {board} only</>}
         </p>
         {total > 0 && !board && <MarkSeen updates={updates} client={client} />}
       </div>
       {total > 0 && board && (
-        <p class="muted updates-note">
-          Seen is kept for all boards at once. <a href="/asks">Show every board</a> to mark updates seen.
+        <p className="mb-2 text-muted-foreground">
+          Seen is kept for all boards at once. <Link to="/asks">Show every board</Link> to mark
+          updates seen.
         </p>
       )}
       {updates.more && (
-        <p class="notice notice-warn compact">
-          Only the newest {UPDATES_MAX} of each kind are listed; older ones were cut. Marking all
-          seen covers them too. Each task's page and the event feed keep the full history.
-        </p>
+        <Alert variant="warn" className="my-3 px-3.5 py-2.5">
+          <AlertDescription className="text-warn">
+            Only the newest {UPDATES_MAX} of each kind are listed; older ones were cut. Marking all
+            seen covers them too. Each task's page and the event feed keep the full history.
+          </AlertDescription>
+        </Alert>
       )}
-      {total === 0
-        ? (
-          <Empty title="You're up to date">
-            Finished tasks and what coordinators said at the end of their turns appear here until you
-            mark them seen.
-          </Empty>
-        )
-        : (
-          <>
-            {updates.done.length > 0 && (
-              <UpdateGroup title="Finished tasks" count={updates.done.length}>
-                {updates.done.map((item) => <DoneCard key={item.task} item={item} agents={agents} />)}
-              </UpdateGroup>
-            )}
-            {updates.said.length > 0 && (
-              <UpdateGroup title="Coordinators said" count={updates.said.length}>
-                {updates.said.map((item) => <SaidCard key={item.id} item={item} agents={agents} />)}
-              </UpdateGroup>
-            )}
-          </>
-        )}
+      {total === 0 ? (
+        <Empty title="You're up to date">
+          Finished tasks and what coordinators said at the end of their turns appear here until you
+          mark them seen.
+        </Empty>
+      ) : (
+        <>
+          {updates.done.length > 0 && (
+            <UpdateGroup title="Finished tasks" count={updates.done.length}>
+              {updates.done.map((item) => (
+                <DoneCard key={item.task} item={item} agents={agents} />
+              ))}
+            </UpdateGroup>
+          )}
+          {updates.said.length > 0 && (
+            <UpdateGroup title="Coordinators said" count={updates.said.length}>
+              {updates.said.map((item) => (
+                <SaidCard key={item.id} item={item} agents={agents} />
+              ))}
+            </UpdateGroup>
+          )}
+        </>
+      )}
     </>
   );
 }
 
 function MarkSeen({ updates, client }: { updates: Updates; client: Pick<Api, "markSeen"> }) {
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<ApiFailure | null>(null);
-
-  async function mark() {
-    if (pending) return;
-    setPending(true);
-    setError(null);
-    try {
-      await markShownSeen(client, updates);
-      cache.invalidate([tags.updates]);
-    } catch (failure) {
-      if (!(failure instanceof ApiFailure)) throw failure;
-      setError(failure);
-    } finally {
-      setPending(false);
-    }
-  }
-
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: fetching(() => markShownSeen(client, updates)),
+    onSuccess: () => invalidateTags(queryClient, [tags.updates]),
+  });
   return (
-    <div class="mark-seen">
-      <button type="button" class="button" onClick={mark} disabled={pending}>
-        {pending ? "Marking…" : "Mark all seen"}
-      </button>
-      {error && <ErrorNotice error={error} compact />}
+    <div className="flex flex-wrap items-center justify-end gap-2">
+      <Button
+        type="button"
+        variant="outline"
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+      >
+        {mutation.isPending ? "Marking…" : "Mark all seen"}
+      </Button>
+      {mutation.error && <ErrorNotice error={mutation.error} compact />}
     </div>
   );
 }
 
-function UpdateGroup({ title, count, children }: { title: string; count: number; children: ComponentChildren }) {
+function UpdateGroup({
+  title,
+  count,
+  children,
+}: {
+  title: string;
+  count: number;
+  children: ReactNode;
+}) {
   return (
-    <div class="update-group">
-      <h3 class="group-title">
-        {title} <span class="group-count">{count}</span>
+    <div className="mt-4.5" data-slot="update-group">
+      <h3 className="mb-2 flex items-baseline gap-1.5 text-meta font-semibold text-subtle-foreground">
+        {title} <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
       </h3>
-      <div class="update-list">{children}</div>
+      <div className="grid gap-2.5">{children}</div>
     </div>
   );
 }
+
+const updateCard =
+  "bg-card shadow-raise flex min-w-0 flex-col gap-1.5 rounded-lg border px-4 py-3.5";
+const updateMeta = "text-meta text-muted-foreground";
 
 /** PRs and commits: what the user opens to see the change. */
 const SHOWN_EVIDENCE = new Set(["pr", "commit"]);
@@ -166,36 +193,54 @@ const SHOWN_EVIDENCE = new Set(["pr", "commit"]);
 function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agent> }) {
   const evidence = item.evidence.filter((entry) => SHOWN_EVIDENCE.has(entry.kind));
   return (
-    <article class="card update-card">
-      <h4 class="update-title">
-        <a href={`/tasks/${encodeURIComponent(item.task)}`}>
-          <span class="ident">{item.task}</span> <PlainText text={item.title} />
-        </a>
+    <article className={updateCard}>
+      <h4 className="text-base font-semibold">
+        <Link className="text-foreground" to="/tasks/$id" params={{ id: item.task }}>
+          <span className="ident mr-1 text-muted-foreground">{item.task}</span>{" "}
+          <PlainText className="whitespace-normal" text={item.title} />
+        </Link>
       </h4>
-      <p class="update-meta">
-        <a href={`/boards/${encodeURIComponent(item.board)}`}>{item.board}</a>
-        {item.owner && <> · <Who id={item.owner} agents={agents} /></>}
+      <p className={updateMeta}>
+        <Link to="/boards/$slug" params={{ slug: item.board }}>
+          {item.board}
+        </Link>
+        {item.owner && (
+          <>
+            {" "}
+            · <Who id={item.owner} agents={agents} />
+          </>
+        )}
         {" · done "}
         <RelTime at={item.done_at} />
         {item.parent && (
           <>
             {" · part of "}
-            <a href={`/tasks/${encodeURIComponent(item.parent)}`}><span class="ident">{item.parent}</span></a>
+            <Link to="/tasks/$id" params={{ id: item.parent }}>
+              <span className="ident">{item.parent}</span>
+            </Link>
           </>
         )}
       </p>
-      {item.summary
-        ? <div class="agent-text update-text"><Markdown text={item.summary} /></div>
-        : <p class="muted update-text">No summary written.</p>}
+      {item.summary ? (
+        <div className="mt-0.5 max-w-[72ch]">
+          <Markdown text={item.summary} />
+        </div>
+      ) : (
+        <p className="mt-0.5 text-muted-foreground">No summary written.</p>
+      )}
       {evidence.length > 0 && (
-        <ul class="update-evidence" aria-label="Evidence">
+        <ul className="mt-1 flex flex-wrap gap-x-4.5 gap-y-1.5 border-t pt-2" aria-label="Evidence">
           {evidence.map((entry, index) => (
-            <li key={index}>
-              <span class="tag">{entry.kind === "pr" ? "PR" : "commit"}</span>
-              <span class="evidence-value">
-                {safeHref(entry.value)
-                  ? <SafeLink href={entry.value}>{entry.value}</SafeLink>
-                  : <code>{entry.value}</code>}
+            <li key={index} className="flex min-w-0 items-center gap-1.5">
+              <Badge variant="outline" shape="tag">
+                {entry.kind === "pr" ? "PR" : "commit"}
+              </Badge>
+              <span className="min-w-0 [overflow-wrap:anywhere]">
+                {safeHref(entry.value) ? (
+                  <SafeLink href={entry.value}>{entry.value}</SafeLink>
+                ) : (
+                  <code>{entry.value}</code>
+                )}
               </span>
             </li>
           ))}
@@ -207,11 +252,13 @@ function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agen
 
 function SaidCard({ item, agents }: { item: Said; agents: Map<string, Agent> }) {
   return (
-    <article class="card update-card">
-      <p class="update-meta">
+    <article className={updateCard}>
+      <p className={cn(updateMeta, "flex flex-wrap items-center gap-x-1")}>
         <Who id={item.agent} agents={agents} />
         {" on "}
-        <a href={`/boards/${encodeURIComponent(item.board)}`}>{item.board}</a>
+        <Link to="/boards/$slug" params={{ slug: item.board }}>
+          {item.board}
+        </Link>
         {" · "}
         <RelTime at={item.at} />
       </p>
@@ -232,21 +279,32 @@ export function isLong(text: string): boolean {
 export function CollapsibleMarkdown({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   const id = useId();
-  if (!isLong(text)) return <div class="agent-text update-text"><Markdown text={text} /></div>;
-  return (
-    <div class="collapsible">
-      <div id={id} class={open ? "agent-text update-text" : "agent-text update-text clamped"}>
+  if (!isLong(text)) {
+    return (
+      <div className="mt-0.5 max-w-[72ch]">
         <Markdown text={text} />
       </div>
-      <button
+    );
+  }
+  return (
+    <div className="flex flex-col items-start">
+      <div
+        id={id}
+        className={cn("mt-0.5 max-w-[72ch]", !open && "clamped")}
+        data-clamped={open ? undefined : ""}
+      >
+        <Markdown text={text} />
+      </div>
+      <Button
         type="button"
-        class="link-button"
+        variant="link"
+        className="min-h-9 px-0 py-1.5 text-sm underline"
         aria-expanded={open}
         aria-controls={id}
         onClick={() => setOpen(!open)}
       >
         {open ? "Show less" : "Show all"}
-      </button>
+      </Button>
     </div>
   );
 }

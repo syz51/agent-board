@@ -583,7 +583,11 @@ impl BoardMcp {
         let mut cached = self.ctx.lock().await;
         if cached.is_none() {
             let default = self.default_agent.clone().map_err(anyhow::Error::msg)?;
-            *cached = Some(Ctx::load(self.home.clone(), default, None)?);
+            *cached = Some(Ctx::load(
+                self.home.clone(),
+                default,
+                Some(crate::client::REQUEST_TIMEOUT),
+            )?);
         }
         let base = cached.as_ref().expect("set above");
         Ok(match agent {

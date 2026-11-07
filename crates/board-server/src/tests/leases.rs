@@ -437,3 +437,66 @@ async fn a_delegated_child_and_its_parent_never_overlap_each_other() {
         "{parent_alerts}"
     );
 }
+
+#[tokio::test]
+async fn one_write_found_by_two_peers_shell_scans_is_neither_ones_overlap() {
+    let t = T::new();
+    const C: &str = "t3:gamma";
+    for agent in [A, B, C] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    let scan = |agent: &'static str, path: &'static str, modified: &'static str| {
+        let t = &t;
+        let body = json!({
+            "agent": agent, "repo": REPO, "paths": [path], "scanned": true,
+            "modified": { path: modified },
+        });
+        async move { t.ok("POST", "/v1/touches", Some(agent), Some(body)).await }
+    };
+    let written = "2026-11-06T12:00:00.250Z";
+    // C leases the area, so it hears about every edit there.
+    lease(&t, C, &["src/**"]).await;
+    for agent in [A, B, C] {
+        alerts(&t, agent).await;
+    }
+
+    // A's script writes src/a.rs during B's read-only shell call: both scans find the same
+    // write. Whichever report comes first, neither is warned about the other.
+    let first = scan(A, "src/a.rs", written).await;
+    let second = scan(B, "src/a.rs", written).await;
+    assert_eq!(agents_in(&first["overlaps"]), vec![C], "{first}");
+    assert_eq!(agents_in(&second["overlaps"]), vec![C], "{second}");
+    // A third peer still hears of the write, from both scans.
+    let text = alerts(&t, C).await;
+    assert_eq!(text.matches(" edited src/a.rs").count(), 2, "{text}");
+    let first = scan(B, "src/b.rs", written).await;
+    let second = scan(A, "src/b.rs", written).await;
+    assert_eq!(agents_in(&first["overlaps"]), vec![C], "{first}");
+    assert_eq!(agents_in(&second["overlaps"]), vec![C], "{second}");
+    for agent in [A, B] {
+        let text = alerts(&t, agent).await;
+        assert!(!text.contains("edited"), "{agent}: {text}");
+    }
+
+    // A shell write of A's alone, with no peer scan finding it, is still A's: B's later
+    // write of the file overlaps it, and B's alerts say so.
+    scan(A, "src/c.rs", written).await;
+    let later = scan(B, "src/c.rs", "2026-11-06T12:00:09Z").await;
+    assert_eq!(agents_in(&later["overlaps"]), vec![A, C], "{later}");
+    let text = alerts(&t, B).await;
+    assert!(
+        text.contains(" edited src/c.rs <1m ago; you edited it"),
+        "{text}"
+    );
+    let text = alerts(&t, A).await;
+    assert!(
+        text.contains(" edited src/c.rs <1m ago; you edited it"),
+        "{text}"
+    );
+
+    // A peer on another device cannot share the work tree: an equal time is a real overlap.
+    t.exec("UPDATE agents SET device = 'pc' WHERE id = 't3:beta'");
+    scan(A, "src/d.rs", written).await;
+    let far = scan(B, "src/d.rs", written).await;
+    assert_eq!(agents_in(&far["overlaps"]), vec![A, C], "{far}");
+}

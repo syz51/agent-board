@@ -582,3 +582,281 @@ async fn a_new_peer_on_the_branch_alerts_only_when_it_shares_files() {
         text(&alerts)
     );
 }
+
+/// Appends `n` events by `actor` to the log, as if the server had recorded them.
+fn log_events(t: &T, n: u32, actor: &str, kind: &str, task: &str, payload: &str) {
+    t.exec(&format!(
+        "WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < {n}) \
+         INSERT INTO events (at, board, actor, type, task, payload) \
+         SELECT (SELECT MAX(at) FROM events), 'factory', '{actor}', '{kind}', '{task}', \
+         '{payload}' FROM i"
+    ));
+}
+
+/// ME owns a task blocked on B's task, with its cursor at the latest event; returns
+/// (blocker, mine).
+async fn blocked_on_peer(t: &T) -> (String, String) {
+    t.board("factory", &[REPO]).await;
+    t.register(ME, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let blocker = t.task(B, "factory", "Blocker").await;
+    assert!(t.claim(B, &blocker).await.0.is_success());
+    let mine = t.task(ME, "factory", "Mine").await;
+    assert!(t.claim(ME, &mine).await.0.is_success());
+    let (s, v) = t.patch(ME, &mine, json!({ "blockers": [blocker] })).await;
+    assert!(s.is_success(), "{v}");
+    snapshot(t, ME, "kind=alerts").await;
+    (blocker, mine)
+}
+
+async fn finish(t: &T, agent: &str, task: &str) {
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    assert!(t.done(agent, task, commit).await.0.is_success());
+}
+
+#[tokio::test]
+async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
+    let t = T::new();
+    let (blocker, _) = blocked_on_peer(&t).await;
+    finish(&t, B, &blocker).await;
+    // 600 events by peers on other work: notes on the peer's task, edits in another repo.
+    log_events(&t, 300, B, "note_added", &blocker, "{}");
+    let elsewhere = format!(r#"{{"repo":"{DOTFILES}","paths":["a.rs"]}}"#);
+    log_events(&t, 300, B, "files_touched", "", &elsewhere);
+
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("not checked"), "{alerts}");
+}
+
+#[tokio::test]
+async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
+
+    // 1,100 notes on my task, all of which can concern me, then the blocker finishes.
+    log_events(&t, 1100, B, "note_added", &mine, "{}");
+    finish(&t, B, &blocker).await;
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let cut = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&cut).to_owned();
+    // 1,000 scanned; the other 100 notes and the done event wait.
+    let first_alert = alerts.lines().nth(1).unwrap_or_default();
+    assert!(
+        first_alert.starts_with("! 101 more events not checked for alerts yet"),
+        "{alerts}"
+    );
+    assert!(alerts.contains("changed your task"), "{alerts}");
+    assert!(!alerts.contains("your blocker is cleared"), "{alerts}");
+    let resume = cut["seq"].as_i64().unwrap();
+    assert_eq!(resume, start + 1000);
+    assert_eq!(
+        t.count(&format!("SELECT cursor FROM agents WHERE id = '{ME}'")),
+        resume
+    );
+
+    // The next request picks up where the cut one stopped.
+    let rest = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&rest).to_owned();
+    assert!(
+        alerts.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("not checked"), "{alerts}");
+    assert_eq!(rest["seq"].as_i64().unwrap(), max);
+}
+
+#[tokio::test]
+async fn a_cut_alert_scan_leaves_the_rest_of_a_full_snapshot_current() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
+    log_events(&t, 1100, B, "note_added", &mine, "{}");
+    finish(&t, B, &blocker).await;
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let full = snapshot(&t, ME, "kind=full").await;
+    let body = text(&full);
+    // The cursor stops where the alert scan did; the board shows its latest state.
+    assert_eq!(full["seq"].as_i64().unwrap(), start + 1000);
+    assert!(body.contains(&format!("seq=\"{max}\"")), "{body}");
+    assert!(body.contains(&format!("#{max} ")), "{body}");
+    assert!(body.contains("101 more events not checked"), "{body}");
+}
+
+#[tokio::test]
+async fn alerts_skip_events_older_than_the_window_and_say_which() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let start = t.count("SELECT MAX(seq) FROM events");
+    // The blocker finishes, then 10,500 events by peers on other work bury it.
+    finish(&t, B, &blocker).await;
+    log_events(&t, 10_500, B, "note_added", &blocker, "{}");
+    let (s, v) = t.patch(B, &mine, json!({ "priority": "p1" })).await;
+    assert!(s.is_success(), "{v}");
+    let max = t.count("SELECT MAX(seq) FROM events");
+
+    let snap = snapshot(&t, ME, "kind=alerts").await;
+    let alerts = text(&snap);
+    let first_alert = alerts.lines().nth(1).unwrap_or_default();
+    assert_eq!(
+        first_alert,
+        format!(
+            "! events #{}-#{} are too old to check for alerts -> board_snapshot for the \
+             current state",
+            start + 1,
+            max - 10_000
+        ),
+        "{alerts}"
+    );
+    // Within the window, alerts still arrive.
+    assert!(
+        alerts.contains(&format!("changed your task {mine}")),
+        "{alerts}"
+    );
+    assert!(!alerts.contains("blocker is cleared"), "{alerts}");
+    assert_eq!(snap["seq"].as_i64().unwrap(), max);
+}
+
+#[tokio::test]
+async fn a_review_left_a_day_without_a_note_reminds_its_owner() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.register("t3:beta", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task("t3:alpha", "factory", "Wait on CI").await;
+    assert!(t.claim("t3:alpha", &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch("t3:alpha", &id, review).await.0.is_success());
+    let quiet = |s: &Value| text(s).contains(&format!("{id} has sat in review"));
+    snapshot(&t, "t3:alpha", "kind=delta").await;
+    snapshot(&t, "t3:beta", "kind=delta").await;
+
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0, "not a day yet");
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    assert_eq!(
+        sweep_quiet_reviews(&t),
+        0,
+        "once a day while it stays quiet"
+    );
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains(&format!(
+            "{id} has sat in review for 25h with no note from its owner for 25h"
+        )) && text(&delta).contains(&format!("task_note {id}")),
+        "{}",
+        text(&delta)
+    );
+    // An event alert: shown once, not on every snapshot after it.
+    assert!(!quiet(&snapshot(&t, "t3:alpha", "kind=delta").await));
+    // Another live agent's task is not this agent's business.
+    assert!(!quiet(&snapshot(&t, "t3:beta", "kind=delta").await));
+
+    // A note saying what it still waits on starts the clock again.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some("t3:alpha"),
+        Some(json!({ "agent": "t3:alpha", "kind": "note", "text": "note: CI queued" })),
+    )
+    .await;
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0);
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("in review for 2d with no note from its owner for 25h"),
+        "{}",
+        text(&delta)
+    );
+
+    // A task out of review is never announced.
+    let doing = json!({ "status": "doing" });
+    assert!(t.patch("t3:alpha", &id, doing).await.0.is_success());
+    t.advance(TimeDelta::hours(25));
+    assert_eq!(sweep_quiet_reviews(&t), 0);
+}
+
+#[tokio::test]
+async fn a_quiet_review_whose_owner_ended_goes_to_the_coordinator() {
+    let t = T::new();
+    let (coordinator, child) = ("t3:coord", "t3:child");
+    t.register(coordinator, Some(REPO), None).await;
+    t.register(child, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    let lease = json!({ "device": "mac", "agent": coordinator });
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease.clone()),
+    )
+    .await;
+    let id = t.task(child, "auto", "Wait on review").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(child, &id, review).await.0.is_success());
+    let quiet = |s: &Value| text(s).contains(&format!("{id} has sat in review"));
+    snapshot(&t, coordinator, "kind=delta").await;
+
+    // While the owner lives, the reminder is the owner's alone.
+    t.advance(TimeDelta::hours(23));
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease.clone()),
+    )
+    .await;
+    t.register(child, Some(REPO), None).await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    assert!(!quiet(&snapshot(&t, coordinator, "kind=delta").await));
+
+    // Once the owner has ended, the coordinator gets it, so the wait is not lost.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{child}/state"),
+        Some(child),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    t.advance(TimeDelta::hours(23));
+    assert_eq!(sweep_quiet_reviews(&t), 0, "a day after the last reminder");
+    t.advance(TimeDelta::hours(2));
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease),
+    )
+    .await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(quiet(&delta), "{}", text(&delta));
+}
+
+fn sweep_quiet_reviews(t: &T) -> usize {
+    t.state
+        .db()
+        .write(
+            || t.state.now(),
+            t.state.settings(),
+            crate::ops::tasks::announce_quiet_reviews,
+        )
+        .unwrap()
+}

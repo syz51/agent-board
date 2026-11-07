@@ -19,6 +19,7 @@ use board_proto::{
     StatusCounts, Task, TaskStatus,
 };
 use chrono::{TimeZone as _, Utc};
+use futures_util::StreamExt as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -65,8 +66,17 @@ struct StubState {
     requests: Vec<Recorded>,
     /// Delay applied to every request (an overloaded or hanging server).
     hang: Option<Duration>,
+    /// Routes answered as a server-sent event stream: the events after the request's
+    /// `since`, then nothing more while the connection stays open.
+    streams: BTreeMap<String, Stream>,
     /// Version and commit sent in the build headers, as a server does since it reports them.
     build: Option<(String, String)>,
+}
+
+struct Stream {
+    events: Vec<board_proto::Event>,
+    /// Each connection carries the first event after `since` and then ends.
+    flapping: bool,
 }
 
 #[derive(Clone)]
@@ -152,6 +162,44 @@ impl Stub {
         self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned()));
     }
 
+    /// Delays the answers to `route` by `delay`, as a server stalled on it would.
+    pub fn delay(&self, route: &str, delay: Duration) -> &Self {
+        if let Some(canned) = self.state.lock().unwrap().routes.get_mut(route) {
+            canned.delay = delay;
+        }
+        self
+    }
+
+    /// Answers `route` as an event stream carrying the `events` after the request's
+    /// `since`, then staying open and silent: no event and no keep-alive.
+    pub fn on_stream(&self, route: &str, events: Vec<board_proto::Event>) -> &Self {
+        let stream = Stream {
+            events,
+            flapping: false,
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(route.to_owned(), stream);
+        self
+    }
+
+    /// Answers `route` as an event stream that carries the first of `events` after the
+    /// request's `since` and then ends, as a flapping connection would.
+    pub fn on_flapping_stream(&self, route: &str, events: Vec<board_proto::Event>) -> &Self {
+        let stream = Stream {
+            events,
+            flapping: true,
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .streams
+            .insert(route.to_owned(), stream);
+        self
+    }
+
     /// Delays every answer, as a hanging server would.
     pub fn hang(&self, delay: Duration) {
         self.state.lock().unwrap().hang = Some(delay);
@@ -196,7 +244,12 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         .unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let route = format!("{method} {path}");
-    let (canned, hang, build) = {
+    let since: i64 = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("since="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let (canned, hang, stream, build) = {
         let mut st = state.lock().unwrap();
         st.requests.push(Recorded {
             method,
@@ -208,12 +261,42 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             body,
         });
         let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
+        let stream = st.streams.get(&route).map(|stream| {
+            let after = stream.events.iter().filter(|e| e.seq > since);
+            let take = if stream.flapping { 1 } else { usize::MAX };
+            let text = after
+                .take(take)
+                .map(|e| {
+                    format!(
+                        "id: {}\ndata: {}\n\n",
+                        e.seq,
+                        serde_json::to_string(e).unwrap()
+                    )
+                })
+                .collect::<String>();
+            (text, stream.flapping)
+        });
         (
             once.or_else(|| st.routes.get(&route).cloned()),
             st.hang,
+            stream,
             st.build.clone(),
         )
     };
+    if let Some((text, flapping)) = stream {
+        let sent = futures_util::stream::iter([Ok::<_, std::io::Error>(text)]);
+        let body = if flapping {
+            Body::from_stream(sent)
+        } else {
+            Body::from_stream(sent.chain(futures_util::stream::pending()))
+        };
+        let mut resp = Response::new(body);
+        resp.headers_mut().insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return resp;
+    }
     if let Some(delay) = hang {
         tokio::time::sleep(delay).await;
     }

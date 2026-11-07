@@ -473,6 +473,17 @@ async fn claims_follow_ownership_blockers_and_the_doing_limit() {
         (409, Some("claim_refused"))
     );
     assert!(v["message"].as_str().unwrap().contains(&first), "{v}");
+    // The refusal says which parked state fits which wait.
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!(
+            "task_update {first} status=review, then task_note {first} naming the PR"
+        )) && next.contains("status=blocked with blocked_reason")
+            && next.contains(&format!(
+                "only a date -> release {first} and set its not_before"
+            )),
+        "{v}"
+    );
 
     let (s, v) = t.claim(B, &waiting).await;
     assert_eq!(
@@ -1126,7 +1137,7 @@ async fn claim_on_create_is_refused_at_the_doing_limit_and_creates_nothing() {
     assert_eq!((code, err.as_str()), (409, "claim_refused"), "{v}");
     assert!(v["message"].as_str().unwrap().contains(&first), "{v}");
     let next = v["next"].as_str().unwrap();
-    assert!(next.contains("review or blocked first"), "{v}");
+    assert!(next.contains("park it by what it waits on"), "{v}");
     assert!(next.contains(&first), "{v}");
     // Nothing was written: no task, no event, and the number is not used up.
     assert_eq!(t.count("SELECT COUNT(*) FROM tasks"), before);

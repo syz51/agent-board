@@ -57,7 +57,15 @@ function setup(options: { initialSeq?: () => Promise<number> } = {}) {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function message(seq: number, type = "task_updated") {
-  return JSON.stringify({ seq, at: "2026-11-06T12:00:00Z", board: "factory", actor: "t3:7f3a", type, task: "factory-12", payload: {} });
+  return JSON.stringify({
+    seq,
+    at: "2026-11-06T12:00:00Z",
+    board: "factory",
+    actor: "t3:7f3a",
+    type,
+    task: "factory-12",
+    payload: {},
+  });
 }
 
 describe("EventStream", () => {

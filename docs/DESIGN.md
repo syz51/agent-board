@@ -48,8 +48,9 @@ One Rust binary, `board`, provides every role through subcommands: `serve`, `mcp
 | `board-server` | Storage, rules, API, SSE, snapshot rendering, web assets, notifier |
 | `board` | The binary: CLI, MCP server, hook handler, device daemon, configuration |
 
-The web view lives in `web/` (TypeScript), is built to `web/dist` and embedded in the
-binary at compile time.
+The web view lives in `web/` (TypeScript: React with TanStack Router and Query, Tailwind CSS
+and shadcn/ui, built with Bun; see `web/README.md`), is built to `web/dist` and embedded in
+the binary at compile time.
 
 ### Why Rust
 
@@ -90,6 +91,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the coordinator may start it; it follows the board's autopilot switch and is false only
   for a task the user must do or decide (a key, a login, a payment, a product choice) and
   for a pending proposal (see "Proposals and triage").
+- **Waiting states**: `review` is where a task waits on CI or a reviewer, with a note naming
+  the PR; `blocked` is where it waits on another task or the user (an ask), or on anything
+  else with a `blocked_reason`; a wait for a date alone is an `open` task with `not_before`.
+  `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
+  which fits which wait. The sweeper announces a task in `review` a day with no note from
+  its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
+  when the owner is gone. Stats count dones that spent under a minute in `doing`, takeovers
+  and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
@@ -198,7 +207,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
-| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported). Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
+| `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
@@ -326,6 +335,25 @@ registers without a repo).
     delivered it.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
+  - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
+    reconcile gets 90 seconds and a flush's checks 30, eight queues at a time, and a stop
+    request cuts any step short. Every step is safe to cut: checks only read, queues and
+    the retry list change only once a result is in, a send cut short counts as maybe
+    delivered, and the state is saved after the last flush. A queue not checked in time
+    waits for the next flush without a back-off. A stream with no bytes for 45 seconds
+    (the server sends a keep-alive every 15) is reopened after the last event handled.
+    After a failed check a queue costs no request until its retry time; after a failed
+    send it is still checked, so an agent that ended or paused meanwhile has its answers
+    passed on. The event retries go on past one the server keeps failing and stop only
+    when the server cannot be reached. The daemon reconciles at start and on its tick,
+    also while the stream is down. The boards' `t3 thread show` checks run side by side,
+    10 seconds each; one that fails or runs out of time still renews a named coordinator,
+    and only a check that
+    answers replaces it. The reconnect delay (1 second, doubled up to a minute) resets
+    only after a connection that lasted a minute. An unreadable `watch.json` is copied to
+    `watch.json.unreadable-<time>` with a warning before the daemon starts fresh. The
+    daemon logs its starts, adoptions, reconnects and stops at INFO in `watch.log`; the
+    rest of the binary logs only warnings.
 - **Reporting to the user**: a coordinator's chat is a poor channel to the user, because a
   wake arrives as the thread's next turn and buries whatever the last turn said. So what
   the user should read goes to the board instead: every `task_done` carries a `summary`,
@@ -385,7 +413,10 @@ keeping untrusted text out of those channels, so:
   open tasks held by a `not_before`, soonest first); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
-  one line each.
+  one line each. Alerts come from the events since the agent's cursor, oldest first, at
+  most 1,000 per request that can concern it; the rest wait, counted in the first alert.
+  They read only the last 10,000 events, so a cursor far behind costs no more; an alert
+  names the events skipped.
 - Tool descriptions and server instructions never change at run time, so they do not break
   prompt caching.
 
@@ -499,7 +530,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   normalized message. Agents rarely report a refusal they could work around; the error log
   does it for them.
 - **Measurement.** `GET /v1/stats` reports refused claims, stale takeovers, lease
-  conflicts, ask response times, time in `doing`, done-without-check counts, and feedback
+  conflicts, ask response times, time in `doing`, done-without-check counts, dones under a
+  minute in `doing`, and feedback
   reported, filed and resolved by kind.
 - **Review.** A periodic review (for example a weekly job) reads the feedback board and
   the stats, routes items to work, proposes changes to the defaults, the coordinator prompt
@@ -525,7 +557,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   a restore drill is part of the tests.
 - Devices: `board login` stores the server URL and token; `board install claude` adds the
   hooks and MCP server to Claude Code's user settings; `board watch` runs under launchd or
-  systemd.
+  systemd, one per `$BOARD_HOME`: it holds a lock on `state/watch.lock` while it runs, and
+  a second one exits naming the first one's pid.
 
 ## Testing
 
