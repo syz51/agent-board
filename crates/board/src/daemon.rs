@@ -17,7 +17,7 @@
 //! until its repos, home devices, autopilot switch or status change.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -68,6 +68,11 @@ pub struct WatchState {
     /// Events whose handling failed on a transient error, retried on the reconcile tick.
     #[serde(default)]
     pub retry: Vec<Event>,
+    /// Boards whose coordinator start began at this time and has not recorded its thread.
+    /// Saved before `t3 thread start` runs, so a start the daemon did not live to finish is
+    /// found again: the next start adopts the thread it created instead of adding another.
+    #[serde(default)]
+    pub pending_starts: BTreeMap<BoardSlug, Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +218,7 @@ impl<T: T3> Daemon<T> {
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
+                self.state.pending_starts.remove(&board.slug);
                 if self.state.coordinators.remove(&board.slug).is_some() {
                     self.release(&board.slug).await;
                 }
@@ -227,6 +233,9 @@ impl<T: T3> Daemon<T> {
             .coordinators
             .retain(|slug, _| boards.contains_key(slug));
         self.failures.retain(|slug, _| boards.contains_key(slug));
+        self.state
+            .pending_starts
+            .retain(|slug, _| boards.contains_key(slug));
         self.save()
     }
 
@@ -410,7 +419,7 @@ impl<T: T3> Daemon<T> {
                 runtime,
                 device: self.ctx.device.clone(),
                 role: AgentRole::Coordinator,
-                title: Some(format!("{slug} coordinator")),
+                title: Some(coordinator_title(slug)),
                 repo: Some(repo),
                 branch: None,
                 cwd: Some(project.display().to_string()),
@@ -469,14 +478,7 @@ impl<T: T3> Daemon<T> {
             Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => return Ok(()),
             Err(err) => return Err(err),
         }
-        let started = self
-            .t3
-            .start_thread(
-                &project,
-                &format!("{slug} coordinator"),
-                &coordinator_message(slug),
-            )
-            .await;
+        let started = self.start_or_find_thread(slug, &project, now).await;
         let thread = match started {
             Ok(thread) => thread,
             Err(err) => {
@@ -502,8 +504,60 @@ impl<T: T3> Daemon<T> {
         };
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
+        self.state.pending_starts.remove(slug);
         self.save()?;
         self.adopt(board, local, now).await
+    }
+
+    /// The coordinator thread for `slug`: the one an unfinished earlier start created, if
+    /// any, else a new one. An earlier start is unfinished when its pending mark is still
+    /// saved (the daemon was killed, or `t3` failed or timed out, after the mark was written);
+    /// a thread with the coordinator title created since then is its thread. One that never
+    /// ran is briefed first. Threads older than the mark are never taken.
+    async fn start_or_find_thread(
+        &mut self,
+        slug: &BoardSlug,
+        project: &Path,
+        now: Timestamp,
+    ) -> Result<String> {
+        let title = coordinator_title(slug);
+        let message = coordinator_message(slug);
+        if let Some(&since) = self.state.pending_starts.get(slug) {
+            let found = self
+                .t3
+                .threads_titled(project, &title)
+                .await
+                .context("looking for the thread of an unfinished coordinator start")?
+                .into_iter()
+                .filter(|t| t.created_at >= since)
+                .max_by_key(|t| t.created_at);
+            if let Some(thread) = found {
+                if thread.ran {
+                    tracing::warn!(
+                        "coordinator of {slug}: adopting thread {}, which a start at {since} launched but did not record",
+                        thread.id
+                    );
+                    return Ok(thread.id);
+                }
+                tracing::warn!(
+                    "coordinator of {slug}: briefing thread {}, which a start at {since} created but did not send its message",
+                    thread.id
+                );
+                if let Err(err) = self.t3.send(&thread.id, &message).await {
+                    // Not that thread again: the next start makes a new one.
+                    self.state.pending_starts.remove(slug);
+                    return Err(err.context(format!(
+                        "briefing thread {} left by an earlier start; archive it in T3",
+                        thread.id
+                    )));
+                }
+                return Ok(thread.id);
+            }
+        }
+        // On disk before T3 can create the thread.
+        self.state.pending_starts.entry(slug.clone()).or_insert(now);
+        self.save()?;
+        self.t3.start_thread(project, &title, &message).await
     }
 
     /// Makes the existing thread named by `board board adopt` the board's coordinator: like
@@ -591,6 +645,7 @@ impl<T: T3> Daemon<T> {
         };
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
+        self.state.pending_starts.remove(slug);
         self.save()?;
         drop_adoption(&self.ctx.home, slug, &adoption)?;
         self.adopt(board, local, now).await
@@ -855,6 +910,11 @@ fn priority(p: &board_proto::Priority) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+/// The title of a board's coordinator thread.
+pub fn coordinator_title(slug: &BoardSlug) -> String {
+    format!("{slug} coordinator")
 }
 
 /// The first message of a coordinator thread.
