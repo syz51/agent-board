@@ -197,6 +197,11 @@ pub struct CreateTask {
     /// Not ready before this time; a time already passed is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
+    /// Create the task in `doing`, owned by `agent`, in the same transaction, so no other
+    /// agent can claim it first. Sent only when true: a server that predates it ignores
+    /// the field and creates the task `open`, which the client sees in the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claim: bool,
 }
 
 fn default_priority() -> Priority {
@@ -506,6 +511,23 @@ mod tests {
             serde_json::to_value(&create).unwrap(),
             serde_json::json!({ "about": "board", "text": "Slow" })
         );
+    }
+
+    /// Older clients never send `claim`, and a request without it is the same on the wire.
+    #[test]
+    fn claim_is_optional_on_the_wire() {
+        let old = serde_json::json!({ "board": "factory", "agent": "t3:a", "title": "Fix" });
+        let create: CreateTask = serde_json::from_value(old.clone()).unwrap();
+        assert!(!create.claim);
+        assert_eq!(
+            serde_json::to_value(&create).unwrap()["claim"],
+            serde_json::Value::Null
+        );
+        let claimed = CreateTask {
+            claim: true,
+            ..create
+        };
+        assert_eq!(serde_json::to_value(&claimed).unwrap()["claim"], true);
     }
 
     /// Resolution counts from servers that predate `fixed` still parse.

@@ -192,7 +192,10 @@ const TOOLS: &[ToolSpec] = &[
                 ("parent", task_arg("Parent task id."), false),
                 (
                     "blockers",
-                    strings("Task ids that must be done first.", TASK_ID_MAX),
+                    strings(
+                        "Task ids that must be done first, on any board.",
+                        TASK_ID_MAX,
+                    ),
                     false,
                 ),
                 ("priority", one_of(PRIORITIES, "Default p2."), false),
@@ -208,6 +211,13 @@ const TOOLS: &[ToolSpec] = &[
                     s(
                         "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time: for work that must wait for a date.",
                         TIME_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "claim",
+                    b(
+                        "Create it in doing, owned by you, so no other agent starts it first. Refused at your doing limit or while a blocker is not done.",
                     ),
                     false,
                 ),
@@ -622,6 +632,7 @@ impl BoardMcp {
                     priority: a.priority,
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
+                    claim: a.claim,
                 };
                 ops::task_add(&ctx, new).await?
             }
@@ -767,6 +778,8 @@ struct AddArgs {
     priority: Option<Priority>,
     auto: Option<bool>,
     not_before: Option<String>,
+    #[serde(default)]
+    claim: bool,
 }
 
 #[derive(Deserialize)]

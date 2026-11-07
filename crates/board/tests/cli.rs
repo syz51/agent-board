@@ -1394,3 +1394,53 @@ fn other_over_long_text_fails_before_any_request() {
         assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
     }
 }
+
+#[test]
+fn add_with_claim_creates_it_claimed_and_claims_after_an_older_server() {
+    let e = env();
+    let mut doing = task_fixture("factory-12", "Write docs");
+    doing.status = board_proto::TaskStatus::Doing;
+    doing.owner = Some(ME.parse().unwrap());
+    doing.ready = false;
+    e.stub.on("POST /v1/tasks", &doing);
+    let out = e.run(&["add", "Write docs", "--board", "factory", "--claim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("added and claimed factory-12 doing"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(e.stub.requests_to("POST /v1/tasks")[0].body["claim"], true);
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-12/claim")
+            .is_empty()
+    );
+
+    // Without --claim the request is what older clients send: no claim field.
+    let out = e.run(&["add", "Write docs", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        e.stub.requests_to("POST /v1/tasks")[1]
+            .body
+            .get("claim")
+            .is_none()
+    );
+
+    // A server that predates claim ignores it and answers with an open task: the client
+    // claims it next.
+    e.stub
+        .on("POST /v1/tasks", task_fixture("factory-12", "Write docs"));
+    e.stub.on("POST /v1/tasks/factory-12/claim", &doing);
+    let out = e.run(&["add", "Write docs", "--board", "factory", "--claim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("added and claimed factory-12 doing"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-12/claim").len(),
+        1
+    );
+}

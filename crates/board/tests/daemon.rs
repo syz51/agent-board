@@ -629,6 +629,94 @@ async fn a_cleared_blocker_wakes_the_coordinator() {
     );
 }
 
+/// A blocker on another board: its done event comes from that board, and wakes the
+/// coordinator of the waiting task's board and the owner of a task blocked on it.
+#[tokio::test]
+async fn a_blocker_done_on_another_board_wakes_the_waiting_boards_coordinator_and_owner() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    let mut done = detail(
+        "other-3",
+        false,
+        &["factory-12", "factory-13", "factory-14"],
+    );
+    done.task.status = board_proto::TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/other-3", &done);
+    e.stub
+        .on("GET /v1/tasks/factory-12", detail("factory-12", true, &[]));
+    // Blocked by the worker on other-3 alone; and one that still waits on factory-2.
+    let mut blocked = detail("factory-13", false, &[]);
+    blocked.task.status = board_proto::TaskStatus::Blocked;
+    blocked.task.owner = Some("t3:worker".parse().unwrap());
+    blocked.task.blockers = vec!["other-3".parse().unwrap()];
+    e.stub.on("GET /v1/tasks/factory-13", &blocked);
+    let mut still = blocked.clone();
+    still.task.id = "factory-14".parse().unwrap();
+    still.task.blockers = vec!["other-3".parse().unwrap(), "factory-2".parse().unwrap()];
+    e.stub.on("GET /v1/tasks/factory-14", &still);
+    e.stub
+        .on("GET /v1/tasks/factory-2", detail("factory-2", false, &[]));
+
+    let mut ev = event(20, EventType::TaskDone, Some("other-3"), "t3:elsewhere");
+    ev.board = Some("other".parse().unwrap());
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    let mut sends = e.t3.sends();
+    sends.sort();
+    assert_eq!(
+        sends,
+        [
+            (
+                "coord".to_owned(),
+                "board factory: other-3 is done; its blocker cleared for factory-12\nRun board_snapshot and continue."
+                    .to_owned()
+            ),
+            (
+                "worker".to_owned(),
+                "board factory: every blocker of your blocked factory-13 is done; resume it (task_update factory-13 status=doing)\nRun board_snapshot and continue."
+                    .to_owned()
+            ),
+        ]
+    );
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // Checked again when sent: an owner who resumed already, or a task claimed meanwhile,
+    // is not woken.
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    blocked.task.status = board_proto::TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks/factory-13", &blocked);
+    let mut claimed = detail("factory-12", false, &[]);
+    claimed.task.status = board_proto::TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks/factory-12", &claimed);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 2);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+/// A task created with `claim` is in doing when the daemon reads it: no ready wake.
+#[tokio::test]
+async fn a_task_created_claimed_wakes_no_one() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut claimed = detail("factory-4", false, &[]);
+    claimed.task.status = board_proto::TaskStatus::Doing;
+    claimed.task.owner = Some("t3:worker".parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-4", &claimed);
+    for (seq, kind) in [(10, EventType::TaskCreated), (11, EventType::TaskClaimed)] {
+        e.daemon
+            .on_event(&event(seq, kind, Some("factory-4"), "t3:worker"), at())
+            .await
+            .unwrap();
+    }
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
 #[tokio::test]
 async fn a_paused_coordinator_is_not_woken_before_its_reset() {
     let reset = at() + chrono::Duration::hours(1);

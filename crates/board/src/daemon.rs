@@ -6,9 +6,10 @@
 //!   thread with `prompts/coordinator.md`, plus `prompts/triage.md` on the device's feedback
 //!   board, claim again as the thread's agent);
 //! - renews the coordinator lease while the thread is live;
-//! - wakes the coordinator when a task becomes ready or a blocker clears, and the asker
-//!   (worker or coordinator) when its ask is answered, or the coordinator when the asker
-//!   cannot be woken;
+//! - wakes the coordinator when a task becomes ready or a blocker clears (the coordinator
+//!   of the waiting task's board, which may differ from the blocker's), the owner of a
+//!   blocked task when its last blocker is done, and the asker (worker or coordinator) when
+//!   its ask is answered, or the coordinator when the asker cannot be woken;
 //! - never wakes a paused agent before its `paused_until`.
 //!
 //! Wake-ups are queued as what they are about (a task, an ask), not as text. Each flush
@@ -32,7 +33,7 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, Priority, RegisterAgent, Runtime,
-    TaskId, Timestamp,
+    Task, TaskId, TaskStatus, Timestamp,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -140,6 +141,9 @@ pub enum WakeAbout {
     Cleared { done: TaskId, ready: Vec<TaskId> },
     /// For the coordinator: another agent filed `task` as a proposal to review.
     Proposal { task: TaskId },
+    /// For the owner of the blocked `task`: `done` was its last blocker not done. The line
+    /// names only the task, so two blockers done close together make one line.
+    Unblocked { done: TaskId, task: TaskId },
     /// The user answered `asker`'s ask: for the asker, or for the coordinator when the
     /// asker cannot be woken.
     Answered { ask: i64, asker: AgentId },
@@ -857,16 +861,14 @@ impl<T: T3> Daemon<T> {
             self.note_state(event, now);
         }
         let (reconcile, wakes) = self.examine(event).await?;
-        if let Some(board) = &event.board {
-            for (agent, about) in wakes {
-                let wake = Wake {
-                    board: board.clone(),
-                    about,
-                    queued_at: now,
-                    forwarded: false,
-                };
-                self.queue(agent, wake);
-            }
+        for (board, agent, about) in wakes {
+            let wake = Wake {
+                board,
+                about,
+                queued_at: now,
+                forwarded: false,
+            };
+            self.queue(agent, wake);
         }
         self.state.last_seq = Some(self.state.last_seq.unwrap_or(0).max(event.seq));
         Ok(reconcile)
@@ -905,8 +907,9 @@ impl<T: T3> Daemon<T> {
         seen.idled |= state != AgentState::Running;
     }
 
-    /// What one event calls for: a reconcile, and wake-ups by agent. Only reads.
-    async fn examine(&self, event: &Event) -> Result<(bool, Vec<(AgentId, WakeAbout)>)> {
+    /// What one event calls for: a reconcile, and wake-ups by agent, each with the board
+    /// it is about. Only reads.
+    async fn examine(&self, event: &Event) -> Result<(bool, Vec<(BoardSlug, AgentId, WakeAbout)>)> {
         let mut wakes = Vec::new();
         let Some(slug) = &event.board else {
             return Ok((false, wakes));
@@ -930,28 +933,47 @@ impl<T: T3> Daemon<T> {
                         None
                     };
                     if let Some(about) = about {
-                        wakes.push((coordinator.clone(), about));
+                        wakes.push((slug.clone(), coordinator.clone(), about));
                     }
                 }
             }
+            // The tasks waiting on it may be on other boards: each board's coordinator hears
+            // of its own tasks that became ready, and the owner of a blocked task of its
+            // last blocker.
             EventType::TaskDone => {
-                if let Some(task) = &event.task
-                    && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
-                {
-                    let detail = self.client().task(task).await?;
-                    let mut ready: Vec<TaskId> = Vec::new();
+                if let Some(done) = &event.task {
+                    let detail = self.client().task(done).await?;
+                    let mut ready: BTreeMap<BoardSlug, Vec<TaskId>> = BTreeMap::new();
                     for blocked in &detail.blocks {
-                        let t = self.client().task(blocked).await?.task;
+                        // One gone since (its board deleted) does not hold up the rest.
+                        let t = match self.client().task(blocked).await {
+                            Ok(d) => d.task,
+                            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
+                            Err(err) => return Err(err),
+                        };
                         if t.ready && t.auto {
-                            ready.push(t.id);
+                            ready.entry(t.board.clone()).or_default().push(t.id);
+                        } else if let Some(owner) = self.wakeable(t.owner.as_ref(), event)
+                            && t.status == TaskStatus::Blocked
+                            && self.blockers_done(&t).await?
+                        {
+                            let about = WakeAbout::Unblocked {
+                                done: done.clone(),
+                                task: t.id.clone(),
+                            };
+                            wakes.push((t.board.clone(), owner.clone(), about));
                         }
                     }
-                    if !ready.is_empty() {
-                        let about = WakeAbout::Cleared {
-                            done: task.clone(),
-                            ready,
-                        };
-                        wakes.push((coordinator.clone(), about));
+                    for (board, ready) in ready {
+                        if let Some(coordinator) =
+                            self.wakeable(self.coordinator_here(&board), event)
+                        {
+                            let about = WakeAbout::Cleared {
+                                done: done.clone(),
+                                ready,
+                            };
+                            wakes.push((board, coordinator.clone(), about));
+                        }
                     }
                 }
             }
@@ -976,12 +998,22 @@ impl<T: T3> Daemon<T> {
                         .cloned(),
                 };
                 if let Some(to) = to {
-                    wakes.push((to, WakeAbout::Answered { ask, asker }));
+                    wakes.push((slug.clone(), to, WakeAbout::Answered { ask, asker }));
                 }
             }
             _ => {}
         }
         Ok((false, wakes))
+    }
+
+    /// Whether every blocker of `task` is done, wherever it is.
+    async fn blockers_done(&self, task: &Task) -> Result<bool> {
+        for blocker in &task.blockers {
+            if self.client().task(blocker).await?.task.status != TaskStatus::Done {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// A lease claim this device made (the server records the claiming device).
@@ -1272,6 +1304,28 @@ impl<T: T3> Daemon<T> {
                 let task = self.client().task(task).await?.task;
                 is_proposal(&task)
                     .then(|| format!("board {slug}: {} is a proposal to review", task.id))
+            }
+            // Still the agent's, still blocked, and nothing left to wait on.
+            WakeAbout::Unblocked { task, .. } => {
+                let task = self.client().task(task).await?.task;
+                let due = task.owner.as_ref() == Some(agent)
+                    && task.status == TaskStatus::Blocked
+                    && self.blockers_done(&task).await?;
+                // A blocked reason may name another wait, such as an ask.
+                let next = if task.blocked_reason.is_some() {
+                    format!(
+                        "check its blocked reason (task_show {}) before resuming",
+                        task.id
+                    )
+                } else {
+                    format!("resume it (task_update {} status=doing)", task.id)
+                };
+                due.then(|| {
+                    format!(
+                        "board {slug}: every blocker of your blocked {} is done; {next}",
+                        task.id
+                    )
+                })
             }
             // An answer stays answered; only its text is read.
             WakeAbout::Answered { ask, asker } if asker == agent || coordinator => {

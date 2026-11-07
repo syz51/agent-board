@@ -158,13 +158,9 @@ fn owner_desc(cx: &Ctx<'_>, owner: &AgentId) -> Result<String> {
     })
 }
 
-/// Blockers must exist, be on the task's board, and not form a cycle.
-fn check_blockers(
-    cx: &Ctx<'_>,
-    task: Option<&TaskId>,
-    board: &BoardSlug,
-    blockers: &[TaskId],
-) -> Result<Vec<TaskId>> {
+/// Blockers must exist and not form a cycle. They may be on any board: the task is not
+/// ready until they are done, wherever they are.
+fn check_blockers(cx: &Ctx<'_>, task: Option<&TaskId>, blockers: &[TaskId]) -> Result<Vec<TaskId>> {
     let mut out: Vec<TaskId> = Vec::with_capacity(blockers.len());
     for blocker in blockers {
         if out.contains(blocker) {
@@ -176,20 +172,14 @@ fn check_blockers(
                 "remove it from blockers",
             ));
         }
-        if blocker.board() != *board {
-            return Err(invalid(
-                format!(
-                    "blocker {blocker} is on board {}, not {board}",
-                    blocker.board()
-                ),
-                "blockers must be on the same board; link other boards in the body instead",
-            ));
-        }
         if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [blocker.as_str()])? {
-            return Err(invalid(
-                format!("blocker {blocker} does not exist"),
-                format!("check the id; task_list board={board} lists the tasks"),
-            ));
+            let board = blocker.board();
+            let next = if cx.exists("SELECT 1 FROM boards WHERE slug = ?1", [board.as_str()])? {
+                format!("check the id; task_list board={board} lists the tasks")
+            } else {
+                format!("there is no board {board}; check the id (board_status lists the boards)")
+            };
+            return Err(invalid(format!("blocker {blocker} does not exist"), next));
         }
         out.push(blocker.clone());
     }
@@ -252,7 +242,10 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             ));
         }
     }
-    let blockers = check_blockers(cx, None, &req.board, &req.blockers)?;
+    let blockers = check_blockers(cx, None, &req.blockers)?;
+    if req.claim {
+        check_claimable_new(cx, &req, &blockers)?;
+    }
     let number: i64 = cx.db.query_row(
         "UPDATE boards SET next_number = next_number + 1 WHERE slug = ?1 RETURNING next_number - 1",
         [req.board.as_str()],
@@ -264,10 +257,16 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         .not_before
         .map(|at| at.timestamp_millis())
         .filter(|&at| at > now);
+    // A claimed task starts in doing, owned by its creator: no other agent sees it ready.
+    let (status, owner, doing_since) = if req.claim {
+        (TaskStatus::Doing, Some(req.agent.as_str()), Some(now))
+    } else {
+        (TaskStatus::Open, None, None)
+    };
     cx.db.execute(
         "INSERT INTO tasks (id, board, number, parent, title, body, acceptance, status, priority, \
-         auto, created_by, version, created_at, updated_at, not_before) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, 1, ?11, ?11, ?12)",
+         auto, created_by, version, created_at, updated_at, not_before, owner, doing_since) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, 1, ?11, ?11, ?12, ?14, ?15)",
         params![
             id.as_str(),
             req.board.as_str(),
@@ -281,6 +280,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             req.agent.as_str(),
             now,
             not_before,
+            status_str(status),
+            owner,
+            doing_since,
         ],
     )?;
     set_blockers(cx, &id, &blockers)?;
@@ -289,6 +291,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     if let Some(parent) = &req.parent {
         payload["parent"] = parent.as_str().into();
     }
+    if req.claim {
+        payload["claimed"] = true.into();
+    }
     cx.emit(
         Some(&req.board),
         req.agent.as_str(),
@@ -296,7 +301,69 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         Some(&id),
         payload,
     )?;
+    if req.claim {
+        // As a claim of an open task records it, so history and clients that follow
+        // claims see who works on it.
+        cx.emit(
+            Some(&req.board),
+            req.agent.as_str(),
+            EventType::TaskClaimed,
+            Some(&id),
+            serde_json::json!({ "previous_owner": null }),
+        )?;
+    }
     get_task(cx, &id)
+}
+
+/// A task created with `claim` starts as a claim would leave it, so it must pass what a
+/// claim checks: no blocker left to finish, no `not_before` ahead, and room in the
+/// creator's `doing` limit. Checked before anything is written.
+fn check_claimable_new(cx: &Ctx<'_>, req: &CreateTask, blockers: &[TaskId]) -> Result<()> {
+    let mut waiting: Vec<String> = Vec::new();
+    for b in blockers {
+        let status: String = cx.db.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [b.as_str()],
+            |r| r.get(0),
+        )?;
+        if status != "done" {
+            waiting.push(format!("{b} ({status})"));
+        }
+    }
+    if !waiting.is_empty() {
+        return Err(bad_transition(
+            format!(
+                "a claimed task starts in doing, but it would wait on {}",
+                waiting.join(", ")
+            ),
+            "add it without claim; it becomes ready when its blockers are done",
+        ));
+    }
+    if req
+        .not_before
+        .is_some_and(|at| at.timestamp_millis() > cx.now_ms())
+    {
+        return Err(bad_transition(
+            "a claimed task starts in doing, but not_before is still ahead",
+            "add it without claim, or without not_before if it should start now",
+        ));
+    }
+    let doing = doing_tasks(cx, &req.agent, None)?;
+    if doing.len() >= cx.s.max_doing_per_agent as usize {
+        return Err(refused(
+            format!(
+                "you already have {} in doing; nothing was created",
+                doing.join(", ")
+            ),
+            format!(
+                "move {0} to review or blocked first (task_update {0} status=review), finish it \
+                 (task_done) or release it, then add the task with claim again; or add it \
+                 without claim",
+                doing[0]
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Announces every `not_before` the clock has passed, once: a `task_updated` event by
@@ -395,19 +462,22 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         .collect())
 }
 
-/// Other tasks the agent has in `doing`.
-fn doing_elsewhere(cx: &Ctx<'_>, agent: &AgentId, except: &TaskId) -> Result<Vec<String>> {
+/// The tasks the agent has in `doing`, other than `except`.
+fn doing_tasks(cx: &Ctx<'_>, agent: &AgentId, except: Option<&TaskId>) -> Result<Vec<String>> {
     Ok(cx
         .db
         .prepare_cached(
-            "SELECT id FROM tasks WHERE owner = ?1 AND status = 'doing' AND id != ?2 ORDER BY id",
+            "SELECT id FROM tasks WHERE owner = ?1 AND status = 'doing' AND id IS NOT ?2 \
+             ORDER BY id",
         )?
-        .query_map(params![agent.as_str(), except.as_str()], |r| r.get(0))?
+        .query_map(params![agent.as_str(), except.map(TaskId::as_str)], |r| {
+            r.get(0)
+        })?
         .collect::<rusqlite::Result<_>>()?)
 }
 
 fn check_doing_limit(cx: &Ctx<'_>, agent: &AgentId, task: &TaskId) -> Result<()> {
-    let doing = doing_elsewhere(cx, agent, task)?;
+    let doing = doing_tasks(cx, agent, Some(task))?;
     if doing.len() >= cx.s.max_doing_per_agent as usize {
         return Err(refused(
             format!("you already have {} in doing", doing.join(", ")),
@@ -426,7 +496,7 @@ fn open_blockers(cx: &Ctx<'_>, task: &TaskId) -> Result<Vec<(String, String)>> {
         .db
         .prepare_cached(
             "SELECT b.blocker, t.status FROM task_blockers b JOIN tasks t ON t.id = b.blocker \
-             WHERE b.task = ?1 AND t.status != 'done' ORDER BY t.number",
+             WHERE b.task = ?1 AND t.status != 'done' ORDER BY t.number, t.board",
         )?
         .query_map([task.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?)
@@ -703,8 +773,10 @@ pub(crate) fn update(
 
     let blockers = match &req.blockers {
         Some(new) => {
-            let new = check_blockers(cx, Some(id), &task.board, new)?;
-            if new != task.blockers {
+            let new = check_blockers(cx, Some(id), new)?;
+            // The same set in another order is no change.
+            let as_set = |list: &[TaskId]| list.iter().cloned().collect::<HashSet<TaskId>>();
+            if as_set(&new) != as_set(&task.blockers) {
                 fields.push("blockers");
             }
             new
