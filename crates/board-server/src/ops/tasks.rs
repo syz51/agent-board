@@ -9,13 +9,13 @@ use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
 
 use crate::config::Settings;
-use crate::db::{Ctx, enum_str, parse_id, ts};
+use crate::db::{Ctx, enum_str, parse_id, ready_sql, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
 use crate::ops::{join_board, touch_agent};
 use crate::store::{
-    NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks, seen,
+    NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks_up_to, seen,
 };
 use crate::text::{ago, check_line, check_text};
 
@@ -463,15 +463,16 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         clauses.push("t.owner = :owner");
         params.push((":owner", owner));
     }
-    if filter.ready == Some(true) {
-        clauses.push("t.status = 'open'");
+    // The same test as `Task::ready`, so the limit applies in SQL.
+    let ready = match filter.ready {
+        Some(true) => Some(ready_sql("t")),
+        Some(false) => Some(format!("NOT {}", ready_sql("t"))),
+        None => None,
+    };
+    if let Some(ready) = &ready {
+        clauses.push(ready);
     }
-    let tasks = load_tasks(cx, &clauses.join(" AND "), &params)?;
-    Ok(tasks
-        .into_iter()
-        .filter(|t| filter.ready.is_none_or(|r| t.ready == r))
-        .take(filter.limit)
-        .collect())
+    load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }
 
 /// The tasks the agent has in `doing`, other than `except`.
