@@ -77,11 +77,13 @@ export function EventsScreen() {
                   New events appear here as they happen.
                 </Empty>
               ) : (
-                <Timeline live>
-                  {shown.map((event) => (
-                    <EventLine key={event.seq} event={event} agents={agents} showTask />
-                  ))}
-                </Timeline>
+                <div className="rounded-xl border bg-card px-4 py-2 shadow-raise">
+                  <Timeline live>
+                    {shown.map((event) => (
+                      <EventLine key={event.seq} event={event} agents={agents} showTask />
+                    ))}
+                  </Timeline>
+                </div>
               )}
               {oldest > 1 && (
                 <div className="mt-4 flex justify-center">

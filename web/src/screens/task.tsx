@@ -130,9 +130,9 @@ function TaskView({
         </p>
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_288px] lg:items-start lg:gap-6">
         <aside
-          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
+          className="order-2 grid gap-5 rounded-xl border bg-card p-5 shadow-raise lg:sticky lg:top-6"
           aria-label="Properties"
         >
           <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
@@ -194,7 +194,8 @@ function TaskView({
           <TaskLinks title="Subtasks" ids={detail.children} related={related} />
         </aside>
 
-        <div className="min-w-0">
+        {/* The task itself on one raised sheet. */}
+        <div className="min-w-0 rounded-xl border bg-card p-6 shadow-raise max-md:px-4 max-md:py-5">
           {task.blocked_reason && (
             <Alert variant="warn" className="mb-5 px-4.5 py-4">
               <AlertTitle className="text-sm font-semibold">Blocked</AlertTitle>
@@ -250,7 +251,7 @@ function TaskView({
 
           <Section id="task-evidence" title="Evidence" count={detail.evidence.length}>
             {detail.evidence.length > 0 ? (
-              <ul className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+              <ul className="divide-y overflow-hidden rounded-lg border">
                 {detail.evidence.map((item, index) => (
                   <EvidenceItem key={index} item={item} agents={agents} />
                 ))}
@@ -264,7 +265,7 @@ function TaskView({
             {detail.notes.length > 0 ? (
               <ul className="grid gap-2.5">
                 {detail.notes.map((note) => (
-                  <li key={note.id} className="grid gap-1.5 rounded-lg border bg-card px-3.5 py-3">
+                  <li key={note.id} className="grid gap-1.5 rounded-lg bg-muted px-3.5 py-3">
                     <div className="flex flex-wrap items-center gap-2 text-meta">
                       <Who id={note.agent} agents={agents} />
                       <Badge

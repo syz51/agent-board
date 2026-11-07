@@ -95,7 +95,7 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="grid gap-3">
+            <div className="grid items-start gap-4 xl:grid-cols-2">
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -109,8 +109,9 @@ export function AgentsScreen() {
 
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
-    <article className="grid gap-3.5 rounded-lg border bg-card px-4 py-3.5 shadow-raise lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-6">
-      <div className="grid content-start justify-items-start gap-2">
+    // A card: who and their state with where they run, then what they work on.
+    <article className="grid gap-4 rounded-xl border bg-card p-4 shadow-raise md:grid-cols-[232px_minmax(0,1fr)] md:gap-5 xl:grid-cols-1 xl:gap-4">
+      <div className="grid content-start justify-items-start gap-3">
         {/* The avatar beside the handle, with the state on its own line under it. */}
         <header className="grid grid-cols-[auto_minmax(0,1fr)] items-center justify-items-start gap-x-2.5 gap-y-0.5">
           <Avatar handle={agent.handle} large className="row-span-2 size-9 text-xs" />
@@ -184,7 +185,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   );
 }
 
-const handoffBox = "bg-muted grid gap-1.5 rounded-sm border px-3 py-2.5";
+const handoffBox = "bg-muted grid gap-1.5 rounded-lg px-3 py-2.5";
 
 function HandoffView({ agentId }: { agentId: string }) {
   const handoff = useQuery(queries.handoff(agentId));

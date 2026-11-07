@@ -233,10 +233,10 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-/** The frame around task groups: one card, groups divided by rules. */
+/** Task groups as columns side by side, wrapping onto new rows; stacked on a phone. */
 export function TaskBoard({ children }: { children: ReactNode }) {
   return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
+    <div className="grid items-start gap-3 md:grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
       {children}
     </div>
   );
@@ -258,13 +258,13 @@ export function TaskGroupSection({
 }) {
   const Heading = level === 2 ? "h2" : "h3";
   return (
-    <section aria-labelledby={id}>
-      <Heading
-        id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
-      >
+    // A column: a tinted lane with its heading and count, holding one card per task.
+    <section className="rounded-xl bg-secondary p-1.5" aria-labelledby={id}>
+      <Heading id={id} className="flex h-9 items-center gap-2 px-2 text-meta font-semibold">
         {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        <span className="ml-auto h-5 min-w-5 rounded-full bg-card px-1.5 text-center text-xs leading-5 font-medium text-subtle-foreground tabular-nums">
+          {count}
+        </span>
       </Heading>
       {children}
     </section>
@@ -312,17 +312,15 @@ const columns = column.columns([
   }),
 ]);
 
-// Desktop rows share the list's columns (subgrid), so the id column fits the longest id.
-// On a phone a row stacks: status and title, then id, priority, owner and update.
+// A card: status and title on top, then id, priority, owner and the last update, wrapping
+// as the column narrows.
 const CELL_CLASS: Record<string, string> = {
-  priority: "max-md:[grid-area:prio] max-md:self-center",
-  status: "max-md:[grid-area:status] max-md:mt-0.75",
-  id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center",
-  main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
-  owner:
-    "min-w-0 overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
-  updated:
-    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+  priority: "order-4",
+  status: "order-1 mt-0.75 flex-none",
+  id: "order-3 ml-6 ident text-subtle-foreground text-xs",
+  main: "order-2 flex min-w-0 basis-[calc(100%-24px)] flex-wrap items-center gap-x-2 gap-y-1",
+  owner: "order-5 flex min-w-0 flex-wrap items-center text-meta",
+  updated: "order-6 ml-auto text-meta text-muted-foreground whitespace-nowrap tabular-nums",
 };
 
 export function TaskList({
@@ -342,11 +340,11 @@ export function TaskList({
   );
   const table = useTable({ features, columns, data, getRowId: (row) => row.task.id });
   return (
-    <ul className="grid grid-cols-[54px_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_88px] gap-x-3 divide-y max-md:block">
+    <ul className="grid gap-1.5">
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative flex flex-wrap items-start gap-x-2.5 gap-y-2 rounded-lg border bg-card px-3 py-2.5 shadow-raise hover:border-input"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>

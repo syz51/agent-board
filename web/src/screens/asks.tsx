@@ -230,8 +230,8 @@ function WaitingTasks({
       <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
-      {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
+      {/* Tasks only you can start keep their amber tag. */}
+      <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
             <TaskGroupSection
@@ -300,7 +300,7 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
+        "relative grid gap-3.5 overflow-hidden rounded-xl border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
         "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
         ask.status !== "open"
           ? "before:bg-input"

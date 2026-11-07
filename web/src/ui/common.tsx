@@ -84,7 +84,7 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
+    <div className="grid justify-items-center gap-1.5 rounded-xl border-2 border-dashed border-input px-6 py-12 text-center text-muted-foreground">
       <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
         <Icon name={icon} className="size-5" />
       </span>
@@ -367,7 +367,7 @@ export function SectionTitle({
 
 /** A bordered list of rows on a card surface. */
 export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+  "bg-card shadow-raise divide-y overflow-hidden rounded-xl border [&>li]:border-border";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {
