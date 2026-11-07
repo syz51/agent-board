@@ -172,7 +172,7 @@ pub struct ResolveFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskId>,
     /// Required for `forwarded`, `declined` and `fixed`; at most
-    /// [`RESOLUTION_REASON_CHARS_MAX`] characters.
+    /// [`crate::RESOLUTION_REASON_CHARS_MAX`] characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
