@@ -110,7 +110,11 @@ pub(crate) fn validate_done(req: &DoneTask, id: &TaskId) -> Result<()> {
         ));
     }
     for item in &req.evidence {
-        check_line("evidence value", &item.value, 500)?;
+        check_line(
+            "evidence value",
+            &item.value,
+            board_proto::EVIDENCE_VALUE_CHARS_MAX,
+        )?;
         if item.kind == EvidenceKind::Check && item.exit_code.is_none() {
             return Err(Error::api(
                 ErrorCode::EvidenceRequired,

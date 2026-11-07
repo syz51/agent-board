@@ -1251,6 +1251,151 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
 }
 
 #[test]
+fn over_long_text_fails_before_any_request() {
+    let e = env();
+    let cases: [(Vec<String>, &str); 4] = [
+        (
+            vec!["note".into(), "factory-12".into(), "x".repeat(501)],
+            "text is 501 characters; the limit is 500 (not sent)",
+        ),
+        (
+            vec!["add".into(), "x".repeat(80)],
+            "title is 80 characters; the limit is 72 (not sent)",
+        ),
+        (
+            vec![
+                "handoff".into(),
+                "--now".into(),
+                "x".repeat(310),
+                "--next".into(),
+                "x".into(),
+            ],
+            "now is 310 characters; the limit is 300 (not sent)",
+        ),
+        (
+            vec![
+                "ask".into(),
+                "Which?".into(),
+                "--option".into(),
+                "x".repeat(61),
+            ],
+            "option is 61 characters; the limit is 60 (not sent)",
+        ),
+    ];
+    for (args, message) in cases {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = e.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains(message), "{err}");
+        assert!(err.contains("\nnext: shorten"), "{err}");
+        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+    }
+
+    let out = e.run(&["note", "factory-12", &"x".repeat(450)]);
+    assert!(
+        !stderr(&out).contains("(not sent)"),
+        "a 450-character note is within the limit: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn help_states_text_limits_and_enum_values() {
+    let e = env();
+    let help = |args: &[&str]| stdout(&e.run(args));
+    let add = help(&["add", "--help"]);
+    assert!(add.contains("At most 72 characters"), "{add}");
+    assert!(add.contains("[possible values: p1, p2, p3]"), "{add}");
+    let note = help(&["note", "--help"]);
+    assert!(note.contains("At most 500 characters"), "{note}");
+    assert!(
+        note.contains("[possible values: note, finding, decision]"),
+        "{note}"
+    );
+    let handoff = help(&["handoff", "--help"]);
+    assert_eq!(
+        handoff.matches("At most 300 characters").count(),
+        3,
+        "{handoff}"
+    );
+    let ask = help(&["ask", "--help"]);
+    assert!(ask.contains("At most 1000 characters"), "{ask}");
+    assert!(ask.contains("At most 60 characters"), "{ask}");
+}
+
+#[test]
+fn an_unknown_enum_value_lists_the_accepted_ones() {
+    let e = env();
+    let out = e.run(&["add", "x", "--priority", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr(&out);
+    assert!(
+        err.contains("invalid value '1' for '--priority <PRIORITY>'")
+            && err.contains("[possible values: p1, p2, p3]"),
+        "{err}"
+    );
+    assert!(e.stub.requests().is_empty());
+}
+
+#[test]
+fn other_over_long_text_fails_before_any_request() {
+    let e = env();
+    let long = |n: usize| "x".repeat(n);
+    let cases: [(Vec<String>, &str, &str); 5] = [
+        (
+            vec!["done".into(), "factory-12".into(), "--pr".into(), long(501)],
+            "evidence value is 501 characters; the limit is 500",
+            "link to the log or artifact instead",
+        ),
+        (
+            vec![
+                "update".into(),
+                "factory-12".into(),
+                "--reason".into(),
+                long(501),
+            ],
+            "blocked_reason is 501 characters; the limit is 500",
+            "split it across notes",
+        ),
+        (
+            vec!["feedback".into(), long(4001)],
+            "text is 4001 characters; the limit is 4000",
+            "keep to what happened and what it cost",
+        ),
+        (
+            vec![
+                "resolve".into(),
+                "board-feedback-1".into(),
+                "--declined".into(),
+                long(281),
+            ],
+            "reason is 281 characters; the limit is 280",
+            "put the detail in a note on the item",
+        ),
+        (
+            vec![
+                "board".into(),
+                "create".into(),
+                "factory".into(),
+                "--title".into(),
+                long(73),
+            ],
+            "title is 73 characters; the limit is 72",
+            "put the detail in the goal",
+        ),
+    ];
+    for (args, message, goes) in cases {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = e.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains(message) && err.contains(goes), "{err}");
+        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+    }
+}
+
+#[test]
 fn add_with_claim_creates_it_claimed_and_claims_after_an_older_server() {
     let e = env();
     let mut doing = task_fixture("factory-12", "Write docs");

@@ -17,7 +17,7 @@ use crate::error::{Result, bad_transition, forbidden, invalid};
 use crate::ops::tasks::status_str;
 use crate::ops::{boards, touch_agent};
 use crate::store::{find_board, find_task, get_task};
-use crate::text::{check_line, check_text, cut};
+use crate::text::{check_line, check_text_or, cut};
 
 /// Agents an item lists in `reporters`: the most recent ones.
 const REPORTERS_MAX: usize = 20;
@@ -74,7 +74,12 @@ pub(crate) fn validate_create(
             "say what cost you a step: the first line is the title",
         ));
     }
-    check_text("text", text, s.body_chars)?;
+    check_text_or(
+        "text",
+        text,
+        s.body_chars,
+        Some(board_proto::FEEDBACK_LONGER_TEXT_GOES),
+    )?;
     let first: String = text
         .split(['\n', '\r'])
         .next()
@@ -509,7 +514,7 @@ pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()> {
+pub(crate) fn validate_resolve(req: &ResolveFeedback) -> Result<()> {
     let kind = enum_str(&req.kind);
     match req.kind {
         ResolutionKind::Unknown => {
@@ -532,23 +537,26 @@ pub(crate) fn validate_resolve(req: &ResolveFeedback, s: &Settings) -> Result<()
             ));
         }
         ResolutionKind::Routed | ResolutionKind::Duplicate => {}
-        ResolutionKind::Forwarded => needs_reason(req, s, "where it went")?,
-        ResolutionKind::Declined => needs_reason(req, s, "why it is not acted on")?,
-        ResolutionKind::Fixed => needs_reason(req, s, "what changed, such as the file and line")?,
+        ResolutionKind::Forwarded => needs_reason(req, "where it went")?,
+        ResolutionKind::Declined => needs_reason(req, "why it is not acted on")?,
+        ResolutionKind::Fixed => needs_reason(req, "what changed, such as the file and line")?,
     }
     if let Some(reason) = &req.reason {
-        check_line("reason", reason, s.note_chars)?;
+        check_line("reason", reason, board_proto::RESOLUTION_REASON_CHARS_MAX)?;
     }
     Ok(())
 }
 
 /// Checks a kind that takes a reason (`hint` says what it gives) and no task.
-fn needs_reason(req: &ResolveFeedback, s: &Settings, hint: &str) -> Result<()> {
+fn needs_reason(req: &ResolveFeedback, hint: &str) -> Result<()> {
     let kind = enum_str(&req.kind);
     if req.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
         return Err(invalid(
             format!("{kind} needs a reason"),
-            format!("send reason (at most {} characters): {hint}", s.note_chars),
+            format!(
+                "send reason (at most {} characters): {hint}",
+                board_proto::RESOLUTION_REASON_CHARS_MAX
+            ),
         ));
     }
     if req.task.is_some() {
@@ -631,7 +639,7 @@ pub(crate) fn resolve(
     };
     let evidence = NewEvidence {
         kind: EvidenceKind::Artifact,
-        value: cut(&value, 500),
+        value: cut(&value, board_proto::EVIDENCE_VALUE_CHARS_MAX),
         exit_code: None,
     };
     // Evidence names an agent: the resolver, else the owner, else the reporter.

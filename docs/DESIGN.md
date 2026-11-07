@@ -160,9 +160,12 @@ descriptions under 300 characters):
 `ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
 
 Every string parameter declares a `maxLength` equal to the server's default limit (title
-72, note 280, handoff field 200, question 1,000, body 4,000 characters, and so on), so a
+72, note 500, handoff field 300, question 1,000, body 4,000 characters, and so on), so a
 runtime can refuse an oversized argument before the call; a server configured with other
-limits still checks its own. The server's instructions ask agents to
+limits still checks its own. The CLI states the same default limits in `--help` and
+refuses over-long text before sending, with the server's message and hint, so it cannot
+use limits a server raised above the defaults; its enum flags list their values in
+`--help` and in the error for an unknown one. The server's instructions ask agents to
 report, with `feedback`, anything in a setup that cost them a step and then carry on;
 `task_note` no longer offers the `feedback` kind.
 
