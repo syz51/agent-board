@@ -27,8 +27,8 @@
     { "id": "github-issue", "title": "GitHub issue", "url": "https://github.com/github/roadmap/issues/1025", "views": ["desktop-light"], "steps": [{ "wait": 1500 }] }
   ],
   "judges": [
-    { "model": "claude-sonnet-5-5", "effort": "medium", "samples": 2 },
-    { "model": "claude-opus-5-5", "effort": "high", "samples": 2 }
+    { "model": "claude-opus-5-5", "effort": "high", "samples": 2 },
+    { "model": "claude-opus-5-5", "effort": "xhigh", "samples": 2 }
   ],
   "pass": { "min": 9, "gain": 0.5 },
   "budgetUsd": { "call": 3, "round": 10, "run": 60 },
