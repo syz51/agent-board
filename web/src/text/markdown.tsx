@@ -188,9 +188,14 @@ export function SafeLink(
       <a href={url} target="_blank" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">
         {children}
       </a>
-      {showTarget && <span class="link-target"> ({shown})</span>}
+      {showTarget && <span class="link-target"> ({breakable(shown)})</span>}
     </span>
   );
+}
+
+/** A URL with line-break opportunities after its separators, so it wraps between parts. */
+function breakable(url: string): ComponentChildren {
+  return url.split(/(?<=[/?#&=])/).flatMap((part, index) => index === 0 ? [part] : [<wbr key={index} />, part]);
 }
 
 function flatText(children: ComponentChildren): string {

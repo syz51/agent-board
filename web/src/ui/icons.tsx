@@ -26,6 +26,8 @@ const PATHS = {
   pause: "M5.75 3.5v9M10.25 3.5v9",
   cloud: "M4.5 12.25a3 3 0 0 1-.35-5.98 4 4 0 0 1 7.7-.77 3.25 3.25 0 0 1 .4 6.75z",
   plug: "M6 1.75v3.5M10 1.75v3.5M4 5.25h8v2.5a4 4 0 0 1-8 0zM8 11.75v2.5",
+  minus: "M4.25 8h7.5",
+  cross: "m5 5 6 6M11 5l-6 6",
 } as const;
 
 export type IconName = keyof typeof PATHS;

@@ -55,7 +55,7 @@ export function BoardsScreen() {
                     <Icon name={ask.kind === "action" ? "hand" : "question"} />
                     {ask.kind === "action" ? "Action" : "Decision"}
                   </span>
-                  <span class="ask-preview-text">{plainLine(ask.question)}</span>
+                  <span class="ask-preview-text" title={plainLine(ask.question)}>{plainLine(ask.question)}</span>
                   <span class="ask-preview-meta">
                     {ask.board} · <RelTime at={ask.created_at} />
                   </span>
@@ -74,16 +74,25 @@ export function BoardsScreen() {
               </Empty>
             )
             : (
-              <div class="board-grid">
-                {list.map((board) => (
-                  <BoardCard
-                    key={board.slug}
-                    board={board}
-                    coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
-                    agents={agents}
-                  />
-                ))}
-              </div>
+              <section class="board-table" aria-label="All boards">
+                <div class="board-table-head" aria-hidden="true">
+                  <span>Board</span>
+                  <span>Tasks</span>
+                  <span>Coordinator</span>
+                  <span>Asks</span>
+                  <span>Autopilot</span>
+                </div>
+                <ul class="board-list">
+                  {list.map((board) => (
+                    <BoardRow
+                      key={board.slug}
+                      board={board}
+                      coordinator={board.coordinator ? agents.get(board.coordinator) : undefined}
+                      agents={agents}
+                    />
+                  ))}
+                </ul>
+              </section>
             )}
       </Query>
     </>
@@ -119,19 +128,21 @@ function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number
   };
 }
 
-function BoardCard(
+/** One board as a row of the boards table: name and goal, tasks by status, coordinator,
+ *  open asks and autopilot, in columns that line up from board to board. */
+function BoardRow(
   { board, coordinator, agents }: { board: Board; coordinator: Agent | undefined; agents: Map<string, Agent> },
 ) {
   const counts = segmentCounts(board.counts);
   const total = SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
   return (
-    <article class="card board-card">
-      <header class="board-card-head">
-        <h2 class="card-title">
-          <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
-        </h2>
-        <code class="slug">{board.slug}</code>
-        <span class="board-tags">
+    <li class="board-row">
+      <div class="board-name">
+        <div class="board-name-line">
+          <h2 class="board-title">
+            <a href={`/boards/${encodeURIComponent(board.slug)}`}>{board.title}</a>
+          </h2>
+          <span class="slug ident">{board.slug}</span>
           {board.status !== "active" && (
             <span class={`pill board-${board.status}`}>
               <span class="state-dot" aria-hidden="true" />
@@ -139,62 +150,66 @@ function BoardCard(
             </span>
           )}
           {board.temporary && <span class="tag">Temporary</span>}
-        </span>
-      </header>
-      <p class={board.goal ? "board-goal" : "board-goal muted"}>
-        {board.goal ? <PlainText text={board.goal} /> : "No goal written."}
-      </p>
-
-      <div class="progress" aria-hidden="true">
-        {SEGMENTS.map((segment) =>
-          counts[segment.key] > 0 && (
-            <span
-              key={segment.key}
-              class={`progress-seg seg-${segment.key}`}
-              style={{ flexGrow: counts[segment.key] }}
-            />
-          )
-        )}
-      </div>
-      {total === 0
-        ? <p class="tally muted">No tasks yet</p>
-        : (
-          <ul class="tally" aria-label="Tasks by status">
-            {SEGMENTS.map((segment) =>
-              counts[segment.key] > 0 && (
-                <li key={segment.key}>
-                  <StatusIcon status={segment.key === "waiting" ? "open" : segment.key} />
-                  <strong>{counts[segment.key]}</strong> {segment.label}
-                </li>
-              )
-            )}
-          </ul>
-        )}
-
-      <footer class="board-foot">
-        <div class="coordinator">
-          {board.coordinator === null
-            ? <span class="muted">{board.autopilot ? "No coordinator running" : "No coordinator"}</span>
-            : coordinator
-            ? (
-              <>
-                <Who id={coordinator.id} agents={agents} />
-                <AgentStateBadge agent={coordinator} />
-              </>
-            )
-            : <Who id={board.coordinator} agents={agents} />}
         </div>
-        <a
-          class={board.open_asks > 0 ? "asks-link has-asks" : "asks-link"}
-          href={`/asks?board=${encodeURIComponent(board.slug)}`}
-          aria-label={`${board.open_asks} open ask${board.open_asks === 1 ? "" : "s"}`}
-        >
-          <Icon name="inbox" />
-          {board.open_asks}
-        </a>
-        <AutopilotSwitch board={board} />
-      </footer>
-    </article>
+        <p class={board.goal ? "board-goal" : "board-goal muted"}>
+          {board.goal ? <PlainText text={board.goal} /> : "No goal written."}
+        </p>
+      </div>
+
+      <div class="board-tasks">
+        <div class="progress" aria-hidden="true">
+          {SEGMENTS.map((segment) =>
+            counts[segment.key] > 0 && (
+              <span
+                key={segment.key}
+                class={`progress-seg seg-${segment.key}`}
+                style={{ flexGrow: counts[segment.key] }}
+              />
+            )
+          )}
+        </div>
+        {total === 0
+          ? <p class="tally muted">No tasks yet</p>
+          : (
+            <ul class="tally" aria-label="Tasks by status">
+              {SEGMENTS.map((segment) =>
+                counts[segment.key] > 0 && (
+                  <li key={segment.key} title={`${counts[segment.key]} ${segment.label}`}>
+                    <StatusIcon status={segment.key === "waiting" ? "open" : segment.key} />
+                    <strong>{counts[segment.key]}</strong> <span class="tally-label">{segment.label}</span>
+                  </li>
+                )
+              )}
+            </ul>
+          )}
+      </div>
+
+      <div class="coordinator">
+        {board.coordinator === null
+          ? <span class="muted">{board.autopilot ? "No coordinator running" : "No coordinator"}</span>
+          : coordinator
+          ? (
+            <>
+              <Who id={coordinator.id} agents={agents} />
+              <AgentStateBadge agent={coordinator} />
+            </>
+          )
+          : <Who id={board.coordinator} agents={agents} />}
+      </div>
+
+      <div class="board-asks">
+        {board.open_asks > 0
+          ? (
+            <a class="asks-link" href={`/asks?board=${encodeURIComponent(board.slug)}`}>
+              <Icon name="inbox" />
+              {board.open_asks} <span class="asks-word">{board.open_asks === 1 ? "ask" : "asks"}</span>
+            </a>
+          )
+          : <span class="no-asks">No asks</span>}
+      </div>
+
+      <AutopilotSwitch board={board} />
+    </li>
   );
 }
 

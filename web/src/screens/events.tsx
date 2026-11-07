@@ -165,8 +165,12 @@ export function EventLine(
     : ROUTINE.has(event.type)
     ? "routine"
     : "normal";
+  // Events that went wrong get the glyph of what went wrong: the blocked mark, or a cross
+  // for a failed check, so failure reads apart from routine work and the two apart.
   const icon: IconName = event.type === "ask_created"
     ? askKind === "action" ? "hand" : "question"
+    : weight === "notable"
+    ? event.type === "evidence_added" ? "cross" : "minus"
     : KIND_ICON[kind] ?? "events";
   return (
     <li class={`event event-${weight}`} data-kind={kind}>
@@ -176,10 +180,10 @@ export function EventLine(
           <Who id={event.actor} agents={agents} />
           <span class="event-type" title={event.type}>{verb}</span>
           {showTask && event.task && (
-            <a href={`/tasks/${encodeURIComponent(event.task)}`}><code>{event.task}</code></a>
+            <a href={`/tasks/${encodeURIComponent(event.task)}`}><span class="ident">{event.task}</span></a>
           )}
           {showTask && !event.task && event.board && !PERSONAL.has(event.type) && (
-            <a href={`/boards/${encodeURIComponent(event.board)}`}><code>{event.board}</code></a>
+            <a href={`/boards/${encodeURIComponent(event.board)}`}><span class="ident">{event.board}</span></a>
           )}
           {suffix && <span class="event-type">{suffix}</span>}
         </p>

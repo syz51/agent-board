@@ -4,7 +4,8 @@ import { render } from "preact-render-to-string";
 import { HOSTILE_BODY, HOSTILE_TITLE } from "../../dev/fixtures.ts";
 import { Markdown, PlainText, safeHref } from "./markdown.tsx";
 
-const md = (text: string) => render(<Markdown text={text} />);
+// Line-break hints inside shown URLs are layout, not content.
+const md = (text: string) => render(<Markdown text={text} />).replaceAll("<wbr/>", "");
 
 /** Every tag name in rendered HTML. */
 function tagNames(html: string): Set<string> {
