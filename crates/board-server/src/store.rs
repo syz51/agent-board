@@ -315,16 +315,15 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         )
         .collect();
     let mut handles = BTreeMap::new();
-    let mut stmt = cx
-        .db
-        .prepare_cached("SELECT handle FROM agents WHERE id = ?1")?;
-    for id in named {
-        let handle: Option<String> = stmt.query_row([id], |r| r.get(0)).optional()?;
-        if let Some(handle) = handle.filter(|h| h != id) {
+    for id in named
+        .into_iter()
+        .filter(|id| !matches!(*id, "user" | "server"))
+    {
+        let handle = handle_of(cx, id)?;
+        if handle != id {
             handles.insert(id.to_owned(), handle);
         }
     }
-    drop(stmt);
     Ok(TaskDetail {
         task,
         notes,
@@ -507,6 +506,24 @@ pub(crate) fn find_agent(cx: &Ctx<'_>, id: &AgentId) -> Result<Option<Agent>> {
     Ok(load_agents(cx, "id = :id", &vec![(":id", &id.as_str())])?
         .into_iter()
         .next())
+}
+
+/// The agent `id` names: itself, or the agent whose short handle it is. Clients print
+/// handles, so an agent may pass one back where an id is expected.
+pub(crate) fn agent_by_id_or_handle(cx: &Ctx<'_>, id: &AgentId) -> Result<AgentId> {
+    let by_handle: Option<String> = cx
+        .db
+        .query_row(
+            "SELECT id FROM agents WHERE handle = ?1 \
+             AND NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match by_handle {
+        Some(found) => parse_id(&found)?,
+        None => id.clone(),
+    })
 }
 
 pub(crate) fn get_agent(cx: &Ctx<'_>, id: &AgentId) -> Result<Agent> {

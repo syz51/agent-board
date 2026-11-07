@@ -102,29 +102,6 @@ impl Ctx {
         }
     }
 
-    /// Refuses to act as another registered agent: when this process has its own identity
-    /// (`own`, from the environment), an explicit agent (`flag`) may name only `own` or an
-    /// id no agent has registered yet. Without an identity of its own, any agent goes.
-    pub async fn refuse_borrowed(&self, own: Option<&AgentId>, flag: &str) -> Result<()> {
-        let (Some(own), Some(named)) = (own, self.client.agent()) else {
-            return Ok(());
-        };
-        if own == named {
-            return Ok(());
-        }
-        match self.client.agent_info(named).await {
-            Ok(info) if &info.id == own => Ok(()),
-            Ok(info) => anyhow::bail!(
-                "{flag} names {} ({}), another registered agent, and this session is {own}: \
-                 drop {flag} to act as yourself",
-                info.id,
-                info.handle
-            ),
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
     /// The board to act on: the explicit one, else the agent's only board (or its board
     /// for this repo), else the one active board covering this repo.
     pub async fn resolve_board(&self, explicit: Option<BoardSlug>) -> Result<BoardSlug> {

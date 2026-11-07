@@ -1543,7 +1543,7 @@ fn a_server_on_another_build_gets_one_warning_and_version_names_the_commit() {
 }
 
 #[test]
-fn agent_naming_another_registered_agent_is_refused_when_the_environment_has_one() {
+fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     let e = env();
     const PEER: &str = "t3:thread-2";
     e.stub.on(
@@ -1555,31 +1555,29 @@ fn agent_naming_another_registered_agent_is_refused_when_the_environment_has_one
         task_fixture("factory-12", "Fix the parser"),
     );
 
-    // This session is ME: acting as a registered peer is refused before anything is sent.
-    let out = e.run(&["--agent", PEER, "claim", "factory-12"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("drop --agent to act as yourself"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(
-        e.stub
-            .requests_to("POST /v1/tasks/factory-12/claim")
-            .is_empty()
-    );
-
-    // Its own id, or an id no agent has registered (which registers it), still works.
-    e.stub.on(
-        "POST /v1/agents",
-        agent_fixture("t3:new-thread", DEVICE, board_proto::AgentState::Running),
-    );
-    for agent in [ME, "t3:new-thread"] {
-        let out = e.run(&["--agent", agent, "claim", "factory-12"]);
-        assert!(out.status.success(), "{agent}: {}", stderr(&out));
+    // This thread is ME: a peer's id, or a new one, is refused before anything is sent,
+    // also for commands that only read or withdraw.
+    for args in [
+        &["--agent", PEER, "claim", "factory-12"][..],
+        &["--agent", "t3:new-thread", "claim", "factory-12"],
+        &["--agent", PEER, "withdraw", "7"],
+        &["--agent", PEER, "show", "factory-12"],
+    ] {
+        let out = e.run(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            stderr(&out).contains("drop --agent to act as yourself"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
     }
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
 
-    // Without an identity in the environment, --agent works as before.
+    // Its own id still works.
+    let out = e.run(&["--agent", ME, "claim", "factory-12"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Without a T3 thread in the environment, --agent works as before.
     e.stub.clear();
     let out = board(
         &e.home,

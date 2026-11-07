@@ -118,7 +118,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   decide at `SessionStart` and cache the answer per session in `$BOARD_HOME/state/sessions/`
   until `SessionEnd` (entries untouched for 7 days are pruned at `SessionStart`), `board
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
-  it, but may not borrow another registered agent's id while the environment gives one.
+  it for choosing the identity; in a T3 thread the check still runs once, because
+  `--agent` there may name only the thread's own agent.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the

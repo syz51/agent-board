@@ -13,7 +13,7 @@ use crate::db::{Ctx, enum_str, parse_id, ready_sql, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
-use crate::ops::{join_board, touch_agent};
+use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
     NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks_up_to, seen,
 };
@@ -496,7 +496,12 @@ pub(crate) struct TaskFilter {
 pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     let board = filter.board.as_ref().map(|b| b.as_str().to_owned());
     let status = filter.status.map(status_str);
-    let owner = filter.owner.as_ref().map(|o| o.as_str().to_owned());
+    let owner = filter
+        .owner
+        .as_ref()
+        .map(|o| crate::store::agent_by_id_or_handle(cx, o))
+        .transpose()?
+        .map(|o| o.as_str().to_owned());
     let mut clauses = vec!["1 = 1"];
     let mut params: NamedParams<'_> = Vec::new();
     if let Some(board) = &board {
@@ -918,7 +923,11 @@ pub(crate) fn update(
     req: UpdateTask,
     by_user: bool,
 ) -> Result<Task> {
-    touch_agent(cx, &req.agent)?;
+    if by_user {
+        note_agent_seen(cx, &req.agent)?;
+    } else {
+        touch_agent(cx, &req.agent)?;
+    }
     let task = get_task(cx, id)?;
     if req.version != task.version {
         return Err(version_conflict(&task, req.version));
@@ -962,7 +971,12 @@ pub(crate) fn update(
         fields.push("status");
     }
     // A handover names another owner than the status change leaves.
-    if let Some(target) = req.owner.as_ref().filter(|t| owner.as_ref() != Some(*t)) {
+    let target = req
+        .owner
+        .as_ref()
+        .map(|t| crate::store::agent_by_id_or_handle(cx, t))
+        .transpose()?;
+    if let Some(target) = target.as_ref().filter(|t| owner.as_ref() != Some(*t)) {
         check_handover(cx, &task, agent, by_user, target, owner.is_some(), to)?;
         owner = Some(target.clone());
     }

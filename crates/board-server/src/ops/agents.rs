@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::hex;
 use crate::db::{Ctx, enum_str, parse_id};
 use crate::error::{Result, conflict, invalid};
-use crate::ops::{expires, join_board, mark_seen, touch_agent};
+use crate::ops::{expires, join_board, note_agent_seen, touch_agent};
 use crate::store::{agent_missing, find_handoff, get_agent, load_agents};
 use crate::text::{check_line, check_line_or, check_text, normalize_repo};
 
@@ -227,7 +227,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
         )
         .optional()?
         .ok_or_else(|| agent_missing(id))?;
-    mark_seen(cx, id)?;
+    note_agent_seen(cx, id)?;
     // Before `ended` releases the boards it coordinates. Advisory: cleaned and cut here,
     // never a reason to refuse the state change.
     let said = match update.said.as_deref().and_then(board_proto::turn_ending) {

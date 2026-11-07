@@ -111,14 +111,19 @@ server's minute sweep.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with.
   Clients register on session start (hooks) and before acting when the agent is unknown.
-- Any other call an agent makes as itself (a task change, note, lease, touch, ask, handoff
-  or snapshot that advances its cursor) marks it seen; one marked `ended` is `running`
-  again, announced by one `agent_state_changed` event (`from` `ended`, `to` `running`).
-- An agent acts as the identity its environment gives (see docs/DESIGN.md). When there is
-  one, `--agent` (CLI) or `agent=` (MCP) may name only that agent or an id not yet
-  registered; naming another registered agent is refused before anything is sent, and the
-  error says to drop the flag. Without an identity in the environment, any agent may be
-  named.
+- Every call that acts as an agent marks it seen. One marked `ended` that makes such a call
+  itself (a task, note, lease, touch, ask, handoff, board join, feedback call, or snapshot
+  that advances its cursor) is `running` again, announced by one `agent_state_changed`
+  event (`from` `ended`, `to` `running`). Calls made for it leave its state alone: a
+  device claiming or renewing the coordinator lease, a state update, and task changes
+  through the user token.
+- Wherever a request names an agent to look up (`owner` in `[UpdateTask]` and in
+  `GET /v1/tasks`), its short handle works too.
+- Clients act only as themselves: in a T3 thread, outside a nested session, `--agent`
+  (CLI) and `agent=` (MCP) may name only the thread's own agent, and any other id is
+  refused before anything is sent, with an error that says to drop the flag. Elsewhere,
+  where the environment proves no identity, any agent may be named. The server does not
+  check this.
 - `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
   than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
@@ -213,8 +218,8 @@ Reopening a closed board, or any change on it, starts the period again.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
   first; when it was cut, it does not start with the `task_created` event. `handles` maps
   each registered agent the detail names (owner, creator, note and evidence authors,
-  history actors) to its short handle when that differs from its id; it is absent when
-  none does, and `task_show` names agents by these handles.
+  history actors, feedback resolver) to its short handle when that differs from its id;
+  it is absent when none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
 - `owner` in `[UpdateTask]` hands the task over: the named agent owns it from then on, so

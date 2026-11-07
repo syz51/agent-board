@@ -410,6 +410,25 @@ async fn an_ended_agent_that_calls_again_is_running_again() {
         ),
         ["ended>running"]
     );
+    // A device claiming the coordinator lease for an ended agent is no sign of it working.
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(a),
+        Some(json!({ "device": "mac", "agent": a })),
+    )
+    .await;
+    let agent = t.ok("GET", &format!("/v1/agents/{a}"), None, None).await;
+    assert_eq!(agent["state"], "ended", "{agent}");
 }
 
 #[tokio::test]
@@ -433,4 +452,15 @@ async fn task_detail_names_each_agent_it_mentions_by_handle() {
         json!({ long: registered["handle"] }),
         "{detail}"
     );
+    // A handle copied from task_show works where an agent id is expected.
+    let handle = registered["handle"].as_str().unwrap();
+    let listed = t
+        .ok("GET", &format!("/v1/tasks?owner={handle}"), None, None)
+        .await;
+    assert_eq!(listed[0]["id"], task.as_str(), "{listed}");
+    let peer = "t3:peer";
+    let peer_handle = t.register(peer, Some(REPO), None).await["handle"].clone();
+    let (status, v) = t.patch(long, &task, json!({ "owner": peer_handle })).await;
+    assert!(status.is_success(), "{v}");
+    assert_eq!(v["owner"], peer, "{v}");
 }

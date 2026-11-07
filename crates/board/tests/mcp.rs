@@ -98,16 +98,10 @@ fn text(result: &Value) -> &str {
 fn tools_are_listed_and_called_with_framed_peer_text() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
-    // Registered already, as the session-start hook would have done. `claude:other`, named
-    // with agent=, is new: the MCP server registers it first (another registered agent would be
-    // refused).
+    // Registered already, as the session-start hook would have done.
     stub.on(
         &format!("GET /v1/agents/{}", enc("t3:thread-1")),
         agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
-    );
-    stub.on(
-        "POST /v1/agents",
-        agent_fixture("claude:other", DEVICE, board_proto::AgentState::Running),
     );
     let home = home_for(dir.path(), &stub.url);
     let cwd = dir.path().join("work");
@@ -264,14 +258,14 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let noted = mcp.call(
         5,
         "task_note",
-        json!({"id": "factory-12", "text": "x", "kind": "decision", "agent": "claude:other"}),
+        json!({"id": "factory-12", "text": "x", "kind": "decision", "agent": "t3:thread-1"}),
     );
     assert_eq!(text(&noted), "noted on factory-12 (#5)");
     let req = &stub.requests_to("POST /v1/tasks/factory-12/notes")[0];
-    assert_eq!(req.agent.as_deref(), Some("claude:other"));
+    assert_eq!(req.agent.as_deref(), Some("t3:thread-1"));
     assert_eq!(
         req.body,
-        json!({"agent": "claude:other", "kind": "decision", "text": "x"})
+        json!({"agent": "t3:thread-1", "kind": "decision", "text": "x"})
     );
 
     // A JSON null clears not_before, as `none` does; absent leaves it alone.
@@ -442,18 +436,12 @@ fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
 }
 
 #[test]
-fn agent_naming_another_registered_agent_is_refused() {
+fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
-    for agent in ["t3:thread-1", "t3:thread-2"] {
-        stub.on(
-            &format!("GET /v1/agents/{}", enc(agent)),
-            agent_fixture(agent, DEVICE, board_proto::AgentState::Running),
-        );
-    }
     stub.on(
-        "POST /v1/agents",
-        agent_fixture("t3:new-thread", DEVICE, board_proto::AgentState::Running),
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
     );
     stub.on(
         "POST /v1/tasks/factory-12/claim",
@@ -470,26 +458,36 @@ fn agent_naming_another_registered_agent_is_refused() {
     );
     mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
-    // This server is t3:thread-1: a registered peer cannot be borrowed.
-    let refused = mcp.call(
-        2,
-        "task_claim",
-        json!({"id": "factory-12", "agent": "t3:thread-2"}),
-    );
-    assert_eq!(refused["isError"], true, "{refused}");
+    // This server is t3:thread-1: a peer's id, or a new one, is refused before anything is
+    // sent, every time.
+    for (n, agent) in [
+        (2, "t3:thread-2"),
+        (3, "t3:new-thread"),
+        (4, "t3:new-thread"),
+    ] {
+        let refused = mcp.call(n, "task_claim", json!({"id": "factory-12", "agent": agent}));
+        assert_eq!(refused["isError"], true, "{agent}: {refused}");
+        assert!(
+            text(&refused).contains("drop agent= to act as yourself"),
+            "{refused}"
+        );
+    }
     assert!(
-        text(&refused).contains("drop agent= to act as yourself"),
-        "{refused}"
+        stub.requests()
+            .iter()
+            .all(|r| r.agent.as_deref() != Some("t3:thread-2"))
     );
     assert!(
         stub.requests_to("POST /v1/tasks/factory-12/claim")
             .is_empty()
     );
 
-    // Its own id and an id no agent has registered still work.
-    for (n, agent) in [(3, "t3:thread-1"), (4, "t3:new-thread")] {
-        let ok = mcp.call(n, "task_claim", json!({"id": "factory-12", "agent": agent}));
-        assert_ne!(ok["isError"], true, "{agent}: {ok}");
-    }
-    assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 2);
+    // Its own id still works.
+    let ok = mcp.call(
+        5,
+        "task_claim",
+        json!({"id": "factory-12", "agent": "t3:thread-1"}),
+    );
+    assert_ne!(ok["isError"], true, "{ok}");
+    assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
 }
