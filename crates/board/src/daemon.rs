@@ -40,7 +40,7 @@ use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, ServerError, error_code};
+use crate::client::{Client, ServerError, error_code, is_unreachable};
 use crate::config::Home;
 use crate::ops::Ctx;
 use crate::state;
@@ -64,6 +64,8 @@ pub const WAKE_RETRY_MAX: TimeDelta = TimeDelta::minutes(10);
 /// How long one wake-up send may take; one that runs out is not sent again, since T3 may
 /// have delivered it.
 const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(20);
+/// How many agents' wake-ups a flush checks at once.
+const FLUSH_CHECKS_AT_ONCE: usize = 8;
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
@@ -157,6 +159,11 @@ pub struct WakeQueue {
 pub struct Backoff {
     pub delay_secs: i64,
     pub retry_at: Timestamp,
+    /// Set after a failed agent lookup, which is not tried again before `retry_at`. After a
+    /// failed send, only the send waits: the agent is still checked, so its answers reach
+    /// the coordinator and expired lines go.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lookup: bool,
 }
 
 /// A queued wake-up: what it is about, checked again and rendered when it is sent.
@@ -291,6 +298,41 @@ enum Sent {
     Failed(anyhow::Error),
 }
 
+/// What a flush learned of one agent's queue, read before anything changes, so a flush
+/// cut short leaves the queue as it was.
+enum Checked {
+    /// Not checked before the flush's deadline: left as it was, for the next flush.
+    NotReached,
+    /// Backing off after a failed lookup: left as it was.
+    Waiting,
+    /// The lookup failed.
+    LookupFailed(anyhow::Error),
+    /// Unknown to the server.
+    Unknown,
+    /// Known; `read` when just read from the server. `rechecks` holds the line of each
+    /// wake-up still fresh, in order, when the agent can be woken now and no failed send
+    /// is backing off.
+    Known {
+        seen: Box<Seen>,
+        read: bool,
+        rechecks: Option<Vec<Result<Option<String>>>>,
+    },
+}
+
+/// When a wake-up for an agent paused until `paused_until` is still worth sending: a
+/// paused agent's wake-ups live from the reset on.
+fn is_fresh(wake: &Wake, paused_until: Option<Timestamp>, now: Timestamp) -> bool {
+    let from = paused_until.map_or(wake.queued_at, |until| until.max(wake.queued_at));
+    now - from < WAKE_TTL
+}
+
+fn paused_until(seen: &Seen) -> Option<Timestamp> {
+    match seen.agent.state {
+        AgentState::Paused => seen.agent.paused_until,
+        _ => None,
+    }
+}
+
 /// The next delay of a doubling back-off: `first`, then twice the `last`, up to `max`.
 fn next_delay(last: Option<TimeDelta>, first: TimeDelta, max: TimeDelta) -> TimeDelta {
     last.map_or(first, |last| (last * 2).min(max))
@@ -402,6 +444,9 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
+    /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
+    /// them here: their lines count as maybe delivered, never sent twice.
+    sending: Vec<AgentId>,
     pub timing: Timing,
 }
 
@@ -417,6 +462,7 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             agents: BTreeMap::new(),
+            sending: Vec::new(),
             timing: Timing::default(),
         }
     }
@@ -1132,32 +1178,51 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Sends the queued wake-ups, one message per agent, after checking each again. The
-    /// checks share [`Timing::flush_budget`]; the sends run side by side, each given
+    /// checks read only, a few agents at a time, within [`Timing::flush_budget`]; then the
+    /// queues change at once, without waiting on anything, so a flush cut short at any
+    /// point loses no wake-up. The sends run side by side, each given
     /// [`WAKE_SEND_TIMEOUT`], so a hanging T3 holds the daemon up once per flush, not once
-    /// per agent.
+    /// per agent; a flush cut short while sending counts those lines as maybe delivered.
     pub async fn flush(&mut self, now: Timestamp) {
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
+        let queues: Vec<(AgentId, WakeQueue)> = self
+            .state
+            .wakes
+            .iter()
+            .map(|(agent, queue)| (agent.clone(), queue.clone()))
+            .collect();
+        let this = &*self;
+        let checked: Vec<Checked> =
+            futures_util::stream::iter(queues.iter().map(|(agent, queue)| async move {
+                tokio::time::timeout_at(deadline, this.check(agent, queue, now))
+                    .await
+                    .unwrap_or(Checked::NotReached)
+            }))
+            .buffered(FLUSH_CHECKS_AT_ONCE)
+            .collect()
+            .await;
+        let late = checked
+            .iter()
+            .filter(|c| matches!(c, Checked::NotReached))
+            .count();
+        if late > 0 {
+            tracing::warn!(
+                "flush: {late} agents' wake-ups not checked within {}s; checked on the next flush",
+                self.timing.flush_budget.as_secs()
+            );
+        }
         let mut outgoing = Vec::new();
-        for (agent, queue) in std::mem::take(&mut self.state.wakes) {
-            // `prepare` changes nothing of this queue before its last await, so a check cut
-            // short leaves the queue as it was.
-            let mut kept = queue.clone();
-            match tokio::time::timeout_at(deadline, self.prepare(agent.clone(), queue, now)).await {
-                Ok(Some(out)) => outgoing.push(out),
-                Ok(None) => {}
-                Err(_) => {
-                    let delay = back_off(&mut kept, now);
-                    tracing::warn!(
-                        "waking {agent}: checking its wake-ups ran out of time; trying again in {delay}"
-                    );
-                    self.requeue(agent, kept);
-                }
+        for ((agent, queue), checked) in queues.into_iter().zip(checked) {
+            if let Some(out) = self.apply(agent, queue, checked, now) {
+                outgoing.push(out);
             }
         }
+        self.sending = outgoing.iter().map(|out| out.agent.clone()).collect();
         let sends = outgoing
             .iter()
             .map(|out| self.send_wake(&out.agent, &out.message));
         let results = futures_util::future::join_all(sends).await;
+        self.sending.clear();
         for (out, sent) in outgoing.into_iter().zip(results) {
             self.settle(out, sent, now);
         }
@@ -1165,47 +1230,124 @@ impl<T: T3> Daemon<T> {
         self.agents.retain(|agent, _| wakes.contains_key(agent));
     }
 
-    /// Decides what to do with `agent`'s wake-ups now. Drops those past their time to live,
-    /// keeps those for later (held, paused, backing off, or a check that failed on a
-    /// transient error), passes answers the agent cannot be woken for to the coordinator, and
-    /// returns the message to send, if any.
-    async fn prepare(
+    /// Reads what a flush needs to decide on `agent`'s `queue`: the agent, and each line
+    /// when it can be sent now. Changes nothing.
+    async fn check(&self, agent: &AgentId, queue: &WakeQueue, now: Timestamp) -> Checked {
+        let backing_off = queue.backoff.as_ref().filter(|b| now < b.retry_at);
+        let (seen, read) = match self.agents.get(agent) {
+            Some(seen) => (seen.clone(), false),
+            // During an outage a lookup backing off costs no request.
+            None if backing_off.is_some_and(|b| b.lookup) => return Checked::Waiting,
+            None => match self.client().agent_info(agent).await {
+                Ok(info) => {
+                    let seen = Seen {
+                        agent: info,
+                        since: now,
+                        idled: false,
+                    };
+                    (seen, true)
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    return Checked::Unknown;
+                }
+                Err(err) => return Checked::LookupFailed(err),
+            },
+        };
+        let due =
+            backing_off.is_none() && matches!(Reach::of(&seen, &self.ctx.device, now), Reach::Now);
+        let rechecks = if due {
+            let paused_until = paused_until(&seen);
+            let mut lines = Vec::new();
+            for wake in queue
+                .wakes
+                .iter()
+                .filter(|w| is_fresh(w, paused_until, now))
+            {
+                lines.push(self.recheck(agent, wake).await);
+            }
+            Some(lines)
+        } else {
+            None
+        };
+        Checked::Known {
+            seen: Box::new(seen),
+            read,
+            rechecks,
+        }
+    }
+
+    /// Settles `queue`, as [`Self::check`] read it, from what that found: drops wake-ups
+    /// past their time to live, keeps those for later (held, paused, backing off, not
+    /// checked, or a check that failed on a transient error), passes answers the agent
+    /// cannot be woken for to the coordinator, and returns the message to send, if any.
+    /// Wake-ups queued for the agent since the check (answers forwarded to it) wait for the
+    /// next flush.
+    fn apply(
         &mut self,
         agent: AgentId,
-        mut queue: WakeQueue,
+        queue: WakeQueue,
+        checked: Checked,
         now: Timestamp,
     ) -> Option<Outgoing> {
-        // Checked first: during an outage a backing-off queue costs no request.
-        if queue.backoff.as_ref().is_some_and(|b| now < b.retry_at) {
-            self.requeue(agent, queue);
-            return None;
+        let meanwhile: Vec<Wake> = self
+            .state
+            .wakes
+            .remove(&agent)
+            .map(|kept| {
+                kept.wakes
+                    .into_iter()
+                    .filter(|w| !queue.wakes.contains(w))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let out = self.decide(&agent, queue, checked, now);
+        for wake in meanwhile {
+            self.queue(agent.clone(), wake);
         }
-        let seen = match self.seen(&agent, now).await {
-            Ok(Some(seen)) => seen,
-            // Unknown to the server: its answers go to the coordinator.
-            Ok(None) => {
-                self.forward_answers(&agent, &mut queue.wakes);
+        out
+    }
+
+    fn decide(
+        &mut self,
+        agent: &AgentId,
+        mut queue: WakeQueue,
+        checked: Checked,
+        now: Timestamp,
+    ) -> Option<Outgoing> {
+        let (seen, rechecks) = match checked {
+            Checked::NotReached | Checked::Waiting => {
+                self.requeue(agent.clone(), queue);
                 return None;
             }
-            Err(err) => {
+            // Unknown to the server: its answers go to the coordinator.
+            Checked::Unknown => {
+                self.forward_answers(agent, &mut queue.wakes);
+                return None;
+            }
+            Checked::LookupFailed(err) => {
                 if is_transient(&err) {
-                    let delay = back_off(&mut queue, now);
+                    let delay = back_off(&mut queue, now, true);
                     tracing::warn!("waking {agent}: {err:#}; trying again in {delay}");
-                    self.requeue(agent, queue);
+                    self.requeue(agent.clone(), queue);
                 } else {
                     tracing::warn!("waking {agent}: {err:#}; dropped");
                 }
                 return None;
             }
+            Checked::Known {
+                seen,
+                read,
+                rechecks,
+            } => {
+                if read {
+                    self.agents.insert(agent.clone(), (*seen).clone());
+                }
+                (*seen, rechecks)
+            }
         };
-        // A paused agent's wake-ups live from the reset on.
-        let paused_until = match seen.agent.state {
-            AgentState::Paused => seen.agent.paused_until,
-            _ => None,
-        };
+        let paused_until = paused_until(&seen);
         queue.wakes.retain(|w| {
-            let from = paused_until.map_or(w.queued_at, |until| until.max(w.queued_at));
-            let fresh = now - from < WAKE_TTL;
+            let fresh = is_fresh(w, paused_until, now);
             if !fresh {
                 tracing::warn!("waking {agent}: not delivered in time; dropped");
             }
@@ -1214,27 +1356,32 @@ impl<T: T3> Daemon<T> {
         match Reach::of(&seen, &self.ctx.device, now) {
             Reach::Now => {}
             Reach::Held => {
-                self.requeue(agent, queue);
+                self.requeue(agent.clone(), queue);
                 return None;
             }
             // Kept for the reset; meanwhile the coordinator hears of its answers.
             Reach::Paused => {
-                self.forward_answers(&agent, &mut queue.wakes);
-                self.requeue(agent, queue);
+                self.forward_answers(agent, &mut queue.wakes);
+                self.requeue(agent.clone(), queue);
                 return None;
             }
             // Another device's, or not to be woken by the daemon: its answers go to the
             // coordinator, and the rest is not ours to send.
             Reach::Never => {
-                self.forward_answers(&agent, &mut queue.wakes);
+                self.forward_answers(agent, &mut queue.wakes);
                 return None;
             }
         }
+        // A failed send is backing off.
+        let Some(rechecks) = rechecks else {
+            self.requeue(agent.clone(), queue);
+            return None;
+        };
         let backoff = queue.backoff.clone();
         let mut sent = Vec::new();
         let mut lines = Vec::new();
-        for wake in std::mem::take(&mut queue.wakes) {
-            match self.recheck(&agent, &wake).await {
+        for (wake, line) in std::mem::take(&mut queue.wakes).into_iter().zip(rechecks) {
+            match line {
                 Ok(Some(line)) => {
                     if !lines.contains(&line) {
                         lines.push(line);
@@ -1255,32 +1402,11 @@ impl<T: T3> Daemon<T> {
             return None;
         }
         Some(Outgoing {
-            agent,
+            agent: agent.clone(),
             message: format!("{}\nRun board_snapshot and continue.", lines.join("\n")),
             wakes: sent,
             backoff,
         })
-    }
-
-    /// What is known of `agent`: read from the server the first time, then kept current by
-    /// its events. `None` when the server does not know it.
-    async fn seen(&mut self, agent: &AgentId, now: Timestamp) -> Result<Option<Seen>> {
-        if let Some(seen) = self.agents.get(agent) {
-            return Ok(Some(seen.clone()));
-        }
-        match self.client().agent_info(agent).await {
-            Ok(info) => {
-                let seen = Seen {
-                    agent: info,
-                    since: now,
-                    idled: false,
-                };
-                self.agents.insert(agent.clone(), seen.clone());
-                Ok(Some(seen))
-            }
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(None),
-            Err(err) => Err(err),
-        }
     }
 
     /// Puts `queue` back for a later flush, after wake-ups queued for `agent` meanwhile.
@@ -1371,7 +1497,7 @@ impl<T: T3> Daemon<T> {
                     wakes: out.wakes,
                     backoff: out.backoff,
                 };
-                let delay = back_off(&mut queue, now);
+                let delay = back_off(&mut queue, now, false);
                 tracing::warn!("waking {agent}: {err:#}; trying again in {delay}");
                 self.requeue(agent, queue);
             }
@@ -1510,36 +1636,48 @@ impl<T: T3> Daemon<T> {
 
     /// Handles again the events that failed on a transient error, dropping those older than
     /// [`RETRY_EVENTS_FOR`] or failing for good. Returns true when the boards should be
-    /// reconciled.
-    /// After one fails on a transient error again, the rest wait for the next tick
-    /// untried, so a server that is still down costs one request timeout, not one per event.
+    /// reconciled. An event leaves the list only once settled, so a retry cut short keeps
+    /// it. A server that does not answer at all stops the round: the rest wait for the next
+    /// tick untried, so an outage costs one request timeout, not one per event. An event
+    /// the server answers with an error does not hold up the others.
     pub async fn retry_failed(&mut self, now: Timestamp) -> bool {
-        let mut reconcile = false;
-        let mut failing = false;
-        for event in std::mem::take(&mut self.state.retry) {
-            if now - event.at > RETRY_EVENTS_FOR {
+        self.state.retry.retain(|event| {
+            let keep = now - event.at <= RETRY_EVENTS_FOR;
+            if !keep {
                 tracing::warn!("event #{}: still failing; dropped", event.seq);
-                continue;
             }
-            if failing {
-                self.state.retry.push(event);
-                continue;
-            }
-            match self.on_event(&event, now).await {
-                Ok(again) => reconcile |= again,
-                Err(err) if is_transient(&err) => {
-                    failing = true;
-                    self.state.retry.push(event);
+            keep
+        });
+        let mut reconcile = false;
+        for event in self.state.retry.clone() {
+            let settled = match self.on_event(&event, now).await {
+                Ok(again) => {
+                    reconcile |= again;
+                    true
                 }
-                Err(err) => tracing::warn!("event #{}: {err:#}; dropped", event.seq),
+                Err(err) if is_transient(&err) => {
+                    if is_unreachable(&err) {
+                        tracing::warn!("event #{}: {err:#}; retrying the rest later", event.seq);
+                        break;
+                    }
+                    false
+                }
+                Err(err) => {
+                    tracing::warn!("event #{}: {err:#}; dropped", event.seq);
+                    true
+                }
+            };
+            if settled {
+                self.state.retry.retain(|e| e.seq != event.seq);
             }
         }
         reconcile
     }
 }
 
-/// Backs `queue` off after a failure: nothing is sent before the returned delay passes.
-fn back_off(queue: &mut WakeQueue, now: Timestamp) -> TimeDelta {
+/// Backs `queue` off after a failure: nothing is sent before the returned delay passes,
+/// and after a failed `lookup` the agent is not looked up again before then either.
+fn back_off(queue: &mut WakeQueue, now: Timestamp, lookup: bool) -> TimeDelta {
     let last = queue
         .backoff
         .as_ref()
@@ -1548,6 +1686,7 @@ fn back_off(queue: &mut WakeQueue, now: Timestamp) -> TimeDelta {
     queue.backoff = Some(Backoff {
         delay_secs: delay.num_seconds(),
         retry_at: now + delay,
+        lookup,
     });
     delay
 }
@@ -1761,86 +1900,100 @@ enum Step {
     Reconcile,
 }
 
-/// Sleeps `delay` unless asked to stop (true), then doubles it up to the cap.
-async fn wait_to_reconnect(shutdown: &mut Shutdown, delay: &mut Duration) -> bool {
-    let stop = tokio::select! {
-        () = tokio::time::sleep(*delay) => false,
-        () = shutdown.wait() => true,
-    };
-    *delay = (*delay * 2).min(RECONNECT_MAX);
-    stop
-}
-
 impl<T: T3> Daemon<T> {
-    /// Follows the event stream, flushing and reconciling on their ticks, until `shutdown`
-    /// asks it to stop. Each step races the request to stop, so a step that waits on a
-    /// server or `t3` never delays the exit.
+    /// Reconciles at once, then follows the event stream, flushing and reconciling on their
+    /// ticks, also while the stream is down, until `shutdown` asks it to stop. Each step
+    /// races the request to stop, so a step that waits on a server or `t3` never delays the
+    /// exit; every step is safe to cut short.
     pub async fn follow(&mut self, shutdown: &mut Shutdown) -> Result<()> {
         let first = self.timing.reconnect_first;
         let mut delay = first;
         let mut reconcile_tick = tokio::time::interval(self.timing.reconcile_every);
         let mut flush_tick = tokio::time::interval(self.timing.flush_every);
         let mut reconcile_needed = false;
+        if self
+            .run_step(Step::Reconcile, &mut reconcile_needed, shutdown)
+            .await?
+        {
+            return self.stop().await;
+        }
+        reconcile_tick.reset();
         loop {
             let client = self.client().clone();
             let connected = tokio::select! {
                 connected = client.event_stream(self.state.last_seq) => connected,
                 () = shutdown.wait() => return self.stop().await,
             };
-            let resp = match connected {
-                Ok(resp) => resp,
-                Err(err) => {
-                    tracing::warn!(
-                        "event stream: {err:#}; retrying in {:.1}s",
+            match connected {
+                Ok(resp) => {
+                    tracing::info!(
+                        "event stream open after #{}",
+                        self.state.last_seq.unwrap_or(0)
+                    );
+                    let opened = tokio::time::Instant::now();
+                    let mut stream =
+                        Box::pin(idle_limited(resp, self.timing.stream_idle).eventsource());
+                    loop {
+                        let step = tokio::select! {
+                            item = stream.next() => match item {
+                                // The delay resets only after a stable connection (below),
+                                // so a stream that drops after each event still backs off.
+                                Some(Ok(message)) => Step::Event(message.data),
+                                Some(Err(err)) => {
+                                    tracing::warn!("event stream: {err}");
+                                    break;
+                                }
+                                None => break,
+                            },
+                            _ = flush_tick.tick() => Step::Flush,
+                            _ = reconcile_tick.tick() => Step::Reconcile,
+                            () = shutdown.wait() => return self.stop().await,
+                        };
+                        if self.run_step(step, &mut reconcile_needed, shutdown).await? {
+                            return self.stop().await;
+                        }
+                    }
+                    if opened.elapsed() >= STREAM_HEALTHY {
+                        delay = first;
+                    }
+                    tracing::info!(
+                        "event stream ended; reconnecting in {:.1}s",
                         delay.as_secs_f32()
                     );
-                    if wait_to_reconnect(shutdown, &mut delay).await {
-                        return self.stop().await;
-                    }
-                    continue;
                 }
-            };
-            tracing::info!(
-                "event stream open after #{}",
-                self.state.last_seq.unwrap_or(0)
-            );
-            let opened = tokio::time::Instant::now();
-            let mut stream = Box::pin(idle_limited(resp, self.timing.stream_idle).eventsource());
+                Err(err) => tracing::warn!(
+                    "event stream: {err:#}; retrying in {:.1}s",
+                    delay.as_secs_f32()
+                ),
+            }
+            // Until the stream is back, leases are still renewed and wake-ups still sent.
+            let reopen = tokio::time::sleep(delay);
+            tokio::pin!(reopen);
             loop {
                 let step = tokio::select! {
-                    item = stream.next() => match item {
-                        // The delay resets only after a stable connection (below), so a
-                        // stream that drops after each event still backs off.
-                        Some(Ok(message)) => Step::Event(message.data),
-                        Some(Err(err)) => {
-                            tracing::warn!("event stream: {err}");
-                            break;
-                        }
-                        None => break,
-                    },
+                    () = &mut reopen => break,
                     _ = flush_tick.tick() => Step::Flush,
                     _ = reconcile_tick.tick() => Step::Reconcile,
                     () = shutdown.wait() => return self.stop().await,
                 };
-                let done = tokio::select! {
-                    done = self.step(step, &mut reconcile_needed) => Some(done),
-                    () = shutdown.wait() => None,
-                };
-                match done {
-                    Some(done) => done?,
-                    None => return self.stop().await,
+                if self.run_step(step, &mut reconcile_needed, shutdown).await? {
+                    return self.stop().await;
                 }
             }
-            if opened.elapsed() >= STREAM_HEALTHY {
-                delay = first;
-            }
-            tracing::info!(
-                "event stream ended; reconnecting in {:.1}s",
-                delay.as_secs_f32()
-            );
-            if wait_to_reconnect(shutdown, &mut delay).await {
-                return self.stop().await;
-            }
+            delay = (delay * 2).min(RECONNECT_MAX);
+        }
+    }
+
+    /// Runs `step` unless asked to stop first; true when asked.
+    async fn run_step(
+        &mut self,
+        step: Step,
+        reconcile_needed: &mut bool,
+        shutdown: &mut Shutdown,
+    ) -> Result<bool> {
+        tokio::select! {
+            done = self.step(step, reconcile_needed) => done.map(|()| false),
+            () = shutdown.wait() => Ok(true),
         }
     }
 
@@ -1865,12 +2018,12 @@ impl<T: T3> Daemon<T> {
         Ok(())
     }
 
-    /// Sends what is queued and saves the state before exiting. The state is saved first,
-    /// so a flush cut short by [`Timing::stop_budget`] loses nothing: what it did not
-    /// settle is sent on the next start.
+    /// Sends what is queued, within [`Timing::stop_budget`], and saves the state before
+    /// exiting. A flush cut short, here or by the stop request, loses nothing still queued;
+    /// lines it was sending count as maybe delivered and are not sent again.
     async fn stop(&mut self) -> Result<()> {
         tracing::info!("stopping");
-        self.save()?;
+        self.note_cut_sends();
         let budget = self.timing.stop_budget;
         if tokio::time::timeout(budget, self.flush(Utc::now()))
             .await
@@ -1880,9 +2033,19 @@ impl<T: T3> Daemon<T> {
                 "stopping: sending the queued wake-ups took over {}s; the rest wait for the next start",
                 budget.as_secs()
             );
-            return Ok(());
+            self.note_cut_sends();
         }
         self.save()
+    }
+
+    /// Logs the sends a cut-short flush left unsettled: they may have been delivered, so
+    /// they are not sent again.
+    fn note_cut_sends(&mut self) {
+        for agent in std::mem::take(&mut self.sending) {
+            tracing::warn!(
+                "waking {agent}: stopped while sending; not sent again, since T3 may have delivered it"
+            );
+        }
     }
 
     async fn reconcile_logged(&mut self) {

@@ -58,6 +58,8 @@ struct FakeT3 {
     time_out_send: Arc<AtomicBool>,
     /// Threads whose `t3 thread show` never answers.
     hang_info: Arc<Mutex<Vec<String>>>,
+    /// Threads whose `t3 thread send` never answers.
+    hang_send: Arc<Mutex<Vec<String>>>,
     /// What `t3 thread list` shows, by title.
     listed: Arc<Mutex<Vec<(String, ListedThread)>>>,
     /// When T3 creates a thread.
@@ -136,6 +138,9 @@ impl T3 for FakeT3 {
             thread: thread.to_owned(),
             message: message.to_owned(),
         });
+        if self.hang_send.lock().unwrap().iter().any(|t| t == thread) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_send.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread send failed: server unavailable");
         }
@@ -2755,5 +2760,238 @@ fn a_coordinator_start_is_logged() {
     assert!(
         log.contains(&format!("t3:{NEW_THREAD} coordinates factory")),
         "{log}"
+    );
+}
+
+/// Stubs `agent` as an idle T3 thread on this device and queues the answer to its ask.
+async fn queue_answer(e: &mut Env, seq: i64, ask: i64, agent: &str, now: Timestamp) {
+    e.stub.on(
+        &format!("GET {}", agent_path(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    let ev = answered(e, seq, ask, agent);
+    e.daemon.on_event(&ev, now).await.unwrap();
+}
+
+fn queued(state: &board::daemon::WatchState) -> Vec<&str> {
+    state.wakes.keys().map(|a| a.as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_stop_that_cuts_a_flush_short_keeps_the_wake_ups_it_was_checking() {
+    let mut e = following_env(Duration::from_secs(3600));
+    // Only the stop request ends this flush.
+    e.daemon.timing.flush_budget = Duration::from_secs(3600);
+    e.daemon.timing.stop_budget = Duration::from_millis(300);
+    e.stub.on_stream("GET /v1/events", vec![]);
+    queue_answer(&mut e, 6, 3, "t3:worker", chrono::Utc::now()).await;
+    e.stub.delay(
+        &format!("GET {}", agent_path("t3:worker")),
+        Duration::from_secs(3600),
+    );
+
+    let (_, stopping) = follow_until(&mut e, Duration::from_millis(500), |_, _| false).await;
+    assert!(stopping < Duration::from_secs(2), "stopped in {stopping:?}");
+    assert_eq!(queued(&saved_state(&e)), ["t3:worker"]);
+}
+
+#[tokio::test]
+async fn a_last_flush_cut_short_saves_what_it_delivered() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.stop_budget = Duration::from_millis(300);
+    queue_answer(&mut e, 6, 3, "t3:a", chrono::Utc::now()).await;
+    queue_answer(&mut e, 7, 4, "t3:b", chrono::Utc::now()).await;
+    e.t3.hang_send.lock().unwrap().push("b".into());
+    e.stub.delay("GET /v1/boards", Duration::from_secs(3600));
+
+    // Asked to stop at once: the last flush delivers to a, then hangs sending to b.
+    let (_, stopping) = follow_until(&mut e, Duration::ZERO, |_, _| true).await;
+    assert!(stopping < Duration::from_secs(2), "stopped in {stopping:?}");
+    assert_eq!(threads(&e.t3), ["a", "b"]);
+    assert!(
+        queued(&saved_state(&e)).is_empty(),
+        "a was delivered and b may have been: neither is sent again"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_that_cuts_a_retry_short_keeps_its_events() {
+    let mut e = following_env(Duration::from_secs(3600));
+    e.stub.on_stream("GET /v1/events", vec![]);
+    e.stub
+        .on("GET /v1/tasks/factory-1", detail("factory-1", false, &[]));
+    e.stub
+        .delay("GET /v1/tasks/factory-1", Duration::from_secs(3600));
+    let mut failed = event(4, EventType::TaskDone, Some("factory-1"), "t3:x");
+    failed.at = chrono::Utc::now();
+    e.daemon.state.retry.push(failed);
+
+    follow_until(&mut e, Duration::from_millis(500), |_, _| false).await;
+    let saved = saved_state(&e);
+    assert_eq!(
+        saved.retry.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        [4],
+        "still to retry"
+    );
+}
+
+#[tokio::test]
+async fn an_event_the_server_keeps_failing_does_not_hold_up_the_others() {
+    let mut e = env();
+    e.stub.on_error(
+        "GET /v1/tasks/factory-1",
+        503,
+        "unavailable",
+        "broken",
+        "try again",
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-2", detail("factory-2", false, &[]));
+    for (seq, task) in [(6, "factory-1"), (7, "factory-2")] {
+        e.daemon
+            .state
+            .retry
+            .push(event(seq, EventType::TaskDone, Some(task), "t3:x"));
+    }
+    e.daemon.retry_failed(at()).await;
+    let left: Vec<i64> = e.daemon.state.retry.iter().map(|e| e.seq).collect();
+    assert_eq!(left, [6], "the second was retried and settled");
+}
+
+#[tokio::test]
+async fn an_unreachable_server_stops_a_retry_round_after_one_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let mut daemon = daemon_timed(
+        dir.path(),
+        &stub,
+        projects(),
+        &t3,
+        Some(Duration::from_millis(200)),
+    );
+    for (seq, task) in [(6, "factory-1"), (7, "factory-2")] {
+        let route = format!("GET /v1/tasks/{task}");
+        stub.on(&route, detail(task, false, &[]));
+        stub.delay(&route, Duration::from_secs(3600));
+        daemon
+            .state
+            .retry
+            .push(event(seq, EventType::TaskDone, Some(task), "t3:x"));
+    }
+    daemon.retry_failed(at()).await;
+    let tried = stub
+        .requests()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/tasks/"))
+        .count();
+    assert_eq!(tried, 1, "the rest wait for the next tick");
+    assert_eq!(daemon.state.retry.len(), 2);
+}
+
+#[tokio::test]
+async fn queues_a_flush_did_not_check_in_time_do_not_back_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let mut daemon = daemon_timed(
+        dir.path(),
+        &stub,
+        projects(),
+        &t3,
+        Some(Duration::from_secs(3600)),
+    );
+    daemon.timing.flush_budget = Duration::from_millis(300);
+    let mut e = Env {
+        _dir: dir,
+        stub,
+        t3,
+        daemon,
+    };
+    queue_answer(&mut e, 6, 3, "t3:worker", at()).await;
+    queue_answer(&mut e, 7, 4, "t3:slow", at()).await;
+    e.stub.delay(
+        &format!("GET {}", agent_path("t3:slow")),
+        Duration::from_secs(3600),
+    );
+
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["worker"], "checked side by side");
+    let slow = &e.daemon.state.wakes[&"t3:slow".parse().unwrap()];
+    assert_eq!(slow.wakes.len(), 1, "kept");
+    assert_eq!(slow.backoff, None, "never checked, so nothing failed");
+}
+
+#[tokio::test]
+async fn a_send_backing_off_still_passes_answers_on_to_the_coordinator() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_answer(&mut e, 30, 3, "t3:worker", at()).await;
+    e.t3.live("worker");
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["worker"]);
+    let worker = &e.daemon.state.wakes[&"t3:worker".parse().unwrap()];
+    assert!(worker.backoff.is_some(), "the send backs off");
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+
+    // The worker ended while its send backed off: its answer goes to the coordinator now,
+    // not once the back-off ends.
+    let ended = state_changed(31, "t3:worker", AgentState::Ended, None);
+    e.daemon.on_event(&ended, at()).await.unwrap();
+    e.daemon.flush(at() + chrono::Duration::seconds(3)).await;
+    e.daemon.flush(at() + chrono::Duration::seconds(6)).await;
+    assert_eq!(threads(&e.t3), ["worker", "coord"]);
+    assert!(
+        e.t3.sends()[1].1.contains("ask #3 by t3:worker"),
+        "{:?}",
+        e.t3.sends()
+    );
+}
+
+#[tokio::test]
+async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
+    let mut e = following_env(Duration::from_secs(5));
+    e.daemon.timing.reconcile_every = Duration::from_millis(200);
+    e.stub
+        .on_error("GET /v1/events", 503, "unavailable", "restarting", "retry");
+    let agent = "t3:coord";
+    e.t3.live("coord");
+    e.daemon.state.coordinators.insert(
+        "factory".parse().unwrap(),
+        Coordinator {
+            thread: "coord".into(),
+            agent: agent.parse().unwrap(),
+            started_at: at(),
+            renewed_at: at(),
+            resumed_after: None,
+            registered: true,
+        },
+    );
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(agent), &[DEVICE]),
+    );
+
+    let (reached, _) = follow_until(&mut e, Duration::from_secs(3), |stub, _| {
+        stub.requests_to("GET /v1/boards").len() >= 3
+    })
+    .await;
+    assert!(
+        reached < Duration::from_secs(2),
+        "reconciled at start and on its tick: {reached:?}"
+    );
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .len(),
+        1,
+        "the due lease was renewed"
     );
 }

@@ -50,6 +50,16 @@ pub fn error_code(err: &anyhow::Error) -> Option<ErrorCode> {
     err.downcast_ref::<ServerError>().map(ServerError::code)
 }
 
+/// Whether `err` is the server not answering at all (no connection, or no answer in
+/// time), rather than an answer that was an error.
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_request())
+    })
+}
+
 /// Query filters for `GET /v1/tasks`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TaskQuery {

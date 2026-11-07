@@ -317,13 +317,19 @@ registers without a repo).
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
   - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
-    reconcile gets 90 seconds and a flush's checks 30, and a stop request cuts any step
-    short; the state is saved first, so a cut-short last flush loses nothing. A stream
-    with no bytes for 45 seconds (the server sends a keep-alive every 15) is reopened
-    after the last event handled. A queue backing off after a failed check or send costs
-    no request until its retry time, and the event retries stop at the first that still
-    fails. The boards' `t3 thread show` checks run side by side, 10 seconds each; one that
-    fails or runs out of time still renews a named coordinator, and only a check that
+    reconcile gets 90 seconds and a flush's checks 30, eight queues at a time, and a stop
+    request cuts any step short. Every step is safe to cut: checks only read, queues and
+    the retry list change only once a result is in, a send cut short counts as maybe
+    delivered, and the state is saved after the last flush. A queue not checked in time
+    waits for the next flush without a back-off. A stream with no bytes for 45 seconds
+    (the server sends a keep-alive every 15) is reopened after the last event handled.
+    After a failed check a queue costs no request until its retry time; after a failed
+    send it is still checked, so an agent that ended or paused meanwhile has its answers
+    passed on. The event retries go on past one the server keeps failing and stop only
+    when the server cannot be reached. The daemon reconciles at start and on its tick,
+    also while the stream is down. The boards' `t3 thread show` checks run side by side,
+    10 seconds each; one that fails or runs out of time still renews a named coordinator,
+    and only a check that
     answers replaces it. The reconnect delay (1 second, doubled up to a minute) resets
     only after a connection that lasted a minute. An unreadable `watch.json` is copied to
     `watch.json.unreadable-<time>` with a warning before the daemon starts fresh. The
