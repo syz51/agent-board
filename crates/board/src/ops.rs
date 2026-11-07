@@ -189,10 +189,77 @@ pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>
     }
 }
 
+/// Text limits from the server defaults (`docs/API.md`, "Defaults"), which the MCP schemas
+/// state and the CLI checks before sending.
+pub fn limits() -> &'static board_server::Settings {
+    static LIMITS: std::sync::LazyLock<board_server::Settings> =
+        std::sync::LazyLock::new(board_server::Settings::default);
+    &LIMITS
+}
+
+/// Refuses `value` when it has more than `max` characters, with the server's message and
+/// hint, so over-long text fails before a request is sent.
+pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
+    check_chars_or(field, value, max, board_proto::longer_text_goes(field))
+}
+
+/// [`check_chars`] with `goes` saying where longer text goes, as the server says it.
+pub fn check_chars_or(field: &str, value: &str, max: usize, goes: Option<&str>) -> Result<()> {
+    match board_proto::TooLong::check(field, value, max) {
+        Some(long) => bail!(
+            "{} (not sent)\nnext: {}",
+            long.message(),
+            long.next_or(goes)
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Parses a `snake_case` enum value the way the wire format spells it.
 pub fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T, String> {
-    serde_json::from_value(Value::String(value.to_owned()))
-        .map_err(|_| format!("unknown value {value:?}"))
+    serde_json::from_value(Value::String(value.to_owned())).map_err(|_| {
+        format!(
+            "unknown value {value:?}; send one of {}",
+            enum_values::<T>().join(", ")
+        )
+    })
+}
+
+/// The wire spellings of a unit-variant enum, read from its derived `Deserialize`, which
+/// names them when it asks the deserializer for an enum.
+pub fn enum_values<T: DeserializeOwned>() -> &'static [&'static str] {
+    struct Probe<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> serde::Deserializer<'de> for Probe<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("not an enum"))
+        }
+
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            variants: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = variants;
+            Err(serde::de::Error::custom("variants read"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct
+            identifier ignored_any
+        }
+    }
+
+    let mut variants: &'static [&'static str] = &[];
+    let _ = T::deserialize(Probe(&mut variants));
+    variants
 }
 
 pub async fn snapshot(
@@ -882,4 +949,35 @@ pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
 pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Output> {
     let task = ctx.client.resolve_feedback(id, &req).await?;
     Ok(Output::new(render::task_line(&task), &task))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_values_are_the_wire_spellings() {
+        assert_eq!(enum_values::<Priority>(), ["p1", "p2", "p3"]);
+        assert_eq!(
+            enum_values::<NoteKind>(),
+            ["note", "finding", "decision", "feedback"]
+        );
+        assert_eq!(enum_values::<String>(), [] as [&str; 0]);
+        assert_eq!(
+            parse_enum::<Priority>("1").unwrap_err(),
+            "unknown value \"1\"; send one of p1, p2, p3"
+        );
+        assert_eq!(parse_enum::<Priority>("p1"), Ok(Priority::P1));
+    }
+
+    #[test]
+    fn over_long_text_is_refused_before_sending() {
+        assert!(check_chars("title", &"x".repeat(72), limits().title_chars).is_ok());
+        let err = check_chars("title", &"x".repeat(80), limits().title_chars).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "title is 80 characters; the limit is 72 (not sent)\n\
+             next: shorten title to at most 72 characters, or put the detail in the body"
+        );
+    }
 }

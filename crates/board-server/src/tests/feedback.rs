@@ -302,6 +302,20 @@ async fn resolve_is_for_the_owner_or_the_user() {
         .fail("POST", &path, Some(A), Some(json!({ "kind": "declined" })))
         .await;
     assert_eq!(code, 400);
+    // A reason fits one evidence value with its prefix.
+    let (code, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(A),
+            Some(json!({ "kind": "declined", "reason": "x".repeat(281) })),
+        )
+        .await;
+    assert_eq!(code, 400);
+    assert_eq!(
+        v["next"],
+        "shorten reason to at most 280 characters, or put the detail in a note on the item"
+    );
     let (code, _, _) = t
         .fail(
             "POST",
@@ -503,6 +517,20 @@ async fn reports_are_validated() {
         )
         .await;
     assert_eq!(code, 400, "the agent header is required");
+    // Over-long text says where the rest goes: a report has no body or evidence.
+    let (_, _, v) = t
+        .fail(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "x".repeat(4001) })),
+        )
+        .await;
+    assert_eq!(
+        v["next"],
+        "shorten text to at most 4000 characters, or keep to what happened and what it cost, \
+         and add the rest as notes on the item"
+    );
     let long = format!("{}\nrest", "word ".repeat(30));
     let filed = report(
         &t,

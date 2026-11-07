@@ -10,7 +10,8 @@ use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{board_missing, get_board};
-use crate::text::{ago, check_line, check_text, normalize_repo};
+use crate::text::{ago, check_line_or, check_text, normalize_repo};
+use board_proto::BOARD_TITLE_LONGER_TEXT_GOES;
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
     if repos.len() > 20 {
@@ -46,7 +47,12 @@ fn check_devices(devices: Vec<DeviceName>) -> Result<Vec<DeviceName>> {
 }
 
 pub(crate) fn validate_create(mut req: CreateBoard, s: &Settings) -> Result<CreateBoard> {
-    check_line("title", &req.title, s.title_chars)?;
+    check_line_or(
+        "title",
+        &req.title,
+        s.title_chars,
+        Some(BOARD_TITLE_LONGER_TEXT_GOES),
+    )?;
     check_text("goal", &req.goal, s.body_chars)?;
     req.repos = check_repos(req.repos)?;
     req.home_devices = check_devices(req.home_devices)?;
@@ -55,7 +61,12 @@ pub(crate) fn validate_create(mut req: CreateBoard, s: &Settings) -> Result<Crea
 
 pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<UpdateBoard> {
     if let Some(title) = &req.title {
-        check_line("title", title, s.title_chars)?;
+        check_line_or(
+            "title",
+            title,
+            s.title_chars,
+            Some(BOARD_TITLE_LONGER_TEXT_GOES),
+        )?;
     }
     if let Some(goal) = &req.goal {
         check_text("goal", goal, s.body_chars)?;
