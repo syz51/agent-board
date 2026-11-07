@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
+    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
     EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind, Runtime,
     Task, TaskId, TaskStatus, Timestamp,
 };
@@ -340,6 +340,18 @@ pub struct CreateAsk {
     pub options: Vec<String>,
 }
 
+/// The answer to `POST /v1/asks`: the new ask, and a warning when it may repeat another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatedAsk {
+    #[serde(flatten)]
+    pub ask: Ask,
+    /// Set when the board has other open asks younger than the server's
+    /// `duplicate_ask_window_secs`: names each (id, task, asker, age) and what to do.
+    /// Absent otherwise, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// `POST /v1/asks/{id}/answer` (user only).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnswerAsk {
@@ -489,6 +501,31 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&create).unwrap(),
             serde_json::json!({ "about": "board", "text": "Slow" })
+        );
+    }
+
+    /// A created ask is an `Ask` on the wire; `warning` is an optional extra field.
+    #[test]
+    fn a_created_ask_is_an_ask_with_an_optional_warning() {
+        let ask = serde_json::json!({
+            "id": 3, "board": "factory", "task": "factory-2", "agent": "t3:a",
+            "kind": "decision", "question": "Ship it?", "options": ["yes"],
+            "status": "open", "answer": null, "answered_via": null,
+            "created_at": "2026-11-06T12:00:00Z", "answered_at": null,
+        });
+        // From a server that predates the warning.
+        let created: CreatedAsk = serde_json::from_value(ask.clone()).unwrap();
+        assert_eq!((created.ask.id, &created.warning), (3, &None));
+        assert_eq!(serde_json::to_value(&created).unwrap(), ask);
+        // Older clients read the answer as a plain `Ask`.
+        let mut warned = ask;
+        warned["warning"] = serde_json::json!("board factory has another open ask");
+        let plain: Ask = serde_json::from_value(warned.clone()).unwrap();
+        assert_eq!(plain.id, 3);
+        let created: CreatedAsk = serde_json::from_value(warned).unwrap();
+        assert_eq!(
+            created.warning.as_deref(),
+            Some("board factory has another open ask")
         );
     }
 
