@@ -254,6 +254,25 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Where it runs**: never in the project root, which the user's and other threads share.
+  When the project folder is in a git repository, the daemon starts the thread with
+  `t3 thread start --worktree <base> --branch coordinator/<board>`: T3 creates that branch
+  from `<base>` and runs the thread in a new worktree on it. `<base>` is the remote's
+  default branch (`origin/HEAD`), else `origin/main`, else `main`. A `[board_projects]`
+  folder outside git starts the thread in the folder, as before. The coordinator prompt
+  forbids changing files, switching branches or merging in the project root; file work the
+  coordinator does itself happens in its worktree, on a new branch per task.
+- **Its worktree when the thread ends**: nothing removes it while the thread lives, and
+  ending or archiving the thread in T3 leaves it in place. The next start on that device
+  reuses the branch name and worktree folder. T3 can only create the branch, never check
+  out one that exists, so before each start the daemon frees it without losing work: it
+  forgets worktrees whose folder is gone (`git worktree prune`), removes the old worktree
+  on `coordinator/<board>` when it is clean (git refuses a dirty or locked one), then
+  deletes the branch when `<base>` has all its commits, else renames it to
+  `coordinator/<board>-<UTC time>`. When the old worktree cannot be removed, it keeps the
+  branch, and the new thread starts on `coordinator/<board>-<UTC time>` instead; a person
+  clears such a leftover. A start that resumes an unfinished earlier start adopts that
+  thread and its worktree, and touches no branch.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another
