@@ -294,18 +294,21 @@ settings in use, warned once per edit.
   creates an ask and moves on to other ready work. When nothing is ready it stops, after a
   goal review when the board has a goal and the last task it finished has no `review:`
   note.
-- **Parallel tasks**: the board's `parallel_tasks` (1 to 4, default 1) caps the tasks the
-  coordinator and its children have in `doing` at once; a task parked in `review`,
-  `blocked` or `open` does not count. The coordinator's snapshot shows it on the `you:`
-  line (`coordinator, up to 2 tasks at once`). Only the user raises it, since every agent
+- **Parallel tasks**: the board's `parallel_tasks` (1 to 4, default 1) is how many tasks
+  the coordinator and its children may have in progress at once: in `doing`, or dispatched
+  to a child that has not claimed it yet; a task parked in `review`, `blocked` or `open`
+  does not count. The coordinator keeps to it; the server stores and shows it but does not
+  refuse claims over it, since it cannot tell a coordinator's children from other agents
+  on the board. The coordinator's snapshot shows it on the `you:` line (`coordinator, up
+  to 2 tasks at once`), and the prompt reads a missing line as 1. Only the user raises it, since every agent
   shares one usage limit; anyone may lower it. Beside a task in progress, another starts
   only when neither waits on the other, its likely files miss the in-flight leases, it does
   not change the same kind of widely shared file (design and API docs, wire types,
   migrations, shared styles), it is not size L and needs no ask, and no agent of the
   coordinator's stopped on a usage limit since the tasks in progress started. A child whose
   lease overlaps another task in progress stops and leaves its task `open`. PRs merge by
-  the repository's own rules. The parallel-work design and its review (agent-board-40,
-  agent-board-135) judge it by wait, throughput, merge cost per PR and rework.
+  the repository's own rules. A raise pays when, per board, wait drops and throughput
+  rises while merge cost per PR and rework stay within 20% of the week before.
 - **Triage**: the feedback board's coordinator routes its items rather than doing them:
   for each ready item it reads the reports and resolves it as a duplicate of an earlier
   item, routed to a new task on the owner's board (done once the fix is deployed where

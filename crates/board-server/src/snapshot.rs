@@ -398,14 +398,22 @@ fn fill_full(
     board: &BoardSlug,
     board_counts: Option<Counts>,
 ) -> Result<()> {
-    let shown_board = get_board(cx, board)?;
+    // Only the board's coordinator, with its lease live, is told the limit.
+    let parallel_tasks: Option<u32> = cx
+        .db
+        .query_row(
+            "SELECT parallel_tasks FROM boards WHERE slug = ?1 AND coordinator = ?2 \
+             AND coordinator_expires_at > ?3",
+            params![board.as_str(), agent.id.as_str(), cx.now_ms()],
+            |r| r.get(0),
+        )
+        .optional()?;
     model.you = Some(You {
         handle: agent.handle.clone(),
         runtime: runtime_str(agent.runtime),
         repo: agent.repo.clone(),
         branch: agent.branch.clone(),
-        parallel_tasks: (shown_board.coordinator.as_ref() == Some(&agent.id))
-            .then_some(shown_board.parallel_tasks),
+        parallel_tasks,
     });
     model.counts = board_counts;
 
@@ -1561,7 +1569,7 @@ fn render_yaml(m: &Model) -> String {
             let _ = writeln!(o, "  branch: {}", q(branch));
         }
         if let Some(n) = you.parallel_tasks {
-            let _ = writeln!(o, "  coordinator_parallel_tasks: {n}");
+            let _ = writeln!(o, "  parallel_tasks: {n}");
         }
     }
     if let Some(c) = &m.counts {

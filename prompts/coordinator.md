@@ -12,11 +12,15 @@ says how many tasks you and your children may have in progress at once (the boar
 1. Call `board_snapshot`. Read the alerts first and act on them. Then give a verdict on
    each pending proposal on this board that you did not propose, and delegate the review
    again for your own pending proposals whose reviewer child is gone (see Proposals). For
-   each task of yours or your children's in `review` whose PR has merged, finish it
-   (steps 5 and 6).
-2. Count the tasks in progress: those you and your children own in `doing`. While that is
-   under the limit, pick the highest-priority ready task marked `auto` that may start now
-   (see Parallel tasks), and take it through steps 3 and 4; then pick the next. If none is
+   each task in `review` whose PR has merged and whose child has ended (it no longer shows
+   among the peers as running or idle), hand it to yourself (`task_update owner=<your
+   id>`) and finish it (steps 5 and 6); a live child finishes its own.
+2. Count the tasks in progress: those you and your children own in `doing`, plus each task
+   you dispatched whose child has not claimed it yet. The limit is the one your snapshot's
+   `you:` line shows; when it shows none, the limit is 1. While the count is under the
+   limit, pick the highest-priority ready task marked `auto` that you have not dispatched
+   and that may start now (see Parallel tasks), and take it through steps 3 and 4; then
+   pick the next. If none is
    ready and nothing is in progress, run the goal review (below) when it is due. When
    nothing more can start, set your handoff, keeping the last task you finished in it, and
    end your turn with a status: the board wakes you when work becomes ready, one of your

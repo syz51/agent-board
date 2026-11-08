@@ -1077,12 +1077,14 @@ async fn the_coordinator_sees_how_many_tasks_it_may_run_at_once() {
         "{full}"
     );
     let yaml = snapshot(&t, coordinator, "kind=full&format=yaml").await;
-    assert!(
-        text(&yaml).contains("  coordinator_parallel_tasks: 2\n"),
-        "{yaml}"
-    );
+    assert!(text(&yaml).contains("  parallel_tasks: 2\n"), "{yaml}");
 
     // Another agent on the board is not told the coordinator's limit.
     let full = snapshot(&t, other, "kind=full").await;
+    assert!(!you(&full).contains("coordinator"), "{full}");
+
+    // Nor is a coordinator whose lease lapsed: the prompt then reads the limit as 1.
+    t.advance(super::coordinator_ttl() + TimeDelta::seconds(1));
+    let full = snapshot(&t, coordinator, "kind=full").await;
     assert!(!you(&full).contains("coordinator"), "{full}");
 }
