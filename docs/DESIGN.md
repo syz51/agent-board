@@ -617,8 +617,30 @@ settings in use, warned once per edit.
   - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
     failure up to 10 minutes, then checks them again before sending. A thread T3 no
     longer has, has archived, or whose worktree is gone, drops them. A send gets 20 seconds and all agents' sends
-    run side by side; one that runs out of time is not sent again, since T3 may have
-    delivered it.
+    run side by side; one that runs out of time may still have been delivered (below).
+  - **A wake-up whose send timed out**: each message ends with a marker line,
+    `(wake-up <first 16 hex digits of a SHA-256 of its text and send time>)`. Before the
+    send, the daemon records the message as unsure in its state, by agent: the digest, the
+    wake-ups it carries (what they are about, never the text) and the time. A send that
+    is delivered, fails or finds the thread gone clears that record; one that times out,
+    or a flush cut short while sending, keeps it. From one minute after the send, so T3
+    has handled the request, the flush reads the thread's 100 latest messages with
+    `t3 thread show`, sharing the helper the fresh-session read uses. The agent's new lines
+    wait for that check, so lines owed again go out with them in one message. A user
+    message carrying the marker settles it. Without one, while T3 has a run of the thread
+    active or queued, the message may still wait in T3's queue, so it is read again on
+    the next flush; the new lines are not held for that, since a thread left marked
+    running must still be woken. With no such run, or when T3 does not know the thread,
+    the wake-ups are queued again, each checked again before sending like any line. A
+    wake-up queued again is marked so that a second send that times out counts as
+    delivered: it is sent at most twice. A check that fails, times out or reads an
+    unknown format backs off from 30 seconds up to 10 minutes and sends nothing; the
+    agent's new lines are no longer held for it. Only the newest timed-out message per
+    agent is kept: one more timeout before its check settles it drops the earlier
+    one's wake-ups, with a warning. A record older than an hour is dropped like an
+    expired line. A coordinator's re-brief that went in the same message is looked for by
+    the reconcile, by its own marker and the same rules (A re-brief whose send timed out,
+    above), so when the message was lost, the next one carries both again.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
   - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A

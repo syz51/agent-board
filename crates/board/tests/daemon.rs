@@ -44,6 +44,14 @@ enum Call {
     },
 }
 
+/// `message` without the `(wake-up <digest>)` line a wake-up message ends with.
+fn unmarked(message: &str) -> &str {
+    match message.rsplit_once('\n') {
+        Some((text, last)) if last.starts_with("(wake-up ") && last.ends_with(')') => text,
+        _ => message,
+    }
+}
+
 #[derive(Clone, Default)]
 struct FakeT3 {
     calls: Arc<Mutex<Vec<Call>>>,
@@ -96,7 +104,16 @@ impl FakeT3 {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The messages sent, without the marker line that ends each wake-up message, which
+    /// names a digest of its text and send time; [`Self::raw_sends`] keeps it.
     fn sends(&self) -> Vec<(String, String)> {
+        self.raw_sends()
+            .into_iter()
+            .map(|(thread, message)| (thread, unmarked(&message).to_owned()))
+            .collect()
+    }
+
+    fn raw_sends(&self) -> Vec<(String, String)> {
         self.calls()
             .into_iter()
             .filter_map(|c| match c {
@@ -2438,16 +2455,161 @@ async fn a_failed_send_backs_off_and_stops_once_the_thread_is_gone() {
     assert!(e.daemon.state.wakes.is_empty());
 }
 
+/// The timed-out wake-up message the daemon waits to look for in `agent`'s thread.
+fn unsure_wakes(e: &Env, agent: &str) -> Option<board::daemon::UnsureWakes> {
+    e.daemon
+        .state
+        .unsure_wakes
+        .get(&agent.parse().unwrap())
+        .cloned()
+}
+
 #[tokio::test]
-async fn a_send_that_timed_out_is_not_sent_again() {
+async fn a_timed_out_wake_up_the_thread_never_got_is_sent_again_once() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    let line = "board factory: factory-1 is ready (p1)\nRun board_snapshot and continue.";
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends(), [("coord".to_owned(), line.to_owned())]);
+    // Recorded by what it was about and a digest its marker names, never its text.
+    let unsure = unsure_wakes(&e, &agent).expect("looked for later");
+    assert_eq!(unsure.since, at());
+    assert_eq!(unsure.wakes.len(), 1);
+    assert!(
+        e.t3.raw_sends()[0]
+            .1
+            .ends_with(&format!("\n{}", board::daemon::wake_marker(&unsure.digest)))
+    );
+    let saved = serde_json::to_string(&e.daemon.state).unwrap();
+    assert!(!saved.contains("is ready"), "{saved}");
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // Not looked for while T3 may still handle the send.
+    e.daemon.flush(at() + chrono::Duration::seconds(30)).await;
+    assert_eq!((e.t3.sends().len(), reads(&e)), (1, 0));
+
+    // Missing a minute later, with no run that might still take it: sent again, once.
+    e.daemon.flush(minute(1)).await;
+    assert_eq!(reads(&e), 1);
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    assert_eq!(sends[1].1, line);
+    let raw = e.t3.raw_sends();
+    assert_ne!(raw[0].1, raw[1].1, "each message has its own marker");
+    // That send timed out too: it counts as delivered.
+    assert_eq!(unsure_wakes(&e, &agent), None);
+    e.daemon.flush(minute(30)).await;
+    assert_eq!((e.t3.sends().len(), reads(&e)), (2, 1));
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_timed_out_wake_up_that_reached_the_thread_is_not_sent_twice() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.t3.time_out_delivers.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert!(unsure_wakes(&e, &agent).is_some());
+
+    // A line queued meanwhile waits for the check, so it goes with the lost lines if any.
+    let soon = at() + chrono::Duration::seconds(10);
+    queue_ready(&mut e, 11, &["factory-2"], soon).await;
+    e.daemon.flush(soon).await;
+    assert_eq!(e.t3.sends().len(), 1);
+
+    // Found: settled, and only the new line goes.
+    e.daemon.flush(minute(1)).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    assert_eq!(
+        sends[1].1,
+        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+    );
+    assert_eq!(unsure_wakes(&e, &agent), None);
+    e.daemon.flush(minute(30)).await;
+    assert_eq!(e.t3.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn a_timed_out_wake_up_waits_for_a_busy_thread_and_a_failed_check_sends_nothing() {
+    use board::daemon::WAKE_RETRY_FIRST;
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+
+    // A run active or queued may still take it: looked for again on the next flush.
+    e.t3.running.lock().unwrap().push("coord".to_owned());
+    e.daemon.flush(minute(1)).await;
+    assert_eq!((e.t3.sends().len(), reads(&e)), (1, 1));
+    assert!(unsure_wakes(&e, &agent).is_some());
+    e.t3.running.lock().unwrap().clear();
+
+    // A failed check backs off and sends nothing.
+    e.t3.fail_messages.store(true, Ordering::SeqCst);
+    e.daemon.flush(minute(2)).await;
+    assert_eq!((e.t3.sends().len(), reads(&e)), (1, 2));
+    let backoff = unsure_wakes(&e, &agent).unwrap().backoff.unwrap();
+    assert_eq!(backoff.retry_at, minute(2) + WAKE_RETRY_FIRST);
+    e.t3.fail_messages.store(false, Ordering::SeqCst);
+    // While it backs off, nothing is read, and new lines are no longer held for it; their
+    // delivered send leaves it to be looked for.
+    let soon = minute(2) + chrono::Duration::seconds(10);
+    queue_ready(&mut e, 11, &["factory-2"], soon).await;
+    e.daemon.flush(soon).await;
+    assert_eq!(reads(&e), 2);
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    assert_eq!(
+        sends[1].1,
+        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+    );
+    assert_eq!(unsure_wakes(&e, &agent).unwrap().backoff, Some(backoff));
+
+    // Its retry finds it missing: its line is sent again.
+    e.daemon.flush(minute(2) + WAKE_RETRY_FIRST).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 3, "{sends:?}");
+    assert_eq!(
+        sends[2].1,
+        "board factory: factory-1 is ready (p1)\nRun board_snapshot and continue."
+    );
+    assert_eq!(unsure_wakes(&e, &agent), None);
+}
+
+#[tokio::test]
+async fn a_timed_out_wake_up_is_looked_for_after_a_restart() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     e.daemon.reconcile(at()).await.unwrap();
     queue_ready(&mut e, 10, &["factory-1"], at()).await;
     e.t3.time_out_send.store(true, Ordering::SeqCst);
     e.daemon.flush(at()).await;
-    e.daemon.flush(at() + chrono::Duration::minutes(30)).await;
-    assert_eq!(e.t3.sends().len(), 1, "T3 may have delivered it");
-    assert!(e.daemon.state.wakes.is_empty());
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    e.daemon.save().unwrap();
+    // An entry this version cannot read is skipped, not the rest of the state.
+    let path = home_of(&e).state_dir().join("watch.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["unsure_wakes"]["t3:other"] = json!({ "digest": 5 });
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.coordinators, e.daemon.state.coordinators);
+    assert_eq!(restarted.state.unsure_wakes, e.daemon.state.unsure_wakes);
+    assert_eq!(restarted.state.unsure_wakes.len(), 1);
+    restarted.reconcile(minute(1)).await.unwrap();
+    restarted.flush(minute(1)).await;
+    assert_eq!(e.t3.sends().len(), 2);
+    assert!(restarted.state.unsure_wakes.is_empty());
 }
 
 #[tokio::test]
@@ -5009,7 +5171,7 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     assert_eq!(e.t3.sends().len(), 6);
     assert_eq!(briefed(&e), current);
-    let checked = later + board::daemon::REBRIEF_CHECK_AFTER;
+    let checked = later + board::daemon::SEND_CHECK_AFTER;
     e.daemon.reconcile(checked).await.unwrap();
     assert_eq!(e.t3.sends().len(), 6);
     assert_eq!(e.daemon.state.coordinators[&slug].rebrief_unsure, None);
@@ -5118,10 +5280,12 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
         "board factory: factory-5 is ready (p1)\nRun board_snapshot and continue."
     );
 
-    // A send that timed out may have got through: the prompt counts as sent.
+    // A send that timed out may have got through: the prompt counts as sent. (It did, so
+    // the check a minute later finds it and the next lines go on their own.)
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
     queue_ready(&mut e, 12, &["factory-6"], next).await;
     e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.t3.time_out_delivers.store(true, Ordering::SeqCst);
     e.daemon.flush(next).await;
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     assert_eq!(e.t3.sends().len(), 4);
@@ -5133,6 +5297,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     assert_eq!(briefed(&e), current);
 
     // A thread that coordinates two boards gets each prompt it is owed.
+    let next = next + board::daemon::SEND_CHECK_AFTER;
     let other: board_proto::BoardSlug = "other".parse().unwrap();
     let mut second = e.daemon.state.coordinators[&slug].clone();
     second.briefed = None;
@@ -5396,7 +5561,8 @@ async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() 
     assert_eq!(e.t3.sends().len(), 1);
     assert!(unsure(&e).is_some_and(|u| !u.resent));
 
-    // Missing: owed again, and with the board idle it waits for the next wake-up.
+    // Missing: owed again, and with the board idle it waits for the next wake-up, which
+    // also carries the lost message's line.
     e.daemon.reconcile(minute(1)).await.unwrap();
     assert_eq!(e.t3.sends().len(), 1);
     assert_eq!(e.daemon.state.coordinators[&slug].briefed, None);
@@ -5407,7 +5573,8 @@ async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() 
     assert_eq!(
         sends[1].1,
         format!(
-            "{}\n\nboard factory: factory-5 is ready (p1)\nRun board_snapshot and continue.",
+            "{}\n\nboard factory: factory-5 is ready (p1)\nboard factory: factory-4 is ready (p1)\n\
+             Run board_snapshot and continue.",
             board::daemon::rebrief_message(&slug, false)
         )
     );
