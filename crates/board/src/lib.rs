@@ -28,6 +28,11 @@ pub const BUILT: &str = env!("BOARD_BUILT");
 /// `VERSION (COMMIT)`, as `board --version` prints it.
 pub const BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BOARD_COMMIT"), ")");
 
+/// The integration tests' fake-executable writer, for unit tests that run a fake CLI.
+#[cfg(all(test, unix))]
+#[path = "../tests/common/script.rs"]
+mod test_script;
+
 #[cfg(test)]
 mod build_commit {
     include!("../build_commit.rs");

@@ -1106,10 +1106,9 @@ const ADOPT_REPO: &str = "github.com/example/infra";
 /// threads `live`, `other-live` and `archived`.
 #[cfg(unix)]
 fn adopt_env() -> Env {
-    use std::os::unix::fs::PermissionsExt as _;
     let e = env();
     let t3 = e.home.join("fake-t3");
-    std::fs::write(
+    common::script::write_script(
         &t3,
         r#"#!/bin/sh
 # t3 thread show --json --messages 1 <thread>
@@ -1121,9 +1120,7 @@ case "$thread" in
   *) echo "Thread $thread is no longer available." >&2; exit 1 ;;
 esac
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let project = e.home.join("infra");
     std::fs::create_dir_all(&project).unwrap();
     let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();

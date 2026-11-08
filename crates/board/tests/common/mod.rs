@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod script;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
