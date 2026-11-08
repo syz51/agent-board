@@ -1709,6 +1709,78 @@ async fn a_handover_from_a_stale_owner_says_to_take_it_first() {
 }
 
 #[tokio::test]
+async fn a_coordinator_takes_an_ended_childs_review_task_by_handle_or_full_id() {
+    let t = setup().await;
+    let coordinator = "t3:mcp:launch:0123abcd";
+    let handle = t.register(coordinator, Some(REPO), None).await["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(handle, coordinator);
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let by_handle = task_in(&t, TaskStatus::Review).await;
+    let by_id = task_in(&t, TaskStatus::Review).await;
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+
+    // An unknown handle is named as such, and the task stays with its owner.
+    let (s, v) = patch_as(
+        &t,
+        coordinator,
+        false,
+        &by_handle,
+        json!({ "owner": "t3:ffff" }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (404, Some("not_found")), "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("t3:ffff is not registered"),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&by_handle).await["owner"], A);
+
+    for (id, owner) in [(&by_handle, handle.as_str()), (&by_id, coordinator)] {
+        assert_eq!(t.done(coordinator, id, check(0)).await.0.as_u16(), 403);
+        let (s, v) = patch_as(&t, coordinator, false, id, json!({ "owner": owner })).await;
+        assert_eq!(
+            (s, v["owner"].as_str(), v["status"].as_str()),
+            (200, Some(coordinator), Some("review")),
+            "{v}"
+        );
+        // Clients tie a handle they sent to the full id through the detail's handles.
+        let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+        assert_eq!(detail["handles"][coordinator], handle.as_str(), "{detail}");
+        let (s, v) = t.done(coordinator, id, check(0)).await;
+        assert_eq!(
+            (s.as_u16(), v["status"].as_str()),
+            (200, Some("done")),
+            "{v}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_handover_needs_an_owned_task_and_a_live_target() {
     let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
     t.register(U, None, None).await;
