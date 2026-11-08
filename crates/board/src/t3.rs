@@ -11,7 +11,9 @@
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state, with its own worktree
 //!   (`worktreePath`, null for a thread in its project folder); with `--messages 0`
 //!   the hooks read a thread's title, link and, for a delegated thread, its parent
-//!   (`parentThreadId`).
+//!   (`parentThreadId`); with `--messages 100` the daemon reads whether a re-brief whose
+//!   send timed out reached the thread (`messages`: `{role, text}`, oldest first, and
+//!   `thread.activeRunId`, null unless a run is active).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
@@ -57,6 +59,20 @@ pub fn folder_gone(folder: &Path) -> bool {
     std::fs::metadata(folder).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// A thread's latest messages, as far as the daemon reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecentMessages {
+    /// Whether a run is active: a message sent meanwhile may wait as its next turn.
+    pub running: bool,
+    /// The text of each user message, oldest first.
+    pub user: Vec<String>,
+}
+
+/// How many of a thread's latest messages [`T3::recent_messages`] reads: enough that a
+/// re-brief stays among them for a few reconciles of a busy coordinator, few enough that
+/// `t3 thread show` answers within [`crate::daemon::Timing::thread_check`].
+pub const RECENT_MESSAGES: usize = 100;
+
 /// What the hooks read about their own thread from `t3 thread show`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadFacts {
@@ -100,6 +116,12 @@ pub trait T3: Send + Sync {
 
     /// The thread's state, or `None` when T3 does not know it.
     fn thread_info(&self, thread: &str) -> impl Future<Output = Result<Option<ThreadInfo>>> + Send;
+
+    /// The thread's [`RECENT_MESSAGES`] latest messages, or `None` when T3 does not know it.
+    fn recent_messages(
+        &self,
+        thread: &str,
+    ) -> impl Future<Output = Result<Option<RecentMessages>>> + Send;
 
     /// The active threads titled `title` in the project containing `project`.
     fn threads_titled(
@@ -241,6 +263,13 @@ impl T3 for T3Cli {
             .map(|value| parse_thread_info(&value)))
     }
 
+    async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
+        Ok(self
+            .thread_show(thread, &RECENT_MESSAGES.to_string())
+            .await?
+            .map(|value| parse_recent_messages(&value)))
+    }
+
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
         let project = project.to_string_lossy();
         let args = ["thread", "list", "--json", "--project", &project];
@@ -320,6 +349,21 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
             .as_str()
             .filter(|p| !p.is_empty())
             .map(PathBuf::from),
+    }
+}
+
+/// Reads `{"thread": {"activeRunId": …}, "messages": [{"role", "text", …}]}` from
+/// `t3 thread show --json`. A message without a text is left out.
+pub fn parse_recent_messages(value: &Value) -> RecentMessages {
+    RecentMessages {
+        running: !value["thread"]["activeRunId"].is_null(),
+        user: value["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["role"].as_str() == Some("user"))
+            .filter_map(|m| m["text"].as_str().map(str::to_owned))
+            .collect(),
     }
 }
 
@@ -623,5 +667,27 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(!gone);
         assert!(folder_gone(&dir.path().join("gone")));
+    }
+
+    #[test]
+    fn recent_messages_read_the_user_texts_and_whether_a_run_is_active() {
+        let recent = parse_recent_messages(&json!({
+            "thread": {"activeRunId": "run:1"},
+            "messages": [
+                {"role": "user", "runId": "run:0", "text": "first"},
+                {"role": "assistant", "runId": "run:0", "text": "reply"},
+                {"role": "user", "runId": "run:1"},
+                {"role": "user", "runId": "run:1", "text": "second"},
+            ],
+        }));
+        assert_eq!(
+            recent,
+            RecentMessages {
+                running: true,
+                user: vec!["first".to_owned(), "second".to_owned()],
+            }
+        );
+        let idle = parse_recent_messages(&json!({"thread": {"activeRunId": null}}));
+        assert_eq!(idle, RecentMessages::default());
     }
 }

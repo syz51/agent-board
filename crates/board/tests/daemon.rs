@@ -14,7 +14,7 @@ use board::config::{Config, Home};
 use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{ListedThread, NewWorktree, T3, ThreadInfo, TimedOut};
+use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut};
 use board_proto::{
     AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, TaskStatus,
     Timestamp,
@@ -58,6 +58,16 @@ struct FakeT3 {
     fail_send: Arc<AtomicBool>,
     /// `t3 thread send` runs out of time while set, after it may have delivered.
     time_out_send: Arc<AtomicBool>,
+    /// Whether a send that ran out of time delivered its message first.
+    time_out_delivers: Arc<AtomicBool>,
+    /// The messages each thread got, oldest first, as `t3 thread show --messages` lists them.
+    received: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+    /// Threads with an active run.
+    running: Arc<Mutex<Vec<String>>>,
+    /// `t3 thread show --messages` fails while set.
+    fail_messages: Arc<AtomicBool>,
+    /// How many times the daemon read a thread's messages.
+    message_reads: Arc<AtomicUsize>,
     /// Threads whose `t3 thread show` never answers.
     hang_info: Arc<Mutex<Vec<String>>>,
     /// `t3 thread show` fails while set.
@@ -166,7 +176,15 @@ impl T3 for FakeT3 {
         if self.refuse_send.lock().unwrap().iter().any(|t| t == thread) {
             anyhow::bail!("t3 thread send failed: thread {thread} is archived");
         }
-        if self.time_out_send.load(Ordering::SeqCst) {
+        let timed_out = self.time_out_send.load(Ordering::SeqCst);
+        if !timed_out || self.time_out_delivers.load(Ordering::SeqCst) {
+            let mut received = self.received.lock().unwrap();
+            received
+                .entry(thread.to_owned())
+                .or_default()
+                .push(message.to_owned());
+        }
+        if timed_out {
             return Err(TimedOut(format!("t3 thread send {thread}")).into());
         }
         if let Some((home, adoption)) = self.adopt_during_send.lock().unwrap().take() {
@@ -199,6 +217,26 @@ impl T3 for FakeT3 {
             anyhow::bail!("t3 thread show failed: server not running");
         }
         Ok(self.threads.lock().unwrap().get(thread).cloned())
+    }
+
+    async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
+        self.message_reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_messages.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread show failed: server not running");
+        }
+        if !self.threads.lock().unwrap().contains_key(thread) {
+            return Ok(None);
+        }
+        Ok(Some(RecentMessages {
+            running: self.running.lock().unwrap().iter().any(|t| t == thread),
+            user: self
+                .received
+                .lock()
+                .unwrap()
+                .get(thread)
+                .cloned()
+                .unwrap_or_default(),
+        }))
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
@@ -749,6 +787,7 @@ fn coordinator_in(project: &Path) -> Env {
             registered: true,
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
+            rebrief_unsure: None,
         },
     );
     e.stub
@@ -990,6 +1029,7 @@ fn coordinator_env(
             registered: true,
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
+            rebrief_unsure: None,
         },
     );
     e.stub
@@ -4166,6 +4206,7 @@ fn named_coordinators(e: &mut Env, slugs: &[&str]) {
                 registered: true,
                 briefed: Some(board::daemon::prompt_digest(false).to_owned()),
                 rebrief_backoff: None,
+                rebrief_unsure: None,
             },
         );
         let mut board = autopilot(Some(&agent), &[DEVICE]);
@@ -4793,6 +4834,7 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             registered: true,
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
+            rebrief_unsure: None,
         },
     );
     e.stub
@@ -4894,9 +4936,11 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
     assert_eq!(e.t3.sends().len(), 5);
     assert_eq!(briefed(&e), current);
 
-    // A send that timed out may have got through: it counts as sent and is not repeated.
+    // A send that timed out but got through counts as sent and is not repeated (see
+    // `a_timed_out_re_brief_is_sent_again_only_when_the_thread_never_got_it`).
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
     e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.t3.time_out_delivers.store(true, Ordering::SeqCst);
     e.daemon.reconcile(later).await.unwrap();
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     assert_eq!(e.t3.sends().len(), 6);
@@ -5109,4 +5153,160 @@ async fn an_idle_coordinator_resumed_at_a_usage_reset_gets_the_new_prompt_with_i
         e.daemon.state.coordinators[&slug].briefed,
         Some(board::daemon::prompt_digest(false).to_owned())
     );
+}
+
+/// Whether `factory`'s coordinator waits to learn if a timed-out re-brief reached it.
+fn unsure(e: &Env) -> Option<board::daemon::UnsureRebrief> {
+    e.daemon.state.coordinators[&factory()]
+        .rebrief_unsure
+        .clone()
+}
+
+#[tokio::test]
+async fn a_timed_out_re_brief_is_sent_again_only_when_the_thread_never_got_it() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let message = board::daemon::rebrief_message(&slug, false);
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    let minute = |n| at() + chrono::Duration::minutes(n);
+    assert!(message.ends_with(&board::daemon::rebrief_marker(&slug, false)));
+
+    // The send times out and T3 drops it: counted as sent for now, and saved as unsure.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends(), [("coord".to_owned(), message.clone())]);
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
+    let home = Home::at(e._dir.path().join("home"));
+    let saved = board::daemon::load_watch_state(&home).coordinators[&slug].clone();
+    assert_eq!(saved.rebrief_unsure, unsure(&e));
+    assert!(unsure(&e).is_some_and(|u| !u.resent));
+
+    // Not looked for while the coordinator is at work.
+    let mut running = agent_fixture(&agent, DEVICE, AgentState::Running);
+    running.last_seen = minute(1);
+    e.stub.on(&format!("GET {}", agent_path(&agent)), &running);
+    e.daemon.reconcile(minute(1)).await.unwrap();
+    assert_eq!(reads(&e), 0);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+
+    // Missing while T3 runs the thread, which may take it as its next turn: not sent yet.
+    e.t3.running.lock().unwrap().push("coord".to_owned());
+    e.daemon.reconcile(minute(2)).await.unwrap();
+    assert_eq!(reads(&e), 1);
+    assert_eq!(e.t3.sends().len(), 1);
+    e.t3.running.lock().unwrap().clear();
+
+    // Missing from the idle thread: sent again, and then settled.
+    e.daemon.reconcile(minute(3)).await.unwrap();
+    assert_eq!(reads(&e), 2);
+    assert_eq!(e.t3.sends().len(), 2);
+    assert_eq!(e.t3.sends()[1], ("coord".to_owned(), message.clone()));
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
+    assert_eq!(unsure(&e), None);
+    e.daemon.reconcile(minute(4)).await.unwrap();
+    assert_eq!((reads(&e), e.t3.sends().len()), (2, 2));
+
+    // A resend that times out too counts as delivered: never a third send.
+    e.t3.received.lock().unwrap().clear();
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(minute(5)).await.unwrap();
+    e.daemon.reconcile(minute(6)).await.unwrap();
+    assert_eq!((reads(&e), e.t3.sends().len()), (3, 4));
+    assert_eq!(unsure(&e), None);
+    e.daemon.reconcile(minute(7)).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!((reads(&e), e.t3.sends().len()), (3, 4));
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
+}
+
+#[tokio::test]
+async fn a_timed_out_re_brief_that_reached_the_thread_is_not_sent_twice() {
+    use board::daemon::WAKE_RETRY_FIRST;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    let minute = |n| at() + chrono::Duration::minutes(n);
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.t3.time_out_delivers.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends().len(), 1);
+    assert!(unsure(&e).is_some());
+
+    // The check fails: it backs off and sends nothing, since the message may be there.
+    e.t3.fail_messages.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(minute(1)).await.unwrap();
+    e.t3.fail_messages.store(false, Ordering::SeqCst);
+    assert_eq!((reads(&e), e.t3.sends().len()), (1, 1));
+    assert!(unsure(&e).is_some());
+    let backoff = e.daemon.state.coordinators[&slug].rebrief_backoff.clone();
+    assert_eq!(
+        backoff.map(|b| b.retry_at),
+        Some(minute(1) + WAKE_RETRY_FIRST)
+    );
+    e.daemon
+        .reconcile(minute(1) + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(reads(&e), 1, "backing off");
+
+    // Found in the thread: settled, never sent again.
+    e.daemon.reconcile(minute(2)).await.unwrap();
+    assert_eq!((reads(&e), e.t3.sends().len()), (2, 1));
+    assert_eq!(unsure(&e), None);
+    assert_eq!(e.daemon.state.coordinators[&slug].rebrief_backoff, None);
+    e.daemon.reconcile(minute(3)).await.unwrap();
+    assert_eq!((reads(&e), e.t3.sends().len()), (2, 1));
+    assert_eq!(
+        e.daemon.state.coordinators[&slug].briefed,
+        Some(board::daemon::prompt_digest(false).to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.stub
+        .on("GET /v1/boards", [counted(&agent, 0, Some(0), 0)]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        e.t3.sends().is_empty(),
+        "the idle board waits for a wake-up"
+    );
+    queue_ready(&mut e, 10, &["factory-4"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends().len(), 1);
+    assert!(unsure(&e).is_some());
+
+    // Missing: owed again, and with the board idle it waits for the next wake-up.
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, None);
+    queue_ready(&mut e, 11, &["factory-5"], later).await;
+    e.daemon.flush(later).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(
+        sends[1].1,
+        format!(
+            "{}\n\nboard factory: factory-5 is ready (p1)\nRun board_snapshot and continue.",
+            board::daemon::rebrief_message(&slug, false)
+        )
+    );
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
+    assert_eq!(unsure(&e), None);
 }
