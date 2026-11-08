@@ -8,7 +8,8 @@
 //!   the command.
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
-//! - `t3 thread show --json --messages 1 <thread>`: the thread's state; with `--messages 0`
+//! - `t3 thread show --json --messages 1 <thread>`: the thread's state, with its own worktree
+//!   (`worktreePath`, null for a thread in its project folder); with `--messages 0`
 //!   the hooks read a thread's title, link and, for a delegated thread, its parent
 //!   (`parentThreadId`).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
@@ -32,6 +33,28 @@ use tokio::io::AsyncWriteExt as _;
 pub struct ThreadInfo {
     pub archived: bool,
     pub runtime: Runtime,
+    /// The thread's own git worktree, for one that runs in a worktree, not its project folder.
+    pub worktree: Option<PathBuf>,
+}
+
+impl ThreadInfo {
+    /// The folder T3 runs the thread in: its worktree, else `project`, its project folder
+    /// when the caller knows it.
+    pub fn folder<'a>(&'a self, project: Option<&'a Path>) -> Option<&'a Path> {
+        self.worktree.as_deref().or(project)
+    }
+
+    /// Whether T3 can run the thread: it is not archived and its [`Self::folder`] is not
+    /// gone. T3 fails every run of a thread whose folder is gone, before the agent starts.
+    pub fn runnable(&self, project: Option<&Path>) -> bool {
+        !self.archived && !self.folder(project).is_some_and(folder_gone)
+    }
+}
+
+/// Whether `folder` no longer exists. One that cannot be read for another reason, such as a
+/// permission, may still be there for T3, so it does not count as gone.
+pub fn folder_gone(folder: &Path) -> bool {
+    std::fs::metadata(folder).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// What the hooks read about their own thread from `t3 thread show`.
@@ -281,7 +304,8 @@ pub fn is_unknown_thread(stderr: &str, thread: &str) -> bool {
         ))
 }
 
-/// Reads `{"thread": {"archived": …, "providerInstanceId": …}}` from `t3 thread show --json`.
+/// Reads `{"thread": {"archived": …, "providerInstanceId": …, "worktreePath": …}}` from
+/// `t3 thread show --json`.
 pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     let thread = &value["thread"];
     let provider = thread["providerInstanceId"].as_str().unwrap_or_default();
@@ -292,6 +316,10 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
         } else {
             Runtime::Claude
         },
+        worktree: thread["worktreePath"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
     }
 }
 
@@ -535,24 +563,65 @@ mod tests {
     }
 
     #[test]
-    fn thread_info_reads_archived_and_provider() {
-        let info = parse_thread_info(
-            &json!({"thread": {"archived": true, "providerInstanceId": "codex"}}),
-        );
+    fn thread_info_reads_archived_provider_and_worktree() {
+        let info = parse_thread_info(&json!({"thread": {
+            "archived": true, "providerInstanceId": "codex", "worktreePath": "/w/factory",
+        }}));
         assert_eq!(
             info,
             ThreadInfo {
                 archived: true,
-                runtime: Runtime::Codex
+                runtime: Runtime::Codex,
+                worktree: Some(PathBuf::from("/w/factory")),
             }
         );
-        let info = parse_thread_info(&json!({"thread": {"providerInstanceId": "claudeAgent"}}));
+        let info = parse_thread_info(&json!({"thread": {
+            "providerInstanceId": "claudeAgent", "worktreePath": null,
+        }}));
         assert_eq!(
             info,
             ThreadInfo {
                 archived: false,
-                runtime: Runtime::Claude
+                runtime: Runtime::Claude,
+                worktree: None,
             }
         );
+    }
+
+    #[test]
+    fn a_thread_is_runnable_only_while_its_folder_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let info = |archived, worktree: Option<&Path>| ThreadInfo {
+            archived,
+            runtime: Runtime::Claude,
+            worktree: worktree.map(Path::to_path_buf),
+        };
+        // In its project folder: that folder decides, when known.
+        assert!(info(false, None).runnable(None));
+        assert!(info(false, None).runnable(Some(dir.path())));
+        assert!(!info(false, None).runnable(Some(&gone)));
+        // In its own worktree: the worktree decides, whatever the project folder.
+        assert!(info(false, Some(dir.path())).runnable(Some(&gone)));
+        assert!(!info(false, Some(&gone)).runnable(Some(dir.path())));
+        assert!(!info(false, Some(&gone)).runnable(None));
+        // Archived: never.
+        assert!(!info(true, None).runnable(Some(dir.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_read_is_not_gone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        let inside = locked.join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // stat fails with a permission error, not NotFound.
+        let gone = folder_gone(&inside);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!gone);
+        assert!(folder_gone(&dir.path().join("gone")));
     }
 }
