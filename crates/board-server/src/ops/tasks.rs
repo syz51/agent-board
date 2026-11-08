@@ -496,12 +496,12 @@ pub(crate) const ENTERED_DOING: &str = "SELECT COALESCE((SELECT seq FROM events 
          OR json_extract(payload, '$.owner') IS NOT NULL))) \
      ORDER BY seq DESC LIMIT 1), 0)";
 
-/// Whether task `?1` has an idle notice about agent `?3` after seq `?2`, and at or after
-/// `?4` when that is not null.
-pub(crate) const TOLD: &str = "SELECT EXISTS (SELECT 1 FROM events \
+/// How many idle notices about agent `?3` task `?1` has after seq `?2`, and at or after
+/// `?4` when that is not null, and when the first of them was recorded (null when none).
+pub(crate) const TOLD: &str = "SELECT COUNT(*), MIN(at) FROM events \
      WHERE task = ?1 AND seq > ?2 AND type = 'task_updated' \
        AND json_extract(payload, '$.idle_doing') IS NOT NULL \
-       AND json_extract(payload, '$.away') = ?3 AND (?4 IS NULL OR at >= ?4))";
+       AND json_extract(payload, '$.away') = ?3 AND (?4 IS NULL OR at >= ?4)";
 
 /// Whether a T3 thread agent `?1` delegated, to depth `?2`, is at work: running and seen
 /// after `?3`, or waiting for a usage-limit reset still to come (`?4`, now), paused or with
@@ -521,10 +521,12 @@ pub(crate) const DELEGATE_AT_WORK: &str = concat!(
 /// away began, `away` the owner). Away means not running since then (idle, paused with no
 /// reset ahead, or ended), or marked running but not seen for that long, as a turn cut
 /// short by an error leaves a thread. An owner waiting for a usage-limit reset still to
-/// come (paused, or ended meanwhile) is not away. Once per spell: an owner that runs again
-/// and stops starts a new one, and so does a running owner seen again. The snapshot shows
-/// it as an alert to the owner, or to the board's coordinator, and the owner's device
-/// daemon wakes a T3 owner. Run by the sweeper.
+/// come (paused, or ended meanwhile) is not away. Twice per spell at most: once at
+/// `doing_idle_secs`, and once more at twice that, when the board's coordinator stands in
+/// for a T3 owner, unless the first came that late. An owner that runs again and stops
+/// starts a new spell, and so does a running owner seen again. The snapshot shows it as an
+/// alert to the owner, or to the board's coordinator, and the owner's device daemon wakes
+/// a T3 owner. Run by the sweeper.
 pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
     let cutoff = now - cx.s.doing_idle_ms();
@@ -570,23 +572,32 @@ pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
         if since > cutoff {
             continue;
         }
-        // Told this spell: a notice after the owner last ran and after the task last came to
+        // Told this spell: notices after the owner last ran and after the task last came to
         // it. A session closing later moves neither, so it is the same spell. A running
         // owner's spell starts when it was last seen, so one seen again is told again.
         let entered: i64 = cx
             .db
             .prepare_cached(ENTERED_DOING)?
             .query_row([id.as_str()], |r| r.get(0))?;
-        let told: bool = cx.db.prepare_cached(TOLD)?.query_row(
+        let (told, first): (i64, Option<i64>) = cx.db.prepare_cached(TOLD)?.query_row(
             params![
                 id.as_str(),
                 last_run.max(entered),
                 owner,
                 running.then_some(since)
             ],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if told {
+        // Once more at twice the period: the snapshot shows the coordinator a T3 owner's
+        // notice only from then, and alerts are read once, so one that snapshot in between
+        // passed the first. A first notice that came that late needs no repeat.
+        let twice = since + 2 * cx.s.doing_idle_ms();
+        let due = match told {
+            0 => true,
+            1 => now >= twice && first.is_some_and(|f| f < twice),
+            _ => false,
+        };
+        if !due {
             continue;
         }
         let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(

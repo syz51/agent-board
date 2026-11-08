@@ -316,10 +316,12 @@ Reopening a closed board, or any change on it, starts the period again.
   that `paused_until` kept) is not away. No event is recorded while an agent the owner
   delegated (a T3 thread whose `t3_parent` chain leads to the owner) is running and was
   seen within `doing_idle_secs`, or waits for a reset still to come (`paused` or `ended`).
-  The task is unchanged. The event is recorded once per spell: none is recorded while one
-  exists for the same task and owner after the owner's last change to `running` and after
-  the task last came to it (claimed, taken, moved to `doing`, handed over); a session
-  ending later is the same spell. A running owner's spell starts when it was last seen, so
+  The task is unchanged. The event is recorded at most twice per spell. The spell's
+  events are those for the same task and owner after the owner's last change to `running`
+  and after the task last came to it (claimed, taken, moved to `doing`, handed over); a
+  session ending later is the same spell. The first is recorded once the owner has been
+  away `doing_idle_secs`. A second, with the same payload, is recorded once it has been
+  away twice `doing_idle_secs`, unless the first was recorded that late; no third. A running owner's spell starts when it was last seen, so
   one seen again starts a new one. The snapshot shows it as an alert while the task is
   still in `doing` and still that owner's: to the owner, and to the board's coordinator
   when the owner is no T3 thread or has been away at least twice `doing_idle_secs`.
