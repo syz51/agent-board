@@ -436,16 +436,21 @@ settings in use, warned once per edit.
   a safe point (`prompts/coordinator.md`, Fresh sessions). The daemon keeps, per
   coordinator, the thread's `runCount` from the reconcile's `t3 thread show`, and the count
   at the last notice (the first count read starts it). Once the thread has run
-  `FRESH_SESSION_RUNS` (10) more times, a reconcile reads its 100 latest messages; it reads
-  them again only after the thread ran since. A user message is one that does not start
-  with `board <slug>:`, `Delegated task` or `Update on pull request`. T3 gives messages no
-  time, so the daemon records the newest user message by its run id with the time it first
-  saw it, and holds the notice while that is under `USER_QUIET` (60 minutes) old, without
-  reading again meanwhile. Otherwise the next wake-up the daemon sends the coordinator
-  ends with the line `board <slug>: a fresh session is due …`, and the count starts again
-  from the last one read: a coordinator that cannot rotate then (it owns a task in doing,
-  runs background work, or the user is talking with it) hears again `FRESH_SESSION_RUNS`
-  runs later. A failed send leaves the notice for the retry. The coordinator writes its
+  `FRESH_SESSION_RUNS` (10) more times, the flush that is about to send the coordinator a
+  wake-up first reads the thread's 100 latest messages, within the flush's check, so a
+  read cut short keeps the wake-up queued. A user message is one that does not start with
+  `board <slug>:`, the coordinator prompt's title (the daemon's own brief), `Delegated
+  task`, `Update on pull request` or `Background task completed`, and is not `/compact`
+  (T3's idle compaction). T3's CLI gives messages no time and no sender, so the daemon
+  records the newest user message by a digest of its run id and text (never the text)
+  with the time it first saw it, and holds the notice while that is under `USER_QUIET`
+  (60 minutes) old, without reading again meanwhile. Otherwise that wake-up ends with the
+  line `board <slug>: a fresh session is due …`, and the count starts again from the last
+  one read: a coordinator that cannot rotate then (it owns a task in doing, runs
+  background work, or the user is talking with it) hears again `FRESH_SESSION_RUNS` runs
+  later. A read that fails sends the wake-up without the notice, and a failed send leaves
+  the notice for the retry. A message another agent sent the thread looks like the
+  user's, which only delays the notice. The coordinator writes its
   state to the board first: its handoff, a thread link on each dispatched task, and a
   `decision` note for each instruction the user gave in chat. The user's board-wide
   decisions go on one `dropped` task per board, `Board decisions from the user`, named in

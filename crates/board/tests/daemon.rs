@@ -5561,7 +5561,12 @@ fn only_messages_not_from_the_board_children_or_pull_requests_are_the_users() {
         "board agent-board: your standing instructions changed",
         &board::daemon::fresh_session_message(&factory()),
         "Delegated task finished",
+        "Delegated tasks t1, t2 reached terminal states.",
         "Update on pull request #4",
+        "/compact",
+        "Background task completed.",
+        &board::daemon::coordinator_message(&factory(), false),
+        &board::daemon::adoption_message(&factory(), true),
     ] {
         assert!(!is_user_message(text), "{text}");
     }
@@ -5594,4 +5599,54 @@ fn every_brief_starts_with_what_board_brief_prints() {
             board::daemon::rebrief_message(&factory(), triage).contains(&format!("\n\n{brief} "))
         );
     }
+}
+
+#[tokio::test]
+async fn a_user_message_since_the_last_thread_check_holds_the_notice_it_would_go_with() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.set_runs("coord", FRESH_SESSION_RUNS);
+    e.daemon.reconcile(minute(6)).await.unwrap();
+    // The user writes after the reconcile read the count: the flush reads it first.
+    e.t3.message("coord", "Hold on, I am looking at factory-2.");
+    queue_ready(&mut e, 11, &["factory-11"], minute(7)).await;
+    e.daemon.flush(minute(7)).await;
+    let message = e.t3.sends().last().unwrap().1.clone();
+    assert!(message.contains("factory-11"), "{message}");
+    assert!(!says_fresh(&message), "{message}");
+}
+
+#[tokio::test]
+async fn a_failed_read_sends_the_wake_up_without_the_notice_and_tries_with_the_next() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.fail_messages.store(true, Ordering::SeqCst);
+    let message = wake_at_runs(&mut e, FRESH_SESSION_RUNS, minute(6), 11).await;
+    assert!(!says_fresh(&message), "{message}");
+    e.t3.fail_messages.store(false, Ordering::SeqCst);
+    let message = wake_at_runs(&mut e, FRESH_SESSION_RUNS + 1, minute(12), 12).await;
+    assert!(says_fresh(&message), "{message}");
+}
+
+#[test]
+fn a_message_key_names_the_run_and_text_without_keeping_the_text() {
+    use board::daemon::message_key;
+    let message = |run: Option<&str>, text: &str| UserMessage {
+        text: text.to_owned(),
+        run: run.map(str::to_owned),
+    };
+    let first = message_key(&message(Some("run:7"), "secret token abc"));
+    assert!(!first.contains("secret"));
+    assert_eq!(
+        first,
+        message_key(&message(Some("run:7"), "secret token abc"))
+    );
+    // A message steered into the same run is a new one.
+    assert_ne!(
+        first,
+        message_key(&message(Some("run:7"), "and another thing"))
+    );
+    assert_ne!(first, message_key(&message(None, "secret token abc")));
 }

@@ -203,12 +203,17 @@ after about ten runs of the thread, never while a user message is under an hour 
    - a `decision` note for each instruction the user gave you in chat that is not on the
      board yet: on the task it is about, or, for one about the whole board, on the board
      decisions task.
-4. Call T3 `t3_thread_send` on your own thread (`$T3CODE_THREAD_ID`) with `freshContext:
+4. Run `board brief <slug>` yourself first. When it fails or prints no instructions, do
+   not start a fresh session: report the failure with `feedback` and carry on in this one.
+5. Call T3 `t3_thread_send` on your own thread (`$T3CODE_THREAD_ID`) with `freshContext:
    true` and exactly this message, with the board's slug for `<slug>`:
 
    > board <slug>: fresh session. Run `board brief <slug>` and follow what it prints, then call board_snapshot.
 
-   Then end your turn with a status.
+   When this thread coordinates more than one board, add a line per other board: `Also
+   run board brief <other slug>.` When it had another role before it became coordinator
+   (an adopted thread), the handoff and notes from step 3 carry that work. Then end your
+   turn with a status.
 
 In the fresh session, `t3_thread_read` reads this thread's earlier messages when you need
 one.
