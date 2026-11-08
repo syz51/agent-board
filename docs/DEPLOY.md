@@ -107,6 +107,9 @@ A board with autopilot on gets a coordinator thread on one of its home devices, 
 project on that device. `board watch` finds the project in the device's
 `$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
+A running `board watch` re-reads the file within a minute of an edit and applies these two
+tables and `feedback_board` without a restart; a change to `server`, `device` or `t3_bin`
+needs one, and the daemon's log says so.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
