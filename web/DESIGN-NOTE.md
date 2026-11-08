@@ -12,9 +12,10 @@ inset panel, and lists that run edge to edge across it.
 - **Rows**: one row model for lists. A row has one main line and at most one line of
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
-- **Density**: 36px task rows and 38px group bands. Boards rows never cut the name or
-  slug (badges or a long slug take a second line), keep the goal to two lines and the task
-  tally to one. Agents are a two-column table: who, with
+- **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
+  name, slug and states share one line (a long slug ends in an ellipsis, whole on hover),
+  the goal keeps to two lines, the task tally to one and the coordinator to two; the Asks
+  column is right-aligned. Agents are a two-column table: who, with
   its state, when last seen and one quiet line of where it runs (cut with an ellipsis,
   whole on hover); then what it is working on, with its handoff. Priority labels share one
   weight; the bars carry the level.
@@ -23,13 +24,13 @@ inset panel, and lists that run edge to edge across it.
 - **Color and surfaces**: cool greys, a graphite primary action and one violet signal for
   links, selection and unseen marks. The panel's outline is the only elevation. Status
   colours stay, always with a shape and a word: board tallies spell out "3 done 1 review"
-  after a dot of each bar colour. Agent and board states are one style everywhere: a dot and
+  after an 8px dot of each bar colour, and an open ring for waiting. Agent and board states are one style everywhere: a dot and
   a word, no pill.
 - **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
   bottom tabs on phones. Counts there are what waits on the user, in one pill: filled amber
   for the total (Needs you), tinted amber for a board's share of it. Home has no count; its
-  Since you last looked says what is new. A count that cannot load is an offline mark, and
-  boards that cannot load are placeholder rows. On a board or a task the sidebar marks the
+  Since you last looked says what is new. A count that cannot load does not show (the
+  banner and footer say why), and boards that cannot load are placeholder rows. On a board or a task the sidebar marks the
   board, not Home.
 - **Home**: what the user follows, in sections they collapse and reorder: waiting asks (a
   left edge in each kind's colour, as on Needs you, and an Answer cue on hover), the boards,
@@ -44,7 +45,10 @@ inset panel, and lists that run edge to edge across it.
   two-line field that grows, so it plainly sends either; Cmd or Ctrl with Enter sends from
   the field. A single ask is titled with its kind ("Decision · Ask #9"), across the content
   width with its prose at a reading measure, and its task and the asking agent's handoff in
-  one card beside it, split by a rule, or below it on narrow screens.
+  the side panel beside it, split by a rule, or below it on narrow screens.
+- **Side panel**: a task's properties and an ask's context sit in one kind of card, 300px
+  wide beside the main column, its sections split by rules, and kept in view while the
+  main column scrolls on wide screens.
 - **Failures**: while the connection banner shows, only the banner warns; a failed page is
   a neutral placeholder that says it loads again once the connection is back; its icon
   tile stays error-tinted, so it never reads as an empty state. "Try again" is a filled
@@ -54,4 +58,4 @@ inset panel, and lists that run edge to edge across it.
 
 - Small type and edge-to-edge rows favour scanning on a desktop over reading on a phone.
 - Cards are gone from lists, so a row's extent shows only by its rules and hover.
-- A paused coordinator's end time can wrap its boards row to a second line.
+- A board's slug can end in an ellipsis on Home when its name and states fill the line.

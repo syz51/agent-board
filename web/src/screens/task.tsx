@@ -18,6 +18,8 @@ import {
   QueryFrame,
   RelTime,
   SectionTitle,
+  SidePanel,
+  SidePanelSection,
   StatusBadge,
   useAgents,
   useTitle,
@@ -155,69 +157,68 @@ function TaskView({
         )}
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-start lg:gap-8">
-        <aside
-          className="order-2 grid gap-5 max-lg:border-t max-lg:pt-5 lg:sticky lg:top-6 lg:border-l lg:pl-6"
-          aria-label="Properties"
-        >
-          <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
-            <div>
-              <dt>Status</dt>
-              <dd>
-                <StatusBadge status={task.status} ready={task.ready} />
-                {task.status === "open" && !task.ready && task.blockers.length > 0 && (
-                  <span className="text-muted-foreground">waiting on blockers</span>
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt>Priority</dt>
-              <dd>
-                <PriorityBadge priority={task.priority} />
-              </dd>
-            </div>
-            <div>
-              <dt>Owner</dt>
-              <dd>
-                <Owner task={task} agents={agents} />
-              </dd>
-            </div>
-            <div>
-              <dt>Autopilot</dt>
-              <dd>
-                {task.auto
-                  ? "May start without you"
-                  : task.proposal
-                    ? "Proposal: waits for an agent's review"
-                    : "Needs you to start"}
-              </dd>
-            </div>
-            {task.not_before && (
+      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_300px] lg:items-start lg:gap-8">
+        <SidePanel className="order-2" aria-label="Properties">
+          <SidePanelSection>
+            <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
               <div>
-                <dt>Not before</dt>
+                <dt>Status</dt>
                 <dd>
-                  <AbsTime at={task.not_before} />
+                  <StatusBadge status={task.status} ready={task.ready} />
+                  {task.status === "open" && !task.ready && task.blockers.length > 0 && (
+                    <span className="text-muted-foreground">waiting on blockers</span>
+                  )}
                 </dd>
               </div>
-            )}
-            <div>
-              <dt>Created</dt>
-              <dd>
-                <RelTime at={task.created_at} /> by <Who id={task.created_by} agents={agents} />
-              </dd>
-            </div>
-            <div>
-              <dt>Updated</dt>
-              <dd>
-                <RelTime at={task.updated_at} />
-              </dd>
-            </div>
-          </Facts>
+              <div>
+                <dt>Priority</dt>
+                <dd>
+                  <PriorityBadge priority={task.priority} />
+                </dd>
+              </div>
+              <div>
+                <dt>Owner</dt>
+                <dd>
+                  <Owner task={task} agents={agents} />
+                </dd>
+              </div>
+              <div>
+                <dt>Autopilot</dt>
+                <dd>
+                  {task.auto
+                    ? "May start without you"
+                    : task.proposal
+                      ? "Proposal: waits for an agent's review"
+                      : "Needs you to start"}
+                </dd>
+              </div>
+              {task.not_before && (
+                <div>
+                  <dt>Not before</dt>
+                  <dd>
+                    <AbsTime at={task.not_before} />
+                  </dd>
+                </div>
+              )}
+              <div>
+                <dt>Created</dt>
+                <dd>
+                  <RelTime at={task.created_at} /> by <Who id={task.created_by} agents={agents} />
+                </dd>
+              </div>
+              <div>
+                <dt>Updated</dt>
+                <dd>
+                  <RelTime at={task.updated_at} />
+                </dd>
+              </div>
+            </Facts>
+          </SidePanelSection>
           <TaskLinks title="Blocked by" ids={task.blockers} related={related} />
           <TaskLinks title="Blocks" ids={detail.blocks} related={related} />
           {task.parent && <TaskLinks title="Parent" ids={[task.parent]} related={related} />}
           <TaskLinks title="Subtasks" ids={detail.children} related={related} />
-        </aside>
+        </SidePanel>
 
         <div className="min-w-0">
           {task.blocked_reason && (
@@ -444,15 +445,14 @@ function TaskLinks({
 }) {
   if (ids.length === 0) return null;
   return (
-    <section id={linksId(title)} className="scroll-mt-4 border-t pt-4">
-      <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
-      <ul className="grid gap-1">
+    <SidePanelSection id={linksId(title)} className="scroll-mt-4" title={title}>
+      <ul className="-mx-2 grid gap-0.5">
         {ids.map((id) => {
           const task = related.get(id);
           return (
             <li key={id}>
               <Link
-                className="-mx-2 grid grid-cols-[14px_auto] items-center gap-x-2 gap-y-0.5 rounded-sm px-2 py-1.5 text-meta text-foreground hover:bg-secondary hover:no-underline"
+                className="grid grid-cols-[14px_auto] items-center gap-x-2 gap-y-0.5 rounded-sm px-2 py-1.5 text-meta text-foreground hover:bg-secondary hover:no-underline"
                 to="/tasks/$id"
                 params={{ id }}
               >
@@ -469,7 +469,7 @@ function TaskLinks({
           );
         })}
       </ul>
-    </section>
+    </SidePanelSection>
   );
 }
 

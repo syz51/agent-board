@@ -22,6 +22,8 @@ import {
   PageHeader,
   QueryFrame,
   RelTime,
+  SidePanel,
+  SidePanelSection,
   StatusBadge,
   useAgents,
   useTitle,
@@ -122,7 +124,7 @@ export function AskScreen() {
           {(data) => (
             // The ask fills the content width, its prose kept to a reading measure; what it is
             // about sits in a column beside it on wide screens and below it on narrow ones.
-            <div className="grid items-start gap-x-7 gap-y-6 xl:grid-cols-[minmax(0,1fr)_280px]">
+            <div className="grid items-start gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_300px]">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -137,28 +139,24 @@ export function AskScreen() {
 
 /** Beside a single ask: the task it is about and the asking agent's handoff. */
 function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
-  const heading = "text-xs font-semibold text-subtle-foreground";
-  const part = "grid content-start gap-2 px-3.5 py-3";
-  // One card, its sections split by a rule: stacked beside the ask on wide screens, side by
-  // side below it on medium ones.
+  // The side panel, as on a task page: stacked beside the ask on wide screens, its sections
+  // side by side below it on medium ones.
   return (
-    <aside
-      className="grid content-start divide-y overflow-hidden rounded-lg border bg-card sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
+    <SidePanel
+      className="sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
       aria-label="About this ask"
     >
       {ask.task && (
-        <section className={part}>
-          <h2 className={heading}>Task</h2>
+        <SidePanelSection title="Task">
           <AskTask id={ask.task} agents={agents} />
-        </section>
+        </SidePanelSection>
       )}
-      <section className={part}>
-        <h2 className={heading}>Asked by</h2>
+      <SidePanelSection title="Asked by">
         <Who id={ask.agent} agents={agents} />
         {/* As on the agents page, an ended agent's handoff is history, not context. */}
         {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} stacked />}
-      </section>
-    </aside>
+      </SidePanelSection>
+    </SidePanel>
   );
 }
 
@@ -174,7 +172,7 @@ function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
   return (
     <div className="grid gap-2">
       <Link
-        className="line-clamp-2 text-sm font-medium [overflow-wrap:anywhere] text-foreground"
+        className="line-clamp-2 text-sm font-medium text-balance [overflow-wrap:anywhere] text-foreground"
         to="/tasks/$id"
         params={{ id }}
         title={task.title}

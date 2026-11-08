@@ -259,12 +259,19 @@ export function plainLine(text: string): string {
 }
 
 const SEGMENTS = [
-  { key: "done", label: "done", bar: "bg-status-done" },
-  { key: "review", label: "review", bar: "bg-status-review" },
-  { key: "doing", label: "doing", bar: "bg-status-doing" },
-  { key: "blocked", label: "blocked", bar: "bg-status-blocked" },
-  { key: "ready", label: "ready", bar: "bg-status-ready" },
-  { key: "waiting", label: "waiting", bar: "bg-input" },
+  { key: "done", label: "done", bar: "bg-status-done", dot: "bg-status-done" },
+  { key: "review", label: "review", bar: "bg-status-review", dot: "bg-status-review" },
+  { key: "doing", label: "doing", bar: "bg-status-doing", dot: "bg-status-doing" },
+  { key: "blocked", label: "blocked", bar: "bg-status-blocked", dot: "bg-status-blocked" },
+  { key: "ready", label: "ready", bar: "bg-status-ready", dot: "bg-status-ready" },
+  // Not started: the bar is the track's grey and the dot an open ring, never a grey disc
+  // that reads as done.
+  {
+    key: "waiting",
+    label: "waiting",
+    bar: "bg-input",
+    dot: "border-[1.5px] border-subtle-foreground bg-transparent",
+  },
 ] as const;
 
 function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
@@ -333,12 +340,18 @@ const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
   coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
-  asks: "",
+  // Counts and dashes share a right edge, as numbers in a table column do.
+  asks: "@min-[760px]:justify-self-end",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
+/**
+ * The boards table's columns. Every row is one height on wide screens: the name line never
+ * wraps (a long slug ends in an ellipsis), the goal keeps to two lines, the tally to one
+ * and the coordinator to two, so the cells sit centred in a 78px row.
+ */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_40px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -368,7 +381,10 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
           aria-hidden="true"
         >
           {group.headers.map((header) => (
-            <span key={header.id} className={AREA[header.id]}>
+            <span
+              key={header.id}
+              className={cn(AREA[header.id], header.id === "asks" && "justify-self-end")}
+            >
               <table.FlexRender header={header} />
             </span>
           ))}
@@ -380,7 +396,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-(--gutter) py-3 @min-[760px]:min-h-14 @min-[760px]:py-2 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-[78px] @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -398,10 +414,11 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      {/* The name and slug are never cut: where the badges do not fit beside them, they
-          move to a line of their own. */}
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em] [overflow-wrap:anywhere]">
+      {/* One line: the name, its slug and its states. Where they do not fit, the slug gives
+          way first, ending in an ellipsis (whole on hover and in the board's address); the
+          name and the states keep their width. */}
+      <div className="flex h-5 min-w-0 items-center gap-x-2">
+        <h3 className="max-w-full flex-none truncate text-sm font-semibold tracking-[-0.006em]">
           <Link
             className="text-foreground"
             to="/boards/$slug"
@@ -411,7 +428,10 @@ function BoardName({ board }: { board: Board }) {
             {board.title}
           </Link>
         </h3>
-        <span className="ident min-w-0 text-meta [overflow-wrap:anywhere] text-muted-foreground">
+        <span
+          className="ident min-w-0 flex-[0_1000_auto] truncate text-meta text-muted-foreground"
+          title={board.slug}
+        >
           {board.slug}
         </span>
         {board.status !== "active" && (
@@ -421,7 +441,7 @@ function BoardName({ board }: { board: Board }) {
           </StatePill>
         )}
         {board.temporary && (
-          <Badge variant="outline" shape="tag">
+          <Badge variant="outline" shape="tag" className="flex-none">
             Temporary
           </Badge>
         )}
@@ -460,7 +480,7 @@ function TaskTally({ board }: { board: Board }) {
       ) : (
         <ul
           // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
+          className="flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -469,10 +489,10 @@ function TaskTally({ board }: { board: Board }) {
                 // A count and its word, in the bar's order, after a dot of its bar colour.
                 <li
                   key={segment.key}
-                  className="inline-flex items-center gap-1 whitespace-nowrap max-md:gap-0.75"
+                  className="inline-flex items-center gap-0.75 whitespace-nowrap"
                 >
                   <span
-                    className={cn("size-1.5 flex-none rounded-full", segment.bar)}
+                    className={cn("size-2 flex-none rounded-full", segment.dot)}
                     aria-hidden="true"
                   />
                   <strong className="font-semibold text-foreground tabular-nums">
