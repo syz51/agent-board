@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::{REPO, T};
 use crate::db::{live_sql, ready_sql};
+use crate::ops::asks::BY_TELEGRAM_MESSAGE;
 use crate::ops::leases::DELEGATION_FAMILY;
 use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
 use crate::snapshot::{
@@ -218,6 +219,16 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
         assert!(!p.contains("SCAN events"), "{sql}:\n{p}");
         assert!(!p.contains("TEMP B-TREE"), "{sql}:\n{p}");
     }
+}
+
+/// A reply from Telegram finds its ask by chat and message along an index, not by scanning
+/// every ask.
+#[tokio::test]
+async fn a_telegram_reply_searches_asks_by_chat_and_message() {
+    let t = T::new();
+    let p = plan(&t, BY_TELEGRAM_MESSAGE);
+    assert!(p.contains("INDEX asks_telegram_message"), "{p}");
+    assert!(!p.contains("SCAN"), "{p}");
 }
 
 /// The two-query recent() picks the same events, in the same order, as the one query it

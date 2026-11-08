@@ -672,6 +672,72 @@ async fn an_answer_that_fails_to_record_is_reported_and_stays_answerable() {
     notifier.await.unwrap();
 }
 
+/// Telegram does not resend an update, so a reply whose ask the board cannot look up asks
+/// the user to send it again. The paired chat is read once, before the first poll, so
+/// answers do not depend on reading it again.
+#[tokio::test]
+async fn a_reply_that_fails_to_read_is_reported_and_stays_answerable() {
+    const PHONE: i64 = 555;
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let notifier = spawn_telegram(t.state.clone(), unpaired(api_base))
+        .unwrap()
+        .unwrap();
+    let code = t.state.create_telegram_pairing(false).unwrap();
+    fake.handle(start(1, PHONE, "private", &format!("/start {code}")))
+        .await;
+    fake.wait("sendMessage", 1).await;
+    let id = ask(&t, "Log in to the registry").await;
+    fake.wait("sendMessage", 2).await;
+    let reply = |update_id: i64| {
+        json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 80 + update_id, "chat": { "id": PHONE, "type": "private" },
+                "text": "done", "reply_to_message": { "message_id": 1002, "chat": { "id": PHONE } },
+            },
+        })
+    };
+    let sql = |sql: &'static str| {
+        t.state.write(move |cx| {
+            cx.db.execute_batch(sql)?;
+            Ok(())
+        })
+    };
+    sql("ALTER TABLE telegram_chat RENAME TO telegram_chat_away;")
+        .await
+        .unwrap();
+
+    // The ask a reply answers cannot be looked up.
+    sql("ALTER TABLE asks RENAME TO asks_away;").await.unwrap();
+    fake.push(reply(2));
+    let sent = fake.wait("sendMessage", 3).await;
+    assert_eq!(sent[2]["chat_id"], PHONE);
+    assert_eq!(
+        sent[2]["text"],
+        "The board could not read this reply; if it answers an ask, send it again."
+    );
+    assert_eq!(sent[2]["reply_parameters"]["message_id"], 82);
+    sql("ALTER TABLE asks_away RENAME TO asks;").await.unwrap();
+    let open = t.ok("GET", "/v1/asks?status=open", None, None).await;
+    assert_eq!(open.as_array().unwrap().len(), 1, "{open}");
+
+    // Sending it again once the asks are back answers it, with the paired chat still
+    // unreadable.
+    fake.push(reply(3));
+    assert_eq!(wait_for_answer(&t, id).await["answer"], "done");
+    let sent = fake.wait("sendMessage", 4).await;
+    assert_eq!(sent[3]["text"], format!("Answered ask {id}: done"));
+    sql("ALTER TABLE telegram_chat_away RENAME TO telegram_chat;")
+        .await
+        .unwrap();
+
+    t.state.shutdown();
+    notifier.await.unwrap();
+}
+
 #[tokio::test]
 async fn an_ask_created_while_a_chat_pairs_is_sent_once() {
     const PHONE: i64 = 555;
@@ -700,7 +766,9 @@ async fn an_ask_created_while_a_chat_pairs_is_sent_once() {
 
 #[tokio::test]
 async fn a_send_claim_holds_only_for_the_current_chat() {
-    use crate::ops::asks::{claim_telegram_send, set_telegram_message, telegram_message};
+    use crate::ops::asks::{
+        by_telegram_message, claim_telegram_send, set_telegram_message, telegram_message,
+    };
     use crate::ops::telegram::redeem;
 
     let t = T::new();
@@ -738,6 +806,11 @@ async fn a_send_claim_holds_only_for_the_current_chat() {
         .await
         .unwrap();
     assert_eq!(sent(id).await.unwrap(), Some((2, 501)));
+    // A reply finds the ask by chat and message: the same message id in another chat is
+    // another message.
+    let found = |chat: i64| t.state.read(move |cx| by_telegram_message(cx, chat, 501));
+    assert_eq!(found(2).await.unwrap(), Some(id));
+    assert_eq!(found(1).await.unwrap(), None);
 
     // A configured chat is not checked against the paired one.
     assert!(claim(other, 9, false).await.unwrap());
