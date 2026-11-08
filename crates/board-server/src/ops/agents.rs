@@ -213,25 +213,31 @@ pub(crate) fn boards_for_repo(cx: &Ctx<'_>, repo: &str) -> Result<Vec<board_prot
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// How long an ended agent stays in a board's listing: its membership and record stay, so
-/// it comes back when it resumes, and `state=ended` lists it.
-const ENDED_LISTED_MS: i64 = 7 * 86_400_000;
+/// How long an unseen agent stays in a board's listing: its membership and record stay, so
+/// it comes back when it is seen again, and `state=ended` lists the ended ones.
+const UNSEEN_LISTED_MS: i64 = 7 * 86_400_000;
 
-/// Agents, by board and state. A board's listing leaves out agents that ended more than a
-/// week ago unless `state=ended`, so it does not grow with every session the board ever
-/// had; the unfiltered listing stays complete, as clients use it to name agents.
+/// Agents, by board and state. A board's listing leaves out agents not seen for more than a
+/// week, whatever their state (a session that crashed never sends `ended`), unless they
+/// wait for a usage-limit reset still ahead or the request asks for `state=ended`. So it
+/// does not grow with every session the board ever had; the unfiltered listing stays
+/// complete, as clients use it to name agents.
 pub(crate) fn list(
     cx: &Ctx<'_>,
     board: Option<&board_proto::BoardSlug>,
     state: Option<AgentState>,
 ) -> Result<Vec<Agent>> {
     let board = board.map(|b| b.as_str().to_owned());
-    let ended_before = cx.now_ms() - ENDED_LISTED_MS;
+    let now = cx.now_ms();
+    let unseen_before = now - UNSEEN_LISTED_MS;
     let mut filter = vec!["1 = 1"];
     let mut params: crate::store::NamedParams<'_> = Vec::new();
     if board.is_some() && state != Some(AgentState::Ended) {
-        filter.push("NOT (state = 'ended' AND last_seen < :ended_before)");
-        params.push((":ended_before", &ended_before));
+        filter.push(
+            "NOT (last_seen < :unseen_before AND (paused_until IS NULL OR paused_until <= :now))",
+        );
+        params.push((":unseen_before", &unseen_before));
+        params.push((":now", &now));
     }
     let state = state.map(|s| enum_str(&s));
     if let Some(board) = &board {

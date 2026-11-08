@@ -148,8 +148,12 @@ server's minute sweep deletes older ones.
   refused before anything is sent, with an error that says to drop the flag. Elsewhere,
   where the environment proves no identity, any agent may be named. The server does not
   check this.
-- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
-  than 7 days ago are left out unless `state=ended`; they stay members of the board.
+- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents not seen for more
+  than 7 days are left out whatever their state, since a session that crashed never sends
+  `ended`. Two exceptions: an agent waiting for a usage-limit reset still to come
+  (`paused_until` ahead) stays listed, and `state=ended` lists every ended agent. The
+  agents left out stay members of the board, and any newer call lists them again.
+  (Servers before this change left out only agents that ended more than 7 days ago.)
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's file leases; owned tasks stay owned. Its coordinator lease

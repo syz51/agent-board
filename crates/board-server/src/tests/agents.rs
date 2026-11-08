@@ -488,13 +488,14 @@ async fn devices_register_agents_only_as_themselves() {
 }
 
 #[tokio::test]
-async fn board_listings_leave_out_agents_ended_more_than_a_week_ago() {
+async fn board_listings_leave_out_agents_unseen_for_more_than_a_week() {
     let t = T::new();
     t.board("factory", &[REPO]).await;
-    let (live, gone) = ("t3:live", "t3:gone");
-    for agent in [live, gone] {
+    let (crashed, gone, limited, seen) = ("t3:crashed", "t3:gone", "t3:limited", "t3:seen");
+    for agent in [crashed, gone, limited, seen] {
         t.register(agent, Some(REPO), None).await;
     }
+    // `crashed` stays running: a session that dies never sends `ended`.
     t.ok(
         "POST",
         &format!("/v1/agents/{gone}/state"),
@@ -502,34 +503,79 @@ async fn board_listings_leave_out_agents_ended_more_than_a_week_ago() {
         Some(json!({ "state": "ended" })),
     )
     .await;
+    // A weekly usage limit: the reset comes after a week of silence.
+    let reset = t.state.now() + TimeDelta::days(8);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{limited}/state"),
+        Some(limited),
+        Some(json!({ "state": "paused", "paused_until": reset.to_rfc3339() })),
+    )
+    .await;
+    // Sorted by id: the server orders agents by handle, a hash.
     let listed = |path: &'static str| {
         let t = &t;
         async move {
             let agents = t.ok("GET", path, None, None).await;
-            agents
+            let mut ids = agents
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|a| a["id"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
         }
     };
     t.advance(TimeDelta::days(7) - TimeDelta::minutes(1));
-    assert_eq!(listed("/v1/agents?board=factory").await, [gone, live]);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{seen}/state"),
+        Some(seen),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    assert_eq!(
+        listed("/v1/agents?board=factory").await,
+        [crashed, gone, limited, seen]
+    );
 
-    // Past a week the ended agent drops out of listings, also when the live one is quiet;
-    // asking for ended agents still lists it, and it stays a member of the board.
+    // Past a week unseen agents drop out of listings whatever their state, also for a
+    // state filter, except one waiting for a reset still ahead and the one seen since.
+    // Asking for ended agents still lists them, and they stay members of the board.
     t.advance(TimeDelta::minutes(2));
-    assert_eq!(listed("/v1/agents?board=factory").await, [live]);
+    assert_eq!(listed("/v1/agents?board=factory").await, [limited, seen]);
+    assert_eq!(
+        listed("/v1/agents?board=factory&state=running").await,
+        Vec::<String>::new()
+    );
     assert_eq!(listed("/v1/agents?board=factory&state=ended").await, [gone]);
     // Without a board the listing stays complete: clients use it to name agents.
-    assert_eq!(listed("/v1/agents").await, [gone, live]);
-    let agent = t.ok("GET", &format!("/v1/agents/{gone}"), None, None).await;
-    assert_eq!(agent["boards"], json!(["factory"]));
+    assert_eq!(listed("/v1/agents").await, [crashed, gone, limited, seen]);
+    for agent in [crashed, gone] {
+        let agent = t
+            .ok("GET", &format!("/v1/agents/{agent}"), None, None)
+            .await;
+        assert_eq!(agent["boards"], json!(["factory"]));
+    }
 
-    // Resuming brings it back.
+    // Once its reset has passed, the paused agent drops out too.
+    t.advance(TimeDelta::days(1));
+    assert_eq!(listed("/v1/agents?board=factory").await, [seen]);
+
+    // Any newer sign of life brings an agent back: a state update or a registration.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{crashed}/state"),
+        Some(crashed),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
     t.register(gone, Some(REPO), None).await;
-    assert_eq!(listed("/v1/agents?board=factory").await, [gone, live]);
+    assert_eq!(
+        listed("/v1/agents?board=factory").await,
+        [crashed, gone, seen]
+    );
 }
 
 #[tokio::test]
