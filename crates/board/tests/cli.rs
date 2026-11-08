@@ -2164,6 +2164,94 @@ fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     assert_eq!(claims[0].agent.as_deref(), Some(PEER));
 }
 
+#[test]
+fn agent_naming_an_unknown_id_is_refused_without_a_write() {
+    let e = env();
+    const STRAY: &str = "claude:e2e-xb";
+    e.stub.on_status(
+        &format!("GET /v1/agents/{}", enc(STRAY)),
+        404,
+        json!({"code": "not_found", "message": "no such agent", "next": "register first"}),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(STRAY, DEVICE, board_proto::AgentState::Running),
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+
+    // Outside a T3 thread, where any id may be named: an id the server does not know is
+    // refused before any write, so nothing registers it.
+    for args in [
+        &["--agent", STRAY, "claim", "factory-12"][..],
+        &["--agent", STRAY, "status"],
+        &["--agent", STRAY, "feedback", "--about", "board", "slow"],
+    ] {
+        let out = board(&e.home, &e.cwd, &[], args, "");
+        assert!(!out.status.success(), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains("does not know"), "{args:?}: {err}");
+        assert!(
+            err.contains("drop --agent to act as yourself"),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains("hooks or the daemon"), "{args:?}: {err}");
+    }
+    let writes: Vec<_> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.method != "GET")
+        .collect();
+    assert!(writes.is_empty(), "{writes:?}");
+
+    // --register lets a script with its own fixed id register it, on either side of the
+    // command.
+    for args in [
+        &["--agent", STRAY, "--register", "claim", "factory-12"][..],
+        &["--agent", STRAY, "claim", "factory-12", "--register"],
+    ] {
+        e.stub.clear();
+        let out = board(&e.home, &e.cwd, &[], args, "");
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        assert_eq!(e.stub.requests_to("POST /v1/agents")[0].body["id"], STRAY);
+        assert_eq!(
+            e.stub.requests_to("POST /v1/tasks/factory-12/claim").len(),
+            1
+        );
+    }
+
+    // --register names no agent of its own.
+    let out = board(&e.home, &e.cwd, &[], &["--register", "status"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("pass --agent <id> with it"),
+        "{}",
+        stderr(&out)
+    );
+
+    // In a T3 thread, --agent naming the thread's own unknown id registers it, as it would
+    // without the flag.
+    const OWN: &str = "t3:thread-9";
+    e.stub.clear();
+    e.stub.on_status(
+        &format!("GET /v1/agents/{}", enc(OWN)),
+        404,
+        json!({"code": "not_found", "message": "no such agent", "next": "register first"}),
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[("T3CODE_THREAD_ID", "thread-9")],
+        &["--agent", OWN, "claim", "factory-12"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(e.stub.requests_to("POST /v1/agents")[0].body["id"], OWN);
+}
+
 /// A server that predates the proposal filter ignores it, returns every task and calls a
 /// pending proposal ready: the CLI filters and marks proposals by the shared rule.
 #[test]
