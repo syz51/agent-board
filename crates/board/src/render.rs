@@ -129,7 +129,18 @@ pub fn task_list(tasks: &[Task]) -> String {
     if tasks.is_empty() {
         return "no tasks".into();
     }
-    tasks.iter().map(task_line).collect::<Vec<_>>().join("\n")
+    tasks
+        .iter()
+        .map(|task| {
+            let mut line = task_line(task);
+            // Umbrella tasks: `task_list parent=<id>` lists the children.
+            if task.child_count > 0 {
+                let _ = write!(line, " children {}", task.child_count);
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Tasks with their bodies and acceptance checks as peer text.
@@ -145,6 +156,54 @@ pub fn task_list_detailed(tasks: &[Task]) -> String {
         list
     } else {
         format!("{list}\n{block}")
+    }
+}
+
+/// Statuses in the order a parent's children line counts them: finished work first.
+const CHILD_STATUS_ORDER: [TaskStatus; 6] = [
+    TaskStatus::Done,
+    TaskStatus::Review,
+    TaskStatus::Doing,
+    TaskStatus::Blocked,
+    TaskStatus::Open,
+    TaskStatus::Dropped,
+];
+
+/// The children line: how many children, a count per status, then the ids of each status.
+/// A server that predates `child_tasks` sends the ids alone, which print as they are.
+fn children(out: &mut String, detail: &TaskDetail) {
+    if detail.child_tasks.is_empty() {
+        if !detail.children.is_empty() {
+            let ids: Vec<&str> = detail.children.iter().map(TaskId::as_str).collect();
+            let _ = write!(out, "\nchildren {}", ids.join(","));
+        }
+        return;
+    }
+    let by_status: Vec<(TaskStatus, Vec<&str>)> = CHILD_STATUS_ORDER
+        .iter()
+        .map(|&status| {
+            let ids = detail
+                .child_tasks
+                .iter()
+                .filter(|c| c.status == status)
+                .map(|c| c.id.as_str())
+                .collect();
+            (status, ids)
+        })
+        .filter(|(_, ids): &(TaskStatus, Vec<&str>)| !ids.is_empty())
+        .collect();
+    let counts: Vec<String> = by_status
+        .iter()
+        .map(|(status, ids)| format!("{} {}", enum_str(status), ids.len()))
+        .collect();
+    let _ = write!(
+        out,
+        "\nchildren {}: {}",
+        detail.child_tasks.len(),
+        counts.join(" · ")
+    );
+    for (status, ids) in &by_status {
+        let _ = write!(out, "\n  {} {}", enum_str(status), ids.join(","));
     }
 }
 
@@ -191,10 +250,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         let ids: Vec<&str> = detail.blocks.iter().map(|b| b.as_str()).collect();
         let _ = write!(out, "\nblocks {}", ids.join(","));
     }
-    if !detail.children.is_empty() {
-        let ids: Vec<&str> = detail.children.iter().map(|b| b.as_str()).collect();
-        let _ = write!(out, "\nchildren {}", ids.join(","));
-    }
+    children(&mut out, detail);
     for ev in &detail.evidence {
         let _ = write!(
             out,

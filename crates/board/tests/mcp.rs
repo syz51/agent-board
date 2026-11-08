@@ -120,6 +120,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };
@@ -486,6 +487,7 @@ fn a_server_on_another_build_adds_one_warning_to_a_tool_result() {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };
@@ -639,4 +641,74 @@ fn an_unknown_argument_is_refused_before_anything_is_sent() {
         "{refused}"
     );
     assert!(stub.requests().is_empty(), "nothing reached the server");
+}
+
+#[test]
+fn task_list_narrows_to_a_parent_and_task_show_counts_its_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut umbrella = task_fixture("factory-1", "Umbrella");
+    umbrella.child_count = 1;
+    let mut child = task_fixture("factory-2", "Child");
+    child.parent = Some("factory-1".parse().unwrap());
+    stub.on("GET /v1/tasks", [umbrella, child]);
+    stub.on("GET /v1/tasks/factory-1", parent_detail());
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let list = mcp.request(2, "tools/list", json!({}));
+    let tool = |name: &str| {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        tool("task_list")["inputSchema"]["properties"]["parent"]["type"],
+        "string"
+    );
+    // agent-board-244: the schema says where a parent may be.
+    let parent = tool("task_add")["inputSchema"]["properties"]["parent"]["description"].clone();
+    assert!(
+        parent.as_str().unwrap().contains("same board only")
+            && parent.as_str().unwrap().contains("use blockers"),
+        "{parent}"
+    );
+
+    // Every task, marked with its child count; then the same set the CLI's --parent gives.
+    let all = mcp.call(3, "task_list", json!({"board": "factory"}));
+    assert!(
+        text(&all).contains("factory-1 open p1 \"Umbrella\" ready auto children 1"),
+        "{all}"
+    );
+    let children = mcp.call(
+        4,
+        "task_list",
+        json!({"parent": "factory-1", "status": "open"}),
+    );
+    assert_ne!(children["isError"], true, "{children}");
+    let q = stub.requests_to("GET /v1/tasks")[1].query_pairs();
+    assert_eq!(
+        (q["parent"].as_str(), q["status"].as_str()),
+        ("factory-1", "open")
+    );
+    assert_eq!(text(&children), "factory-2 open p1 \"Child\" ready auto");
+
+    let shown = mcp.call(5, "task_show", json!({"id": "factory-1"}));
+    assert!(text(&shown).contains(PARENT_CHILDREN_LINES), "{shown}");
 }

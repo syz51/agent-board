@@ -1993,3 +1993,135 @@ async fn a_proposal_cannot_be_created_claimed() {
     );
     assert!(v["next"].as_str().unwrap().contains("without claim"), "{v}");
 }
+
+#[tokio::test]
+async fn the_task_list_narrows_to_a_parents_children_with_their_statuses() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let parent = t.task(A, "factory", "Umbrella").await;
+    let child = |title: &'static str, priority: &'static str| json!({ "board": "factory", "title": title, "parent": parent, "priority": priority });
+    let first = t.task_with(A, child("First child", "p2")).await;
+    let second = t.task_with(A, child("Second child", "p1")).await;
+    let third = t.task_with(A, child("Third child", "p2")).await;
+    // A grandchild is not a direct child; a task elsewhere is no child at all.
+    let grandchild = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Grandchild", "parent": first }),
+        )
+        .await;
+    t.task(A, "factory", "Unrelated").await;
+    assert!(t.claim(A, &second).await.0.is_success());
+    assert!(t.claim(B, &third).await.0.is_success());
+    assert!(t.done(B, &third, check(0)).await.0.is_success());
+
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let path = format!("/v1/tasks?parent={parent}");
+    let all = t.ok("GET", &path, None, None).await;
+    // List order: priority, then number.
+    assert_eq!(ids(&all), [second.as_str(), first.as_str(), third.as_str()]);
+    // The filter combines with the others.
+    let open = t
+        .ok("GET", &format!("{path}&status=open"), None, None)
+        .await;
+    assert_eq!(ids(&open), [first.as_str()]);
+    let ready = t.ok("GET", &format!("{path}&ready=true"), None, None).await;
+    assert_eq!(ids(&ready), [first.as_str()]);
+    let mine = t
+        .ok("GET", &format!("{path}&mine=true"), Some(A), None)
+        .await;
+    assert_eq!(ids(&mine), [second.as_str()]);
+    let owned = t.ok("GET", &format!("{path}&owner={B}"), None, None).await;
+    assert_eq!(ids(&owned), [third.as_str()]);
+    let here = t
+        .ok("GET", &format!("{path}&board=factory"), None, None)
+        .await;
+    assert_eq!(ids(&here).len(), 3);
+    let elsewhere = t
+        .ok("GET", &format!("{path}&board=other"), None, None)
+        .await;
+    assert_eq!(ids(&elsewhere), Vec::<String>::new());
+    let grand = t
+        .ok("GET", &format!("/v1/tasks?parent={first}"), None, None)
+        .await;
+    assert_eq!(ids(&grand), [grandchild.as_str()]);
+    // A task without children, or one that does not exist, has an empty list.
+    let none = t
+        .ok("GET", &format!("/v1/tasks?parent={grandchild}"), None, None)
+        .await;
+    assert_eq!(ids(&none), Vec::<String>::new());
+    let none = t
+        .ok("GET", "/v1/tasks?parent=factory-999", None, None)
+        .await;
+    assert_eq!(ids(&none), Vec::<String>::new());
+    let (s, v) = t
+        .call("GET", "/v1/tasks?parent=not%20an%20id", None, None)
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+
+    // Every task read counts children, whatever their status; none is left out.
+    let listed = t.ok("GET", "/v1/tasks?board=factory", None, None).await;
+    let count = |id: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .unwrap()
+            .get("child_count")
+            .cloned()
+    };
+    assert_eq!(count(&parent), Some(json!(3)));
+    assert_eq!(count(&first), Some(json!(1)));
+    assert_eq!(count(&second), None);
+
+    // The detail lists the children by number, with their titles and statuses.
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{parent}"), None, None)
+        .await;
+    assert_eq!(detail["task"]["child_count"], 3);
+    assert_eq!(detail["children"], json!([first, second, third]));
+    assert_eq!(
+        detail["child_tasks"],
+        json!([
+            { "id": first, "title": "First child", "status": "open", "ready": true },
+            { "id": second, "title": "Second child", "status": "doing", "ready": false },
+            { "id": third, "title": "Third child", "status": "done", "ready": false },
+        ])
+    );
+    let leaf = t
+        .ok("GET", &format!("/v1/tasks/{second}"), None, None)
+        .await;
+    assert_eq!(leaf["children"], json!([]));
+    assert!(leaf.get("child_tasks").is_none(), "{leaf}");
+    assert!(leaf["task"].get("child_count").is_none(), "{leaf}");
+}
+
+#[tokio::test]
+async fn a_parent_on_another_board_is_refused_with_the_alternatives() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let elsewhere = t.task(A, "other", "Elsewhere").await;
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "agent": A, "board": "factory", "title": "Child",
+                         "parent": elsewhere })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    let next = v["next"].as_str().unwrap();
+    assert!(next.contains("name it in the body or use blockers"), "{v}");
+}

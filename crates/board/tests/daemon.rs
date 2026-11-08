@@ -768,6 +768,7 @@ fn detail(id: &str, ready: bool, blocks: &[&str]) -> TaskDetail {
         evidence: vec![],
         blocks: blocks.iter().map(|b| b.parse().unwrap()).collect(),
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     }

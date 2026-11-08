@@ -192,6 +192,7 @@ fn done_reads_the_version_and_sends_paired_evidence() {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };
@@ -253,6 +254,7 @@ fn show_frames_peer_text_and_escapes_tags() {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };
@@ -274,6 +276,7 @@ fn show_reads_resolution_kinds_from_newer_servers() {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };
@@ -1505,6 +1508,7 @@ fn update_owner_hands_the_task_over_and_catches_an_old_server() {
             evidence: vec![],
             blocks: vec![],
             children: vec![],
+            child_tasks: vec![],
             history: vec![],
             handles: Default::default(),
         },
@@ -1580,6 +1584,7 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
             evidence: vec![],
             blocks: vec![],
             children: vec![],
+            child_tasks: vec![],
             history: vec![],
             handles: Default::default(),
         },
@@ -2089,4 +2094,79 @@ fn help_names_the_json_shape_and_sends_nothing() {
         assert!(text.contains(shape), "{args:?}: {text}");
     }
     assert!(e.stub.requests().is_empty(), "help sent a request");
+}
+
+#[test]
+fn ls_narrows_to_a_parents_children_and_marks_umbrella_tasks() {
+    let e = env();
+    let mut umbrella = task_fixture("factory-1", "Umbrella");
+    umbrella.child_count = 2;
+    let mut child = task_fixture("factory-2", "Child");
+    child.parent = Some("factory-1".parse().unwrap());
+    // A server that predates the filter answers with every task; the CLI keeps the children.
+    e.stub.on("GET /v1/tasks", [umbrella, child]);
+
+    let out = e.run(&["ls", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert_eq!(
+        lines,
+        [
+            "factory-1 open p1 \"Umbrella\" ready auto children 2",
+            "factory-2 open p1 \"Child\" ready auto",
+        ]
+    );
+
+    let out = e.run(&[
+        "ls",
+        "--parent",
+        "factory-1",
+        "--status",
+        "open",
+        "--ready",
+        "--board",
+        "factory",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let q = e.stub.requests_to("GET /v1/tasks")[1].query_pairs();
+    assert_eq!(q["parent"], "factory-1");
+    assert_eq!(q["status"], "open");
+    assert_eq!(q["ready"], "true");
+    assert_eq!(q["board"], "factory");
+    assert_eq!(
+        stdout(&out).trim(),
+        "factory-2 open p1 \"Child\" ready auto"
+    );
+
+    let out = e.run(&["ls", "--parent", "not an id"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+#[test]
+fn show_counts_children_by_status_and_keeps_their_ids() {
+    let e = env();
+    e.stub.on("GET /v1/tasks/factory-1", parent_detail());
+    let out = e.run(&["show", "factory-1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains(PARENT_CHILDREN_LINES), "{text}");
+
+    // A server that predates child_tasks sends the ids alone.
+    let mut old = serde_json::to_value(parent_detail()).unwrap();
+    old.as_object_mut().unwrap().remove("child_tasks");
+    e.stub.on("GET /v1/tasks/factory-1", &old);
+    let text = stdout(&e.run(&["show", "factory-1"]));
+    assert!(
+        text.contains("\nchildren factory-2,factory-3,factory-4,factory-5"),
+        "{text}"
+    );
+
+    // A task without children has no children line.
+    let mut leaf = parent_detail();
+    leaf.task = task_fixture("factory-3", "Child");
+    leaf.children.clear();
+    leaf.child_tasks.clear();
+    e.stub.on("GET /v1/tasks/factory-3", &leaf);
+    let text = stdout(&e.run(&["show", "factory-3"]));
+    assert!(!text.contains("children"), "{text}");
 }

@@ -362,6 +362,9 @@ pub struct TaskQuery {
     pub proposal: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mine: Option<bool>,
+    /// Only the direct children of this task; servers before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -769,6 +772,9 @@ impl Client {
         // Servers that predate the `proposal` filter ignore it and return every task.
         if let Some(want) = q.proposal {
             tasks.retain(|t| t.is_pending_proposal() == want);
+        }
+        if let Some(parent) = &q.parent {
+            tasks.retain(|t| t.parent.as_ref() == Some(parent));
         }
         Ok(tasks)
     }

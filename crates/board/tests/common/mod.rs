@@ -550,6 +550,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         version: 3,
         feedback: None,
         summary: None,
+        child_count: 0,
         created_at: at(),
         updated_at: at(),
     }
@@ -584,3 +585,34 @@ pub fn snapshot_fixture(kind: SnapshotKind, text: &str, seq: i64) -> Snapshot {
         at: Utc::now(),
     }
 }
+
+/// A parent's detail with four children in three statuses, as a current server sends it.
+pub fn parent_detail() -> board_proto::TaskDetail {
+    let mut task = task_fixture("factory-1", "Umbrella");
+    task.child_count = 4;
+    let child = |id: &str, status: TaskStatus| board_proto::ChildTask {
+        id: id.parse().unwrap(),
+        title: format!("Child {id}"),
+        status,
+        ready: status == TaskStatus::Open,
+    };
+    let child_tasks = vec![
+        child("factory-2", TaskStatus::Done),
+        child("factory-3", TaskStatus::Open),
+        child("factory-4", TaskStatus::Done),
+        child("factory-5", TaskStatus::Blocked),
+    ];
+    board_proto::TaskDetail {
+        task,
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: child_tasks.iter().map(|c| c.id.clone()).collect(),
+        child_tasks,
+        history: vec![],
+        handles: Default::default(),
+    }
+}
+
+/// What `show` and `task_show` print for [`parent_detail`]'s children.
+pub const PARENT_CHILDREN_LINES: &str = "children 4: done 2 · blocked 1 · open 1\n  done factory-2,factory-4\n  blocked factory-5\n  open factory-3";

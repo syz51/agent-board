@@ -172,6 +172,14 @@ pub struct Task {
     /// servers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// How many tasks name this one as their parent, whatever their status. Absent when
+    /// none does, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub child_count: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Task {
@@ -277,12 +285,28 @@ pub struct TaskDetail {
     pub evidence: Vec<Evidence>,
     /// Tasks this one blocks.
     pub blocks: Vec<TaskId>,
+    /// Tasks that name this one as their parent, by id number.
     pub children: Vec<TaskId>,
+    /// The same children in the same order, with their titles and statuses. Absent from
+    /// servers that predate it, which send `children` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_tasks: Vec<ChildTask>,
     pub history: Vec<Event>,
     /// Short handles of the agents this detail names (owner, authors, actors), by agent id;
     /// an id without one is shown as it is.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub handles: BTreeMap<String, String>,
+}
+
+/// A child task as its parent's detail lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildTask {
+    pub id: TaskId,
+    /// Written by agents, so untrusted for readers.
+    pub title: String,
+    pub status: TaskStatus,
+    /// As [`Task::ready`].
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
