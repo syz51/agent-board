@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use board_proto::{
     AgentId, BoardSlug, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX,
@@ -413,6 +414,35 @@ pub(crate) fn shared_scan(me: &str) -> String {
     )
 }
 
+/// Peers of `?3` on its device: the only ones that can share its work tree.
+const PEERS_ON_DEVICE: &str = "agent != ?3 AND agent IN (SELECT id FROM agents \
+     WHERE device = (SELECT device FROM agents WHERE id = ?3))";
+
+/// Whether a peer of `?3` on its device touched `?1`/`?2` with an edit tool at `?4`.
+pub(crate) static PEER_WROTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM touches WHERE repo = ?1 AND path = ?2 \
+         AND scanned = 0 AND modified = ?4 AND {PEERS_ON_DEVICE})"
+    )
+});
+
+/// Removes the scanned touches of `?1`/`?2` at `?4` by peers of `?3` on its device.
+pub(crate) static PEER_SCANS_DROP: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "DELETE FROM touches WHERE repo = ?1 AND path = ?2 \
+         AND scanned = 1 AND modified = ?4 AND {PEERS_ON_DEVICE}"
+    )
+});
+
+/// Peers' touches of `?1`/`?2` after `?4`, newest first, for `?3`'s overlaps.
+pub(crate) static OVERLAP_TOUCHES: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT agent, at FROM touches t WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
+         AND at > ?4 AND NOT {} ORDER BY at DESC",
+        shared_scan("?3")
+    )
+});
+
 /// Records touched files, renews the agent's leases in the repo, and reports peers that
 /// leased or touched the same paths recently.
 pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
@@ -427,28 +457,18 @@ pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
         // during the caller's shell call. When the peer's touch comes second, it removes
         // the scanned one instead.
         if let Some(modified) = modified {
-            let peers = "agent != ?3 AND agent IN (SELECT id FROM agents \
-                 WHERE device = (SELECT device FROM agents WHERE id = ?3))";
             if req.scanned {
-                let peer_wrote: bool = cx.db.query_row(
-                    &format!(
-                        "SELECT EXISTS (SELECT 1 FROM touches WHERE repo = ?1 AND path = ?2 \
-                         AND scanned = 0 AND modified = ?4 AND {peers})"
-                    ),
-                    params![req.repo, path, me, modified],
-                    |r| r.get(0),
-                )?;
+                let peer_wrote: bool = cx
+                    .db
+                    .prepare_cached(&PEER_WROTE)?
+                    .query_row(params![req.repo, path, me, modified], |r| r.get(0))?;
                 if peer_wrote {
                     continue;
                 }
             } else {
-                cx.db.execute(
-                    &format!(
-                        "DELETE FROM touches WHERE repo = ?1 AND path = ?2 \
-                         AND scanned = 1 AND modified = ?4 AND {peers}"
-                    ),
-                    params![req.repo, path, me, modified],
-                )?;
+                cx.db
+                    .prepare_cached(&PEER_SCANS_DROP)?
+                    .execute(params![req.repo, path, me, modified])?;
             }
         }
         // A scanned report never replaces the caller's own edit-tool touch, which a peer's
@@ -508,11 +528,6 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
     let globs: Vec<Glob<'_>> = leases.iter().map(|(_, g, _)| Glob::new(g)).collect();
     let family = delegation_family(cx, me.as_str())?;
     let window_start = cx.now_ms() - cx.s.touch_ms();
-    let touches_sql = format!(
-        "SELECT agent, at FROM touches t WHERE repo = ?1 AND path = ?2 AND agent != ?3 \
-         AND at > ?4 AND NOT {} ORDER BY at DESC",
-        shared_scan("?3")
-    );
     for path in paths {
         for ((agent, _, at), glob) in leases.iter().zip(&globs) {
             if glob.matches(path) && is_live(cx, agent)? && !family.contains(agent) {
@@ -527,7 +542,7 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
         }
         let touches: Vec<(String, i64)> = cx
             .db
-            .prepare_cached(&touches_sql)?
+            .prepare_cached(&OVERLAP_TOUCHES)?
             .query_map(params![repo, path, me.as_str(), window_start], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
