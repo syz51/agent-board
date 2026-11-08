@@ -54,7 +54,8 @@ pub enum Command {
     },
     /// List tasks.
     Ls(LsArgs),
-    /// Show a task with its notes and evidence.
+    /// Show a task with its evidence, every finding and decision note, and the latest plain
+    /// notes (--detailed for all and the history).
     Show {
         id: TaskId,
         #[arg(long)]

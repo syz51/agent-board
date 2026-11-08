@@ -117,6 +117,72 @@ fn claim_posts_the_agent_and_relays_refusals_with_next() {
     assert!(stderr(&out).contains("no agent id"));
 }
 
+/// factory-12 in the task detail's shape, with `notes` as (kind, text, minute past 10:00)
+/// and a claim by `ME` at 10:05.
+fn noted_detail(notes: &[(&str, &str, u32)]) -> Value {
+    let at = |m: u32| format!("2026-11-07T10:{m:02}:00Z");
+    json!({
+        "task": task_fixture("factory-12", "Do it"),
+        "notes": notes.iter().enumerate().map(|(i, (kind, text, m))| json!({
+            "id": i + 1, "task": "factory-12", "agent": "t3:peer", "kind": kind,
+            "text": text, "at": at(*m),
+        })).collect::<Vec<_>>(),
+        "evidence": [], "blocks": [], "children": [],
+        "history": [{
+            "seq": 1, "at": at(5), "board": "factory", "actor": ME,
+            "type": "task_claimed", "task": "factory-12", "payload": {},
+        }],
+    })
+}
+
+#[test]
+fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Do it"),
+    );
+    e.stub.on(
+        "GET /v1/tasks/factory-12",
+        noted_detail(&[
+            ("finding", "checked before the claim", 1),
+            ("note", "plain", 2),
+        ]),
+    );
+    let out = e.run(&["claim", "factory-12"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "\n2 notes on factory-12 (1 finding, 0 decisions, 1 plain): task_show factory-12 and \
+             read every one before starting"
+        ),
+        "{text}"
+    );
+
+    e.stub.on(
+        "GET /v1/tasks/factory-12",
+        noted_detail(&[
+            ("finding", "checked before the claim", 1),
+            ("finding", "found after the claim", 7),
+        ]),
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-12/done",
+        task_fixture("factory-12", "Do it"),
+    );
+    let out = e.run(&["done", "factory-12", "--commit", "4e1c2ab"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("done factory-12"), "{text}");
+    assert!(
+        text.contains("\n1 finding since the claim; the task is done: for each one"),
+        "{text}"
+    );
+    assert!(text.contains("found after the claim"), "{text}");
+    assert!(!text.contains("checked before the claim"), "{text}");
+}
+
 #[test]
 fn done_reads_the_version_and_sends_paired_evidence() {
     let e = env();
