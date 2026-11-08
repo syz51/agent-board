@@ -31,7 +31,6 @@ const badgeVariants = cva(
         tag: "h-5.5 rounded-sm px-2 py-0",
       },
     },
-    compoundVariants: [{ variant: "outline", shape: "tag", class: "bg-secondary" }],
     defaultVariants: {
       variant: "default",
       shape: "pill",

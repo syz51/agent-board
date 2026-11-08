@@ -18,9 +18,9 @@ import {
   Empty,
   ErrorNotice,
   ExpandableLine,
+  listClass,
   PageHeader,
   QueryFrame,
-  listClass,
   RelTime,
   StatePill,
   useAgents,
@@ -79,14 +79,14 @@ export function HomeScreen() {
             case "asks":
               return (
                 <Section
-                  title="Needs you"
+                  title="Waiting on you"
                   count={openAsks.length}
                   aside={
                     <Link
                       className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
                       to="/asks"
                     >
-                      See all <Icon name="arrow" className="size-3.5" />
+                      All asks <Icon name="arrow" className="size-3.5" />
                     </Link>
                   }
                   {...state}
@@ -201,8 +201,8 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
                 wait on the user, unlike every other row on Home. */}
             <Link
               className={cn(
-                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 py-1.5 pr-(--gutter) pl-[calc(var(--gutter)+12px)] text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
-                "before:absolute before:inset-y-2 before:left-(--gutter) before:w-[3px] before:rounded-full",
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
                 ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
               )}
               to="/asks/$id"
@@ -259,13 +259,12 @@ export function plainLine(text: string): string {
 }
 
 const SEGMENTS = [
-  { key: "done", label: "done", bar: "bg-status-done", icon: "done" },
-  { key: "review", label: "review", bar: "bg-status-review", icon: "review" },
-  { key: "doing", label: "doing", bar: "bg-status-doing", icon: "doing" },
-  { key: "blocked", label: "blocked", bar: "bg-status-blocked", icon: "blocked" },
-  { key: "ready", label: "ready", bar: "bg-status-ready", icon: "ready" },
-  // Not started: the track's grey in the bar, and the dashed ring of an open task.
-  { key: "waiting", label: "waiting", bar: "bg-input", icon: "open" },
+  { key: "done", label: "done", bar: "bg-status-done" },
+  { key: "review", label: "review", bar: "bg-status-review" },
+  { key: "doing", label: "doing", bar: "bg-status-doing" },
+  { key: "blocked", label: "blocked", bar: "bg-status-blocked" },
+  { key: "ready", label: "ready", bar: "bg-status-ready" },
+  { key: "waiting", label: "waiting", bar: "bg-input" },
 ] as const;
 
 function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
@@ -289,9 +288,9 @@ const features = tableFeatures({});
 const column = createColumnHelper<typeof features, BoardRowData>();
 
 /**
- * The boards table: name and goal (with any open asks beside the name), tasks by status,
- * coordinator and autopilot. At 760px of width and up the cells line up in columns under
- * a header; below, a row stacks name, tasks, then coordinator and autopilot.
+ * The boards table: name and goal, tasks by status, coordinator, open asks and autopilot.
+ * At 760px of width and up the cells line up in columns under a header; below, a row
+ * stacks name, tasks, coordinator, then asks and autopilot.
  */
 const columns = column.columns([
   column.display({
@@ -310,6 +309,11 @@ const columns = column.columns([
     cell: ({ row }) => <Coordinator {...row.original} />,
   }),
   column.display({
+    id: "asks",
+    header: "Asks",
+    cell: ({ row }) => <BoardAsks board={row.original.board} />,
+  }),
+  column.display({
     id: "autopilot",
     header: "Autopilot",
     cell: ({ row }) => <AutopilotSwitch board={row.original.board} />,
@@ -320,6 +324,7 @@ const AREA: Record<string, string> = {
   name: "[grid-area:name]",
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
+  asks: "[grid-area:asks]",
   // Not "auto": that is a keyword for grid-area and would place the cell automatically.
   autopilot: "[grid-area:pilot]",
 };
@@ -327,17 +332,13 @@ const AREA: Record<string, string> = {
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator: "text-meta flex min-h-5 min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
+  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
+  asks: "",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
-/**
- * The boards table's columns. Every row is one height on wide screens: the name line, with
- * its whole slug, states and open asks, the goal in one line, the tally in one and the
- * coordinator in two at most. Cells start at the top of the row, level with the name.
- */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,416px)_minmax(0,160px)_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -379,7 +380,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-(--gutter) py-3 @min-[760px]:min-h-17 @min-[760px]:items-start @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-14 @min-[760px]:py-2 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -397,8 +398,9 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      {/* One line: the name, its slug and its states, none of them cut. */}
-      <div className="flex min-h-5 min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+      {/* The name and slug are never cut: where the badges do not fit beside them, they
+          move to a line of their own. */}
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
         <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em] [overflow-wrap:anywhere]">
           <Link
             className="text-foreground"
@@ -419,14 +421,13 @@ function BoardName({ board }: { board: Board }) {
           </StatePill>
         )}
         {board.temporary && (
-          <Badge variant="outline" shape="tag" className="flex-none">
+          <Badge variant="outline" shape="tag">
             Temporary
           </Badge>
         )}
-        <BoardAsks board={board} />
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={1} />
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
       )}
@@ -459,7 +460,7 @@ function TaskTally({ board }: { board: Board }) {
       ) : (
         <ul
           // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="grid grid-cols-3 gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex @min-[760px]:flex-nowrap @min-[760px]:gap-x-1.5"
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -468,9 +469,12 @@ function TaskTally({ board }: { board: Board }) {
                 // A count and its word, in the bar's order, after a dot of its bar colour.
                 <li
                   key={segment.key}
-                  className="inline-flex items-center gap-0.75 whitespace-nowrap"
+                  className="inline-flex items-center gap-1 whitespace-nowrap max-md:gap-0.75"
                 >
-                  <StatusIcon status={segment.icon} className="size-3 @min-[760px]:size-2.5" />
+                  <span
+                    className={cn("size-1.5 flex-none rounded-full", segment.bar)}
+                    aria-hidden="true"
+                  />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
@@ -486,12 +490,7 @@ function TaskTally({ board }: { board: Board }) {
 
 function Coordinator({ board, coordinator, agents }: BoardRowData) {
   if (board.coordinator === null) {
-    return (
-      <span className="text-muted-foreground">
-        <span className="@min-[760px]:hidden">No coordinator</span>
-        <span className="hidden @min-[760px]:inline">None</span>
-      </span>
-    );
+    return <span className="text-muted-foreground">No coordinator</span>;
   }
   if (!coordinator) return <Who id={board.coordinator} agents={agents} />;
   return (
@@ -502,20 +501,24 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   );
 }
 
-/** A board's open asks, beside its name only when there are some, in the sidebar's tint. */
 function BoardAsks({ board }: { board: Board }) {
-  if (board.open_asks === 0) return null;
+  if (board.open_asks === 0) {
+    return (
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
+        <span aria-hidden="true">–</span>
+        <span className="sr-only">No asks</span>
+      </span>
+    );
+  }
   return (
-    // A 24px target that keeps the name line's 20px height.
     <Link
-      className="-my-0.5 inline-flex min-h-6 items-center hover:no-underline"
+      className="inline-flex min-h-7 items-center gap-1.25 text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
       to="/asks"
       search={{ board: board.slug }}
     >
-      <span className="inline-flex h-5 items-center gap-1 rounded-full bg-amber-soft px-2 text-xs font-semibold whitespace-nowrap text-amber tabular-nums ring-1 ring-amber/30 ring-inset">
-        <Icon name="inbox" className="size-3" />
-        {board.open_asks} {board.open_asks === 1 ? "ask" : "asks"}
-      </span>
+      <Icon name="inbox" className="size-3.5" />
+      {board.open_asks}{" "}
+      <span className="@min-[760px]:hidden">{board.open_asks === 1 ? "ask" : "asks"}</span>
     </Link>
   );
 }

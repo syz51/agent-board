@@ -107,7 +107,7 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1 rounded-lg border border-dashed px-6 py-14 text-center text-meta text-muted-foreground">
+    <div className="grid justify-items-center gap-1 rounded-lg border px-6 py-9 text-center text-meta text-muted-foreground">
       <span className="mb-1.5 grid size-8 place-items-center rounded-md border bg-card text-subtle-foreground">
         <Icon name={icon} className="size-4" />
       </span>
@@ -328,38 +328,6 @@ export function Who({ id, agents }: { id: string; agents: Map<string, Agent> }) 
       <Avatar handle={handle} />
       <span className="truncate text-meta font-medium tabular-nums">{handle}</span>
     </span>
-  );
-}
-
-/**
- * The card beside a page's main column: a task's properties, an ask's context. Its sections
- * are split by rules, and on wide screens it stays in view while the main column scrolls.
- * Both pages give it a 300px column.
- */
-export function SidePanel({ className, ...props }: ComponentProps<"aside">) {
-  return (
-    <aside
-      className={cn(
-        "grid content-start divide-y overflow-hidden rounded-lg border bg-card lg:sticky lg:top-6",
-        className,
-      )}
-      {...props}
-    />
-  );
-}
-
-/** One section of a side panel, under a small heading. */
-export function SidePanelSection({
-  title,
-  className,
-  children,
-  ...props
-}: Omit<ComponentProps<"section">, "title"> & { title?: ReactNode }) {
-  return (
-    <section className={cn("grid content-start gap-2 px-4 py-3.5", className)} {...props}>
-      {title && <h2 className="text-xs font-semibold text-subtle-foreground">{title}</h2>}
-      {children}
-    </section>
   );
 }
 

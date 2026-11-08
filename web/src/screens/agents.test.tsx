@@ -43,22 +43,21 @@ function seed(client: QueryClient) {
 }
 
 describe("the agents list", () => {
-  test("says where each agent runs under its name, its machine then its code, with no details column", async () => {
+  test("says where each agent runs in one line under its name, with no details column", async () => {
     await renderRoute("/agents", { seed });
     const coordinator = agents.find((agent) => agent.role === "coordinator" && agent.repo)!;
     const row = await waitFor(() =>
       screen.getByRole("heading", { level: 2, name: coordinator.handle }).closest("article")!,
     );
-    const where = row.querySelector("header [data-slot=where]");
-    expect(where?.textContent).toBe(`Coordinator · ${coordinator.device} · ${coordinator.runtime}`);
-    const code = row.querySelector("header [data-slot=code]");
-    expect(code?.textContent).toBe(
+    const line = row.querySelector("header [data-slot=where]");
+    expect(line?.textContent).toBe(
       [
+        "Coordinator",
+        `${coordinator.device} · ${coordinator.runtime}`,
         coordinator.repo!.replace(/^github\.com\//, ""),
         ...(coordinator.branch ? [coordinator.branch] : []),
       ].join(" · "),
     );
-    expect(code?.className).toContain("font-mono");
     expect(within(row).queryByText("Role")).toBeNull();
     expect(screen.queryByText("Details")).toBeNull();
   });

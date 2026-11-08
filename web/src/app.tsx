@@ -105,9 +105,9 @@ const NAV_COUNT =
 export function Nav() {
   const path = usePathname();
   const asks = useOpenAsks();
-  // Without the asks the count is unknown, not zero: no count shows, and the connection
-  // banner and the footer say why.
   const open = asks.data?.length ?? 0;
+  // Without the asks, the count is unknown, not zero: an offline mark says so.
+  const unknown = asks.data === undefined && asks.error !== null;
   return (
     <nav
       className="flex flex-1 gap-0.5 max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-10 max-md:h-[calc(60px+env(safe-area-inset-bottom))] max-md:gap-0 max-md:border-t max-md:bg-card max-md:px-1 max-md:pb-[env(safe-area-inset-bottom)] lg:flex-none lg:flex-col"
@@ -131,6 +131,19 @@ export function Nav() {
               className={NAV_COUNT}
               aria-label={`${open} waiting on you`}
             />
+          )}
+          {item.to === "/asks" && unknown && (
+            <span
+              className={cn(
+                NAV_COUNT,
+                "grid place-items-center text-muted-foreground max-md:bg-card",
+              )}
+              title="Unknown until the connection is back"
+              role="img"
+              aria-label="Count unknown until the connection is back"
+            >
+              <Icon name="plug" className="size-3.5" />
+            </span>
           )}
         </Link>
       ))}

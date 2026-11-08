@@ -22,8 +22,6 @@ import {
   PageHeader,
   QueryFrame,
   RelTime,
-  SidePanel,
-  SidePanelSection,
   StatusBadge,
   useAgents,
   useTitle,
@@ -124,7 +122,7 @@ export function AskScreen() {
           {(data) => (
             // The ask fills the content width, its prose kept to a reading measure; what it is
             // about sits in a column beside it on wide screens and below it on narrow ones.
-            <div className="grid items-start gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_300px] xl:items-stretch">
+            <div className="grid items-start gap-x-7 gap-y-6 xl:grid-cols-[minmax(0,1fr)_280px]">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -139,24 +137,28 @@ export function AskScreen() {
 
 /** Beside a single ask: the task it is about and the asking agent's handoff. */
 function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
-  // The side panel, as on a task page: stacked beside the ask on wide screens, its sections
-  // side by side below it on medium ones.
+  const heading = "text-xs font-semibold text-subtle-foreground";
+  const part = "grid content-start gap-2 px-3.5 py-3";
+  // One card, its sections split by a rule: stacked beside the ask on wide screens, side by
+  // side below it on medium ones.
   return (
-    <SidePanel
-      className="sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
+    <aside
+      className="grid content-start divide-y overflow-hidden rounded-lg border bg-card sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
       aria-label="About this ask"
     >
       {ask.task && (
-        <SidePanelSection title="Task">
+        <section className={part}>
+          <h2 className={heading}>Task</h2>
           <AskTask id={ask.task} agents={agents} />
-        </SidePanelSection>
+        </section>
       )}
-      <SidePanelSection title="Asked by">
+      <section className={part}>
+        <h2 className={heading}>Asked by</h2>
         <Who id={ask.agent} agents={agents} />
         {/* As on the agents page, an ended agent's handoff is history, not context. */}
         {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} stacked />}
-      </SidePanelSection>
-    </SidePanel>
+      </section>
+    </aside>
   );
 }
 
@@ -172,7 +174,7 @@ function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
   return (
     <div className="grid gap-2">
       <Link
-        className="line-clamp-2 text-sm font-medium text-balance [overflow-wrap:anywhere] text-foreground"
+        className="line-clamp-2 text-sm font-medium [overflow-wrap:anywhere] text-foreground"
         to="/tasks/$id"
         params={{ id }}
         title={task.title}
@@ -200,12 +202,13 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-2.5 rounded-lg border border-l-3 bg-card pt-3 pr-4 pb-3.5 pl-3.5",
+        "relative grid gap-2.5 overflow-hidden rounded-lg border bg-card px-4 pt-3 pb-3.5",
+        "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
         ask.status !== "open"
-          ? "border-l-input"
+          ? "before:bg-input"
           : ask.kind === "action"
-            ? "border-l-amber"
-            : "border-l-status-review",
+            ? "before:bg-amber"
+            : "before:bg-status-review",
       )}
       data-status={ask.status}
     >

@@ -119,25 +119,26 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who and where it runs, then what it is
  * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[300px_minmax(0,1fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1fr)]";
 
 /**
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
  * coordinator, its turn endings. Narrow lists stack the two.
  */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
-  // Where it runs, in two lines: its role and machine in words, then the repository and
-  // branch as the ids they are. A line too long for the column ends in an ellipsis.
-  const runs = [agent.role === "coordinator" ? "Coordinator" : null, agent.device, agent.runtime]
-    .filter(Boolean)
-    .join(" · ");
-  const code = [agent.repo?.replace(/^github\.com\//, ""), agent.branch]
+  const where = [
+    agent.role === "coordinator" ? "Coordinator" : null,
+    agent.device,
+    agent.runtime,
+    agent.repo?.replace(/^github\.com\//, ""),
+    agent.branch,
+  ]
     .filter(Boolean)
     .join(" · ");
   return (
     <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
-        <Avatar handle={agent.handle} large className="row-span-4 size-7 self-start text-2xs" />
+        <Avatar handle={agent.handle} large className="row-span-3 size-7 self-start text-2xs" />
         <h2
           className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
           title={agent.id}
@@ -152,26 +153,15 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             seen <RelTime at={agent.last_seen} />
           </span>
         </div>
-        {runs && (
-          <p
-            className="col-start-2 w-full truncate text-meta text-muted-foreground"
-            data-slot="where"
-            title={runs}
-          >
-            {runs}
-          </p>
-        )}
-        {code && (
-          <p
-            // The id face a step smaller, on the meta lines' height, so the block keeps one
-            // rhythm.
-            className="col-start-2 w-full truncate font-mono text-[11.5px] leading-[18px] text-muted-foreground"
-            data-slot="code"
-            title={code}
-          >
-            {code}
-          </p>
-        )}
+        {/* Where it runs, as one quiet line under who it is; a line too long for the column
+            ends in an ellipsis and shows whole on hover. */}
+        <p
+          className="col-start-2 w-full truncate text-meta text-muted-foreground"
+          data-slot="where"
+          title={where}
+        >
+          {where}
+        </p>
       </header>
       <div className="grid min-w-0 content-start gap-2">
         <p className="font-medium">
