@@ -491,27 +491,39 @@ async fn devices_register_agents_only_as_themselves() {
 async fn board_listings_leave_out_agents_unseen_for_more_than_a_week() {
     let t = T::new();
     t.board("factory", &[REPO]).await;
-    let (crashed, gone, limited, seen) = ("t3:crashed", "t3:gone", "t3:limited", "t3:seen");
-    for agent in [crashed, gone, limited, seen] {
+    let (coord, crashed, gone, limited) = ("t3:coord", "t3:crashed", "t3:gone", "t3:limited");
+    let (seen, stopped, waiting) = ("t3:seen", "t3:stopped", "t3:waiting");
+    for agent in [coord, crashed, gone, limited, seen, stopped, waiting] {
         t.register(agent, Some(REPO), None).await;
     }
+    let set = |agent: &'static str, body: serde_json::Value| {
+        let t = &t;
+        async move {
+            t.ok(
+                "POST",
+                &format!("/v1/agents/{agent}/state"),
+                Some(agent),
+                Some(body),
+            )
+            .await;
+        }
+    };
     // `crashed` stays running: a session that dies never sends `ended`.
-    t.ok(
-        "POST",
-        &format!("/v1/agents/{gone}/state"),
-        Some(gone),
-        Some(json!({ "state": "ended" })),
-    )
-    .await;
-    // A weekly usage limit: the reset comes after a week of silence.
-    let reset = t.state.now() + TimeDelta::days(8);
-    t.ok(
-        "POST",
-        &format!("/v1/agents/{limited}/state"),
-        Some(limited),
-        Some(json!({ "state": "paused", "paused_until": reset.to_rfc3339() })),
-    )
-    .await;
+    set(gone, json!({ "state": "ended" })).await;
+    // A weekly usage limit: the reset comes after a week of silence. `stopped` waits for
+    // it too, though T3 has ended its session; `waiting` has no reset, so waits for the user.
+    let reset = (t.state.now() + TimeDelta::days(8)).to_rfc3339();
+    for agent in [limited, stopped] {
+        set(agent, json!({ "state": "paused", "paused_until": reset })).await;
+    }
+    set(stopped, json!({ "state": "ended" })).await;
+    set(waiting, json!({ "state": "paused" })).await;
+    // The daemon renews a coordinator lease without marking the agent seen.
+    let lease_until = (t.state.now() + TimeDelta::days(30)).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET coordinator = '{coord}', coordinator_device = 'mac', \
+         coordinator_expires_at = {lease_until} WHERE slug = 'factory'"
+    ));
     // Sorted by id: the server orders agents by handle, a hash.
     let listed = |path: &'static str| {
         let t = &t;
@@ -528,30 +540,38 @@ async fn board_listings_leave_out_agents_unseen_for_more_than_a_week() {
         }
     };
     t.advance(TimeDelta::days(7) - TimeDelta::minutes(1));
-    t.ok(
-        "POST",
-        &format!("/v1/agents/{seen}/state"),
-        Some(seen),
-        Some(json!({ "state": "idle" })),
-    )
-    .await;
+    set(seen, json!({ "state": "idle" })).await;
     assert_eq!(
         listed("/v1/agents?board=factory").await,
-        [crashed, gone, limited, seen]
+        [coord, crashed, gone, limited, seen, stopped, waiting]
     );
 
     // Past a week unseen agents drop out of listings whatever their state, also for a
-    // state filter, except one waiting for a reset still ahead and the one seen since.
-    // Asking for ended agents still lists them, and they stay members of the board.
+    // state filter. Kept are the one seen since, those waiting for a reset still ahead or
+    // for the user, and the coordinator holding the lease. Asking for ended agents still
+    // lists them all, and they stay members of the board.
     t.advance(TimeDelta::minutes(2));
-    assert_eq!(listed("/v1/agents?board=factory").await, [limited, seen]);
+    assert_eq!(
+        listed("/v1/agents?board=factory").await,
+        [coord, limited, seen, stopped, waiting]
+    );
     assert_eq!(
         listed("/v1/agents?board=factory&state=running").await,
-        Vec::<String>::new()
+        [coord]
     );
-    assert_eq!(listed("/v1/agents?board=factory&state=ended").await, [gone]);
+    assert_eq!(
+        listed("/v1/agents?board=factory&state=paused").await,
+        [limited, waiting]
+    );
+    assert_eq!(
+        listed("/v1/agents?board=factory&state=ended").await,
+        [gone, stopped]
+    );
     // Without a board the listing stays complete: clients use it to name agents.
-    assert_eq!(listed("/v1/agents").await, [crashed, gone, limited, seen]);
+    assert_eq!(
+        listed("/v1/agents").await,
+        [coord, crashed, gone, limited, seen, stopped, waiting]
+    );
     for agent in [crashed, gone] {
         let agent = t
             .ok("GET", &format!("/v1/agents/{agent}"), None, None)
@@ -559,22 +579,22 @@ async fn board_listings_leave_out_agents_unseen_for_more_than_a_week() {
         assert_eq!(agent["boards"], json!(["factory"]));
     }
 
-    // Once its reset has passed, the paused agent drops out too.
+    // Once the reset has passed, the agents that waited for it drop out too; so does the
+    // coordinator once its lease has lapsed.
     t.advance(TimeDelta::days(1));
-    assert_eq!(listed("/v1/agents?board=factory").await, [seen]);
+    assert_eq!(
+        listed("/v1/agents?board=factory").await,
+        [coord, seen, waiting]
+    );
+    t.exec("UPDATE boards SET coordinator_expires_at = 0 WHERE slug = 'factory'");
+    assert_eq!(listed("/v1/agents?board=factory").await, [seen, waiting]);
 
     // Any newer sign of life brings an agent back: a state update or a registration.
-    t.ok(
-        "POST",
-        &format!("/v1/agents/{crashed}/state"),
-        Some(crashed),
-        Some(json!({ "state": "idle" })),
-    )
-    .await;
+    set(crashed, json!({ "state": "idle" })).await;
     t.register(gone, Some(REPO), None).await;
     assert_eq!(
         listed("/v1/agents?board=factory").await,
-        [crashed, gone, seen]
+        [crashed, gone, seen, waiting]
     );
 }
 

@@ -218,10 +218,12 @@ pub(crate) fn boards_for_repo(cx: &Ctx<'_>, repo: &str) -> Result<Vec<board_prot
 const UNSEEN_LISTED_MS: i64 = 7 * 86_400_000;
 
 /// Agents, by board and state. A board's listing leaves out agents not seen for more than a
-/// week, whatever their state (a session that crashed never sends `ended`), unless they
-/// wait for a usage-limit reset still ahead or the request asks for `state=ended`. So it
-/// does not grow with every session the board ever had; the unfiltered listing stays
-/// complete, as clients use it to name agents.
+/// week, whatever their state (a session that crashed never sends `ended`), unless the
+/// request asks for `state=ended`. Kept are agents that wait: for a usage-limit reset still
+/// ahead (paused, or ended meanwhile), or paused with no reset, for the user. So is the
+/// board's coordinator while its lease is live, since the daemon renews the lease without
+/// marking the agent seen. So the listing does not grow with every session the board ever
+/// had; the unfiltered listing stays complete, as clients use it to name agents.
 pub(crate) fn list(
     cx: &Ctx<'_>,
     board: Option<&board_proto::BoardSlug>,
@@ -234,7 +236,11 @@ pub(crate) fn list(
     let mut params: crate::store::NamedParams<'_> = Vec::new();
     if board.is_some() && state != Some(AgentState::Ended) {
         filter.push(
-            "NOT (last_seen < :unseen_before AND (paused_until IS NULL OR paused_until <= :now))",
+            "(last_seen >= :unseen_before \
+             OR paused_until > :now \
+             OR (state = 'paused' AND paused_until IS NULL) \
+             OR id IN (SELECT coordinator FROM boards \
+                       WHERE slug = :board AND coordinator_expires_at > :now))",
         );
         params.push((":unseen_before", &unseen_before));
         params.push((":now", &now));
