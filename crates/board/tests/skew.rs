@@ -28,6 +28,8 @@ fn this_stamp() -> Option<u64> {
 }
 
 const SERVER: &str = "0123456789ab";
+/// The sentence that ends every skew warning.
+const NO_REPORT: &str = "This is expected during an upgrade, so no feedback report is needed.";
 
 #[test]
 fn an_older_client_says_calls_still_work_and_what_picks_up_the_new_build() {
@@ -41,7 +43,7 @@ fn an_older_client_says_calls_still_work_and_what_picks_up_the_new_build() {
             "board: warning: this session's board, {v} ({c}), is older than the board server, \
              {v} ({SERVER}); calls still work, so keep working. This device is not upgraded \
              yet: the device upgrade (deploy/upgrade.sh, run by whoever deploys) installs the new \
-             build; nothing is needed from you.",
+             build; nothing is needed from you. {NO_REPORT}",
             v = board_proto::VERSION,
             c = board::COMMIT,
         )
@@ -55,7 +57,7 @@ fn an_older_server_says_to_upgrade_the_server() {
     let expected = format!(
         "board: warning: the board server, {v} ({SERVER}), is older than this session's board, \
          {v} ({c}): whoever deploys should upgrade the server (docs/DEPLOY.md). Until then, \
-         calls new in this build may fail.",
+         calls new in this build may fail. {NO_REPORT}",
         v = board_proto::VERSION,
         c = board::COMMIT,
     );
@@ -75,7 +77,8 @@ fn a_server_built_without_a_stamp_gets_the_unordered_warning() {
     }
     let err = ls_against(|stub| stub.build(board_proto::VERSION, SERVER));
     assert!(
-        err.contains("upgrade the older one (docs/DEPLOY.md)"),
+        err.contains("upgrade the older one (docs/DEPLOY.md)")
+            && err.trim_end().ends_with(&format!("upgrade. {NO_REPORT}")),
         "{err}"
     );
     // The same build with its stamp: no warning.
