@@ -3019,6 +3019,57 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
 }
 
 #[test]
+fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        // When to declare one, at the finish of the fixed task.
+        "File its revisit too when Revisits below calls for one",
+        "**Declare** one when you finish a task that changed a tuned value",
+        "fixed a feedback item that recurs or that two or more agents reported, or when the user asks",
+        "Routine tasks get none",
+        // Its fields.
+        "File it as a sub-task of the fixed task: it is scope the fix declared, not a proposal",
+        "Title it `Revisit: …`, keep it `auto` with the fix's priority",
+        "set `not_before` about 14 days after the deploy",
+        "Start its body with `Revisit:` and name the deploy time",
+        "the feedback items and error signatures it watches, the values under review, and the bar for \"held\"",
+        // Its cap.
+        "One revisit per fix, and at most three open revisits per board",
+        "add the new watch to the open revisit due soonest",
+        // How to run it.
+        "Count the errors with `board errors --since <deploy time>`",
+        "read the feedback items routed to it and their reports",
+        "`held` when under the bar; `adjust` when over the bar or the values no longer fit",
+        "Adjust files a proposal, a child of the revisit, with the counts and the change",
+        "for a value the user chose, `ask_user` instead",
+        // How to record the outcome.
+        "a `decision` note starting `revisit: held` or `revisit: adjust`, with the counts, the window and the bar, on the fixed task and on each watched feedback item",
+        "`task_done` the revisit with the counts as evidence",
+        "a second adjustment of one value in a row goes to the user",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
+fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let triage = words(board::daemon::TRIAGE_PROMPT);
+    for rule in [
+        // From PR #83: a recurring item goes to the open revisit, never as a duplicate.
+        "A recurring item is never a duplicate of a closed item",
+        "When the earlier task has an open revisit (a child task titled `Revisit: …`), route the item to the revisit",
+        // Repeats without `recurs` go there too, and a signal brings the revisit forward.
+        "Any item that repeats a problem whose fix has an open revisit goes to that revisit, even without `recurs`",
+        "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
+        "When the item is a `signal`, also clear the revisit's `not_before`",
+    ] {
+        assert!(triage.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
 fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));

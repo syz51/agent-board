@@ -64,6 +64,10 @@ only for a cause that is already gone.
   body; when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's
   owner (see "Finding the owner") and cite the earlier item and its reason: a fix that did
   not hold goes to the owner, not back to you.
+- Any item that repeats a problem whose fix has an open revisit goes to that revisit, even
+  without `recurs` (a report in other words, a signal): `feedback_resolve` with kind
+  `routed` and `task` the revisit, with no new task. When the item is a `signal`, also clear
+  the revisit's `not_before` (`task_update` with `not_before` none) so it runs now.
 - When the owner declines or merges a routed proposal (its task is dropped), its verdict
   note is the answer to the reporters. Route the problem to that owner again only with
   evidence the verdict did not weigh, and cite the verdict.
