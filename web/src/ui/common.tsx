@@ -41,20 +41,24 @@ export function ErrorNotice({
   compact?: boolean;
 }) {
   return (
+    // A page that failed to load gets a neutral card with a red mark: the connection banner,
+    // when there is one, already carries the alarm. Inline failures stay red.
     <Alert
-      variant="error"
+      variant={compact ? "error" : "default"}
       className={cn(
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
       )}
     >
       {!compact && (
-        <span className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-card">
-          <Icon name="plug" className="size-4.5" />
+        <span className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-error-soft text-error">
+          <Icon name="alert" className="size-4.5" />
         </span>
       )}
       <div className="grid flex-[1_1_280px] gap-1">
-        <AlertTitle className="col-start-1 line-clamp-none font-semibold">
+        <AlertTitle
+          className={cn("col-start-1 line-clamp-none font-semibold", !compact && "text-foreground")}
+        >
           {error.message}
         </AlertTitle>
         <AlertDescription className="col-start-1 text-foreground!">
@@ -243,8 +247,10 @@ export function Owner({
 }) {
   if (!task.owner) {
     return (
+      // A dash, as other empty cells show; the word is for screen readers.
       <span className="inline-flex min-h-5 min-w-0 items-center text-meta text-muted-foreground">
-        Unowned
+        <span aria-hidden="true">–</span>
+        <span className="sr-only">Unowned</span>
       </span>
     );
   }
@@ -309,7 +315,7 @@ export function PageHeader({
           </h1>
           {children}
         </div>
-        {sub && <p className="max-w-[68ch] text-meta text-muted-foreground">{sub}</p>}
+        {sub && <p className="max-w-[72ch] text-sm text-muted-foreground">{sub}</p>}
       </div>
       {aside}
     </header>

@@ -27,7 +27,7 @@ import {
   Who,
 } from "@/ui/common.tsx";
 import { ConfirmDialog } from "@/ui/confirm.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon } from "@/ui/icons.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
 
 export function BoardsScreen() {
@@ -197,7 +197,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,432px)_152px_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,344px)_152px_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -263,6 +263,7 @@ function BoardName({ board }: { board: Board }) {
             {board.title}
           </Link>
         </h2>
+        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}
@@ -275,15 +276,11 @@ function BoardName({ board }: { board: Board }) {
           </Badge>
         )}
       </div>
-      {/* The slug leads the goal's line, so the title line keeps its width for the name. */}
-      <div className="flex min-w-0 items-baseline gap-2 text-meta text-muted-foreground">
-        <span className="ident flex-none">{board.slug}</span>
-        {board.goal ? (
-          <ExpandableLine className="min-w-0 flex-1" text={board.goal} />
-        ) : (
-          <p className="leading-6">No goal written.</p>
-        )}
-      </div>
+      {board.goal ? (
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
+      ) : (
+        <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
+      )}
     </>
   );
 }
@@ -312,25 +309,18 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
+          className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
             (segment) =>
               counts[segment.key] > 0 && (
-                <li
-                  key={segment.key}
-                  className="inline-flex items-center gap-0.75"
-                  title={`${counts[segment.key]} ${segment.label}`}
-                >
-                  <StatusIcon
-                    status={segment.key === "waiting" ? "open" : segment.key}
-                    className="size-3.5"
-                  />
+                // A count and its word, in the bar's order: the words carry the status and
+                // the bar above carries the colour, so the legend stays quiet.
+                <li key={segment.key} className="whitespace-nowrap">
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
-                  {/* Each count keeps its word, so the status reads without its colour. */}
                   <span>{segment.label}</span>
                 </li>
               ),

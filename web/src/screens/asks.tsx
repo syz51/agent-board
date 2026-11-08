@@ -275,7 +275,11 @@ export function AskScreen() {
       <PageHeader title={`Ask #${id}`} />
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
-          {(data) => <AskCard ask={data} agents={agents} standalone />}
+          {(data) => (
+            <div className="max-w-[760px]">
+              <AskCard ask={data} agents={agents} standalone />
+            </div>
+          )}
         </QueryFrame>
       ) : (
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
@@ -419,7 +423,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     {ask.options.map((option, index) => (
                       <Label
                         key={index}
-                        className="flex min-h-9 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
+                        className="flex min-h-8.5 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-1.5 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
                       >
                         <input
                           type="radio"
@@ -444,43 +448,50 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                   </div>
                 </fieldset>
               )}
-              <form.Field name="text">
-                {(field) => (
-                  <div className="grid gap-1.5">
-                    <Label
-                      htmlFor={`${id}-text`}
-                      className="text-meta font-medium text-subtle-foreground"
-                    >
-                      {ask.options.length > 0 ? "Or write your own answer" : "Your answer"}
-                    </Label>
-                    <Textarea
-                      id={`${id}-text`}
-                      rows={2}
-                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
-                      value={field.state.value}
-                      aria-invalid={missing ? true : undefined}
-                      aria-describedby={missing ? `${id}-missing` : undefined}
-                      onChange={(event) => field.handleChange(event.currentTarget.value)}
-                    />
-                  </div>
-                )}
-              </form.Field>
+              {/* Send sits beside the answer field, so an ask stays short in a list. */}
+              <div className="flex flex-wrap items-end gap-x-2.5 gap-y-2">
+                <form.Field name="text">
+                  {(field) => (
+                    <div className="grid min-w-[min(100%,280px)] flex-1 gap-1.5">
+                      <Label
+                        htmlFor={`${id}-text`}
+                        className="text-meta font-medium text-subtle-foreground"
+                      >
+                        {ask.options.length > 0 ? "Or write your own answer" : "Your answer"}
+                      </Label>
+                      <Textarea
+                        id={`${id}-text`}
+                        rows={1}
+                        className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                        value={field.state.value}
+                        aria-invalid={missing ? true : undefined}
+                        aria-describedby={missing ? `${id}-missing` : undefined}
+                        onChange={(event) => field.handleChange(event.currentTarget.value)}
+                      />
+                    </div>
+                  )}
+                </form.Field>
+                {/* Quiet until there is something to send, so a list of asks is not a column
+                    of heavy buttons; a press with nothing chosen says what is missing. */}
+                <Button
+                  type="submit"
+                  variant={answer ? "default" : "outline"}
+                  disabled={mutation.isPending}
+                >
+                  {mutation.isPending ? "Sending…" : "Send answer"}
+                </Button>
+              </div>
               {missing && (
                 <p id={`${id}-missing`} className="text-meta font-medium text-error" role="alert">
                   {missing}
                 </p>
               )}
               {mutation.error && <ErrorNotice error={mutation.error} compact />}
-              <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2">
-                <Button type="submit" disabled={mutation.isPending}>
-                  {mutation.isPending ? "Sending…" : "Send answer"}
-                </Button>
-                {answer && !mutation.isPending && (
-                  <span className="text-meta [overflow-wrap:anywhere] text-muted-foreground">
-                    Sends “{answer}”
-                  </span>
-                )}
-              </div>
+              {answer && !mutation.isPending && (
+                <span className="text-meta [overflow-wrap:anywhere] text-muted-foreground">
+                  Sends “{answer}”
+                </span>
+              )}
             </>
           );
         }}

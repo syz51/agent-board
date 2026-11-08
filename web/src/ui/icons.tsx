@@ -34,6 +34,8 @@ const PATHS = {
   cloud: "M4.5 12.25a3 3 0 0 1-.35-5.98 4 4 0 0 1 7.7-.77 3.25 3.25 0 0 1 .4 6.75z",
   plug: "M6 1.75v3.5M10 1.75v3.5M4 5.25h8v2.5a4 4 0 0 1-8 0zM8 11.75v2.5",
   minus: "M4.25 8h7.5",
+  /** A warning triangle: a request that failed. */
+  alert: "M8 2.25 14.25 13.25H1.75zM8 6.5v3M8 11.5v.25",
   /** A crescent: an agent that went idle. */
   idle: "M12.75 9.75A5 5 0 1 1 6.25 3.25a4 4 0 0 0 6.5 6.5z",
   cross: "m5 5 6 6M11 5l-6 6",

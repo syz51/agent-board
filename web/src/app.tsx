@@ -106,7 +106,7 @@ export function Nav() {
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
             <span
-              className="ml-auto h-4.5 min-w-5 rounded-full bg-signal px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-signal-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
+              className="ml-auto h-4.5 min-w-5 rounded-full bg-amber px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-card tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
               aria-label={`${open} waiting on you`}
             >
               {open}

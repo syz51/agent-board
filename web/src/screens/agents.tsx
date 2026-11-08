@@ -102,7 +102,7 @@ export function AgentsScreen() {
               >
                 <span>Agent</span>
                 <span>Working on</span>
-                <span>Where</span>
+                <span>Details</span>
               </div>
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
@@ -220,7 +220,7 @@ function HandoffView({ agentId }: { agentId: string }) {
           · <RelTime at={updated_at} />
         </span>
       </p>
-      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-subtle-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[64px_minmax(0,1fr)] [&>div]:gap-2">
+      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-subtle-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
         <div>
           <dt>Now</dt>
           <dd>
