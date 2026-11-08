@@ -521,6 +521,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         autopilot: false,
         parallel_tasks: 1,
         coordinator: None,
+        dispatch: Default::default(),
         home_devices: Vec::new(),
         counts: StatusCounts::default(),
         open_asks: 0,

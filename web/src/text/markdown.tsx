@@ -255,18 +255,19 @@ function inlineToken(token: Token, key: number): ReactNode {
  */
 export function SafeLink({ href, children }: { href: string; children: ReactNode }): ReactElement {
   const url = safeHref(href);
+  const childText = typeof children === "string" ? children : flatText(children);
   if (url === null) {
+    // An autolink such as <t3-thread://...> already shows its target as its text.
     return (
       <span className="md-link-blocked text-subtle-foreground">
         {children}{" "}
         <span className="link-target inline-block text-meta text-muted-foreground">
-          (link not followed: {href})
+          {childText === href ? "(link not followed)" : `(link not followed: ${href})`}
         </span>
       </span>
     );
   }
   const shown = url.startsWith("mailto:") ? url.slice(7) : url;
-  const childText = typeof children === "string" ? children : flatText(children);
   const showTarget = childText !== href && childText !== url && childText !== shown;
   const target = url.startsWith("mailto:") ? shown : new URL(url).host;
   return (

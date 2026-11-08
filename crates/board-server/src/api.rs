@@ -13,10 +13,10 @@ use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
     AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
     CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
-    DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen,
-    Note, PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
-    Touches, UpdateBoard, UpdateTask, Updates,
+    DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult,
+    MarkSeen, Note, PutHandoff, RegisterAgent, RegisterJudge, ResolveFeedback, Said, SeenCursor,
+    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use crate::auth::Caller;
 use crate::error::{Error, Result, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
-use crate::ops::{agents, asks, boards, devices, feedback, leases, stats, tasks, updates};
+use crate::ops::{agents, asks, boards, devices, feedback, judges, leases, stats, tasks, updates};
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
 use crate::{events, snapshot, web};
@@ -77,6 +77,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route(
             "/boards/{slug}/coordinator",
             post(claim_coordinator).delete(release_coordinator),
+        )
+        .route(
+            "/boards/{slug}/judges",
+            get(list_judges).post(register_judge),
         )
         .route("/stats", get(show_stats))
         .route("/errors", get(show_errors).post(report_error))
@@ -386,6 +390,32 @@ async fn claim_coordinator(
             .write(move |cx| boards::claim_coordinator(cx, &actor, &slug, req))
             .await?,
     ))
+}
+
+/// The board's coordinator registers a judge; the agent comes from `X-Board-Agent`.
+async fn register_judge(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(slug): Path<String>,
+    Body(req): Body<RegisterJudge>,
+) -> Result<Json<Judge>> {
+    let slug: BoardSlug = parse_path(&slug)?;
+    let agent = caller.agent()?.clone();
+    let req = judges::validate_register(req)?;
+    Ok(Json(
+        state
+            .write(move |cx| judges::register(cx, &agent, &slug, req))
+            .await?,
+    ))
+}
+
+async fn list_judges(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Path(slug): Path<String>,
+) -> Result<Json<Vec<Judge>>> {
+    let slug: BoardSlug = parse_path(&slug)?;
+    Ok(Json(state.read(move |cx| judges::list(cx, &slug)).await?))
 }
 
 async fn release_coordinator(

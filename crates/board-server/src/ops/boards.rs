@@ -1,6 +1,6 @@
 use board_proto::{
-    Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType, TaskId,
-    UpdateBoard,
+    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType,
+    TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -185,13 +185,17 @@ pub(crate) fn update(
         req.parallel_tasks
             .is_some_and(|v| v != before.parallel_tasks),
     );
+    set(
+        "dispatch",
+        req.dispatch.is_some_and(|v| v != before.dispatch),
+    );
     if fields.is_empty() {
         return Ok(before);
     }
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
-         home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10 \
-         WHERE slug = ?1",
+         home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
+         dispatch = ?11 WHERE slug = ?1",
         params![
             slug.as_str(),
             req.title.unwrap_or(before.title),
@@ -204,6 +208,7 @@ pub(crate) fn update(
             cx.now_ms(),
             req.temporary.unwrap_or(before.temporary),
             req.parallel_tasks.unwrap_or(before.parallel_tasks),
+            enum_str(&req.dispatch.unwrap_or(before.dispatch)),
         ],
     )?;
     cx.emit(
@@ -280,6 +285,7 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         format!("DELETE FROM events WHERE board = ?1 OR task IN ({TASKS})"),
         "DELETE FROM asks WHERE board = ?1".to_owned(),
         "DELETE FROM said WHERE board = ?1".to_owned(),
+        "DELETE FROM judges WHERE board = ?1".to_owned(),
         // Parents are on the same board, so no task elsewhere refers to these.
         "UPDATE tasks SET parent = NULL WHERE board = ?1".to_owned(),
         "INSERT OR REPLACE INTO deleted_boards (slug, next_number) \
@@ -425,11 +431,7 @@ pub(crate) fn sweep_temporary(
     Ok(swept)
 }
 
-pub(crate) fn join(
-    cx: &mut Ctx<'_>,
-    slug: &BoardSlug,
-    agent: &board_proto::AgentId,
-) -> Result<Board> {
+pub(crate) fn join(cx: &mut Ctx<'_>, slug: &BoardSlug, agent: &AgentId) -> Result<Board> {
     get_board(cx, slug)?;
     touch_agent(cx, agent)?;
     join_board(cx, slug, agent)?;
@@ -496,6 +498,21 @@ pub(crate) fn claim_coordinator(
                 ago(chrono::TimeDelta::milliseconds(left))
             ),
             "leave the coordinator to that device; retry after the lease expires",
+        ));
+    }
+    if let Some(agent) = &req.agent
+        && let Some(device) = agent.dispatch_device()
+        && device != req.device
+    {
+        return Err(forbidden(
+            format!(
+                "{agent} is device {device}'s dispatch agent, not device {}'s",
+                req.device
+            ),
+            format!(
+                "name your own device's dispatch agent: agent={}",
+                AgentId::dispatch(&req.device)
+            ),
         ));
     }
     if let Some(agent) = &req.agent {

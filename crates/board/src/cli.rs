@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use board_proto::{
     ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
-    EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
-    FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
-    ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
-    UpdateBoard,
+    Dispatch, EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
+    FeedbackActivity, FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX,
+    ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId,
+    TaskStatus, UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -615,7 +615,8 @@ pub enum BoardCommand {
         #[arg(long)]
         temporary: bool,
     },
-    /// Change a board.
+    /// Change a board (also `board board set`).
+    #[command(visible_alias = "set")]
     Update {
         slug: BoardSlug,
         #[arg(long, help = at_most("New title", limits().title_chars))]
@@ -640,6 +641,10 @@ pub enum BoardCommand {
         /// once (1 to 4). Only the user may raise it.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
         parallel_tasks: Option<u32>,
+        /// Who runs the board's autopilot: a coordinator thread (thread), or the daemon of
+        /// the device holding the coordinator lease (daemon).
+        #[arg(long, value_parser = enum_arg::<Dispatch>())]
+        dispatch: Option<Dispatch>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1134,6 +1139,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             home_devices,
             temporary,
             parallel_tasks,
+            dispatch,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1144,6 +1150,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 home_devices,
                 temporary,
                 parallel_tasks,
+                dispatch,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
