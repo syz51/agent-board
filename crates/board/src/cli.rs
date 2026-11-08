@@ -29,11 +29,132 @@ pub struct Cli {
     /// the thread's own id is accepted.
     #[arg(long, global = true)]
     pub agent: Option<String>,
-    /// Print JSON instead of text.
+    /// Print JSON instead of text. Each command's --help names the shape it prints.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// What `--json` prints at the top level, per command path, for its `--help`. Every
+/// command has an entry: a CLI test walks the command tree.
+const JSON_SHAPES: &[(&str, &str)] = &[
+    (
+        "status",
+        "{board, agents} for a board, or {boards: [...]} when none resolves",
+    ),
+    ("ls", "a JSON array of tasks"),
+    ("show", "{task, notes, evidence, blocks, children, history}"),
+    ("add", "the task object {id, status, owner, ...}"),
+    ("claim", "the task object {id, status, owner, ...}"),
+    ("release", "the task object {id, status, owner, ...}"),
+    ("take", "the task object {id, status, owner, ...}"),
+    ("update", "the task object {id, status, owner, ...}"),
+    ("done", "the task object {id, status, owner, ...}"),
+    ("note", "the note object {id, task, agent, kind, text, at}"),
+    (
+        "handoff",
+        "the handoff object {agent, now, next, blockers, version, ...}, or null when there is none",
+    ),
+    ("lease", "{leases: [...], conflicts: [...], warning?}"),
+    (
+        "ask",
+        "the ask object {id, status, question, ..., warning?}",
+    ),
+    ("asks", "a JSON array of asks"),
+    ("withdraw", "the ask object {id, status, question, ...}"),
+    ("answer", "the ask object {id, status, question, ...}"),
+    ("join", "the board object {slug, title, status, ...}"),
+    ("boards", "a JSON array of boards"),
+    ("board", "see each subcommand's --help"),
+    (
+        "board create",
+        "the board object {slug, title, status, ...}",
+    ),
+    (
+        "board update",
+        "the board object {slug, title, status, ...}",
+    ),
+    ("board delete", "{deleted: slug}"),
+    ("board adopt", "the board object {slug, title, status, ...}"),
+    ("log", "{events: [...], next_since}"),
+    (
+        "stats",
+        "{days, tasks_created, tasks_done, ..., boards: [...]}",
+    ),
+    ("errors", "{signatures: [...], since, retention_days}"),
+    ("snapshot", "{kind, text, seq, at}"),
+    ("feedback", "{task, duplicate, reports}"),
+    ("resolve", "the task object {id, status, owner, ...}"),
+];
+
+/// Commands that print no JSON and ignore `--json`, with their subcommands.
+const JSON_IGNORED: &[&str] = &[
+    "login",
+    "mcp",
+    "hook",
+    "read-thread",
+    "install",
+    "watch",
+    "serve",
+    "admin",
+];
+
+/// The `--json` help for a command path, such as `board create`.
+fn json_help(path: &str) -> Option<String> {
+    if let Some((_, shape)) = JSON_SHAPES.iter().find(|(p, _)| *p == path) {
+        return Some(format!("Print JSON instead of text: {shape}"));
+    }
+    let top = path.split(' ').next().unwrap_or(path);
+    JSON_IGNORED
+        .contains(&top)
+        .then(|| "Ignored: this command prints no JSON".to_owned())
+}
+
+/// The command line, with each command's `--json` help naming the shape it prints.
+pub fn command() -> clap::Command {
+    use clap::CommandFactory as _;
+    let mut cmd = Cli::command();
+    // Copies the global --json into every subcommand, so each copy can get its own help.
+    cmd.build();
+    describe_json(cmd, "")
+}
+
+fn describe_json(mut cmd: clap::Command, path: &str) -> clap::Command {
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    for name in names {
+        let path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path} {name}")
+        };
+        cmd = cmd.mut_subcommand(&name, |sub| {
+            let sub = match json_help(&path) {
+                // Not `mut_arg`: it moves the arg to the end, which breaks the built key
+                // index, so `--help` would parse as `--json`. `mut_args` keeps the order.
+                Some(help) => sub.mut_args(|a| {
+                    if a.get_id() == "json" {
+                        a.help(help.clone())
+                    } else {
+                        a
+                    }
+                }),
+                None => sub,
+            };
+            describe_json(sub, &path)
+        });
+    }
+    cmd
+}
+
+/// Parses the process arguments like [`Parser::parse`], with [`command`]'s help.
+pub fn parse() -> Cli {
+    use clap::FromArgMatches as _;
+    let mut matches = command().get_matches();
+    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.format(&mut command()).exit())
 }
 
 #[derive(Debug, Subcommand)]
@@ -1139,6 +1260,59 @@ mod tests {
             update.contains("[possible values: open, doing, blocked, review, dropped]"),
             "done goes through board done: {update}"
         );
+    }
+
+    #[test]
+    fn every_command_names_its_json_shape_in_help() {
+        fn walk(cmd: &clap::Command, path: &str, seen: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let name = sub.get_name();
+                let path = if path.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{path} {name}")
+                };
+                // clap's own `help` subcommand, and its mirror of the tree, take no flags.
+                if name == "help" {
+                    continue;
+                }
+                let json = sub
+                    .get_arguments()
+                    .find(|a| a.get_id() == "json")
+                    .unwrap_or_else(|| panic!("board {path} has no --json"));
+                let help = json.get_help().map(ToString::to_string).unwrap_or_default();
+                assert!(
+                    help.starts_with("Print JSON instead of text: ")
+                        || help.starts_with("Ignored: "),
+                    "board {path} --help does not name its --json shape: {help:?}; \
+                     add it to JSON_SHAPES or JSON_IGNORED"
+                );
+                seen.push(path.clone());
+                walk(sub, &path, seen);
+            }
+        }
+        let cmd = command();
+        let mut seen = Vec::new();
+        walk(&cmd, "", &mut seen);
+        for (path, _) in JSON_SHAPES {
+            assert!(seen.iter().any(|s| s == path), "no command {path:?}");
+        }
+        for path in JSON_IGNORED {
+            assert!(seen.iter().any(|s| s == path), "no command {path:?}");
+        }
+
+        let mut cmd = command();
+        for (args, shape) in [
+            (&["asks"][..], "a JSON array of asks"),
+            (&["log"], "{events: [...], next_since}"),
+            (&["board", "delete"], "{deleted: slug}"),
+        ] {
+            let err = cmd
+                .try_get_matches_from_mut([&["board"][..], args, &["--help"]].concat())
+                .unwrap_err();
+            let help = err.to_string();
+            assert!(help.contains(shape), "board {args:?} --help: {help}");
+        }
     }
 
     #[test]
