@@ -1545,6 +1545,35 @@ fn update_owner_hands_the_task_over_and_catches_an_old_server() {
     let body = &e.stub.requests_to("PATCH /v1/tasks/factory-7")[0].body;
     assert_eq!(body["owner"], "t3:child");
 
+    // The server resolves a short handle to the full id; the detail's handles tie them.
+    let full = "t3:mcp:launch:0123abcd";
+    let mut resolved = task.clone();
+    resolved.owner = Some(full.parse().unwrap());
+    e.stub.on("PATCH /v1/tasks/factory-7", &resolved);
+    e.stub.on(
+        "GET /v1/tasks/factory-7",
+        TaskDetail {
+            task: resolved.clone(),
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: [(full.to_owned(), "t3:01ab".to_owned())].into(),
+        },
+    );
+    let out = e.run(&["update", "factory-7", "--owner", "t3:01ab"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Another agent's handle is not the one the server answered with.
+    let out = e.run(&["update", "factory-7", "--owner", "t3:99ff"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("predates handovers"),
+        "{}",
+        stderr(&out)
+    );
+
     // An old server ignores owner and answers with the owner unchanged.
     e.stub.on("PATCH /v1/tasks/factory-7", &task);
     let out = e.run(&["update", "factory-7", "--owner", "t3:child"]);

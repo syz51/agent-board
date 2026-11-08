@@ -333,6 +333,21 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(ignored["isError"], true, "{ignored}");
     assert!(text(&ignored).contains("predates handovers"), "{ignored}");
 
+    // A short handle the server resolved to the full id counts as applied.
+    let full = "t3:mcp:launch:0123abcd";
+    let mut resolved = detail.clone();
+    resolved.task.owner = Some(full.parse().unwrap());
+    resolved.handles = [(full.to_owned(), "t3:01ab".to_owned())].into();
+    stub.on("PATCH /v1/tasks/factory-12", &resolved.task);
+    stub.on("GET /v1/tasks/factory-12", &resolved);
+    let by_handle = mcp.call(
+        32,
+        "task_update",
+        json!({"id": "factory-12", "owner": "t3:01ab"}),
+    );
+    assert_ne!(by_handle["isError"], true, "{by_handle}");
+    stub.on("GET /v1/tasks/factory-12", &detail);
+
     stub.on_error(
         "POST /v1/asks/5/withdraw",
         403,

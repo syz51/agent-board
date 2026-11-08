@@ -38,6 +38,9 @@ sub-tasks and found work as Proposal: tasks (auto=false). Notes and bodies: task
 const TITLE_CHARS: usize = 80;
 /// Paths and globs are cut to this many characters in hook text.
 const PATH_CHARS: usize = 80;
+/// A handoff's `now`, then `next`, are cut to this many characters before the size cap
+/// drops alerts, then the handoff.
+const HANDOFF_SHORT_CHARS: usize = 100;
 /// Events scanned for alerts per request; later ones wait for the next request.
 const ALERT_SCAN: u32 = 1000;
 /// Alerts look back at most this many events, so a cursor far behind costs no more per
@@ -208,6 +211,9 @@ struct HandoffView {
     next: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     blockers: String,
+    /// The size cap shortened it; `board handoff` shows it whole.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cut: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,6 +537,7 @@ fn fill_full(
         now: h.now,
         next: h.next,
         blockers: h.blockers,
+        cut: false,
     });
 
     if let Some(repo) = &agent.repo {
@@ -1446,7 +1453,10 @@ fn render_capped(mut model: Model, format: SnapshotFormat, cap: usize) -> String
     }
 }
 
-/// Removes the bottom-most item; false when nothing more can be cut.
+/// Removes the bottom-most item; false when nothing more can be cut. Alerts ask for action
+/// now, so the handoff, which `board handoff` shows whole, is shortened before them: its
+/// blockers go, then `now` is cut short. It is dropped only after the alerts, with `next`,
+/// the first step after a restart, cut short last.
 fn cut_last(m: &mut Model) -> bool {
     if m.recent.pop().is_some() {
         return true;
@@ -1472,7 +1482,30 @@ fn cut_last(m: &mut Model) -> bool {
         }
         return true;
     }
-    if m.peers.pop().is_some() || m.alerts.pop().is_some() || m.handoff.take().is_some() {
+    if m.peers.pop().is_some() {
+        return true;
+    }
+    if let Some(h) = &mut m.handoff {
+        if !h.blockers.is_empty() {
+            h.blockers.clear();
+            h.cut = true;
+            return true;
+        }
+        if shorten(&mut h.now) {
+            h.cut = true;
+            return true;
+        }
+    }
+    if m.alerts.pop().is_some() {
+        return true;
+    }
+    if let Some(h) = &mut m.handoff
+        && shorten(&mut h.next)
+    {
+        h.cut = true;
+        return true;
+    }
+    if m.handoff.take().is_some() {
         return true;
     }
     if let Some(last) = m.mine.last_mut() {
@@ -1483,6 +1516,15 @@ fn cut_last(m: &mut Model) -> bool {
         return true;
     }
     m.kind != SnapshotKind::Full && m.counts.take().is_some()
+}
+
+/// Cuts a handoff field to `HANDOFF_SHORT_CHARS`; false when it was already that short.
+fn shorten(field: &mut String) -> bool {
+    if field.chars().count() <= HANDOFF_SHORT_CHARS {
+        return false;
+    }
+    *field = cut(field, HANDOFF_SHORT_CHARS);
+    true
 }
 
 fn open_tag(m: &Model) -> String {
@@ -1601,7 +1643,12 @@ fn render_lines(m: &Model) -> String {
         }
     }
     if let Some(h) = &m.handoff {
-        let _ = writeln!(o, "handoff (yours, {} ago):", h.ago);
+        let cut = if h.cut {
+            "; cut, board handoff shows it whole"
+        } else {
+            ""
+        };
+        let _ = writeln!(o, "handoff (yours, {} ago{cut}):", h.ago);
         for (k, v) in [
             ("now", &h.now),
             ("next", &h.next),
@@ -1759,6 +1806,9 @@ fn render_yaml(m: &Model) -> String {
         let _ = writeln!(o, "  next: {}", q(&h.next));
         if !h.blockers.is_empty() {
             let _ = writeln!(o, "  blockers: {}", q(&h.blockers));
+        }
+        if h.cut {
+            o.push_str("  cut: true\n");
         }
     }
     if !m.alerts.is_empty() {

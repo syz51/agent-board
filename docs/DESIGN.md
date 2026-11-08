@@ -402,18 +402,33 @@ settings in use, warned once per edit.
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
   the triage prompt), a reconcile that keeps the coordinator alive sends it one message
-  with the new prompt in full, then records the new digest. The message follows the
-  wake-up rules: it is held while the coordinator is paused, or runs and was seen within
-  `WAKE_HOLD_MAX`; a send that timed out may have got through, so it counts as sent; a
-  failed send backs off from 30 seconds up to 10 minutes, and makes the next reconcile ask
-  T3 whether the thread is gone. It is held too while the board is idle (nothing in
-  doing or review, no ready auto task and no open ask; a server without `ready_auto`
-  counts as not idle), or while wake-ups wait for the coordinator, so a deploy costs an
-  idle coordinator no turn: the next wake-up the daemon sends it, or the message that
-  resumes it after a usage limit, carries the new prompt in front. A send that may have
-  got through records the new digest; a failed one leaves the prompt owed for its retry.
-  A record without a digest (from before this rule), or a thread an earlier unfinished
-  start launched, counts as changed, so it is briefed once.
+  with the new prompt in full, then records the new digest. The message ends with a
+  marker line, `(re-brief <first 16 hex digits of the digest> of board <slug>)`. It
+  follows the wake-up rules: it is held while the coordinator is paused, or runs and was
+  seen within `WAKE_HOLD_MAX`; a failed send backs off from 30 seconds up to 10 minutes,
+  and makes the next reconcile ask T3 whether the thread is gone. It is held too while
+  the board is idle (nothing in doing or review, no ready auto task and no open ask; a
+  server without `ready_auto` counts as not idle), or while wake-ups wait for the
+  coordinator, so a deploy costs an idle coordinator no turn: the next wake-up the daemon
+  sends it, or the message that resumes it after a usage limit, carries the new prompt in
+  front. A failed send leaves the prompt owed for its retry. A record without a digest
+  (from before this rule), or a thread an earlier unfinished start launched, counts as
+  changed, so it is briefed once.
+- **A re-brief whose send timed out**: T3 may or may not have delivered it, so the daemon
+  records the new digest and keeps the re-brief as unsure in its state, with the time of
+  the send. This covers a wake-up or a usage-limit resume that carried it, and a flush
+  cut short while sending it. From one minute after the send, so T3 has handled the
+  request, each reconcile reads the thread's 100 latest messages with `t3 thread show`,
+  while the coordinator works too, so its turns do not push the message out of them.
+  The newest user message with a re-brief marker of the board settles it when that
+  marker carries this digest. Otherwise, while T3 has a run of the thread active or
+  queued (`thread.status` preparing, queued, starting, running or waiting), the message
+  may still wait in T3's queue, so it is read again on the next reconcile. With no such
+  run, the prompt is owed again and sent by the rules above. A second send that times out
+  counts as delivered, so a digest is sent at most twice. A check that fails, times out
+  or reads an unknown format backs off like a failed send and sends nothing, so a
+  re-brief that arrived is not sent twice. One that answers that T3 does not know the
+  thread makes the next reconcile ask whether the thread is gone.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
@@ -716,7 +731,11 @@ keeping untrusted text out of those channels, so:
   the end of `you`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with
-  `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
+  `->` and the action. Over the cap, it is cut from the bottom (recent, proposals, waiting,
+  ready, peers), except that the handoff is shortened before alerts go: first its
+  blockers, then `now` to 100 characters; then alerts, then `next` to 100 characters, then
+  the handoff, then the bottom of `mine`. A shortened handoff says `cut, board handoff
+  shows it whole` in its header (`cut: true` in `json` and `yaml`). **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
   most 1,000 per request that can concern it; the rest wait, counted in the first alert.
