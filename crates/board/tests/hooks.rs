@@ -359,16 +359,10 @@ fn post_tool_use_with_nothing_to_send_skips_the_server_and_the_keychain() {
     std::fs::create_dir_all(&bin).unwrap();
     let log = e.home.join("security.log");
     let security = bin.join("security");
-    std::fs::write(
+    common::script::write_script(
         &security,
-        format!("#!/bin/sh\necho run >> '{}'\nexit 44\n", log.display()),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        &format!("#!/bin/sh\necho run >> '{}'\nexit 44\n", log.display()),
+    );
     std::fs::write(e.home.join("token"), format!("{TOKEN}\n")).unwrap();
     let path = format!(
         "{}:{}",
@@ -1954,21 +1948,18 @@ fn a_delegated_t3_thread_registers_its_parent() {
 /// call once it answers, so a call the hook gave up on is not logged.
 #[cfg(unix)]
 fn fake_t3(dir: &std::path::Path, slow: bool) -> (String, PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt as _;
     let log = dir.join("t3.log");
     let answer = dir.join("t3-answer.json");
     let t3 = dir.join("t3");
     let wait = if slow { "sleep 0.7\n" } else { "" };
-    std::fs::write(
+    common::script::write_script(
         &t3,
-        format!(
+        &format!(
             "#!/bin/sh\n{wait}echo \"$@\" >> '{}'\ncat '{}'\n",
             log.display(),
             answer.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (t3.to_str().unwrap().to_owned(), log, answer)
 }
 
