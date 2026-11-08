@@ -3,6 +3,7 @@ import { getRouteApi, Link, useLocation } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
+import { useNow } from "@/live/runtime.ts";
 import { PlainText } from "@/text/markdown.tsx";
 import {
   agentAnchor,
@@ -27,16 +28,50 @@ const FILTERS = [
   { value: "running", label: "Running" },
   { value: "paused", label: "Paused" },
   { value: "idle", label: "Idle" },
+  { value: "away", label: "Away" },
   { value: "ended", label: "Ended" },
   { value: "all", label: "All" },
 ] as const;
 
-/** Agents for a state filter (`""` hides ended ones), busiest first. Exported for tests. */
-export function sortAgents(agents: Agent[], state: string): Agent[] {
+/**
+ * How long an agent that has not ended may go unseen before it counts as away: the server's
+ * default `doing_idle_secs`. A session that crashed or was killed never sends `ended`, and a
+ * live one is seen at every tool call and turn.
+ */
+const AWAY_AFTER_MS = 30 * 60_000;
+
+/**
+ * Whether an agent that has not ended is away: unseen for {@link AWAY_AFTER_MS}, and not
+ * waiting. Waiting are agents paused for a usage-limit reset still ahead or, with no reset,
+ * for the user, and a board's coordinator, whose lease the daemon renews without marking it
+ * seen. The server's board listing keeps the same agents. Exported for tests.
+ */
+export function isAway(agent: Agent, now: number, coordinators: ReadonlySet<string>): boolean {
+  if (agent.state === "ended" || now - Date.parse(agent.last_seen) <= AWAY_AFTER_MS) return false;
+  if (agent.paused_until ? Date.parse(agent.paused_until) > now : agent.state === "paused") {
+    return false;
+  }
+  return !coordinators.has(agent.id);
+}
+
+/**
+ * Agents for a filter, busiest first. Active and each state leave out away agents, which
+ * `away` lists; `ended` and `all` ignore it. Exported for tests.
+ */
+export function sortAgents(
+  agents: Agent[],
+  filter: string,
+  now: number,
+  coordinators: ReadonlySet<string>,
+): Agent[] {
   return agents
-    .filter((agent) =>
-      state === "all" ? true : state ? agent.state === state : agent.state !== "ended",
-    )
+    .filter((agent) => {
+      if (filter === "all") return true;
+      if (filter === "ended") return agent.state === "ended";
+      const away = isAway(agent, now, coordinators);
+      if (filter === "away") return away;
+      return !away && (filter ? agent.state === filter : agent.state !== "ended");
+    })
     .sort(
       (a, b) =>
         STATE_ORDER[a.state] - STATE_ORDER[b.state] ||
@@ -51,10 +86,14 @@ export function AgentsScreen() {
   const target = useLocation({ select: (location) => location.hash });
   const agents = useAgents();
   const doing = useQuery(queries.doingTasks());
+  const boards = useQuery(queries.boards());
+  const now = useNow();
   const current = new Map<string, Task>();
   for (const task of doing.data ?? []) if (task.owner) current.set(task.owner, task);
-  const count = (state: Agent["state"]) =>
-    agents.data?.filter((agent) => agent.state === state).length ?? 0;
+  const coordinators = new Set<string>();
+  for (const board of boards.data ?? []) if (board.coordinator) coordinators.add(board.coordinator);
+  const count = (filter: string) =>
+    agents.data ? sortAgents(agents.data, filter, now, coordinators).length : 0;
 
   return (
     <>
@@ -63,7 +102,8 @@ export function AgentsScreen() {
         sub={
           agents.data && (
             <>
-              {count("running")} running · {count("paused")} paused · {count("idle")} idle
+              {count("running")} running · {count("paused")} paused · {count("idle")} idle ·{" "}
+              {count("away")} away
             </>
           )
         }
@@ -89,7 +129,7 @@ export function AgentsScreen() {
       )}
       <QueryFrame query={agents} label="Loading agents">
         {(list) => {
-          const shown = sortAgents(list, state);
+          const shown = sortAgents(list, state, now, coordinators);
           if (shown.length === 0) {
             return (
               <Empty
