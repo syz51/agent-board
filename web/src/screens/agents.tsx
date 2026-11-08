@@ -119,7 +119,7 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who and where it runs, then what it is
  * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[340px_minmax(0,1fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1fr)]";
 
 /**
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
@@ -191,8 +191,8 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
 }
 
 /**
- * An agent's handoff. Beside a task, a rule sets it off and its labels sit left of their
- * values; `stacked`, for a narrow card, drops the rule and puts each label above its value.
+ * An agent's handoff, its labels left of their values. Beside a task, a rule sets it off;
+ * `stacked`, for a narrow card, drops the rule and narrows the label column.
  */
 export function HandoffView({ agentId, stacked }: { agentId: string; stacked?: boolean }) {
   const handoff = useQuery(queries.handoff(agentId));
@@ -220,9 +220,10 @@ export function HandoffView({ agentId, stacked }: { agentId: string; stacked?: b
       <dl
         className={cn(
           "m-0 grid [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-sm [&_dd]:text-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid",
+          "gap-0.5 [&>div]:gap-2",
           stacked
-            ? "gap-2 [&>div]:gap-0.5"
-            : "gap-0.5 [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2",
+            ? "[&>div]:grid-cols-[40px_minmax(0,1fr)]"
+            : "[&>div]:grid-cols-[72px_minmax(0,1fr)]",
         )}
       >
         <div>

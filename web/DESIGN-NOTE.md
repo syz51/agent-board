@@ -12,8 +12,9 @@ inset panel, and lists that run edge to edge across it.
 - **Rows**: one row model for lists. A row has one main line and at most one line of
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
-- **Density**: 36px task rows and 38px group bands. Boards rows keep the name, slug and
-  badges on one line and the goal to two lines. Agents are a two-column table: who, with
+- **Density**: 36px task rows and 38px group bands. Boards rows never cut the name or
+  slug (badges or a long slug take a second line), keep the goal to two lines and the task
+  tally to one. Agents are a two-column table: who, with
   its state, when last seen and one quiet line of where it runs (cut with an ellipsis,
   whole on hover); then what it is working on, with its handoff. Priority labels share one
   weight; the bars carry the level.

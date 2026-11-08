@@ -338,7 +338,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,432px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -398,10 +398,10 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      {/* One line in every row: the slug gives way first, then the title; both keep their
-          full text in a tooltip, and the board page shows them whole. */}
-      <div className="flex min-w-0 items-center gap-x-2.5">
-        <h3 className="min-w-0 truncate text-sm font-semibold tracking-[-0.006em]">
+      {/* The name and slug are never cut: where the badges do not fit beside them, they
+          move to a line of their own. */}
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em] [overflow-wrap:anywhere]">
           <Link
             className="text-foreground"
             to="/boards/$slug"
@@ -411,10 +411,7 @@ function BoardName({ board }: { board: Board }) {
             {board.title}
           </Link>
         </h3>
-        <span
-          className="ident min-w-0 shrink-[4] truncate text-meta text-muted-foreground"
-          title={board.slug}
-        >
+        <span className="ident min-w-0 text-meta [overflow-wrap:anywhere] text-muted-foreground">
           {board.slug}
         </span>
         {board.status !== "active" && (
@@ -462,14 +459,18 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
+          // Phones set it a step smaller and tighter, so six counts still fit on one line.
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
             (segment) =>
               counts[segment.key] > 0 && (
                 // A count and its word, in the bar's order, after a dot of its bar colour.
-                <li key={segment.key} className="inline-flex items-center gap-1 whitespace-nowrap">
+                <li
+                  key={segment.key}
+                  className="inline-flex items-center gap-1 whitespace-nowrap max-md:gap-0.75"
+                >
                   <span
                     className={cn("size-1.5 flex-none rounded-full", segment.bar)}
                     aria-hidden="true"

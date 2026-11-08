@@ -342,7 +342,9 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                         />
                         <span className="whitespace-pre-wrap">{option}</span>
                         {index === 0 && (
-                          <Badge variant="accent" shape="tag">
+                          // Neutral, so it reads apart from the violet of a decision.
+                          <Badge variant="outline" shape="tag" className="gap-1">
+                            <Icon name="check" className="size-3" />
                             Recommended
                           </Badge>
                         )}
