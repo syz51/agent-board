@@ -61,7 +61,7 @@ only for a cause that is already gone.
   the same owner, never as a `duplicate` of the closed item. When the earlier task has an
   open revisit (a child task titled `Revisit: …`), route the item to the revisit.
   Otherwise route it to the board of the earlier task and name that task in the new
-  body. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's
+  body; when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's
   owner (see "Finding the owner") and cite the earlier item and its reason: a fix that did
   not hold goes to the owner, not back to you.
 - When the owner declines or merges a routed proposal (its task is dropped), its verdict

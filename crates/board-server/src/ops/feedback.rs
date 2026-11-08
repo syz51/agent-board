@@ -7,7 +7,8 @@ use board_proto::{
     CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode,
     ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
     Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
-    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
+    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, TaskStatus,
+    Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -277,33 +278,35 @@ fn resolution(
 }
 
 /// Refuses resolving item `id` as a duplicate of `original` unless `original` takes reports
-/// (`live_item`; a plain task while it is open), and not through `id` itself. A duplicate of
-/// an item that is no longer live is not live either, so the next report would open yet
-/// another item that nobody routes: the hint says where to route `id` instead.
+/// (`live_item`; a plain task while it is open). A duplicate of an item that is no longer
+/// live is not live either, so the next report would open yet another item that nobody
+/// routes: the hint says where to route `id` instead. `resolve` checks `id` again once the
+/// resolution is written, for chains that lead back to `id`.
 fn check_original(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<()> {
     let live = if is_feedback(cx, original)? {
-        live_item(cx, original, 0)?
+        live_item(cx, original, 0)?.is_some()
     } else {
-        task_open(cx, original)?.then(|| original.clone())
+        task_open(cx, original)?
     };
-    match live {
-        Some(item) if &item == id => Err(invalid(
-            format!("{original} passes its reports to {id}, so {id} cannot be its duplicate"),
-            format!("name the original item, not one resolved as a duplicate of {id}"),
-        )),
-        Some(_) => Ok(()),
-        None => Err(invalid(
-            format!("{original} no longer takes reports, so {id} cannot be its duplicate"),
-            route_instead(cx, id, original)?,
-        )),
+    if live {
+        return Ok(());
     }
+    Err(invalid(
+        format!("{original} no longer takes reports, so {id} cannot be its duplicate"),
+        route_instead(cx, id, original)?,
+    ))
 }
 
 /// Where to route item `id`, whose original is no longer live: the open revisit of the
-/// original's routed task, else a proposal to that task's owner, else to the setup's owner.
+/// original's routed task, else that task's owner (who declined it, when it was dropped),
+/// else the setup's owner.
 fn route_instead(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<String> {
     let routed = format!("then feedback_resolve {id} kind=routed task=<its id>");
-    let Some(task) = routed_task(cx, original)? else {
+    let task = match routed_task(cx, original)? {
+        Some(task) => find_task(cx, &task)?,
+        None => None,
+    };
+    let Some(task) = task else {
         return Ok(format!(
             "file a Proposal: task for the setup's owner that cites {original}, {routed}"
         ));
@@ -312,31 +315,40 @@ fn route_instead(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<String>
         .db
         .query_row(
             "SELECT id FROM tasks WHERE parent = ?1 AND status NOT IN ('done', 'dropped') \
-             AND (title LIKE 'Revisit:%' OR body LIKE 'Revisit:%') ORDER BY number LIMIT 1",
-            [task.as_str()],
+             AND title GLOB 'Revisit:*' ORDER BY number LIMIT 1",
+            [task.id.as_str()],
             |r| r.get(0),
         )
         .optional()?;
     if let Some(revisit) = revisit {
         return Ok(format!(
-            "route it to the open revisit of {task}: feedback_resolve {id} kind=routed \
-             task={revisit}"
+            "route it to the open revisit of {}: feedback_resolve {id} kind=routed \
+             task={revisit}",
+            task.id
         ));
     }
-    let row: Option<(String, Option<String>)> = cx
-        .db
-        .query_row(
-            "SELECT status, owner FROM tasks WHERE id = ?1",
-            [task.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let (status, owner) = row.unwrap_or_else(|| ("gone".to_owned(), None));
-    let owner = owner.map_or_else(String::new, |o| format!(", owned by {o}"));
+    let owner = task
+        .owner
+        .as_ref()
+        .map_or_else(String::new, |o| format!(", owned by {o}"));
+    let names = if &task.id == original {
+        task.id.to_string()
+    } else {
+        format!("{} and {original}", task.id)
+    };
+    if task.status == TaskStatus::Dropped {
+        return Ok(format!(
+            "{} was dropped{owner}: its verdict note answers these reports. Decline {id} \
+             citing it (kind=declined), or, with evidence the verdict did not weigh, file a \
+             Proposal: task on board {} that names {names} and cites the verdict, {routed}",
+            task.id, task.board
+        ));
+    }
     Ok(format!(
-        "its fix {task} is {status}{owner}: file a Proposal: task on board {} that names \
-         {task} and {original}, {routed}",
-        task.board()
+        "{} is {}{owner}: file a Proposal: task on board {} that names {names}, {routed}",
+        task.id,
+        status_str(task.status),
+        task.board
     ))
 }
 
@@ -344,7 +356,7 @@ fn route_instead(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<String>
 /// the feedback board that `id` is, or that the chain names.
 fn routed_task(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<TaskId>> {
     let mut at = id.clone();
-    for _ in 0..=DUPLICATE_DEPTH_MAX {
+    for _ in 0..DUPLICATE_DEPTH_MAX {
         match resolution(cx, &at)? {
             None if at.board() == cx.s.feedback_board => return Ok(None),
             None => return Ok(Some(at)),
@@ -770,6 +782,21 @@ pub(crate) fn resolve(
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now],
     )?;
+    // The checks above see `id` still open. Once it is resolved, a chain of duplicates that
+    // leads back to it (or runs past the depth limit) leaves it taking no reports; the
+    // error rolls the resolution back.
+    if req.kind == ResolutionKind::Duplicate
+        && let Some(original) = &req.task
+        && live_item(cx, id, 0)?.is_none()
+    {
+        return Err(invalid(
+            format!("{original} passes its reports back to {id}, so {id} cannot be its duplicate"),
+            format!(
+                "name the item that takes the reports, at the end of the duplicate links, not \
+                 one that leads back to {id}"
+            ),
+        ));
+    }
     crate::ops::leases::release_for_task(cx, id, &task.board, &by)?;
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",

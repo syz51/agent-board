@@ -447,6 +447,111 @@ async fn a_duplicate_needs_an_original_that_still_takes_reports() {
     );
 }
 
+async fn user_resolve(t: &T, item: &str, body: Value) -> (u16, Value) {
+    let (s, v) = t
+        .as_user("POST", &format!("/v1/feedback/{item}/resolve"), Some(body))
+        .await;
+    (s.as_u16(), v)
+}
+
+async fn item(t: &T, agent: &str, text: &str) -> String {
+    report(t, agent, json!({ "about": "board", "text": text })).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_duplicate_is_refused_when_its_original_closes_or_leads_back() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+
+    // An original routed to the item being resolved leads back to it: refused, rolled back.
+    let (x, y) = (
+        item(&t, A, "Routed loop one").await,
+        item(&t, B, "Routed loop two").await,
+    );
+    let (s, v) = user_resolve(&t, &x, json!({ "kind": "routed", "task": y })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = user_resolve(&t, &y, json!({ "kind": "duplicate", "task": x })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("passes its reports back"),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&y).await["status"], "open", "rolled back");
+
+    // So does a plain task on the feedback board, adopted as it is resolved.
+    let plain = t.task(B, "board-feedback", "Plain loop report").await;
+    let z = item(&t, A, "Plain loop item").await;
+    let (s, v) = user_resolve(&t, &z, json!({ "kind": "duplicate", "task": plain })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = user_resolve(&t, &plain, json!({ "kind": "duplicate", "task": z })).await;
+    assert_eq!(s, 400, "{v}");
+
+    // A plain task off the feedback board is an original while it is open.
+    let open = t.task(B, "factory", "Open plain work").await;
+    let q = item(&t, A, "Duplicate of open work").await;
+    let (s, v) = user_resolve(&t, &q, json!({ "kind": "duplicate", "task": open })).await;
+    assert_eq!(s, 200, "{v}");
+    let done = t.task(B, "factory", "Finished plain work").await;
+    assert!(t.claim(B, &done).await.0.is_success());
+    assert!(t.done(B, &done, check(0)).await.0.is_success());
+    let r = item(&t, A, "Duplicate of finished work").await;
+    let (s, v) = user_resolve(&t, &r, json!({ "kind": "duplicate", "task": done })).await;
+    assert_eq!(s, 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!("{done} is done, owned by {B}")),
+        "{v}"
+    );
+    assert!(next.contains(&format!("names {done}, then")), "{v}");
+
+    // A dropped routed task was declined or merged: the hint points to its verdict.
+    let declined = t.task(B, "factory", "Declined work").await;
+    let text = "Routed then declined";
+    let s1 = item(&t, A, text).await;
+    let (s, v) = user_resolve(&t, &s1, json!({ "kind": "routed", "task": declined })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = t.patch(B, &declined, json!({ "status": "dropped" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let s2 = item(&t, C, text).await;
+    assert_ne!(s1, s2);
+    let (s, v) = user_resolve(&t, &s2, json!({ "kind": "duplicate", "task": s1 })).await;
+    assert_eq!(s, 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!("{declined} was dropped")) && next.contains("kind=declined"),
+        "{v}"
+    );
+
+    // A routed task whose board is gone: the hint falls back to the setup's owner.
+    t.board("scratch", &[]).await;
+    let gone = t.task(B, "scratch", "Work on a deleted board").await;
+    let text = "Routed to a deleted board";
+    let u1 = item(&t, A, text).await;
+    let (s, v) = user_resolve(&t, &u1, json!({ "kind": "routed", "task": gone })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/scratch",
+            Some(json!({ "status": "closed" })),
+        )
+        .await;
+    assert!(s.is_success());
+    let (s, _) = t.as_user("DELETE", "/v1/boards/scratch", None).await;
+    assert_eq!(s.as_u16(), 204);
+    let u2 = item(&t, B, text).await;
+    assert_ne!(u1, u2);
+    let (s, v) = user_resolve(&t, &u2, json!({ "kind": "duplicate", "task": u1 })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("setup's owner"), "{v}");
+}
+
 #[tokio::test]
 async fn resolve_is_for_the_owner_or_the_user() {
     let t = setup().await;
