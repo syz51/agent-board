@@ -418,8 +418,9 @@ settings in use, warned once per edit.
   changed, so it is briefed once.
 - **A re-brief whose send timed out**: T3 may or may not have delivered it, so the daemon
   records the new digest and keeps the re-brief as unsure in its state, with the time of
-  the send. This covers a wake-up or a usage-limit resume that carried it, and a flush
-  cut short while sending it. From one minute after the send, so T3 has handled the
+  the send. This covers a usage-limit resume that carried it. One that went with a
+  wake-up is tracked with that message instead (A wake-up whose send timed out, below),
+  so a lost message comes back as one. From one minute after the send, so T3 has handled the
   request, each reconcile reads the thread's 100 latest messages with `t3 thread show`,
   while the coordinator works too, so its turns do not push the message out of them.
   The newest user message with a re-brief marker of the board settles it when that
@@ -620,27 +621,30 @@ settings in use, warned once per edit.
     run side by side; one that runs out of time may still have been delivered (below).
   - **A wake-up whose send timed out**: each message ends with a marker line,
     `(wake-up <first 16 hex digits of a SHA-256 of its text and send time>)`. Before the
-    send, the daemon records the message as unsure in its state, by agent: the digest, the
-    wake-ups it carries (what they are about, never the text) and the time. A send that
-    is delivered, fails or finds the thread gone clears that record; one that times out,
-    or a flush cut short while sending, keeps it. From one minute after the send, so T3
-    has handled the request, the flush reads the thread's 100 latest messages with
-    `t3 thread show`, sharing the helper the fresh-session read uses. The agent's new lines
-    wait for that check, so lines owed again go out with them in one message. A user
-    message carrying the marker settles it. Without one, while T3 has a run of the thread
-    active or queued, the message may still wait in T3's queue, so it is read again on
-    the next flush; the new lines are not held for that, since a thread left marked
-    running must still be woken. With no such run, or when T3 does not know the thread,
-    the wake-ups are queued again, each checked again before sending like any line. A
-    wake-up queued again is marked so that a second send that times out counts as
-    delivered: it is sent at most twice. A check that fails, times out or reads an
-    unknown format backs off from 30 seconds up to 10 minutes and sends nothing; the
-    agent's new lines are no longer held for it. Only the newest timed-out message per
-    agent is kept: one more timeout before its check settles it drops the earlier
-    one's wake-ups, with a warning. A record older than an hour is dropped like an
-    expired line. A coordinator's re-brief that went in the same message is looked for by
-    the reconcile, by its own marker and the same rules (A re-brief whose send timed out,
-    above), so when the message was lost, the next one carries both again.
+    send, the daemon records the message as unsure in its state, by agent, with what it
+    carries for the first time: the digest, its wake-ups (what they are about), the
+    boards and prompt digests of its re-briefs, its fresh-session notices, and the time;
+    never the text. A delivered send drops the record, and drops from the agent's older
+    unsure messages what it delivered again. A failed send drops it too, since its lines
+    are retried. One that finds the thread gone drops all of the agent's, and passes their
+    answers on with the rest. One that times out, or a flush cut short while sending,
+    keeps it. From one minute after a send, so T3 has handled the request, the flush reads
+    the thread's 100 latest messages with `t3 thread show`, once for all of the agent's
+    due messages, two threads at a time; the same read serves the fresh-session check.
+    The agent's new lines wait while a message is not looked for yet, so what is owed
+    again goes out with them in one message. A user message carrying a marker settles
+    that message. Without one, while T3 has a run of the thread active or queued, the
+    message may still wait in T3's queue, so it is read again a minute later; new lines
+    are not held for that, since a thread left marked running must still be woken. With
+    no such run, or when T3 does not know the thread, what it carried is owed again: its
+    wake-ups are queued again and checked before sending like any line, its re-briefs are
+    owed and go in front of them, and its fresh-session notices are due again for the
+    next wake-up. A wake-up or re-brief owed again is marked so that a second send that
+    times out counts as delivered: each is sent at most twice. A new event about a
+    wake-up so marked clears the mark. A check that fails, times out or reads an unknown
+    format backs off from 30 seconds up to 10 minutes and sends nothing; meanwhile the
+    agent's new lines are not held. A message not settled within an hour is dropped
+    like an expired line.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
   - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A

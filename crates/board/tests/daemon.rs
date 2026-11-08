@@ -2476,6 +2476,8 @@ async fn a_timed_out_wake_up_the_thread_never_got_is_sent_again_once() {
     assert_eq!(e.t3.sends(), [("coord".to_owned(), line.to_owned())]);
     // Recorded by what it was about and a digest its marker names, never its text.
     let unsure = unsure_wakes(&e, &agent).expect("looked for later");
+    assert_eq!(unsure.messages.len(), 1);
+    let unsure = &unsure.messages[0];
     assert_eq!(unsure.since, at());
     assert_eq!(unsure.wakes.len(), 1);
     assert!(
@@ -2547,19 +2549,31 @@ async fn a_timed_out_wake_up_waits_for_a_busy_thread_and_a_failed_check_sends_no
     e.daemon.flush(at()).await;
     e.t3.time_out_send.store(false, Ordering::SeqCst);
 
-    // A run active or queued may still take it: looked for again on the next flush.
+    // A run active or queued may still take it: looked for again a minute later, not on
+    // every flush.
     e.t3.running.lock().unwrap().push("coord".to_owned());
     e.daemon.flush(minute(1)).await;
     assert_eq!((e.t3.sends().len(), reads(&e)), (1, 1));
-    assert!(unsure_wakes(&e, &agent).is_some());
+    assert_eq!(
+        unsure_wakes(&e, &agent).unwrap().read_after,
+        Some(minute(2))
+    );
+    e.daemon
+        .flush(minute(1) + chrono::Duration::seconds(30))
+        .await;
+    assert_eq!((e.t3.sends().len(), reads(&e)), (1, 1));
     e.t3.running.lock().unwrap().clear();
 
     // A failed check backs off and sends nothing.
     e.t3.fail_messages.store(true, Ordering::SeqCst);
     e.daemon.flush(minute(2)).await;
     assert_eq!((e.t3.sends().len(), reads(&e)), (1, 2));
-    let backoff = unsure_wakes(&e, &agent).unwrap().backoff.unwrap();
-    assert_eq!(backoff.retry_at, minute(2) + WAKE_RETRY_FIRST);
+    let unsure = unsure_wakes(&e, &agent).unwrap();
+    assert_eq!(unsure.read_after, Some(minute(2) + WAKE_RETRY_FIRST));
+    assert_eq!(
+        unsure.failed_delay_secs,
+        Some(WAKE_RETRY_FIRST.num_seconds())
+    );
     e.t3.fail_messages.store(false, Ordering::SeqCst);
     // While it backs off, nothing is read, and new lines are no longer held for it; their
     // delivered send leaves it to be looked for.
@@ -2573,7 +2587,7 @@ async fn a_timed_out_wake_up_waits_for_a_busy_thread_and_a_failed_check_sends_no
         sends[1].1,
         "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
     );
-    assert_eq!(unsure_wakes(&e, &agent).unwrap().backoff, Some(backoff));
+    assert_eq!(unsure_wakes(&e, &agent), Some(unsure));
 
     // Its retry finds it missing: its line is sent again.
     e.daemon.flush(minute(2) + WAKE_RETRY_FIRST).await;
@@ -2599,7 +2613,7 @@ async fn a_timed_out_wake_up_is_looked_for_after_a_restart() {
     let path = home_of(&e).state_dir().join("watch.json");
     let mut saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    saved["unsure_wakes"]["t3:other"] = json!({ "digest": 5 });
+    saved["unsure_wakes"]["t3:other"] = json!({ "messages": 5 });
     std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
 
     let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
@@ -5542,7 +5556,7 @@ async fn only_the_newest_re_brief_of_the_board_in_the_thread_counts() {
 }
 
 #[tokio::test]
-async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() {
+async fn a_lost_wake_up_with_a_re_brief_is_sent_again_as_one_message() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
     let current = Some(board::daemon::prompt_digest(false).to_owned());
@@ -5559,13 +5573,17 @@ async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() 
     e.daemon.flush(at()).await;
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     assert_eq!(e.t3.sends().len(), 1);
-    assert!(unsure(&e).is_some_and(|u| !u.resent));
-
-    // Missing: owed again, and with the board idle it waits for the next wake-up, which
-    // also carries the lost message's line.
+    // The message tracks its re-brief: the reconcile leaves it to the flush.
+    assert_eq!(unsure(&e), None);
+    let message = &unsure_wakes(&e, &agent).unwrap().messages[0];
+    assert_eq!(message.rebriefs.len(), 1);
+    assert_eq!(message.wakes.len(), 1);
+    let reads = e.t3.message_reads.load(Ordering::SeqCst);
     e.daemon.reconcile(minute(1)).await.unwrap();
-    assert_eq!(e.t3.sends().len(), 1);
-    assert_eq!(e.daemon.state.coordinators[&slug].briefed, None);
+    assert_eq!(e.t3.message_reads.load(Ordering::SeqCst), reads);
+    assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
+
+    // Missing: the re-brief and the line go again together, with the lines queued since.
     queue_ready(&mut e, 11, &["factory-5"], minute(1)).await;
     e.daemon.flush(minute(1)).await;
     let sends = e.t3.sends();
@@ -5580,6 +5598,118 @@ async fn a_timed_out_re_brief_carried_by_a_wake_up_is_owed_again_when_missing() 
     );
     assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
     assert_eq!(unsure(&e), None);
+    assert_eq!(unsure_wakes(&e, &agent), None);
+    e.daemon.reconcile(minute(2)).await.unwrap();
+    e.daemon.flush(minute(2)).await;
+    assert_eq!(e.t3.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn a_second_timeout_before_the_check_keeps_both_messages() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let line =
+        |id: &str| format!("board factory: {id} is ready (p1)\nRun board_snapshot and continue.");
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+
+    // T3 stalls: the check fails, so the new line is not held, and its send times out too.
+    e.t3.fail_messages.store(true, Ordering::SeqCst);
+    queue_ready(&mut e, 11, &["factory-2"], minute(1)).await;
+    e.daemon.flush(minute(1)).await;
+    assert_eq!(e.t3.sends().len(), 2);
+    assert_eq!(unsure_wakes(&e, &agent).unwrap().messages.len(), 2);
+
+    // Neither reached the thread: each is sent again once it is due.
+    e.t3.fail_messages.store(false, Ordering::SeqCst);
+    let retry = minute(1) + board::daemon::WAKE_RETRY_FIRST;
+    e.daemon.flush(retry).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 3, "{sends:?}");
+    assert_eq!(sends[2].1, line("factory-1"));
+    e.daemon.flush(minute(2)).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 4, "{sends:?}");
+    assert_eq!(sends[3].1, line("factory-2"));
+    assert_eq!(unsure_wakes(&e, &agent), None);
+    e.daemon.flush(minute(30)).await;
+    assert_eq!(e.t3.sends().len(), 4);
+}
+
+#[tokio::test]
+async fn a_flush_stopped_while_sending_leaves_the_message_to_be_looked_for() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.hang_send.lock().unwrap().push("coord".to_owned());
+    let cut = tokio::time::timeout(Duration::from_millis(200), e.daemon.flush(at())).await;
+    assert!(cut.is_err());
+    assert_eq!(unsure_wakes(&e, &agent).unwrap().messages.len(), 1);
+    e.t3.hang_send.lock().unwrap().clear();
+    e.daemon.flush(minute(1)).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 2, "never got it: sent again");
+    assert_eq!(sends[0].1, sends[1].1);
+    assert_eq!(unsure_wakes(&e, &agent), None);
+}
+
+#[tokio::test]
+async fn a_lost_message_to_a_gone_thread_passes_its_answer_on() {
+    let (mut e, coordinator) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let worker = "t3:worker";
+    e.t3.live("worker");
+    e.stub.on(
+        &format!("GET {}", agent_path(worker)),
+        agent_fixture(worker, DEVICE, AgentState::Idle),
+    );
+    queue_answer(&mut e, 10, 7, worker, at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert!(unsure_wakes(&e, worker).is_some());
+
+    // The thread is gone by the check: the answer goes to the coordinator.
+    e.t3.threads.lock().unwrap().remove("worker");
+    e.t3.refuse_send.lock().unwrap().push("worker".to_owned());
+    e.daemon.flush(minute(1)).await;
+    e.daemon.flush(minute(1)).await;
+    assert_eq!(unsure_wakes(&e, worker), None);
+    let to_coordinator: Vec<_> =
+        e.t3.sends()
+            .into_iter()
+            .filter(|(thread, _)| thread == "coord")
+            .collect();
+    assert_eq!(to_coordinator.len(), 1, "{to_coordinator:?}");
+    let _ = coordinator;
+}
+
+#[tokio::test]
+async fn a_fresh_session_notice_in_a_lost_message_is_due_again() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.set_runs("coord", FRESH_SESSION_RUNS);
+    e.daemon.reconcile(minute(6)).await.unwrap();
+    queue_ready(&mut e, 11, &["factory-11"], minute(6)).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(minute(6)).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert!(says_fresh(&e.t3.sends().last().unwrap().1));
+    let since = |e: &Env| e.daemon.state.coordinators[&factory()].fresh.since;
+    assert_eq!(since(&e), Some(FRESH_SESSION_RUNS));
+
+    // Never got it: its line goes again, and the notice is due for the next wake-up.
+    e.daemon.flush(minute(7)).await;
+    let message = e.t3.sends().last().unwrap().1.clone();
+    assert!(message.contains("factory-11"), "{message}");
+    assert_eq!(since(&e), Some(0));
+    queue_ready(&mut e, 12, &["factory-12"], minute(8)).await;
+    e.daemon.flush(minute(8)).await;
+    let message = e.t3.sends().last().unwrap().1.clone();
+    assert!(message.contains("factory-12"), "{message}");
+    assert!(says_fresh(&message), "{message}");
 }
 
 #[tokio::test]
