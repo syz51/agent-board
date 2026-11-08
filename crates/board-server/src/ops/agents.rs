@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::auth::hex;
-use crate::db::{Ctx, enum_str, parse_id};
+use crate::db::{Ctx, enum_str, parse_id, ts};
 use crate::error::{Result, conflict, invalid};
 use crate::ops::{expires, join_board, note_agent_seen, touch_agent};
 use crate::store::{agent_missing, find_handoff, get_agent, load_agents};
@@ -234,17 +234,23 @@ pub(crate) fn validate_state(update: &AgentStateUpdate) -> Result<()> {
 }
 
 /// Heartbeat and lifecycle. Renews the agent's leases and coordinator lease; `ended`
-/// releases them instead.
+/// releases them instead. An agent waiting for a usage-limit reset still ahead keeps that
+/// `paused_until` when it is marked `ended`: T3 closes a session left idle for 30 minutes,
+/// but the limit holds until the reset, so the daemon does not wake it before then.
 pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate) -> Result<Agent> {
-    let before: String = cx
+    let (before, waited_until): (String, Option<i64>) = cx
         .db
         .query_row(
-            "SELECT state FROM agents WHERE id = ?1",
+            "SELECT state, paused_until FROM agents WHERE id = ?1",
             [id.as_str()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| agent_missing(id))?;
+    let paused_until = match update.state {
+        AgentState::Ended => waited_until.filter(|&until| until > cx.now_ms()).map(ts),
+        _ => update.paused_until,
+    };
     note_agent_seen(cx, id)?;
     // Before `ended` releases the boards it coordinates. Advisory: cleaned and cut here,
     // never a reason to refuse the state change.
@@ -258,7 +264,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
         params![
             id.as_str(),
             state,
-            update.paused_until.map(|p| p.timestamp_millis())
+            paused_until.map(|p| p.timestamp_millis())
         ],
     )?;
     let now = cx.now_ms();
@@ -285,7 +291,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
             serde_json::json!({
                 "from": before,
                 "to": update.state,
-                "paused_until": update.paused_until,
+                "paused_until": paused_until,
             }),
         )?;
     }

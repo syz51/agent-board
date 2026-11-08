@@ -12,7 +12,9 @@
 //!   its ask is answered, or the coordinator when the asker cannot be woken;
 //! - never wakes a paused agent before its `paused_until`;
 //! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
-//!   session left idle, which marks its agent ended, and a message resumes the thread.
+//!   session left idle, which marks its agent ended, and a message resumes the thread. One
+//!   whose session closed while it waited for a usage-limit reset keeps that reset, and
+//!   waits for it like a paused agent.
 //!
 //! Wake-ups are queued as what they are about (a task, an ask), not as text. Each flush
 //! checks them again before sending: a task no longer ready and auto drops its line. Lines
@@ -338,6 +340,9 @@ impl Reach {
             // the thread unless T3 says it is gone. When T3 did not answer, the send finds out.
             AgentState::Ended => match seen.thread {
                 ThreadCheck::Gone => Self::Never(Unreachable::ThreadGone),
+                // The session closed while it waited for a usage-limit reset: the limit
+                // still holds, and a message before the reset would only stop on it again.
+                _ if agent.paused_until.is_some_and(|until| until > now) => Self::Paused,
                 ThreadCheck::NotAsked | ThreadCheck::Live | ThreadCheck::NoAnswer => Self::Now,
             },
             AgentState::Paused => match agent.paused_until {
@@ -399,9 +404,11 @@ fn is_fresh(wake: &Wake, paused_until: Option<Timestamp>, now: Timestamp) -> boo
     now - from < WAKE_TTL
 }
 
+/// The usage-limit reset `seen` waits for: a paused agent's, or that of one whose session
+/// ended while it waited, which the server keeps.
 fn paused_until(seen: &Seen) -> Option<Timestamp> {
     match seen.agent.state {
-        AgentState::Paused => seen.agent.paused_until,
+        AgentState::Paused | AgentState::Ended => seen.agent.paused_until,
         _ => None,
     }
 }
@@ -850,7 +857,8 @@ impl<T: T3> Daemon<T> {
             }
         }
         let info = self.client().agent_info(&local.agent).await?;
-        if info.state == AgentState::Paused
+        // An ended coordinator keeps the reset its session stopped on (see `Reach::of`).
+        if matches!(info.state, AgentState::Paused | AgentState::Ended)
             && let Some(until) = info.paused_until
             && until <= now
             && local.resumed_after != Some(until)

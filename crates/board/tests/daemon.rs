@@ -809,6 +809,67 @@ async fn a_paused_coordinator_is_not_woken_before_its_reset() {
     assert!(e.t3.sends().is_empty());
 }
 
+#[tokio::test]
+async fn a_coordinator_whose_session_ended_during_a_limit_waits_for_the_reset() {
+    // Paused on a usage limit, then T3 closed its idle session: the server keeps the
+    // reset on the ended agent. Waking it before the reset would only stop on the limit
+    // again (and report another pause).
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, agent) = coordinator_env(AgentState::Paused, Some(reset));
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "user"),
+            at(),
+        )
+        .await
+        .unwrap();
+    // Read as paused at the first flush, then followed through its events.
+    e.daemon.flush(at()).await;
+    e.daemon
+        .on_event(
+            &state_changed(11, &agent, AgentState::Ended, Some(reset)),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon
+        .on_event(
+            &event(12, EventType::TaskCreated, Some("factory-4"), "user"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // From the reset on, the ended thread is woken like any other.
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.flush(later).await;
+    assert_eq!(threads(&e.t3), ["coord"]);
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_session_ended_during_a_limit_is_resumed_at_the_reset() {
+    // Nothing is queued for it: reconcile resumes it once the reset passes, as it does a
+    // paused one.
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, _) = coordinator_env(AgentState::Ended, Some(reset));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.reconcile(later).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert!(sends[0].1.contains("the usage limit has reset"));
+}
+
 fn answered_ask(id: i64, agent: &str) -> Ask {
     Ask {
         id,

@@ -340,8 +340,11 @@ settings in use, warned once per edit.
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
     So an ended T3 agent on this device is woken like an idle one while T3 has its thread
-    unarchived. The daemon asks T3 once per state change; when T3 does not answer, the
-    send is tried. A thread archived later, which no event announces, is found when a send
+    unarchived, unless its session ended while it waited for a usage-limit reset: the
+    server keeps that reset on the ended agent, and its lines are kept until then like a
+    paused agent's (a wake before the reset would only stop on the limit again); a
+    coordinator in that state is resumed at the reset like a paused one. The daemon asks
+    T3 once per state change; when T3 does not answer, the send is tried. A thread archived later, which no event announces, is found when a send
     to it fails, and its answers then go to the coordinator. Lines dropped for an agent
     the daemon cannot wake from its own device, and answers with no other coordinator to
     go to, are logged as warnings.
@@ -410,7 +413,14 @@ settings in use, warned once per edit.
 - **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
   public endpoint is needed; answers are accepted only from that chat. The same channel
-  reports a coordinator paused on a usage limit. The chat is `[telegram] chat_id` when set;
+  reports a usage limit once per runtime and reset time, naming the first agent that
+  stopped on it and the reset in `utc_offset` time. While a limit holds every agent that
+  runs stops on it, and T3 resumes an agent whose idle session it closed, so one limit
+  would otherwise be reported again and again. A limit counts as reported once its
+  message is sent, so a failed send is made by the next pause on it. A coordinator paused
+  with no reset time is reported each time, since only the user resumes it. The limits
+  reported are kept in memory, so a restart reports a limit still holding at most once
+  more. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
@@ -426,9 +436,13 @@ settings in use, warned once per edit.
     4 hours), is reported once, with its owner, how long it has been quiet, its last event
     and a link. The tasks found at one check share one message; those past its length
     (3,500 characters) go in the next check's message. A task is reported again only
-    after a new event and another quiet period. Tasks of a coordinator paused on a usage
-    limit wait until the reset (or, without an end time, until it resumes), since that
-    pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
+    after a new event and another quiet period. Tasks whose owner stopped on a usage limit
+    wait until a whole quiet period after the owner resumed or the limit reset, whichever
+    comes first, since the limit is reported apart and T3 resumes the owner at the reset;
+    the owner's events are read, as a resumed owner no longer shows the reset. This holds
+    review tasks too: under one account the coordinator that reviews them shares the
+    limit. Tasks of a coordinator paused with no reset time wait
+    until it resumes; a worker's are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
   - *Stalled board*: a board is stalled while it is active, has autopilot on, has no task
     in `doing` and has a ready auto task. Each check records when it first saw a board
@@ -442,7 +456,8 @@ settings in use, warned once per edit.
     that holds its lease, or that none does, with a link. Boards found at one check share
     one message; those past its length go in the next check's message. A board is
     reported again only once it stalls anew. Boards whose lease holder is paused on a
-    usage limit are not stalled, as for stuck tasks. This catches a stopped coordinator or
+    usage limit, or ended while it waits for a reset still ahead, are not stalled, as for
+    stuck tasks. This catches a stopped coordinator or
     device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
