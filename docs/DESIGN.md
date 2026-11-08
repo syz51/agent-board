@@ -190,6 +190,13 @@ host.
   daemon stopping mid-hook) changes the breaker. Directly, a hook sends its requests one
   after another on one connection; through the relay, the heartbeat and the snapshot go at
   once.
+- The CLI and `board mcp` send a read again after 1 and then 2 seconds when the reverse
+  proxy answers `502` or `503`, as it does while the server restarts, and after a `504`
+  for every read but the snapshot, whose lost answer may have moved the alert cursor. They
+  never repeat a write. When the failure outlasts the repeats, the error says the server
+  may be restarting and the read is safe to repeat; a failed write says to check with a
+  read before repeating it. Hooks and the daemon send each request once: hooks keep to
+  their budget, and the daemon backs off on its own schedule.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
