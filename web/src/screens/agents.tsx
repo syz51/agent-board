@@ -163,7 +163,9 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         )}
         {code && (
           <p
-            className="ident col-start-2 w-full truncate text-meta text-muted-foreground"
+            // The id face a step smaller, on the meta lines' height, so the block keeps one
+            // rhythm.
+            className="col-start-2 w-full truncate font-mono text-[11.5px] leading-[18px] text-muted-foreground"
             data-slot="code"
             title={code}
           >

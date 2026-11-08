@@ -412,7 +412,8 @@ const columns = column.columns([
 // Desktop rows share the list's columns (subgrid), so the id column fits the longest id.
 // On a phone a row stacks: status and title, then id, priority, owner and update.
 const CELL_CLASS: Record<string, string> = {
-  priority: "max-md:[grid-area:prio] max-md:self-center",
+  // A step down, so its smaller label sits on the title's baseline.
+  priority: "max-md:[grid-area:prio] max-md:self-center md:pt-0.5",
   status: "max-md:[grid-area:status] max-md:mt-0.75",
   id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center max-md:text-[13px]",
   main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",

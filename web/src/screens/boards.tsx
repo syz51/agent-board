@@ -288,9 +288,9 @@ const features = tableFeatures({});
 const column = createColumnHelper<typeof features, BoardRowData>();
 
 /**
- * The boards table: name and goal, tasks by status, coordinator, open asks and autopilot.
- * At 760px of width and up the cells line up in columns under a header; below, a row
- * stacks name, tasks, coordinator, then asks and autopilot.
+ * The boards table: name and goal (with any open asks beside the name), tasks by status,
+ * coordinator and autopilot. At 760px of width and up the cells line up in columns under
+ * a header; below, a row stacks name, tasks, then coordinator and autopilot.
  */
 const columns = column.columns([
   column.display({
@@ -309,11 +309,6 @@ const columns = column.columns([
     cell: ({ row }) => <Coordinator {...row.original} />,
   }),
   column.display({
-    id: "asks",
-    header: "Asks",
-    cell: ({ row }) => <BoardAsks board={row.original.board} />,
-  }),
-  column.display({
     id: "autopilot",
     header: "Autopilot",
     cell: ({ row }) => <AutopilotSwitch board={row.original.board} />,
@@ -324,7 +319,6 @@ const AREA: Record<string, string> = {
   name: "[grid-area:name]",
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
-  asks: "[grid-area:asks]",
   // Not "auto": that is a keyword for grid-area and would place the cell automatically.
   autopilot: "[grid-area:pilot]",
 };
@@ -332,19 +326,17 @@ const AREA: Record<string, string> = {
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
-  // Counts and dashes share a right edge, as numbers in a table column do.
-  asks: "@min-[760px]:justify-self-end",
+  coordinator: "text-meta flex min-h-5 min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
 /**
  * The boards table's columns. Every row is one height on wide screens: the name line, with
- * its whole slug and states, the goal in two lines, the tally and the coordinator in two at
- * most. Cells start at the top of the row, level with the name.
+ * its whole slug, states and open asks, the goal in two lines, the tally in one and the
+ * coordinator in two at most. Cells start at the top of the row, level with the name.
  */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,300px)_minmax(0,184px)_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,416px)_minmax(0,160px)_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -374,10 +366,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
           aria-hidden="true"
         >
           {group.headers.map((header) => (
-            <span
-              key={header.id}
-              className={cn(AREA[header.id], header.id === "asks" && "justify-self-end")}
-            >
+            <span key={header.id} className={AREA[header.id]}>
               <table.FlexRender header={header} />
             </span>
           ))}
@@ -433,6 +422,7 @@ function BoardName({ board }: { board: Board }) {
             Temporary
           </Badge>
         )}
+        <BoardAsks board={board} />
       </div>
       {board.goal ? (
         <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
@@ -468,7 +458,7 @@ function TaskTally({ board }: { board: Board }) {
       ) : (
         <ul
           // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs @min-[760px]:grid @min-[760px]:grid-cols-3 @min-[760px]:gap-x-3"
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-x-1.5"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -479,7 +469,7 @@ function TaskTally({ board }: { board: Board }) {
                   key={segment.key}
                   className="inline-flex items-center gap-0.75 whitespace-nowrap"
                 >
-                  <StatusIcon status={segment.icon} className="size-3 max-md:size-2" />
+                  <StatusIcon status={segment.icon} className="size-3 @min-[760px]:size-2.5" />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
@@ -513,24 +503,20 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   );
 }
 
+/** A board's open asks, beside its name only when there are some, in the sidebar's tint. */
 function BoardAsks({ board }: { board: Board }) {
-  if (board.open_asks === 0) {
-    return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline-block @min-[760px]:w-[1ch] @min-[760px]:text-center">
-        <span aria-hidden="true">–</span>
-        <span className="sr-only">No asks</span>
-      </span>
-    );
-  }
+  if (board.open_asks === 0) return null;
   return (
+    // A 24px target that keeps the name line's 20px height.
     <Link
-      className="inline-flex min-h-7 items-center gap-1.25 text-meta font-semibold whitespace-nowrap text-amber tabular-nums"
+      className="-my-0.5 inline-flex min-h-6 items-center hover:no-underline"
       to="/asks"
       search={{ board: board.slug }}
     >
-      <Icon name="inbox" className="size-3.5" />
-      {board.open_asks}{" "}
-      <span className="@min-[760px]:hidden">{board.open_asks === 1 ? "ask" : "asks"}</span>
+      <span className="inline-flex h-5 items-center gap-1 rounded-full bg-amber-soft px-2 text-xs font-semibold whitespace-nowrap text-amber tabular-nums ring-1 ring-amber/30 ring-inset">
+        <Icon name="inbox" className="size-3" />
+        {board.open_asks} {board.open_asks === 1 ? "ask" : "asks"}
+      </span>
     </Link>
   );
 }

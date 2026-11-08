@@ -13,12 +13,13 @@ inset panel, and lists that run edge to edge across it.
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
-  name, slug and states share one line, none of them cut, the goal keeps to two lines, the
-  task tally to two rows of three fixed columns and the coordinator to two; cells start
-  level with the name, an empty cell is a dash, and the Asks column is right-aligned.
+  name, slug, states and open asks (a tinted pill, only when there are some) share one
+  line, none of them cut, the goal keeps to two lines, the task tally to one (it wraps on
+  phones rather than shrink) and the coordinator to two; cells start level with the name,
+  and an empty cell is a dash.
   Agents are a two-column table: who (in a 300px column), with its state, when last seen
-  and where it runs in two quiet lines, its machine, then its repository and branch set as
-  ids; then what it is working on, with its handoff. Priority labels share one weight; the
+  and where it runs in two quiet lines, its machine, then its repository and branch in the
+  id face a step smaller; then what it is working on, with its handoff. Priority labels share one weight; the
   bars carry the level.
 - **Type**: Inter at 13px body, 12.5px meta, 24px page titles and 28px task titles; prose
   stops at a 100-character measure.
@@ -43,7 +44,8 @@ inset panel, and lists that run edge to edge across it.
   collapsed. What a task waits for (blockers, a start date) is muted text with an icon;
   outlined chips are tags only. A board with nothing to filter has no filter bar. On phones
   a task row's time sits on its title line.
-- **Asks**: a filled Send closes the answer group at its left, under the options and a
+- **Asks**: an ask card's left border takes its kind's colour. A filled Send closes the
+  answer group at its left, under the options and a
   two-line field that grows, so it plainly sends either; Cmd or Ctrl with Enter sends from
   the field. A single ask is titled with its kind ("Decision · Ask #9"), across the content
   width with its prose at a reading measure, and its task and the asking agent's handoff in

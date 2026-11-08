@@ -200,13 +200,12 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-2.5 overflow-hidden rounded-lg border bg-card px-4 pt-3 pb-3.5",
-        "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+        "relative grid gap-2.5 rounded-lg border border-l-3 bg-card pt-3 pr-4 pb-3.5 pl-3.5",
         ask.status !== "open"
-          ? "before:bg-input"
+          ? "border-l-input"
           : ask.kind === "action"
-            ? "before:bg-amber"
-            : "before:bg-status-review",
+            ? "border-l-amber"
+            : "border-l-status-review",
       )}
       data-status={ask.status}
     >

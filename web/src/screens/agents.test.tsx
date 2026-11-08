@@ -58,7 +58,7 @@ describe("the agents list", () => {
         ...(coordinator.branch ? [coordinator.branch] : []),
       ].join(" · "),
     );
-    expect(code?.className).toContain("ident");
+    expect(code?.className).toContain("font-mono");
     expect(within(row).queryByText("Role")).toBeNull();
     expect(screen.queryByText("Details")).toBeNull();
   });
