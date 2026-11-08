@@ -40,7 +40,7 @@ export function SearchField({
   return (
     <label
       className={cn(
-        "relative flex flex-[1_1_240px] items-center text-muted-foreground has-disabled:opacity-50",
+        "relative flex flex-[1_1_240px] items-center text-muted-foreground has-disabled:opacity-70",
         className,
       )}
     >
@@ -48,7 +48,7 @@ export function SearchField({
       <span className="sr-only">{label}</span>
       <Input
         type="search"
-        className="h-[34px] bg-card pl-8 text-foreground shadow-raise dark:bg-card"
+        className="h-[34px] bg-card pl-8 text-foreground shadow-raise disabled:opacity-100 dark:bg-card"
         value={draft}
         placeholder={placeholder}
         onChange={(event) => {
@@ -79,7 +79,7 @@ export function FilterSelect({
   return (
     <label
       className={cn(
-        "flex h-[34px] min-w-0 items-center rounded-md border border-input bg-card shadow-raise focus-within:border-ring focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-ring hover:border-muted-foreground has-disabled:pointer-events-none has-disabled:opacity-50",
+        "flex h-[34px] min-w-0 items-center rounded-md border border-input bg-card shadow-raise focus-within:border-ring focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-ring hover:border-muted-foreground has-disabled:pointer-events-none has-disabled:opacity-70",
         className,
       )}
     >
@@ -111,7 +111,7 @@ export function FilterToggle({
   return (
     <label
       className={cn(
-        "flex h-[34px] cursor-pointer items-center gap-2 rounded-md border border-input bg-card pr-3 pl-2.5 text-meta font-medium whitespace-nowrap shadow-raise has-checked:border-signal/45 has-checked:bg-primary-soft has-checked:text-link has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-disabled:pointer-events-none has-disabled:opacity-50 max-md:pr-2.5 max-md:pl-2 [&_input]:outline-none",
+        "flex h-[34px] cursor-pointer items-center gap-2 rounded-md border border-input bg-card pr-3 pl-2.5 text-meta font-medium whitespace-nowrap shadow-raise has-checked:border-signal/45 has-checked:bg-primary-soft has-checked:text-link has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-disabled:pointer-events-none has-disabled:opacity-70 max-md:pr-2.5 max-md:pl-2 [&_input]:outline-none",
         className,
       )}
     >

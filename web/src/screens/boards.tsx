@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
 import {
-  AgentStateBadge,
+  AgentStateInline,
   agentIndex,
   AskKind,
   Empty,
@@ -73,7 +73,7 @@ export function BoardsScreen() {
                   >
                     <AskKind kind={ask.kind} />
                     <span
-                      className="truncate font-medium max-md:col-span-2 max-md:row-start-2"
+                      className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-2 max-md:whitespace-normal"
                       title={plainLine(ask.question)}
                     >
                       {plainLine(ask.question)}
@@ -190,14 +190,13 @@ const AREA: Record<string, string> = {
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator:
-    "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 @min-[760px]:grid @min-[760px]:justify-items-start",
+  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
   asks: "",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,344px)_152px_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-6";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,330px)_minmax(0,208px)_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-6";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -339,9 +338,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   return (
     <>
       <Who id={coordinator.id} agents={agents} />
-      <span className="hidden @min-[760px]:inline-flex">
-        <AgentStateBadge agent={coordinator} />
-      </span>
+      <AgentStateInline agent={coordinator} />
     </>
   );
 }

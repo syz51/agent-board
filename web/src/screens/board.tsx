@@ -259,10 +259,10 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-8 items-center gap-2 border-b bg-muted px-(--gutter) text-meta font-semibold"
+        className="flex h-9.5 items-center gap-2 border-b bg-muted px-(--gutter) text-sm font-semibold"
       >
         {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        <span className="text-meta font-medium text-subtle-foreground tabular-nums">{count}</span>
       </Heading>
       {children}
     </section>

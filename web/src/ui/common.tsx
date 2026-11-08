@@ -236,6 +236,34 @@ export function StatePill({
   );
 }
 
+/**
+ * An agent's state as a mark and a word, for a cell that stays one line high; a pause's end
+ * moves to the tooltip.
+ */
+export function AgentStateInline({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
+  const now = useNow();
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
+        agent.state === "running"
+          ? "text-status-ready"
+          : agent.state === "paused"
+            ? "text-amber"
+            : "text-status-open",
+      )}
+      title={
+        agent.state === "paused" && agent.paused_until
+          ? `Paused until ${formatUntil(agent.paused_until, now)}`
+          : undefined
+      }
+    >
+      <StateDot state={agent.state} />
+      {agent.state[0]?.toUpperCase() + agent.state.slice(1)}
+    </span>
+  );
+}
+
 export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
   const now = useNow();
   return (
