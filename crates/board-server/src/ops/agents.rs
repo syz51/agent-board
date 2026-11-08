@@ -354,8 +354,8 @@ fn release_leases(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_handoff(req: &PutHandoff, max: usize) -> Result<()> {
-    check_text("now", &req.now, max)?;
+pub(crate) fn validate_handoff(req: &PutHandoff, now_max: usize, max: usize) -> Result<()> {
+    check_text("now", &req.now, now_max)?;
     check_text("next", &req.next, max)?;
     check_text("blockers", &req.blockers, max)?;
     if req.now.trim().is_empty() && req.next.trim().is_empty() {

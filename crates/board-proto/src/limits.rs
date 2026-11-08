@@ -41,6 +41,7 @@ pub const CLIENT_CHECKED_FIELDS: &[&str] = &[
     "signature",
     "reason",
     "goal",
+    "summary",
 ];
 
 /// A text field over its length limit, counted in characters.
@@ -111,6 +112,7 @@ pub fn longer_text_goes(field: &str) -> Option<&'static str> {
         "option" => "explain the options in the question",
         "body" | "acceptance" => "split the work into child tasks",
         "evidence value" => "link to the log or artifact instead",
+        "summary" => "put the detail in a note on the task",
         _ => return None,
     })
 }
@@ -143,6 +145,12 @@ mod tests {
         }
         let evidence = "evidence value is 501 characters; the limit is 500";
         assert_eq!(TooLong::parse(evidence).unwrap().field, "evidence value");
+        let summary = TooLong::check("summary", &"x".repeat(801), 800).unwrap();
+        assert_eq!(TooLong::parse(&summary.message()), Some(summary));
+        assert_eq!(
+            summary.next(),
+            "shorten summary to at most 800 characters, or put the detail in a note on the task"
+        );
         let long = TooLong::check("cwd", &"x".repeat(3), 2).unwrap();
         assert_eq!(long.next(), "shorten cwd to at most 2 characters");
         assert_eq!(

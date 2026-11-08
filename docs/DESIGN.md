@@ -232,9 +232,11 @@ agents otherwise learn only from a refusal):
 `ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
 
 Every string parameter declares a `maxLength` equal to the server's default limit (title
-72, note 500, handoff field 300, question 1,000, body 4,000 characters, and so on), so a
-runtime can refuse an oversized argument before the call; a server configured with other
-limits still checks its own. Every input schema sets `additionalProperties: false`, and
+80, note 800, handoff `now` 400, handoff `next` and `blockers` 300, question 1,500, done
+summary 800, body 4,000 characters, and so on). The tools that take a title, note,
+question, handoff or done summary also state that limit in their description, so an agent
+does not guess one tool's limit from another's. A runtime can refuse an oversized argument before the call; a server configured
+with other limits still checks its own. Every input schema sets `additionalProperties: false`, and
 `board mcp` refuses a call with an argument its tool does not declare, before anything is
 sent: the error names the unknown arguments, lists the accepted ones and says to call
 again with them. An argument dropped in silence would let a guessed name, such as
@@ -746,7 +748,7 @@ Claim before working (task_claim <id>). Before task_done, file what is left as s
 </board>
 ```
 
-Writing conventions, enforced where possible: titles are imperative, at most 72 characters,
+Writing conventions, enforced where possible: titles are imperative, at most 80 characters,
 without status or ids; bodies stand alone; acceptance is one observable check per line;
 notes start with their kind and cite evidence; handoff `next` is the first concrete action.
 
