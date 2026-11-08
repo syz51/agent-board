@@ -572,3 +572,65 @@ fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     assert_ne!(ok["isError"], true, "{ok}");
     assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
 }
+
+#[test]
+fn an_unknown_argument_is_refused_before_anything_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let listed = mcp.request(2, "tools/list", json!({}));
+    let tools = listed["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 16);
+    for (n, tool) in (3..).zip(tools) {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
+        let refused = mcp.call(n, name, json!({"blocked_by": ["factory-2"]}));
+        assert_eq!(refused["isError"], true, "{name}: {refused}");
+        let message = text(&refused);
+        assert!(
+            message.starts_with(&format!(
+                "error: invalid arguments: {name} has no argument `blocked_by`; it accepts "
+            )),
+            "{message}"
+        );
+        let mut declared: Vec<&str> = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        declared.sort();
+        let mut listed: Vec<&str> = message
+            .split_once("it accepts ")
+            .and_then(|(_, rest)| rest.split_once(". Call "))
+            .unwrap_or_else(|| panic!("{message}"))
+            .0
+            .split(", ")
+            .collect();
+        listed.sort();
+        assert_eq!(listed, declared, "{message}");
+        assert!(
+            message.ends_with(&format!("Call {name} again with only those arguments.")),
+            "{message}"
+        );
+    }
+
+    // An agent that is not a string is refused, not dropped for the default identity.
+    let refused = mcp.call(100, "task_claim", json!({"id": "factory-3", "agent": 42}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        text(&refused).starts_with("error: invalid arguments: agent must be an agent id string"),
+        "{refused}"
+    );
+    assert!(stub.requests().is_empty(), "nothing reached the server");
+}
