@@ -1730,3 +1730,76 @@ async fn you_names_the_task_held_in_doing_next_to_the_limit() {
     let full = snapshot(&t, me, "kind=full").await;
     assert!(you(&full).ends_with(" · doing none (limit 1)"), "{full}");
 }
+
+#[tokio::test]
+async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let mut mine = Vec::new();
+    for i in 0..4 {
+        let title =
+            format!("Make the parser accept every malformed header seen in the wild {i:02}");
+        let id = t.task(ME, "factory", &title).await;
+        assert!(t.claim(ME, &id).await.0.is_success());
+        if i < 3 {
+            let (s, v) = t.patch(ME, &id, json!({ "status": "review" })).await;
+            assert!(s.is_success(), "{v}");
+        }
+        mine.push(id);
+    }
+    // A handoff at every field's limit: 400, 300 and 300 characters.
+    let next = format!("run the live suite{}", " then the parser fuzz".repeat(14));
+    let next = next[..300].to_owned();
+    t.ok(
+        "PUT",
+        &format!("/v1/agents/{ME}/handoff"),
+        Some(ME),
+        Some(json!({
+            "now": "n".repeat(400),
+            "next": next,
+            "blockers": "b".repeat(300),
+        })),
+    )
+    .await;
+    snapshot(&t, ME, "kind=alerts").await;
+    for id in &mine {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{id}/notes"),
+            Some(B),
+            Some(
+                json!({ "agent": B, "kind": "finding", "text": "finding: the parser drops tabs" }),
+            ),
+        )
+        .await;
+    }
+
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.chars().count() <= defaults().snapshot_full_chars,
+        "{} chars:\n{full}",
+        full.chars().count()
+    );
+    for id in &mine {
+        assert!(
+            full.contains(&format!("changed your task {id} (finding)")),
+            "{full}"
+        );
+    }
+    assert!(
+        full.contains("ago; cut, board handoff shows it whole):"),
+        "{full}"
+    );
+    assert!(full.contains("  next: \"run the live suite"), "{full}");
+    assert!(
+        full.contains(&format!("  now: \"{}…\"", "n".repeat(99))),
+        "{full}"
+    );
+    assert!(!full.contains("  blockers: "), "{full}");
+
+    // The alerts were read above; JSON marks the cut handoff too.
+    let json = text(&snapshot(&t, ME, "format=json").await).to_owned();
+    assert!(json.contains("\"cut\":true"), "{json}");
+}
