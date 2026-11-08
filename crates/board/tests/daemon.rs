@@ -3035,17 +3035,20 @@ fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
         "Start its body with `Revisit:` and name the deploy time",
         "the feedback items and error signatures it watches, the values under review, and the bar for \"held\"",
         // Its cap.
-        "One revisit per fix, and at most three open revisits per board",
-        "add the new watch to the open revisit due soonest",
+        "One revisit per fix, and at most three open revisits per board (`task_list` its open tasks titled `Revisit:`)",
+        "add the new watch, with its own fixed task and deploy time, to the open revisit due soonest",
+        "`task_note` that revisit's id on the fixed task",
         // How to run it.
-        "Count the errors with `board errors --since <deploy time>`",
+        "Count the errors with `board errors --since <deploy time>` per watch",
+        "say so when the window is cut",
         "read the feedback items routed to it and their reports",
         "`held` when under the bar; `adjust` when over the bar or the values no longer fit",
         "Adjust files a proposal, a child of the revisit, with the counts and the change",
         "for a value the user chose, `ask_user` instead",
         // How to record the outcome.
-        "a `decision` note starting `revisit: held` or `revisit: adjust`, with the counts, the window and the bar, on the fixed task and on each watched feedback item",
+        "a `decision` note starting `revisit: held` or `revisit: adjust`, with the counts, the window and the bar, on each fixed task it watches and on each watched feedback item",
         "`task_done` the revisit with the counts as evidence",
+        "A shipped adjustment gets its own revisit, which names the revisit before it",
         "a second adjustment of one value in a row goes to the user",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
@@ -3059,9 +3062,12 @@ fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
     for rule in [
         // From PR #83: a recurring item goes to the open revisit, never as a duplicate.
         "A recurring item is never a duplicate of a closed item",
-        "When the earlier task has an open revisit (a child task titled `Revisit: …`), route the item to the revisit",
+        "When the earlier task has an open revisit (a child task titled `Revisit: …`, or one a note on that task names), route the item to the revisit as the rule above says",
+        // The dropped-proposal rule still follows the recurring rule it is named from.
+        "when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's owner (see \"Finding the owner\") and cite the earlier item and its reason: a fix that did not hold goes to the owner, not back to you. - When the owner declines or merges a routed proposal",
         // Repeats without `recurs` go there too, and a signal brings the revisit forward.
-        "Any item that repeats a problem whose fix has an open revisit goes to that revisit, even without `recurs`",
+        "Any item that repeats a problem whose fix has an open revisit goes to that revisit, with or without `recurs`",
+        "Find open revisits with `task_list` on the owner's board",
         "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
         "When the item is a `signal`, also clear the revisit's `not_before`",
     ] {

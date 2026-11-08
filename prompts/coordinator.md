@@ -174,18 +174,21 @@ hold, and do the chosen values still fit.
   `Revisit:` and name the deploy time (counts start there), the feedback items and error
   signatures it watches, the values under review, and the bar for "held", such as at most
   two errors a week. When the measure is not an API error, name the command that measures
-  it. One revisit per fix, and at most three open revisits per board: past that, add the
-  new watch to the open revisit due soonest.
+  it. One revisit per fix, and at most three open revisits per board (`task_list` its open
+  tasks titled `Revisit:`): past that, add the new watch, with its own fixed task and deploy
+  time, to the open revisit due soonest, and `task_note` that revisit's id on the fixed task.
 - **Run** it when it becomes ready, like any task. Count the errors with `board errors
-  --since <deploy time>`, read the feedback items routed to it and their reports, and
+  --since <deploy time>` per watch (records older than the server's `error_retention_days`,
+  35 by default, are gone: say so when the window is cut), read the feedback items routed to
+  it and their reports, and
   decide: `held` when under the bar; `adjust` when over the bar or the values no longer fit.
   Adjust files a proposal, a child of the revisit, with the counts and the change; for a
   value the user chose, `ask_user` instead, with the counts and a recommendation.
 - **Record** a `decision` note starting `revisit: held` or `revisit: adjust`, with the
-  counts, the window and the bar, on the fixed task and on each watched feedback item, so
-  their reporters see the answer. Then `task_done` the revisit with the counts as evidence.
-  A shipped adjustment gets its own revisit; a second adjustment of one value in a row goes
-  to the user.
+  counts, the window and the bar, on each fixed task it watches and on each watched feedback
+  item, so their reporters see the answer. Then `task_done` the revisit with the counts as
+  evidence. A shipped adjustment gets its own revisit, which names the revisit before it; a
+  second adjustment of one value in a row goes to the user.
 
 ## Goal review
 
