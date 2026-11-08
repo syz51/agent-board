@@ -57,9 +57,17 @@ only for a cause that is already gone.
 
 - Never drop an item: do not set it `dropped`, mark it done without `feedback_resolve`, or
   release it unresolved. Resolve it, or block it with an ask.
+- Any item that repeats a problem whose fix has an open revisit goes to that revisit, with
+  or without `recurs`: for example the same problem in other words, or a `signal` with a
+  watched signature. Find open revisits with `task_list` on the owner's board: their titles
+  start `Revisit:` and their bodies name the items and signatures they watch.
+  `feedback_resolve` with kind `routed` and `task` the revisit, with no new task. When the
+  item is a `signal`, also clear the revisit's `not_before` (`task_update` with
+  `not_before` none) so it runs now.
 - A recurring item (`recurs` set: it came back after an earlier resolution) goes back to
   the same owner, never as a `duplicate` of the closed item. When the earlier task has an
-  open revisit (a child task titled `Revisit: …`), route the item to the revisit.
+  open revisit (a child task titled `Revisit: …`, or one a note on that task names),
+  route the item to the revisit as the rule above says.
   Otherwise route it to the board of the earlier task and name that task in the new
   body; when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's
   owner (see "Finding the owner") and cite the earlier item and its reason: a fix that did

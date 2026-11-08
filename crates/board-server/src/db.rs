@@ -52,6 +52,9 @@ pub struct Db {
     readers: Arc<Readers>,
     writer: Arc<Mutex<Connection>>,
     events: broadcast::Sender<Event>,
+    /// Read and write transactions begun, so tests can tell what a request cost.
+    #[cfg(test)]
+    transactions: Arc<[std::sync::atomic::AtomicUsize; 2]>,
 }
 
 impl Db {
@@ -65,7 +68,22 @@ impl Db {
             readers: Arc::new(readers),
             writer: Arc::new(Mutex::new(writer)),
             events,
+            #[cfg(test)]
+            transactions: Arc::default(),
         })
+    }
+
+    /// Read and write transactions begun since the database opened.
+    #[cfg(test)]
+    pub(crate) fn transactions(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let [reads, writes] = &*self.transactions;
+        (reads.load(SeqCst), writes.load(SeqCst))
+    }
+
+    #[cfg(test)]
+    fn count_transaction(&self, write: bool) {
+        self.transactions[usize::from(write)].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Creates a device (a user device when `user`) and returns its token, shown once.
@@ -107,6 +125,8 @@ impl Db {
         f: impl FnOnce(&mut Ctx<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.lock();
+        #[cfg(test)]
+        self.count_transaction(true);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cx = Ctx {
             db: &tx,
@@ -133,6 +153,8 @@ impl Db {
         f: impl FnOnce(&Ctx<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.readers.lend();
+        #[cfg(test)]
+        self.count_transaction(false);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let cx = Ctx {
             db: &tx,
