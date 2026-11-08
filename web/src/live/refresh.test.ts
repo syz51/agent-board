@@ -3,14 +3,7 @@ import { ApiFailure } from "../api/client.ts";
 import type { BoardEvent } from "../api/schema.ts";
 import type { QueryClient } from "@tanstack/react-query";
 import { QueryObserver } from "@tanstack/react-query";
-import {
-  addToFeed,
-  createQueryClient,
-  fetching,
-  invalidateTags,
-  mergeEvents,
-  queries,
-} from "./query.ts";
+import { createQueryClient, fetching, invalidateTags } from "./query.ts";
 import { TagBatcher, tags, tagsForEvent } from "./refresh.ts";
 import { manualTimers } from "./testing.ts";
 
@@ -336,63 +329,5 @@ describe("query tags", () => {
     await flush();
     await client.invalidateQueries();
     expect(counts).toEqual({ a: 2, b: 2 });
-  });
-});
-
-describe("event feed", () => {
-  test("a live event joins a loaded feed, newest first, once", () => {
-    const client = createQueryClient();
-    const key = queries.events().queryKey;
-    addToFeed(client, event("task_done", { seq: 5 }));
-    expect(client.getQueryData(key)).toBeUndefined();
-
-    client.setQueryData(key, [event("task_created", { seq: 3 })]);
-    addToFeed(client, event("task_done", { seq: 5 }));
-    addToFeed(client, event("task_done", { seq: 5 }));
-    addToFeed(client, event("note_added", { seq: 4 }));
-    expect(client.getQueryData(key)?.map((item) => item.seq)).toEqual([5, 4, 3]);
-  });
-
-  test("a live event during the feed's first load joins it once the load lands", async () => {
-    const client = createQueryClient();
-    const key = queries.events().queryKey;
-    const page = deferred<BoardEvent[]>();
-    const observer = new QueryObserver(client, {
-      queryKey: key,
-      queryFn: () => page.promise,
-      meta: { tags: [] },
-    });
-    observer.subscribe(() => {});
-    await flush();
-    addToFeed(client, event("task_done", { seq: 5 }));
-    page.resolve([event("task_created", { seq: 3 })]);
-    await flush();
-    expect(client.getQueryData(key)?.map((item) => item.seq)).toEqual([5, 3]);
-  });
-
-  test("a live event during a failed first load is left to the retry", async () => {
-    const client = createQueryClient();
-    const key = queries.events().queryKey;
-    const page = deferred<BoardEvent[]>();
-    const observer = new QueryObserver(client, {
-      queryKey: key,
-      queryFn: () => page.promise,
-      meta: { tags: [] },
-    });
-    observer.subscribe(() => {});
-    await flush();
-    addToFeed(client, event("task_done", { seq: 5 }));
-    page.reject(new ApiFailure(500, "internal", "db locked", "retry"));
-    await flush();
-    expect(client.getQueryData(key)).toBeUndefined();
-    expect(observer.getCurrentResult().error?.message).toBe("db locked");
-  });
-
-  test("merging keeps older pages and live events, ordered by sequence", () => {
-    const merged = mergeEvents(
-      [event("a", { seq: 9 }), event("b", { seq: 7 })],
-      [event("c", { seq: 8 })],
-    );
-    expect(merged.map((item) => item.seq)).toEqual([9, 8, 7]);
   });
 });

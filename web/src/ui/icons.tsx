@@ -11,6 +11,8 @@ const PATHS = {
   agents:
     "M6 7.5a2.25 2.25 0 1 0 0-4.5 2.25 2.25 0 0 0 0 4.5zM1.75 13c.4-2.4 2.1-4 4.25-4s3.85 1.6 4.25 4M10.5 3.2a2.25 2.25 0 0 1 0 4.1M11.75 9.4c1.3.5 2.2 1.8 2.5 3.6",
   events: "M1.75 8h2.5l2-4.75 3.5 9.5 2-4.75h2.5",
+  /** Six dots: a handle to drag a section. */
+  grip: "M6 4h.01M10 4h.01M6 8h.01M10 8h.01M6 12h.01M10 12h.01",
   search: "M7 11.5a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9zM10.25 10.25 13.5 13.5",
   arrow: "M3 8h9.5M9 4.5 12.5 8 9 11.5",
   chevron: "m6 3.5 4.5 4.5L6 12.5",
@@ -31,9 +33,17 @@ const PATHS = {
   file: "M4 1.75h5l3 3v9.5H4zM9 1.75v3h3",
   bolt: "M8.75 1.75 3.5 9h4l-.75 5.25L12 7H8z",
   pause: "M5.75 3.5v9M10.25 3.5v9",
+  /** A clock face: a task that waits for a date. */
+  clock: "M8 13.75a5.75 5.75 0 1 0 0-11.5 5.75 5.75 0 0 0 0 11.5zM8 4.75V8l2.25 1.5",
+  /** Two links of a chain: a task that waits for other tasks. */
+  link: "M6.75 9.25a2.5 2.5 0 0 0 3.5 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-.5.5M9.25 6.75a2.5 2.5 0 0 0-3.5 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l.5-.5",
   cloud: "M4.5 12.25a3 3 0 0 1-.35-5.98 4 4 0 0 1 7.7-.77 3.25 3.25 0 0 1 .4 6.75z",
   plug: "M6 1.75v3.5M10 1.75v3.5M4 5.25h8v2.5a4 4 0 0 1-8 0zM8 11.75v2.5",
   minus: "M4.25 8h7.5",
+  /** A warning triangle: a request that failed. */
+  alert: "M8 2.25 14.25 13.25H1.75zM8 6.5v3M8 11.5v.25",
+  /** A crescent: an agent that went idle. */
+  idle: "M12.75 9.75A5 5 0 1 1 6.25 3.25a4 4 0 0 0 6.5 6.5z",
   cross: "m5 5 6 6M11 5l-6 6",
 } as const;
 
@@ -171,8 +181,13 @@ export function PriorityMark({ priority, compact }: { priority: Priority; compac
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.25 text-meta tabular-nums",
-        priority === "p1" ? "font-semibold text-foreground" : "font-medium text-subtle-foreground",
+        // One weight for every level: the bars carry the level, and the label only fades.
+        "inline-flex items-center gap-1.25 text-meta font-medium tabular-nums",
+        priority === "p1"
+          ? "text-foreground"
+          : priority === "p2"
+            ? "text-subtle-foreground"
+            : "text-muted-foreground",
         compact && "justify-center",
       )}
       title={`Priority ${priority.toUpperCase()}`}

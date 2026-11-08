@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { BoardEvent } from "../api/schema.ts";
 import { plainLine } from "./boards.tsx";
-import { describe as describeEvent, detail } from "./events.tsx";
+import { describe as describeEvent, detail, eventMark } from "./events.tsx";
 import { monogram } from "../ui/icons.tsx";
 
 const event = (type: string, payload: unknown, task: string | null = "factory-9"): BoardEvent => ({
@@ -65,5 +65,34 @@ describe("monogram", () => {
     expect(monogram("claude:5be1")).toBe("5B");
     expect(monogram("user")).toBe("US");
     expect(monogram("::")).toBe("?");
+  });
+});
+
+describe("event marks", () => {
+  test("show the state an event leaves behind, by one rule", () => {
+    expect(eventMark(event("task_updated", { from: "doing", to: "review" })).status).toBe("review");
+    expect(eventMark(event("task_done", { from: "doing", to: "done" })).status).toBe("done");
+    expect(eventMark(event("task_claimed", {})).status).toBe("doing");
+    expect(eventMark(event("task_taken", { from: "t3:aa", status: "review" })).status).toBe(
+      "review",
+    );
+    expect(eventMark(event("task_taken", { from: "t3:aa", status: "doing" })).status).toBe("doing");
+    expect(eventMark(event("task_released", { from: "doing" })).status).toBe("open");
+    expect(eventMark(event("ask_created", { ask: 8, kind: "action" })).icon).toBe("hand");
+    expect(eventMark(event("evidence_added", { kind: "check", exit_code: 1 })).icon).toBe("cross");
+    expect(eventMark(event("evidence_added", { kind: "check", exit_code: 0 })).icon).toBe("shield");
+    expect(eventMark(event("handoff_updated", {}, null))).toEqual({
+      icon: "handoff",
+      tone: "text-subtle-foreground",
+    });
+  });
+
+  test("give each agent state its own shape", () => {
+    const state = (to: string) =>
+      eventMark(event("agent_state_changed", { from: "running", to }, null)).icon;
+    expect(state("paused")).toBe("pause");
+    expect(state("idle")).toBe("idle");
+    expect(state("running")).toBe("agent");
+    expect(new Set([state("paused"), state("idle"), state("running")]).size).toBe(3);
   });
 });

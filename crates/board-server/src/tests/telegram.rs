@@ -1520,6 +1520,19 @@ async fn the_digest_goes_out_once_a_day_at_the_set_time() {
         )
         .await;
     assert!(s.is_success(), "{v}");
+    let zeta_ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "zeta", "kind": "action",
+                "question": "Log in to the registrar.",
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
 
     // 12:00 UTC is 14:00 at +02:00; the digest is set for 15:00 there.
     let mut notifier = Scheduled::start(&t, api_base, |c| {
@@ -1532,7 +1545,7 @@ async fn the_digest_goes_out_once_a_day_at_the_set_time() {
     let sent = fake.wait("sendMessage", 1).await;
     let text = sent[0]["text"].as_str().unwrap();
     assert!(
-        text.starts_with("Needs you, 2026-11-06: 1 open ask, 2 tasks waiting on you."),
+        text.starts_with("Needs you, 2026-11-06: 2 open asks."),
         "{text}"
     );
     let factory = text.find("\nfactory\n").expect(text);
@@ -1543,15 +1556,11 @@ async fn the_digest_goes_out_once_a_day_at_the_set_time() {
         "{text}"
     );
     assert!(
-        text.contains(&format!("· {waits} waits on you: Sign the form")),
+        text.contains(&format!("· ask {zeta_ask}: Log in to the registrar.\n")),
         "{text}"
     );
-    assert!(
-        text.contains(&format!("· {blocked} blocked: Renew the domain")),
-        "{text}"
-    );
-    // A task with an open ask is listed as the ask; proposals and auto work are not listed.
-    for id in [&asked, &proposal, &ready] {
+    // Only asks wait on the user: a task is never listed, not even blocked or non-auto ones.
+    for id in [&asked, &waits, &proposal, &ready, &blocked] {
         assert!(!text.contains(&format!("· {id} ")), "{id}: {text}");
     }
     assert!(text.ends_with("https://board.example/asks"), "{text}");
@@ -1584,6 +1593,21 @@ async fn an_empty_digest_is_skipped() {
         json!({ "board": "factory", "title": "Ordinary work", "auto": true }),
     )
     .await;
+    // Tasks without an ask do not wait on the user, so they send nothing either.
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Sign the form", "auto": false }),
+    )
+    .await;
+    let blocked = t.task(A, "factory", "Renew the domain").await;
+    let (s, v) = t
+        .patch(
+            A,
+            &blocked,
+            json!({ "status": "blocked", "blocked_reason": "waits on the registrar" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
     let mut notifier = Scheduled::start(&t, api_base, |c| {
         c.digest_at = chrono::NaiveTime::from_hms_opt(9, 0, 0);
     });
@@ -1596,15 +1620,21 @@ async fn a_long_digest_counts_the_items_it_leaves_out() {
     let (fake, api_base) = fake_api().await;
     let t = T::new();
     t.register(A, None, None).await;
+    let long = "x".repeat(130);
     for board in ["factory", "zeta"] {
         t.board(board, &[]).await;
         for _ in 0..20 {
-            t.task_with(A, json!({ "board": board, "title": "Long", "auto": false }))
-                .await;
+            t.ok(
+                "POST",
+                "/v1/asks",
+                Some(A),
+                Some(json!({
+                    "agent": A, "board": board, "kind": "action", "question": long,
+                })),
+            )
+            .await;
         }
     }
-    let long = "x".repeat(130);
-    t.exec(&format!("UPDATE tasks SET title = '{long}'"));
     let mut notifier = Scheduled::start(&t, api_base, |c| {
         c.digest_at = chrono::NaiveTime::from_hms_opt(9, 0, 0);
     });
@@ -1628,11 +1658,7 @@ async fn a_digest_due_just_before_midnight_still_goes_out_after_it() {
     let t = T::new();
     t.register(A, None, None).await;
     t.board("factory", &[]).await;
-    t.task_with(
-        A,
-        json!({ "board": "factory", "title": "Sign the form", "auto": false }),
-    )
-    .await;
+    ask(&t, "Sign the form").await;
     // The clock starts at 12:00 UTC on 2026-11-06; the digest is due at 23:59.
     let mut notifier = Scheduled::start(&t, api_base, |c| {
         c.digest_at = chrono::NaiveTime::from_hms_opt(23, 59, 0);

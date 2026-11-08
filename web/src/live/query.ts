@@ -5,7 +5,6 @@
 
 import { type Query, QueryClient, queryOptions } from "@tanstack/react-query";
 import { ApiFailure, api } from "@/api/client.ts";
-import type { BoardEvent } from "@/api/schema.ts";
 import { boardOfTask } from "@/lib/ids.ts";
 import { tags } from "./refresh.ts";
 
@@ -77,26 +76,13 @@ export function fetching<A extends unknown[], T>(
   };
 }
 
-/** Events by sequence number, newest first. */
-export function mergeEvents(
-  current: readonly BoardEvent[],
-  incoming: readonly BoardEvent[],
-): BoardEvent[] {
-  const bySeq = new Map(current.map((event) => [event.seq, event]));
-  for (const event of incoming) bySeq.set(event.seq, event);
-  return [...bySeq.values()].sort((a, b) => b.seq - a.seq);
-}
-
-/** Events per page of the feed. */
-export const EVENTS_PAGE = 100;
-
-/** Open and blocked tasks on every board: Needs you and its navigation count. */
-async function candidateTasks() {
-  const [open, blocked] = await Promise.all([
-    api.tasks({ status: "open" }),
-    api.tasks({ status: "blocked" }),
+/** Tasks in progress on every board, doing then review: the home page's In progress. */
+async function activeTasks() {
+  const [doing, review] = await Promise.all([
+    api.tasks({ status: "doing" }),
+    api.tasks({ status: "review" }),
   ]);
-  return [...open, ...blocked];
+  return [...doing, ...review];
 }
 
 export const queries = {
@@ -118,10 +104,10 @@ export const queries = {
       queryFn: fetching(() => api.tasks({ status: "doing" })),
       meta: { tags: [tags.tasks] },
     }),
-  candidateTasks: () =>
+  activeTasks: () =>
     queryOptions({
-      queryKey: ["tasks", "needs-you"],
-      queryFn: fetching(() => candidateTasks()),
+      queryKey: ["tasks", "active"],
+      queryFn: fetching(() => activeTasks()),
       meta: { tags: [tags.tasks] },
     }),
   task: (id: string) =>
@@ -166,43 +152,4 @@ export const queries = {
       queryFn: fetching(() => api.updates(board ? { board } : {})),
       meta: { tags: [tags.updates] },
     }),
-  /**
-   * The event feed: the latest page merged into what is already shown. Live events are
-   * added by the runtime as they arrive; older pages are added on demand.
-   */
-  events: () =>
-    queryOptions({
-      queryKey: ["events"],
-      queryFn: fetching(async () => {
-        const { seq } = await api.health();
-        const page = await api.events({
-          since: Math.max(0, seq - EVENTS_PAGE),
-          limit: EVENTS_PAGE,
-        });
-        return page.events;
-      }),
-      // Keep events already shown (live ones, older pages) when the latest page is refetched.
-      structuralSharing: (previous, next) =>
-        mergeEvents((previous as BoardEvent[] | undefined) ?? [], next as BoardEvent[]),
-      meta: { tags: [] },
-    }),
 };
-
-/**
- * Add a live event to the feed. During the feed's first load the event waits for it: that
- * load stops at the sequence number it started from, so it may not include the event.
- */
-export function addToFeed(client: QueryClient, event: BoardEvent): void {
-  const key = queries.events().queryKey;
-  const merge = () =>
-    client.setQueryData(key, (current) => current && mergeEvents(current, [event]));
-  if (client.getQueryData(key) !== undefined) {
-    merge();
-    return;
-  }
-  // A failed first load shows its error, and its retry fetches the event anyway.
-  client
-    .getQueryCache()
-    .find({ queryKey: key })
-    ?.promise?.then(merge, () => undefined);
-}

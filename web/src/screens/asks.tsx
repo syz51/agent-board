@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { useId, useMemo } from "react";
 import { api } from "@/api/client.ts";
-import type { Agent, Ask, Task } from "@/api/schema.ts";
+import type { Agent, Ask } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Label } from "@/components/ui/label.tsx";
@@ -11,28 +11,30 @@ import { Textarea } from "@/components/ui/textarea.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
-import { useNow } from "@/live/runtime.ts";
-import { Markdown } from "@/text/markdown.tsx";
+import { Markdown, PlainText } from "@/text/markdown.tsx";
 import {
   agentIndex,
   AskKind,
   Crumbs,
   Empty,
   ErrorNotice,
+  Owner,
   PageHeader,
   QueryFrame,
   RelTime,
-  SectionTitle,
+  StatusBadge,
   useAgents,
   useTitle,
   Who,
 } from "@/ui/common.tsx";
 import { Icon } from "@/ui/icons.tsx";
-import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
-import { UpdatesSection } from "./updates.tsx";
+import { HandoffView } from "./agents.tsx";
 
 const asksRoute = getRouteApi("/asks");
 const askRoute = getRouteApi("/asks/$id");
+
+/** Whether the send shortcut is named ⌘ Enter, as on Apple keyboards, or Ctrl Enter. */
+const MAC = typeof navigator !== "undefined" && /Mac|iP(hone|ad)/.test(navigator.platform);
 
 const VIA: Record<string, string> = { web: "the web view", telegram: "Telegram", cli: "the CLI" };
 
@@ -47,92 +49,10 @@ export function newestFirst(asks: Ask[]): Ask[] {
   );
 }
 
-export interface BoardTasks {
-  board: string;
-  tasks: Task[];
-}
-
-/**
- * Tasks that wait on the user with no open ask, by board: blocked tasks, and open tasks
- * not marked `auto`. Left out: pending proposals and feedback items (agents review and
- * triage those), open tasks held by a `not_before` still ahead, and tasks on closed
- * boards. Exported for tests.
- */
-export function waitingTasks(
-  tasks: Task[],
-  openAsks: Ask[],
-  now: number,
-  closedBoards: ReadonlySet<string> = new Set(),
-): BoardTasks[] {
-  const asked = new Set(openAsks.flatMap((ask) => (ask.task ? [ask.task] : [])));
-  const byBoard = new Map<string, Task[]>();
-  for (const task of tasks) {
-    if (asked.has(task.id) || closedBoards.has(task.board)) continue;
-    const waits =
-      task.status === "blocked" ||
-      (task.status === "open" &&
-        !task.auto &&
-        !task.proposal &&
-        task.feedback === null &&
-        (task.not_before === null || Date.parse(task.not_before) <= now));
-    if (!waits) continue;
-    const list = byBoard.get(task.board) ?? [];
-    list.push(task);
-    byBoard.set(task.board, list);
-  }
-  const number = (id: string) => Number(id.slice(id.lastIndexOf("-") + 1));
-  return [...byBoard]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([board, list]) => ({
-      board,
-      tasks: list.sort(
-        (a, b) => a.priority.localeCompare(b.priority) || number(a.id) - number(b.id),
-      ),
-    }));
-}
-
-/** What the Needs you page lists across boards: the open asks and the waiting tasks. */
-export function needsYouCount(
-  openAsks: Ask[],
-  tasks: Task[],
-  now: number,
-  closedBoards: ReadonlySet<string> = new Set(),
-): number {
-  return waitingTasks(tasks, openAsks, now, closedBoards).reduce(
-    (sum, group) => sum + group.tasks.length,
-    openAsks.length,
-  );
-}
-
-/**
- * The navigation badge's count, from the page's own cached queries. Until the tasks load
- * it counts the open asks only.
- */
-export function useNeedsYouCount(): number {
-  const asks = useOpenAsks();
-  const tasks = useQuery(queries.candidateTasks());
-  const closed = useClosedBoards();
-  const now = useNow(60_000);
-  return needsYouCount(asks.data ?? [], tasks.data ?? [], now, closed);
-}
-
-/** Slugs of closed boards, from the boards query; none until it loads. */
-function useClosedBoards(): ReadonlySet<string> {
-  const boards = useQuery(queries.boards()).data;
-  return useMemo(
-    () =>
-      new Set((boards ?? []).filter((item) => item.status === "closed").map((item) => item.slug)),
-    [boards],
-  );
-}
-
 export function AsksScreen() {
   useTitle("Needs you");
   const board = asksRoute.useSearch().board ?? "";
   const asks = useOpenAsks();
-  const tasks = useQuery(queries.candidateTasks());
-  const closed = useClosedBoards();
-  const now = useNow(60_000);
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
 
@@ -140,7 +60,7 @@ export function AsksScreen() {
     <>
       <PageHeader
         title="Needs you"
-        sub="Questions and requests from agents, newest first, then tasks waiting on you."
+        sub="Questions and requests from agents that wait on your answer, newest first."
         aside={
           board && (
             <Badge variant="outline" shape="tag" className="h-7 text-meta" asChild>
@@ -154,98 +74,25 @@ export function AsksScreen() {
       <QueryFrame query={asks} label="Loading asks">
         {(list) => {
           const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
+          if (shown.length === 0) {
+            return (
+              <Empty title="Nothing needs you" icon="inbox">
+                {board
+                  ? `No open asks on ${board}.`
+                  : "When an agent needs your decision or action, its ask appears here, and on Telegram if it is set up."}
+              </Empty>
+            );
+          }
           return (
-            <>
-              {shown.length > 0 && (
-                <div className="grid gap-4">
-                  {shown.map((ask) => (
-                    <AskCard key={ask.id} ask={ask} agents={agents} />
-                  ))}
-                </div>
-              )}
-              {/* Its own frame: asks stay answerable while tasks load or fail. */}
-              <QueryFrame query={tasks} label="Loading tasks">
-                {(taskList) => {
-                  const waiting = waitingTasks(taskList, list, now, closed).filter(
-                    (group) => !board || group.board === board,
-                  );
-                  if (waiting.length > 0) {
-                    return (
-                      <WaitingTasks
-                        groups={waiting}
-                        agents={agents}
-                        now={now}
-                        first={shown.length === 0}
-                      />
-                    );
-                  }
-                  if (shown.length > 0) return null;
-                  return (
-                    <Empty title="Nothing needs you" icon="inbox">
-                      Agents' questions and requests appear here, and on Telegram if it is set up,
-                      with tasks that wait on you.
-                    </Empty>
-                  );
-                }}
-              </QueryFrame>
-            </>
+            <div className="grid gap-3">
+              {shown.map((ask) => (
+                <AskCard key={ask.id} ask={ask} agents={agents} />
+              ))}
+            </div>
           );
         }}
       </QueryFrame>
-      <UpdatesSection board={board} />
     </>
-  );
-}
-
-/** Tasks that wait on the user without an open ask, one group per board. */
-function WaitingTasks({
-  groups,
-  agents,
-  now,
-  first,
-}: {
-  groups: BoardTasks[];
-  agents: Map<string, Agent>;
-  now: number;
-  first: boolean;
-}) {
-  const count = groups.reduce((sum, group) => sum + group.tasks.length, 0);
-  return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby="needs-you-tasks">
-      <SectionTitle
-        id="needs-you-tasks"
-        count={count}
-        icon={<Icon name="inbox" className="self-center text-amber" />}
-      >
-        Tasks waiting on you
-      </SectionTitle>
-      <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
-        Blocked tasks and tasks only you can start, with no open ask.
-      </p>
-      {/* The board's rows with an amber edge, like action asks. */}
-      <div className="rounded-lg border-l-3 border-l-amber [&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
-        <TaskBoard>
-          {groups.map(({ board, tasks }) => (
-            <TaskGroupSection
-              key={board}
-              id={`needs-you-board-${board}`}
-              level={3}
-              heading={
-                <>
-                  <Icon name="board" className="size-3.5 text-muted-foreground" />
-                  <Link className="text-foreground" to="/boards/$slug" params={{ slug: board }}>
-                    {board}
-                  </Link>
-                </>
-              }
-              count={tasks.length}
-            >
-              <TaskList tasks={tasks} agents={agents} now={now} />
-            </TaskGroupSection>
-          ))}
-        </TaskBoard>
-      </div>
-    </section>
   );
 }
 
@@ -254,24 +101,92 @@ export function AskScreen() {
   const { id } = askRoute.useParams();
   const askId = Number(id);
   const valid = Number.isSafeInteger(askId) && askId > 0;
-  useTitle(`Ask #${id}`);
+  // The number as read, so `/asks/012` is titled "Ask #12".
+  const label = valid ? `Ask #${askId}` : `Ask #${id}`;
   const ask = useQuery({ ...queries.ask(askId), enabled: valid });
+  // Once loaded, the title says what kind of ask it is, as a card in a list does.
+  const kind = ask.data && (ask.data.kind === "action" ? "Action" : "Decision");
+  const title = kind ? `${kind} · ${label}` : label;
+  useTitle(title);
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
 
   return (
     <>
-      <Crumbs current={`Ask #${id}`}>
+      <Crumbs current={label}>
         <Link to="/asks">Needs you</Link>
       </Crumbs>
+      <PageHeader title={title} />
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
-          {(data) => <AskCard ask={data} agents={agents} standalone />}
+          {(data) => (
+            // The ask fills the content width, its prose kept to a reading measure; what it is
+            // about sits in a column beside it on wide screens and below it on narrow ones.
+            <div className="grid items-start gap-x-7 gap-y-6 xl:grid-cols-[minmax(0,1fr)_280px]">
+              <AskCard ask={data} agents={agents} standalone />
+              <AskContext ask={data} agents={agents} />
+            </div>
+          )}
         </QueryFrame>
       ) : (
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
       )}
     </>
+  );
+}
+
+/** Beside a single ask: the task it is about and the asking agent's handoff. */
+function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
+  const heading = "text-xs font-semibold text-subtle-foreground";
+  const part = "grid content-start gap-2 px-3.5 py-3";
+  // One card, its sections split by a rule: stacked beside the ask on wide screens, side by
+  // side below it on medium ones.
+  return (
+    <aside
+      className="grid content-start divide-y overflow-hidden rounded-lg border bg-card sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
+      aria-label="About this ask"
+    >
+      {ask.task && (
+        <section className={part}>
+          <h2 className={heading}>Task</h2>
+          <AskTask id={ask.task} agents={agents} />
+        </section>
+      )}
+      <section className={part}>
+        <h2 className={heading}>Asked by</h2>
+        <Who id={ask.agent} agents={agents} />
+        {/* As on the agents page, an ended agent's handoff is history, not context. */}
+        {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} stacked />}
+      </section>
+    </aside>
+  );
+}
+
+function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
+  const detail = useQuery(queries.task(id));
+  if (detail.error && detail.data === undefined) {
+    return <ErrorNotice error={detail.error} retry={() => void detail.refetch()} compact />;
+  }
+  if (detail.data === undefined) {
+    return <p className="text-meta text-muted-foreground">Loading task…</p>;
+  }
+  const { task } = detail.data;
+  return (
+    <div className="grid gap-2">
+      <Link
+        className="line-clamp-2 text-sm font-medium [overflow-wrap:anywhere] text-foreground"
+        to="/tasks/$id"
+        params={{ id }}
+        title={task.title}
+      >
+        <PlainText className="whitespace-normal" text={task.title} />
+      </Link>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-meta">
+        <StatusBadge status={task.status} ready={task.ready} />
+        <span className="ident text-muted-foreground">{id}</span>
+        <Owner task={task} agents={agents} />
+      </div>
+    </div>
   );
 }
 
@@ -284,12 +199,11 @@ function AskCard({
   agents: Map<string, Agent>;
   standalone?: boolean;
 }) {
-  const Heading = standalone ? "h1" : "h2";
   return (
     <article
       className={cn(
-        "relative grid gap-3.5 rounded-lg border bg-card px-5.5 pt-4.5 pb-5 shadow-raise",
-        "before:absolute before:top-3.5 before:bottom-3.5 before:-left-px before:w-[3px] before:rounded-r-[3px]",
+        "relative grid gap-2.5 overflow-hidden rounded-lg border bg-card px-4 pt-3 pb-3.5",
+        "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
         ask.status !== "open"
           ? "before:bg-input"
           : ask.kind === "action"
@@ -299,16 +213,15 @@ function AskCard({
       data-status={ask.status}
     >
       <header className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-meta">
-        <AskKind kind={ask.kind} />
-        <Heading className="text-meta font-semibold">
-          {standalone ? (
-            <>Ask #{ask.id}</>
-          ) : (
+        {/* On its own page the ask's kind and number are the page title. */}
+        {!standalone && <AskKind kind={ask.kind} />}
+        {!standalone && (
+          <h2 className="text-meta font-semibold">
             <Link className="text-foreground" to="/asks/$id" params={{ id: String(ask.id) }}>
               Ask #{ask.id}
             </Link>
-          )}
-        </Heading>
+          </h2>
+        )}
         <span className="inline-flex items-center gap-2">
           <Who id={ask.agent} agents={agents} />
           <span className="text-muted-foreground">
@@ -329,7 +242,8 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="text-base leading-[1.55] text-foreground">
+      {/* The question runs the card's width, as the answer controls below it do. */}
+      <div className="text-sm leading-normal text-foreground">
         <Markdown text={ask.question} />
       </div>
       {ask.status === "open" && <AnswerForm ask={ask} />}
@@ -385,7 +299,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
 
   return (
     <form
-      className="grid gap-3 border-t pt-3.5"
+      className="grid gap-2.5 border-t pt-3"
       noValidate
       onSubmit={(event) => {
         event.preventDefault();
@@ -404,15 +318,15 @@ export function AnswerForm({ ask }: { ask: Ask }) {
           return (
             <>
               {ask.options.length > 0 && (
-                <fieldset className="m-0 grid gap-2 border-0 p-0">
-                  <legend className="mb-2 p-0 text-meta font-medium text-subtle-foreground">
+                <fieldset className="m-0 grid gap-1.5 border-0 p-0">
+                  <legend className="mb-1.5 p-0 text-meta font-medium text-subtle-foreground">
                     Choose an answer
                   </legend>
-                  <div className="grid gap-2">
+                  <div className="grid gap-1.5">
                     {ask.options.map((option, index) => (
                       <Label
                         key={index}
-                        className="flex min-h-[42px] cursor-pointer items-center gap-2.5 rounded-sm border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-primary has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
+                        className="flex min-h-7.5 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-1 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
                       >
                         <input
                           type="radio"
@@ -428,7 +342,9 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                         />
                         <span className="whitespace-pre-wrap">{option}</span>
                         {index === 0 && (
-                          <Badge variant="accent" shape="tag">
+                          // Neutral, so it reads apart from the violet of a decision.
+                          <Badge variant="outline" shape="tag" className="gap-1">
+                            <Icon name="check" className="size-3" />
                             Recommended
                           </Badge>
                         )}
@@ -449,11 +365,19 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     <Textarea
                       id={`${id}-text`}
                       rows={2}
-                      className="min-h-[62px] bg-card text-sm dark:bg-card"
+                      // Two lines, so it reads as room to write; it grows with the text.
+                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}
+                      aria-keyshortcuts="Meta+Enter Control+Enter"
                       onChange={(event) => field.handleChange(event.currentTarget.value)}
+                      onKeyDown={(event) => {
+                        // Enter adds a line; with Cmd or Ctrl it sends, as in chat and mail.
+                        if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+                        event.preventDefault();
+                        event.currentTarget.form?.requestSubmit();
+                      }}
                     />
                   </div>
                 )}
@@ -464,13 +388,23 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                 </p>
               )}
               {mutation.error && <ErrorNotice error={mutation.error} compact />}
-              <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2">
+              {/* Send closes the whole answer group, so it plainly sends a choice or the text.
+                  It sits at the left, under the field, where the eye ends after typing. */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                {/* The page's main action; a press with nothing chosen says what is missing. */}
                 <Button type="submit" disabled={mutation.isPending}>
                   {mutation.isPending ? "Sending…" : "Send answer"}
                 </Button>
-                {answer && !mutation.isPending && (
-                  <span className="text-meta [overflow-wrap:anywhere] text-muted-foreground">
+                {answer && !mutation.isPending ? (
+                  <span className="line-clamp-2 min-w-0 flex-1 text-meta [overflow-wrap:anywhere] text-muted-foreground">
                     Sends “{answer}”
+                  </span>
+                ) : (
+                  <span
+                    className="text-meta text-muted-foreground max-md:hidden"
+                    aria-hidden="true"
+                  >
+                    or <kbd className="font-sans">{MAC ? "⌘" : "Ctrl"}&nbsp;Enter</kbd> in the field
                   </span>
                 )}
               </div>

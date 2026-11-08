@@ -53,6 +53,22 @@ describe("answer form", () => {
     expect(requests[0]!.body).toEqual({ answer: option });
   });
 
+  test("Cmd or Ctrl with Enter in the field sends the text; Enter alone does not", async () => {
+    const requests: unknown[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return Response.json(state.ask(withOptions.id));
+    }) as typeof fetch;
+    await renderInApp(<AnswerForm ask={withOptions} />);
+    const field = screen.getByRole("textbox", { name: "Or write your own answer" });
+    expect(field.getAttribute("aria-keyshortcuts")).toBe("Meta+Enter Control+Enter");
+    await act(() => fireEvent.change(field, { target: { value: "Later" } }));
+    await act(() => fireEvent.keyDown(field, { key: "Enter" }));
+    expect(requests).toEqual([]);
+    await act(() => fireEvent.keyDown(field, { key: "Enter", ctrlKey: true }));
+    await waitFor(() => expect(requests).toEqual([{ answer: "Later" }]));
+  });
+
   test("a second submit before the first settles sends nothing more", async () => {
     let requests = 0;
     let settle!: () => void;

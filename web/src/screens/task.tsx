@@ -41,14 +41,17 @@ export function TaskScreen() {
     [boardTasks.data],
   );
   useTitle(detail.data ? `${detail.data.task.id} ${detail.data.task.title}` : id);
+  // The crumb names the board as its page does, from the list the sidebar already holds.
+  const slug = detail.data?.task.board ?? board;
+  const boardTitle = useQuery(queries.boards()).data?.find((item) => item.slug === slug)?.title;
 
   return (
     <>
       <Crumbs current={id}>
-        <Link to="/">Boards</Link>
+        <Link to="/">Home</Link>
         <Icon name="chevron" className="size-3 opacity-70" />
-        <Link to="/boards/$slug" params={{ slug: detail.data?.task.board ?? board }}>
-          {detail.data?.task.board ?? board}
+        <Link to="/boards/$slug" params={{ slug }}>
+          {boardTitle ?? slug}
         </Link>
       </Crumbs>
       <QueryFrame query={detail} label="Loading task">
@@ -73,7 +76,7 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby={id}>
+    <section className={first ? undefined : "mt-7"} aria-labelledby={id}>
       <SectionTitle id={id} {...(count === undefined ? {} : { count })}>
         {title}
       </SectionTitle>
@@ -119,7 +122,7 @@ function TaskView({
   return (
     <article>
       <header className="mb-6">
-        <h1 className="max-w-[36ch] text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+        <h1 className="max-w-[40ch] text-headline font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
@@ -128,11 +131,33 @@ function TaskView({
           <PriorityBadge priority={task.priority} />
           <Owner task={task} agents={agents} />
         </p>
+        {/* The links to other tasks are far down there too; this says they exist. */}
+        {(task.blockers.length > 0 || detail.children.length > 0) && (
+          <p className="mt-1.5 flex flex-wrap items-center gap-x-3 text-meta text-muted-foreground lg:hidden">
+            {task.blockers.length > 0 && (
+              <a
+                className="inline-flex min-h-6 items-center gap-1 text-muted-foreground"
+                href={`#${linksId("Blocked by")}`}
+              >
+                <Icon name="link" className="size-3.5" />
+                Blocked by <span className="ident">{task.blockers.join(", ")}</span>
+              </a>
+            )}
+            {detail.children.length > 0 && (
+              <a
+                className="inline-flex min-h-6 items-center text-muted-foreground"
+                href={`#${linksId("Subtasks")}`}
+              >
+                {detail.children.length} {detail.children.length === 1 ? "subtask" : "subtasks"}
+              </a>
+            )}
+          </p>
+        )}
       </header>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_272px] lg:items-start lg:gap-10">
+      <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-start lg:gap-8">
         <aside
-          className="order-2 grid gap-5 rounded-lg border bg-muted p-4 lg:sticky lg:top-6"
+          className="order-2 grid gap-5 max-lg:border-t max-lg:pt-5 lg:sticky lg:top-6 lg:border-l lg:pl-6"
           aria-label="Properties"
         >
           <Facts className="gap-3 text-meta [&>div]:grid-cols-[76px_minmax(0,1fr)] max-[520px]:[&>div]:grid-cols-[96px_minmax(0,1fr)]">
@@ -212,7 +237,7 @@ function TaskView({
 
           {summary && (
             <Section id="task-summary" title="Summary" first>
-              <div className="max-w-[72ch] leading-relaxed">
+              <div className="max-w-[100ch] leading-relaxed">
                 <Markdown text={summary} />
               </div>
             </Section>
@@ -220,7 +245,7 @@ function TaskView({
 
           <Section id="task-description" title="Description" first={!summary && !task.feedback}>
             {task.body.trim() ? (
-              <div className="max-w-[72ch] leading-relaxed">
+              <div className="max-w-[100ch] leading-relaxed">
                 <Markdown text={task.body} />
               </div>
             ) : (
@@ -283,7 +308,7 @@ function TaskView({
                         <RelTime at={note.at} />
                       </span>
                     </div>
-                    <p className="max-w-[72ch]">
+                    <p className="max-w-[100ch]">
                       <PlainText text={note.text} />
                     </p>
                   </li>
@@ -300,7 +325,7 @@ function TaskView({
                 {[...detail.history]
                   .sort((a, b) => b.seq - a.seq)
                   .map((event: BoardEvent) => (
-                    <EventLine key={event.seq} event={event} agents={agents} showTask={false} />
+                    <EventLine key={event.seq} event={event} agents={agents} />
                   ))}
               </Timeline>
             ) : (
@@ -403,6 +428,11 @@ function TaskRef({ id, related }: { id: string; related: Map<string, Task> }) {
   );
 }
 
+/** The anchor of a list of linked tasks, such as "task-blocked-by". */
+function linksId(title: string): string {
+  return `task-${title.toLowerCase().replaceAll(" ", "-")}`;
+}
+
 function TaskLinks({
   title,
   ids,
@@ -414,7 +444,7 @@ function TaskLinks({
 }) {
   if (ids.length === 0) return null;
   return (
-    <section className="border-t pt-4">
+    <section id={linksId(title)} className="scroll-mt-4 border-t pt-4">
       <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
       <ul className="grid gap-1">
         {ids.map((id) => {

@@ -3,44 +3,65 @@ import { Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
 import { useMemo, useState } from "react";
 import { api } from "@/api/client.ts";
-import type { Agent, Board } from "@/api/schema.ts";
+import type { Agent, Ask, Board, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Switch } from "@/components/ui/switch.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
 import { PlainText } from "@/text/markdown.tsx";
+import { useNow } from "@/live/runtime.ts";
 import {
   AgentStateBadge,
   agentIndex,
   AskKind,
   Empty,
   ErrorNotice,
+  ExpandableLine,
   listClass,
   PageHeader,
   QueryFrame,
   RelTime,
-  SectionTitle,
   StatePill,
   useAgents,
   useTitle,
   Who,
 } from "@/ui/common.tsx";
 import { ConfirmDialog } from "@/ui/confirm.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusLabel } from "@/ui/icons.tsx";
+import { ArrangedSections, Section } from "@/ui/sections.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
+import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
+import { unseenCount, Updates, UpdatesHeader, useUpdates } from "./updates.tsx";
 
-export function BoardsScreen() {
-  useTitle("Boards");
+// Boards come second, so the overview is in reach without scrolling past the work in hand.
+const HOME_SECTIONS = ["asks", "boards", "progress", "updates"] as const;
+
+/**
+ * Home: what waits on the user, every board, what is in progress and what changed since they
+ * last looked. Each section collapses and moves; the arrangement is kept per browser.
+ */
+export function HomeScreen() {
+  useTitle("Home");
   const boards = useQuery(queries.boards());
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
   const openAsks = useOpenAsks().data ?? [];
+  const updates = useUpdates().data;
+  const active = useQuery(queries.activeTasks());
+  const closed = useMemo(
+    () =>
+      new Set(
+        (boards.data ?? []).filter((board) => board.status === "closed").map((board) => board.slug),
+      ),
+    [boards.data],
+  );
+  const now = useNow(60_000);
 
   return (
     <>
       <PageHeader
-        title="Boards"
+        title="Home"
         sub={
           boards.data && (
             <>
@@ -50,56 +71,182 @@ export function BoardsScreen() {
           )
         }
       />
-      {openAsks.length > 0 && (
-        <section className="mb-8" aria-labelledby="waiting-title">
-          <div className="flex items-baseline justify-between gap-3">
-            <SectionTitle id="waiting-title">Waiting on you</SectionTitle>
-            <Link
-              className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
-              to="/asks"
-            >
-              All asks <Icon name="arrow" className="size-3.5" />
-            </Link>
-          </div>
-          <ul className={listClass}>
-            {newestFirst(openAsks)
-              .slice(0, 4)
-              .map((ask) => (
-                <li key={ask.id}>
-                  <Link
-                    className="grid min-h-11 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-2 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
-                    to="/asks/$id"
-                    params={{ id: String(ask.id) }}
-                  >
-                    <AskKind kind={ask.kind} />
-                    <span
-                      className="truncate font-medium max-md:line-clamp-2 max-md:whitespace-normal"
-                      title={plainLine(ask.question)}
+      <ArrangedSections
+        storageKey="home"
+        ids={HOME_SECTIONS}
+        render={(id, state) => {
+          switch (id) {
+            case "asks":
+              return (
+                <Section
+                  title="Waiting on you"
+                  count={openAsks.length}
+                  aside={
+                    <Link
+                      className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
+                      to="/asks"
                     >
-                      {plainLine(ask.question)}
-                    </span>
-                    <span className="text-meta whitespace-nowrap text-muted-foreground">
-                      {ask.board} · <RelTime at={ask.created_at} />
-                    </span>
-                  </Link>
-                </li>
-              ))}
-          </ul>
-        </section>
-      )}
-      <QueryFrame query={boards} label="Loading boards">
-        {(list) =>
-          list.length === 0 ? (
-            <Empty title="No boards yet">
-              Create one with <code>board create</code>; it appears here.
-            </Empty>
-          ) : (
-            <BoardTable boards={list} agents={agents} />
-          )
-        }
-      </QueryFrame>
+                      All asks <Icon name="arrow" className="size-3.5" />
+                    </Link>
+                  }
+                  {...state}
+                >
+                  <WaitingAsks asks={openAsks} />
+                </Section>
+              );
+            case "progress":
+              return (
+                <Section
+                  title="In progress"
+                  count={active.data && inProgress(active.data, closed).length}
+                  {...state}
+                >
+                  <QueryFrame query={active} label="Loading tasks">
+                    {(list) => (
+                      <InProgress tasks={inProgress(list, closed)} agents={agents} now={now} />
+                    )}
+                  </QueryFrame>
+                </Section>
+              );
+            case "updates":
+              return (
+                <Section
+                  title="Since you last looked"
+                  count={updates ? unseenCount(updates) : undefined}
+                  aside={updates && <UpdatesHeader updates={updates} />}
+                  {...state}
+                >
+                  <Updates />
+                </Section>
+              );
+            case "boards":
+              return (
+                <Section title="Boards" count={boards.data?.length} {...state}>
+                  <QueryFrame query={boards} label="Loading boards">
+                    {(list) =>
+                      list.length === 0 ? (
+                        <Empty title="No boards yet">
+                          Create one with <code>board create</code>; it appears here.
+                        </Empty>
+                      ) : (
+                        <BoardTable boards={list} agents={agents} />
+                      )
+                    }
+                  </QueryFrame>
+                </Section>
+              );
+          }
+        }}
+      />
     </>
   );
+}
+
+/** How many open asks Home lists; Needs you lists them all. */
+export const HOME_ROWS = 4;
+
+/**
+ * Tasks in progress, under Doing and Review headings as on a board, so the two read apart at
+ * a glance.
+ */
+function InProgress({
+  tasks,
+  agents,
+  now,
+}: {
+  tasks: Task[];
+  agents: Map<string, Agent>;
+  now: number;
+}) {
+  if (tasks.length === 0) {
+    return <p className="text-meta text-muted-foreground">No task is in progress.</p>;
+  }
+  const groups = (["doing", "review"] as const)
+    .map((status) => ({ status, tasks: tasks.filter((task) => task.status === status) }))
+    .filter((group) => group.tasks.length > 0);
+  return (
+    <TaskBoard>
+      {groups.map((group) => (
+        <TaskGroupSection
+          key={group.status}
+          id={`progress-${group.status}`}
+          level={3}
+          heading={
+            <>
+              <StatusIcon status={group.status} />
+              {statusLabel(group.status)}
+            </>
+          }
+          count={group.tasks.length}
+        >
+          <TaskList tasks={group.tasks} agents={agents} now={now} />
+        </TaskGroupSection>
+      ))}
+    </TaskBoard>
+  );
+}
+
+/** The newest open asks, one line each; the Needs you page lists them all. */
+function WaitingAsks({ asks }: { asks: Ask[] }) {
+  if (asks.length === 0) {
+    return <p className="text-meta text-muted-foreground">Nothing waits on you.</p>;
+  }
+  return (
+    <ul className={listClass}>
+      {newestFirst(asks)
+        .slice(0, HOME_ROWS)
+        .map((ask) => (
+          <li key={ask.id}>
+            {/* The left edge takes the kind's colour, as on the Needs you cards: these rows
+                wait on the user, unlike every other row on Home. */}
+            <Link
+              className={cn(
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+                ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
+              )}
+              to="/asks/$id"
+              params={{ id: String(ask.id) }}
+            >
+              <AskKind kind={ask.kind} />
+              <span
+                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-3 max-md:whitespace-normal"
+                title={plainLine(ask.question)}
+              >
+                {/* Tags show as code here too, as in the ask itself. */}
+                <PlainText className="[white-space:inherit]" text={plainLine(ask.question)} />
+              </span>
+              {/* Where and when; on hover or focus, what a click does. */}
+              <span className="grid text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
+                <span className="col-start-1 row-start-1 [@media(hover:hover)]:group-hover/ask:invisible [@media(hover:hover)]:group-focus-visible/ask:invisible">
+                  {ask.board} · <RelTime at={ask.created_at} />
+                </span>
+                <span
+                  className="invisible col-start-1 row-start-1 inline-flex items-center justify-end gap-1 font-medium text-link [@media(hover:hover)]:group-hover/ask:visible [@media(hover:hover)]:group-focus-visible/ask:visible"
+                  aria-hidden="true"
+                >
+                  Answer <Icon name="arrow" className="size-3.5" />
+                </span>
+              </span>
+            </Link>
+          </li>
+        ))}
+    </ul>
+  );
+}
+
+/**
+ * Tasks being worked on or waiting for review, on boards that are not closed: doing first,
+ * then review, each most recently updated first. Exported for tests.
+ */
+export function inProgress(tasks: Task[], closedBoards: ReadonlySet<string>): Task[] {
+  const rank = (task: Task) => (task.status === "doing" ? 0 : 1);
+  return tasks
+    .filter(
+      (task) =>
+        (task.status === "doing" || task.status === "review") && !closedBoards.has(task.board),
+    )
+    .sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
 /** The first line of agent markdown without its markup, for a one-line preview. */
@@ -143,7 +290,7 @@ const column = createColumnHelper<typeof features, BoardRowData>();
 /**
  * The boards table: name and goal, tasks by status, coordinator, open asks and autopilot.
  * At 760px of width and up the cells line up in columns under a header; below, a row
- * stacks name, tasks, then coordinator, asks and autopilot.
+ * stacks name, tasks, coordinator, then asks and autopilot.
  */
 const columns = column.columns([
   column.display({
@@ -178,19 +325,20 @@ const AREA: Record<string, string> = {
   tasks: "[grid-area:tasks]",
   coordinator: "[grid-area:coord]",
   asks: "[grid-area:asks]",
-  autopilot: "[grid-area:auto]",
+  // Not "auto": that is a keyword for grid-area and would place the cell automatically.
+  autopilot: "[grid-area:pilot]",
 };
 
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
+  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1",
   asks: "",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_auto'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_176px_168px_56px_56px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_auto'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -209,16 +357,13 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
     getRowId: (row) => row.board.slug,
   });
   return (
-    <section
-      className="@container overflow-hidden rounded-lg border bg-card shadow-raise"
-      aria-label="All boards"
-    >
+    <div className="edge @container overflow-hidden border-y bg-card">
       {table.getHeaderGroups().map((group) => (
         <div
           key={group.id}
           className={cn(
             ROW_GRID,
-            "hidden h-[34px] items-center border-b bg-muted px-4 text-xs font-medium text-muted-foreground @min-[760px]:grid",
+            "hidden h-8 items-center border-b bg-muted px-(--gutter) text-xs font-medium text-muted-foreground @min-[760px]:grid",
           )}
           aria-hidden="true"
         >
@@ -235,7 +380,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-4 py-3.5 @min-[760px]:min-h-16 @min-[760px]:py-3 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-14 @min-[760px]:py-2 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -246,20 +391,29 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
           </li>
         ))}
       </ul>
-    </section>
+    </div>
   );
 }
 
 function BoardName({ board }: { board: Board }) {
   return (
     <>
+      {/* The name and slug are never cut: where the badges do not fit beside them, they
+          move to a line of their own. */}
       <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
-          <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
+        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em] [overflow-wrap:anywhere]">
+          <Link
+            className="text-foreground"
+            to="/boards/$slug"
+            params={{ slug: board.slug }}
+            title={board.title}
+          >
             {board.title}
           </Link>
-        </h2>
-        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
+        </h3>
+        <span className="ident min-w-0 text-meta [overflow-wrap:anywhere] text-muted-foreground">
+          {board.slug}
+        </span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}
@@ -272,13 +426,11 @@ function BoardName({ board }: { board: Board }) {
           </Badge>
         )}
       </div>
-      <p className="truncate text-meta text-muted-foreground">
-        {board.goal ? (
-          <PlainText className="whitespace-nowrap" text={board.goal} />
-        ) : (
-          "No goal written."
-        )}
-      </p>
+      {board.goal ? (
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
+      ) : (
+        <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
+      )}
     </>
   );
 }
@@ -307,26 +459,26 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-3 gap-y-1 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-2"
+          // Phones set it a step smaller and tighter, so six counts still fit on one line.
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
             (segment) =>
               counts[segment.key] > 0 && (
+                // A count and its word, in the bar's order, after a dot of its bar colour.
                 <li
                   key={segment.key}
-                  className="inline-flex items-center gap-1"
-                  title={`${counts[segment.key]} ${segment.label}`}
+                  className="inline-flex items-center gap-1 whitespace-nowrap max-md:gap-0.75"
                 >
-                  <StatusIcon
-                    status={segment.key === "waiting" ? "open" : segment.key}
-                    className="size-3"
+                  <span
+                    className={cn("size-1.5 flex-none rounded-full", segment.bar)}
+                    aria-hidden="true"
                   />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
-                  {/* The column head names the counts; each keeps its word for screen readers. */}
-                  <span className="@min-[760px]:sr-only">{segment.label}</span>
+                  <span>{segment.label}</span>
                 </li>
               ),
           )}
@@ -338,19 +490,13 @@ function TaskTally({ board }: { board: Board }) {
 
 function Coordinator({ board, coordinator, agents }: BoardRowData) {
   if (board.coordinator === null) {
-    return (
-      <span className="text-muted-foreground">
-        {board.autopilot ? "No coordinator running" : "No coordinator"}
-      </span>
-    );
+    return <span className="text-muted-foreground">No coordinator</span>;
   }
   if (!coordinator) return <Who id={board.coordinator} agents={agents} />;
   return (
     <>
       <Who id={coordinator.id} agents={agents} />
-      <span className="hidden @min-[760px]:inline-flex">
-        <AgentStateBadge agent={coordinator} />
-      </span>
+      <AgentStateBadge agent={coordinator} />
     </>
   );
 }
@@ -358,7 +504,10 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">No asks</span>
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
+        <span aria-hidden="true">–</span>
+        <span className="sr-only">No asks</span>
+      </span>
     );
   }
   return (

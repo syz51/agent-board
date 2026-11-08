@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DevState } from "../../dev/state.ts";
-import { groupTasks, type TaskFilters } from "./board.tsx";
+import { groupTasks, showsTasks, type TaskFilters } from "./board.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const tasks = new DevState(() => now).tasks(new URLSearchParams({ board: "factory" }));
@@ -46,5 +46,22 @@ describe("groupTasks", () => {
     expect(ids({ readyOnly: true }).open).toEqual([]);
     expect(ids({ q: "LEASES" }).ready).toEqual(["factory-15"]);
     expect(ids({ q: "factory-13" }).review).toEqual(["factory-13"]);
+  });
+});
+
+describe("showsTasks", () => {
+  const at = (id: string) => {
+    const task = tasks.find((item) => item.id === id);
+    if (!task) throw new Error(`no fixture task ${id}`);
+    return task;
+  };
+
+  test("counts only tasks the list would show before filtering", () => {
+    expect(showsTasks(tasks, now)).toBe(true);
+    expect(showsTasks([], now)).toBe(false);
+    const dropped = { ...at("factory-15"), status: "dropped" as const };
+    const oldDone = { ...at("factory-9"), updated_at: "2026-09-01T00:00:00Z" };
+    expect(showsTasks([dropped, oldDone], now)).toBe(false);
+    expect(showsTasks([dropped, at("factory-9")], now)).toBe(true);
   });
 });
