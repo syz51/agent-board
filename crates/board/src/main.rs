@@ -5,9 +5,12 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("BOARD_LOG")
-                // The daemon also says what it does (starts, adoptions, reconnects) in
-                // watch.log; everything else speaks only of trouble.
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,board::daemon=info")),
+                // The daemon and its hook relay also say what they do (starts, adoptions,
+                // reconnects, hooks that passed the relay by) in watch.log; everything else
+                // speaks only of trouble.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("warn,board::daemon=info,board::relay=info")
+                }),
         )
         .with_writer(std::io::stderr)
         .init();
