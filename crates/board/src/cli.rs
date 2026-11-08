@@ -484,6 +484,10 @@ pub enum BoardCommand {
         /// user may turn it on for an existing board.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         temporary: Option<bool>,
+        /// How many tasks the coordinator and its child threads may have in progress at
+        /// once (1 to 4). Only the user may raise it.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
+        parallel_tasks: Option<u32>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -884,6 +888,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             autopilot,
             home_devices,
             temporary,
+            parallel_tasks,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -893,6 +898,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 autopilot,
                 home_devices,
                 temporary,
+                parallel_tasks,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
@@ -947,7 +953,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let req = ResolveFeedback { kind, task, reason };
             ops::resolve(&ctx()?, &id, req).await?
         }
-        Command::Stats { days } => ops::stats(&ctx()?, days).await?,
+        Command::Stats { days } => ops::stats(&ctx()?, days, chrono::Utc::now()).await?,
         Command::Errors {
             since,
             code,

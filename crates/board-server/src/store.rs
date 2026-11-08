@@ -399,7 +399,7 @@ pub(crate) fn find_board(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<Board>
         .db
         .query_row(
             "SELECT slug, title, goal, status, repos, autopilot, home_devices, coordinator, \
-             coordinator_expires_at, created_at, updated_at, temporary FROM boards \
+             coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks FROM boards \
              WHERE slug = ?1",
             [slug.as_str()],
             |r| {
@@ -413,6 +413,7 @@ pub(crate) fn find_board(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<Board>
                     temporary: r.get(11)?,
                     repos: parse_json(&r.get::<_, String>(4)?)?,
                     autopilot: r.get(5)?,
+                    parallel_tasks: r.get(12)?,
                     coordinator: match (coordinator, expires) {
                         (Some(c), Some(e)) if e > cx.now_ms() => Some(parse_id(&c)?),
                         _ => None,

@@ -162,6 +162,12 @@ server's minute sweep deletes older ones.
 
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
+  `parallel_tasks` (1 to 4; 400 `invalid` otherwise) is how many tasks the board's
+  coordinator and its child threads may have in progress at once. The coordinator keeps to
+  it; the server does not refuse claims over it. Raising it is user only (403
+  `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
+  restate or lower it. A `Board` from a server that predates it reads as 1, and a client
+  leaves the field out of `UpdateBoard` unless it sets it.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
@@ -179,7 +185,8 @@ server's minute sweep deletes older ones.
   slug may be used again, and its task numbers continue where the deleted board's stopped,
   so a task id an agent still holds never names a new task. Ask ids are never reused
   either.
-- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
+- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7. Its fields are listed
+  under `board stats` in "CLI".
 - `GET /v1/errors?since=&code=&route=&q=&limit=` → `[ErrorLog]` `{since, retention_days,
   signatures}`: the API errors recorded for signals (see "Signals") at or after `since`,
   one row per signature, most errors first. A row `[ErrorSignature]` has `signature`
@@ -522,8 +529,29 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
-  it), each within the period. Without `--json` it prints
-  a four-line summary.
+  it), each within the period; `since`, the oldest time the numbers cover (`days` back
+  from now, or the server's oldest kept event when that is later; absent from servers that
+  predate it); and `boards` (empty from servers that predate it), one `[BoardStats]` per
+  board with events in the period, by slug: `board`; `claims`, claims of auto tasks that
+  waited ready (tasks created claimed are left out), with `wait_minutes_median` and
+  `wait_minutes_p90` from ready to claimed. A task is ready at the latest of: its last
+  creation, release, move to `open`, or change of `auto`, blockers or `not_before`; the
+  `not_before` it has then (the one it was created with until a change); and its last
+  blocker done. A cleared or earlier `not_before` makes it ready sooner. `tasks_done` and
+  `done_per_day`; `doing_minutes_median`, time in `doing` since the task was last done,
+  with `review` excluded; `lease_conflicts`, lease conflicts and file-touch overlaps in the
+  board's repos, whichever task a lease names, if any; `reopened_after_review`, moves from
+  `review` to `open`, `doing` or `blocked`; `pr_links` in the evidence of the tasks done;
+  `limit_pauses` of member agents after they joined, and `limit_pauses_per_day`;
+  `paused_hours`, until each pause's reset, an earlier move to a working state, the
+  session's end when the pause named no reset, or now (a repeated pause before the reset
+  extends it to a later reset named; one after the reset is a new pause); and `peak_running_at_pause`, the most member agents running when one
+  paused (`null` without pauses). A member counts as running when its latest registration
+  or state change before the pause left it running and it acted within the owner
+  staleness threshold before it. Rates are per day since `since`, and medians and
+  percentiles are `null` when nothing was measured. Without `--json` it prints a summary,
+  says when the history starts more than an hour into the period asked, and adds one line
+  per board.
 - `board errors [--since T] [--code C] [--route R] [--grep TEXT] [--limit N] --json` →
   `[ErrorLog]` from `GET /v1/errors`. `--since` takes an RFC 3339 time, a date
   (`YYYY-MM-DD`, midnight UTC) or a duration back from now (`30m`, `12h`, `14d`); `--grep`

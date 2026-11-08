@@ -74,6 +74,10 @@ pub struct UpdateBoard {
     /// Turning it on for a board that is not temporary is for the user only, since the
     /// board is then deleted once idle.
     pub temporary: Option<bool>,
+    /// 1 to [`crate::PARALLEL_TASKS_MAX`]. Raising it is for the user only, since more
+    /// tasks at once spend the shared usage limit faster; anyone may lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks: Option<u32>,
 }
 
 /// `POST /v1/boards/{slug}/join`: the calling agent joins the board.
@@ -116,6 +120,43 @@ pub struct Stats {
     /// Feedback reports and items. Absent from servers that predate feedback items.
     #[serde(default)]
     pub feedback: FeedbackStats,
+    /// The oldest time the numbers cover: `days` back from now, or the oldest event the
+    /// server keeps when that is later. Absent from servers that predate it.
+    #[serde(default)]
+    pub since: Option<Timestamp>,
+    /// Per-board numbers over the same window, for each board with events in it, by slug.
+    /// Empty from servers that predate them.
+    #[serde(default)]
+    pub boards: Vec<BoardStats>,
+}
+
+/// One board's numbers in [`Stats`]. Medians and percentiles are `None` when nothing was
+/// measured; rates are per day of the window covered (from [`Stats::since`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardStats {
+    pub board: BoardSlug,
+    /// Claims of auto tasks that waited ready, not counting tasks created claimed.
+    pub claims: u32,
+    /// Minutes those tasks waited from ready to claimed.
+    pub wait_minutes_median: Option<f64>,
+    pub wait_minutes_p90: Option<f64>,
+    pub tasks_done: u32,
+    pub done_per_day: f64,
+    /// Median minutes the tasks done spent in `doing`, time in `review` excluded.
+    pub doing_minutes_median: Option<f64>,
+    /// Lease conflicts and file-touch overlaps on the board's repos.
+    pub lease_conflicts: u32,
+    /// Tasks moved from `review` back to `open`, `doing` or `blocked`.
+    pub reopened_after_review: u32,
+    /// PR links in the evidence of the tasks done.
+    pub pr_links: u32,
+    /// Usage-limit pauses of the board's member agents.
+    pub limit_pauses: u32,
+    pub limit_pauses_per_day: f64,
+    /// Hours those agents spent paused, within the window.
+    pub paused_hours: f64,
+    /// The most member agents running at the moment one of them paused.
+    pub peak_running_at_pause: Option<u32>,
 }
 
 /// Feedback counts in [`Stats`].
@@ -703,6 +744,7 @@ mod tests {
         .unwrap();
         assert_eq!(stats.feedback, FeedbackStats::default());
         assert_eq!(stats.done_under_a_minute, None);
+        assert_eq!((stats.since, stats.boards.len()), (None, 0));
         let create: CreateFeedback =
             serde_json::from_value(serde_json::json!({ "about": "board", "text": "Slow" }))
                 .unwrap();
@@ -813,5 +855,15 @@ mod tests {
         }))
         .unwrap();
         assert!(!board.temporary);
+        assert_eq!(
+            board.parallel_tasks, 1,
+            "older servers run one task at a time"
+        );
+        assert_eq!(update.parallel_tasks, None);
+        // Older servers reject no field they do not know, and an unset one is not sent.
+        assert_eq!(
+            serde_json::to_value(UpdateBoard::default()).unwrap()["parallel_tasks"],
+            serde_json::Value::Null
+        );
     }
 }

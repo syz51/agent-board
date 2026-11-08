@@ -499,6 +499,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         temporary: false,
         repos: repos.iter().map(|r| (*r).to_owned()).collect(),
         autopilot: false,
+        parallel_tasks: 1,
         coordinator: None,
         home_devices: Vec::new(),
         counts: StatusCounts::default(),
