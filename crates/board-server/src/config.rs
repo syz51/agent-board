@@ -22,6 +22,7 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 /// [telegram]
 /// chat_id = 123456789          # optional; else paired with `board admin telegram-pair`
 /// stuck_after_secs = 14400      # 0 turns the stuck-task alert off
+/// stalled_after_secs = 7200     # 0 turns the stalled-board alert off
 /// digest_at = "09:00"           # daily Needs you digest, local time; "off" turns it off
 /// utc_offset = "+00:00"         # the local time's offset from UTC
 ///
@@ -158,6 +159,11 @@ pub struct TelegramConfig {
     /// turns the alert off. Default 4 hours.
     #[serde(default = "default_stuck_after")]
     pub stuck_after_secs: u64,
+    /// An active autopilot board with ready auto work, no task in doing, and no task moved
+    /// into or out of doing for this long is reported once, and again only after such a
+    /// move. 0 turns the alert off. Default 2 hours.
+    #[serde(default = "default_stalled_after")]
+    pub stalled_after_secs: u64,
     /// Local time of the daily Needs you digest (`HH:MM`, at `utc_offset`); `None`
     /// (`"off"` in the file) sends none. Default 09:00.
     #[serde(default = "default_digest_at", deserialize_with = "digest_time")]
@@ -170,6 +176,10 @@ pub struct TelegramConfig {
 
 fn default_stuck_after() -> u64 {
     4 * 3600
+}
+
+fn default_stalled_after() -> u64 {
+    2 * 3600
 }
 
 fn default_digest_at() -> Option<NaiveTime> {
@@ -213,6 +223,7 @@ impl Default for TelegramConfig {
             chat_id: None,
             api_base: default_telegram_api(),
             stuck_after_secs: default_stuck_after(),
+            stalled_after_secs: default_stalled_after(),
             digest_at: default_digest_at(),
             utc_offset: utc(),
         }
@@ -244,6 +255,7 @@ impl fmt::Debug for TelegramConfig {
             .field("chat_id", &self.chat_id)
             .field("api_base", &self.api_base)
             .field("stuck_after_secs", &self.stuck_after_secs)
+            .field("stalled_after_secs", &self.stalled_after_secs)
             .field("digest_at", &self.digest_at)
             .field("utc_offset", &self.utc_offset)
             .finish()
@@ -462,17 +474,24 @@ mod tests {
         let paired = paired.telegram.unwrap();
         assert_eq!(paired.chat_id, None);
         assert_eq!(paired.stuck_after_secs, 4 * 3600);
+        assert_eq!(paired.stalled_after_secs, 2 * 3600);
         assert_eq!(paired.digest_at, NaiveTime::from_hms_opt(9, 0, 0));
         assert_eq!(paired.utc_offset, FixedOffset::east_opt(0).unwrap());
         let alerts = ServerConfig::from_toml(
-            "db = \"b\"\n[telegram]\nstuck_after_secs = 0\ndigest_at = \"off\"\nutc_offset = \"+08:00\"",
+            "db = \"b\"\n[telegram]\nstuck_after_secs = 0\nstalled_after_secs = 0\n\
+             digest_at = \"off\"\nutc_offset = \"+08:00\"",
         )
         .unwrap()
         .telegram
         .unwrap();
         assert_eq!(
-            (alerts.stuck_after_secs, alerts.digest_at, alerts.utc_offset),
-            (0, None, FixedOffset::east_opt(8 * 3600).unwrap())
+            (
+                alerts.stuck_after_secs,
+                alerts.stalled_after_secs,
+                alerts.digest_at,
+                alerts.utc_offset
+            ),
+            (0, 0, None, FixedOffset::east_opt(8 * 3600).unwrap())
         );
         let at = ServerConfig::from_toml("db = \"b\"\n[telegram]\ndigest_at = \"18:30\"").unwrap();
         assert_eq!(

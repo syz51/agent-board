@@ -207,7 +207,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
-| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
+| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
@@ -430,6 +430,20 @@ settings in use, warned once per edit.
     limit wait until the reset (or, without an end time, until it resumes), since that
     pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
+  - *Stalled board*: a board is stalled while it is active, has autopilot on, has no task
+    in `doing` and has a ready auto task. Each check records when it first saw a board
+    stalled. A board that stops being stalled, or where a task moved into or out of
+    `doing` since then (claim, take, release, done, or a status change from or to
+    `doing`), starts over. A board that stays stalled for `[telegram] stalled_after_secs`
+    (default 2 hours) is reported once. So work that became claimable by any route
+    (autopilot switched on, a board resumed, a blocker done, a pause over) gives a
+    coordinator the whole threshold to claim it. The message names the board, its ready
+    auto count, since when it stalled, and the state and last-seen time of the coordinator
+    that holds its lease, or that none does, with a link. Boards found at one check share
+    one message; those past its length go in the next check's message. A board is
+    reported again only once it stalls anew. Boards whose lease holder is paused on a
+    usage limit are not stalled, as for stuck tasks. This catches a stopped coordinator or
+    device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
     after local midnight, one message lists the Needs you items by board,
@@ -437,11 +451,13 @@ settings in use, warned once per edit.
     not closed, that are blocked or that are open, not auto, not a proposal, not a
     feedback item and past any `not_before`. It adds how many tasks were done since the
     user last marked updates seen. Nothing is sent when every list is empty.
-  - The sent state is stored (`telegram_stuck`, `telegram_digest`) after each send, so a
-    restart repeats neither, and an alert that cannot be sent, or is cut off by shutdown,
-    is tried again at the next check; a crash between a send and its record repeats that
-    alert once. Nothing is recorded while no chat is paired, and pairing a new chat
-    forgets what was sent to the old one. With both alerts off, nothing is checked.
+  - The sent state is stored (`telegram_stuck`, `telegram_stalled`, `telegram_digest`)
+    after each send, so a restart repeats none, and an alert that cannot be sent, or is
+    cut off by shutdown, is tried again at the next check; a crash between a send and its
+    record repeats that alert once. Nothing is checked or recorded while no chat is
+    paired, so a stalled board's clock starts at the first check with a chat. Pairing a
+    new chat forgets what was sent to the old one. With all three alerts off, nothing is
+    checked.
 - **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
   switches and coordinator state; a board's tasks by status; task detail with notes,
   evidence and history; agents with their state, current task and handoff; a **Needs you**

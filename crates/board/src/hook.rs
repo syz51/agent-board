@@ -859,7 +859,11 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let mut lines = Vec::new();
         for touches in &self.touches {
-            let result = self.client.touches(touches).await?;
+            let mut result = self.client.touches(touches).await?;
+            // Every call reports every overlap; each is shown once per peer change.
+            result
+                .overlaps
+                .retain(|o| self.local.first_sight(o, self.now));
             lines.extend(render::overlaps(&result));
         }
         if heartbeat_due(self.local.last_heartbeat, self.now) {
