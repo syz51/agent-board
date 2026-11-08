@@ -1765,6 +1765,16 @@ fn over_long_text_fails_before_any_request() {
             &args[..2],
             stderr(&out)
         );
+        // It went on to the server, and no refusal was recorded. `add` resolves the board
+        // first, which the stub does not answer, so only some commands reach their POST.
+        let sent = e.stub.requests();
+        assert!(!sent.is_empty(), "{:?}: nothing was sent", &args[..2]);
+        assert!(
+            sent.iter().all(|r| r.path != "/v1/errors"),
+            "{:?}",
+            &args[..2]
+        );
+        e.stub.clear();
     }
 }
 

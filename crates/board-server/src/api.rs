@@ -284,7 +284,7 @@ async fn put_handoff(
     let id: AgentId = parse_path(&id)?;
     caller.act_as(&id)?;
     let s = state.settings();
-    agents::validate_handoff(&req, s.handoff_now_chars, s.handoff_field_chars)?;
+    agents::validate_handoff(&req, s.handoff_now_max(), s.handoff_field_chars)?;
     Ok(Json(
         state
             .write(move |cx| agents::put_handoff(cx, &id, req))

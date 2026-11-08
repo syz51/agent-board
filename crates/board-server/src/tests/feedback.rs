@@ -977,6 +977,12 @@ async fn reports_are_validated() {
     assert_eq!(title.chars().count(), 80);
     assert!(title.ends_with('…'));
     assert_eq!(filed["task"]["feedback"]["source"], "capture");
+    // The signature keeps the first 72 characters, as before titles took 80, so reports
+    // after the change join items filed before it.
+    assert_eq!(
+        filed["task"]["feedback"]["signature"],
+        format!("board:{}w…", "word ".repeat(14))
+    );
     // A bare carriage return ends the title.
     let filed = report(
         &t,

@@ -233,9 +233,9 @@ agents otherwise learn only from a refusal):
 
 Every string parameter declares a `maxLength` equal to the server's default limit (title
 80, note 800, handoff `now` 400, handoff `next` and `blockers` 300, question 1,500, done
-summary 800, body 4,000 characters, and so on), and each tool's description states the
-limits of its own text arguments, so an agent does not guess one tool's limit from
-another's. A runtime can refuse an oversized argument before the call; a server configured
+summary 800, body 4,000 characters, and so on). The tools that take a title, note,
+question, handoff or done summary also state that limit in their description, so an agent
+does not guess one tool's limit from another's. A runtime can refuse an oversized argument before the call; a server configured
 with other limits still checks its own. Every input schema sets `additionalProperties: false`, and
 `board mcp` refuses a call with an argument its tool does not declare, before anything is
 sent: the error names the unknown arguments, lists the accepted ones and says to call

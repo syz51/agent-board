@@ -97,7 +97,7 @@ pub(crate) fn validate_create(
             check_line("signature", sig, FEEDBACK_SIGNATURE_MAX)?;
             sig.to_owned()
         }
-        None => derived_signature(&about, &title),
+        None => derived_signature(&about, &cut(&first, SIGNATURE_TITLE_CHARS)),
     };
     Ok(Report {
         about,
@@ -109,6 +109,12 @@ pub(crate) fn validate_create(
         reporter,
     })
 }
+
+/// How much of a report's first line its derived signature keeps: the title limit when
+/// signatures were first derived. Fixed, so a changed `title_chars` leaves the signatures
+/// of filed items matching new reports, and `about` (40) with it stays within
+/// `FEEDBACK_SIGNATURE_MAX`.
+const SIGNATURE_TITLE_CHARS: usize = 72;
 
 /// The signature of a report that names none: `about` and the title, lowercased, with
 /// ids and numbers normalized.
@@ -1213,8 +1219,8 @@ pub(crate) fn validate_client_error(req: ClientError, agent: AgentId) -> Result<
     if board_proto::TooLong::parse(&req.message).is_none() {
         return Err(invalid(
             "message is not a refusal of text over a limit",
-            "send the server's message for it, such as text is 501 characters; the limit \
-             is 500, for a field clients check (docs/API.md)",
+            "send the server's message for it, such as text is 801 characters; the limit \
+             is 800, for a field clients check (docs/API.md)",
         ));
     }
     Ok(ApiErrorSeen {

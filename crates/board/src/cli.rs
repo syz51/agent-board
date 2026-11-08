@@ -214,7 +214,7 @@ pub enum Command {
     },
     /// Show your handoff, or replace it with --now and --next.
     Handoff {
-        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_now_chars))]
+        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_now_max()))]
         now: Option<String>,
         #[arg(long, requires = "now", help = at_most("The first concrete action", limits().handoff_field_chars))]
         next: Option<String>,
@@ -769,7 +769,7 @@ impl Command {
                 blockers,
                 ..
             } => {
-                check_opt("now", now, l.handoff_now_chars)?;
+                check_opt("now", now, l.handoff_now_max())?;
                 check_opt("next", next, l.handoff_field_chars)?;
                 check_chars("blockers", blockers, l.handoff_field_chars)?;
             }

@@ -772,7 +772,7 @@ no nonce.
 | Idle temporary board closed after (`temporary_close_after_secs`) | 1 day |
 | Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
-| Text limits (`title_chars`, `note_chars`, `handoff_now_chars`, `handoff_field_chars`, `question_chars`, `body_chars`) | title 80, note 800, handoff `now` 400, handoff `next` and `blockers` 300, question 1,500, body 4,000 characters; outside settings, done summary 800, ask option 60 and evidence value 500. A blocked reason takes the note limit, an answer and a board title take the question and title limits |
+| Text limits (`title_chars`, `note_chars`, `handoff_now_chars`, `handoff_field_chars`, `question_chars`, `body_chars`) | title 80, note 800, handoff `now` 400 (or `handoff_field_chars` when larger), handoff `next` and `blockers` 300, question 1,500, body 4,000 characters; outside settings, done summary 800, ask option 60 and evidence value 500. A blocked reason takes the note limit, an answer and a board title take the question and title limits |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 | API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |

@@ -302,7 +302,8 @@ pub struct Settings {
     pub note_chars: usize,
     /// Handoff `next` and `blockers`.
     pub handoff_field_chars: usize,
-    /// Handoff `now`, which says where the work stands and runs longer than `next`.
+    /// Handoff `now`, which says where the work stands and runs longer than `next`; never
+    /// less than `handoff_field_chars` ([`Self::handoff_now_max`]).
     pub handoff_now_chars: usize,
     pub question_chars: usize,
     pub body_chars: usize,
@@ -428,6 +429,12 @@ impl Settings {
             ));
         }
         Ok(())
+    }
+
+    /// The handoff `now` limit: `handoff_now_chars`, or `handoff_field_chars` when that is
+    /// larger, so a config that raised the field limit before `now` had its own keeps it.
+    pub fn handoff_now_max(&self) -> usize {
+        self.handoff_now_chars.max(self.handoff_field_chars)
     }
 
     pub(crate) fn stale_ms(&self) -> i64 {
@@ -593,6 +600,7 @@ mod tests {
             "declined_reopen_reports",
             "declined_reopen_agents",
             "duplicate_ask_window_secs",
+            "handoff_now_chars",
         ] {
             assert!(
                 ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 0")).is_err(),
@@ -602,5 +610,18 @@ mod tests {
                 ServerConfig::from_toml(&format!("db = \"b\"\n[defaults]\n{name} = 60")).unwrap();
             assert_ne!(set.defaults, Settings::default(), "{name}");
         }
+    }
+
+    #[test]
+    fn handoff_now_takes_the_larger_of_its_limit_and_the_field_limit() {
+        assert_eq!(Settings::default().handoff_now_max(), 400);
+        let raised =
+            ServerConfig::from_toml("db = \"b\"\n[defaults]\nhandoff_field_chars = 600").unwrap();
+        assert_eq!(raised.defaults.handoff_now_max(), 600);
+        let own = ServerConfig::from_toml(
+            "db = \"b\"\n[defaults]\nhandoff_field_chars = 200\nhandoff_now_chars = 500",
+        )
+        .unwrap();
+        assert_eq!(own.defaults.handoff_now_max(), 500);
     }
 }

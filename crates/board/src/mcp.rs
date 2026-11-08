@@ -211,7 +211,10 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "title",
                     s(
-                        "Imperative title, at most 80 characters.",
+                        &format!(
+                            "Imperative title, at most {} characters.",
+                            limits().title_chars
+                        ),
                         limits().title_chars,
                     ),
                     true,
@@ -348,7 +351,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_done",
-        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks run (command and exit code), commits, PRs or artifacts; at least one. Add a summary (at most 800 characters) for the user, who reads it in the web view.",
+        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks, commits, PRs or artifacts; at least one. Add a summary (at most 800 characters) for the user, who reads it in the web view, apart from this chat.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -426,7 +429,7 @@ const TOOLS: &[ToolSpec] = &[
             vec![
                 (
                     "now",
-                    handoff_field("Where the work stands", limits().handoff_now_chars),
+                    handoff_field("Where the work stands", limits().handoff_now_max()),
                     true,
                 ),
                 (
@@ -1437,7 +1440,7 @@ mod tests {
             ("task_update", "title", l.title_chars),
             ("task_note", "text", l.note_chars),
             ("ask_user", "question", l.question_chars),
-            ("handoff_set", "now", l.handoff_now_chars),
+            ("handoff_set", "now", l.handoff_now_max()),
             ("handoff_set", "next", l.handoff_field_chars),
             ("handoff_set", "blockers", l.handoff_field_chars),
             ("task_done", "summary", SUMMARY_CHARS_MAX),
