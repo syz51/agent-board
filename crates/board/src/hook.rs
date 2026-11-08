@@ -30,16 +30,22 @@ use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failur
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
-use crate::state::{self, AgentLocal, DoneMark, ToolStart};
+use crate::state::{self, AgentLocal, DoneMark, SessionLocal, ThreadRead, ToolStart};
 use crate::t3::{T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
 const DELEGATED_THREAD: &str = "thread:delegated-task:";
 /// Where T3 tells its threads its CLI is.
 const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
-/// Time for asking T3 about the agent's thread (`t3 thread show`, about 0.2 seconds
-/// measured); past it the agent registers without its title, link or parent.
+/// Time for asking T3 about the agent's thread (`t3 thread show`, 0.2 to 0.7 seconds
+/// measured); past it the agent registers without its title, link or parent, and a
+/// background read ([`read_later`]) brings them to a later hook.
 const T3_BUDGET: Duration = Duration::from_millis(400);
+/// Time a background read gives `t3 thread show`.
+const READ_LATER_BUDGET: Duration = Duration::from_secs(30);
+/// A session starts a background read at most this often, so two never run at once.
+/// Longer than [`READ_LATER_BUDGET`].
+const READ_LATER_EVERY: Duration = Duration::from_secs(45);
 /// A `Stop` asks T3 for the thread's title at the session's first `Stop`, then at most this
 /// often: T3 renames a thread after its first turn, and the user may rename it later.
 const TITLE_REFRESH: Duration = Duration::from_secs(3600);
@@ -205,14 +211,15 @@ struct Hook<'a> {
     local: AgentLocal,
     /// At `PostToolUse`, the files to report, in batches the server takes.
     touches: Vec<Touches>,
-    /// At `SessionStart`, what T3 says of this agent's thread; at `Stop`, the same when
-    /// its title or link changed since the hook registered them.
+    /// At `SessionStart`, what T3 says of this agent's thread; at `Stop`,
+    /// `UserPromptSubmit` and a `PostToolUse` with a heartbeat, the same when its title,
+    /// link or parent changed since the hooks registered them.
     t3: Option<SeenThread>,
     /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
     done_reminder: Option<String>,
     now: Timestamp,
-    /// Shortly before the hook's server share runs out: what a `Stop` may still spend
-    /// registering a renamed thread.
+    /// Shortly before the hook's server share runs out: what a hook may still spend
+    /// registering the thread again ([`Hook::register_again`]).
     deadline: tokio::time::Instant,
 }
 
@@ -326,15 +333,24 @@ async fn handle(
         _ if nested || !t3_identity_applies(explicit_agent, env) => None,
         // A hook that skips the server registers nothing, so T3's answer would go unused.
         _ if breaker.open_at(now).is_some() => None,
-        HookEvent::SessionStart => thread_at_start(&home, runtime, session).await,
+        HookEvent::SessionStart => thread_at_start(&home, runtime, session, now).await,
         HookEvent::Stop => thread_renamed(&home, runtime, session, now).await,
+        // Mid-session, only what a background read found ([`read_later`]): at each prompt,
+        // and with a tool call's heartbeat, so a registration that keeps failing costs a
+        // tool call no more than the heartbeat does.
+        HookEvent::UserPromptSubmit => thread_read_later(&home, runtime, session, now),
+        HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            if heartbeat_due(local.last_heartbeat, now) =>
+        {
+            thread_read_later(&home, runtime, session, now)
+        }
         _ => None,
     };
     steps.mark("t3");
-    // A Stop that registers a new title registers where the agent runs too.
-    let renamed = event == HookEvent::Stop && t3.is_some();
+    // A later hook that registers the thread's title registers where the agent runs too.
+    let reregister = event != HookEvent::SessionStart && t3.is_some();
     let repo = if event == HookEvent::SessionStart
-        || renamed
+        || reregister
         || !edited.is_empty()
         || shell_start.is_some()
     {
@@ -626,8 +642,11 @@ async fn nested_session(
         && let Some(session) = session
         && let Some(cached) = state::load_session(home, runtime, session)
     {
-        if event == HookEvent::SessionEnd {
-            state::remove_session(home, runtime, session)?;
+        // The agent is marked ended whether or not its files go.
+        if event == HookEvent::SessionEnd
+            && let Err(err) = state::remove_session(home, runtime, session)
+        {
+            tracing::warn!("forgetting session {session}: {err:#}");
         }
         return Ok(cached.nested);
     }
@@ -665,6 +684,28 @@ fn input_cwd(input: &Value) -> PathBuf {
 struct SeenThread {
     id: String,
     facts: ThreadFacts,
+    from: Source,
+}
+
+/// Where the hook got a thread's facts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Source {
+    /// The session's cache: what the hooks registered before.
+    Cache,
+    /// T3, asked by this hook at this time.
+    Asked(Timestamp),
+    /// A background read ([`read_later`]) that asked T3 at this time.
+    Read(Timestamp),
+}
+
+impl Source {
+    /// When T3 gave the facts; `None` for the cache.
+    fn at(self) -> Option<Timestamp> {
+        match self {
+            Self::Cache => None,
+            Self::Asked(at) | Self::Read(at) => Some(at),
+        }
+    }
 }
 
 /// The T3 thread id this process runs in, when T3 set one.
@@ -673,39 +714,129 @@ fn t3_thread_id() -> Option<String> {
     Some(thread.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
+/// What the hooks registered for `thread`, as the session's cache keeps it; nothing when
+/// they registered another thread, or none.
+fn registered(cached: &SessionLocal, thread: &str) -> ThreadFacts {
+    if cached.t3_thread.as_deref() != Some(thread) {
+        return ThreadFacts::default();
+    }
+    ThreadFacts {
+        parent: cached.t3_parent.clone(),
+        title: cached.t3_title.clone(),
+        link: cached.t3_link.clone(),
+    }
+}
+
+/// Whether a background read for this session may be running: one started less than
+/// [`READ_LATER_EVERY`] ago. Asking T3 again meanwhile would only wait out the budget.
+fn reading(cached: &SessionLocal, now: Timestamp) -> bool {
+    !due(cached.thread_read_at, now, READ_LATER_EVERY)
+}
+
 /// What T3 says of this session's thread at `SessionStart`: from the session's cache once
-/// the hooks registered it, else asked of T3. The parent is kept only for a thread T3
-/// started for a parent's `delegate_task`. `None` outside T3 or when T3 does not answer in
-/// time; a later `SessionStart` asks again.
+/// the hooks registered it, else from a background read that finished
+/// ([`thread_read_later`]), else asked of T3, unless a background read is running. The
+/// parent is kept only for a thread T3 started for a parent's `delegate_task`. `None`
+/// outside T3 or when T3 does not answer in time; then a background read brings the answer
+/// to a later hook.
 async fn thread_at_start(
     home: &Home,
     runtime: Runtime,
     session: Option<&str>,
+    now: Timestamp,
 ) -> Option<SeenThread> {
     let id = t3_thread_id()?;
-    let cached = session.and_then(|s| state::load_session(home, runtime, s));
-    if let Some(cached) = cached.filter(|c| c.t3_thread.as_deref() == Some(id.as_str())) {
-        let facts = ThreadFacts {
-            parent: cached.t3_parent,
-            title: cached.t3_title,
-            link: cached.t3_link,
-        };
-        return Some(SeenThread { id, facts });
+    let mut cached = session
+        .and_then(|s| state::load_session(home, runtime, s))
+        .unwrap_or_default();
+    if cached.t3_thread.as_deref() == Some(id.as_str()) {
+        let facts = registered(&cached, &id);
+        return Some(SeenThread {
+            id,
+            facts,
+            from: Source::Cache,
+        });
     }
-    let mut facts = ask_t3(home, &id).await?;
+    if let Some(seen) = thread_read_later(home, runtime, session, now) {
+        return Some(seen);
+    }
+    if reading(&cached, now) {
+        return None;
+    }
+    let mut facts = match ask_t3(home, &id).await {
+        Ok(facts) => facts?,
+        Err(Late) => {
+            if let Some(session) = session
+                && read_later(home, runtime, session, &mut cached, &id, now) == ReadLater::Started
+                && let Err(err) = state::save_session(home, runtime, session, &cached)
+            {
+                tracing::debug!("recording the background read: {err:#}");
+            }
+            return None;
+        }
+    };
     if !id.starts_with(DELEGATED_THREAD) {
         facts.parent = None;
     }
-    Some(SeenThread { id, facts })
+    Some(SeenThread {
+        id,
+        facts,
+        from: Source::Asked(now),
+    })
 }
 
-/// At `Stop`, when a title check is due ([`title_check_due`]): what T3 says of this
+/// A background read of this session's thread that finished ([`read_later`]), when it
+/// tells something the hooks have not registered: a title, link or parent. One that tells
+/// nothing new, asked T3 before the registered facts were read, is over an hour old or was
+/// of another thread is dropped. Runs at each hook that may register it, so it only reads
+/// files.
+fn thread_read_later(
+    home: &Home,
+    runtime: Runtime,
+    session: Option<&str>,
+    now: Timestamp,
+) -> Option<SeenThread> {
+    let id = t3_thread_id()?;
+    let session = session?;
+    let read = state::load_thread_read(home, runtime, session)?;
+    let cached = state::load_session(home, runtime, session).unwrap_or_default();
+    let had = registered(&cached, &id);
+    let mut facts = ThreadFacts {
+        parent: read.parent,
+        title: read.title,
+        link: read.link,
+    };
+    if !id.starts_with(DELEGATED_THREAD) {
+        facts.parent = None;
+    }
+    let older = cached.t3_thread.as_deref() == Some(id.as_str())
+        && cached.t3_facts_at.is_some_and(|at| at >= read.at);
+    let new_parent = facts.parent.is_some() && facts.parent != had.parent;
+    let news = new_parent || thread_changed(had.title.as_deref(), had.link.as_deref(), &facts);
+    if read.thread != id || older || due(Some(read.at), now, TITLE_REFRESH) || !news {
+        if let Err(err) = state::remove_thread_read(home, runtime, session) {
+            tracing::debug!("dropping the thread read: {err:#}");
+        }
+        return None;
+    }
+    facts.parent = facts.parent.or(had.parent);
+    Some(SeenThread {
+        id,
+        facts,
+        from: Source::Read(read.at),
+    })
+}
+
+/// At `Stop`: when a title check is due ([`title_check_due`]), what T3 says of this
 /// session's thread, when its title or link differs from what the hooks registered
-/// ([`thread_changed`]). A check that finds no change, or no answer, counts as done, so a
-/// slow T3 costs one `Stop` an hour; a change counts once the server took it
-/// ([`Hook::register`]), so a failed registration is tried again at the next `Stop`.
-/// `None` without a session cache, which `SessionStart` (or the session's first hook)
-/// writes.
+/// ([`thread_changed`]); else, or when T3 is too slow, what a finished background read
+/// found ([`thread_read_later`]). A due check is asked first, since a read may predate a
+/// rename. A check that finds no change or no answer, or that started a background read
+/// (which brings its answer to a later hook), counts as done, so a slow T3 costs one `Stop`
+/// an hour. While an earlier read runs, the check stays due without asking. A change
+/// counts once the server took it ([`Hook::register`]), so a failed registration is tried
+/// again at the next `Stop`. `None` without a session cache, which `SessionStart` (or the
+/// session's first hook) writes.
 async fn thread_renamed(
     home: &Home,
     runtime: Runtime,
@@ -715,25 +846,32 @@ async fn thread_renamed(
     let id = t3_thread_id()?;
     let session = session?;
     let mut cached = state::load_session(home, runtime, session)?;
-    if !title_check_due(cached.title_checked_at, now) {
-        return None;
+    if !title_check_due(cached.title_checked_at, now) || reading(&cached, now) {
+        return thread_read_later(home, runtime, Some(session), now);
     }
-    // What was registered for another thread, or never, says nothing of this one.
-    let same = cached.t3_thread.as_deref() == Some(id.as_str());
-    let (parent, title, link) = if same {
-        (
-            cached.t3_parent.clone(),
-            cached.t3_title.clone(),
-            cached.t3_link.clone(),
-        )
-    } else {
-        (None, None, None)
+    let had = registered(&cached, &id);
+    let read = match ask_t3(home, &id).await {
+        Ok(read) => read,
+        Err(Late) => {
+            // Running only when another hook started one meanwhile: the check stays due.
+            if read_later(home, runtime, session, &mut cached, &id, now) != ReadLater::Running {
+                cached.title_checked_at = Some(now);
+                if let Err(err) = state::save_session(home, runtime, session, &cached) {
+                    tracing::debug!("recording the title check: {err:#}");
+                }
+            }
+            return thread_read_later(home, runtime, Some(session), now);
+        }
     };
-    let read = ask_t3(home, &id).await;
     let mut facts = match read {
-        Some(facts) if thread_changed(title.as_deref(), link.as_deref(), &facts) => facts,
+        Some(facts) if thread_changed(had.title.as_deref(), had.link.as_deref(), &facts) => facts,
         _ => {
             cached.title_checked_at = Some(now);
+            // An unchanged answer confirms the registered facts, so a read that asked
+            // before it is older news.
+            if read.is_some() && cached.t3_thread.as_deref() == Some(id.as_str()) {
+                cached.t3_facts_at = Some(now);
+            }
             if let Err(err) = state::save_session(home, runtime, session, &cached) {
                 tracing::debug!("recording the title check: {err:#}");
             }
@@ -745,8 +883,12 @@ async fn thread_renamed(
     if !id.starts_with(DELEGATED_THREAD) {
         facts.parent = None;
     }
-    facts.parent = facts.parent.or(parent);
-    Some(SeenThread { id, facts })
+    facts.parent = facts.parent.or(had.parent);
+    Some(SeenThread {
+        id,
+        facts,
+        from: Source::Asked(now),
+    })
 }
 
 /// Whether T3's answer has a title or link other than the ones registered. A field T3 left
@@ -763,24 +905,144 @@ pub fn title_check_due(last: Option<Timestamp>, now: Timestamp) -> bool {
     due(last, now, TITLE_REFRESH)
 }
 
-/// Asks T3 about `thread` within [`T3_BUDGET`], with the `t3` this thread's T3 names, else
-/// the configured one. `None` when T3 does not know the thread, fails or is too slow.
-async fn ask_t3(home: &Home, thread: &str) -> Option<ThreadFacts> {
+/// The `t3` this thread's T3 names, else the configured one.
+fn t3_cli(home: &Home) -> T3Cli {
     let bin = std::env::var_os(T3_CLI_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| Config::load(home).ok()?.t3_bin);
-    let t3 = T3Cli::locate(bin.as_deref());
-    match tokio::time::timeout(T3_BUDGET, t3.thread_facts(thread)).await {
-        Ok(Ok(facts)) => facts,
+    T3Cli::locate(bin.as_deref())
+}
+
+/// T3 did not answer within [`T3_BUDGET`].
+struct Late;
+
+/// Asks T3 about `thread` within [`T3_BUDGET`]. `Ok(None)` when T3 does not know the
+/// thread or fails.
+async fn ask_t3(home: &Home, thread: &str) -> Result<Option<ThreadFacts>, Late> {
+    match tokio::time::timeout(T3_BUDGET, t3_cli(home).thread_facts(thread)).await {
+        Ok(Ok(facts)) => Ok(facts),
         Ok(Err(err)) => {
             tracing::debug!("thread {thread}: {err:#}");
-            None
+            Ok(None)
         }
-        Err(_) => {
-            tracing::debug!("thread {thread}: over budget");
-            None
+        Err(_) => Err(Late),
+    }
+}
+
+/// What [`read_later`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadLater {
+    Started,
+    /// One started less than [`READ_LATER_EVERY`] ago may still run.
+    Running,
+    /// `board read-thread` did not start.
+    Failed,
+}
+
+/// Where `board read-thread` writes what goes wrong, in `$BOARD_HOME/state`: its errors
+/// would be lost otherwise, since it runs with no terminal or runtime to read them.
+pub const READ_LOG: &str = "read-thread.log";
+/// The log starts over once it is this long.
+const READ_LOG_BYTES_MAX: u64 = 256 * 1024;
+
+/// T3 answered too slowly for the hook: starts `board read-thread` on its own, which gives
+/// `t3 thread show` [`READ_LATER_BUDGET`] and leaves the answer in the session's state for
+/// its next hooks ([`thread_read_later`]): `UserPromptSubmit`, `PostToolUse` or `Stop`. At
+/// most once per [`READ_LATER_EVERY`]; the session's first is logged at info level. `local`
+/// records the start, and the caller saves it.
+fn read_later(
+    home: &Home,
+    runtime: Runtime,
+    session: &str,
+    local: &mut SessionLocal,
+    thread: &str,
+    now: Timestamp,
+) -> ReadLater {
+    if reading(local, now) {
+        tracing::debug!("thread {thread}: over budget; a background read started lately");
+        return ReadLater::Running;
+    }
+    let mut command = tokio::process::Command::new(current_exe());
+    command
+        .args([
+            "read-thread",
+            "--runtime",
+            state::runtime_name(runtime),
+            "--",
+            session,
+            thread,
+        ])
+        .env("BOARD_HOME", home.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(read_log(home));
+    // Its own process group, so a runtime that stops the hook's group spares it.
+    #[cfg(unix)]
+    command.process_group(0);
+    // Not waited for: it outlives the hook, and dropping it neither kills nor blocks.
+    if let Err(err) = command.spawn() {
+        tracing::warn!("thread {thread}: starting a background read: {err:#}");
+        return ReadLater::Failed;
+    }
+    if local.thread_read_at.is_none() {
+        tracing::info!(
+            "thread {thread}: t3 thread show took over {T3_BUDGET:?}; reading it in the background for a later hook"
+        );
+    } else {
+        tracing::debug!("thread {thread}: over budget; reading it in the background again");
+    }
+    local.thread_read_at = Some(now);
+    ReadLater::Started
+}
+
+/// [`READ_LOG`] to append to, started over once it reached [`READ_LOG_BYTES_MAX`]; no
+/// output when it cannot be opened.
+fn read_log(home: &Home) -> std::process::Stdio {
+    let path = home.state_dir().join(READ_LOG);
+    let long = std::fs::metadata(&path).is_ok_and(|m| m.len() >= READ_LOG_BYTES_MAX);
+    let open = std::fs::create_dir_all(home.state_dir()).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(!long)
+            .write(true)
+            .truncate(long)
+            .open(&path)
+    });
+    match open {
+        Ok(file) => file.into(),
+        Err(err) => {
+            tracing::debug!("opening {}: {err:#}", path.display());
+            std::process::Stdio::null()
         }
+    }
+}
+
+/// `board read-thread`: reads `thread` within [`READ_LATER_BUDGET`] and keeps T3's answer,
+/// with the time it asked, for the session's next hooks. Errors go to its log
+/// ([`READ_LOG`]), never to the caller: a later hook reads again.
+pub async fn read_thread(runtime: Runtime, session: &str, thread: &str) {
+    let read = async {
+        let home = Home::from_env()?;
+        let at = Utc::now();
+        let facts = tokio::time::timeout(READ_LATER_BUDGET, t3_cli(&home).thread_facts(thread))
+            .await
+            .map_err(|_| anyhow::anyhow!("no answer within {READ_LATER_BUDGET:?}"))??;
+        let Some(facts) = facts else {
+            tracing::debug!("thread {thread}: T3 does not know it");
+            return Ok(());
+        };
+        let read = ThreadRead {
+            thread: thread.to_owned(),
+            at,
+            parent: facts.parent,
+            title: facts.title,
+            link: facts.link,
+        };
+        state::save_thread_read(&home, runtime, session, &read)
+    };
+    if let Err(err) = read.await {
+        tracing::warn!("reading thread {thread}: {err:#}");
     }
 }
 
@@ -793,11 +1055,19 @@ impl Hook<'_> {
     async fn online(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
         match self.event {
             HookEvent::SessionStart => self.session_start(repo).await,
-            HookEvent::UserPromptSubmit => self.user_prompt_submit().await,
+            HookEvent::UserPromptSubmit => {
+                let reply = self.user_prompt_submit().await?;
+                self.register_again(repo.as_ref()).await;
+                Ok(reply)
+            }
             // Handled before login (`handle`).
             HookEvent::PreToolUse => Ok(Reply::Nothing),
             // A failed shell command may still have changed files.
-            HookEvent::PostToolUse | HookEvent::PostToolUseFailure => self.post_tool_use().await,
+            HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
+                let reply = self.post_tool_use().await?;
+                self.register_again(repo.as_ref()).await;
+                Ok(reply)
+            }
             HookEvent::Stop => self.stop(repo).await,
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
@@ -998,11 +1268,23 @@ impl Hook<'_> {
             if seen.facts.link.is_some() {
                 local.t3_link = seen.facts.link.clone();
             }
-            if self.event == HookEvent::Stop {
+            // Only a check this `Stop` asked counts: a background read may predate a rename.
+            if self.event == HookEvent::Stop && matches!(seen.from, Source::Asked(_)) {
                 local.title_checked_at = Some(self.now);
+            }
+            if let Some(at) = seen.from.at() {
+                local.t3_facts_at = Some(at);
             }
             if let Err(err) = state::save_session(&self.home, self.runtime, session, &local) {
                 tracing::debug!("caching the thread's title and link: {err:#}");
+            }
+            // A background read waiting that asked T3 no later than these facts is spent.
+            if let Some(at) = seen.from.at()
+                && state::load_thread_read(&self.home, self.runtime, session)
+                    .is_some_and(|read| read.at <= at)
+                && let Err(err) = state::remove_thread_read(&self.home, self.runtime, session)
+            {
+                tracing::debug!("dropping the registered thread read: {err:#}");
             }
         }
         Ok(())
@@ -1130,27 +1412,40 @@ impl Hook<'_> {
                 Reply::Block(text.join("\n"))
             }
         };
-        if let Some(repo) = &repo {
-            self.register_renamed(repo).await;
-        }
+        self.register_again(repo.as_ref()).await;
         Ok(reply)
     }
 
-    /// T3 renamed the thread: registers it again, last and in the time left, then marks it
-    /// idle again, since registering marks it running. Rare (about once a thread). A failure
-    /// is logged and the next `Stop` tries again; one that cuts off between the two requests
-    /// leaves the agent marked running until its next hook.
-    async fn register_renamed(&self, repo: &RepoInfo) {
-        if self.t3.is_none() {
+    /// T3 renamed the thread, or a background read found its title, link or parent:
+    /// registers it again, last and in the time left; at `Stop`, then marks it idle again,
+    /// since registering marks it running (mid-turn it is running anyway). Rare (about
+    /// twice a thread). A failure is logged and the next such hook tries again, except that
+    /// a read the server refuses as invalid is dropped; one that cuts off between the two
+    /// requests leaves the agent marked running until its next hook.
+    async fn register_again(&self, repo: Option<&RepoInfo>) {
+        let (Some(repo), Some(_)) = (repo, &self.t3) else {
             return;
-        }
+        };
         let again = async {
             self.register(repo).await?;
-            self.set_state(AgentState::Idle, None).await
+            if self.event == HookEvent::Stop {
+                self.set_state(AgentState::Idle, None).await?;
+            }
+            Ok::<_, anyhow::Error>(())
         };
         match tokio::time::timeout_at(self.deadline, again).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::debug!("registering the thread's new title: {err:#}"),
+            Ok(Err(err)) => {
+                tracing::debug!("registering the thread's new title: {err:#}");
+                // The server refuses what the read found: trying again would not help.
+                if crate::client::error_code(&err) == Some(board_proto::ErrorCode::Invalid)
+                    && matches!(self.t3.as_ref().map(|t| t.from), Some(Source::Read(_)))
+                    && let Some(session) = self.input["session_id"].as_str()
+                    && let Err(err) = state::remove_thread_read(&self.home, self.runtime, session)
+                {
+                    tracing::debug!("dropping the refused thread read: {err:#}");
+                }
+            }
             Err(_) => tracing::debug!("registering the thread's new title: out of time"),
         }
     }
