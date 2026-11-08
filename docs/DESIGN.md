@@ -254,6 +254,13 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
+  of the standing prompt it briefed the thread with. When `board` is upgraded and the
+  compiled prompt changes, the next reconcile sends each live coordinator one message with
+  the new prompt in full (with the triage prompt on the feedback board), then records the
+  new digest. It holds the message while the coordinator runs or is paused, so it lands
+  between turns, and tries a failed send again at the next reconcile. A record without a
+  digest, from before this rule, counts as changed, so it is briefed once.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live

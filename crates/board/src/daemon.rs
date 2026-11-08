@@ -422,6 +422,10 @@ pub struct Coordinator {
     /// Whether the thread's agent is registered; false right after the thread started.
     #[serde(default = "registered_default")]
     pub registered: bool,
+    /// [`prompt_digest`] of the standing prompt the thread was last briefed with. A record
+    /// without it predates the field, so its prompt counts as changed and is sent once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub briefed: Option<String>,
 }
 
 /// Records written before this field existed were registered before they were saved.
@@ -866,8 +870,39 @@ impl<T: T3> Daemon<T> {
                 .await?;
             local.resumed_after = Some(until);
         }
+        self.rebrief(&board.slug, &mut local, info.state).await;
         self.state.coordinators.insert(board.slug.clone(), local);
         Ok(())
+    }
+
+    /// Sends a live coordinator the standing prompt again when it changed since the thread
+    /// was briefed (`board` was upgraded), once. Held while the coordinator runs or is
+    /// paused, so it lands between turns; a failed send is tried at the next reconcile.
+    async fn rebrief(&self, slug: &BoardSlug, local: &mut Coordinator, state: AgentState) {
+        let triage = self.triages(slug);
+        let digest = prompt_digest(triage);
+        if local.briefed.as_deref() == Some(digest.as_str())
+            || matches!(state, AgentState::Running | AgentState::Paused)
+        {
+            return;
+        }
+        match self
+            .t3
+            .send(&local.thread, &rebrief_message(slug, triage))
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "re-briefed {} of {slug}: its standing prompt changed",
+                    local.agent
+                );
+                local.briefed = Some(digest);
+            }
+            Err(err) => tracing::warn!(
+                "re-briefing {} of {slug}: {err:#}; retrying at the next reconcile",
+                local.agent
+            ),
+        }
     }
 
     /// Names a live thread of ours the board's coordinator: registers its agent when that
@@ -1011,6 +1046,7 @@ impl<T: T3> Daemon<T> {
             renewed_at: now,
             resumed_after: None,
             registered: false,
+            briefed: Some(prompt_digest(self.triages(slug))),
         };
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -1155,6 +1191,7 @@ impl<T: T3> Daemon<T> {
             renewed_at: now,
             resumed_after: None,
             registered,
+            briefed: Some(prompt_digest(self.triages(slug))),
         };
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -1978,6 +2015,24 @@ fn standing_prompt(triage: bool) -> String {
     } else {
         COORDINATOR_PROMPT.to_owned()
     }
+}
+
+/// A digest of the standing prompt for `triage`, as hex: a coordinator briefed with another
+/// one gets [`rebrief_message`].
+pub fn prompt_digest(triage: bool) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(standing_prompt(triage).as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The message that gives a running coordinator its changed standing prompt in full.
+pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
+    format!(
+        "board {slug}: your standing instructions changed (board was upgraded). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot."
+    )
 }
 
 /// The first message of a coordinator thread; `triage` for the device's feedback board.
