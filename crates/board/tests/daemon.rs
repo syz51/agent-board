@@ -3273,10 +3273,14 @@ fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_the
         "(`t3_thread_launch` with its `projectId` and `workspaceStrategy: \"worktree\"`)",
         // T3 launches a thread only when the user asks for one.
         "this brief is the user's standing request for such a thread",
-        "Brief it the same way, and `task_note` its link on the task.",
+        // T3 drops a `prompt` key, so the thread would start idle.
+        "Put the brief in its `message`, not `prompt`: a `prompt` key is dropped and the thread starts idle.",
+        "Then check the result's `runId`; when it is null, no run started, so send the brief with `t3_thread_send`.",
+        "`task_note` the thread's link on the task.",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+    assert!(!prompt.contains("Brief it the same way"));
 }
 
 #[test]
