@@ -105,4 +105,16 @@ describe("a task's page", () => {
     expect(screen.queryByRole("region", { name: /^Subtasks/ })).toBeNull();
     expect(screen.queryByText("Subtask of")).toBeNull();
   });
+
+  test.each([
+    // A feedback task: Summary follows the Feedback section, so it keeps the section gap.
+    ["docs-3", "mt-7"],
+    // No feedback: Summary opens the main column with no gap.
+    ["factory-9", ""],
+  ])("on %s the Summary section has the class %p", async (id, className) => {
+    await renderRoute(`/tasks/${id}`, { seed: seed(id) });
+    const summary = await waitFor(() => screen.getByRole("region", { name: "Summary" }));
+    expect(summary.className).toBe(className);
+    expect(screen.queryByRole("region", { name: /^Feedback/ }) !== null).toBe(id === "docs-3");
+  });
 });
