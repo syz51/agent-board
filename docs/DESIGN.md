@@ -729,7 +729,11 @@ keeping untrusted text out of those channels, so:
   the end of `you`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with
-  `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
+  `->` and the action. Over the cap, it is cut from the bottom (recent, proposals, waiting,
+  ready, peers), except that the handoff is shortened before alerts go: first its
+  blockers, then `now` to 100 characters; then alerts, then `next` to 100 characters, then
+  the handoff, then the bottom of `mine`. A shortened handoff says `cut, board handoff
+  shows it whole` in its header (`cut: true` in `json` and `yaml`). **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
   most 1,000 per request that can concern it; the rest wait, counted in the first alert.
