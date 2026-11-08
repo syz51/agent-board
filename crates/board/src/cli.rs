@@ -255,6 +255,15 @@ pub enum Command {
         #[arg(long, value_enum)]
         runtime: RuntimeArg,
     },
+    /// Read a T3 thread's title, link and parent for a session's later hooks. The hooks
+    /// start it when T3 answers too slowly for them.
+    #[command(hide = true)]
+    ReadThread {
+        #[arg(long, value_enum)]
+        runtime: RuntimeArg,
+        session: String,
+        thread: String,
+    },
     /// Print or write runtime and service configuration.
     #[command(subcommand)]
     Install(crate::install::InstallCommand),
@@ -742,6 +751,14 @@ pub async fn run(cli: Cli) -> i32 {
             }
             return 0;
         }
+        Command::ReadThread {
+            runtime,
+            session,
+            thread,
+        } => {
+            crate::hook::read_thread(runtime.into(), &session, &thread).await;
+            return 0;
+        }
         Command::Serve { config } => {
             return report(serve(&config).await);
         }
@@ -1042,7 +1059,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             };
             ops::errors(&ctx()?, &q).await?
         }
-        Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
+        Command::Hook { .. }
+        | Command::ReadThread { .. }
+        | Command::Serve { .. }
+        | Command::Admin(_) => {
             unreachable!("handled in run")
         }
     };
