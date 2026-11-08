@@ -30,7 +30,6 @@ use board_proto::{BoardSlug, DeviceName};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub use api::CLIENT_ERROR_ROUTES;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig};
 pub use db::Db;

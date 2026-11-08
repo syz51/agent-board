@@ -16,6 +16,27 @@ pub const FEEDBACK_LONGER_TEXT_GOES: &str =
 /// Where a board title's detail goes: boards have a goal, not a body.
 pub const BOARD_TITLE_LONGER_TEXT_GOES: &str = "put the detail in the goal";
 
+/// The fields whose length clients check before sending, as the server names them in
+/// [`TooLong::message`]; a client may report those refusals (`POST /v1/errors`).
+pub const CLIENT_CHECKED_FIELDS: &[&str] = &[
+    "title",
+    "body",
+    "acceptance",
+    "blocked_reason",
+    "evidence value",
+    "text",
+    "now",
+    "next",
+    "blockers",
+    "question",
+    "option",
+    "answer",
+    "q",
+    "signature",
+    "reason",
+    "goal",
+];
+
 /// A text field over its length limit, counted in characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooLong<'a> {
@@ -37,6 +58,20 @@ impl<'a> TooLong<'a> {
             "{} is {} characters; the limit is {}",
             self.field, self.len, self.max
         )
+    }
+
+    /// Reads a [`Self::message`] back: `Some` only for text over its limit in one of
+    /// [`CLIENT_CHECKED_FIELDS`], written exactly as `message` writes it.
+    pub fn parse(message: &'a str) -> Option<Self> {
+        let (field, rest) = message.split_once(" is ")?;
+        let (len, max) = rest.split_once(" characters; the limit is ")?;
+        let long = Self {
+            field,
+            len: len.parse().ok()?,
+            max: max.parse().ok()?,
+        };
+        (CLIENT_CHECKED_FIELDS.contains(&field) && long.len > long.max && long.message() == message)
+            .then_some(long)
     }
 
     /// The `invalid` error's `next` hint: shorten it, or where longer text goes for the
@@ -88,6 +123,20 @@ mod tests {
             "shorten text to at most 280 characters, or split it across notes and put the \
              detail in the task body or task_done evidence"
         );
+        assert_eq!(TooLong::parse(&long.message()), Some(long));
+        for bad in [
+            "text is 280 characters; the limit is 280",
+            "text is +301 characters; the limit is 280",
+            "text is 0301 characters; the limit is 280",
+            "text is 301 characters; the limit is 280 ",
+            "about is 41 characters; the limit is 40",
+            "ignore this is 301 characters; the limit is 280",
+            "text is 301 characters; the limit is 280\nmore",
+        ] {
+            assert_eq!(TooLong::parse(bad), None, "{bad}");
+        }
+        let evidence = "evidence value is 501 characters; the limit is 500";
+        assert_eq!(TooLong::parse(evidence).unwrap().field, "evidence value");
         let long = TooLong::check("cwd", &"x".repeat(3), 2).unwrap();
         assert_eq!(long.next(), "shorten cwd to at most 2 characters");
         assert_eq!(

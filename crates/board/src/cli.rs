@@ -644,7 +644,10 @@ impl Command {
                 text,
                 ..
             } => {
-                check_chars("about", about, FEEDBACK_ABOUT_MAX)?;
+                // A plain error, not reported: the server answers an over-long about
+                // with `about "…" is not a setup name`, under another signature.
+                check_chars("about", about, FEEDBACK_ABOUT_MAX)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
                 check_opt("signature", signature, FEEDBACK_SIGNATURE_MAX)?;
                 ops::check_chars_or(
                     "text",
@@ -686,7 +689,12 @@ impl Command {
             Self::Update(_) => "PATCH /v1/tasks/{id}",
             Self::Done(_) => "POST /v1/tasks/{id}/done",
             Self::Note { .. } => "POST /v1/tasks/{id}/notes",
-            Self::Handoff { .. } => "PUT /v1/agents/{id}/handoff",
+            // Without both, it shows the handoff and sends no text.
+            Self::Handoff {
+                now: Some(_),
+                next: Some(_),
+                ..
+            } => "PUT /v1/agents/{id}/handoff",
             Self::Ask { .. } => "POST /v1/asks",
             Self::Answer { .. } => "POST /v1/asks/{id}/answer",
             Self::Errors { .. } => "GET /v1/errors",
@@ -795,9 +803,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
         if let (Some(refused), Some(route)) = (
             err.downcast_ref::<ops::Refused>(),
             cli.command.checked_route(),
-        ) && let Ok(ctx) = ctx()
-        {
-            report_refusal(&ctx, route, refused).await;
+        ) {
+            match ctx() {
+                Ok(ctx) => report_refusal(&ctx, route, refused).await,
+                Err(err) => tracing::debug!("not recording the refusal on the server: {err:#}"),
+            }
         }
         return Err(err);
     }
@@ -1122,15 +1132,29 @@ mod tests {
             &["board", "create", "factory", "--title", long],
             &["board", "update", "factory", "--goal", long],
         ];
+        let parse = |args: &[&str]| Cli::try_parse_from([&["board"][..], args].concat()).unwrap();
         for args in cases {
-            let cli = Cli::try_parse_from([&["board"][..], args].concat()).unwrap();
+            let cli = parse(args);
             let err = cli.command.check_text_limits().unwrap_err();
-            assert!(err.downcast_ref::<ops::Refused>().is_some(), "{args:?}");
+            let refused = err.downcast_ref::<ops::Refused>().unwrap();
+            assert!(
+                board_proto::TooLong::parse(&refused.message).is_some(),
+                "{args:?}: the server would refuse {refused}"
+            );
             let route = cli.command.checked_route().unwrap();
             assert!(
-                board_server::CLIENT_ERROR_ROUTES.contains(&route),
+                board_proto::CLIENT_ERROR_ROUTES.contains(&route),
                 "{args:?}: {route}"
             );
         }
+
+        // Not reported: a handoff that only shows, and an about the server refuses with
+        // another message.
+        let show = parse(&["handoff", "--blockers", long]);
+        assert!(show.command.check_text_limits().is_err());
+        assert_eq!(show.command.checked_route(), None);
+        let about = parse(&["feedback", "--about", long, "x"]);
+        let err = about.command.check_text_limits().unwrap_err();
+        assert!(err.downcast_ref::<ops::Refused>().is_none(), "{err}");
     }
 }

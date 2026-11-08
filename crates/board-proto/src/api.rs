@@ -212,10 +212,59 @@ pub struct ClientError {
     /// The route template the request would have gone to, such as
     /// `POST /v1/tasks/{id}/notes`.
     pub route: String,
-    /// The message the server would have answered, such as `text is 501 characters; the
-    /// limit is 500`.
+    /// The message the server would have answered for text over a limit, such as `text is
+    /// 501 characters; the limit is 500` ([`crate::TooLong::message`]), for one of
+    /// [`crate::CLIENT_CHECKED_FIELDS`].
     pub message: String,
 }
+
+/// The routes a client may name in `POST /v1/errors`: every `/v1` route but that one, as
+/// method and template (`docs/API.md`). The server's tests check that it routes each.
+pub const CLIENT_ERROR_ROUTES: &[&str] = &[
+    "POST /v1/agents",
+    "GET /v1/agents",
+    "GET /v1/agents/{id}",
+    "POST /v1/agents/{id}/state",
+    "GET /v1/agents/{id}/handoff",
+    "PUT /v1/agents/{id}/handoff",
+    "GET /v1/agents/{id}/said",
+    "GET /v1/updates",
+    "PUT /v1/updates/seen",
+    "GET /v1/boards",
+    "POST /v1/boards",
+    "GET /v1/boards/{slug}",
+    "PATCH /v1/boards/{slug}",
+    "DELETE /v1/boards/{slug}",
+    "POST /v1/boards/{slug}/join",
+    "POST /v1/boards/{slug}/coordinator",
+    "DELETE /v1/boards/{slug}/coordinator",
+    "GET /v1/stats",
+    "GET /v1/errors",
+    "GET /v1/tasks",
+    "POST /v1/tasks",
+    "GET /v1/tasks/{id}",
+    "PATCH /v1/tasks/{id}",
+    "POST /v1/tasks/{id}/claim",
+    "POST /v1/tasks/{id}/release",
+    "POST /v1/tasks/{id}/take",
+    "POST /v1/tasks/{id}/done",
+    "POST /v1/tasks/{id}/notes",
+    "POST /v1/leases",
+    "DELETE /v1/leases/{id}",
+    "POST /v1/touches",
+    "POST /v1/feedback",
+    "POST /v1/feedback/{id}/resolve",
+    "GET /v1/asks",
+    "POST /v1/asks",
+    "GET /v1/asks/{id}",
+    "POST /v1/asks/{id}/answer",
+    "POST /v1/asks/{id}/withdraw",
+    "GET /v1/snapshot",
+    "GET /v1/events",
+    "GET /v1/admin/devices",
+    "POST /v1/admin/devices",
+    "DELETE /v1/admin/devices/{name}",
+];
 
 /// Longest [`ClientError`] message, in characters.
 pub const CLIENT_ERROR_MESSAGE_CHARS_MAX: usize = 300;

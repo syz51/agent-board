@@ -208,10 +208,15 @@ server's minute sweep deletes older ones.
   item once the threshold is reached. `code` is `invalid`, the only code recorded from
   clients; `route` is the method and route template the request would have gone to, one of
   the `/v1` routes in this document but this one (`POST /v1/tasks/{id}/notes`); `message`
-  is the server's message for that request (`text is 501 characters; the limit is 500`),
-  one line of at most 300 characters. It needs a device token and `X-Board-Agent`, and the
-  record is that agent's: the body names no agent. Anything else is 400 `invalid`.
-  Servers before it answer 405.
+  is the server's message for text over a limit, exactly as the server writes it
+  (`<field> is <n> characters; the limit is <max>`, `n` above `max`), for a field clients
+  check: `title`, `body`, `acceptance`, `blocked_reason`, `evidence value`, `text`, `now`,
+  `next`, `blockers`, `question`, `option`, `answer`, `q`, `signature`, `reason` or `goal`
+  (`board_proto::CLIENT_CHECKED_FIELDS`), so a record carries no text of the client's
+  choosing. It needs a device token and `X-Board-Agent`, and the record is that agent's:
+  the body names no agent. Anything else is 400 `invalid`. Servers before it answer 405,
+  or 404 `not_found` before `GET /v1/errors`; some of those record that 404 as their own
+  error.
 
 #### Temporary boards
 
@@ -582,7 +587,10 @@ All exit 1 with the error on stderr when the server refuses or cannot be reached
 
 Text over a limit (see "Defaults") is refused before any request, with the server's message
 followed by `(not sent)` and its `next` hint, and exit 1. The CLI then reports the refusal
-to `POST /v1/errors`, waiting at most 2 seconds, so signals count it. The report never
+to `POST /v1/errors`, waiting at most 2 seconds, so signals count it; it does not report an
+over-long feedback `about`, which the server refuses with another message, or a request it
+would not have sent, such as `board handoff --blockers` alone, which only shows the
+handoff. The report never
 changes the output or the exit code: a server that is unreachable, slow, older or refuses
 it is ignored. MCP tools do not check lengths before sending, so the server answers and
 records those itself.

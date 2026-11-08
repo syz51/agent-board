@@ -113,54 +113,6 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The routes a client may name in `POST /v1/errors`: every `/v1` route but that one, as
-/// method and template. `router` must route each of them (a test checks it).
-pub const CLIENT_ERROR_ROUTES: &[&str] = &[
-    "POST /v1/agents",
-    "GET /v1/agents",
-    "GET /v1/agents/{id}",
-    "POST /v1/agents/{id}/state",
-    "GET /v1/agents/{id}/handoff",
-    "PUT /v1/agents/{id}/handoff",
-    "GET /v1/agents/{id}/said",
-    "GET /v1/updates",
-    "PUT /v1/updates/seen",
-    "GET /v1/boards",
-    "POST /v1/boards",
-    "GET /v1/boards/{slug}",
-    "PATCH /v1/boards/{slug}",
-    "DELETE /v1/boards/{slug}",
-    "POST /v1/boards/{slug}/join",
-    "POST /v1/boards/{slug}/coordinator",
-    "DELETE /v1/boards/{slug}/coordinator",
-    "GET /v1/stats",
-    "GET /v1/errors",
-    "GET /v1/tasks",
-    "POST /v1/tasks",
-    "GET /v1/tasks/{id}",
-    "PATCH /v1/tasks/{id}",
-    "POST /v1/tasks/{id}/claim",
-    "POST /v1/tasks/{id}/release",
-    "POST /v1/tasks/{id}/take",
-    "POST /v1/tasks/{id}/done",
-    "POST /v1/tasks/{id}/notes",
-    "POST /v1/leases",
-    "DELETE /v1/leases/{id}",
-    "POST /v1/touches",
-    "POST /v1/feedback",
-    "POST /v1/feedback/{id}/resolve",
-    "GET /v1/asks",
-    "POST /v1/asks",
-    "GET /v1/asks/{id}",
-    "POST /v1/asks/{id}/answer",
-    "POST /v1/asks/{id}/withdraw",
-    "GET /v1/snapshot",
-    "GET /v1/events",
-    "GET /v1/admin/devices",
-    "POST /v1/admin/devices",
-    "DELETE /v1/admin/devices/{name}",
-];
-
 /// Names this build on every answer, so clients can warn when they and the server differ.
 async fn build_headers(State(state): State<AppState>, mut resp: Response) -> Response {
     let headers = resp.headers_mut();

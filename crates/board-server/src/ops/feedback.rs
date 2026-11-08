@@ -3,14 +3,14 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CLIENT_ERROR_MESSAGE_CHARS_MAX, ClientError, CreateBoard, CreateFeedback,
-    ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode, ErrorLog,
-    ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback,
-    FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
+    AgentId, Board, CLIENT_ERROR_MESSAGE_CHARS_MAX, CLIENT_ERROR_ROUTES, ClientError, CreateBoard,
+    CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode,
+    ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
+    Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
     NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Settings;
@@ -729,7 +729,8 @@ pub(crate) struct ApiErrorSeen {
 }
 
 /// Who answered a recorded error (`api_errors.source`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ErrorSource {
     /// The server, to a request it received.
     Server,
@@ -737,18 +738,10 @@ pub(crate) enum ErrorSource {
     Client,
 }
 
-impl ErrorSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Server => "server",
-            Self::Client => "client",
-        }
-    }
-}
-
 /// Checks a client's record of a refusal it made before sending (`POST /v1/errors`): an
-/// `invalid` answer to an API route, with a one-line message. It is recorded for `agent`,
-/// the caller, whatever the body says.
+/// `invalid` answer to an API route, whose message is the server's own for text over a
+/// limit, so a client cannot put text of its choosing in a signal item. It is recorded for
+/// `agent`, the caller, whatever the body says.
 pub(crate) fn validate_client_error(req: ClientError, agent: AgentId) -> Result<ApiErrorSeen> {
     if req.code != ErrorCode::Invalid {
         return Err(invalid(
@@ -756,7 +749,7 @@ pub(crate) fn validate_client_error(req: ClientError, agent: AgentId) -> Result<
             "send code invalid: clients report only the requests they refused as invalid",
         ));
     }
-    if !crate::api::CLIENT_ERROR_ROUTES.contains(&req.route.as_str()) {
+    if !CLIENT_ERROR_ROUTES.contains(&req.route.as_str()) {
         return Err(invalid(
             format!("route {:?} is not an API route", cut(&req.route, 80)),
             "send the method and route template, such as POST /v1/tasks/{id}/notes \
@@ -764,6 +757,13 @@ pub(crate) fn validate_client_error(req: ClientError, agent: AgentId) -> Result<
         ));
     }
     check_line("message", &req.message, CLIENT_ERROR_MESSAGE_CHARS_MAX)?;
+    if board_proto::TooLong::parse(&req.message).is_none() {
+        return Err(invalid(
+            "message is not a refusal of text over a limit",
+            "send the server's message for it, such as text is 501 characters; the limit \
+             is 500, for a field clients check (docs/API.md)",
+        ));
+    }
     Ok(ApiErrorSeen {
         agent,
         code: req.code,
@@ -817,12 +817,17 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
             e.route,
             template,
             now,
-            e.source.as_str()
+            enum_str(&e.source)
         ],
     )?;
     let earlier = match prior(cx, &signature)? {
         Prior::Live(item) => {
-            let summary = format!("{code} from {}", e.route);
+            let summary = match e.source {
+                ErrorSource::Server => format!("{code} from {}", e.route),
+                ErrorSource::Client => {
+                    format!("{code} from {}, refused by the client", e.route)
+                }
+            };
             add_report(cx, &item, &e.agent, "server", &summary)?;
             return Ok(Some(item));
         }
@@ -840,10 +845,11 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         )?;
         from = from.max(last + 1);
     }
-    let count: u32 = cx.db.query_row(
-        "SELECT COUNT(*) FROM api_errors WHERE signature = ?1 AND at >= ?2",
-        params![signature, from],
-        |r| r.get(0),
+    let (count, refused): (u32, u32) = cx.db.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE source = ?3) FROM api_errors \
+         WHERE signature = ?1 AND at >= ?2",
+        params![signature, from, enum_str(&ErrorSource::Client)],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let agents: Vec<AgentId> = cx
         .db
@@ -858,14 +864,16 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     if count < cx.s.signal_min_reports || (agents.len() as u32) < cx.s.signal_min_agents {
         return Ok(None);
     }
-    let refused: u32 = cx.db.query_row(
-        "SELECT COUNT(*) FROM api_errors WHERE signature = ?1 AND at >= ?2 AND source = ?3",
-        params![signature, from, ErrorSource::Client.as_str()],
-        |r| r.get(0),
-    )?;
-    let by_clients = match refused {
-        0 => String::new(),
-        n => format!(" ({n} of them refused by the client before sending)"),
+    let answered = match refused {
+        0 => format!("The server answered `{code}` to {count} requests"),
+        n if n == count => {
+            format!("Clients refused {count} requests as `{code}` before sending them")
+        }
+        n => format!(
+            "Agents got `{code}` on {count} requests ({} answered by the server, {n} refused \
+             by the client before sending)",
+            count - n
+        ),
     };
     let days = cx.s.signal_window_days;
     let listed: Vec<&str> = agents.iter().map(AgentId::as_str).collect();
@@ -874,8 +882,8 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         cx.s.title_chars,
     );
     let body = format!(
-        "{title}\n\nThe server answered `{code}` to {count} requests{by_clients} from {} \
-         agents within {days} days.\n\nRoute: {}\nMessage (normalized): {template}\nAgents: {}",
+        "{title}\n\n{answered} from {} agents within {days} days.\n\nRoute: {}\n\
+         Message (normalized): {template}\nAgents: {}",
         agents.len(),
         e.route,
         listed.join(", "),
