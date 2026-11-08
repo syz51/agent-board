@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::{REPO, T};
 use crate::db::{live_sql, ready_sql};
 use crate::ops::asks::BY_TELEGRAM_MESSAGE;
-use crate::ops::feedback::CLUSTER;
+use crate::ops::feedback::{CLUSTER, CLUSTER_ERRORS, CLUSTER_REPORTERS};
 use crate::ops::leases::DELEGATION_FAMILY;
 use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
 use crate::snapshot::{
@@ -199,9 +199,21 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
 
     // A feedback item's duplicates, which every read of the item counts: along the
     // partial index, not a scan of the feedback board's items per item.
-    let p = plan(&t, CLUSTER);
-    assert!(p.contains("USING INDEX feedback_duplicates"), "{p}");
-    assert!(!p.contains("SCAN f"), "{p}");
+    for sql in [CLUSTER, CLUSTER_REPORTERS, CLUSTER_ERRORS] {
+        let p = plan(&t, sql);
+        assert!(p.contains("USING INDEX feedback_duplicates"), "{sql}:\n{p}");
+        assert!(
+            !p.contains("SCAN f\n") && !p.ends_with("SCAN f"),
+            "{sql}:\n{p}"
+        );
+    }
+    for sql in [CLUSTER_REPORTERS, CLUSTER_ERRORS] {
+        let p = plan(&t, sql);
+        assert!(
+            p.contains("USING INDEX feedback_reports_task"),
+            "{sql}:\n{p}"
+        );
+    }
 
     // A task's children, as deleting a task or a board looks them up.
     let p = plan(&t, "SELECT id FROM tasks WHERE parent = ?1");

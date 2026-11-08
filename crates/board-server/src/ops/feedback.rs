@@ -194,7 +194,7 @@ pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
         ),
     };
     if !duplicate {
-        record_report(cx, &task.id, &r.reporter)?;
+        record_report(cx, &task.id, &r.reporter, false)?;
     }
     let reports = task.feedback.as_ref().map_or(1, |f| f.reports);
     Ok(FeedbackResult {
@@ -242,10 +242,13 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
     Ok(match (kind, target) {
         (None, _) => task_open(cx, id)?.then(|| id.clone()),
         (Some(ResolutionKind::Declined), _) => Some(id.clone()),
-        (Some(ResolutionKind::Duplicate), Some(original))
-            if depth < DUPLICATE_DEPTH_MAX && is_feedback(cx, &original)? =>
-        {
-            live_item(cx, &original, depth + 1)?
+        // Past the depth limit (or in a loop), the item takes no reports.
+        (Some(ResolutionKind::Duplicate), Some(original)) if is_feedback(cx, &original)? => {
+            if depth < DUPLICATE_DEPTH_MAX {
+                live_item(cx, &original, depth + 1)?
+            } else {
+                None
+            }
         }
         // A duplicate of a plain task counts as routed to it.
         (Some(ResolutionKind::Routed | ResolutionKind::Duplicate), Some(task)) => {
@@ -473,10 +476,11 @@ fn file(
     get_task(cx, &id)
 }
 
-fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId) -> Result<()> {
+/// Records one report of `item` by `agent`; `signal` marks an API error the server counted.
+fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId, signal: bool) -> Result<()> {
     cx.db.execute(
-        "INSERT INTO feedback_reports (task, agent, at) VALUES (?1, ?2, ?3)",
-        params![item.as_str(), agent.as_str(), cx.now_ms()],
+        "INSERT INTO feedback_reports (task, agent, at, signal) VALUES (?1, ?2, ?3, ?4)",
+        params![item.as_str(), agent.as_str(), cx.now_ms(), signal],
     )?;
     Ok(())
 }
@@ -503,10 +507,7 @@ fn add_report(
     )?;
     let reports = reports.saturating_add(1);
     let mut reporters: Vec<AgentId> = parse_json(&reporters)?;
-    reporters.retain(|a| a != reporter);
-    reporters.push(reporter.clone());
-    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
-    reporters.drain(..excess);
+    push_reporter(&mut reporters, reporter.clone());
     cx.db.execute(
         "UPDATE feedback SET reports = ?2, reporters = ?3, last_reported_at = ?4 WHERE task = ?1",
         params![
@@ -516,7 +517,7 @@ fn add_report(
             cx.now_ms(),
         ],
     )?;
-    record_report(cx, item, reporter)?;
+    record_report(cx, item, reporter, signal)?;
     note_reports(cx, item, reporter, &actor, summary, signal)?;
     if kind.as_deref() == Some("declined") {
         reopen_declined(cx, item, reporter, &actor)?;
@@ -554,7 +555,7 @@ fn note_reports(
         "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
         params![item.as_str(), now],
     )?;
-    let (merged, errors) = load_merged(cx, item)?.expect("the row was just updated");
+    let merged = load(cx, item)?.expect("the row was just updated");
     let reports = merged.reports;
     // The task doing the work: the routed one, or a plain task the item duplicates.
     let working = match routed_task(cx, item)? {
@@ -597,6 +598,12 @@ fn note_reports(
     if let Some((task, Some(status))) = working
         && !status.is_closed()
     {
+        let errors: u32 = cx
+            .db
+            .prepare_cached(CLUSTER_ERRORS)?
+            .query_row(params![item.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+                r.get(0)
+            })?;
         let text = routed_note(cx, item, signal, &merged, errors, summary);
         cx.db.execute(
             "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'note', ?3, ?4)",
@@ -754,28 +761,11 @@ fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &
     Ok(())
 }
 
-/// The feedback part of task `id`, if it is a feedback item, with the reports of the items
-/// resolved as its duplicates (`load_merged`).
+/// The feedback part of task `id`, if it is a feedback item. Its `reports`, `reporters`
+/// and `last_reported_at` include those of the items resolved as its duplicates, and
+/// theirs: counted when read, never copied, so each report keeps one row (the stats count
+/// it once), and reopening a duplicate takes its reports back.
 pub(crate) fn load(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<Feedback>> {
-    Ok(load_merged(cx, id)?.map(|(feedback, _)| feedback))
-}
-
-/// Feedback item `?1` and the items resolved as its duplicates, and theirs, at most `?2`
-/// links deep, oldest last report first.
-pub(crate) const CLUSTER: &str = "WITH RECURSIVE cluster (task, depth) AS (SELECT ?1, 0 \
-     UNION SELECT f.task, c.depth + 1 FROM cluster c JOIN feedback f \
-     ON f.resolution_task = c.task AND f.resolution = 'duplicate' WHERE c.depth < ?2) \
-     SELECT task, about, activity, source, signature, reports, reporters, last_reported_at, \
-     resolution, resolution_task, resolution_reason, resolved_at, resolved_by, recurs \
-     FROM feedback WHERE task IN (SELECT task FROM cluster) ORDER BY last_reported_at, rowid";
-
-/// The feedback part of task `id`, if it is a feedback item, and how many of its reports
-/// are API errors (those of `signal` items). Its `reports`, `reporters` and
-/// `last_reported_at` include those of the items resolved as its duplicates, and theirs:
-/// counted when read, never copied, so each report has one row (the stats count it once),
-/// and reopening a duplicate takes its reports back. Reporters join in the order of their
-/// items' last reports, so the newest stay when the list is cut.
-fn load_merged(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<(Feedback, u32)>> {
     let rows = cx
         .db
         .prepare_cached(CLUSTER)?
@@ -815,19 +805,15 @@ fn load_merged(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<(Feedback, u32)>> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let (mut reports, mut errors) = (0u32, 0u32);
-    let mut reporters: Vec<AgentId> = Vec::new();
+    let merged = rows.len() > 1;
+    let mut reports = 0u32;
+    // Agents listed by the items, in the order of the items' last reports.
+    let mut listed: Vec<AgentId> = Vec::new();
     let mut last_reported_at = None;
     let mut own = None;
     for (task, mut feedback) in rows {
         reports = reports.saturating_add(feedback.reports);
-        if feedback.source == FeedbackSource::Signal {
-            errors = errors.saturating_add(feedback.reports);
-        }
-        for agent in std::mem::take(&mut feedback.reporters) {
-            reporters.retain(|a| a != &agent);
-            reporters.push(agent);
-        }
+        listed.extend(std::mem::take(&mut feedback.reporters));
         last_reported_at = last_reported_at.max(Some(feedback.last_reported_at));
         if task == id.as_str() {
             own = Some(feedback);
@@ -836,13 +822,70 @@ fn load_merged(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<(Feedback, u32)>> {
     let Some(mut feedback) = own else {
         return Ok(None);
     };
-    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
-    reporters.drain(..excess);
+    let last_reported_at = last_reported_at.unwrap_or(feedback.last_reported_at);
+    if !merged {
+        feedback.reporters = listed;
+        return Ok(Some(feedback));
+    }
+    // Across items, each agent's newest report row orders the reporters. An item adopted
+    // from a plain task has no row for its creator: the agents only a list names go first.
+    let by_row: Vec<AgentId> = cx
+        .db
+        .prepare_cached(CLUSTER_REPORTERS)?
+        .query_map(params![id.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+            parse_id(&r.get::<_, String>(0)?)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let listed_only: Vec<AgentId> = listed.into_iter().filter(|a| !by_row.contains(a)).collect();
+    let mut reporters = Vec::new();
+    for agent in listed_only.into_iter().chain(by_row) {
+        push_reporter(&mut reporters, agent);
+    }
     feedback.reports = reports;
     feedback.reporters = reporters;
-    feedback.last_reported_at = last_reported_at.unwrap_or(feedback.last_reported_at);
-    Ok(Some((feedback, errors)))
+    feedback.last_reported_at = last_reported_at;
+    Ok(Some(feedback))
 }
+
+/// Adds `agent` as the newest of `reporters`, keeping the latest [`REPORTERS_MAX`].
+fn push_reporter(reporters: &mut Vec<AgentId>, agent: AgentId) {
+    reporters.retain(|a| a != &agent);
+    reporters.push(agent);
+    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
+    reporters.drain(..excess);
+}
+
+/// The CTE `cluster`: feedback item `?1` and the items resolved as its duplicates, and
+/// theirs, at most `?2` links deep, as `live_item` follows them.
+macro_rules! cluster {
+    () => {
+        "WITH RECURSIVE cluster (task, depth) AS (SELECT ?1, 0 UNION SELECT f.task, \
+         c.depth + 1 FROM cluster c JOIN feedback f ON f.resolution_task = c.task \
+         AND f.resolution = 'duplicate' WHERE c.depth < ?2) "
+    };
+}
+
+/// The items of the cluster, oldest last report first.
+pub(crate) const CLUSTER: &str = concat!(
+    cluster!(),
+    "SELECT task, about, activity, source, signature, reports, reporters, last_reported_at, \
+     resolution, resolution_task, resolution_reason, resolved_at, resolved_by, recurs \
+     FROM feedback WHERE task IN (SELECT task FROM cluster) ORDER BY last_reported_at, rowid"
+);
+
+/// The agents that reported the cluster, by their newest report, oldest first.
+pub(crate) const CLUSTER_REPORTERS: &str = concat!(
+    cluster!(),
+    "SELECT agent FROM feedback_reports WHERE task IN (SELECT task FROM cluster) \
+     GROUP BY agent ORDER BY MAX(id)"
+);
+
+/// The cluster's reports that are API errors.
+pub(crate) const CLUSTER_ERRORS: &str = concat!(
+    cluster!(),
+    "SELECT COUNT(*) FROM feedback_reports WHERE signal = 1 \
+     AND task IN (SELECT task FROM cluster)"
+);
 
 /// Forgets the resolution of a reopened item, so it is live again.
 pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
@@ -1028,7 +1071,8 @@ pub(crate) fn resolve(
         let Some(live) = live_item(cx, id, 0)? else {
             return Err(invalid(
                 format!(
-                    "{original} passes its reports back to {id}, so {id} cannot be its duplicate"
+                    "{original} passes its reports back to {id}, or on through more than \
+                     {DUPLICATE_DEPTH_MAX} duplicate links, so {id} cannot be its duplicate"
                 ),
                 format!(
                     "name the item that takes the reports, at the end of the duplicate links, \
@@ -1059,7 +1103,7 @@ pub(crate) fn resolve(
     // The item's reports now count on the original, which announces them as a repeat
     // report does, crediting the item's latest reporter and quoting its title.
     if let Some(live) = takes_reports {
-        let (feedback, _) = load_merged(cx, id)?.expect("adopted above if it was plain");
+        let feedback = load(cx, id)?.expect("adopted above if it was plain");
         let author = feedback
             .reporters
             .last()
@@ -1286,7 +1330,7 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     let reporters = agents[excess..].to_vec();
     let task = file(cx, &report, "server", reporters, count, earlier)?;
     cx.db.execute(
-        "INSERT INTO feedback_reports (task, agent, at) SELECT ?1, agent, at FROM api_errors \
+        "INSERT INTO feedback_reports (task, agent, at, signal) SELECT ?1, agent, at, 1 FROM api_errors \
          WHERE signature = ?2 AND at >= ?3 ORDER BY id",
         params![task.id.as_str(), report.signature, from],
     )?;

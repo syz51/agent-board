@@ -1992,4 +1992,57 @@ async fn a_duplicate_of_an_item_routed_to_an_open_task_notes_that_task() {
         )) && noted[1].contains("Latest error, from the server's signal"),
         "{noted:?}"
     );
+    // Reporters are ordered by each agent's newest report, across the items.
+    assert!(
+        noted[1].ends_with(&format!("Reporters, newest first: {B}, {A}, {C}")),
+        "{noted:?}"
+    );
+
+    // A later error goes through the signal item to the original, and counts as an error
+    // there, though the original is an agent's report.
+    t.advance(TimeDelta::minutes(61));
+    t.fail("GET", "/v1/tasks/factory-14", Some(C), None).await;
+    let noted = notes(&t, &work).await;
+    assert_eq!(noted.len(), 3, "{noted:?}");
+    assert!(
+        noted[2].contains(&format!(
+            "feedback item {original} has 7 reports (4 of them API errors) from 3 agents. "
+        )) && noted[2].ends_with(&format!("Reporters, newest first: {C}, {B}, {A}")),
+        "{noted:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_past_the_link_limit_is_refused() {
+    let t = setup().await;
+    let original = item(&t, A, "Item zero").await;
+    let mut last = original.clone();
+    // Titles that differ only in a number share a signature, so the words differ.
+    let words = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight",
+    ];
+    for (n, word) in words.into_iter().enumerate() {
+        let dup = item(&t, B, &format!("Item {word}")).await;
+        let (s, v) = user_resolve(&t, &dup, json!({ "kind": "duplicate", "task": last })).await;
+        assert_eq!(s, 200, "link {}: {v}", n + 1);
+        last = dup;
+    }
+    // Eight links count on the original.
+    assert_eq!(counts(&t, &original).await.0, 9);
+    // A ninth would leave the new item taking no reports.
+    let ninth = item(&t, C, "Item nine").await;
+    let (s, v) = user_resolve(&t, &ninth, json!({ "kind": "duplicate", "task": last })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("more than 8 duplicate links"),
+        "{v}"
+    );
+    assert_eq!(counts(&t, &original).await.0, 9);
+    // Naming the original instead works.
+    let (s, v) = user_resolve(&t, &ninth, json!({ "kind": "duplicate", "task": original })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(counts(&t, &original).await.0, 10);
 }

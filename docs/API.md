@@ -615,10 +615,12 @@ resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`)
 item's duplicates, and of their duplicates in turn (at most 8 links). The server counts
 them when it reads the item and copies nothing: each report stays one row on the item it
 landed on, so `stats.feedback.reported` counts it once. Reopening a duplicate takes its
-reports back off the original, and resolving it again counts them once. `reporters` joins
-the lists in the order of each item's last report and keeps the latest 20. On a `signal`
-item, `reports` counts API errors, not agents' reports. The plain note on a routed task
-says how many of the reports are API errors (`6 reports (3 of them API errors)`).
+reports back off the original, and resolving it again counts them once. Across items,
+`reporters` is ordered by each agent's newest report and keeps the latest 20. On a `signal`
+item, `reports` counts API errors, not agents' reports. Each report records which it is,
+and the plain note on a routed task says how many of the reports are API errors
+(`7 reports (4 of them API errors)`), wherever they landed. A chain of more than 8
+duplicate links is refused (400 `invalid`), since its last item would take no reports.
 
 ### Snapshots and events
 
