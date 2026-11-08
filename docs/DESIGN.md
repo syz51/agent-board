@@ -83,8 +83,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   never the title, so a real board is never removed by accident. Ids are never reused: a
   slug created again continues its task numbering, and ask ids are not handed out again.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
-  computed when read (open, all blockers done, no live owner, `not_before` passed), never
-  stored. Done requires
+  computed when read (open, all blockers done, no live owner, `not_before` passed, not a
+  pending proposal), never stored. Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact), and may carry a
   `summary` for the user: what changed and what they should know or decide. Reopening
   clears it. `auto` says whether
@@ -447,8 +447,9 @@ keeping untrusted text out of those channels, so:
   not be followed. The server sets attribution; JSON escaping (with `<` and `>` as `\u003c`
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
-  order (you, counts, mine, handoff, alerts, peers, ready, waiting, recent; `waiting` lists
-  open tasks held by a `not_before`, soonest first); every alert ends with
+  order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
+  lists pending proposals, which are never ready work); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
@@ -516,6 +517,12 @@ agrees, after checking it.
   finding of a review report, a routed feedback item). It is a task with `auto=false` whose
   body starts `Proposal:` and gives the problem, the evidence, the change and its size. A
   coordinator never sets it `auto` without an accept verdict, and Needs you does not list it.
+  The server enforces the gate, with one definition in `board-proto`
+  (`is_pending_proposal`): it stores a new proposal with `auto=false` whatever was asked,
+  refuses to create it claimed, keeps it out of `ready` and out of `doing` (by claim or by a
+  status change) until an accept sets `auto`, and lists it apart from ready work in
+  snapshots, with who filed it (`Task.proposal`, API.md). Feedback items are triaged
+  instead, whatever their text.
 - **Reviewer**: any agent but the proposer. A coordinator reviews proposals others file on
   its board at the start of its loop; its own go to a reviewer child briefed with the
   evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
@@ -527,7 +534,8 @@ agrees, after checking it.
   destructive, irreversible or cross-repository changes. Split verdicts and decisions only
   the user can make (direction, spending, security posture, publishing, deleting data, what
   reaches their phone, this process) go to the user, one ask per batch with recommendations.
-- **Enforcement**: by convention for now (`prompts/coordinator.md`). Agent ids are asserted
+- **Enforcement**: the gate above is on the server; who may give a verdict, and when one
+  sets `auto`, is by convention for now (`prompts/coordinator.md`). Agent ids are asserted
   by clients, so the server cannot prove independence; stats on verdicts and on the fate of
   accepted proposals decide whether a server-side record is worth adding.
 - **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`

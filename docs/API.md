@@ -195,9 +195,10 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&mine=&limit=` → `[Task]` list, sorted by
-  priority, then id number. `mine=true` uses the `X-Board-Agent` header. `limit` defaults
-  to 200, at most 1,000.
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&limit=` → `[Task]` list,
+  sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+  `proposal=true` lists only pending proposals, `false` leaves them out (see "Pending
+  proposals" below). `limit` defaults to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -212,6 +213,10 @@ Reopening a closed board, or any change on it, starts the period again.
     400 `invalid_transition` while a blocker is not done or `not_before` is ahead. A refused
     request creates nothing and uses no task number. The `task_created` payload then also
     has `"claimed": true`, and a `task_claimed` event (`previous_owner: null`) follows.
+    A body starting `Proposal:` with `claim: true` is 400 `invalid`: the agent that files a
+    proposal cannot start it.
+  - A body starting `Proposal:` (after leading whitespace) creates a pending proposal: the
+    server stores `auto: false` whatever the request says.
   - Compatibility: `claim` is sent only when true, so older clients' requests are
     unchanged. Request bodies are read without rejecting unknown fields, so a server that
     predates `claim` ignores it and answers with an `open` task; the CLI and MCP see that
@@ -257,7 +262,8 @@ Reopening a closed board, or any change on it, starts the period again.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
-  `not_before` has not passed. A claim
+  `not_before` has not passed. A pending proposal is refused the same way, with 400
+  `invalid_transition`, until a verdict sets it `auto`. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
   board coordinator or user only (as status changes below).
@@ -293,6 +299,21 @@ browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
 `owner` and `previous_owner`.
+
+Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
+body is a reporter's text, triaged instead), and its body starts `Proposal:` after leading
+whitespace (`board_proto::is_pending_proposal`, one definition for the server, the daemon,
+the CLI and the web view). The rule reads the task as it is now: an edit that sets `auto`
+or removes the prefix ends it. `Task.proposal` says so; it is computed when read and absent
+from servers that predate it (clients apply the rule to the task's fields instead). A
+pending proposal is never `ready` and cannot be claimed. No other path takes an
+unaccepted proposal (not `auto`, with the prefix, whatever its status) into `doing`:
+`PATCH` to `doing`, from `blocked` say, is refused with 400 `invalid_transition` unless
+the same request sets `auto`. The snapshot lists pending proposals under `proposals`,
+apart from ready work, with who filed each (an agent does not review its own); one held by
+a `not_before` still ahead is listed under `waiting` instead. A proposal becomes work when
+another agent records a `verdict:` note and an accept sets `auto` (`DESIGN.md`,
+"Proposals and triage").
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
 exist and must not form a cycle; they may be on any board. A task is not `ready`, and

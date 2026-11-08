@@ -503,6 +503,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         blocked_reason: None,
         owner: None,
         owner_stale: false,
+        proposal: false,
         blockers: Vec::new(),
         ready: true,
         not_before: None,

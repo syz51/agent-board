@@ -1590,3 +1590,44 @@ fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     let claims = e.stub.requests_to("POST /v1/tasks/factory-12/claim");
     assert_eq!(claims[0].agent.as_deref(), Some(PEER));
 }
+
+/// A server that predates the proposal filter ignores it, returns every task and calls a
+/// pending proposal ready: the CLI filters and marks proposals by the shared rule.
+#[test]
+fn ls_proposals_filters_and_marks_by_the_shared_rule() {
+    let e = env();
+    let mut proposal = task_fixture("factory-12", "Cache builds");
+    proposal.body = "Proposal: cache the builds.".into();
+    proposal.auto = false;
+    let ordinary = task_fixture("factory-13", "Ordinary");
+    e.stub.on("GET /v1/tasks", [proposal.clone(), ordinary]);
+
+    let out = e.run(&["ls", "--proposals", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("GET /v1/tasks")[0].query_pairs()["proposal"],
+        "true"
+    );
+    assert_eq!(
+        stdout(&out).trim(),
+        "factory-12 open p1 \"Cache builds\" proposal"
+    );
+
+    // Filing one prints that it is not ready work.
+    e.stub.on("POST /v1/tasks", proposal);
+    let out = e.run(&[
+        "add",
+        "Cache builds",
+        "--board",
+        "factory",
+        "--body",
+        "Proposal: cache the builds.",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("added factory-12 open p1 \"Cache builds\" proposal"),
+        "{text}"
+    );
+    assert!(text.contains("pending proposal: not ready work."), "{text}");
+}

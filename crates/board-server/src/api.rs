@@ -480,6 +480,7 @@ struct TasksQuery {
     status: Option<TaskStatus>,
     owner: Option<AgentId>,
     ready: Option<bool>,
+    proposal: Option<bool>,
     mine: Option<bool>,
     limit: Option<usize>,
 }
@@ -506,6 +507,7 @@ async fn list_tasks(
         status: q.status,
         owner,
         ready: q.ready,
+        proposal: q.proposal,
         limit: q.limit.unwrap_or(200).clamp(1, 1000),
     };
     Ok(Json(state.read(move |cx| tasks::list(cx, filter)).await?))
