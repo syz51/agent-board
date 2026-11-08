@@ -117,9 +117,9 @@ export function AskScreen() {
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
-            // The answer comes first, at a reading width; what the ask is about follows it,
-            // and sits beside it only where both fit at full width.
-            <div className="grid max-w-[820px] items-start gap-x-8 gap-y-6 2xl:max-w-none 2xl:grid-cols-[minmax(0,820px)_300px]">
+            // The ask fills the content width, its prose kept to a reading measure; what it is
+            // about sits in a column beside it on wide screens and below it on narrow ones.
+            <div className="grid items-start gap-x-7 gap-y-6 xl:grid-cols-[minmax(0,1fr)_280px]">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -137,7 +137,7 @@ function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
   const heading = "text-xs font-semibold text-subtle-foreground";
   return (
     <aside
-      className="grid content-start items-start gap-x-6 gap-y-5 sm:grid-cols-2 2xl:grid-cols-1"
+      className="grid content-start items-start gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-1"
       aria-label="About this ask"
     >
       {ask.task && (
@@ -196,7 +196,7 @@ function AskCard({
   return (
     <article
       className={cn(
-        "relative grid gap-3 overflow-hidden rounded-lg border bg-card px-4.5 pt-3.5 pb-4",
+        "relative grid gap-2.5 overflow-hidden rounded-lg border bg-card px-4 pt-3 pb-3.5",
         "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
         ask.status !== "open"
           ? "before:bg-input"
@@ -236,7 +236,7 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="text-sm leading-normal text-foreground">
+      <div className="max-w-[72ch] text-sm leading-normal text-foreground">
         <Markdown text={ask.question} />
       </div>
       {ask.status === "open" && <AnswerForm ask={ask} />}
@@ -292,7 +292,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
 
   return (
     <form
-      className="grid gap-3 border-t pt-3.5"
+      className="grid gap-2.5 border-t pt-3"
       noValidate
       onSubmit={(event) => {
         event.preventDefault();
@@ -311,15 +311,15 @@ export function AnswerForm({ ask }: { ask: Ask }) {
           return (
             <>
               {ask.options.length > 0 && (
-                <fieldset className="m-0 grid gap-2 border-0 p-0">
-                  <legend className="mb-2 p-0 text-meta font-medium text-subtle-foreground">
+                <fieldset className="m-0 grid gap-1.5 border-0 p-0">
+                  <legend className="mb-1.5 p-0 text-meta font-medium text-subtle-foreground">
                     Choose an answer
                   </legend>
-                  <div className="grid gap-2">
+                  <div className="grid gap-1.5">
                     {ask.options.map((option, index) => (
                       <Label
                         key={index}
-                        className="flex min-h-8.5 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-1.5 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
+                        className="flex min-h-7.5 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-1 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
                       >
                         <input
                           type="radio"
@@ -355,8 +355,9 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     </Label>
                     <Textarea
                       id={`${id}-text`}
-                      rows={2}
-                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                      rows={1}
+                      // One line until the user writes more; it grows with the text.
+                      className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}

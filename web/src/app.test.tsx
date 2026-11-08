@@ -19,31 +19,50 @@ function seed(client: QueryClient) {
   client.setQueryData(queries.updates("").queryKey, state.updates(none));
 }
 
-const current = () =>
+const marked = (value: string) =>
   screen
     .getAllByRole("link")
-    .filter((link) => link.getAttribute("aria-current") === "page")
+    .filter((link) => link.getAttribute("aria-current") === value)
     .map((link) => link.textContent);
 
 describe("navigation", () => {
   test.each([
     ["/", "Home"],
-    ["/boards/factory?ready=1", "Home"],
-    ["/tasks/factory-9", "Home"],
     ["/asks/3", "Needs you"],
     ["/agents?state=running", "Agents"],
-  ])("on %s only %s is current", async (path, label) => {
+  ])("on %s only %s is the current page", async (path, label) => {
     await renderInApp(<Nav />, { path, seed });
-    const links = current();
+    const links = marked("page");
     expect(links.length).toBe(1);
     expect(links[0]).toStartWith(label);
+    expect(marked("true")).toEqual([]);
   });
+
+  test.each(["/boards/factory?ready=1", "/tasks/factory-9"])(
+    "on %s Home holds the page but is not it, so only the board is shown current",
+    async (path) => {
+      await renderInApp(<Nav />, { path, seed });
+      expect(marked("page")).toEqual([]);
+      const holders = marked("true");
+      expect(holders.length).toBe(1);
+      expect(holders[0]).toStartWith("Home");
+    },
+  );
 
   test("Needs you counts the open asks; Home names its unseen updates", async () => {
     await renderInApp(<Nav />, { seed });
     const open = state.asks(new URLSearchParams({ status: "open" })).length;
     expect(screen.getByLabelText(`${open} waiting on you`).textContent).toBe(String(open));
-    expect(screen.getByRole("link", { name: /Home/ }).textContent).toMatch(/unseen updates?$/);
+    const home = screen.getByRole("link", { name: /Home/ });
+    expect(home.textContent).toMatch(/unseen updates?$/);
+    // A count, not a bare dot, with what it counts on hover.
+    const unseen = state.updates(none);
+    const count = home.querySelector("[title]");
+    expect(count?.getAttribute("title")).toMatch(/^\d+ new since you last looked$/);
+    expect(Number(count?.textContent)).toBeGreaterThan(0);
+    expect(unseen.done.length + unseen.said.length).toBeGreaterThanOrEqual(
+      Number(count?.textContent),
+    );
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
   });
 

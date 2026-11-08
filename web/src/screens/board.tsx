@@ -11,7 +11,7 @@ import { useNow } from "@/live/runtime.ts";
 import type { BoardSearch } from "@/router.tsx";
 import { PlainText } from "@/text/markdown.tsx";
 import {
-  AbsTime,
+  DayTime,
   agentIndex,
   Crumbs,
   Empty,
@@ -153,57 +153,62 @@ export function BoardScreen() {
         </p>
       )}
 
-      {/* The bar always shows, so the header holds still; it is disabled until there are
-          tasks to filter. */}
-      <form
-        className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-        role="search"
-        onSubmit={(event) => event.preventDefault()}
-      >
-        <fieldset
-          className="contents"
-          disabled={tasks.data === undefined || (!filtered && !showsTasks(tasks.data, now))}
+      {/* While tasks load the bar shows disabled, so the header holds still. A board with
+          nothing to filter, or whose tasks failed to load, has no bar: it would only look
+          broken there. */}
+      {(filtered ||
+        (tasks.data === undefined && !tasks.error) ||
+        (tasks.data !== undefined && showsTasks(tasks.data, now))) && (
+        <form
+          className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+          role="search"
+          onSubmit={(event) => event.preventDefault()}
         >
-          <SearchField
-            label="Search tasks"
-            placeholder="Search by title or id"
-            value={filters.q}
-            onChange={(value) => setFilter("q", value)}
-            className="max-md:col-span-2"
-          />
-          <FilterSelect
-            label="Priority"
-            value={filters.priority}
-            onChange={(value) => setFilter("priority", value)}
+          <fieldset
+            className="contents"
+            disabled={tasks.data === undefined || (!filtered && !showsTasks(tasks.data, now))}
           >
-            <NativeSelectOption value="">Any</NativeSelectOption>
-            <NativeSelectOption value="p1">P1</NativeSelectOption>
-            <NativeSelectOption value="p2">P2</NativeSelectOption>
-            <NativeSelectOption value="p3">P3</NativeSelectOption>
-          </FilterSelect>
-          <FilterSelect
-            label="Owner"
-            value={filters.owner}
-            onChange={(value) => setFilter("owner", value)}
-            className="max-md:col-span-2"
-          >
-            <NativeSelectOption value="">Anyone</NativeSelectOption>
-            <NativeSelectOption value="none">Unowned</NativeSelectOption>
-            {ownerOptions(tasks.data ?? [], agents).map((agent) => (
-              <NativeSelectOption key={agent.id} value={agent.id}>
-                {agent.label}
-              </NativeSelectOption>
-            ))}
-          </FilterSelect>
-          <FilterToggle
-            checked={filters.readyOnly}
-            onChange={(checked) => setFilter("ready", checked ? "1" : "")}
-            className="max-md:col-start-3 max-md:row-start-1"
-          >
-            Ready only
-          </FilterToggle>
-        </fieldset>
-      </form>
+            <SearchField
+              label="Search tasks"
+              placeholder="Search by title or id"
+              value={filters.q}
+              onChange={(value) => setFilter("q", value)}
+              className="max-md:col-span-2"
+            />
+            <FilterSelect
+              label="Priority"
+              value={filters.priority}
+              onChange={(value) => setFilter("priority", value)}
+            >
+              <NativeSelectOption value="">Any</NativeSelectOption>
+              <NativeSelectOption value="p1">P1</NativeSelectOption>
+              <NativeSelectOption value="p2">P2</NativeSelectOption>
+              <NativeSelectOption value="p3">P3</NativeSelectOption>
+            </FilterSelect>
+            <FilterSelect
+              label="Owner"
+              value={filters.owner}
+              onChange={(value) => setFilter("owner", value)}
+              className="max-md:col-span-2"
+            >
+              <NativeSelectOption value="">Anyone</NativeSelectOption>
+              <NativeSelectOption value="none">Unowned</NativeSelectOption>
+              {ownerOptions(tasks.data ?? [], agents).map((agent) => (
+                <NativeSelectOption key={agent.id} value={agent.id}>
+                  {agent.label}
+                </NativeSelectOption>
+              ))}
+            </FilterSelect>
+            <FilterToggle
+              checked={filters.readyOnly}
+              onChange={(checked) => setFilter("ready", checked ? "1" : "")}
+              className="max-md:col-start-3 max-md:row-start-1"
+            >
+              Ready only
+            </FilterToggle>
+          </fieldset>
+        </form>
+      )}
 
       <QueryFrame query={tasks} label="Loading tasks">
         {(list) => {
@@ -266,6 +271,7 @@ export function TaskGroupSection({
   count,
   collapsed = false,
   onToggle,
+  level = 2,
   children,
 }: {
   id: string;
@@ -273,9 +279,12 @@ export function TaskGroupSection({
   count: number;
   collapsed?: boolean;
   onToggle?: () => void;
+  /** 3 where the groups sit inside a titled section, as on the home page. */
+  level?: 2 | 3;
   children: ReactNode;
 }) {
   const bodyId = useId();
+  const Heading = level === 2 ? "h2" : "h3";
   const row = "flex h-9.5 w-full items-center gap-2 px-(--gutter)";
   const label = (
     <>
@@ -285,7 +294,7 @@ export function TaskGroupSection({
   );
   return (
     <section aria-labelledby={id}>
-      <h2
+      <Heading
         id={id}
         className={cn(
           "bg-muted/45 text-sm font-semibold",
@@ -304,19 +313,20 @@ export function TaskGroupSection({
             aria-controls={bodyId}
             onClick={onToggle}
           >
-            {label}
+            {/* Left of the label, as on the home page's sections. */}
             <Icon
               name="chevronDown"
               className={cn(
-                "ml-auto size-3.5 text-muted-foreground transition-transform motion-reduce:transition-none",
+                "size-3.5 flex-none text-muted-foreground transition-transform motion-reduce:transition-none",
                 collapsed && "-rotate-90",
               )}
             />
+            {label}
           </button>
         ) : (
           label
         )}
-      </h2>
+      </Heading>
       <div id={bodyId} hidden={collapsed}>
         {children}
       </div>
@@ -414,6 +424,10 @@ export function TaskList({
   );
 }
 
+/** Above the row link's cover, so its links stay clickable. */
+const DEPENDENCY =
+  "relative z-1 inline-flex min-h-6 items-center gap-1 text-meta text-muted-foreground";
+
 function TaskMain({ task, done, now }: TaskRowData) {
   // Blockers already done no longer hold the task up.
   const blockers = done ? task.blockers.filter((id) => !done.has(id)) : [];
@@ -432,22 +446,26 @@ function TaskMain({ task, done, now }: TaskRowData) {
       >
         <PlainText className="whitespace-normal" text={task.title} />
       </Link>
+      {/* What the task waits for is muted text with an icon; outlined chips are tags. */}
       {blockers.length > 0 && (
-        <Badge variant="outline" shape="tag" className="relative z-1">
-          blocked by{" "}
-          {blockers.map((id, index) => (
-            <Fragment key={id}>
-              {index > 0 && ", "}
-              <Link
-                className="inline-flex min-h-6 items-center text-foreground tabular-nums"
-                to="/tasks/$id"
-                params={{ id }}
-              >
-                {id}
-              </Link>
-            </Fragment>
-          ))}
-        </Badge>
+        <span className={DEPENDENCY} data-dependency="blockers">
+          <Icon name="link" className="size-3.5 flex-none" />
+          <span>
+            blocked by{" "}
+            {blockers.map((id, index) => (
+              <Fragment key={id}>
+                {index > 0 && ", "}
+                <Link
+                  className="ident inline-flex min-h-6 items-center text-foreground"
+                  to="/tasks/$id"
+                  params={{ id }}
+                >
+                  {id}
+                </Link>
+              </Fragment>
+            ))}
+          </span>
+        </span>
       )}
       {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
       {!task.auto && (
@@ -462,9 +480,12 @@ function TaskMain({ task, done, now }: TaskRowData) {
         </Badge>
       )}
       {waitsUntil && (
-        <Badge variant="outline" shape="tag" className="relative z-1">
-          waits until <AbsTime at={waitsUntil} />
-        </Badge>
+        <span className={DEPENDENCY} data-dependency="date">
+          <Icon name="clock" className="size-3.5 flex-none" />
+          <span>
+            waits until <DayTime at={waitsUntil} now={now} />
+          </span>
+        </span>
       )}
       {task.blocked_reason && (
         <p className="basis-full text-meta text-status-blocked">

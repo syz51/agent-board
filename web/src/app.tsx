@@ -66,20 +66,37 @@ function usePathname(): string {
   return useRouterState({ select: (state) => state.location.pathname });
 }
 
+/**
+ * Whether a navigation item is the current page ("page"), holds it ("true": a board or a
+ * task is under Home), or neither.
+ */
+type Current = "page" | "true" | undefined;
+
 const NAV: {
   to: "/" | "/asks" | "/agents";
   label: string;
   icon: IconName;
-  match: (path: string) => boolean;
+  match: (path: string) => Current;
 }[] = [
   {
     to: "/",
     label: "Home",
     icon: "boards",
-    match: (path) => path === "/" || /^\/(boards|tasks)\//.test(path),
+    match: (path) =>
+      path === "/" ? "page" : /^\/(boards|tasks)\//.test(path) ? "true" : undefined,
   },
-  { to: "/asks", label: "Needs you", icon: "inbox", match: (path) => path.startsWith("/asks") },
-  { to: "/agents", label: "Agents", icon: "agents", match: (path) => path.startsWith("/agents") },
+  {
+    to: "/asks",
+    label: "Needs you",
+    icon: "inbox",
+    match: (path) => (path.startsWith("/asks") ? "page" : undefined),
+  },
+  {
+    to: "/agents",
+    label: "Agents",
+    icon: "agents",
+    match: (path) => (path.startsWith("/agents") ? "page" : undefined),
+  },
 ];
 
 export function Nav() {
@@ -96,9 +113,10 @@ export function Nav() {
         <Link
           key={item.to}
           to={item.to}
-          // Boards stays current on a board and a task; the router's own match would not.
-          aria-current={item.match(path) ? "page" : undefined}
-          className="relative flex min-h-7.5 items-center gap-2.25 rounded-md px-2 py-1 font-medium text-sidebar-foreground hover:bg-sidebar-accent hover:text-foreground hover:no-underline aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-semibold aria-[current=page]:text-foreground max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link max-md:[&>svg]:size-5.25"
+          // On a board or a task, Home holds the page: wide screens mark the board in the
+          // list below instead, and phones, which have no board list, mark the Home tab.
+          aria-current={item.match(path)}
+          className="relative flex min-h-7.5 items-center gap-2.25 rounded-md px-2 py-1 font-medium text-sidebar-foreground hover:bg-sidebar-accent hover:text-foreground hover:no-underline aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-semibold aria-[current=page]:text-foreground max-lg:aria-[current=true]:bg-sidebar-accent max-lg:aria-[current=true]:font-semibold max-lg:aria-[current=true]:text-foreground max-md:flex-1 max-md:flex-col max-md:justify-center max-md:gap-0.75 max-md:rounded-none max-md:px-0.5 max-md:py-1.5 max-md:text-2xs max-md:tracking-normal max-md:hover:bg-transparent max-md:aria-[current=page]:bg-transparent max-md:aria-[current=page]:font-medium max-md:aria-[current=page]:text-link max-md:aria-[current=true]:bg-transparent max-md:aria-[current=true]:font-medium max-md:aria-[current=true]:text-link max-md:[&>svg]:size-5.25"
         >
           <Icon name={item.icon} />
           <span>{item.label}</span>
@@ -110,14 +128,17 @@ export function Nav() {
               {open}
             </span>
           )}
-          {/* Since you last looked is on the home page; a dot there says something is new. */}
+          {/* Since you last looked is on the home page: its count says how much is new. Quieter
+              than the asks' count, as nothing here waits on the user. */}
           {item.to === "/" && unseen > 0 && (
             <>
               <span
-                className="ml-auto size-2 flex-none rounded-full bg-signal max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                className="ml-auto h-4.5 min-w-5 rounded-full bg-primary-soft px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-link tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
                 aria-hidden="true"
-                title={`${unseen} unseen updates`}
-              />
+                title={`${unseen} new since you last looked`}
+              >
+                {unseen}
+              </span>
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}
               </span>

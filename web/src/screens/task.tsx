@@ -131,6 +131,28 @@ function TaskView({
           <PriorityBadge priority={task.priority} />
           <Owner task={task} agents={agents} />
         </p>
+        {/* The links to other tasks are far down there too; this says they exist. */}
+        {(task.blockers.length > 0 || detail.children.length > 0) && (
+          <p className="mt-1.5 flex flex-wrap items-center gap-x-3 text-meta text-muted-foreground lg:hidden">
+            {task.blockers.length > 0 && (
+              <a
+                className="inline-flex min-h-6 items-center gap-1 text-muted-foreground"
+                href={`#${linksId("Blocked by")}`}
+              >
+                <Icon name="link" className="size-3.5" />
+                Blocked by <span className="ident">{task.blockers.join(", ")}</span>
+              </a>
+            )}
+            {detail.children.length > 0 && (
+              <a
+                className="inline-flex min-h-6 items-center text-muted-foreground"
+                href={`#${linksId("Subtasks")}`}
+              >
+                {detail.children.length} {detail.children.length === 1 ? "subtask" : "subtasks"}
+              </a>
+            )}
+          </p>
+        )}
       </header>
 
       <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-start lg:gap-8">
@@ -406,6 +428,11 @@ function TaskRef({ id, related }: { id: string; related: Map<string, Task> }) {
   );
 }
 
+/** The anchor of a list of linked tasks, such as "task-blocked-by". */
+function linksId(title: string): string {
+  return `task-${title.toLowerCase().replaceAll(" ", "-")}`;
+}
+
 function TaskLinks({
   title,
   ids,
@@ -417,7 +444,7 @@ function TaskLinks({
 }) {
   if (ids.length === 0) return null;
   return (
-    <section className="border-t pt-4">
+    <section id={linksId(title)} className="scroll-mt-4 border-t pt-4">
       <h2 className="mb-2 text-meta font-medium text-muted-foreground">{title}</h2>
       <ul className="grid gap-1">
         {ids.map((id) => {

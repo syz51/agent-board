@@ -18,11 +18,13 @@ import {
   agentIndex,
   Empty,
   ErrorNotice,
+  listClass,
   QueryFrame,
   RelTime,
   useAgents,
   Who,
 } from "@/ui/common.tsx";
+import { Icon } from "@/ui/icons.tsx";
 
 /** Updates since the seen cursor, for one board or all; shared with the navigation dot. */
 export function useUpdates(board = "") {
@@ -70,32 +72,12 @@ export function Updates() {
 }
 
 /** The lists themselves; exported for tests. */
-export function UpdatesView({
-  updates,
-  agents,
-  client = api,
-}: {
-  updates: Updates;
-  agents: Map<string, Agent>;
-  client?: Pick<Api, "markSeen">;
-}) {
+export function UpdatesView({ updates, agents }: { updates: Updates; agents: Map<string, Agent> }) {
   const total = unseenCount(updates);
   return (
     <>
-      <div className="mb-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-        <p className="text-muted-foreground">
-          {updates.since ? (
-            <>
-              Since <RelTime at={updates.since} />
-            </>
-          ) : (
-            "Everything kept so far"
-          )}
-        </p>
-        {total > 0 && <MarkSeen updates={updates} client={client} />}
-      </div>
       {updates.more && (
-        <Alert variant="warn" className="my-3 px-3.5 py-2.5">
+        <Alert variant="warn" className="mb-3 px-3.5 py-2.5">
           <AlertDescription className="text-warn">
             Only the newest {UPDATES_MAX} of each kind are listed; older ones were cut. Marking all
             seen covers them too. Each task's page keeps its full history.
@@ -112,19 +94,46 @@ export function UpdatesView({
           {updates.done.length > 0 && (
             <UpdateGroup title="Finished tasks" count={updates.done.length}>
               {updates.done.map((item) => (
-                <DoneCard key={item.task} item={item} agents={agents} />
+                <DoneRow key={item.task} item={item} agents={agents} />
               ))}
             </UpdateGroup>
           )}
           {updates.said.length > 0 && (
             <UpdateGroup title="Coordinators said" count={updates.said.length}>
               {updates.said.map((item) => (
-                <SaidCard key={item.id} item={item} agents={agents} />
+                <SaidRow key={item.id} item={item} agents={agents} />
               ))}
             </UpdateGroup>
           )}
         </>
       )}
+    </>
+  );
+}
+
+/**
+ * The section's header aside: since when updates are listed, and a quiet button to mark
+ * them all seen. Exported for tests.
+ */
+export function UpdatesHeader({
+  updates,
+  client = api,
+}: {
+  updates: Updates;
+  client?: Pick<Api, "markSeen">;
+}) {
+  return (
+    <>
+      <span className="text-meta whitespace-nowrap text-muted-foreground">
+        {updates.since ? (
+          <>
+            Since <RelTime at={updates.since} />
+          </>
+        ) : (
+          "Everything kept"
+        )}
+      </span>
+      {unseenCount(updates) > 0 && <MarkSeen updates={updates} client={client} />}
     </>
   );
 }
@@ -136,17 +145,20 @@ function MarkSeen({ updates, client }: { updates: Updates; client: Pick<Api, "ma
     onSuccess: () => invalidateTags(queryClient, [tags.updates]),
   });
   return (
-    <div className="flex flex-wrap items-center justify-end gap-2">
+    <>
       <Button
         type="button"
-        variant="outline"
+        variant="ghost"
+        size="sm"
+        className="text-meta"
         onClick={() => mutation.mutate()}
         disabled={mutation.isPending}
       >
+        <Icon name="check" className="size-3.5" />
         {mutation.isPending ? "Marking…" : "Mark all seen"}
       </Button>
       {mutation.error && <ErrorNotice error={mutation.error} compact />}
-    </div>
+    </>
   );
 }
 
@@ -160,85 +172,122 @@ function UpdateGroup({
   children: ReactNode;
 }) {
   return (
-    <div className="mt-4.5" data-slot="update-group">
-      <h3 className="mb-2 flex items-baseline gap-1.5 text-meta font-semibold text-subtle-foreground">
+    <div className="mt-4 first:mt-0" data-slot="update-group">
+      <h3 className="mb-1.5 flex items-baseline gap-1.5 text-meta font-semibold text-subtle-foreground">
         {title} <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
       </h3>
-      <div className="grid gap-2.5">{children}</div>
+      <ul className={listClass}>{children}</ul>
     </div>
   );
 }
 
-const updateCard =
-  "bg-card shadow-raise flex min-w-0 flex-col gap-1.5 rounded-lg border px-4 py-3.5";
 const updateMeta = "text-meta text-muted-foreground";
 
 /** PRs and commits: what the user opens to see the change. */
 const SHOWN_EVIDENCE = new Set(["pr", "commit"]);
 
-function DoneCard({ item, agents }: { item: DoneUpdate; agents: Map<string, Agent> }) {
+/**
+ * A finished task on one line, like a task row; its summary and evidence open below it on
+ * demand, so the list stays as dense as the rest of the page.
+ */
+function DoneRow({ item, agents }: { item: DoneUpdate; agents: Map<string, Agent> }) {
+  const [open, setOpen] = useState(false);
+  const detailId = useId();
   const evidence = item.evidence.filter((entry) => SHOWN_EVIDENCE.has(entry.kind));
   return (
-    <article className={updateCard}>
-      <h4 className="text-base font-semibold">
-        <Link className="text-foreground" to="/tasks/$id" params={{ id: item.task }}>
-          <span className="ident mr-1 text-muted-foreground">{item.task}</span>{" "}
-          <PlainText className="whitespace-normal" text={item.title} />
-        </Link>
-      </h4>
-      <p className={updateMeta}>
-        <Link to="/boards/$slug" params={{ slug: item.board }}>
-          {item.board}
-        </Link>
-        {item.owner && (
-          <>
-            {" "}
-            · <Who id={item.owner} agents={agents} />
-          </>
-        )}
-        {" · done "}
-        <RelTime at={item.done_at} />
+    <li>
+      <div className="grid min-h-9 grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-2 py-1 pr-(--gutter) pl-[calc(var(--gutter)-6px)] max-md:grid-cols-[24px_minmax(0,1fr)] max-md:gap-y-0.5">
+        <button
+          type="button"
+          className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+          aria-expanded={open}
+          aria-controls={detailId}
+          aria-label={`${open ? "Hide" : "Show"} the summary of ${item.task}`}
+          onClick={() => setOpen(!open)}
+        >
+          <Icon
+            name="chevronDown"
+            className={cn(
+              "size-3.5 transition-transform motion-reduce:transition-none",
+              !open && "-rotate-90",
+            )}
+          />
+        </button>
+        <h4 className="min-w-0 font-medium">
+          <Link
+            className="block truncate py-[3.5px] text-foreground"
+            to="/tasks/$id"
+            params={{ id: item.task }}
+          >
+            <span className="ident mr-1.5 text-muted-foreground">{item.task}</span>
+            <PlainText text={item.title} />
+          </Link>
+        </h4>
+        <p className={cn(updateMeta, "whitespace-nowrap max-md:col-start-2")}>
+          <Link
+            className="inline-flex min-h-6 items-center"
+            to="/boards/$slug"
+            params={{ slug: item.board }}
+          >
+            {item.board}
+          </Link>
+          {item.owner && (
+            <>
+              {" · "}
+              <Who id={item.owner} agents={agents} />
+            </>
+          )}
+          {" · done "}
+          <RelTime at={item.done_at} />
+        </p>
+      </div>
+      <div
+        id={detailId}
+        hidden={!open}
+        className="flex flex-col gap-1.5 pt-0.5 pr-(--gutter) pb-3 pl-[calc(var(--gutter)+26px)]"
+      >
         {item.parent && (
-          <>
-            {" · part of "}
+          <p className={updateMeta}>
+            {"Part of "}
             <Link to="/tasks/$id" params={{ id: item.parent }}>
               <span className="ident">{item.parent}</span>
             </Link>
-          </>
+          </p>
         )}
-      </p>
-      {item.summary ? (
-        <div className="mt-0.5 max-w-[72ch]">
-          <Markdown text={item.summary} />
-        </div>
-      ) : (
-        <p className="mt-0.5 text-muted-foreground">No summary written.</p>
-      )}
-      {evidence.length > 0 && (
-        <ul className="mt-1 flex flex-wrap gap-x-4.5 gap-y-1.5 border-t pt-2" aria-label="Evidence">
-          {evidence.map((entry, index) => (
-            <li key={index} className="flex min-w-0 items-center gap-1.5">
-              <Badge variant="outline" shape="tag">
-                {entry.kind === "pr" ? "PR" : "commit"}
-              </Badge>
-              <span className="min-w-0 [overflow-wrap:anywhere]">
-                {safeHref(entry.value) ? (
-                  <SafeLink href={entry.value}>{entry.value}</SafeLink>
-                ) : (
-                  <code>{entry.value}</code>
-                )}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </article>
+        {item.summary ? (
+          <div className="max-w-[72ch]">
+            <Markdown text={item.summary} />
+          </div>
+        ) : (
+          <p className="text-muted-foreground">No summary written.</p>
+        )}
+        {evidence.length > 0 && (
+          <ul className="flex flex-wrap gap-x-4.5 gap-y-1.5" aria-label="Evidence">
+            {evidence.map((entry, index) => (
+              <li key={index} className="flex min-w-0 items-center gap-1.5">
+                <Badge variant="outline" shape="tag">
+                  {entry.kind === "pr" ? "PR" : "commit"}
+                </Badge>
+                <span className="min-w-0 [overflow-wrap:anywhere]">
+                  {safeHref(entry.value) ? (
+                    <SafeLink href={entry.value}>{entry.value}</SafeLink>
+                  ) : (
+                    <code>{entry.value}</code>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </li>
   );
 }
 
-function SaidCard({ item, agents }: { item: Said; agents: Map<string, Agent> }) {
+/** A coordinator's closing message: who and where on one line, the text below it. */
+function SaidRow({ item, agents }: { item: Said; agents: Map<string, Agent> }) {
   return (
-    <article className={updateCard}>
+    <li className="flex min-w-0 flex-col gap-1 px-(--gutter) py-2.5">
       <p className={cn(updateMeta, "flex flex-wrap items-center gap-x-1")}>
         <Who id={item.agent} agents={agents} />
         {" on "}
@@ -253,7 +302,7 @@ function SaidCard({ item, agents }: { item: Said; agents: Map<string, Agent> }) 
         <RelTime at={item.at} />
       </p>
       <CollapsibleMarkdown text={item.text} />
-    </article>
+    </li>
   );
 }
 

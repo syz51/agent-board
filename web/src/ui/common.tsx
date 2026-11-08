@@ -58,14 +58,11 @@ export function ErrorNotice({
           "overflow-hidden border-error-border before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:bg-error",
       )}
     >
+      {/* The tinted tile tells a failure from an empty state, which has a grey one. */}
       {!compact && (
         <span
-          className={cn(
-            "grid size-9 flex-none place-items-center rounded-[9px] border",
-            linkDown
-              ? "bg-muted text-muted-foreground"
-              : "border-error-border bg-error-soft text-error",
-          )}
+          className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-error-soft text-error"
+          data-slot="failure-icon"
         >
           <Icon name={linkDown ? "plug" : "alert"} className="size-4.5" />
         </span>
@@ -181,6 +178,26 @@ export function formatAbsolute(at: string): string {
 /** An absolute time, for a moment that matters by its date. */
 export function AbsTime({ at }: { at: string }) {
   return <time dateTime={at}>{formatAbsolute(at)}</time>;
+}
+
+const dayThisYear = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+const dayOtherYear = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+
+/** A date alone: "Nov 22", with the year only when it is not this year's. */
+export function formatDay(at: string, now: number): string {
+  const when = new Date(at);
+  return when.getFullYear() === new Date(now).getFullYear()
+    ? dayThisYear.format(when)
+    : dayOtherYear.format(when);
+}
+
+/** A date alone, for a moment that matters by its day; the full time is in `title`. */
+export function DayTime({ at, now }: { at: string; now: number }) {
+  return (
+    <time dateTime={at} title={formatAbsolute(at)}>
+      {formatDay(at, now)}
+    </time>
+  );
 }
 
 /** A relative time; the absolute time is in `title` and `datetime`. */

@@ -41,15 +41,36 @@ describe("inProgress", () => {
 });
 
 describe("home", () => {
-  test("shows waiting asks, tasks in progress, updates and boards, in that order", async () => {
+  test("shows waiting asks, tasks in progress, boards and updates, in that order", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const titles = screen
       .getAllByRole("heading", { level: 2 })
       .map((heading) => heading.textContent?.replace(/\d+$/, ""));
-    expect(titles).toEqual(["Waiting on you", "In progress", "Since you last looked", "Boards"]);
+    expect(titles).toEqual(["Waiting on you", "In progress", "Boards", "Since you last looked"]);
     const progress = screen.getByRole("region", { name: /In progress/ });
     for (const task of active()) {
       expect(within(progress).getByText(task.title)).toBeTruthy();
+    }
+  });
+
+  test("splits tasks in progress into Doing and Review, each under its own heading", async () => {
+    await renderInApp(<HomeScreen />, { seed });
+    const progress = screen.getByRole("region", { name: /In progress/ });
+    const groups = within(progress)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    const tasks = active();
+    const doing = tasks.filter((task) => task.status === "doing");
+    const review = tasks.filter((task) => task.status === "review");
+    expect(doing.length).toBeGreaterThan(0);
+    expect(review.length).toBeGreaterThan(0);
+    expect(groups).toEqual([`Doing${doing.length}`, `Review${review.length}`]);
+    const reviewGroup = within(progress).getByRole("region", { name: /^Review/ });
+    for (const task of review) {
+      expect(within(reviewGroup).getByText(task.title)).toBeTruthy();
+    }
+    for (const task of doing) {
+      expect(within(reviewGroup).queryByText(task.title)).toBeNull();
     }
   });
 });

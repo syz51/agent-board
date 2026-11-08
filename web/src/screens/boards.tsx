@@ -27,13 +27,13 @@ import {
   Who,
 } from "@/ui/common.tsx";
 import { ConfirmDialog } from "@/ui/confirm.tsx";
-import { Icon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusLabel } from "@/ui/icons.tsx";
 import { ArrangedSections, Section } from "@/ui/sections.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
-import { TaskBoard, TaskList } from "./board.tsx";
-import { unseenCount, Updates, useUpdates } from "./updates.tsx";
+import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
+import { unseenCount, Updates, UpdatesHeader, useUpdates } from "./updates.tsx";
 
-const HOME_SECTIONS = ["asks", "progress", "updates", "boards"] as const;
+const HOME_SECTIONS = ["asks", "progress", "boards", "updates"] as const;
 
 /**
  * Home: what waits on the user, what is in progress, what changed since they last looked,
@@ -102,11 +102,37 @@ export function HomeScreen() {
                   <QueryFrame query={active} label="Loading tasks">
                     {(list) => {
                       const shown = inProgress(list, closed);
-                      return shown.length === 0 ? (
-                        <p className="text-meta text-muted-foreground">No task is in progress.</p>
-                      ) : (
+                      if (shown.length === 0) {
+                        return (
+                          <p className="text-meta text-muted-foreground">No task is in progress.</p>
+                        );
+                      }
+                      // Doing and Review under their own headings, as on a board, so the
+                      // two read apart at a glance.
+                      const groups = (["doing", "review"] as const)
+                        .map((status) => ({
+                          status,
+                          tasks: shown.filter((task) => task.status === status),
+                        }))
+                        .filter((group) => group.tasks.length > 0);
+                      return (
                         <TaskBoard>
-                          <TaskList tasks={shown} agents={agents} now={now} />
+                          {groups.map((group) => (
+                            <TaskGroupSection
+                              key={group.status}
+                              id={`progress-${group.status}`}
+                              level={3}
+                              heading={
+                                <>
+                                  <StatusIcon status={group.status} />
+                                  {statusLabel(group.status)}
+                                </>
+                              }
+                              count={group.tasks.length}
+                            >
+                              <TaskList tasks={group.tasks} agents={agents} now={now} />
+                            </TaskGroupSection>
+                          ))}
                         </TaskBoard>
                       );
                     }}
@@ -118,6 +144,7 @@ export function HomeScreen() {
                 <Section
                   title="Since you last looked"
                   count={updates ? unseenCount(updates) : undefined}
+                  aside={updates && <UpdatesHeader updates={updates} />}
                   {...state}
                 >
                   <Updates />

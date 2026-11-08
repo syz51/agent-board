@@ -33,6 +33,10 @@ const PATHS = {
   file: "M4 1.75h5l3 3v9.5H4zM9 1.75v3h3",
   bolt: "M8.75 1.75 3.5 9h4l-.75 5.25L12 7H8z",
   pause: "M5.75 3.5v9M10.25 3.5v9",
+  /** A clock face: a task that waits for a date. */
+  clock: "M8 13.75a5.75 5.75 0 1 0 0-11.5 5.75 5.75 0 0 0 0 11.5zM8 4.75V8l2.25 1.5",
+  /** Two links of a chain: a task that waits for other tasks. */
+  link: "M6.75 9.25a2.5 2.5 0 0 0 3.5 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-.5.5M9.25 6.75a2.5 2.5 0 0 0-3.5 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l.5-.5",
   cloud: "M4.5 12.25a3 3 0 0 1-.35-5.98 4 4 0 0 1 7.7-.77 3.25 3.25 0 0 1 .4 6.75z",
   plug: "M6 1.75v3.5M10 1.75v3.5M4 5.25h8v2.5a4 4 0 0 1-8 0zM8 11.75v2.5",
   minus: "M4.25 8h7.5",

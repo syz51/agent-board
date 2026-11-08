@@ -24,18 +24,23 @@ inset panel, and lists that run edge to edge across it.
   after a dot of each bar colour. Agent and board states are one style everywhere: a dot and
   a word, no pill.
 - **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
-  bottom tabs on phones. Needs you counts the open asks; a dot on Home marks unseen updates.
+  bottom tabs on phones. Needs you counts the open asks; a quieter count on Home says how
+  many updates are unseen. On a board or a task the sidebar marks the board, not Home.
 - **Home**: what the user follows, in sections they collapse and reorder: waiting asks,
-  tasks in progress across boards, what changed since they last looked, and the boards.
-  Needs you holds only asks, the things that wait on the user. Board status groups
-  collapse, and done starts collapsed.
+  tasks in progress across boards (Doing and Review under their own headings), the boards,
+  and what changed since they last looked. Finished tasks there are one-line rows whose
+  summary opens on demand. Needs you holds only asks, the things that wait on the user.
+  Board status groups collapse, with the chevron left of the label as on Home, and done
+  starts collapsed. What a task waits for (blockers, a start date) is muted text with an
+  icon; outlined chips are tags only. A board with nothing to filter has no filter bar.
 - **Asks**: a filled Send closes the answer group, under the options and the text field,
   so it plainly sends either. A single ask is titled with its kind ("Decision · Ask #9"),
-  at a reading width, with its task and the asking agent's handoff below it, or beside it
-  on the widest screens.
+  across the content width with its prose at a reading measure, and its task and the asking
+  agent's handoff in a column beside it, or below it on narrow screens.
 - **Failures**: while the connection banner shows, only the banner warns; a failed page is
-  a neutral placeholder that says it loads again once the connection is back. "Try again"
-  is a filled button.
+  a neutral placeholder that says it loads again once the connection is back; its icon
+  tile stays error-tinted, so it never reads as an empty state. "Try again" is a filled
+  button.
 
 ## What it trades away
 

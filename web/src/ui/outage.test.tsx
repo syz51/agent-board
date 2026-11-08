@@ -77,6 +77,8 @@ describe("a page that fails to load", () => {
     expect(card().textContent).not.toContain(NEXT);
     // No warning colour or rail on the card: the banner carries the tone.
     expect(card().className).not.toMatch(/error|warn|amber/);
+    // Its icon is still tinted, so it does not read as an empty state.
+    expect(card().querySelector("[data-slot=failure-icon]")?.className).toContain("bg-error-soft");
   });
 
   test.each([
