@@ -393,6 +393,10 @@ pub fn board_line(board: &Board) -> String {
         c.done,
         c.ready
     );
+    // A server that predates the split sends none; 0 would claim nothing may start.
+    if let Some(auto) = c.ready_auto {
+        let _ = write!(line, " (auto {auto})");
+    }
     if board.open_asks > 0 {
         let _ = write!(line, " · asks {}", board.open_asks);
     }
