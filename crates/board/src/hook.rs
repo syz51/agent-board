@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failure};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
+use crate::mcp;
 use crate::render;
 use crate::state::{self, AgentLocal, DoneMark, SessionLocal, ThreadRead, ToolStart};
 use crate::t3::{T3Cli, ThreadFacts};
@@ -1081,7 +1082,10 @@ impl Hook<'_> {
     /// The server is unreachable or too slow: fall back to the cache.
     fn offline(&mut self, failure: Failure) -> Reply {
         match self.event {
-            HookEvent::SessionStart => self.cached_snapshot(failure),
+            HookEvent::SessionStart => match self.cached_snapshot(failure) {
+                Reply::Context(text) => Reply::Context(self.with_tool_search(text)),
+                reply => reply,
+            },
             HookEvent::UserPromptSubmit if !self.local.offline_notified => {
                 self.cached_snapshot(failure)
             }
@@ -1132,6 +1136,26 @@ impl Hook<'_> {
             self.local.turn_started,
             &mut self.local.done_reminded,
         ))
+    }
+
+    /// Ends a `SessionStart` snapshot with the `ToolSearch` call that loads the board tools
+    /// most calls need. Claude Code shows deferred MCP tools by name only, so an agent that
+    /// calls one before loading it guesses its arguments and fails once. Codex has no
+    /// `ToolSearch`; the MCP server's instructions name the tools for it.
+    fn with_tool_search(&self, snapshot: String) -> String {
+        match self.runtime {
+            Runtime::Claude => {
+                let tools: Vec<String> = mcp::CORE_TOOLS
+                    .iter()
+                    .map(|tool| format!("mcp__board__{tool}"))
+                    .collect();
+                format!(
+                    "{snapshot}\nBefore the first board call, load the board tools in one call: ToolSearch select:{}",
+                    tools.join(",")
+                )
+            }
+            Runtime::Codex => snapshot,
+        }
     }
 
     fn cached_snapshot(&mut self, failure: Failure) -> Reply {
@@ -1299,7 +1323,7 @@ impl Hook<'_> {
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
-            return Ok(Reply::Context(text));
+            return Ok(Reply::Context(self.with_tool_search(text)));
         }
         // No board for this agent: hint at a board covering the repo, if any.
         let Some(key) = repo.key else {

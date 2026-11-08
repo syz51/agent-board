@@ -16,6 +16,13 @@ const SESSION: &str = "00893aaf-19fa-41d2-8238-13269b9b3ca0";
 const CLAUDE_AGENT: &str = "claude:00893aaf-19fa-41d2-8238-13269b9b3ca0";
 const SNAPSHOT: &str =
     "<board agent=\"claude:0089\" board=\"factory\" seq=\"812\">\nyou: claude:0089\n</board>";
+/// What Claude's `SessionStart` adds after the snapshot: Claude Code defers MCP tool schemas.
+const TOOL_SEARCH: &str = "Before the first board call, load the board tools in one call: ToolSearch select:mcp__board__task_claim,mcp__board__task_add,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_update,mcp__board__task_done,mcp__board__task_show,mcp__board__lease_paths";
+
+/// Claude's `SessionStart` context for [`SNAPSHOT`].
+fn started() -> String {
+    format!("{SNAPSHOT}\n{TOOL_SEARCH}")
+}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -122,7 +129,7 @@ fn session_start_registers_injects_and_caches_the_snapshot() {
         json!({"source": "startup", "model": "claude-opus-5-5"}),
     );
     let (reply, _) = e.hook("session-start", "claude", payload);
-    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    assert_eq!(context(&reply, "SessionStart"), started());
 
     let register = &e.stub.requests_to("POST /v1/agents")[0];
     assert_eq!(register.agent.as_deref(), Some(CLAUDE_AGENT));
@@ -140,6 +147,29 @@ fn session_start_registers_injects_and_caches_the_snapshot() {
 
     let cached = std::fs::read_dir(e.home.join("cache")).unwrap().count();
     assert_eq!(cached, 1, "the full snapshot is cached for offline use");
+}
+
+#[test]
+fn codex_session_start_injects_the_snapshot_without_tool_search() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("codex:thr_9", DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    let payload = json!({
+        "session_id": "thr_9", "transcript_path": null, "cwd": e.repo,
+        "hook_event_name": "SessionStart", "model": "gpt-5.5-codex", "source": "startup",
+    });
+    let (reply, _) = e.hook("session-start", "codex", payload);
+    assert_eq!(
+        context(&reply, "SessionStart"),
+        SNAPSHOT,
+        "Codex has no ToolSearch; the MCP instructions name the tools"
+    );
 }
 
 #[test]
@@ -727,7 +757,7 @@ fn session_start_prunes_agent_files_untouched_for_a_week() {
     backdate(&e.home.join("state/watch.json"), 30);
 
     let (reply, _) = e.hook("session-start", "claude", start);
-    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    assert_eq!(context(&reply, "SessionStart"), started());
     for dir in ["state", "cache"] {
         let mut left: Vec<String> = std::fs::read_dir(e.home.join(dir))
             .unwrap()
@@ -1548,7 +1578,7 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
         "{text}"
     );
     assert!(
-        text.contains(" ago (seq 812)") && text.ends_with(SNAPSHOT),
+        text.contains(" ago (seq 812)") && text.ends_with(&started()),
         "{text}"
     );
     assert!(!text.contains("fail"), "board tools still work: {text}");
@@ -1593,7 +1623,7 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     .unwrap();
     e.stub.hang(Duration::ZERO);
     let (reply, _) = timed(&e, "session-start", &start);
-    assert_eq!(context(&reply, "SessionStart"), SNAPSHOT);
+    assert_eq!(context(&reply, "SessionStart"), started());
     assert_eq!(breaker(&e), json!({}));
 }
 
@@ -1660,7 +1690,7 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
     assert!(
         text.starts_with("board server unreachable: cached snapshot from ")
             && text.contains(" ago (seq 812); claims and updates fail until it is back.")
-            && text.ends_with(SNAPSHOT),
+            && text.ends_with(&started()),
         "{text}"
     );
     let open = breaker(&e);
