@@ -733,37 +733,21 @@ fn digest_day(now: DateTime<FixedOffset>, at: NaiveTime) -> Option<NaiveDate> {
 }
 
 fn digest_text(state: &AppState, digest: &telegram_ops::Digest, day: &str) -> String {
-    let (asks, tasks) = digest
-        .boards
-        .values()
-        .fold((0, 0), |(a, t), (asks, tasks)| {
-            (a + asks.len(), t + tasks.len())
-        });
+    let asks: usize = digest.boards.values().map(Vec::len).sum();
     let mut text = format!(
-        "Needs you, {day}: {asks} open {}, {tasks} {} waiting on you.\n",
-        plural(asks, "ask", "asks"),
-        plural(tasks, "task", "tasks"),
+        "Needs you, {day}: {asks} open {}.\n",
+        plural(asks, "ask", "asks")
     );
     // Board headings and items; only items count toward "… and N more".
     let mut lines = Vec::new();
-    for (board, (asks, tasks)) in &digest.boards {
+    for (board, asks) in &digest.boards {
         lines.push((false, format!("\n{board}")));
         for ask in asks {
             let question = ask.question.lines().next().unwrap_or_default();
             lines.push((true, format!("· ask {}: {}", ask.id, cut(question))));
         }
-        for task in tasks {
-            let status = match task.status {
-                board_proto::TaskStatus::Blocked => "blocked",
-                _ => "waits on you",
-            };
-            lines.push((
-                true,
-                format!("· {} {status}: {}", task.id, cut(&task.title)),
-            ));
-        }
     }
-    let mut left = asks + tasks;
+    let mut left = asks;
     for (item, line) in lines {
         if text.chars().count() + line.chars().count() > DIGEST_CHARS {
             text.push_str(&format!("\n… and {left} more."));

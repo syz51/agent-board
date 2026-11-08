@@ -1,9 +1,8 @@
-// The running page's live wiring: the event stream invalidates query tags and feeds the
-// event list; React reads the connection state and the clock through hooks.
+// The running page's live wiring: the event stream invalidates query tags; React reads the connection state and the clock through hooks.
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { api } from "@/api/client.ts";
-import { addToFeed, createQueryClient, invalidateTags } from "./query.ts";
+import { createQueryClient, invalidateTags } from "./query.ts";
 import { browserTimers, TagBatcher, tagsForEvent } from "./refresh.ts";
 import { type ConnectionState, EventStream, openEventSource } from "./stream.ts";
 
@@ -24,12 +23,8 @@ export const stream = new EventStream(
   {
     onEvent(event) {
       batcher.add(tagsForEvent(event));
-      addToFeed(queryClient, event);
     },
-    onState(state) {
-      connection = state;
-      for (const listener of connectionListeners) listener();
-    },
+    onState: setConnection,
     // Events may have been missed: refetch everything shown, mark the rest stale.
     onResync: () => void queryClient.invalidateQueries(),
   },
@@ -39,6 +34,12 @@ export function startLive(): void {
   addEventListener("online", () => stream.online());
   addEventListener("offline", () => stream.offline());
   stream.start();
+}
+
+/** The connection state the page shows. The stream sets it; tests set it to render a state. */
+export function setConnection(state: ConnectionState): void {
+  connection = state;
+  for (const listener of connectionListeners) listener();
 }
 
 function subscribeConnection(listener: () => void): () => void {

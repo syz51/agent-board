@@ -10,37 +10,40 @@
 
 :root {
   color-scheme: light dark;
-  --radius: 0.625rem;
+  --radius: 0.5rem;
 
   /* shadcn/ui tokens */
   --background: #ffffff;
-  --foreground: #15171b;
+  --foreground: #1b1c21;
   --card: #ffffff;
-  --card-foreground: #15171b;
+  --card-foreground: #1b1c21;
   --popover: #ffffff;
-  --popover-foreground: #15171b;
-  --primary: #3b55d9;
+  --popover-foreground: #1b1c21;
+  --primary: #232429;
   --primary-foreground: #ffffff;
-  --secondary: #eef0f3;
-  --secondary-foreground: #15171b;
-  --muted: #f7f8fa;
-  --muted-foreground: #626975;
-  --accent: #eef0f3;
-  --accent-foreground: #15171b;
+  --secondary: #f0f1f4;
+  --secondary-foreground: #1b1c21;
+  --muted: #f8f8fa;
+  --muted-foreground: #5f636e;
+  --accent: #f0f1f4;
+  --accent-foreground: #1b1c21;
   --destructive: #c0391b;
-  --border: #e7e9ed;
-  --input: #d4d8de;
-  --ring: #3b55d9;
-  --sidebar: #f6f7f9;
-  --sidebar-foreground: #3d424b;
-  --sidebar-accent: #eef0f3;
-  --sidebar-accent-foreground: #15171b;
-  --sidebar-border: #e7e9ed;
+  --border: #e8e9ed;
+  --input: #d9dbe1;
+  --ring: #5e5fd2;
+  --sidebar: #f3f3f6;
+  --sidebar-foreground: #3d3f47;
+  --sidebar-accent: #e6e7ec;
+  --sidebar-accent-foreground: #1b1c21;
+  --sidebar-border: #e3e4e9;
 
   /* agent-board tokens */
-  --subtle-foreground: #3d424b;
-  --link: #2f47bf;
-  --primary-soft: #edf0fd;
+  --subtle-foreground: #3d3f47;
+  --link: #4e4fc0;
+  /* The one accent fill: Needs you, unseen news and selected options. */
+  --signal: #5e5fd2;
+  --signal-foreground: #ffffff;
+  --primary-soft: #efeffc;
   --status-ready: #18794e;
   --status-ready-soft: #e6f4ec;
   --status-doing: #2f5fd0;
@@ -61,39 +64,42 @@
   --error: #8c2a12;
   --error-soft: #fdf0ed;
   --error-border: #f3c5ba;
-  --shadow-raise: 0 1px 2px rgb(16 24 40 / 0.05);
+  --shadow-raise: 0 0 0 0 transparent;
   --shadow-overlay: 0 16px 48px rgb(16 24 40 / 0.2);
+  --shadow-panel: 0 1px 3px rgb(20 20 40 / 0.06), 0 0 0 1px rgb(20 20 40 / 0.06);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #111216;
-    --foreground: #ecedf0;
-    --card: #17191e;
-    --card-foreground: #ecedf0;
-    --popover: #17191e;
-    --popover-foreground: #ecedf0;
-    --primary: #8299f7;
-    --primary-foreground: #0c1124;
-    --secondary: #24272e;
-    --secondary-foreground: #ecedf0;
-    --muted: #1b1d23;
-    --muted-foreground: #99a0ab;
-    --accent: #24272e;
-    --accent-foreground: #ecedf0;
+    --background: #1a1b20;
+    --foreground: #e5e6ea;
+    --card: #1a1b20;
+    --card-foreground: #e5e6ea;
+    --popover: #202127;
+    --popover-foreground: #e5e6ea;
+    --primary: #e5e6ea;
+    --primary-foreground: #18191d;
+    --secondary: #26272e;
+    --secondary-foreground: #e5e6ea;
+    --muted: #1f2026;
+    --muted-foreground: #a0a2ad;
+    --accent: #26272e;
+    --accent-foreground: #e5e6ea;
     --destructive: #f49a82;
-    --border: #262930;
-    --input: #353943;
-    --ring: #8ea3f8;
-    --sidebar: #0c0d10;
-    --sidebar-foreground: #c7cad1;
-    --sidebar-accent: #24272e;
-    --sidebar-accent-foreground: #ecedf0;
-    --sidebar-border: #262930;
+    --border: #2a2b32;
+    --input: #383a42;
+    --ring: #8d8ef2;
+    --sidebar: #0e0f12;
+    --sidebar-foreground: #c4c5cc;
+    --sidebar-accent: #22232a;
+    --sidebar-accent-foreground: #e5e6ea;
+    --sidebar-border: #1d1e23;
 
-    --subtle-foreground: #c7cad1;
-    --link: #9fb1fa;
-    --primary-soft: #1d2442;
+    --subtle-foreground: #c4c5cc;
+    --link: #a5a6f6;
+    --signal: #8d8ef2;
+    --signal-foreground: #121230;
+    --primary-soft: #24244a;
     --status-ready: #5fd197;
     --status-ready-soft: #15301f;
     --status-doing: #86a8f6;
@@ -114,8 +120,9 @@
     --error: #f7b4a2;
     --error-soft: #34170f;
     --error-border: #5b2618;
-    --shadow-raise: 0 1px 2px rgb(0 0 0 / 0.3);
+    --shadow-raise: 0 0 0 0 transparent;
     --shadow-overlay: 0 16px 48px rgb(0 0 0 / 0.6);
+    --shadow-panel: 0 1px 3px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.13);
   }
 }
 
@@ -146,6 +153,8 @@
 
   --color-subtle-foreground: var(--subtle-foreground);
   --color-link: var(--link);
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
   --color-primary-soft: var(--primary-soft);
   --color-status-ready: var(--status-ready);
   --color-status-ready-soft: var(--status-ready-soft);
@@ -175,6 +184,7 @@
 
   --shadow-raise: var(--shadow-raise);
   --shadow-overlay: var(--shadow-overlay);
+  --shadow-panel: var(--shadow-panel);
 }
 
 @theme {
@@ -184,21 +194,29 @@
     sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  /* The type scale: 11 badge, 12 caption, 13 meta, 14 body, 16 heading, 20 title, 28 display. */
+  /* The type scale: 11 badge, 12 meta, 13 body, 14 lead, 16 heading, 24 page title, 28 task title. */
   --text-2xs: 11px;
   --text-2xs--line-height: 1.4;
-  --text-meta: 13px;
+  --text-meta: 12.5px;
   --text-meta--line-height: 1.45;
-  --text-title: 20px;
+  --text-title: 16px;
   --text-title--line-height: 1.3;
-  --text-display: 28px;
-  --text-display--line-height: 1.2;
-  --text-display-phone: 24px;
+  --text-display: 24px;
+  --text-display--line-height: 1.25;
+  --text-headline: 28px;
+  --text-headline--line-height: 1.2;
+  --text-display-phone: 21px;
   --text-display-phone--line-height: 1.2;
 
   /* Phone below md (720px); the sidebar layout from lg (900px). */
   --breakpoint-md: 45rem;
   --breakpoint-lg: 56.25rem;
+  --text-sm: 13px;
+  --text-sm--line-height: 1.5;
+  --text-base: 14px;
+  --text-base--line-height: 1.45;
+  --text-xs: 11.5px;
+  --text-xs--line-height: 1.4;
 }
 
 @layer base {
@@ -220,7 +238,7 @@
 
   @media (max-width: 45rem) {
     body {
-      font-size: 15px;
+      font-size: 14px;
     }
   }
 
@@ -314,6 +332,13 @@
   .md .md-raw {
     @apply font-mono text-meta whitespace-pre-wrap text-muted-foreground;
   }
+  .md .md-chip {
+    @apply whitespace-nowrap;
+  }
+  /* A tag in plain agent text: inert code, as raw HTML is in agent markdown. */
+  .raw-tag {
+    @apply rounded-[4px] bg-secondary px-1 py-px font-mono text-[0.9em] whitespace-nowrap text-muted-foreground;
+  }
   .md .md-table {
     @apply overflow-x-auto;
   }
@@ -331,5 +356,16 @@
   .clamped {
     @apply max-h-[9.5em] overflow-hidden;
     mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  }
+}
+
+@layer components {
+  /* Lists that run edge to edge across the content panel: the panel's gutter is undone,
+     so rows and group bands meet its borders, as in Linear. */
+  .edge {
+    margin-inline: calc(var(--gutter) * -1);
+    border-inline-width: 0;
+    border-radius: 0;
+    box-shadow: none;
   }
 }

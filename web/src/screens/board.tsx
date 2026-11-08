@@ -1,16 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
-import { Fragment, type ReactNode, useMemo } from "react";
+import { Fragment, type ReactNode, useEffect, useId, useMemo } from "react";
 import type { Agent, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
+import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useNow } from "@/live/runtime.ts";
 import type { BoardSearch } from "@/router.tsx";
 import { PlainText } from "@/text/markdown.tsx";
 import {
-  AbsTime,
+  DayTime,
   agentIndex,
   Crumbs,
   Empty,
@@ -24,6 +25,7 @@ import {
 } from "@/ui/common.tsx";
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
 import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { useCollapsed } from "@/ui/sections.tsx";
 
 const route = getRouteApi("/boards/$slug");
 
@@ -74,6 +76,16 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
   ];
 }
 
+const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
+
+/**
+ * Whether a board shows any task before filtering, by the rule the list uses: dropped tasks
+ * and tasks done over 30 days ago do not count. Exported for tests.
+ */
+export function showsTasks(tasks: Task[], now: number): boolean {
+  return groupTasks(tasks, NO_FILTERS, now).some((group) => group.tasks.length > 0);
+}
+
 /** The filters a board's URL holds. */
 export function filtersOf(search: BoardSearch): TaskFilters {
   return {
@@ -82,6 +94,33 @@ export function filtersOf(search: BoardSearch): TaskFilters {
     owner: search.owner ?? "",
     readyOnly: search.ready === "1",
   };
+}
+
+const TITLES_KEY = "board-titles";
+
+/** Board names last seen in this browser, by slug; a convenience, so failures are ignored. */
+function storedTitles(): Record<string, string> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(TITLES_KEY) ?? "{}");
+    return value && typeof value === "object" ? (value as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberedTitle(slug: string): string | undefined {
+  const title = storedTitles()[slug];
+  return typeof title === "string" ? title : undefined;
+}
+
+function rememberTitle(slug: string, title: string) {
+  const titles = storedTitles();
+  if (titles[slug] === title) return;
+  try {
+    localStorage.setItem(TITLES_KEY, JSON.stringify({ ...titles, [slug]: title }));
+  } catch {
+    // Storage may be full or blocked; the slug then stands in during an outage.
+  }
 }
 
 export function BoardScreen() {
@@ -101,7 +140,15 @@ export function BoardScreen() {
       new Set((tasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id)),
     [tasks.data],
   );
-  useTitle(board?.title ?? slug);
+  // Without the board list, as in an outage, the name last seen in this browser stands in,
+  // or else the slug.
+  useEffect(() => {
+    if (board) rememberTitle(slug, board.title);
+  }, [slug, board]);
+  const name = board?.title ?? rememberedTitle(slug) ?? slug;
+  useTitle(name);
+  // One choice for every board: done work starts folded away.
+  const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
 
   const filters = filtersOf(search);
   const setFilter = (key: keyof BoardSearch, value: string) =>
@@ -113,10 +160,10 @@ export function BoardScreen() {
 
   return (
     <>
-      <Crumbs current={board?.title ?? slug}>
-        <Link to="/">Boards</Link>
+      <Crumbs current={name}>
+        <Link to="/">Home</Link>
       </Crumbs>
-      <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
+      <PageHeader title={name} sub={board?.goal && <PlainText text={board.goal} />}>
         {board && board.title !== slug && (
           <span className="ident text-meta text-muted-foreground">{slug}</span>
         )}
@@ -139,50 +186,62 @@ export function BoardScreen() {
         </p>
       )}
 
-      <form
-        className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-        role="search"
-        onSubmit={(event) => event.preventDefault()}
-      >
-        <SearchField
-          label="Search tasks"
-          placeholder="Search by title or id"
-          value={filters.q}
-          onChange={(value) => setFilter("q", value)}
-          className="max-md:col-span-2"
-        />
-        <FilterSelect
-          label="Priority"
-          value={filters.priority}
-          onChange={(value) => setFilter("priority", value)}
+      {/* While tasks load the bar shows disabled, so the header holds still. A board with
+          nothing to filter, or whose tasks failed to load, has no bar: it would only look
+          broken there. */}
+      {(filtered ||
+        (tasks.data === undefined && !tasks.error) ||
+        (tasks.data !== undefined && showsTasks(tasks.data, now))) && (
+        <form
+          className="mb-5 flex flex-wrap items-center gap-2 max-md:grid max-md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+          role="search"
+          onSubmit={(event) => event.preventDefault()}
         >
-          <NativeSelectOption value="">Any</NativeSelectOption>
-          <NativeSelectOption value="p1">P1</NativeSelectOption>
-          <NativeSelectOption value="p2">P2</NativeSelectOption>
-          <NativeSelectOption value="p3">P3</NativeSelectOption>
-        </FilterSelect>
-        <FilterSelect
-          label="Owner"
-          value={filters.owner}
-          onChange={(value) => setFilter("owner", value)}
-          className="max-md:col-span-2"
-        >
-          <NativeSelectOption value="">Anyone</NativeSelectOption>
-          <NativeSelectOption value="none">Unowned</NativeSelectOption>
-          {ownerOptions(tasks.data ?? [], agents).map((agent) => (
-            <NativeSelectOption key={agent.id} value={agent.id}>
-              {agent.label}
-            </NativeSelectOption>
-          ))}
-        </FilterSelect>
-        <FilterToggle
-          checked={filters.readyOnly}
-          onChange={(checked) => setFilter("ready", checked ? "1" : "")}
-          className="max-md:col-start-3 max-md:row-start-1"
-        >
-          Ready only
-        </FilterToggle>
-      </form>
+          <fieldset
+            className="contents"
+            disabled={tasks.data === undefined || (!filtered && !showsTasks(tasks.data, now))}
+          >
+            <SearchField
+              label="Search tasks"
+              placeholder="Search by title or id"
+              value={filters.q}
+              onChange={(value) => setFilter("q", value)}
+              className="max-md:col-span-2"
+            />
+            <FilterSelect
+              label="Priority"
+              value={filters.priority}
+              onChange={(value) => setFilter("priority", value)}
+            >
+              <NativeSelectOption value="">Any</NativeSelectOption>
+              <NativeSelectOption value="p1">P1</NativeSelectOption>
+              <NativeSelectOption value="p2">P2</NativeSelectOption>
+              <NativeSelectOption value="p3">P3</NativeSelectOption>
+            </FilterSelect>
+            <FilterSelect
+              label="Owner"
+              value={filters.owner}
+              onChange={(value) => setFilter("owner", value)}
+              className="max-md:col-span-2"
+            >
+              <NativeSelectOption value="">Anyone</NativeSelectOption>
+              <NativeSelectOption value="none">Unowned</NativeSelectOption>
+              {ownerOptions(tasks.data ?? [], agents).map((agent) => (
+                <NativeSelectOption key={agent.id} value={agent.id}>
+                  {agent.label}
+                </NativeSelectOption>
+              ))}
+            </FilterSelect>
+            <FilterToggle
+              checked={filters.readyOnly}
+              onChange={(checked) => setFilter("ready", checked ? "1" : "")}
+              className="max-md:col-start-3 max-md:row-start-1"
+            >
+              Ready only
+            </FilterToggle>
+          </fieldset>
+        </form>
+      )}
 
       <QueryFrame query={tasks} label="Loading tasks">
         {(list) => {
@@ -209,6 +268,8 @@ export function BoardScreen() {
                     </>
                   }
                   count={group.tasks.length}
+                  collapsed={collapsed.has(group.key)}
+                  onToggle={() => toggle(group.key)}
                 >
                   <TaskList tasks={group.tasks} agents={agents} done={done} now={now} />
                 </TaskGroupSection>
@@ -230,38 +291,79 @@ function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
 
 /** The frame around task groups: one card, groups divided by rules. */
 export function TaskBoard({ children }: { children: ReactNode }) {
-  return (
-    <div className="divide-y overflow-hidden rounded-lg border bg-card shadow-raise">
-      {children}
-    </div>
-  );
+  return <div className="edge divide-y overflow-hidden border-y bg-card">{children}</div>;
 }
 
-/** A group of tasks under a shaded heading with its count. */
+/**
+ * A group of tasks under a shaded heading with its count. With `onToggle`, the heading is a
+ * button that folds the group away.
+ */
 export function TaskGroupSection({
   id,
   heading,
   count,
+  collapsed = false,
+  onToggle,
   level = 2,
   children,
 }: {
   id: string;
   heading: ReactNode;
-  count: number;
+  /** The number of tasks, or "1 of 2" where only some are listed. */
+  count: number | string;
+  collapsed?: boolean;
+  onToggle?: () => void;
+  /** 3 where the groups sit inside a titled section, as on the home page. */
   level?: 2 | 3;
   children: ReactNode;
 }) {
+  const bodyId = useId();
   const Heading = level === 2 ? "h2" : "h3";
+  const row = "flex h-9.5 w-full items-center gap-2 px-(--gutter)";
+  const label = (
+    <>
+      {heading}
+      <span className="text-meta font-medium text-subtle-foreground tabular-nums">{count}</span>
+    </>
+  );
   return (
     <section aria-labelledby={id}>
       <Heading
         id={id}
-        className="flex h-[38px] items-center gap-2 border-b bg-muted px-4 text-meta font-semibold"
+        className={cn(
+          "bg-muted/45 text-sm font-semibold",
+          !collapsed && "border-b",
+          !onToggle && row,
+        )}
       >
-        {heading}
-        <span className="font-medium text-muted-foreground tabular-nums">{count}</span>
+        {onToggle ? (
+          <button
+            type="button"
+            className={cn(
+              row,
+              "group/toggle cursor-pointer text-left hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+            )}
+            aria-expanded={!collapsed}
+            aria-controls={bodyId}
+            onClick={onToggle}
+          >
+            {/* Left of the label, as on the home page's sections. */}
+            <Icon
+              name="chevronDown"
+              className={cn(
+                "size-3.5 flex-none text-muted-foreground transition-transform group-hover/toggle:text-foreground motion-reduce:transition-none",
+                collapsed && "-rotate-90",
+              )}
+            />
+            {label}
+          </button>
+        ) : (
+          label
+        )}
       </Heading>
-      {children}
+      <div id={bodyId} hidden={collapsed}>
+        {children}
+      </div>
     </section>
   );
 }
@@ -315,9 +417,9 @@ const CELL_CLASS: Record<string, string> = {
   id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center",
   main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
   owner:
-    "min-w-0 overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
+    "flex min-w-0 items-center overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
   updated:
-    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated] max-md:pt-0.75",
 };
 
 export function TaskList({
@@ -337,11 +439,13 @@ export function TaskList({
   );
   const table = useTable({ features, columns, data, getRowId: (row) => row.task.id });
   return (
-    <ul className="grid grid-cols-[54px_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_88px] gap-x-3 divide-y max-md:block">
+    // A row's gutter padding sits inside the subgrid's first and last tracks, so those tracks
+    // add the gutter to their own width; otherwise priority would run into the status mark.
+    <ul className="grid grid-cols-[calc(var(--gutter)+40px)_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_calc(var(--gutter)+80px)] gap-x-3.5 divide-y max-md:block">
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-11 grid-cols-subgrid items-center gap-x-3 px-4 py-1.75 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:px-3.5 max-md:py-3 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:py-2.5 max-md:[grid-template-areas:'status_main_main_main_updated'_'._id_prio_owner_owner']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>
@@ -353,6 +457,10 @@ export function TaskList({
     </ul>
   );
 }
+
+/** Above the row link's cover, so its links stay clickable. */
+const DEPENDENCY =
+  "relative z-1 inline-flex min-h-6 items-center gap-1 text-meta text-muted-foreground";
 
 function TaskMain({ task, done, now }: TaskRowData) {
   // Blockers already done no longer hold the task up.
@@ -372,22 +480,26 @@ function TaskMain({ task, done, now }: TaskRowData) {
       >
         <PlainText className="whitespace-normal" text={task.title} />
       </Link>
+      {/* What the task waits for is muted text with an icon; outlined chips are tags. */}
       {blockers.length > 0 && (
-        <Badge variant="outline" shape="tag" className="relative z-1">
-          blocked by{" "}
-          {blockers.map((id, index) => (
-            <Fragment key={id}>
-              {index > 0 && ", "}
-              <Link
-                className="inline-flex min-h-6 items-center tabular-nums"
-                to="/tasks/$id"
-                params={{ id }}
-              >
-                {id}
-              </Link>
-            </Fragment>
-          ))}
-        </Badge>
+        <span className={DEPENDENCY} data-dependency="blockers">
+          <Icon name="link" className="size-3.5 flex-none" />
+          <span>
+            blocked by{" "}
+            {blockers.map((id, index) => (
+              <Fragment key={id}>
+                {index > 0 && ", "}
+                <Link
+                  className="ident inline-flex min-h-6 items-center text-foreground"
+                  to="/tasks/$id"
+                  params={{ id }}
+                >
+                  {id}
+                </Link>
+              </Fragment>
+            ))}
+          </span>
+        </span>
       )}
       {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
       {!task.auto && (
@@ -402,9 +514,12 @@ function TaskMain({ task, done, now }: TaskRowData) {
         </Badge>
       )}
       {waitsUntil && (
-        <Badge variant="outline" shape="tag" className="relative z-1">
-          waits until <AbsTime at={waitsUntil} />
-        </Badge>
+        <span className={DEPENDENCY} data-dependency="date">
+          <Icon name="clock" className="size-3.5 flex-none" />
+          <span>
+            waits until <DayTime at={waitsUntil} now={now} />
+          </span>
+        </span>
       )}
       {task.blocked_reason && (
         <p className="basis-full text-meta text-status-blocked">

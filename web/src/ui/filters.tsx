@@ -45,7 +45,7 @@ export function SearchField({
       <span className="sr-only">{label}</span>
       <Input
         type="search"
-        className="h-[34px] bg-card pl-8 text-foreground shadow-raise dark:bg-card"
+        className="h-[34px] bg-card pl-8 text-foreground shadow-raise disabled:bg-muted disabled:opacity-100 disabled:shadow-none dark:bg-card dark:disabled:bg-muted"
         value={draft}
         placeholder={placeholder}
         onChange={(event) => {
@@ -76,7 +76,7 @@ export function FilterSelect({
   return (
     <label
       className={cn(
-        "flex h-[34px] min-w-0 items-center rounded-md border border-input bg-card shadow-raise focus-within:border-ring focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-ring hover:border-muted-foreground",
+        "flex h-[34px] min-w-0 items-center rounded-md border border-input bg-card shadow-raise focus-within:border-ring focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-ring hover:border-muted-foreground has-disabled:pointer-events-none has-disabled:bg-muted has-disabled:shadow-none",
         className,
       )}
     >
@@ -108,7 +108,7 @@ export function FilterToggle({
   return (
     <label
       className={cn(
-        "flex h-[34px] cursor-pointer items-center gap-2 rounded-md border border-input bg-card pr-3 pl-2.5 text-meta font-medium whitespace-nowrap shadow-raise has-checked:border-primary/45 has-checked:bg-primary-soft has-checked:text-link has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring max-md:pr-2.5 max-md:pl-2 [&_input]:outline-none",
+        "flex h-[34px] cursor-pointer items-center gap-2 rounded-md border border-input bg-card pr-3 pl-2.5 text-meta font-medium whitespace-nowrap shadow-raise has-checked:border-signal/45 has-checked:bg-primary-soft has-checked:text-link has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-disabled:pointer-events-none has-disabled:bg-muted has-disabled:shadow-none max-md:pr-2.5 max-md:pl-2 [&_input]:outline-none",
         className,
       )}
     >

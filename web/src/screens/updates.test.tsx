@@ -5,7 +5,15 @@ import { HOSTILE_SAID, LONG_SAID } from "../../dev/fixtures.ts";
 import { createApi } from "../api/client.ts";
 import type { Updates } from "../api/schema.ts";
 import { agentIndex } from "../ui/common.tsx";
-import { isLong, markShownSeen, newestAt, unseenCount, UpdatesView } from "./updates.tsx";
+import { act, fireEvent, screen, within } from "@testing-library/react";
+import {
+  isLong,
+  markShownSeen,
+  newestAt,
+  unseenCount,
+  UpdatesHeader,
+  UpdatesView,
+} from "./updates.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const fresh = () => new DevState(() => now);
@@ -20,9 +28,15 @@ const none: Updates = {
   more: false,
 };
 
-const view = async (data: Updates, board = "") =>
-  (await renderInApp(<UpdatesView updates={data} agents={agents} board={board} />)).container
-    .innerHTML;
+const view = async (data: Updates) =>
+  (
+    await renderInApp(
+      <>
+        <UpdatesHeader updates={data} />
+        <UpdatesView updates={data} agents={agents} />
+      </>,
+    )
+  ).container.innerHTML;
 
 describe("updates section", () => {
   test("with nothing new it says so and offers no mark-seen", async () => {
@@ -30,6 +44,29 @@ describe("updates section", () => {
     expect(html).toContain("You're up to date");
     expect(html).not.toContain("Mark all seen");
     expect(html).not.toContain("update-group");
+  });
+
+  test("the header says since when and offers a quiet mark-seen", async () => {
+    await renderInApp(<UpdatesHeader updates={updates} />);
+    expect(screen.getByText(/^Since/)).toBeTruthy();
+    const mark = screen.getByRole("button", { name: "Mark all seen" });
+    expect(mark.getAttribute("data-variant")).toBe("ghost");
+  });
+
+  test("a finished task is one line; its summary opens below it on demand", async () => {
+    await renderInApp(<UpdatesView updates={updates} agents={agents} />);
+    const first = updates.done[0]!;
+    const toggle = screen.getByRole("button", { name: `Show the summary of ${first.task}` });
+    const detail = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(detail?.hidden).toBe(true);
+    // The row itself still links the task.
+    const row = toggle.closest("li")!;
+    expect(within(row).getAllByRole("link")[0]?.getAttribute("href")).toBe(`/tasks/${first.task}`);
+    await act(() => fireEvent.click(toggle));
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.getAttribute("aria-label")).toBe(`Hide the summary of ${first.task}`);
+    expect(detail?.hidden).toBe(false);
   });
 
   test("lists finished tasks with link, board, owner handle, summary and PR and commit evidence", async () => {
@@ -42,7 +79,7 @@ describe("updates section", () => {
     // The summary is markdown: bold and code become elements.
     expect(html).toContain("<strong>Review the PR</strong>");
     expect(html).toContain('href="https://github.com/example/board-web/pull/12"');
-    expect(html).toContain("<code>9b3f0d1</code>");
+    expect(html).toContain(">9b3f0d1</code>");
     // Checks are on the task page; the update shows what to open.
     expect(html).not.toContain("bun run check");
     // A task done without a summary, and its parent.
@@ -73,12 +110,6 @@ describe("updates section", () => {
   test("says when older items were cut", async () => {
     expect(await view({ ...updates, more: true })).toContain("older ones were cut");
     expect(await view(updates)).not.toContain("older ones were cut");
-  });
-
-  test("with a board filter it cannot mark seen, since the cursor covers every board", async () => {
-    const html = await view(state.updates(new URLSearchParams({ board: "docs" })), "docs");
-    expect(html).not.toContain("Mark all seen");
-    expect(html).toContain('href="/asks"');
   });
 
   test("counts what is unseen and finds the newest shown time", async () => {

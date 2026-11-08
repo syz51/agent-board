@@ -645,7 +645,10 @@ impl Command {
                 text,
                 ..
             } => {
-                check_chars("about", about, FEEDBACK_ABOUT_MAX)?;
+                // A plain error, not reported: the server answers an over-long about
+                // with `about "…" is not a setup name`, under another signature.
+                check_chars("about", about, FEEDBACK_ABOUT_MAX)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
                 check_opt("signature", signature, FEEDBACK_SIGNATURE_MAX)?;
                 ops::check_chars_or(
                     "text",
@@ -677,6 +680,31 @@ impl Command {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The route template of the request whose text [`Self::check_text_limits`] checks, as
+    /// the server records its errors.
+    fn checked_route(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Add(_) => "POST /v1/tasks",
+            Self::Update(_) => "PATCH /v1/tasks/{id}",
+            Self::Done(_) => "POST /v1/tasks/{id}/done",
+            Self::Note { .. } => "POST /v1/tasks/{id}/notes",
+            // Without both, it shows the handoff and sends no text.
+            Self::Handoff {
+                now: Some(_),
+                next: Some(_),
+                ..
+            } => "PUT /v1/agents/{id}/handoff",
+            Self::Ask { .. } => "POST /v1/asks",
+            Self::Answer { .. } => "POST /v1/asks/{id}/answer",
+            Self::Errors { .. } => "GET /v1/errors",
+            Self::Feedback { .. } => "POST /v1/feedback",
+            Self::Resolve { .. } => "POST /v1/feedback/{id}/resolve",
+            Self::Board(BoardCommand::Create { .. }) => "POST /v1/boards",
+            Self::Board(BoardCommand::Update { .. }) => "PATCH /v1/boards/{slug}",
+            _ => return None,
+        })
     }
 
     /// Commands that act as the calling agent, which must then be registered.
@@ -732,6 +760,30 @@ pub async fn run(cli: Cli) -> i32 {
     code
 }
 
+/// How long a refused command waits for the server to record the refusal.
+const REFUSAL_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Records a refusal made before sending, so the server's signals count it like its own
+/// (`POST /v1/errors`). Best effort: a failure is logged at debug level only, so the
+/// command's output and exit code stay as they were.
+async fn report_refusal(ctx: &Ctx, route: &str, refused: &ops::Refused) {
+    if ctx.client.agent().is_none() {
+        return;
+    }
+    let body = board_proto::ClientError {
+        code: board_proto::ErrorCode::Invalid,
+        route: route.to_owned(),
+        message: refused.message.clone(),
+    };
+    if let Err(err) = ctx
+        .client
+        .report_refusal(&body, REFUSAL_REPORT_TIMEOUT)
+        .await
+    {
+        tracing::debug!("recording the refusal on the server failed: {err:#}");
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<()> {
     let home = Home::from_env()?;
     let json = cli.json;
@@ -748,7 +800,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
         let ctx = Ctx::load(home.clone(), agent()?, None)?;
         Ok(loaded.get_or_init(|| ctx).clone())
     };
-    cli.command.check_text_limits()?;
+    if let Err(err) = cli.command.check_text_limits() {
+        if let (Some(refused), Some(route)) = (
+            err.downcast_ref::<ops::Refused>(),
+            cli.command.checked_route(),
+        ) {
+            match ctx() {
+                Ok(ctx) => report_refusal(&ctx, route, refused).await,
+                Err(err) => tracing::debug!("not recording the refusal on the server: {err:#}"),
+            }
+        }
+        return Err(err);
+    }
     if cli.command.acts_as_agent() {
         ctx()?.ensure_registered().await?;
     }
@@ -1050,5 +1113,49 @@ mod tests {
             update.contains("[possible values: open, doing, blocked, review, dropped]"),
             "done goes through board done: {update}"
         );
+    }
+
+    #[test]
+    fn every_refusal_names_a_route_the_server_records() {
+        let long = "x".repeat(5000);
+        let long = long.as_str();
+        let cases: &[&[&str]] = &[
+            &["add", long],
+            &["update", "factory-1", "--title", long],
+            &["done", "factory-1", "--pr", long],
+            &["note", "factory-1", long],
+            &["handoff", "--now", long, "--next", "x"],
+            &["ask", long],
+            &["answer", "7", long],
+            &["errors", "--grep", long],
+            &["feedback", long],
+            &["resolve", "board-feedback-1", "--declined", long],
+            &["board", "create", "factory", "--title", long],
+            &["board", "update", "factory", "--goal", long],
+        ];
+        let parse = |args: &[&str]| Cli::try_parse_from([&["board"][..], args].concat()).unwrap();
+        for args in cases {
+            let cli = parse(args);
+            let err = cli.command.check_text_limits().unwrap_err();
+            let refused = err.downcast_ref::<ops::Refused>().unwrap();
+            assert!(
+                board_proto::TooLong::parse(&refused.message).is_some(),
+                "{args:?}: the server would refuse {refused}"
+            );
+            let route = cli.command.checked_route().unwrap();
+            assert!(
+                board_proto::CLIENT_ERROR_ROUTES.contains(&route),
+                "{args:?}: {route}"
+            );
+        }
+
+        // Not reported: a handoff that only shows, and an about the server refuses with
+        // another message.
+        let show = parse(&["handoff", "--blockers", long]);
+        assert!(show.command.check_text_limits().is_err());
+        assert_eq!(show.command.checked_route(), None);
+        let about = parse(&["feedback", "--about", long, "x"]);
+        let err = about.command.check_text_limits().unwrap_err();
+        assert!(err.downcast_ref::<ops::Refused>().is_none(), "{err}");
     }
 }

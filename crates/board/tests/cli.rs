@@ -1633,7 +1633,7 @@ fn over_long_text_fails_before_any_request() {
         let err = stderr(&out);
         assert!(err.contains(message), "{err}");
         assert!(err.contains("\nnext: shorten"), "{err}");
-        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+        assert_only_the_refusal_was_sent(&e, &args);
     }
 
     let out = e.run(&["note", "factory-12", &"x".repeat(450)]);
@@ -1735,8 +1735,117 @@ fn other_over_long_text_fails_before_any_request() {
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let err = stderr(&out);
         assert!(err.contains(message) && err.contains(goes), "{err}");
-        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+        assert_only_the_refusal_was_sent(&e, &args);
     }
+}
+
+/// The request refused never reached the stub: only the record of its refusal did.
+fn assert_only_the_refusal_was_sent(e: &Env, args: &[&str]) {
+    let sent = e.stub.requests();
+    let routes: Vec<String> = sent
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(routes, ["POST /v1/errors"], "{args:?}");
+    assert_eq!(sent[0].body["code"], "invalid", "{args:?}");
+    e.stub.clear();
+}
+
+const REFUSED_NOTE: &str = "board: text is 501 characters; the limit is 500 (not sent)\n\
+    next: shorten text to at most 500 characters, or split it across notes and put the \
+    detail in the task body or task_done evidence\n";
+
+#[test]
+fn a_refused_note_is_recorded_on_the_server_and_never_sent() {
+    let e = env();
+    e.stub.on_status("POST /v1/errors", 204, ());
+    let out = e.run(&["note", "factory-12", &"x".repeat(501)]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), REFUSED_NOTE);
+    assert!(stdout(&out).is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-12/notes")
+            .is_empty()
+    );
+    let sent = e.stub.requests_to("POST /v1/errors");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        json!({
+            "code": "invalid",
+            "route": "POST /v1/tasks/{id}/notes",
+            "message": "text is 501 characters; the limit is 500",
+        })
+    );
+    assert_eq!(sent[0].agent.as_deref(), Some(ME));
+    assert_eq!(
+        sent[0].auth.as_deref(),
+        Some(format!("Bearer {TOKEN}").as_str())
+    );
+}
+
+#[test]
+fn a_refusal_prints_the_same_whether_or_not_the_server_records_it() {
+    let note = "x".repeat(501);
+    let args = ["note", "factory-12", note.as_str()];
+
+    // A server of another build: its build headers add no warning.
+    let e = env();
+    e.stub.on_status("POST /v1/errors", 204, ());
+    e.stub.build("9.9.9", "0123456789ab");
+    let out = e.run(&args);
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+    assert_eq!(e.stub.requests_to("POST /v1/errors").len(), 1);
+
+    // A server that refuses the record.
+    let e = env();
+    e.stub
+        .on_error("POST /v1/errors", 400, "invalid", "no", "fix it");
+    let out = e.run(&args);
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+
+    // An unreachable server: nothing listens on the port.
+    let dir = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let home = home_for(dir.path(), &format!("http://127.0.0.1:{port}"));
+    let out = board(
+        &home,
+        dir.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &args,
+        "",
+    );
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+    assert!(stdout(&out).is_empty());
+
+    // A server that never answers holds the refusal up at most the report's timeout.
+    let e = env();
+    e.stub.hang(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let out = e.run(&args);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
 }
 
 #[test]

@@ -11,8 +11,7 @@ import { Shell, NotFound } from "./app.tsx";
 import { AgentsScreen } from "./screens/agents.tsx";
 import { AskScreen, AsksScreen } from "./screens/asks.tsx";
 import { BoardScreen } from "./screens/board.tsx";
-import { BoardsScreen } from "./screens/boards.tsx";
-import { EventsScreen } from "./screens/events.tsx";
+import { HomeScreen } from "./screens/boards.tsx";
 import { TaskScreen } from "./screens/task.tsx";
 
 /** A search value as a non-empty string, or nothing. */
@@ -54,7 +53,7 @@ export function stringifySearch(search: Record<string, unknown>): string {
 const rootRoute = createRootRoute({ component: Shell, notFoundComponent: NotFound });
 
 const routeTree = rootRoute.addChildren([
-  createRoute({ getParentRoute: () => rootRoute, path: "/", component: BoardsScreen }),
+  createRoute({ getParentRoute: () => rootRoute, path: "/", component: HomeScreen }),
   createRoute({
     getParentRoute: () => rootRoute,
     path: "/boards/$slug",
@@ -79,7 +78,6 @@ const routeTree = rootRoute.addChildren([
     component: AsksScreen,
   }),
   createRoute({ getParentRoute: () => rootRoute, path: "/asks/$id", component: AskScreen }),
-  createRoute({ getParentRoute: () => rootRoute, path: "/events", component: EventsScreen }),
 ]);
 
 export function createAppRouter(history?: RouterHistory) {

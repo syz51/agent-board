@@ -9,13 +9,12 @@ page sends no credentials of its own.
 
 | Path | Shows |
 |---|---|
-| `/` | Boards: counts, open asks, autopilot switch (confirmed before `PATCH /v1/boards/{slug}`), coordinator handle, state and paused-until time |
-| `/boards/<slug>` | Tasks grouped as open (ready first), doing, blocked, review, and done in the last 30 days, with owner, priority, unfinished blockers and blocked reason; filters for text, priority, owner and ready-only, kept in the URL |
+| `/` | Home, in four sections that each collapse and move up or down (buttons, or a drag grip on wide screens), kept per browser in `localStorage`: Waiting on you (the newest open asks), Boards (counts, open asks, autopilot switch confirmed before `PATCH /v1/boards/{slug}`, coordinator handle, state and paused-until time), In progress (doing and review tasks on every board that is not closed, in a Doing and a Review group), and "Since you last looked" (tasks done, one line each, whose summary and PR and commit evidence open on demand, and coordinators' turn endings, long ones collapsed, from `GET /v1/updates`, with "Mark all seen" in the section header: `PUT /v1/updates/seen` with the newest shown item's time). |
+| `/boards/<slug>` | Tasks grouped as doing, review, blocked, ready, waiting, and done in the last 30 days, with owner, priority, unfinished blockers, start date and blocked reason; each group collapses (done starts collapsed; the choice is kept per browser); filters for text, priority, owner and ready-only, kept in the URL, shown once the board has tasks to filter |
 | `/tasks/<id>` | Summary for the user when done, body (sanitized markdown), acceptance, blockers, blocks, parent and subtasks, evidence, notes, history |
 | `/agents` | State, device, runtime, role, repo and branch, current task, handoff, last seen; for a coordinator, its three latest turn endings, collapsed (`GET /v1/agents/{id}/said`); filter by state |
-| `/asks` | Needs you: open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`); below them, "Since you last looked": tasks done with their summary and PR and commit evidence, and coordinators' turn endings, long ones collapsed (`GET /v1/updates`), with "Mark all seen" (`PUT /v1/updates/seen` with the newest shown item's time). A dot on Needs you in the navigation marks unseen updates |
+| `/asks` | Needs you: only what waits on the user's decision or action, the open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`). Its navigation badge counts them |
 | `/asks/<id>` | One ask; the deep link that Telegram messages carry |
-| `/events` | The live event feed, filterable by board, with older pages on demand |
 
 Every screen has a loading state, an empty state, and an error state that shows the server's
 `ApiError.message` and `next`. When a refresh fails, the error appears above the last good data.
@@ -95,8 +94,7 @@ updates seen cursor starts 8 hours back; "Mark all seen" moves it, until the ser
   refetches the shown queries that carry an invalidated tag, cancelling a refresh in flight
   so the last event wins. Queries that are not shown are marked stale and refetched when
   they are next shown. Nothing refetches on a timer or on window focus. After a reconnect,
-  or an event the view cannot read, everything shown is refetched. Live events are added to
-  the event feed's query data as they arrive.
+  or an event the view cannot read, everything shown is refetched.
 
 ## Untrusted text
 
@@ -106,7 +104,8 @@ event payloads) is untrusted:
 - Short fields render as text. Bodies and questions render as markdown through tokens:
   raw HTML shows as literal text, and headings start at `h3`.
 - Links work only for absolute `http`, `https` and `mailto` targets. They always show their
-  target, and open in a new tab with `noopener noreferrer`. Other links show what they
+  target's host (the address for `mailto`, the whole URL in a tooltip), and open in a new
+  tab with `noopener noreferrer`. Other links show what they
   pointed to, struck through. Images are never loaded; they become a link.
 - `build.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
   styles and connections only, no remote images. `<style>` elements need a nonce, which the

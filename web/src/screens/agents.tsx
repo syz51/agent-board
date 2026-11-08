@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
+import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { PlainText } from "@/text/markdown.tsx";
 import {
@@ -13,7 +14,7 @@ import {
   useAgents,
   useTitle,
 } from "@/ui/common.tsx";
-import { Avatar, StatusIcon } from "@/ui/icons.tsx";
+import { Avatar, Icon, StatusIcon } from "@/ui/icons.tsx";
 import { CollapsibleMarkdown } from "./updates.tsx";
 
 const route = getRouteApi("/agents");
@@ -95,7 +96,14 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="grid gap-3">
+            <div className="edge @container divide-y border-y">
+              <div
+                className={`${ROW} hidden h-8 items-center bg-muted text-xs font-medium text-muted-foreground @min-[820px]:grid`}
+                aria-hidden="true"
+              >
+                <span>Agent</span>
+                <span>Working on</span>
+              </div>
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -107,68 +115,66 @@ export function AgentsScreen() {
   );
 }
 
+/**
+ * The agents list's columns from 820px of width: who and where it runs, then what it is
+ * working on, which takes the rest. Two columns leave no empty band between them.
+ */
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1fr)]";
+
+/**
+ * One agent per row: who, its state and where it runs, then its task, handoff and, for a
+ * coordinator, its turn endings. Narrow lists stack the two.
+ */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
+  const where = [
+    agent.role === "coordinator" ? "Coordinator" : null,
+    agent.device,
+    agent.runtime,
+    agent.repo?.replace(/^github\.com\//, ""),
+    agent.branch,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
-    <article className="grid gap-3.5 rounded-lg border bg-card px-4 py-3.5 shadow-raise lg:grid-cols-[248px_minmax(0,1fr)] lg:gap-6">
-      <div className="grid content-start justify-items-start gap-2">
-        {/* The avatar beside the handle, with the state on its own line under it. */}
-        <header className="grid grid-cols-[auto_minmax(0,1fr)] items-center justify-items-start gap-x-2.5 gap-y-0.5">
-          <Avatar handle={agent.handle} large className="row-span-2 size-9 text-xs" />
-          <h2
-            className="text-base font-semibold tracking-[-0.011em] [font-variant-numeric:tabular-nums_slashed-zero]"
-            title={agent.id}
-          >
-            {agent.handle}
-          </h2>
+    <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
+      <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
+        <Avatar handle={agent.handle} large className="row-span-3 size-7 self-start text-2xs" />
+        <h2
+          className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
+          title={agent.id}
+        >
+          {agent.handle}
+        </h2>
+        {/* Its state and when it was last seen share a line: together they answer "is it
+            alive?". */}
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
           <AgentStateBadge agent={agent} />
-        </header>
-        <dl className="m-0 grid gap-0.5 text-meta leading-5 [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
-          {agent.role === "coordinator" && (
-            <div>
-              <dt>Role</dt>
-              <dd>Coordinator</dd>
-            </div>
-          )}
-          <div>
-            <dt>Device</dt>
-            <dd>
-              {agent.device} · {agent.runtime}
-            </dd>
-          </div>
-          {agent.repo && (
-            <div>
-              <dt>Repo</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.repo.replace(/^github\.com\//, "")}</code>
-              </dd>
-            </div>
-          )}
-          {agent.branch && (
-            <div>
-              <dt>Branch</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.branch}</code>
-              </dd>
-            </div>
-          )}
-          <div>
-            <dt>Last seen</dt>
-            <dd>
-              <RelTime at={agent.last_seen} />
-            </dd>
-          </div>
-        </dl>
-      </div>
-      <div className="grid min-w-0 content-start gap-2.5">
+          <span className="text-meta text-muted-foreground">
+            seen <RelTime at={agent.last_seen} />
+          </span>
+        </div>
+        {/* Where it runs, as one quiet line under who it is; a line too long for the column
+            ends in an ellipsis and shows whole on hover. */}
+        <p
+          className="col-start-2 w-full truncate text-meta text-muted-foreground"
+          data-slot="where"
+          title={where}
+        >
+          {where}
+        </p>
+      </header>
+      <div className="grid min-w-0 content-start gap-2">
         <p className="font-medium">
           {task ? (
+            // One run of text, so the id and the title share a line and the title wraps after
+            // it, never onto a line of its own.
             <Link
-              className="inline-flex flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
+              className="block min-h-6 py-0.5 text-foreground"
               to="/tasks/$id"
               params={{ id: task.id }}
             >
-              <StatusIcon status="doing" className="self-center" />
-              <span className="ident text-meta text-muted-foreground">{task.id}</span>{" "}
+              <StatusIcon status="doing" className="mr-2 inline-block align-[-2px]" />
+              <span className="ident mr-2 text-meta text-muted-foreground">{task.id}</span>
               <PlainText className="whitespace-normal" text={task.title} />
             </Link>
           ) : agent.title ? (
@@ -184,10 +190,13 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   );
 }
 
-const handoffBox = "bg-muted grid gap-1.5 rounded-sm border px-3 py-2.5";
-
-function HandoffView({ agentId }: { agentId: string }) {
+/**
+ * An agent's handoff, its labels left of their values. Beside a task, a rule sets it off;
+ * `stacked`, for a narrow card, drops the rule and narrows the label column.
+ */
+export function HandoffView({ agentId, stacked }: { agentId: string; stacked?: boolean }) {
   const handoff = useQuery(queries.handoff(agentId));
+  const handoffBox = stacked ? "grid gap-1 text-meta" : "grid gap-1 border-l-2 pl-3 text-meta";
   if (handoff.error && handoff.data === undefined) {
     return <ErrorNotice error={handoff.error} retry={() => void handoff.refetch()} compact />;
   }
@@ -208,7 +217,15 @@ function HandoffView({ agentId }: { agentId: string }) {
           · <RelTime at={updated_at} />
         </span>
       </p>
-      <dl className="m-0 grid gap-1 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[64px_minmax(0,1fr)] [&>div]:gap-2.5">
+      <dl
+        className={cn(
+          "m-0 grid [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-sm [&_dd]:text-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid",
+          "gap-0.5 [&>div]:gap-2",
+          stacked
+            ? "[&>div]:grid-cols-[40px_minmax(0,1fr)]"
+            : "[&>div]:grid-cols-[72px_minmax(0,1fr)]",
+        )}
+      >
         <div>
           <dt>Now</dt>
           <dd>
@@ -243,8 +260,12 @@ function SaidView({ agentId }: { agentId: string }) {
   const latest = said.data?.[0];
   const note = "text-muted-foreground mb-1 text-xs";
   return (
-    <details className="text-sm">
-      <summary className="min-h-7 cursor-pointer py-0.5 text-meta text-muted-foreground hover:text-foreground">
+    <details className="group/said text-sm">
+      <summary className="-mx-1.5 inline-flex min-h-7 cursor-pointer list-none items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-meta font-medium text-subtle-foreground hover:bg-secondary hover:text-foreground [&::-webkit-details-marker]:hidden">
+        <Icon
+          name="chevron"
+          className="size-3.5 transition-transform group-open/said:rotate-90 motion-reduce:transition-none"
+        />
         Recent turn endings
         {latest && (
           <>

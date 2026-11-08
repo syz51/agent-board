@@ -1,5 +1,5 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { type ReactNode, useEffect } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useState } from "react";
 import type { ApiFailure } from "@/api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "@/api/schema.ts";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
-import { useNow } from "@/live/runtime.ts";
+import { useConnection, useNow } from "@/live/runtime.ts";
 import { Avatar, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
 
 export function useTitle(title: string): void {
@@ -40,33 +40,56 @@ export function ErrorNotice({
   retry?: (() => void) | undefined;
   compact?: boolean;
 }) {
+  // While the connection banner shows, a failed page is most likely the same outage. The
+  // banner alone raises the alarm; the card is a neutral placeholder that says when it loads.
+  const { kind } = useConnection();
+  const linkDown = kind === "offline" || kind === "reconnecting";
   return (
     <Alert
-      variant="error"
+      variant={compact ? "error" : "default"}
+      // The placeholder is news, not a second alarm: assistive tech hears the banner's alarm once.
+      role={linkDown && !compact ? "status" : "alert"}
       className={cn(
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
+        // A rail on the left edge, as ask cards have, so the failure reads before the details.
+        !compact &&
+          !linkDown &&
+          "overflow-hidden border-error-border before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:bg-error",
       )}
     >
+      {/* The tinted tile tells a failure from an empty state, which has a grey one. */}
       {!compact && (
-        <span className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-card">
-          <Icon name="plug" className="size-4.5" />
+        <span
+          className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-error-soft text-error"
+          data-slot="failure-icon"
+        >
+          <Icon name={linkDown ? "plug" : "alert"} className="size-4.5" />
         </span>
       )}
       <div className="grid flex-[1_1_280px] gap-1">
-        <AlertTitle className="col-start-1 line-clamp-none font-semibold">
+        <AlertTitle
+          className={cn(
+            "col-start-1 line-clamp-none font-semibold",
+            !compact && "text-base text-foreground",
+          )}
+        >
           {error.message}
         </AlertTitle>
-        <AlertDescription className="col-start-1 text-error">
-          {error.next && <p>{error.next}</p>}
-          <p className="text-xs opacity-85">
+        <AlertDescription className="col-start-1 text-foreground!">
+          {linkDown && !compact ? (
+            <p>This page loads again once the connection is back.</p>
+          ) : (
+            error.next && <p className="first-letter:uppercase">{error.next}</p>
+          )}
+          <p className="text-xs text-muted-foreground">
             {error.status > 0 ? `HTTP ${error.status} · ` : ""}
             <code>{error.code}</code>
           </p>
         </AlertDescription>
       </div>
       {retry && (
-        <Button type="button" variant="outline" onClick={retry}>
+        <Button type="button" onClick={retry}>
           Try again
         </Button>
       )}
@@ -84,11 +107,11 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1.5 rounded-lg border border-dashed border-input bg-muted px-6 py-12 text-center text-muted-foreground">
-      <span className="mb-1.5 grid size-10 place-items-center rounded-[10px] border bg-card text-subtle-foreground shadow-raise">
-        <Icon name={icon} className="size-5" />
+    <div className="grid justify-items-center gap-1 rounded-lg border px-6 py-9 text-center text-meta text-muted-foreground">
+      <span className="mb-1.5 grid size-8 place-items-center rounded-md border bg-card text-subtle-foreground">
+        <Icon name={icon} className="size-4" />
       </span>
-      <p className="text-base font-semibold text-foreground">{title}</p>
+      <p className="text-sm font-semibold text-foreground">{title}</p>
       {children && <p className="max-w-[48ch]">{children}</p>}
     </div>
   );
@@ -157,6 +180,26 @@ export function AbsTime({ at }: { at: string }) {
   return <time dateTime={at}>{formatAbsolute(at)}</time>;
 }
 
+const dayThisYear = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+const dayOtherYear = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+
+/** A date alone: "Nov 22", with the year only when it is not this year's. */
+export function formatDay(at: string, now: number): string {
+  const when = new Date(at);
+  return when.getFullYear() === new Date(now).getFullYear()
+    ? dayThisYear.format(when)
+    : dayOtherYear.format(when);
+}
+
+/** A date alone, for a moment that matters by its day; the full time is in `title`. */
+export function DayTime({ at, now }: { at: string; now: number }) {
+  return (
+    <time dateTime={at} title={formatAbsolute(at)}>
+      {formatDay(at, now)}
+    </time>
+  );
+}
+
 /** A relative time; the absolute time is in `title` and `datetime`. */
 export function RelTime({ at }: { at: string }) {
   const now = useNow();
@@ -190,7 +233,7 @@ export function StateDot({ state }: { state: "running" | "paused" | "idle" | "en
   );
 }
 
-/** A pill with a state dot: agent and board states. */
+/** A state dot and its word: agent and board states, drawn the same on every page. */
 export function StatePill({
   state,
   children,
@@ -201,12 +244,12 @@ export function StatePill({
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 items-center gap-1.5 rounded-full pr-2.25 pl-1.75 text-xs font-[550] whitespace-nowrap",
+        "inline-flex min-h-5 items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
         state === "running"
-          ? "bg-status-ready-soft text-status-ready"
+          ? "text-status-ready"
           : state === "paused"
-            ? "bg-amber-soft text-amber"
-            : "bg-status-open-soft text-status-open",
+            ? "text-amber"
+            : "text-status-open",
       )}
     >
       <StateDot state={state} />
@@ -241,7 +284,14 @@ export function Owner({
   task: Pick<Task, "owner" | "owner_stale" | "status">;
   agents: Map<string, Agent>;
 }) {
-  if (!task.owner) return <span className="text-meta text-muted-foreground">Unowned</span>;
+  if (!task.owner) {
+    return (
+      // A word, not a dash: nobody has claimed it, which is not the same as missing data.
+      <span className="inline-flex min-h-5 min-w-0 items-center text-meta text-muted-foreground">
+        Unowned
+      </span>
+    );
+  }
   const closed = task.status === "done" || task.status === "dropped";
   return (
     <span className="inline-flex min-w-0 items-center gap-2">
@@ -295,15 +345,15 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+    <header className="mb-5 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
       <div className="grid min-w-0 gap-1.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <h1 className="text-display font-[650] tracking-[-0.022em] text-balance max-md:text-display-phone">
+          <h1 className="text-display font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
             {title}
           </h1>
           {children}
         </div>
-        {sub && <p className="max-w-[68ch] text-sm text-muted-foreground">{sub}</p>}
+        {sub && <p className="max-w-[72ch] text-sm text-muted-foreground">{sub}</p>}
       </div>
       {aside}
     </header>
@@ -314,7 +364,7 @@ export function PageHeader({
 export function Crumbs({ children, current }: { children: ReactNode; current: ReactNode }) {
   return (
     <nav
-      className="mb-3 flex flex-wrap items-center gap-1.5 text-meta text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
+      className="mb-3 flex flex-wrap items-center gap-1.5 text-meta text-muted-foreground [&_a]:inline-flex [&_a]:min-h-6 [&_a]:items-center [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
       aria-label="Breadcrumb"
     >
       {children}
@@ -339,10 +389,7 @@ export function SectionTitle({
   children: ReactNode;
 }) {
   return (
-    <h2
-      id={id}
-      className="mb-3 flex items-baseline gap-2 text-base font-semibold tracking-[-0.011em]"
-    >
+    <h2 id={id} className="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">
       {icon}
       {children}
       {count !== undefined && (
@@ -354,9 +401,41 @@ export function SectionTitle({
   );
 }
 
+const COUNT_TONE = {
+  /** The total that waits on the user: the one filled count, so it is seen first. */
+  solid: "bg-amber text-card",
+  /** A share of that total, such as one board's asks: amber, but tinted. */
+  soft: "bg-amber-soft text-amber ring-1 ring-amber/30 ring-inset",
+  /** A count that only informs. */
+  neutral: "bg-secondary text-subtle-foreground ring-1 ring-input ring-inset",
+};
+
+/**
+ * A count in a pill, the one way the sidebar and the phone tab bar show a count. Only its
+ * colour changes, with what the count asks of the user.
+ */
+export function Count({
+  value,
+  tone,
+  className,
+  ...props
+}: { value: number; tone: keyof typeof COUNT_TONE } & Omit<ComponentProps<"span">, "children">) {
+  return (
+    <span
+      className={cn(
+        "inline-grid h-4.5 min-w-5 flex-none place-items-center rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal tabular-nums",
+        COUNT_TONE[tone],
+        className,
+      )}
+      {...props}
+    >
+      {value}
+    </span>
+  );
+}
+
 /** A bordered list of rows on a card surface. */
-export const listClass =
-  "bg-card shadow-raise divide-y overflow-hidden rounded-lg border [&>li]:border-border";
+export const listClass = "edge bg-card divide-y overflow-hidden border-y [&>li]:border-border";
 
 /** An ask's kind as an icon and a word: actions in amber, decisions in violet. */
 export function AskKind({ kind }: { kind: "action" | "decision" }) {
@@ -370,5 +449,36 @@ export function AskKind({ kind }: { kind: "action" | "decision" }) {
       <Icon name={kind === "action" ? "hand" : "question"} className="size-3.5" />
       {kind === "action" ? "Action" : "Decision"}
     </span>
+  );
+}
+
+/**
+ * Agent text cut to two lines (or `lines`) with an ellipsis. It is a button: a click, tap,
+ * Enter or Space shows the whole text, so it can be read without hovering.
+ */
+export function ExpandableLine({
+  text,
+  lines = 2,
+  className,
+}: {
+  text: string;
+  lines?: 1 | 2;
+  className?: string | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <button
+      type="button"
+      className={cn(
+        "block min-h-6 w-full min-w-0 cursor-pointer rounded-xs text-left text-inherit",
+        open ? "whitespace-pre-wrap" : lines === 1 ? "line-clamp-1" : "line-clamp-2",
+        className,
+      )}
+      aria-expanded={open}
+      title={open ? undefined : text}
+      onClick={() => setOpen(!open)}
+    >
+      {text}
+    </button>
   );
 }
