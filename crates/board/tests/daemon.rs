@@ -2838,8 +2838,8 @@ fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
         "Never change files, switch branches or merge in the project root",
-        "you run in your own worktree on branch `coordinator/<board>`",
-        "on a new branch per task",
+        "Do any file work yourself in a worktree of your own, on a new branch per task",
+        "when your working directory is the project root, as for an older or adopted coordinator, add a worktree first",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
@@ -2972,8 +2972,8 @@ async fn a_git_project_starts_the_coordinator_in_its_own_worktree() {
     };
     assert_eq!(worktree.as_ref(), Some(&expected));
 
-    // A re-start finds the branch an earlier coordinator left, with its clean worktree, and
-    // frees both so T3 can create the branch again.
+    // A re-start leaves the branch and worktree an earlier coordinator left, which a live
+    // thread may still use, and takes a branch of its own.
     let old = dir.path().join("old");
     git(
         &repo,
@@ -2992,8 +2992,9 @@ async fn a_git_project_starts_the_coordinator_in_its_own_worktree() {
     let [Call::Start { worktree, .. }] = calls.as_slice() else {
         panic!("{calls:?}");
     };
-    assert_eq!(worktree.as_ref(), Some(&expected));
-    assert!(!old.exists());
+    let branch = worktree.as_ref().map(|w| w.branch.as_str()).unwrap_or("");
+    assert!(branch.starts_with("coordinator/factory-"), "{worktree:?}");
+    assert!(old.exists());
 
     // A folder outside git starts in the folder itself.
     let config = Config {

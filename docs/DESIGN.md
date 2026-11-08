@@ -255,24 +255,26 @@ settings in use, warned once per edit.
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
 - **Where it runs**: never in the project root, which the user's and other threads share.
-  When the project folder is in a git repository, the daemon starts the thread with
-  `t3 thread start --worktree <base> --branch coordinator/<board>`: T3 creates that branch
-  from `<base>` and runs the thread in a new worktree on it. `<base>` is the remote's
-  default branch (`origin/HEAD`), else `origin/main`, else `main`. A `[board_projects]`
-  folder outside git starts the thread in the folder, as before. The coordinator prompt
-  forbids changing files, switching branches or merging in the project root; file work the
-  coordinator does itself happens in its worktree, on a new branch per task.
-- **Its worktree when the thread ends**: nothing removes it while the thread lives, and
-  ending or archiving the thread in T3 leaves it in place. The next start on that device
-  reuses the branch name and worktree folder. T3 can only create the branch, never check
-  out one that exists, so before each start the daemon frees it without losing work: it
-  forgets worktrees whose folder is gone (`git worktree prune`), removes the old worktree
-  on `coordinator/<board>` when it is clean (git refuses a dirty or locked one), then
-  deletes the branch when `<base>` has all its commits, else renames it to
-  `coordinator/<board>-<UTC time>`. When the old worktree cannot be removed, it keeps the
-  branch, and the new thread starts on `coordinator/<board>-<UTC time>` instead; a person
-  clears such a leftover. A start that resumes an unfinished earlier start adopts that
-  thread and its worktree, and touches no branch.
+  When the project folder is the top of a git repository, the daemon starts the thread
+  with `t3 thread start --worktree <base> --branch <branch>`: T3 creates the branch from
+  `<base>` and runs the thread in a new worktree on it. `<base>` is the remote's default
+  branch (`origin/HEAD`), else the first of `origin/main`, `origin/master`, `main` and
+  `master` that exists, else the start fails and says to set `origin/HEAD`; a remote base
+  is fetched first (a failed fetch is logged, and the local copy used). `<branch>` is
+  `coordinator/<board>`, or `coordinator/<board>-<UTC time>` when that branch exists, since
+  T3 can only create a branch. A folder outside git, or nested in a repository, starts the
+  thread in the folder, as before. The coordinator prompt forbids changing files,
+  switching branches or merging in the project root; file work the coordinator does itself
+  happens in a worktree of its own, on a new branch per task. A coordinator started before
+  this rule, or adopted, still runs in the folder it had; the prompt tells it to add a
+  worktree before such work.
+- **Its worktree when the thread ends**: the daemon never removes a coordinator's
+  worktree or branch. Ending, archiving or replacing the thread leaves both in place,
+  since a thread that lost its record may still run there, and git counts a worktree with
+  only ignored files as clean. The next start finds `coordinator/<board>` taken and starts
+  on a time-stamped branch in a new worktree. Old coordinator worktrees and branches are
+  removed by hand (`git worktree remove`, `git branch -d`) until a cleanup that checks the
+  thread is archived exists.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another
