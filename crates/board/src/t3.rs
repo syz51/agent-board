@@ -9,11 +9,12 @@
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state, with its own worktree
-//!   (`worktreePath`, null for a thread in its project folder); with `--messages 0`
-//!   the hooks read a thread's title, link and, for a delegated thread, its parent
-//!   (`parentThreadId`); with `--messages 100` the daemon reads whether a re-brief whose
-//!   send timed out reached the thread (`messages`: `{role, text}`, oldest first, and
-//!   `thread.status`, the active run's state, else the latest run's, or `idle`).
+//!   (`worktreePath`, null for a thread in its project folder) and how many runs it had
+//!   (`runCount`); with `--messages 0` the hooks read a thread's title, link and, for a
+//!   delegated thread, its parent (`parentThreadId`); with `--messages 100` the daemon
+//!   reads whether a re-brief whose send timed out reached the thread, and whether the user
+//!   wrote to a coordinator lately (`messages`: `{role, text, runId}`, oldest first, with no
+//!   time, and `thread.status`, the active run's state, else the latest run's, or `idle`).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
@@ -37,6 +38,8 @@ pub struct ThreadInfo {
     pub runtime: Runtime,
     /// The thread's own git worktree, for one that runs in a worktree, not its project folder.
     pub worktree: Option<PathBuf>,
+    /// How many runs (turns) the thread has had, when T3 says (`runCount`).
+    pub runs: Option<u64>,
 }
 
 impl ThreadInfo {
@@ -65,8 +68,17 @@ pub struct RecentMessages {
     /// Whether a run is active or queued: a message sent meanwhile may wait in T3's queue,
     /// out of the messages until its run starts.
     pub busy: bool,
-    /// The text of each user message, oldest first.
-    pub user: Vec<String>,
+    /// Each user message, oldest first.
+    pub user: Vec<UserMessage>,
+}
+
+/// A user message of a thread: anything sent to it, by the user, the daemon or T3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMessage {
+    pub text: String,
+    /// The run it started (`runId`), which names the message; none while it waits in T3's
+    /// queue.
+    pub run: Option<String>,
 }
 
 /// How many of a thread's latest messages [`T3::recent_messages`] reads: enough that a
@@ -334,7 +346,7 @@ pub fn is_unknown_thread(stderr: &str, thread: &str) -> bool {
         ))
 }
 
-/// Reads `{"thread": {"archived": …, "providerInstanceId": …, "worktreePath": …}}` from
+/// Reads `{"thread": {"archived": …, "providerInstanceId": …, "worktreePath": …, "runCount": …}}` from
 /// `t3 thread show --json`.
 pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     let thread = &value["thread"];
@@ -350,6 +362,7 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
             .as_str()
             .filter(|p| !p.is_empty())
             .map(PathBuf::from),
+        runs: thread["runCount"].as_u64(),
     }
 }
 
@@ -357,7 +370,7 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
 /// active run's state, else the latest run's (`queued` while its queue is held).
 const BUSY_STATUSES: [&str; 5] = ["preparing", "queued", "starting", "running", "waiting"];
 
-/// Reads `{"thread": {"status": …, "activeRunId": …}, "messages": [{"role", "text", …}]}`
+/// Reads `{"thread": {"status": …, "activeRunId": …}, "messages": [{"role", "text", "runId"}]}`
 /// from `t3 thread show --json`. Output without `thread.status` or the `messages` array is
 /// an error, so a changed format never makes a delivered message look missing.
 pub fn parse_recent_messages(value: &Value) -> Result<RecentMessages> {
@@ -373,7 +386,12 @@ pub fn parse_recent_messages(value: &Value) -> Result<RecentMessages> {
         user: messages
             .iter()
             .filter(|m| m["role"].as_str() == Some("user"))
-            .filter_map(|m| m["text"].as_str().map(str::to_owned))
+            .filter_map(|m| {
+                Some(UserMessage {
+                    text: m["text"].as_str()?.to_owned(),
+                    run: m["runId"].as_str().map(str::to_owned),
+                })
+            })
             .collect(),
     })
 }
@@ -615,9 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn thread_info_reads_archived_provider_and_worktree() {
+    fn thread_info_reads_archived_provider_worktree_and_runs() {
         let info = parse_thread_info(&json!({"thread": {
             "archived": true, "providerInstanceId": "codex", "worktreePath": "/w/factory",
+            "runCount": 543,
         }}));
         assert_eq!(
             info,
@@ -625,6 +644,7 @@ mod tests {
                 archived: true,
                 runtime: Runtime::Codex,
                 worktree: Some(PathBuf::from("/w/factory")),
+                runs: Some(543),
             }
         );
         let info = parse_thread_info(&json!({"thread": {
@@ -636,6 +656,7 @@ mod tests {
                 archived: false,
                 runtime: Runtime::Claude,
                 worktree: None,
+                runs: None,
             }
         );
     }
@@ -648,6 +669,7 @@ mod tests {
             archived,
             runtime: Runtime::Claude,
             worktree: worktree.map(Path::to_path_buf),
+            runs: None,
         };
         // In its project folder: that folder decides, when known.
         assert!(info(false, None).runnable(None));
@@ -685,7 +707,7 @@ mod tests {
                 {"role": "user", "runId": "run:0", "text": "first"},
                 {"role": "assistant", "runId": "run:0", "text": "reply"},
                 {"role": "user", "runId": "run:1"},
-                {"role": "user", "runId": "run:1", "text": "second"},
+                {"role": "user", "runId": null, "text": "second"},
             ],
         }))
         .unwrap();
@@ -693,7 +715,16 @@ mod tests {
             recent,
             RecentMessages {
                 busy: true,
-                user: vec!["first".to_owned(), "second".to_owned()],
+                user: vec![
+                    UserMessage {
+                        text: "first".to_owned(),
+                        run: Some("run:0".to_owned()),
+                    },
+                    UserMessage {
+                        text: "second".to_owned(),
+                        run: None,
+                    },
+                ],
             }
         );
         // A queued or waiting run has no active run id, but may still take a message.

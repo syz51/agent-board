@@ -96,8 +96,18 @@ describe("agent markdown", () => {
   test("autolinks and reference links to unsafe schemes are not followed", () => {
     const html = md("<javascript:alert(2)>\n\n[ref][1]\n\n[1]: javascript:alert(3)");
     expect(hrefs(html)).toEqual([]);
-    expect(html).toContain("link not followed: javascript:alert(2)");
+    // An autolink's text is its target, so the target shows once.
+    expect(html.split("javascript:alert(2)")).toHaveLength(2);
     expect(html).toContain("link not followed: javascript:alert(3)");
+  });
+
+  test("a custom-scheme autolink shows its target once, and a bare URL beside it links", () => {
+    const html = md(
+      "Dispatched to <t3-thread://v2/env-1/mcp:launch:abc>. PR https://example.com/pr/1",
+    );
+    expect(hrefs(html)).toEqual(["https://example.com/pr/1"]);
+    expect(html.split("t3-thread://v2/env-1/mcp:launch:abc")).toHaveLength(2);
+    expect(html).toContain("(link not followed)");
   });
 
   test("a safe link opens in a new tab without a referrer and shows its host", () => {
