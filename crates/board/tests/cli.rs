@@ -2065,3 +2065,28 @@ fn ls_proposals_filters_and_marks_by_the_shared_rule() {
     );
     assert!(text.contains("pending proposal: not ready work."), "{text}");
 }
+
+#[test]
+fn help_names_the_json_shape_and_sends_nothing() {
+    let e = env();
+    for (args, shape) in [
+        (
+            &["asks", "--help"][..],
+            "Print JSON instead of text: a JSON array of asks",
+        ),
+        (
+            &["log", "--help"],
+            "Print JSON instead of text: {events: [...], next_since}",
+        ),
+        (
+            &["--json", "errors", "--help"],
+            "Print JSON instead of text: {signatures: [...], since, retention_days}",
+        ),
+    ] {
+        let out = e.run(args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        let text = stdout(&out);
+        assert!(text.contains(shape), "{args:?}: {text}");
+    }
+    assert!(e.stub.requests().is_empty(), "help sent a request");
+}
