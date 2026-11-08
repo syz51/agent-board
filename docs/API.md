@@ -578,6 +578,13 @@ use, autopilot off). Items get `auto` from that board's autopilot.
     original has no routed task (fixed, forwarded, closed unresolved, or its task is
     gone), a proposal for the setup's owner. Also 400 `invalid` when the resolved item
     would take no reports because the duplicate links lead back to it.
+    The item's reports then count on the original (see `Task.feedback` below). When they
+    land on an item other than this one (an original that is a feedback item, or the item
+    at the end of its duplicate links), that item announces them as a repeat report does,
+    under the same hourly limit: its `feedback` note and `task_updated` event, and the plain
+    note on its open routed task. The notes credit this item's latest reporter and quote
+    its title; the events' actor is the resolver. A duplicate of a plain task keeps its
+    reports and notes that task with later ones.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
     When agents keep reporting it, the server sends it back to triage. The check runs on
@@ -613,6 +620,17 @@ use, autopilot off). Items get `auto` from that board's autopilot.
 `signature`, `reports`, `reporters`, `last_reported_at`, `resolution` (absent until
 resolved: `{kind, task?, reason?, at, by}`, where `by` is an agent id or `user`) and
 `recurs` (absent unless it recurs an earlier item).
+
+`reports`, `reporters` and `last_reported_at` include those of the items resolved as the
+item's duplicates, and of their duplicates in turn (at most 8 links). The server counts
+them when it reads the item and copies nothing: each report stays one row on the item it
+landed on, so `stats.feedback.reported` counts it once. Reopening a duplicate takes its
+reports back off the original, and resolving it again counts them once. Across items,
+`reporters` is ordered by each agent's newest report and keeps the latest 20. On a `signal`
+item, `reports` counts API errors, not agents' reports. Each report records which it is,
+and the plain note on a routed task says how many of the reports are API errors
+(`7 reports (4 of them API errors)`), wherever they landed. A chain of more than 8
+duplicate links is refused (400 `invalid`), since its last item would take no reports.
 
 ### Snapshots and events
 

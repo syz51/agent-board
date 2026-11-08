@@ -254,10 +254,13 @@ pub struct Feedback {
     pub source: FeedbackSource,
     /// Reports with the same signature add to this item while it is live.
     pub signature: String,
-    /// Reports received, the first included.
+    /// Reports received, the first included, with those of the items resolved as its
+    /// duplicates (and theirs). On a `signal` item, they are API errors.
     pub reports: u32,
-    /// Agents that reported it, oldest first; at most the 20 most recent.
+    /// Agents that reported it or its duplicates, oldest report first; at most the 20 most
+    /// recent.
     pub reporters: Vec<AgentId>,
+    /// The latest report of it or its duplicates.
     pub last_reported_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<FeedbackResolution>,
