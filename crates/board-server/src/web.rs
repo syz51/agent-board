@@ -161,8 +161,11 @@ mod tests {
         })
     }
 
+    /// One real nonce for every response in a test run, so tests can look for it.
+    static NONCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(new_nonce);
+
     fn nonce() -> String {
-        "abc123".to_owned()
+        NONCE.clone()
     }
 
     fn csp_of(response: &Response) -> &str {
@@ -202,14 +205,14 @@ mod tests {
         for path in ["/", "/index.html", "/tasks/factory-12"] {
             let response = route(&Method::GET, path, fake, nonce);
             assert!(
-                csp_of(&response).contains("style-src 'self' 'nonce-abc123';"),
+                csp_of(&response).contains(&format!("style-src 'self' 'nonce-{}';", *NONCE)),
                 "{path}"
             );
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(!html.contains(NONCE_PLACEHOLDER), "{path}: {html}");
-            assert_eq!(html.matches("abc123").count(), 2, "{path}: {html}");
+            assert_eq!(html.matches(NONCE.as_str()).count(), 2, "{path}: {html}");
         }
     }
 
@@ -226,12 +229,15 @@ mod tests {
     async fn the_placeholder_styles_itself_with_the_nonce_only() {
         let unbuilt = route(&Method::GET, "/tasks/factory-12", |_| None, nonce);
         assert_eq!(unbuilt.status(), StatusCode::OK);
-        assert!(csp_of(&unbuilt).contains("style-src 'self' 'nonce-abc123';"));
+        assert!(csp_of(&unbuilt).contains(&format!("style-src 'self' 'nonce-{}';", *NONCE)));
         assert_eq!(unbuilt.headers()[header::CACHE_CONTROL], "no-store");
         let body = to_bytes(unbuilt.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("style=\""), "{html}");
-        assert!(html.contains("<style nonce=\"abc123\">"), "{html}");
+        assert!(
+            html.contains(&format!("<style nonce=\"{}\">", *NONCE)),
+            "{html}"
+        );
         assert!(!html.contains(NONCE_PLACEHOLDER), "{html}");
     }
 
