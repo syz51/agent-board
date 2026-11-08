@@ -625,21 +625,32 @@ pub fn tools() -> Vec<Tool> {
 }
 
 /// Runs the MCP server on stdin and stdout until the client disconnects.
-pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
+/// `register` lets an unknown `--agent` given at start-up register; `agent=` never does.
+pub async fn serve(home: Home, explicit_agent: Option<String>, register: bool) -> Result<()> {
     // Decided once: whether this server's session runs inside another agent session.
-    let (default_agent, own) = tokio::task::spawn_blocking(move || {
-        let default = agent_from_env(explicit_agent.as_deref()).map_err(|e| format!("{e:#}"));
-        // An identity given at start-up is this server's; else the one the T3 thread proves.
-        let own = match &explicit_agent {
-            Some(_) => default.clone().ok().flatten(),
-            None => crate::identity::proven_identity(),
+    let (default_agent, own, unknown_default) = tokio::task::spawn_blocking(move || {
+        let mut default = agent_from_env(explicit_agent.as_deref()).map_err(|e| format!("{e:#}"));
+        let proven = crate::identity::proven_identity();
+        let Some(_) = &explicit_agent else {
+            return (default, proven, None);
         };
-        (default, own)
+        // In a T3 thread, `--agent` may name only the thread's own agent.
+        if let (Ok(Some(named)), Some(_)) = (&default, &proven)
+            && let Err(err) = crate::identity::refuse_borrowed(proven.as_ref(), named, "--agent")
+        {
+            default = Err(format!("{err:#}"));
+        }
+        // An identity given at start-up is this server's, refused when unknown unless it is
+        // the one the thread proves or `--register` was given.
+        let own = default.clone().ok().flatten();
+        let unknown = (!register && proven.is_none()).then_some(ops::NamedAgent::McpStart);
+        (default, own, unknown)
     })
     .await?;
     let server = BoardMcp {
         home,
         default_agent,
+        unknown_default,
         own,
         ctx: Mutex::new(None),
         registered: Mutex::default(),
@@ -657,6 +668,9 @@ struct BoardMcp {
     /// The agent this server acts as unless a tool call names one, resolved at start-up;
     /// an error is reported on each call that needs it.
     default_agent: std::result::Result<Option<AgentId>, String>,
+    /// Set when the default agent was named by hand at start-up (`--agent` without
+    /// `--register`), so an unknown one is refused, not registered.
+    unknown_default: Option<ops::NamedAgent>,
     /// The identity this server proves; `agent=` may name no other.
     own: Option<AgentId>,
     /// Built on first use, so a server started before `board login` still works after it.
@@ -705,11 +719,19 @@ impl BoardMcp {
             crate::identity::refuse_borrowed(self.own.as_ref(), &named, "agent=")?;
         }
         let ctx = self.ctx(agent.as_deref()).await?;
-        if let Some(agent) = ctx.client.agent()
-            && !self.registered.lock().await.contains(agent)
+        if let Some(acting) = ctx.client.agent()
+            && !self.registered.lock().await.contains(acting)
         {
-            ctx.ensure_registered().await?;
-            self.registered.lock().await.insert(agent.clone());
+            // An agent named by hand that the server does not know is refused, not
+            // registered; agent= naming the default agent is the default.
+            let unknown = match &agent {
+                Some(_) if self.default_agent.as_ref().ok() != Some(&Some(acting.clone())) => {
+                    Some(ops::NamedAgent::McpArg)
+                }
+                _ => self.unknown_default,
+            };
+            ctx.ensure_registered(unknown).await?;
+            self.registered.lock().await.insert(acting.clone());
         }
         let out: Output = match name {
             "board_snapshot" => {

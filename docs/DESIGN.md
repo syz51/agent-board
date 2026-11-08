@@ -126,7 +126,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   until `SessionEnd` (entries untouched for 7 days are pruned at `SessionStart`), `board
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
   it for choosing the identity; in a T3 thread the check still runs once, because
-  `--agent` there may name only the thread's own agent.
+  `--agent` there may name only the thread's own agent. A hand-named id the server does not
+  know is refused, not registered, since nothing would ever end it; a script with its own
+  fixed id opts in with `--register`.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. A
   claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
   it, with a claim's checks, so an agent returning to its own work is not sent away; a
@@ -762,7 +764,11 @@ keeping untrusted text out of those channels, so:
   the end of `you`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with
-  `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
+  `->` and the action. Over the cap, it is cut from the bottom (recent, proposals, waiting,
+  ready, peers), except that the handoff is shortened before alerts go: first its
+  blockers, then `now` to 100 characters; then alerts, then `next` to 100 characters, then
+  the handoff, then the bottom of `mine`. A shortened handoff says `cut, board handoff
+  shows it whole` in its header (`cut: true` in `json` and `yaml`). **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
   one line each. Alerts come from the events since the agent's cursor, oldest first, at
   most 1,000 per request that can concern it; the rest wait, counted in the first alert.

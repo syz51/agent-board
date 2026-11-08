@@ -27,9 +27,15 @@ use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
 )]
 pub struct Cli {
     /// Act as this agent id instead of the one from the environment. In a T3 thread, only
-    /// the thread's own id is accepted.
+    /// the thread's own id is accepted. A command that acts as the agent refuses an id the
+    /// server does not know, unless --register is given too.
     #[arg(long, global = true)]
     pub agent: Option<String>,
+    /// Register the --agent id when the server does not know it yet, before a command that
+    /// acts as it (also `board mcp`): for a script that acts under its own fixed id.
+    /// Sessions register through their hooks instead.
+    #[arg(long, global = true)]
+    pub register: bool,
     /// Print JSON instead of text. Each command's --help names the shape it prints.
     #[arg(long, global = true)]
     pub json: bool,
@@ -942,7 +948,12 @@ async fn report_refusal(ctx: &Ctx, route: &str, refused: &ops::Refused) {
 async fn dispatch(cli: Cli) -> Result<()> {
     let home = Home::from_env()?;
     let json = cli.json;
+    if cli.register && cli.agent.is_none() {
+        bail!("--register registers the --agent id: pass --agent <id> with it");
+    }
     let agent = || agent_from_env(cli.agent.as_deref());
+    // --agent naming the identity the environment proves acts as that identity.
+    let named_own = std::cell::Cell::new(false);
     let loaded = std::cell::OnceCell::new();
     let ctx = || -> Result<Ctx> {
         if let Some(ctx) = loaded.get() {
@@ -950,7 +961,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         if let Some(named) = &cli.agent {
             let named: board_proto::AgentId = named.parse().context("--agent")?;
-            crate::identity::refuse_borrowed(proven_identity().as_ref(), &named, "--agent")?;
+            let own = proven_identity();
+            crate::identity::refuse_borrowed(own.as_ref(), &named, "--agent")?;
+            named_own.set(own.is_some());
         }
         let mut ctx = Ctx::load(home.clone(), agent()?, None)?;
         // A read the proxy fails while the server restarts is sent again, not left to the agent.
@@ -972,12 +985,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
         return Err(err);
     }
     if cli.command.acts_as_agent() {
-        ctx()?.ensure_registered().await?;
+        let ctx = ctx()?;
+        let named = cli.agent.is_some() && !cli.register && !named_own.get();
+        ctx.ensure_registered(named.then_some(ops::NamedAgent::CliFlag))
+            .await?;
     }
     let out: Output = match cli.command {
         Command::Login { server, device } => return login(&home, server, device),
         Command::Install(cmd) => return crate::install::run(cmd),
-        Command::Mcp => return crate::mcp::serve(home, cli.agent).await,
+        Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
         Command::Brief { board } => {
             let triage = board == Config::load(&home)?.feedback_board();
