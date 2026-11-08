@@ -347,7 +347,7 @@ export function PageHeader({
 export function Crumbs({ children, current }: { children: ReactNode; current: ReactNode }) {
   return (
     <nav
-      className="mb-3 flex flex-wrap items-center gap-1.5 text-meta text-muted-foreground [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
+      className="mb-3 flex flex-wrap items-center gap-1.5 text-meta text-muted-foreground [&_a]:inline-flex [&_a]:min-h-6 [&_a]:items-center [&_a]:text-muted-foreground [&_a:hover]:text-foreground"
       aria-label="Breadcrumb"
     >
       {children}

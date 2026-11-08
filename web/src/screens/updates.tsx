@@ -242,7 +242,11 @@ function SaidCard({ item, agents }: { item: Said; agents: Map<string, Agent> }) 
       <p className={cn(updateMeta, "flex flex-wrap items-center gap-x-1")}>
         <Who id={item.agent} agents={agents} />
         {" on "}
-        <Link to="/boards/$slug" params={{ slug: item.board }}>
+        <Link
+          className="inline-flex min-h-6 items-center"
+          to="/boards/$slug"
+          params={{ slug: item.board }}
+        >
           {item.board}
         </Link>
         {" · "}
