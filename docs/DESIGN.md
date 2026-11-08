@@ -657,6 +657,78 @@ report, not a free-form task (`API.md`, "Feedback"):
   and the agents' instructions, and files them as proposals (see "Proposals and triage")
   before they become reviewed pull requests.
 
+## Revisits
+
+A fix or a tuned value (a text limit, a signal threshold, a TTL) ships on a guess. The
+feedback loop reacts only when a problem crosses the signal threshold again, so a problem
+that stays under it is never seen, and nothing confirms that a fix held. A revisit checks
+back on purpose: did the fix hold, and do the chosen values still fit.
+
+- **What it is.** A child task of the task that shipped the fix, titled `Revisit: …`, with
+  a body starting `Revisit:`, `auto`, the fixed task's priority and a `not_before` about
+  14 days after the fix deployed. The body names the deploy time (counts start there), the
+  feedback items and error signatures it watches (or a route and message), the values under
+  review, and the bar for "held", such as at most two errors a week. A revisit is
+  scope the fix declared, not a proposal.
+- **Trigger.** The date, with an earlier event: when a `signal` item (the threshold reached
+  again) is routed to the revisit, triage clears its `not_before`, and it runs at once.
+- **Who declares it.** The coordinator that finishes the fix, at `task_done`, when the task
+  changed a tuned value, fixed a feedback item that recurs or that two or more agents
+  reported, or when the user asks. Routine tasks get none. One revisit per fix, and at most
+  three open revisits per board: past that, add the new watch to the open revisit due
+  soonest.
+- **Who runs it.** The coordinator of the board, in its usual loop: the task becomes ready
+  on its date. There is no new job or process.
+- **Server errors.** The server keeps its error records for `error_retention_days`
+  (default 35), apart from the signal window, which still bounds what counts toward a
+  signal. `GET /v1/errors` and `board errors --since <time>` list, per signature, the code,
+  route, normalized message, count, distinct agents, first and last time, and the feedback
+  item that took them. That is where errors under the signal threshold are counted and
+  shown; the revisit copies the counts into its outcome.
+- **Client refusals.** The CLI refuses over-long text before sending, so the server never
+  sees it. The CLI reports each refusal, best effort, to the server, which records it with
+  its own errors (source `client`), so signals and revisits both count it. MCP calls reach
+  the server already. A client that checks a schema itself and never sends is not counted;
+  friction capture covers it.
+- **Friction reports.** Their free text gives each a different signature, so the server
+  cannot link them. Triage does: a report that repeats a problem whose fix has an open
+  revisit is resolved `routed` to the revisit task. Later reports of that item then land on
+  the revisit too. The revisit counts the items routed to it and their reports.
+- **Outcome.** The coordinator counts the errors since the deploy, reads the items routed
+  to the revisit and decides:
+  - `held`: under the bar.
+  - `adjust`: over the bar, or the values no longer fit (for example, agents write up to the
+    limit and overshoot it by a few characters). It files a proposal, a child of the
+    revisit, with the counts and the change. A value the user chose goes to the user
+    instead: an ask with the counts and a recommendation.
+
+  It records a `decision` note starting `revisit: held` or `revisit: adjust`, with the
+  counts, the window and the bar, on the fixed task and on each watched feedback item, so
+  their reporters see the answer. Then it calls `task_done` with the counts as evidence. A
+  shipped adjustment gets its own revisit; a second adjustment of one value in a row goes
+  to the user.
+- **Noise.** Revisits are declared, never automatic; the cap and one per fix bound them. A
+  held revisit reaches the user only as its `task_done` summary. Nothing new reaches the
+  phone.
+- **Any board.** Revisits use only tasks, `not_before`, notes and the error log, so every
+  board can declare them. When the measure is not an API error (a benchmark choice, for
+  example), the body names the command that measures it; the outcome rules stay the same.
+
+Alternatives dropped:
+
+- **A server job that re-checks every resolved feedback item** some days after its routed
+  task closes. Most items are one-offs, so it files noise, and a server cannot judge
+  whether a value needs adjusting.
+- **A `revisit_at` field set at `task_done`.** A wire change that does what a child task
+  with `not_before` already does, and it would not show in task lists.
+- **A `revisit:` note alone.** Nothing brings it back.
+- **The metric trigger alone** (the existing recurrence). It misses problems under the
+  threshold and never confirms that a fix held. It stays, as the early trigger.
+- **Matching friction reports by a normalized title.** Reports of one problem differ in
+  wording.
+- **Leaving revisits to a weekly review in another repository.** It ties the board to that
+  repository, and a review sees counts, not the decision behind a value.
+
 ## Security
 
 - Private network only; device tokens; the user identity from Tailscale for the web view.
