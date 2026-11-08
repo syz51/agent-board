@@ -198,6 +198,18 @@ describe("api client parsing", () => {
     expect(error.message).toContain('[0].counts.ready: expected an integer, got "3"');
   });
 
+  test("reads ready_auto when sent and null from a server that predates it", async () => {
+    const board = state.board("factory");
+    const { ready_auto: _, ...older } = board.counts;
+    const { api } = fakeFetch(() =>
+      json([
+        { ...board, counts: { ...board.counts, ready_auto: 2 } },
+        { ...board, counts: older },
+      ]),
+    );
+    expect((await api.boards()).map((item) => item.counts.ready_auto)).toEqual([2, null]);
+  });
+
   test("rejects unknown enum values and bad timestamps", async () => {
     const task = state.task("factory-12").task;
     const bad = fakeFetch(() => json([{ ...task, status: "archived" }]));
