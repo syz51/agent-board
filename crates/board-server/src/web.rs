@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 
 use axum::http::{Method, StatusCode, Uri, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 use crate::error::not_found;
@@ -16,8 +16,9 @@ struct Assets;
 
 const PLACEHOLDER: &str = "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>agent-board</title></head><body style=\"font-family: system-ui, sans-serif; \
-max-width: 40rem; margin: 3rem auto; padding: 0 1rem\"><h1>agent-board</h1>\
+<title>agent-board</title><style nonce=\"{{CSP_NONCE}}\">body {font-family: system-ui, \
+sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem}</style></head><body>\
+<h1>agent-board</h1>\
 <p>The server is running, but this build has no web view. Build <code>web/</code> \
 (<code>bun run build</code>) and rebuild the server to embed it.</p>\
 <p>The API is under <code>/v1</code>; <code>/healthz</code> reports status.</p></body></html>\n";
@@ -125,14 +126,17 @@ fn route(
         }
         None => files("index.html"),
     };
-    match page {
-        Some(file) => {
-            let nonce = nonce();
-            let html = String::from_utf8_lossy(&file.data).replace(NONCE_PLACEHOLDER, &nonce);
-            security_headers(with_cache(file.mime, "no-store", html), page_csp(&nonce))
-        }
-        None => security_headers(Html(PLACEHOLDER).into_response(), csp),
-    }
+    // The placeholder, like index.html, styles itself with a `<style>` that carries the nonce.
+    let (mime, html) = match &page {
+        Some(file) => (file.mime.clone(), String::from_utf8_lossy(&file.data)),
+        None => (
+            "text/html; charset=utf-8".to_owned(),
+            Cow::Borrowed(PLACEHOLDER),
+        ),
+    };
+    let nonce = nonce();
+    let html = html.replace(NONCE_PLACEHOLDER, &nonce);
+    security_headers(with_cache(mime, "no-store", html), page_csp(&nonce))
 }
 
 #[cfg(test)]
@@ -157,8 +161,11 @@ mod tests {
         })
     }
 
+    /// One real nonce for every response in a test run, so tests can look for it.
+    static NONCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(new_nonce);
+
     fn nonce() -> String {
-        "abc123".to_owned()
+        NONCE.clone()
     }
 
     fn csp_of(response: &Response) -> &str {
@@ -198,14 +205,14 @@ mod tests {
         for path in ["/", "/index.html", "/tasks/factory-12"] {
             let response = route(&Method::GET, path, fake, nonce);
             assert!(
-                csp_of(&response).contains("style-src 'self' 'nonce-abc123';"),
+                csp_of(&response).contains(&format!("style-src 'self' 'nonce-{}';", *NONCE)),
                 "{path}"
             );
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(!html.contains(NONCE_PLACEHOLDER), "{path}: {html}");
-            assert_eq!(html.matches("abc123").count(), 2, "{path}: {html}");
+            assert_eq!(html.matches(NONCE.as_str()).count(), 2, "{path}: {html}");
         }
     }
 
@@ -216,8 +223,22 @@ mod tests {
             let response = route(&Method::GET, path, fake, unused);
             assert!(csp_of(&response).contains("style-src 'self';"), "{path}");
         }
-        let unbuilt = route(&Method::GET, "/", |_| None, unused);
-        assert!(csp_of(&unbuilt).contains("style-src 'self';"));
+    }
+
+    #[tokio::test]
+    async fn the_placeholder_styles_itself_with_the_nonce_only() {
+        let unbuilt = route(&Method::GET, "/tasks/factory-12", |_| None, nonce);
+        assert_eq!(unbuilt.status(), StatusCode::OK);
+        assert!(csp_of(&unbuilt).contains(&format!("style-src 'self' 'nonce-{}';", *NONCE)));
+        assert_eq!(unbuilt.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(unbuilt.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("style=\""), "{html}");
+        assert!(
+            html.contains(&format!("<style nonce=\"{}\">", *NONCE)),
+            "{html}"
+        );
+        assert!(!html.contains(NONCE_PLACEHOLDER), "{html}");
     }
 
     #[test]
