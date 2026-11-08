@@ -173,13 +173,21 @@ host.
   server for a minute. A reply that misses the budget says the server is slow and that
   board tools and the CLI, which wait longer, still work; the next hook tries again, and
   only three slow replies in a row make the device's hooks skip the server, for ten
-  seconds. A connection not open (TLS included) within half a second, or 0.1 seconds
-  before the reply's deadline when that comes first, counts as unreachable. Any answer
-  resets both.
-  The server's deadline is set after the hook's local steps (Keychain, process table, T3,
-  git). When those steps left the server under half a second, it is too little to judge:
-  a connection that does not open then ends with the reply's deadline, as slow, and a slow
-  reply changes nothing; a connection that fails at once still counts as unreachable.
+  seconds. Any answer resets both.
+  The server's deadline falls 1.3 seconds after the hook starts (the 1.5-second budget less
+  0.2 seconds kept for writing state and output). The local steps (Keychain, process table,
+  T3, git), the client build and a Stop's local work all count against the server's share.
+  The hook measures that share just before its first request. A share under half a second
+  is too little to judge: a slow reply changes nothing.
+  A direct connection's deadline is set when the connection starts: half a second later, or
+  0.1 seconds before the reply's deadline when that comes first. A connection not open (TLS
+  included) by then counts as unreachable. With under half a second left when it starts, it is too little to
+  judge: the connection has no deadline of its own and ends with the reply's deadline, as
+  slow, and that changes nothing. A connection that fails at once still counts as
+  unreachable.
+  Debug builds honor `BOARD_HOOK_SERVER_SHARE_MS`: it gives the server that many
+  milliseconds from just before the first request, whatever the local steps took, so tests
+  need no timing. Release builds ignore it.
 - **Hook relay**: while `board watch` runs, hooks reach the server through it, so a hook
   pays for neither a TLS handshake (0.04 to 0.3 seconds over a relayed tailnet path) nor a
   Keychain lookup. The daemon serves `$BOARD_HOME/run/hook.sock`: the directory has mode
@@ -392,18 +400,33 @@ settings in use, warned once per edit.
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
   the triage prompt), a reconcile that keeps the coordinator alive sends it one message
-  with the new prompt in full, then records the new digest. The message follows the
-  wake-up rules: it is held while the coordinator is paused, or runs and was seen within
-  `WAKE_HOLD_MAX`; a send that timed out may have got through, so it counts as sent; a
-  failed send backs off from 30 seconds up to 10 minutes, and makes the next reconcile ask
-  T3 whether the thread is gone. It is held too while the board is idle (nothing in
-  doing or review, no ready auto task and no open ask; a server without `ready_auto`
-  counts as not idle), or while wake-ups wait for the coordinator, so a deploy costs an
-  idle coordinator no turn: the next wake-up the daemon sends it, or the message that
-  resumes it after a usage limit, carries the new prompt in front. A send that may have
-  got through records the new digest; a failed one leaves the prompt owed for its retry.
-  A record without a digest (from before this rule), or a thread an earlier unfinished
-  start launched, counts as changed, so it is briefed once.
+  with the new prompt in full, then records the new digest. The message ends with a
+  marker line, `(re-brief <first 16 hex digits of the digest> of board <slug>)`. It
+  follows the wake-up rules: it is held while the coordinator is paused, or runs and was
+  seen within `WAKE_HOLD_MAX`; a failed send backs off from 30 seconds up to 10 minutes,
+  and makes the next reconcile ask T3 whether the thread is gone. It is held too while
+  the board is idle (nothing in doing or review, no ready auto task and no open ask; a
+  server without `ready_auto` counts as not idle), or while wake-ups wait for the
+  coordinator, so a deploy costs an idle coordinator no turn: the next wake-up the daemon
+  sends it, or the message that resumes it after a usage limit, carries the new prompt in
+  front. A failed send leaves the prompt owed for its retry. A record without a digest
+  (from before this rule), or a thread an earlier unfinished start launched, counts as
+  changed, so it is briefed once.
+- **A re-brief whose send timed out**: T3 may or may not have delivered it, so the daemon
+  records the new digest and keeps the re-brief as unsure in its state, with the time of
+  the send. This covers a wake-up or a usage-limit resume that carried it, and a flush
+  cut short while sending it. From one minute after the send, so T3 has handled the
+  request, each reconcile reads the thread's 100 latest messages with `t3 thread show`,
+  while the coordinator works too, so its turns do not push the message out of them.
+  The newest user message with a re-brief marker of the board settles it when that
+  marker carries this digest. Otherwise, while T3 has a run of the thread active or
+  queued (`thread.status` preparing, queued, starting, running or waiting), the message
+  may still wait in T3's queue, so it is read again on the next reconcile. With no such
+  run, the prompt is owed again and sent by the rules above. A second send that times out
+  counts as delivered, so a digest is sent at most twice. A check that fails, times out
+  or reads an unknown format backs off like a failed send and sends nothing, so a
+  re-brief that arrived is not sent twice. One that answers that T3 does not know the
+  thread makes the next reconcile ask whether the thread is gone.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
