@@ -846,6 +846,77 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
 }
 
 #[test]
+fn errors_asks_since_a_time_and_prints_one_line_per_signature_or_the_json() {
+    let e = env();
+    let at = |s: &str| s.parse::<board_proto::Timestamp>().unwrap();
+    let log = board_proto::ErrorLog {
+        since: at("2026-11-07T07:45:00Z"),
+        retention_days: 35,
+        signatures: vec![board_proto::ErrorSignature {
+            signature: "signal:invalid:0123456789ab".into(),
+            code: "invalid".into(),
+            route: "POST /v1/tasks/{id}/notes".into(),
+            template: "text is N characters; the limit is N".into(),
+            count: 2,
+            agents: 1,
+            first_at: at("2026-11-07T08:00:00Z"),
+            last_at: at("2026-11-08T09:30:00Z"),
+            item: None,
+        }],
+    };
+    e.stub.on("GET /v1/errors", &log);
+
+    let out = e.run(&[
+        "errors",
+        "--since",
+        "2026-11-07T07:45:00Z",
+        "--code",
+        "invalid",
+        "--grep",
+        "the limit",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        "API errors since 2026-11-07 07:45Z (kept 35 days)\n\
+         2 × invalid from 1 agent · POST /v1/tasks/{id}/notes · no item · \"text is N characters; the limit is N\" · last 2026-11-08 09:30Z"
+    );
+    assert_eq!(
+        e.stub.requests_to("GET /v1/errors")[0].query,
+        "since=2026-11-07T07%3A45%3A00Z&code=invalid&q=the+limit&limit=100"
+    );
+
+    // A duration counts back from now; `--json` prints the server's answer unchanged.
+    let out = e.run(&["errors", "--since", "14d", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed: board_proto::ErrorLog = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(printed, log);
+    let query = &e.stub.requests_to("GET /v1/errors")[1].query;
+    assert!(
+        query.starts_with("since=") && query.ends_with("&limit=100"),
+        "{query}"
+    );
+
+    // A since that is no time, an unknown code and an over-long grep fail before any
+    // request.
+    let grep = "x".repeat(201);
+    for (args, says) in [
+        (vec!["--since", "last week"], "duration back from now"),
+        (vec!["--since", "100000000d"], "reaches back too far"),
+        (vec!["--code", "NotFound"], "not_found"),
+        (
+            vec!["--grep", grep.as_str()],
+            "q is 201 characters; the limit is 200",
+        ),
+    ] {
+        let out = e.run(&[&["errors"][..], &args].concat());
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(e.stub.requests_to("GET /v1/errors").len(), 2);
+}
+
+#[test]
 fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
     let e = env();
     let open = |id: i64, task: &str| Ask {

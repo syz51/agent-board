@@ -177,6 +177,46 @@ pub struct ResolvedCounts {
     pub fixed: u32,
 }
 
+/// Answer to `GET /v1/errors?since=`: the API errors the server recorded since a time,
+/// one row per signature, so errors under the signal threshold can be counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorLog {
+    /// Errors at or after this time are counted: the time asked for, or the oldest record
+    /// kept when that is later.
+    pub since: Timestamp,
+    /// The server keeps error records this many days; `since` before that reads less.
+    pub retention_days: u32,
+    /// Most errors first.
+    pub signatures: Vec<ErrorSignature>,
+}
+
+/// Most signatures one `GET /v1/errors` answer lists.
+pub const ERRORS_LIMIT_MAX: u32 = 1_000;
+/// Signatures `GET /v1/errors` lists when the request names no `limit`.
+pub const ERRORS_LIMIT_DEFAULT: u32 = 100;
+/// Longest `q` filter of `GET /v1/errors`, in characters.
+pub const ERRORS_Q_CHARS_MAX: usize = 200;
+
+/// One error signature in [`ErrorLog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorSignature {
+    /// `signal:<code>:<hash>`, as on the signal feedback items.
+    pub signature: String,
+    /// The error code, as the wire spells it.
+    pub code: String,
+    /// The route template, such as `POST /v1/tasks/{id}/notes`.
+    pub route: String,
+    /// The message with numbers, task ids, agent ids and quoted text normalized.
+    pub template: String,
+    pub count: u32,
+    /// Distinct agents that got it.
+    pub agents: u32,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    /// The newest feedback item with this signature, when one was filed.
+    pub item: Option<TaskId>,
+}
+
 /// Longest feedback `about`.
 pub const FEEDBACK_ABOUT_MAX: usize = 40;
 /// Longest feedback `signature`.

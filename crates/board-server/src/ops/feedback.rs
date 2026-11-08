@@ -3,12 +3,14 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, EventType, EvidenceKind,
+    AgentId, Board, CreateBoard, CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX,
+    ERRORS_Q_CHARS_MAX, ErrorCode, ErrorLog, ErrorSignature, EventType, EvidenceKind,
     FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution,
     FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind, ResolveFeedback,
-    ResolvedCounts, Task, TaskId,
+    ResolvedCounts, Task, TaskId, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::Settings;
@@ -773,7 +775,8 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         Prior::Gone(earlier) => Some(earlier),
         Prior::None => None,
     };
-    // Errors that an earlier item took (before its fix) do not count towards a new one.
+    // Records outlive the signal window (error_retention_days), so only those within it
+    // count. Errors that an earlier item took (before its fix) do not count towards a new one.
     let mut from = now - cx.s.signal_window_ms();
     if let Some(earlier) = &earlier {
         let last: i64 = cx.db.query_row(
@@ -834,12 +837,120 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     Ok(Some(task.id))
 }
 
-/// Forgets error records older than the signal window. Run by the sweeper.
+/// Forgets error records older than `error_retention_days`. Run by the sweeper.
 pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
     Ok(cx.db.execute(
         "DELETE FROM api_errors WHERE at < ?1",
-        [cx.now_ms() - cx.s.signal_window_ms()],
+        [cx.now_ms() - cx.s.error_retention_ms()],
     )?)
+}
+
+/// `GET /v1/errors` query, validated by [`ErrorsFilter::new`].
+#[derive(Deserialize)]
+pub(crate) struct ErrorsQuery {
+    since: Option<Timestamp>,
+    code: Option<ErrorCode>,
+    route: Option<String>,
+    q: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Filters of `GET /v1/errors`.
+pub(crate) struct ErrorsFilter {
+    since: i64,
+    code: Option<ErrorCode>,
+    route: Option<String>,
+    /// ASCII-lowercased, as SQLite's `lower` folds the template.
+    q: Option<String>,
+    limit: u32,
+}
+
+impl ErrorsFilter {
+    /// `since` defaults to the signal window back from now, and never reaches back past the
+    /// records kept; `limit` defaults to [`ERRORS_LIMIT_DEFAULT`]. Blank text filters are
+    /// left out.
+    pub(crate) fn new(cx: &Ctx<'_>, q: ErrorsQuery) -> Result<Self> {
+        let limit = q.limit.unwrap_or(ERRORS_LIMIT_DEFAULT);
+        if !(1..=ERRORS_LIMIT_MAX).contains(&limit) {
+            return Err(invalid(
+                format!("limit={limit} is out of range"),
+                format!("send limit between 1 and {ERRORS_LIMIT_MAX}"),
+            ));
+        }
+        let blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let text = blank(q.q);
+        if let Some(text) = &text {
+            check_line("q", text, ERRORS_Q_CHARS_MAX)?;
+        }
+        let now = cx.now_ms();
+        let kept = now - cx.s.error_retention_ms();
+        let since = q
+            .since
+            .map_or_else(|| now - cx.s.signal_window_ms(), |at| at.timestamp_millis());
+        Ok(Self {
+            since: since.max(kept),
+            code: q.code,
+            route: blank(q.route),
+            q: text.map(|t| t.to_ascii_lowercase()),
+            limit,
+        })
+    }
+}
+
+/// `GET /v1/errors`: the recorded API errors since a time, one row per signature, most
+/// first, with the newest feedback item each one filed or added to.
+pub(crate) fn errors(cx: &Ctx<'_>, f: &ErrorsFilter) -> Result<ErrorLog> {
+    let code = f.code.as_ref().map(enum_str);
+    // The item lookup runs on the rows kept, not on every signature.
+    let rows = cx
+        .db
+        .prepare_cached(
+            "SELECT g.*, (SELECT task FROM feedback WHERE signature = g.signature \
+             ORDER BY rowid DESC LIMIT 1) FROM ( \
+             SELECT signature, code, route, template, COUNT(*) AS n, COUNT(DISTINCT agent), \
+             MIN(at), MAX(at) AS last FROM api_errors WHERE at >= ?1 \
+             AND (?2 IS NULL OR code = ?2) AND (?3 IS NULL OR route = ?3) \
+             AND (?4 IS NULL OR instr(lower(template), ?4) > 0) \
+             GROUP BY signature ORDER BY n DESC, last DESC LIMIT ?5) g \
+             ORDER BY g.n DESC, g.last DESC",
+        )?
+        .query_map(params![f.since, code, f.route, f.q, f.limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, u32>(4)?,
+                r.get::<_, u32>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let signatures = rows
+        .into_iter()
+        .map(
+            |(signature, code, route, template, count, agents, first, last, item)| {
+                Ok(ErrorSignature {
+                    signature,
+                    code,
+                    route,
+                    template,
+                    count,
+                    agents,
+                    first_at: ts(first),
+                    last_at: ts(last),
+                    item: item.as_deref().map(parse_id).transpose()?,
+                })
+            },
+        )
+        .collect::<Result<_>>()?;
+    Ok(ErrorLog {
+        since: ts(f.since),
+        retention_days: cx.s.error_retention(),
+        signatures,
+    })
 }
 
 /// Feedback counts since `from` (milliseconds).
