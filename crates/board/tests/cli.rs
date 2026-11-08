@@ -154,8 +154,8 @@ fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
     let text = stdout(&out);
     assert!(
         text.contains(
-            "\n2 notes on factory-12 (1 finding, 0 decisions): task_show factory-12 and read \
-             every one before starting"
+            "\n2 notes on factory-12 (1 finding, 0 decisions, 1 plain): task_show factory-12 and \
+             read every one before starting"
         ),
         "{text}"
     );
@@ -176,7 +176,7 @@ fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
     let text = stdout(&out);
     assert!(text.starts_with("done factory-12"), "{text}");
     assert!(
-        text.contains("\n1 finding since your claim: confirm each is addressed"),
+        text.contains("\n1 finding since the claim; the task is done: for each one"),
         "{text}"
     );
     assert!(text.contains("found after the claim"), "{text}");

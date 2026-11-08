@@ -936,7 +936,7 @@ async fn a_note_by_another_agent_on_my_doing_or_review_task_reaches_my_alerts() 
     );
     assert!(
         alerts.contains(&format!(
-            "task_show {id} and read the new notes; address each finding before task_done"
+            "task_show {id}; address the finding before task_done"
         )),
         "{alerts}"
     );
@@ -958,6 +958,74 @@ async fn a_note_by_another_agent_on_my_doing_or_review_task_reaches_my_alerts() 
     let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
     assert!(
         alerts.contains(&format!("changed your task {id} (decision)")),
+        "{alerts}"
+    );
+    // No finding: the action does not ask to address one.
+    assert!(!alerts.contains("address the finding"), "{alerts}");
+}
+
+#[tokio::test]
+async fn a_finding_on_a_task_whose_owner_ended_reaches_the_coordinator() {
+    let t = T::new();
+    let (coordinator, child, reviewer) = ("t3:coord", "t3:child", "t3:reviewer");
+    for agent in [coordinator, child, reviewer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let id = t.task(child, "auto", "Wait on review").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    assert!(
+        t.patch(child, &id, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    snapshot(&t, coordinator, "kind=alerts").await;
+    let finding = json!({ "agent": reviewer, "kind": "finding", "text": "finding: off by one" });
+    let notes = format!("/v1/tasks/{id}/notes");
+    let note = || t.ok("POST", &notes, Some(reviewer), Some(finding.clone()));
+    let changed = format!("changed your task {id} (finding)");
+
+    // While the owner lives, the finding is the owner's alone.
+    note().await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(!alerts.contains(&changed), "{alerts}");
+
+    // Once the owner has ended, the coordinator gets it.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{child}/state"),
+        Some(child),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    note().await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(alerts.contains(&changed), "{alerts}");
+    // A plain note on it is not forwarded.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(reviewer),
+        Some(json!({ "agent": reviewer, "kind": "note", "text": "CI queued" })),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(
+        !alerts.contains(&format!("changed your task {id}")),
         "{alerts}"
     );
 }

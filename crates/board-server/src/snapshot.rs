@@ -53,6 +53,8 @@ const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
       AND (task IN (SELECT value FROM json_each(:mine)) \
            OR json_extract(payload, '$.previous_owner') = :me)) \
+     OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \
+      AND board IN (SELECT slug FROM boards WHERE coordinator = :me)) \
      OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
@@ -958,32 +960,8 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 let Some(task) = &event.task else { continue };
                 // The owner is reminded; when the owner is gone (such as an ended child),
                 // the board's coordinator is, so the wait is not lost.
-                let to_me = mine_ids.contains(task) || {
-                    let row: Option<(Option<String>, String, String, Option<String>)> = cx
-                        .db
-                        .query_row(
-                            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
-                             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
-                            [task.as_str()],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                        )
-                        .optional()?;
-                    match row {
-                        Some((owner, board, status, state)) if status == "review" => {
-                            let board: BoardSlug = parse_id(&board)?;
-                            let gone = match &owner {
-                                Some(owner) => {
-                                    state.as_deref() == Some("ended") || !is_live(cx, owner)?
-                                }
-                                None => true,
-                            };
-                            gone && get_board(cx, &board)?
-                                .coordinator
-                                .is_some_and(|c| c.as_str() == me)
-                        }
-                        _ => false,
-                    }
-                };
+                let to_me =
+                    mine_ids.contains(task) || stands_in_for_owner(cx, task, me, &["review"])?;
                 if !to_me {
                     continue;
                 }
@@ -1015,7 +993,14 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 // A task moved away from me still concerns me.
                 let was_mine =
                     event.payload.get("previous_owner").and_then(|o| o.as_str()) == Some(me);
-                if !mine_ids.contains(task) && !was_mine {
+                // A finding on a task whose owner is gone (such as an ended child) reaches
+                // the board's coordinator, so it is not lost.
+                if !mine_ids.contains(task)
+                    && !was_mine
+                    && !(event.event_type == EventType::NoteAdded
+                        && event.payload.get("kind").and_then(|k| k.as_str()) == Some("finding")
+                        && stands_in_for_owner(cx, task, me, &["doing", "review"])?)
+                {
                     continue;
                 }
                 // Handed to another agent: no longer mine to work on.
@@ -1190,18 +1175,15 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         }
     }
     for ((task, actor), (seq, what)) in changed {
-        let noted = what
-            .iter()
-            .any(|w| matches!(w.as_str(), "note" | "finding" | "decision"));
+        let finding = what.contains("finding");
         let what: Vec<String> = what.into_iter().collect();
         out.insert(
             (CHANGED, format!("{task}|{actor}")),
             Alert {
                 alert: format!("{actor} changed your task {task} ({})", what.join(", ")),
-                action: if noted {
-                    format!(
-                        "task_show {task} and read the new notes; address each finding before task_done"
-                    )
+                // Short: alerts share a small budget.
+                action: if finding {
+                    format!("task_show {task}; address the finding before task_done")
                 } else {
                     format!("task_show {task}")
                 },
@@ -1250,6 +1232,35 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         );
     }
     Ok((alerts, scanned_to))
+}
+
+/// Whether `me` is told what `task`'s owner would be: the task is in one of `statuses`,
+/// its owner is gone (ended, not live, or none) and `me` coordinates its board.
+fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str]) -> Result<bool> {
+    let row: Option<(Option<String>, String, String, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
+             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
+            [task.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((owner, board, status, state)) = row else {
+        return Ok(false);
+    };
+    if !statuses.contains(&status.as_str()) {
+        return Ok(false);
+    }
+    let gone = match &owner {
+        Some(owner) => state.as_deref() == Some("ended") || !is_live(cx, owner)?,
+        None => true,
+    };
+    let board: BoardSlug = parse_id(&board)?;
+    Ok(gone
+        && get_board(cx, &board)?
+            .coordinator
+            .is_some_and(|c| c.as_str() == me))
 }
 
 fn record_change(

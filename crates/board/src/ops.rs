@@ -550,6 +550,15 @@ pub async fn task_done(
         tracing::warn!("recording {} done for the Stop hook: {err:#}", task.id);
     }
     let mut text = format!("done {}", render::task_line(&task));
+    // Read again: a note does not change the version, so one added after the read above
+    // would be missed. When the read fails, the one above still lists the earlier ones.
+    let detail = match ctx.client.task(id).await {
+        Ok(after) => after,
+        Err(err) => {
+            tracing::warn!("reading {id}'s findings after done: {err:#}");
+            detail
+        }
+    };
     let findings = render::done_findings(&detail, ctx.agent()?.as_str());
     if !findings.is_empty() {
         text.push('\n');

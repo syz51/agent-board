@@ -311,13 +311,18 @@ settings in use, warned once per edit.
   review waits for the next finished task.
 - **Reading every note**: the agent doing a task must not miss a finding captured on it;
   some duplicate reading is the price. `task_show` shows every `finding` and `decision`
-  note; without `detailed`, only plain notes are cut to the latest five, with the count
-  cut. A claim or take answers with the task's note count, by kind, and says to read them.
+  note; without `detailed`, only plain and `feedback` notes are cut to the latest five,
+  with the count cut. A claim or take answers with the task's note count, by kind, and
+  says to read them, with `detailed` when `task_show` would cut some.
   A note by another agent on a task its owner has open (`doing` and `review` included)
   raises an alert for the owner, `<agent> changed your task <id> (finding)`, naming the
-  note's kind. `task_done` lists the findings noted since the owner's latest claim, take
-  or handover in the task's history (every finding when none is there), so the owner
-  confirms each is covered, done, or declined with a reason. The coordinator prompt says
+  note's kind. A finding on a `doing` or `review` task whose owner is gone (ended, not
+  live, or none) raises it for the board's coordinator instead. After the done,
+  `task_done` lists the findings noted since the task's latest claim in its history (not
+  a later handover, so findings noted while a child held the task are included; every
+  finding when no claim is there), read after the done so none added meanwhile is
+  missed. The owner then notes how each one the evidence does not cover was addressed,
+  or reopens the task. The coordinator prompt says
   to read every note after the claim and to put each finding and decision into a
   delegate's brief.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,

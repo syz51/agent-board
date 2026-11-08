@@ -214,11 +214,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     }
     // Every finding and decision, so the agent doing the task misses none; plain notes
     // only the latest few unless detailed.
-    let plain = detail
-        .notes
-        .iter()
-        .filter(|n| n.kind == NoteKind::Note)
-        .count();
+    let plain = detail.notes.iter().filter(|n| is_plain(n.kind)).count();
     let cut = if detailed {
         0
     } else {
@@ -229,7 +225,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         .notes
         .iter()
         .filter(|n| {
-            let skip = n.kind == NoteKind::Note && skipped < cut;
+            let skip = is_plain(n.kind) && skipped < cut;
             skipped += usize::from(skip);
             !skip
         })
@@ -266,10 +262,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         peer.push(json!({"task": task.id, "field": "resolution_reason", "text": reason}));
     }
     for note in notes {
-        peer.push(json!({
-            "task": task.id, "field": "note", "kind": note.kind, "by": short(handles, note.agent.as_str()),
-            "at": note.at, "text": note.text,
-        }));
+        peer.push(note_line(note, handles));
     }
     let block = peer_block(&peer);
     if !block.is_empty() {
@@ -279,9 +272,9 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     if cut > 0 {
         let _ = write!(
             out,
-            "\n({cut} older plain {}; every finding and decision is shown; pass detailed for \
-             all and the history)",
-            if cut == 1 { "note" } else { "notes" },
+            "\n({}; every finding and decision is shown; pass detailed for all and the \
+             history)",
+            plural(cut, "older plain note", "older plain notes"),
         );
     }
     out
@@ -289,6 +282,25 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
 
 /// Plain notes `task_show` shows without detailed: the latest few.
 const PLAIN_NOTES: usize = 5;
+
+/// Notes `task_show` cuts to the latest few without detailed: all but findings and
+/// decisions.
+fn is_plain(kind: NoteKind) -> bool {
+    matches!(kind, NoteKind::Note | NoteKind::Feedback)
+}
+
+/// `"1 note"`, `"2 notes"`.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A note as one line of peer text.
+fn note_line(note: &Note, handles: &BTreeMap<String, String>) -> Value {
+    json!({
+        "task": note.task, "field": "note", "kind": note.kind,
+        "by": short(handles, note.agent.as_str()), "at": note.at, "text": note.text,
+    })
+}
 
 /// What a claim adds below the task line: how many notes the task has, and to read them.
 pub fn claim_notes(detail: &TaskDetail) -> String {
@@ -298,66 +310,68 @@ pub fn claim_notes(detail: &TaskDetail) -> String {
     }
     let count = |kind| detail.notes.iter().filter(|n| n.kind == kind).count();
     let (findings, decisions) = (count(NoteKind::Finding), count(NoteKind::Decision));
-    let n = detail.notes.len();
-    format!(
-        "{n} {} on {id} ({findings} {}, {decisions} {}): task_show {id} and read every one \
-         before starting; pass each finding and decision into a delegate's brief",
-        if n == 1 { "note" } else { "notes" },
-        if findings == 1 { "finding" } else { "findings" },
-        if decisions == 1 {
-            "decision"
-        } else {
-            "decisions"
-        },
-    )
+    let plain = detail.notes.len() - findings - decisions;
+    // Without detailed, task_show cuts plain notes past the latest few.
+    let show = if plain > PLAIN_NOTES {
+        format!("task_show {id} with detailed")
+    } else {
+        format!("task_show {id}")
+    };
+    let mut text = format!(
+        "{} on {id} ({}, {}, {plain} plain): {show} and read every one before starting",
+        plural(detail.notes.len(), "note", "notes"),
+        plural(findings, "finding", "findings"),
+        plural(decisions, "decision", "decisions"),
+    );
+    if findings + decisions > 0 {
+        text.push_str("; pass each finding and decision into a delegate's brief");
+    }
+    text
 }
 
-/// What `task_done` adds below the task line: the finding notes added since `agent`'s
-/// latest claim of the task (every finding when the claim is not in the history), so the
-/// agent can confirm each is addressed. Empty when there are none.
+/// What `task_done` adds below the task line: the finding notes added since the task's
+/// latest claim (every finding when no claim is in the history), so the agent can confirm
+/// each is addressed. The window starts at the claim, not at a later handover, so a
+/// finding noted while a child held the task is listed when it is handed back. Empty when
+/// there are none.
 pub fn done_findings(detail: &TaskDetail, agent: &str) -> String {
     let handles = &detail.handles;
     let claimed = detail
         .history
         .iter()
         .rev()
-        .find(|e| match e.event_type {
-            EventType::TaskClaimed | EventType::TaskTaken => e.actor.as_str() == agent,
-            // Handed over by an update.
-            EventType::TaskUpdated => e.payload.get("owner").and_then(Value::as_str) == Some(agent),
-            _ => false,
-        })
+        .find(|e| e.event_type == EventType::TaskClaimed)
         .map(|e| e.at);
-    let findings: Vec<Value> = detail
+    let (own, peers): (Vec<&Note>, Vec<&Note>) = detail
         .notes
         .iter()
         .filter(|n| n.kind == NoteKind::Finding && claimed.is_none_or(|at| n.at >= at))
-        .map(|n| {
-            json!({
-                "task": n.task, "field": "note", "kind": n.kind,
-                "by": short(handles, n.agent.as_str()), "at": n.at, "text": n.text,
-            })
-        })
-        .collect();
-    if findings.is_empty() {
+        .partition(|n| n.agent.as_str() == agent);
+    if own.is_empty() && peers.is_empty() {
         return String::new();
     }
     let since = if claimed.is_some() {
-        "since your claim"
+        "since the claim"
     } else {
         "on the task"
     };
-    format!(
-        "{} {} {since}: confirm each is addressed (covered, done, or declined with a reason) \
-         in the evidence or a task_note\n{}",
-        findings.len(),
-        if findings.len() == 1 {
-            "finding"
-        } else {
-            "findings"
-        },
-        peer_block(&findings)
-    )
+    let mut out = format!(
+        "{} {since}; the task is done: for each one the evidence does not cover, task_note \
+         {} how it was addressed (done, or declined with a reason), or reopen the task \
+         (status open) if it was not",
+        plural(own.len() + peers.len(), "finding", "findings"),
+        detail.task.id,
+    );
+    for note in own {
+        let _ = write!(out, "\nyours: {}", json_line(&note_line(note, handles)));
+    }
+    let peers: Vec<Value> = peers.iter().map(|n| note_line(n, handles)).collect();
+    let block = peer_block(&peers);
+    if !block.is_empty() {
+        out.push('\n');
+        out.push_str(&block);
+    }
+    out
 }
 
 /// `id`'s short handle when `handles` has one, else `id`.
@@ -703,6 +717,14 @@ mod tests {
     }
 
     #[test]
+    fn task_show_cuts_feedback_notes_like_plain_ones() {
+        let notes: Vec<(&str, &str, u32)> = (0..7).map(|_| ("feedback", "again", 1)).collect();
+        let text = task_detail(&noted(&notes, &[]), false);
+        assert_eq!(text.matches("\"again\"").count(), 5, "{text}");
+        assert!(text.contains("(2 older plain notes;"), "{text}");
+    }
+
+    #[test]
     fn claims_count_the_notes_and_done_lists_findings_since_the_claim() {
         let claimed = (
             "task_claimed",
@@ -721,42 +743,65 @@ mod tests {
         );
         assert_eq!(
             claim_notes(&detail),
-            "4 notes on factory-12 (2 findings, 1 decision): task_show factory-12 and read \
-             every one before starting; pass each finding and decision into a delegate's brief"
+            "4 notes on factory-12 (2 findings, 1 decision, 1 plain): task_show factory-12 and \
+             read every one before starting; pass each finding and decision into a delegate's \
+             brief"
         );
         let empty = noted(&[], &[]);
         assert_eq!(
             claim_notes(&empty),
             "no notes on factory-12; task_show factory-12 for its body and acceptance checks"
         );
+        // Plain notes past what task_show shows: say detailed; no findings or decisions:
+        // nothing to brief.
+        let plain: Vec<(&str, &str, u32)> = (0..6).map(|_| ("feedback", "again", 1)).collect();
+        assert_eq!(
+            claim_notes(&noted(&plain, &[])),
+            "6 notes on factory-12 (0 findings, 0 decisions, 6 plain): task_show factory-12 \
+             with detailed and read every one before starting"
+        );
 
         let done = done_findings(&detail, "t3:me");
         assert!(
             done.starts_with(
-                "1 finding since your claim: confirm each is addressed (covered, done, or \
-                 declined with a reason) in the evidence or a task_note\n"
+                "1 finding since the claim; the task is done: for each one the evidence does \
+                 not cover, task_note factory-12 how it was addressed (done, or declined with a \
+                 reason), or reopen the task (status open) if it was not\n"
             ),
             "{done}"
         );
         assert!(done.contains(PEER_HEADER), "{done}");
         assert!(done.contains("after the claim"), "{done}");
         assert!(!done.contains("before the claim"), "{done}");
-        // Another agent's claim is not ours; a handover to us is.
-        let taken = noted(
-            &[("finding", "before", 1), ("finding", "after", 7)],
+        // The window starts at the claim, not at a later handover: a finding noted while
+        // a child held the task is listed when the task is handed back.
+        let handed = noted(
             &[
-                ("task_claimed", "t3:other", 2, json!({})),
-                ("task_updated", "t3:other", 5, json!({ "owner": "t3:me" })),
+                ("finding", "before", 1),
+                ("finding", "while the child had it", 4),
+                ("finding", "after", 7),
+            ],
+            &[
+                ("task_claimed", "t3:me", 2, json!({})),
+                ("task_updated", "t3:me", 3, json!({ "owner": "t3:child" })),
+                ("task_updated", "t3:me", 5, json!({ "owner": "t3:me" })),
             ],
         );
-        let done = done_findings(&taken, "t3:me");
+        let done = done_findings(&handed, "t3:me");
+        assert!(done.starts_with("2 findings since the claim;"), "{done}");
         assert!(
-            done.contains("\"after\"") && !done.contains("\"before\""),
+            done.contains("while the child had it") && !done.contains("\"before\""),
             "{done}"
         );
+        // My own findings are listed as mine, not under the peer header.
+        let mut own = noted(&[("finding", "my own", 7)], std::slice::from_ref(&claimed));
+        own.notes[0].agent = serde_json::from_value(json!("t3:me")).unwrap();
+        let done = done_findings(&own, "t3:me");
+        assert!(done.contains("\nyours: {"), "{done}");
+        assert!(!done.contains(PEER_HEADER), "{done}");
         // No claim in the history: every finding.
         let unknown = noted(&[("finding", "a", 1), ("finding", "b", 7)], &[]);
-        assert!(done_findings(&unknown, "t3:me").starts_with("2 findings on the task:"));
+        assert!(done_findings(&unknown, "t3:me").starts_with("2 findings on the task;"));
         assert_eq!(done_findings(&empty, "t3:me"), "");
     }
 

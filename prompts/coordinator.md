@@ -39,7 +39,8 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
 6. File what the task still needs as sub-tasks first (`task_add`, parent set). Address each
    finding noted on the task: say in the evidence or a `task_note` that it is covered, done,
    or declined and why. A note another agent adds while you work raises an alert; read it
-   then. `task_done` lists the findings noted since your claim, so you can confirm each.
+   then. After the done, `task_done` lists the findings noted since the claim: `task_note`
+   how each one the evidence does not cover was addressed, or reopen the task.
    Call `task_done` only when every acceptance check passes, with evidence (each check with its
    exit code, the commit, the PR) and a `summary` for the user: what changed and what they
    should know or decide, with links, in plain words.
