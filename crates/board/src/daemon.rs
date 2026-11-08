@@ -43,7 +43,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, error_code, is_unreachable};
-use crate::config::Home;
+use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut};
@@ -71,6 +71,11 @@ const FLUSH_CHECKS_AT_ONCE: usize = 8;
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+/// A named coordinator's thread that T3 found live is not asked about again for this long.
+/// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
+/// each minute costs a home device more than the check is worth. A failed send to the
+/// thread, or its agent ending, asks again on the next reconcile.
+pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -510,11 +515,15 @@ pub struct Daemon<T: T3> {
     boards: BTreeMap<BoardSlug, Board>,
     /// Boards whose coordinator failed to start here, by board.
     failures: BTreeMap<BoardSlug, StartFailure>,
+    /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
+    threads_live: BTreeMap<String, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
     /// them here: their lines count as maybe delivered, never sent twice.
     sending: Vec<AgentId>,
+    /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
+    config_text: Option<String>,
     pub timing: Timing,
 }
 
@@ -523,15 +532,79 @@ impl<T: T3> Daemon<T> {
     pub fn new(ctx: Ctx, t3: T) -> Self {
         // A file it cannot read is kept aside rather than lost on the next save.
         let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
+        let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
         Self {
             ctx,
             t3,
             state,
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
+            threads_live: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
+            config_text,
             timing: Timing::default(),
+        }
+    }
+
+    /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
+    /// `feedback_board` take effect at once, and boards whose start failed are tried again,
+    /// since a missing project may be what failed. `server`, `device` and `t3_bin` are
+    /// fixed while the daemon runs, so changing them asks for a restart. A file gone or
+    /// unreadable keeps the settings in use, with one warning per edit.
+    fn reload_config(&mut self) {
+        let path = self.ctx.home.config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                if self.config_text.take().is_some() {
+                    tracing::warn!(
+                        "reading {}: {err}; keeping the configuration in use",
+                        path.display()
+                    );
+                }
+                return;
+            }
+        };
+        if self.config_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let parsed = toml::from_str::<Config>(&text);
+        self.config_text = Some(text);
+        let new = match parsed {
+            Ok(new) => new,
+            Err(err) => {
+                tracing::warn!(
+                    "invalid {}: {err}; keeping the configuration in use until it is fixed",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let current = &mut self.ctx.config;
+        if (&new.server, &new.device, &new.t3_bin)
+            != (&current.server, &current.device, &current.t3_bin)
+        {
+            tracing::warn!(
+                "{} changes server, device or t3_bin: restart board watch to apply them",
+                path.display()
+            );
+        }
+        if (&new.projects, &new.board_projects, &new.feedback_board)
+            != (
+                &current.projects,
+                &current.board_projects,
+                &current.feedback_board,
+            )
+        {
+            current.projects = new.projects;
+            current.board_projects = new.board_projects;
+            current.feedback_board = new.feedback_board;
+            self.failures.clear();
+            tracing::info!(
+                "re-read {}: projects and feedback board updated",
+                path.display()
+            );
         }
     }
 
@@ -551,9 +624,10 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
+        self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
-        let mut checks = self.check_threads(&boards).await;
+        let mut checks = self.check_threads(&boards, now).await;
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -580,27 +654,54 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Whether each coordinator thread of ours that a home board still leaves to us is live,
-    /// by board: asked side by side, each within [`Timing::thread_check`].
-    async fn check_threads(&self, boards: &[Board]) -> BTreeMap<BoardSlug, Result<bool>> {
-        let ours: Vec<(BoardSlug, String)> = boards
-            .iter()
-            .filter(|board| self.is_home(board))
-            .filter_map(|board| {
-                let local = self.state.coordinators.get(&board.slug)?;
-                board
-                    .coordinator
-                    .as_ref()
-                    .is_none_or(|c| *c == local.agent)
-                    .then(|| (board.slug.clone(), local.thread.clone()))
-            })
-            .collect();
-        let checked =
-            futures_util::future::join_all(ours.iter().map(|(_, thread)| self.thread_live(thread)))
+    /// by board: asked side by side, each within [`Timing::thread_check`]. A thread the
+    /// board names as coordinator and T3 found live less than [`THREAD_RECHECK`] ago counts
+    /// as live without asking.
+    async fn check_threads(
+        &mut self,
+        boards: &[Board],
+        now: Timestamp,
+    ) -> BTreeMap<BoardSlug, Result<bool>> {
+        let mut checks = BTreeMap::new();
+        let mut ask: Vec<(BoardSlug, String)> = Vec::new();
+        for board in boards.iter().filter(|board| self.is_home(board)) {
+            let Some(local) = self.state.coordinators.get(&board.slug) else {
+                continue;
+            };
+            match &board.coordinator {
+                Some(named) if *named != local.agent => continue,
+                Some(_)
+                    if local.registered
+                        && self
+                            .threads_live
+                            .get(&local.thread)
+                            .is_some_and(|at| now - *at < THREAD_RECHECK) =>
+                {
+                    checks.insert(board.slug.clone(), Ok(true));
+                }
+                _ => ask.push((board.slug.clone(), local.thread.clone())),
+            }
+        }
+        let answers =
+            futures_util::future::join_all(ask.iter().map(|(_, thread)| self.thread_live(thread)))
                 .await;
-        ours.into_iter()
-            .map(|(slug, _)| slug)
-            .zip(checked)
-            .collect()
+        for ((slug, thread), answer) in ask.into_iter().zip(answers) {
+            if matches!(answer, Ok(true)) {
+                self.threads_live.insert(thread, now);
+            } else {
+                self.threads_live.remove(&thread);
+            }
+            checks.insert(slug, answer);
+        }
+        let ours: Vec<&str> = self
+            .state
+            .coordinators
+            .values()
+            .map(|c| c.thread.as_str())
+            .collect();
+        self.threads_live
+            .retain(|thread, _| ours.contains(&thread.as_str()));
+        checks
     }
 
     /// Whether T3 has `thread` and has not archived it.
@@ -1067,6 +1168,12 @@ impl<T: T3> Daemon<T> {
     /// boards should be reconciled. On an error nothing is queued and `last_seq` stays.
     pub async fn on_event(&mut self, event: &Event, now: Timestamp) -> Result<bool> {
         if event.event_type == EventType::AgentStateChanged {
+            // An ended agent's thread may be gone: the next reconcile asks T3 about it.
+            if event.payload["to"] == "ended"
+                && let Ok(agent) = event.actor.parse::<AgentId>()
+            {
+                self.threads_live.remove(agent.native());
+            }
             self.note_state(event, now);
         }
         let (reconcile, wakes) = self.examine(event).await?;
@@ -1593,6 +1700,10 @@ impl<T: T3> Daemon<T> {
     /// Records how sending `out` went.
     fn settle(&mut self, out: Outgoing, sent: Sent, now: Timestamp) {
         let agent = out.agent;
+        if !matches!(sent, Sent::Delivered) {
+            // A send that failed may mean the thread is gone: the next reconcile asks T3.
+            self.threads_live.remove(agent.native());
+        }
         match sent {
             Sent::Delivered => {
                 if let Some(queue) = self.state.wakes.get_mut(&agent) {
@@ -1829,13 +1940,14 @@ fn is_transient(err: &anyhow::Error) -> bool {
 fn no_project(board: &Board) -> String {
     if board.repos.is_empty() {
         return format!(
-            "no T3 project for board {} on this device: add it under [board_projects] in config.toml",
+            "no T3 project for board {} on this device: add it under [board_projects] in \
+             config.toml; board watch reads it within a minute",
             board.slug
         );
     }
     format!(
         "no T3 project for {} on this device: add it under [projects] (or the board under \
-         [board_projects]) in config.toml",
+         [board_projects]) in config.toml; board watch reads it within a minute",
         board.repos.join(", ")
     )
 }
