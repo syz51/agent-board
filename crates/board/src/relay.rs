@@ -8,29 +8,37 @@
 //!   with the device token; it never adds an identity of its own. It forwards only the
 //!   routes hooks call, and a route with an agent in its path only for that same agent, so a
 //!   hook can do through the relay only what it could do with the token itself.
-//! - A hook uses the relay when the socket is safe and answers, and calls the server
-//!   directly otherwise. When the relay gets no answer from the server, it says so in
-//!   [`RELAY_HEADER`], so the hook judges the server as it would have directly.
+//! - A hook asks the relay first (`GET /relay`, answered by the relay itself) and uses it
+//!   only when it answers at once with the hook's own build and server; otherwise the hook
+//!   calls the server directly. The relay reloads the server and token when `config.toml`
+//!   changes (`board login` rewrites it).
+//! - When the relay gets no answer from the server, or refuses a request itself, it says so
+//!   in [`RELAY_HEADER`], so the hook judges the server as it would have directly and never
+//!   blames it for the relay.
 
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
-use board_proto::{AGENT_HEADER, AgentId, ApiError, COMMIT_HEADER, ErrorCode, VERSION_HEADER};
+use board_proto::{AGENT_HEADER, AgentId, COMMIT_HEADER, VERSION_HEADER};
+use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::config::Home;
+use crate::client::Client;
+use crate::config::{Config, Home, load_token};
 
-/// Set by the relay on an answer it made because the server gave none: `unreachable` (no
-/// connection) or `slow` (no answer in time).
+/// Set by the relay on an answer it made itself: `unreachable` (no connection to the
+/// server), `slow` (no answer in time) or `refused` (not forwarded).
 pub const RELAY_HEADER: &str = "x-board-relay";
+/// The relay's own route, answered with its [`Status`].
+pub const STATUS_PATH: &str = "/relay";
 /// The relay's directory in `$BOARD_HOME`, and the socket in it.
 const DIR: &str = "run";
 const SOCKET: &str = "hook.sock";
@@ -40,11 +48,15 @@ const BODY_MAX: usize = 1 << 20;
 /// unreachable, as for a hook calling it directly.
 const UPSTREAM_CONNECT: Duration = Duration::from_millis(500);
 /// Bounds one forwarded request. Longer than any hook's budget, so the hook gives up first
-/// and judges the server slow.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+/// and judges the server slow, but short enough that a connection that died silently (a
+/// Mac waking from sleep) leaves the pool soon.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an idle connection to the server is kept for the next hook.
 const UPSTREAM_IDLE: Duration = Duration::from_secs(300);
-/// How long a hook waits for the relay to accept its connection.
+/// How often the relay asks the server for its health on two connections at once, so the
+/// pool keeps the two a hook's heartbeat and snapshot use, and drops dead ones.
+const KEEP_WARM: Duration = Duration::from_secs(30);
+/// How long a hook waits for the relay's status; past it, the hook calls the server.
 const PROBE: Duration = Duration::from_millis(100);
 
 /// The relay's socket for `home`.
@@ -55,6 +67,25 @@ pub fn socket_path(home: &Home) -> PathBuf {
 /// This process's effective user id.
 fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+/// What the relay says about itself at [`STATUS_PATH`]: a hook uses it only when all three
+/// match its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    pub version: String,
+    pub commit: String,
+    pub server: String,
+}
+
+impl Status {
+    fn of(server: &str) -> Self {
+        Self {
+            version: board_proto::VERSION.to_owned(),
+            commit: crate::COMMIT.to_owned(),
+            server: server.to_owned(),
+        }
+    }
 }
 
 /// The routes hooks call. One that names an agent in its path is allowed only for the
@@ -78,7 +109,7 @@ fn hook_route(method: &Method, path: &str, agent: &AgentId) -> bool {
 #[derive(Debug)]
 pub struct Relay {
     path: PathBuf,
-    task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Relay {
@@ -89,15 +120,22 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        self.task.abort();
-        // Best effort: a socket left behind refuses connections, and hooks then call the
-        // server directly until the next daemon replaces it.
-        let _ = std::fs::remove_file(&self.path);
+        for task in &self.tasks {
+            task.abort();
+        }
+        // A socket left behind refuses connections, and hooks then call the server directly
+        // until the next daemon replaces it.
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("removing {}: {err}", self.path.display()),
+        }
     }
 }
 
-/// Starts serving hooks of `home`, forwarding to `server` with `token`. The caller must
-/// hold the home's watch lock, so a socket already there is a stale one and is replaced.
+/// Starts serving hooks of `home`, forwarding to `server` with `token` (as the daemon
+/// loaded them from the home) until `config.toml` changes. The caller must hold the home's
+/// watch lock, so a socket already there is a stale one and is replaced.
 pub fn start(home: &Home, server: &str, token: String) -> Result<Relay> {
     let path = socket_path(home);
     let uid = own_uid();
@@ -127,19 +165,37 @@ pub fn start(home: &Home, server: &str, token: String) -> Result<Relay> {
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("restricting {}", path.display()))?;
-    let upstream = Arc::new(Upstream::new(server, token)?);
-    upstream.warm();
-    let app = axum::Router::new().fallback(relay).with_state(upstream);
+    let login = Login {
+        stamp: config_stamp(home),
+        base: server.trim_end_matches('/').to_owned(),
+        token,
+    };
+    let upstream = Arc::new(Upstream::new(home.clone(), login)?);
+    let warm = upstream.clone();
+    let keep_warm = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(KEEP_WARM);
+        loop {
+            tick.tick().await;
+            warm.warm().await;
+        }
+    });
+    let app = axum::Router::new()
+        .route(STATUS_PATH, axum::routing::get(status))
+        .fallback(relay)
+        .with_state(upstream);
     let listener = SameUser {
         inner: listener,
         uid,
     };
-    let task = tokio::spawn(async move {
+    let serve = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::warn!("the hook relay stopped: {err:#}");
         }
     });
-    Ok(Relay { path, task })
+    Ok(Relay {
+        path,
+        tasks: vec![serve, keep_warm],
+    })
 }
 
 /// Accepts only connections from processes of `uid`.
@@ -177,15 +233,47 @@ impl axum::serve::Listener for SameUser {
     }
 }
 
-/// The server the relay forwards to, with the device token and a pool of connections.
-struct Upstream {
-    http: reqwest::Client,
+/// When `config.toml` was last written, to notice a `board login`.
+type Stamp = Option<(SystemTime, u64)>;
+
+fn config_stamp(home: &Home) -> Stamp {
+    let meta = std::fs::metadata(home.config_path()).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The server and device token the relay forwards with, and the config they came from.
+#[derive(Clone)]
+struct Login {
+    stamp: Stamp,
     base: String,
     token: String,
 }
 
+impl Login {
+    /// Reads the home's server and token, as `board login` left them.
+    fn load(home: &Home) -> Result<Self> {
+        // First, so a change while loading is noticed next time.
+        let stamp = config_stamp(home);
+        let config = Config::load(home)?;
+        let (server, _) = config.require_login()?;
+        let token = load_token(home)?.context("no device token")?;
+        Ok(Self {
+            stamp,
+            base: server.trim_end_matches('/').to_owned(),
+            token,
+        })
+    }
+}
+
+/// The server the relay forwards to, with the device token and a pool of connections.
+struct Upstream {
+    http: reqwest::Client,
+    home: Home,
+    login: Mutex<Arc<Login>>,
+}
+
 impl Upstream {
-    fn new(server: &str, token: String) -> Result<Self> {
+    fn new(home: Home, login: Login) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(UPSTREAM_CONNECT)
             .timeout(UPSTREAM_TIMEOUT)
@@ -196,19 +284,56 @@ impl Upstream {
             .context("building the relay's HTTP client")?;
         Ok(Self {
             http,
-            base: server.trim_end_matches('/').to_owned(),
-            token,
+            home,
+            login: Mutex::new(Arc::new(login)),
         })
     }
 
-    /// Opens a connection ahead of the first hook.
-    fn warm(&self) {
-        let health = self.http.get(format!("{}/healthz", self.base)).send();
-        tokio::spawn(async move {
-            if let Err(err) = health.await {
-                tracing::debug!("hook relay: warming the connection: {err}");
+    /// The current login, reloaded when `config.toml` changed since it was read.
+    async fn login(&self) -> Result<Arc<Login>> {
+        let current = self
+            .login
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if current.stamp == config_stamp(&self.home) {
+            return Ok(current);
+        }
+        let home = self.home.clone();
+        // The Keychain lookup runs a process.
+        let fresh = Arc::new(tokio::task::spawn_blocking(move || Login::load(&home)).await??);
+        tracing::info!("hook relay: reloaded the server and token after a config change");
+        *self.login.lock().unwrap_or_else(PoisonError::into_inner) = fresh.clone();
+        Ok(fresh)
+    }
+
+    /// Asks for the server's health on two connections at once, opening or keeping them.
+    async fn warm(&self) {
+        let Ok(login) = self.login().await else {
+            return;
+        };
+        let health = || self.http.get(format!("{}/healthz", login.base)).send();
+        let (a, b) = tokio::join!(health(), health());
+        for result in [a, b] {
+            if let Err(err) = result {
+                tracing::debug!("hook relay: warming connections: {err}");
             }
-        });
+        }
+    }
+}
+
+/// `GET /relay`: the relay's build and server, after reloading a changed config. A relay
+/// that cannot load its login answers 503, and hooks call the server directly.
+async fn status(State(up): State<Arc<Upstream>>) -> Response {
+    match up.login().await {
+        Ok(login) => axum::Json(Status::of(&login.base)).into_response(),
+        Err(err) => {
+            tracing::warn!("hook relay: {err:#}");
+            refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hook relay cannot load this device's login; hooks call the server directly until board watch is restarted",
+            )
+        }
     }
 }
 
@@ -224,50 +349,59 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
     let Some(agent) = agent else {
         return refuse(
             StatusCode::BAD_REQUEST,
-            ErrorCode::Invalid,
-            "the hook relay needs the calling agent in x-board-agent",
+            "send the calling agent's id in x-board-agent",
         );
     };
     let path = parts.uri.path();
     if !hook_route(&parts.method, path, &agent) {
         return refuse(
             StatusCode::FORBIDDEN,
-            ErrorCode::Forbidden,
-            "the hook relay forwards only the requests hooks make for their own agent",
+            "the hook relay forwards only the requests hooks make for their own agent; call the server directly",
         );
     }
-    let body = match axum::body::to_bytes(body, BODY_MAX).await {
-        Ok(body) => body,
-        Err(_) => {
+    let Ok(body) = axum::body::to_bytes(body, BODY_MAX).await else {
+        return refuse(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "send at most 1 MiB through the hook relay, or call the server directly",
+        );
+    };
+    let login = match up.login().await {
+        Ok(login) => login,
+        Err(err) => {
+            tracing::warn!("hook relay: {err:#}");
             return refuse(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorCode::Invalid,
-                "request body too large for the hook relay",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hook relay cannot load this device's login; call the server directly",
             );
         }
     };
-    let mut url = format!("{}{path}", up.base);
+    let mut url = format!("{}{path}", login.base);
     if let Some(query) = parts.uri.query() {
         url.push('?');
         url.push_str(query);
     }
-    let mut out = up
-        .http
-        .request(parts.method, url)
-        .bearer_auth(&up.token)
-        .header(AGENT_HEADER, agent.as_str())
-        .body(body);
-    if let Some(kind) = parts.headers.get(header::CONTENT_TYPE) {
-        out = out.header(header::CONTENT_TYPE, kind.clone());
-    }
-    let answer = async {
-        let resp = out.send().await?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let bytes = resp.bytes().await?;
-        Ok::<_, reqwest::Error>((status, headers, bytes))
+    let send = || {
+        let mut out = up
+            .http
+            .request(parts.method.clone(), &url)
+            .bearer_auth(&login.token)
+            .header(AGENT_HEADER, agent.as_str())
+            .body(body.clone());
+        if let Some(kind) = parts.headers.get(header::CONTENT_TYPE) {
+            out = out.header(header::CONTENT_TYPE, kind.clone());
+        }
+        forward(out)
     };
-    match answer.await {
+    // A kept-alive connection the server closed as it was reused fails without a timeout or
+    // a connect error: try once more, on another connection.
+    let answer = match send().await {
+        Err(err) if !err.is_timeout() && !err.is_connect() => {
+            tracing::debug!("hook relay: retrying after {err}");
+            send().await
+        }
+        answer => answer,
+    };
+    match answer {
         Ok((status, headers, bytes)) => {
             let mut resp = Response::new(Body::from(bytes));
             *resp.status_mut() = status;
@@ -294,21 +428,34 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
     }
 }
 
-fn refuse(status: StatusCode, code: ErrorCode, message: &str) -> Response {
-    let error = ApiError {
-        code,
-        message: message.to_owned(),
-        next: Some("update board on this device and restart board watch".to_owned()),
-    };
-    (status, axum::Json(error)).into_response()
+async fn forward(
+    req: reqwest::RequestBuilder,
+) -> reqwest::Result<(StatusCode, reqwest::header::HeaderMap, Bytes)> {
+    let resp = req.send().await?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.bytes().await?;
+    Ok((status, headers, bytes))
 }
 
-/// The socket a hook of `home` may use, from file metadata alone: a socket owned by this
-/// user in a directory owned by this user that no one else may enter. Cheap enough for every
-/// hook; [`answers`] then checks that a relay listens.
+/// An answer the relay makes without forwarding: plain text, marked `refused`.
+fn refuse(status: StatusCode, message: &'static str) -> Response {
+    let mut resp = (status, message).into_response();
+    resp.headers_mut()
+        .insert(RELAY_HEADER, HeaderValue::from_static("refused"));
+    resp
+}
+
+/// The relay's socket for a hook of `home`, from file metadata alone: a socket owned by
+/// this user, in a directory owned by this user that no one else may enter, in a home that
+/// belongs to this user and that no one else may write. Cheap enough for every hook.
 pub fn safe_socket(home: &Home) -> Option<PathBuf> {
     let path = socket_path(home);
     let uid = own_uid();
+    let root = std::fs::metadata(home.root()).ok()?;
+    if root.uid() != uid || root.mode() & 0o022 != 0 {
+        return None;
+    }
     let dir = std::fs::symlink_metadata(path.parent()?).ok()?;
     if !dir.is_dir() || dir.uid() != uid || dir.mode() & 0o077 != 0 {
         return None;
@@ -317,18 +464,27 @@ pub fn safe_socket(home: &Home) -> Option<PathBuf> {
     (socket.file_type().is_socket() && socket.uid() == uid).then_some(path)
 }
 
-/// Whether a relay of this user accepts connections on `path` within [`PROBE`]. A socket
-/// left by a daemon that died refuses at once.
-pub async fn answers(path: &Path) -> bool {
-    match tokio::time::timeout(PROBE, UnixStream::connect(path)).await {
-        Ok(Ok(stream)) => stream.peer_cred().is_ok_and(|c| c.uid() == own_uid()),
-        Ok(Err(err)) => {
-            tracing::debug!("hook relay at {}: {err}", path.display());
-            false
+/// A client through the relay on `socket`, when the relay answers within [`PROBE`] with
+/// this build and `server`: a socket left by a daemon that died refuses at once, and a
+/// daemon of another build (the binary was upgraded under it) or one still on an earlier
+/// login is passed by. The probe's connection stays open for the hook's requests.
+pub async fn connect(socket: &Path, server: &str) -> Option<Client> {
+    let client = match Client::relayed(socket, PROBE) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!("hook relay: {err:#}");
+            return None;
         }
-        Err(_) => {
-            tracing::debug!("hook relay at {}: no answer in {PROBE:?}", path.display());
-            false
+    };
+    match client.relay_status().await {
+        Ok(status) if status == Status::of(server.trim_end_matches('/')) => Some(client),
+        Ok(status) => {
+            tracing::debug!("hook relay: passed by: {status:?}");
+            None
+        }
+        Err(err) => {
+            tracing::debug!("hook relay at {}: {err:#}", socket.display());
+            None
         }
     }
 }

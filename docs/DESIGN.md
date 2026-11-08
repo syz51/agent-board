@@ -170,18 +170,23 @@ host.
   0700 and must belong to the daemon's user, the socket has mode 0600, and the daemon serves
   only peers with its own user id (`getpeereid`, `SO_PEERCRED`). It forwards each request
   with the device token and the caller's own `X-Board-Agent`, never an identity of its own,
-  and only the routes hooks call: registering, state, handoff of the agent the request
+  and only the routes hooks call: registering, state and handoff of the agent the request
   names, snapshot, touches, boards and tasks. The server's rules for that agent apply as
-  for a direct call. A hook uses the relay only when the socket and its directory belong to
-  its user, the directory is closed to others, and a peer of its own user id accepts within
-  0.1 seconds; otherwise it calls the server directly. The relay keeps its connections to
-  the server open for five minutes and opens one when it starts. When the relay gets no
-  connection or answer from the server, it answers `502` or `504` with `X-Board-Relay:
-  unreachable` or `slow`, and the hook judges the server as it would directly; a relay that
-  fails itself (a daemon stopping mid-hook) leaves the breaker as it was. Directly, a hook
-  sends its requests one after another on one connection; through the relay, the heartbeat
-  and the snapshot go at once. The daemon reads the token and server when it starts, so it
-  needs a restart after `board login`.
+  for a direct call. A hook uses the relay only when the home and the socket belong to its
+  user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a
+  token of the session's own, and the relay's status (`GET /relay`, answered by the relay
+  within 0.1 seconds) names the hook's own build and server; otherwise it calls the server
+  directly. So a daemon left on an older binary after an upgrade, or stopped, is passed by.
+  The relay rereads the server and token when `config.toml` changes, as `board login`
+  rewrites it. It keeps two connections to the server warm (a health check on both every
+  30 seconds, idle ones kept five minutes), sends a request again once when a kept
+  connection fails without a timeout, and gives up on the server after two seconds. When it
+  gets no connection or answer, it answers `502` or `504` with `X-Board-Relay: unreachable`
+  or `slow`, and the hook judges the server as it would directly; a request it does not
+  forward is marked `refused`. Neither a refusal nor the relay's own connection failing (a
+  daemon stopping mid-hook) changes the breaker. Directly, a hook sends its requests one
+  after another on one connection; through the relay, the heartbeat and the snapshot go at
+  once.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,

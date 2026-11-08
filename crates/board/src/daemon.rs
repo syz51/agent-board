@@ -45,7 +45,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, error_code, is_unreachable};
-use crate::config::{Config, Home, load_token};
+use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut};
@@ -2257,14 +2257,13 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     daemon.follow(&mut shutdown).await
 }
 
-/// Starts the hook relay for `ctx`'s home, or says why not and carries on without it.
+/// Starts the hook relay for `ctx`'s home with the server and token `ctx` loaded, or says
+/// why not and carries on without it.
 fn start_relay(ctx: &Ctx) -> Option<crate::relay::Relay> {
-    let started = load_token(&ctx.home)
-        .and_then(|token| token.context("no device token"))
-        .and_then(|token| {
-            let (server, _) = ctx.config.require_login()?;
-            crate::relay::start(&ctx.home, server, token)
-        });
+    let started = ctx.config.require_login().and_then(|(server, _)| {
+        let token = ctx.client.token().context("no device token")?;
+        crate::relay::start(&ctx.home, server, token.to_owned())
+    });
     match started {
         Ok(relay) => {
             tracing::info!("serving hooks on {}", relay.path().display());

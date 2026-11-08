@@ -26,7 +26,7 @@ use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery};
+use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failure};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
@@ -281,13 +281,22 @@ async fn handle(
     } else {
         Vec::new()
     };
-    // The device daemon's relay, when its socket is there and safe to use: it holds the
-    // token, so the hook needs none.
-    let relay = crate::relay::safe_socket(&home);
+    // A PostToolUse hook other than an edit tool's often has nothing to send, so it asks
+    // for the relay or the token only once it knows it has.
+    let early = !post || !edited.is_empty();
+    // The device daemon's relay holds the device token, so a hook using it needs none. A
+    // session given its own token in `BOARD_TOKEN` keeps it, and so calls directly.
+    let socket = std::env::var_os("BOARD_TOKEN")
+        .is_none_or(|t| t.is_empty())
+        .then(|| crate::relay::safe_socket(&home))
+        .flatten();
+    let mut relay = match &socket {
+        Some(socket) if early => crate::relay::connect(socket, server).await,
+        _ => None,
+    };
     // The Keychain lookup runs a process, while the process table and the work tree are
-    // read below. A PostToolUse hook other than an edit tool's often has nothing to send,
-    // so it looks the token up only once it knows it has.
-    let mut token = (relay.is_none() && (!post || !edited.is_empty())).then(|| spawn_token(&home));
+    // read below.
+    let mut token = (early && relay.is_none()).then(|| spawn_token(&home));
     let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
     let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
@@ -318,15 +327,13 @@ async fn handle(
         // Nothing to send: no server call and no Keychain lookup.
         return Ok(Reply::Nothing);
     }
-    // A socket left by a daemon that stopped refuses at once: then call the server directly.
-    let relay = match relay {
-        Some(socket) if crate::relay::answers(&socket).await => Some(socket),
-        _ => None,
-    };
+    if !early && let Some(socket) = &socket {
+        relay = crate::relay::connect(socket, server).await;
+    }
     let route = match relay {
-        Some(socket) => {
+        Some(client) => {
             steps.mark("relay");
-            Route::Relay(socket)
+            Route::Relay(client)
         }
         None => {
             let token = match token.take() {
@@ -350,7 +357,9 @@ async fn handle(
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
     let relayed = matches!(route, Route::Relay(_));
     let client = match route {
-        Route::Relay(socket) => Client::relayed(&socket, agent.clone(), remaining)?,
+        Route::Relay(client) => client
+            .with_agent(Some(agent.clone()))
+            .with_timeout(remaining),
         Route::Direct(token) => {
             let connect = CONNECT_BUDGET.min(remaining);
             Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
@@ -401,15 +410,23 @@ async fn handle(
             tracing::debug!("hook {}: {err:#}", event.name());
             (hook.local_stop(), None, true)
         }
+        // The relay did not forward the request: nothing is known about the server.
+        Ok(Err(err)) if relay_failure(&err) == Some(RelayFailure::Refused) => {
+            tracing::debug!("hook {}: {err:#}", event.name());
+            (hook.local_stop(), None, false)
+        }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
             let failure = Failure::of(&err);
-            // The relay's connection failing (a daemon stopped mid-hook) says nothing about
-            // the server; the relay reports the server's own failures, and a timeout counts.
-            let judged = !hook.relayed
-                || failure == Failure::Slow
-                || err.chain().any(|c| c.is::<RelayFailure>());
-            (hook.offline(failure), Some(failure), judged)
+            // The relay's own connection failing (a daemon stopping mid-hook) says nothing
+            // about the server. The relay reports the server's failures in an answer, and a
+            // timeout counts as the server's.
+            let relay_broke = hook.relayed
+                && err
+                    .chain()
+                    .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+                    .any(|e| !e.is_timeout());
+            (hook.offline(failure), Some(failure), !relay_broke)
         }
         Err(_) => {
             tracing::debug!("hook {}: no answer within {remaining:?}", event.name());
@@ -418,8 +435,10 @@ async fn handle(
     };
     steps.mark("server");
     let next = match failure {
-        // This device left the server too little time to judge it, or the relay failed.
-        Some(_) if remaining < SERVER_SHARE_FAIR || !judged => breaker.clone(),
+        // The relay failed, not the server.
+        _ if !judged => breaker.clone(),
+        // This device left the server too little time to judge it.
+        Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
@@ -469,8 +488,8 @@ impl Drop for Steps {
 
 /// How a hook reaches the server.
 enum Route {
-    /// Through the device daemon's relay on this socket.
-    Relay(PathBuf),
+    /// Through the device daemon's relay, with this client.
+    Relay(Client),
     /// Directly, with this token.
     Direct(String),
 }
@@ -490,12 +509,10 @@ impl Failure {
     /// A request that timed out after it connected is slow; any other failure to get an
     /// answer is unreachable, a connection not opened within [`CONNECT_BUDGET`] included.
     fn of(err: &anyhow::Error) -> Self {
-        if let Some(relayed) = err.chain().find_map(|e| e.downcast_ref::<RelayFailure>()) {
-            return if relayed.slow {
-                Self::Slow
-            } else {
-                Self::Unreachable
-            };
+        match relay_failure(err) {
+            Some(RelayFailure::Slow) => return Self::Slow,
+            Some(RelayFailure::Unreachable) => return Self::Unreachable,
+            Some(RelayFailure::Refused) | None => {}
         }
         let timed_out = err
             .chain()
@@ -1554,6 +1571,20 @@ pub fn current_exe() -> PathBuf {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn the_relays_reports_count_as_the_servers_own_failures() {
+        let err = |f: RelayFailure| anyhow::Error::from(f).context("board server unreachable");
+        assert_eq!(Failure::of(&err(RelayFailure::Slow)), Failure::Slow);
+        assert_eq!(
+            Failure::of(&err(RelayFailure::Unreachable)),
+            Failure::Unreachable
+        );
+        assert_eq!(
+            relay_failure(&err(RelayFailure::Refused)),
+            Some(RelayFailure::Refused)
+        );
+    }
 
     #[test]
     fn edit_tools_yield_paths() {
