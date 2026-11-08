@@ -427,11 +427,16 @@ settings in use, warned once per edit.
   delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
   work is in another repository, a T3 thread launched in that repository's project, since
   `delegate_task` runs only in the coordinator's own project), naming the task
-  id in the brief so the child claims it, opens its PR, turns on auto-merge where the
-  repository allows it, parks the task in `review` and ends, since a child cannot wait for
-  CI; review the result against the acceptance checks when the child reports; merge the PR
-  once its checks pass when auto-merge is off (T3 `watch_pull_request`), and finish the
-  task after the merge; repeat. The
+  id in the brief so the child claims it, opens its PR, turns on auto-merge only where the
+  base branch requires status checks or reviews (the branch protection or rulesets API
+  shows them) and otherwise leaves the PR open, parks the task in `review` with a note
+  naming the PR (or, with no PR, the result: a file, a note id, a report) and ends, since
+  a child cannot wait for CI; review the result against the acceptance checks when the
+  child reports; when the PR is still open, merge it after that review once its checks
+  pass (T3 `watch_pull_request`), and finish the task after the merge; repeat. The
+  coordinator writes each brief as itself, never in the user's voice, and names who
+  closes the task by role and agent id; a child says a task waits on the user only when
+  the brief says the user must decide or act. The
   coordinator does a task itself only when it changes no repository files (a verdict, an
   investigation, an ask) or a child failed it twice, so its context stays small and it
   keeps answering alerts and proposals while children work. When it needs the user it
@@ -834,13 +839,16 @@ report, not a free-form task (`API.md`, "Feedback"):
   sends a declined item back to triage when all three hold (defaults in brackets):
   - it was declined at least `declined_reopen_after_days` ago (1 day);
   - it has gained at least `declined_reopen_reports` reports since the decline (5), from
-    any agent;
+    any agent, on the item or on items resolved as its duplicates (and theirs, up to 8
+    links); a report counts when both its row and its time come after the decline, so
+    errors a signal item copied from before the decline do not count;
   - at least `declined_reopen_agents` of the agents behind them are new (3): they had not
     reported the problem before the decline, on this item, on an item resolved as its
-    duplicate, or as its creator.
+    duplicate, or as the creator of one of them.
 
-  The check runs on each report to a declined item, on the injected clock, so reports that
-  met the bar during the wait take effect with the next report. The item moves to `open`,
+  The check runs on each report to a declined item and when an item is resolved as its
+  duplicate, on the injected clock, so reports that met the bar during the wait take
+  effect with the next report or duplicate resolve. The item moves to `open`,
   unowned and unresolved, with a `reopened:` finding note giving the counts since the
   decline and its reason. Triage routes it to the setup's owner or asks the user, and
   does not decline it again for the same reason. The server keeps the newest report row,
