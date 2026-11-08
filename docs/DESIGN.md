@@ -164,6 +164,29 @@ host.
   The server's deadline is set after the hook's local steps (Keychain, process table, T3,
   git), and a failure changes nothing when those steps left the server under half a
   second.
+- **Hook relay**: while `board watch` runs, hooks reach the server through it, so a hook
+  pays for neither a TLS handshake (0.04 to 0.3 seconds over a relayed tailnet path) nor a
+  Keychain lookup. The daemon serves `$BOARD_HOME/run/hook.sock`: the directory has mode
+  0700 and must belong to the daemon's user, the socket has mode 0600, and the daemon serves
+  only peers with its own user id (`getpeereid`, `SO_PEERCRED`). It forwards each request
+  with the device token and the caller's own `X-Board-Agent`, never an identity of its own,
+  and only the routes hooks call: registering, state and handoff of the agent the request
+  names, snapshot, touches, boards and tasks. The server's rules for that agent apply as
+  for a direct call. A hook uses the relay only when the home and the socket belong to its
+  user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a
+  token of the session's own, and the relay's status (`GET /relay`, answered by the relay
+  within 0.1 seconds) names the hook's own build and server; otherwise it calls the server
+  directly. So a daemon left on an older binary after an upgrade, or stopped, is passed by.
+  The relay rereads the server and token when `config.toml` changes, as `board login`
+  rewrites it. It keeps two connections to the server warm (a health check on both every
+  30 seconds, idle ones kept five minutes), sends a request again once when a kept
+  connection fails without a timeout, and gives up on the server after two seconds. When it
+  gets no connection or answer, it answers `502` or `504` with `X-Board-Relay: unreachable`
+  or `slow`, and the hook judges the server as it would directly; a request it does not
+  forward is marked `refused`. Neither a refusal nor the relay's own connection failing (a
+  daemon stopping mid-hook) changes the breaker. Directly, a hook sends its requests one
+  after another on one connection; through the relay, the heartbeat and the snapshot go at
+  once.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
@@ -789,7 +812,9 @@ Alternatives dropped:
 - Devices: `board login` stores the server URL and token; `board install claude` adds the
   hooks and MCP server to Claude Code's user settings; `board watch` runs under launchd or
   systemd, one per `$BOARD_HOME`: it holds a lock on `state/watch.lock` while it runs, and
-  a second one exits naming the first one's pid.
+  a second one exits naming the first one's pid. It serves the hook relay on
+  `run/hook.sock` (see Network, auth and offline behaviour), replaces a socket left by a
+  daemon that died, and removes it when it stops.
 
 ## Testing
 
@@ -798,6 +823,7 @@ Alternatives dropped:
 - Concurrency: many parallel claims of one task; exactly one wins.
 - API contract tests through the HTTP layer; CLI and MCP tests against an in-process server.
 - Hook tests with recorded Claude Code and Codex payloads; timeouts against an unreachable
-  server; size caps.
+  server; size caps; the hook relay (socket modes, forwarded identity and token, refused
+  routes) and the fallback to direct calls.
 - A two-device end-to-end test; a restore drill; live tests with a real Claude Code session in
   the consuming setup.

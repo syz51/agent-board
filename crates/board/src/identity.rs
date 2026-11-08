@@ -1,7 +1,7 @@
 //! Who is calling (agent id and runtime) and where (repo key, branch, cwd).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 use board_proto::{AgentId, Runtime, normalize_repo};
@@ -235,35 +235,46 @@ pub struct RepoInfo {
 impl RepoInfo {
     /// Reads repo key, root and branch with `git`; outside a repo only `cwd` is set.
     pub fn detect(cwd: &Path) -> Self {
-        let git = |args: &[&str]| -> Option<String> {
-            let out = Command::new("git")
+        // The three reads do not depend on each other, so they run at once: a hook waits
+        // for the slowest one, not for their sum.
+        let spawn = |args: &[&str]| {
+            Command::new("git")
                 .arg("-C")
                 .arg(cwd)
                 .args(args)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        };
+        // Waits for every child, so none is left a zombie even outside a repo.
+        let read = |child: Option<Child>| -> Option<String> {
+            let out = child?.wait_with_output().ok()?;
             out.status
                 .success()
                 .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         };
-        let mut info = Self {
-            cwd: cwd.to_path_buf(),
-            ..Self::default()
-        };
-        info.root = git(&["rev-parse", "--show-toplevel"])
+        let root = spawn(&["rev-parse", "--show-toplevel"]);
+        // `symbolic-ref` also names the branch of a repo without commits; detached HEAD
+        // has none.
+        let branch = spawn(&["symbolic-ref", "--short", "-q", "HEAD"]);
+        let origin = spawn(&["remote", "get-url", "origin"]);
+        let root = read(root)
             .map(|out| PathBuf::from(out.trim_end_matches('\n')))
             .filter(|root| !root.as_os_str().is_empty());
-        if info.root.is_some() {
-            // `symbolic-ref` also names the branch of a repo without commits; detached
-            // HEAD has none.
-            info.branch = git(&["symbolic-ref", "--short", "-q", "HEAD"])
+        let branch = read(branch);
+        let origin = read(origin);
+        let in_repo = root.is_some();
+        Self {
+            cwd: cwd.to_path_buf(),
+            key: origin.filter(|_| in_repo).and_then(|u| normalize_repo(&u)),
+            branch: branch
+                .filter(|_| in_repo)
                 .map(|out| out.trim().to_owned())
-                .filter(|b| !b.is_empty());
-            info.key = git(&["remote", "get-url", "origin"]).and_then(|u| normalize_repo(&u));
+                .filter(|b| !b.is_empty()),
+            root,
         }
-        info
     }
 
     /// `path` relative to the repo root, with `/` separators; `None` outside the repo.

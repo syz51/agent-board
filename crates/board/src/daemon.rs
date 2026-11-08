@@ -2242,6 +2242,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         ctx.device,
         t3.bin.display()
     );
+    // Hooks of this home reach the server through the relay while the daemon runs; without
+    // it they call the server directly, so a relay that cannot start costs only speed.
+    let _relay = if once { None } else { start_relay(&ctx) };
     let mut daemon = Daemon::new(ctx, t3);
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
@@ -2259,6 +2262,25 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         return daemon.save();
     }
     daemon.follow(&mut shutdown).await
+}
+
+/// Starts the hook relay for `ctx`'s home with the server and token `ctx` loaded, or says
+/// why not and carries on without it.
+fn start_relay(ctx: &Ctx) -> Option<crate::relay::Relay> {
+    let started = ctx.config.require_login().and_then(|(server, _)| {
+        let token = ctx.client.token().context("no device token")?;
+        crate::relay::start(&ctx.home, server, token.to_owned())
+    });
+    match started {
+        Ok(relay) => {
+            tracing::info!("serving hooks on {}", relay.path().display());
+            Some(relay)
+        }
+        Err(err) => {
+            tracing::warn!("hooks will call the server directly: {err:#}");
+            None
+        }
+    }
 }
 
 /// A request to stop: Ctrl-C, SIGTERM from launchd or systemd stopping the service, or a

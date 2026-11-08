@@ -200,8 +200,11 @@ fn user_prompt_submit_injects_the_delta_since_the_last_seq() {
         snapshot_fixture(SnapshotKind::Delta, "<board>\nalerts: x\n</board>", 815),
     );
     let prompt = e.with("UserPromptSubmit", json!({"prompt": "continue"}));
+    let before = e.stub.connections();
     let (reply, _) = e.hook("user-prompt-submit", "claude", prompt.clone());
     assert!(context(&reply, "UserPromptSubmit").contains("alerts: x"));
+    // The heartbeat and the snapshot share one connection (one TLS handshake on a server).
+    assert_eq!(e.stub.connections() - before, 1);
     let q = e.stub.requests_to("GET /v1/snapshot")[1].query_pairs();
     assert_eq!((q["kind"].as_str(), q["since"].as_str()), ("delta", "812"));
     assert_eq!(
