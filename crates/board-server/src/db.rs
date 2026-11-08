@@ -35,6 +35,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0018_feedback_duplicates.sql"),
     include_str!("../migrations/0019_agents_device.sql"),
     include_str!("../migrations/0020_daemon_dispatch.sql"),
+    include_str!("../migrations/0021_usage.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

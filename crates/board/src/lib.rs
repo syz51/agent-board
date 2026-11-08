@@ -17,6 +17,7 @@ pub mod relay;
 pub mod render;
 pub mod state;
 pub mod t3;
+pub mod usage;
 pub mod worktree;
 
 /// The git commit this binary was built from (12 hex digits), or `unknown`.

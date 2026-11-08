@@ -2804,8 +2804,8 @@ async fn a_device_without_the_project_never_claims_the_lease() {
         e.stub
             .requests()
             .iter()
-            .all(|r| r.method == "GET" && r.path == "/v1/boards"),
-        "only board reads: {:?}",
+            .all(|r| r.method == "GET" && ["/v1/boards", "/v1/usage"].contains(&r.path.as_str())),
+        "only board and usage reads: {:?}",
         e.stub.requests()
     );
     assert!(e.t3.calls().is_empty());
@@ -6017,4 +6017,217 @@ fn a_message_key_names_the_run_and_text_without_keeping_the_text() {
         message_key(&message(Some("run:7"), "and another thing"))
     );
     assert_ne!(first, message_key(&message(None, "secret token abc")));
+}
+
+/// A reading the server would return: `week` percent of the weekly window, read at `read`.
+fn usage_reading(week: f64, read: Timestamp) -> serde_json::Value {
+    json!({
+        "seven_day": { "percent": week, "resets_at": read + chrono::Duration::days(2) },
+        "read_at": read,
+        "device": DEVICE,
+    })
+}
+
+#[tokio::test]
+async fn high_usage_drops_new_work_wakes_and_wakes_the_coordinator_when_it_eases() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+
+    // Over the board's stop: a ready task wakes no one.
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    assert!(e.daemon.state.wakes.is_empty(), "dropped, not kept");
+
+    // Below the stop: the coordinator is told once to start work again.
+    let later = at() + chrono::Duration::minutes(1);
+    e.stub.on("GET /v1/usage", usage_reading(40.0, later));
+    e.daemon.reconcile(later).await.unwrap();
+    assert!(e.daemon.state.usage_held.is_empty());
+    e.daemon.flush(later).await;
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, "coord");
+    assert!(
+        text.starts_with(
+            "board factory: the account usage no longer stops new work on this board (stop at \
+             90%)"
+        ),
+        "{text}"
+    );
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.flush(later).await;
+    assert_eq!(e.t3.sends().len(), 1, "once");
+}
+
+#[tokio::test]
+async fn a_stale_usage_reading_holds_nothing() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    let stale = at() + chrono::Duration::minutes(board_proto::USAGE_FRESH_MINUTES + 1);
+    e.daemon.reconcile(stale).await.unwrap();
+    assert!(e.daemon.state.usage_held.is_empty());
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            stale,
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(stale).await;
+    assert_eq!(threads(&e.t3), ["coord"]);
+}
+
+#[tokio::test]
+async fn the_daemon_reads_the_usage_endpoint_at_most_every_five_minutes_and_reports_it() {
+    use board::daemon::USAGE_POLL_EVERY;
+    use board::usage::{Credentials, UsageSource};
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let creds = e._dir.path().join("credentials.json");
+    let sign_in = |expires: Timestamp| {
+        json!({ "claudeAiOauth": {
+            "accessToken": "tok-123", "refreshToken": "never-read",
+            "expiresAt": expires.timestamp_millis(),
+        }})
+        .to_string()
+    };
+    std::fs::write(&creds, sign_in(at() + chrono::Duration::hours(8))).unwrap();
+    e.daemon.usage_source = UsageSource::ClaudeCode {
+        url: format!("{}/api/oauth/usage", e.stub.url),
+        credentials: Credentials::File(creds.clone()),
+    };
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({
+            "five_hour": { "utilization": 12.0, "resets_at": "2026-11-06T14:00:00+00:00" },
+            "seven_day": { "utilization": 93.0, "resets_at": null },
+            "seven_day_opus": null,
+        }),
+    );
+    e.stub.on("PUT /v1/usage", usage_reading(93.0, at()));
+    e.stub.on("GET /v1/usage", usage_reading(93.0, at()));
+
+    e.daemon.reconcile(at()).await.unwrap();
+    let reads = e.stub.requests_to("GET /api/oauth/usage");
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].auth.as_deref(), Some("Bearer tok-123"));
+    let reports = e.stub.requests_to("PUT /v1/usage");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].body,
+        json!({
+            "five_hour": { "percent": 12.0, "resets_at": "2026-11-06T14:00:00Z" },
+            "seven_day": { "percent": 93.0 },
+            "read_at": at(),
+        })
+    );
+    assert!(
+        !reports[0].body.to_string().contains("tok-123"),
+        "the token stays here"
+    );
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+
+    // Between readings, the server's newest reading.
+    let soon = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(soon).await.unwrap();
+    assert_eq!(e.stub.requests_to("GET /api/oauth/usage").len(), 1);
+    assert_eq!(e.stub.requests_to("GET /v1/usage").len(), 1);
+
+    let next = at() + USAGE_POLL_EVERY;
+    e.daemon.reconcile(next).await.unwrap();
+    assert_eq!(e.stub.requests_to("GET /api/oauth/usage").len(), 2);
+
+    // An expired token is not refreshed: the endpoint is not read.
+    std::fs::write(&creds, sign_in(at())).unwrap();
+    e.daemon.reconcile(next + USAGE_POLL_EVERY).await.unwrap();
+    assert_eq!(e.stub.requests_to("GET /api/oauth/usage").len(), 2);
+    // No sign-in at all: the same.
+    std::fs::remove_file(&creds).unwrap();
+    e.daemon
+        .reconcile(next + USAGE_POLL_EVERY * 2)
+        .await
+        .unwrap();
+    assert_eq!(e.stub.requests_to("GET /api/oauth/usage").len(), 2);
+}
+
+#[tokio::test]
+async fn an_empty_usage_answer_is_not_reported_and_a_failed_report_keeps_the_local_reading() {
+    use board::daemon::USAGE_POLL_EVERY;
+    use board::usage::{Credentials, UsageSource};
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let creds = e._dir.path().join("credentials.json");
+    std::fs::write(
+        &creds,
+        json!({ "claudeAiOauth": {
+            "accessToken": "tok-123",
+            "expiresAt": (at() + chrono::Duration::hours(8)).timestamp_millis(),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    e.daemon.usage_source = UsageSource::ClaudeCode {
+        url: format!("{}/api/oauth/usage", e.stub.url),
+        credentials: Credentials::File(creds),
+    };
+    e.stub
+        .on("GET /v1/usage", usage_reading(95.0, at()))
+        .on("PUT /v1/usage", usage_reading(95.0, at()));
+
+    // An answer in an unknown shape is no reading: nothing is reported, and the server's
+    // reading still holds the board.
+    e.stub.on("GET /api/oauth/usage", json!({ "renamed": {} }));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.stub.requests_to("PUT /v1/usage").is_empty());
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+
+    // The server fails: the daemon acts on its own reading.
+    let next = at() + USAGE_POLL_EVERY;
+    e.stub
+        .on(
+            "GET /api/oauth/usage",
+            json!({ "seven_day": { "utilization": 97.0 } }),
+        )
+        .on_error("PUT /v1/usage", 503, "unavailable", "down", "retry")
+        .on_error("GET /v1/usage", 503, "unavailable", "down", "retry");
+    e.daemon.reconcile(next).await.unwrap();
+    assert_eq!(e.stub.requests_to("PUT /v1/usage").len(), 1);
+    let usage = e.daemon.usage.as_ref().unwrap();
+    assert_eq!(
+        (usage.seven_day.unwrap().percent, usage.read_at),
+        (97.0, next)
+    );
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+}
+
+#[tokio::test]
+async fn a_daemon_without_a_reading_keeps_the_boards_it_held() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    // As after a restart: the saved state holds the board, and no reading is at hand.
+    e.daemon.state.usage_held.insert(factory());
+    e.stub
+        .on_error("GET /v1/usage", 503, "unavailable", "down", "retry");
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+    assert!(
+        e.t3.sends().is_empty(),
+        "no false eased wake: {:?}",
+        e.t3.sends()
+    );
 }
