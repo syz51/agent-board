@@ -2518,6 +2518,73 @@ async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
     assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
 }
 
+/// An env whose daemon has no project for the factory board yet, nor a `config.toml`.
+fn unmapped_env() -> Env {
+    let e = env_with_projects(BTreeMap::new());
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e
+}
+
+/// Writes the env daemon's `config.toml` with the given projects.
+fn write_config(e: &Env, projects: BTreeMap<String, PathBuf>) {
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects,
+        ..Config::default()
+    }
+    .save(&Home::at(e._dir.path().join("home")))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_project_added_to_config_toml_starts_the_coordinator_without_a_restart() {
+    let mut e = unmapped_env();
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "no project: nothing to start");
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+
+    // Mapped while the daemon runs: the next reconcile starts it, at the same instant, so
+    // the failed start's back-off does not hold it either.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+}
+
+#[tokio::test]
+async fn an_unreadable_config_toml_keeps_the_projects_in_use() {
+    let mut e = unmapped_env();
+    write_config(&e, BTreeMap::new());
+    let home = Home::at(e._dir.path().join("home"));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+
+    std::fs::write(home.config_path(), "projects = [not toml").unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "an invalid file changes nothing");
+    std::fs::remove_file(home.config_path()).unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "a missing file changes nothing");
+
+    // Fixed: read again.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+}
+
 #[tokio::test]
 async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
     let triage = board::daemon::TRIAGE_PROMPT;

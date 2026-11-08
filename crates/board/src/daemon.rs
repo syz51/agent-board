@@ -43,7 +43,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, error_code, is_unreachable};
-use crate::config::Home;
+use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut};
@@ -515,6 +515,8 @@ pub struct Daemon<T: T3> {
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
     /// them here: their lines count as maybe delivered, never sent twice.
     sending: Vec<AgentId>,
+    /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
+    config_text: Option<String>,
     pub timing: Timing,
 }
 
@@ -523,6 +525,7 @@ impl<T: T3> Daemon<T> {
     pub fn new(ctx: Ctx, t3: T) -> Self {
         // A file it cannot read is kept aside rather than lost on the next save.
         let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
+        let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
         Self {
             ctx,
             t3,
@@ -531,7 +534,69 @@ impl<T: T3> Daemon<T> {
             failures: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
+            config_text,
             timing: Timing::default(),
+        }
+    }
+
+    /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
+    /// `feedback_board` take effect at once, and boards whose start failed are tried again,
+    /// since a missing project may be what failed. `server`, `device` and `t3_bin` are
+    /// fixed while the daemon runs, so changing them asks for a restart. A file gone or
+    /// unreadable keeps the settings in use, with one warning per edit.
+    fn reload_config(&mut self) {
+        let path = self.ctx.home.config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                if self.config_text.take().is_some() {
+                    tracing::warn!(
+                        "reading {}: {err}; keeping the configuration in use",
+                        path.display()
+                    );
+                }
+                return;
+            }
+        };
+        if self.config_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let parsed = toml::from_str::<Config>(&text);
+        self.config_text = Some(text);
+        let new = match parsed {
+            Ok(new) => new,
+            Err(err) => {
+                tracing::warn!(
+                    "invalid {}: {err}; keeping the configuration in use until it is fixed",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let current = &mut self.ctx.config;
+        if (&new.server, &new.device, &new.t3_bin)
+            != (&current.server, &current.device, &current.t3_bin)
+        {
+            tracing::warn!(
+                "{} changes server, device or t3_bin: restart board watch to apply them",
+                path.display()
+            );
+        }
+        if (&new.projects, &new.board_projects, &new.feedback_board)
+            != (
+                &current.projects,
+                &current.board_projects,
+                &current.feedback_board,
+            )
+        {
+            current.projects = new.projects;
+            current.board_projects = new.board_projects;
+            current.feedback_board = new.feedback_board;
+            self.failures.clear();
+            tracing::info!(
+                "re-read {}: projects and feedback board updated",
+                path.display()
+            );
         }
     }
 
@@ -551,6 +616,7 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
+        self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         let mut checks = self.check_threads(&boards).await;
@@ -1829,13 +1895,14 @@ fn is_transient(err: &anyhow::Error) -> bool {
 fn no_project(board: &Board) -> String {
     if board.repos.is_empty() {
         return format!(
-            "no T3 project for board {} on this device: add it under [board_projects] in config.toml",
+            "no T3 project for board {} on this device: add it under [board_projects] in \
+             config.toml; board watch reads it within a minute",
             board.slug
         );
     }
     format!(
         "no T3 project for {} on this device: add it under [projects] (or the board under \
-         [board_projects]) in config.toml",
+         [board_projects]) in config.toml; board watch reads it within a minute",
         board.repos.join(", ")
     )
 }
