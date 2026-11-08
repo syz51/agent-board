@@ -212,7 +212,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
-| `SessionEnd` | Mark ended; release leases |
+| `SessionEnd` | Mark ended; release file leases. A coordinator lease runs on: T3 ends idle sessions while the thread lives on, and the daemon of the lease's device renews it while the thread is live, or releases it |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
 
 T3 Code runs Claude Code and Codex underneath, so these hooks fire in T3 threads too; T3
@@ -254,6 +254,14 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
+  while its thread lives on, and the server keeps the coordinator lease (only file leases
+  go). The daemon of the lease's device renews it while T3 finds the thread live. Another
+  home device waits for the lease to expire. The coordinator's own device, when its
+  `watch.json` has no record of it (lost or reset), runs its thread again if T3 has it,
+  briefing it once, since what it was briefed with is unknown; a pending adoption replaces
+  it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
+  the lease first, so the ended agent is not named meanwhile.
 - **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
@@ -267,7 +275,8 @@ settings in use, warned once per edit.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
-  coordinator (switch autopilot off first), when T3 on that device does not know the
+  coordinator (switch autopilot off first), or an ended one of another device whose lease
+  still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
   thread or has archived it, when the device is not a home device, and when it has no
   `[projects]` path for the board's repos. Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
@@ -393,9 +402,12 @@ settings in use, warned once per edit.
     passed on. The event retries go on past one the server keeps failing and stop only
     when the server cannot be reached. The daemon reconciles at start and on its tick,
     also while the stream is down. The boards' `t3 thread show` checks run side by side,
-    10 seconds each; one that fails or runs out of time still renews a named coordinator,
-    and only a check that
-    answers replaces it. Each check starts a `t3` process of about 180 MB, so a named
+    10 seconds each; one that fails or runs out of time still renews a named coordinator
+    at work, and only a check that answers replaces it. One whose session ended is not
+    renewed while the checks fail, and once they have failed for 10 minutes its lease is
+    released, so another home device takes over while T3 is down; its record stays, so
+    the thread is adopted again once T3 answers, unless another coordinator is named by
+    then. Each check starts a `t3` process of about 180 MB, so a named
     coordinator's thread that T3 found live is not asked about again for 5 minutes. A
     failed send to it, or its agent ending, makes the next reconcile ask; an archived
     thread is replaced within that interval. The reconnect delay (1 second, doubled up to a minute) resets

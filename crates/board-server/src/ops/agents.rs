@@ -234,7 +234,9 @@ pub(crate) fn validate_state(update: &AgentStateUpdate) -> Result<()> {
 }
 
 /// Heartbeat and lifecycle. Renews the agent's leases and coordinator lease; `ended`
-/// releases them instead. An agent waiting for a usage-limit reset still ahead keeps that
+/// releases its file leases instead. Its coordinator lease runs on: T3 ends a session left
+/// idle for 30 minutes while the thread lives on, and the daemon of the lease's device
+/// renews the lease while the thread is live, or releases it. An agent waiting for a usage-limit reset still ahead keeps that
 /// `paused_until` when it is marked `ended`: T3 closes a session left idle for 30 minutes,
 /// but the limit holds until the reset, so the daemon does not wake it before then.
 pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate) -> Result<Agent> {
@@ -252,8 +254,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
         _ => update.paused_until,
     };
     note_agent_seen(cx, id)?;
-    // Before `ended` releases the boards it coordinates. Advisory: cleaned and cut here,
-    // never a reason to refuse the state change.
+    // Advisory: cleaned and cut here, never a reason to refuse the state change.
     let said = match update.said.as_deref().and_then(board_proto::turn_ending) {
         Some(text) => crate::ops::updates::record_said(cx, id, &text)?,
         None => false,
@@ -269,7 +270,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
     )?;
     let now = cx.now_ms();
     if update.state == AgentState::Ended {
-        release_all(cx, id)?;
+        release_leases(cx, id)?;
     } else {
         cx.db.execute(
             "UPDATE leases SET expires_at = MAX(expires_at, ?3) WHERE agent = ?1 AND expires_at > ?2",
@@ -298,8 +299,8 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
     get_agent(cx, id)
 }
 
-/// Releases the agent's file leases and coordinator leases.
-fn release_all(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
+/// Releases the agent's file leases.
+fn release_leases(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
     let leases: Vec<(i64, String, String)> = cx
         .db
         .prepare_cached("SELECT id, repo, glob FROM leases WHERE agent = ?1 ORDER BY id")?
@@ -314,26 +315,6 @@ fn release_all(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
             EventType::LeaseReleased,
             None,
             serde_json::json!({ "id": lease, "repo": repo, "glob": glob }),
-        )?;
-    }
-    let boards: Vec<String> = cx
-        .db
-        .prepare_cached("SELECT slug FROM boards WHERE coordinator = ?1")?
-        .query_map([id.as_str()], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for board in boards {
-        cx.db.execute(
-            "UPDATE boards SET coordinator = NULL, coordinator_device = NULL, \
-             coordinator_expires_at = NULL, updated_at = ?2 WHERE slug = ?1",
-            params![board, cx.now_ms()],
-        )?;
-        let slug = parse_id(&board)?;
-        cx.emit(
-            Some(&slug),
-            id.as_str(),
-            EventType::BoardUpdated,
-            None,
-            serde_json::json!({ "fields": ["coordinator"], "coordinator": null }),
         )?;
     }
     Ok(())

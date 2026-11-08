@@ -868,18 +868,29 @@ pub async fn board_adopt(
                 &board,
             ));
         }
-        // A coordinator that has ended is replaced by the daemon, as when none is named.
-        let live = match ctx.client.agent_info(current).await {
-            Ok(info) => info.state != AgentState::Ended,
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+        let info = match ctx.client.agent_info(current).await {
+            Ok(info) => Some(info),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
             Err(err) => return Err(err),
         };
-        if live {
-            bail!(
+        match info {
+            Some(info) if info.state != AgentState::Ended => bail!(
                 "{current} coordinates board {slug} now; switch autopilot off (board board \
                  update {slug} --autopilot false), wait until `board boards` shows it without \
                  a coordinator, then adopt again"
-            );
+            ),
+            // T3 ends a session left idle while its thread lives on, and that device's
+            // daemon keeps the lease while the thread is live. On this device, the adoption
+            // replaces it, as when none is named.
+            Some(info) if info.device != *device => bail!(
+                "{current} coordinates board {slug} from device {}: its session ended, but \
+                 that device keeps the coordinator lease while its thread lives; adopt on that \
+                 device, or wait until `board boards` shows {slug} without a coordinator (the \
+                 lease expires once that device stops renewing it: after the server's \
+                 coordinator_ttl_secs, 45 minutes by default), then adopt again",
+                info.device
+            ),
+            _ => {}
         }
     }
     if let Some(local) = daemon::load_watch_state(&ctx.home).coordinators.get(slug)
