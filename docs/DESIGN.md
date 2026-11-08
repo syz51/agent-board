@@ -236,7 +236,11 @@ Each autopilot board has one **coordinator thread**: a T3 Code thread in the boa
 on one of the board's home devices. The project is the device's `[projects]` folder for one
 of the board's repos; a board none of whose repos is mapped there, such as a feedback board
 with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
-registers without a repo).
+registers without a repo). Each reconcile first re-reads `config.toml` when its text
+changed: new `[projects]`, `[board_projects]` and `feedback_board` apply at once and clear
+the start back-offs, since a missing project may be what failed; `server`, `device` and
+`t3_bin` stay as started, with a warning to restart; a file gone or invalid keeps the
+settings in use, warned once per edit.
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
