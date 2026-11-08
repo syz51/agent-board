@@ -1898,18 +1898,25 @@ fn a_delegated_t3_thread_registers_its_parent() {
             "GET /v1/snapshot",
             snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
         );
-        e.hook_env(
+        // At debug level the hook logs why it has no parent: T3 over budget, a background
+        // read that did not start, or T3's error; the background read inherits the level.
+        let out = e.hook_output(
             "session-start",
             "claude",
             e.with("SessionStart", json!({"source": "startup"})),
-            &[("T3CODE_THREAD_ID", thread), ("T3CODE_CLI_PATH", &t3)],
+            &[
+                ("T3CODE_THREAD_ID", thread),
+                ("T3CODE_CLI_PATH", &t3),
+                ("BOARD_LOG", "board=debug"),
+            ],
         );
         let register = e.stub.requests_to("POST /v1/agents").pop().unwrap().body;
         assert_eq!(register["id"], agent);
         assert_eq!(register["native_ids"]["t3_thread"], thread);
-        register["native_ids"]["t3_parent"]
+        let parent = register["native_ids"]["t3_parent"]
             .as_str()
-            .map(str::to_owned)
+            .map(str::to_owned);
+        (parent, stderr(&out))
     };
     let calls = || {
         std::fs::read_to_string(&log)
@@ -1919,22 +1926,39 @@ fn a_delegated_t3_thread_registers_its_parent() {
     };
 
     // The child's first start registers no parent: T3 answers in the background.
-    assert_eq!(start(CHILD), None);
-    files.read_done();
+    let (parent, hook) = start(CHILD);
+    assert_eq!(
+        parent, None,
+        "T3 answered within the hook's budget:\n{hook}"
+    );
+    files.read_done_after(&hook);
+    let answer = std::fs::read_to_string(&files.read).unwrap();
     // A resume registers the parent the read found, then keeps it from the cache without
     // asking T3: one that asked would start a read.
-    assert_eq!(start(CHILD).as_deref(), Some("parent-1"));
+    let (parent, hook) = start(CHILD);
+    assert_eq!(
+        parent.as_deref(),
+        Some("parent-1"),
+        "the resume dropped the background read; T3's answer as read: {answer}\nthe hook's log:\n{hook}"
+    );
     assert!(!files.read.exists());
     files.backdate("thread_read_at");
     let started = files.cached()["thread_read_at"].clone();
-    assert_eq!(start(CHILD).as_deref(), Some("parent-1"));
+    let (parent, hook) = start(CHILD);
+    assert_eq!(
+        parent.as_deref(),
+        Some("parent-1"),
+        "the session cache lost the parent: {}\nthe hook's log:\n{hook}",
+        files.cached()
+    );
     assert_eq!(files.cached()["thread_read_at"], started);
     assert_eq!(calls(), 1);
 
     // A thread no parent delegated keeps none, whatever T3 says.
-    assert_eq!(start("thread-7"), None);
-    files.read_done();
-    assert_eq!(start("thread-7"), None);
+    let (parent, hook) = start("thread-7");
+    assert_eq!(parent, None);
+    files.read_done_after(&hook);
+    assert_eq!(start("thread-7").0, None);
     assert!(
         !files.read.exists(),
         "a read that tells nothing new is dropped"
@@ -1967,6 +1991,7 @@ fn fake_t3(dir: &std::path::Path, slow: bool) -> (String, PathBuf, PathBuf) {
 struct SessionFiles {
     cache: PathBuf,
     read: PathBuf,
+    read_log: PathBuf,
 }
 
 impl SessionFiles {
@@ -1976,6 +2001,7 @@ impl SessionFiles {
         Self {
             cache: state.join("sessions").join(&name),
             read: state.join("thread-reads").join(name),
+            read_log: state.join(board::hook::READ_LOG),
         }
     }
 
@@ -2003,9 +2029,22 @@ impl SessionFiles {
 
     /// Waits, bounded, for the background read a hook started to leave its answer.
     fn read_done(&self) {
+        self.read_done_after("not kept");
+    }
+
+    /// [`Self::read_done`] after a hook that logged `hook`. A read that never answers fails
+    /// with both logs: the hook's says whether the read started, the read's own
+    /// ([`board::hook::READ_LOG`]) whether T3 failed or missed the read's budget.
+    fn read_done_after(&self, hook: &str) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !self.read.exists() {
-            assert!(Instant::now() < deadline, "no background read answered");
+            if Instant::now() >= deadline {
+                let read_log = std::fs::read_to_string(&self.read_log)
+                    .unwrap_or_else(|err| format!("none ({err})"));
+                panic!(
+                    "no background read answered\nthe hook's log:\n{hook}\nthe read's log:\n{read_log}"
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
