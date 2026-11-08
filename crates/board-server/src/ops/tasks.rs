@@ -19,15 +19,16 @@ use crate::store::{
 };
 use crate::text::{ago, check_line, check_text};
 
-/// Status changes allowed through `PATCH` (`docs/API.md`).
+/// Status changes allowed through `PATCH` (`docs/API.md`). A parked task moves between
+/// `review` and `blocked` directly as what it waits on changes.
 pub(crate) fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
     matches!(
         (from, to),
         (Open, Blocked | Dropped)
             | (Doing, Blocked | Review | Open | Dropped)
-            | (Blocked, Open | Doing | Dropped)
-            | (Review, Doing | Dropped)
+            | (Blocked, Open | Doing | Review | Dropped)
+            | (Review, Doing | Blocked | Dropped)
             | (Done | Dropped, Open)
     )
 }
@@ -852,8 +853,14 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
         return Err(bad_transition(
             format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
             format!(
-                "it is blocked for \"{reason}\": resume it ({}) only once that no longer holds",
-                resume_hint(id)
+                "once \"{reason}\" no longer holds, clear the reason with task_update {id} \
+                 status=open, then task_claim {id}, or resume it at once ({}){}",
+                resume_hint(id),
+                if task.owner.as_ref() == Some(agent) {
+                    format!("; if its work is finished, close it with task_done {id}")
+                } else {
+                    String::new()
+                }
             ),
         ));
     }
@@ -869,8 +876,8 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
         return Err(bad_transition(
             format!("{id} waits on ask #{ask}, so claiming does not resume it"),
             format!(
-                "wait for the user's answer to ask #{ask}, then resume it ({})",
-                resume_hint(id)
+                "wait for the user's answer to ask #{ask}, or withdraw it (ask_withdraw {ask}) if \
+                 you asked it and it no longer applies; then claim it again"
             ),
         ));
     }
@@ -1254,6 +1261,9 @@ pub(crate) fn update(
             TaskStatus::Open => owner = None,
             // Whoever moves a task to doing works on it, as with claim and take.
             TaskStatus::Doing => owner = Some(agent.clone()),
+            // A task in review always has an owner to finish it: whoever parks nobody's
+            // blocked task there takes it on.
+            TaskStatus::Review if owner.is_none() => owner = Some(agent.clone()),
             _ => {}
         }
         fields.push("status");
@@ -1437,16 +1447,18 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
         return Err(version_conflict(&task, req.version));
     }
     require_owner(&task, &req.agent, "complete")?;
-    if !matches!(task.status, TaskStatus::Doing | TaskStatus::Review) {
+    // The owner closes its blocked task directly: the wait often ends off the board, and
+    // resuming it first would hit the doing limit. Done clears `blocked_reason`.
+    if !matches!(
+        task.status,
+        TaskStatus::Doing | TaskStatus::Review | TaskStatus::Blocked
+    ) {
         return Err(bad_transition(
             format!(
-                "{id} is {}; only doing or review tasks can be done",
+                "{id} is {}; only doing, review or blocked tasks can be done",
                 status_str(task.status)
             ),
-            match task.status {
-                TaskStatus::Blocked => format!("resume it first ({})", resume_hint(id)),
-                _ => format!("claim it first with task_claim {id}"),
-            },
+            format!("claim it first with task_claim {id}"),
         ));
     }
     let now = cx.now_ms();

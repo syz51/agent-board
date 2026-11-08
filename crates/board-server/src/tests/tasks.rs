@@ -79,8 +79,10 @@ async fn every_status_change_follows_the_table() {
         (Doing, Dropped),
         (Blocked, Open),
         (Blocked, Doing),
+        (Blocked, Review),
         (Blocked, Dropped),
         (Review, Doing),
+        (Review, Blocked),
         (Review, Dropped),
         (Done, Open),
         (Dropped, Open),
@@ -117,6 +119,21 @@ async fn every_status_change_follows_the_table() {
                 }
                 if to == Done {
                     assert!(next.contains("task_done"), "{next}");
+                } else if from != Open || to != Doing {
+                    // The hint lists exactly the moves the table allows.
+                    let targets: Vec<&str> = all
+                        .iter()
+                        .filter(|t| expected_allowed.contains(&(from, **t)))
+                        .map(|t| match t {
+                            Open => "open",
+                            Doing => "doing",
+                            Blocked => "blocked",
+                            Review => "review",
+                            Done => "done",
+                            Dropped => "dropped",
+                        })
+                        .collect();
+                    assert!(next.ends_with(&targets.join(", ")), "{next}");
                 }
             }
         }
@@ -414,12 +431,9 @@ async fn done_requires_evidence() {
     let (s, v) = t.done(B, &id, check(0)).await;
     assert_eq!(s.as_u16(), 403, "only the owner: {v}");
 
-    let blocked = task_in(&t, TaskStatus::Blocked).await;
-    let (s, v) = t.done(A, &blocked, check(0)).await;
-    assert_eq!(
-        (s.as_u16(), v["code"].as_str()),
-        (400, Some("invalid_transition"))
-    );
+    let open = task_in(&t, TaskStatus::Open).await;
+    let (s, v) = t.done(A, &open, check(0)).await;
+    assert_eq!(s.as_u16(), 403, "nobody owns an open task: {v}");
 
     for evidence in [
         json!([{ "kind": "commit", "value": "4e1c2ab" }]),
@@ -591,10 +605,21 @@ async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
     let next = v["next"].as_str().unwrap();
     assert!(
         next.contains("\"waiting on ask #12\"")
-            && next.contains(&format!("task_update {asked} status=doing")),
+            && next.contains(&format!(
+                "task_update {asked} status=open, then task_claim {asked}"
+            ))
+            && next.contains(&format!("task_update {asked} status=doing"))
+            && next.contains(&format!("task_done {asked}")),
         "{v}"
     );
     assert_eq!(t.get_task(&asked).await["status"], "blocked", "{v}");
+    // The step it names works: open clears the reason, and the claim takes it.
+    let (s, v) = t.patch(A, &asked, json!({ "status": "open" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["blocked_reason"], Value::Null, "{v}");
+    let (s, v) = t.claim(A, &asked).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "doing", "{v}");
 
     // Nobody's blocked task resumes for whoever claims it, who becomes its owner.
     let first = t.task(A, "factory", "First").await;
@@ -1779,7 +1804,10 @@ async fn a_handover_needs_an_owned_task_and_a_live_target() {
         "{v}"
     );
     assert!(
-        v["next"].as_str().unwrap().contains("doing, dropped"),
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains("doing, blocked, dropped"),
         "{v}"
     );
 
@@ -2140,4 +2168,192 @@ async fn a_parent_on_another_board_is_refused_with_the_alternatives() {
     );
     let next = v["next"].as_str().unwrap();
     assert!(next.contains("name it in the body, or make that task wait for this one by adding this one to its blockers"), "{v}");
+}
+
+#[tokio::test]
+async fn the_owner_closes_its_blocked_task_while_another_is_in_doing() {
+    // The default limit: one task in doing.
+    let t = setup().await;
+    let blocked = task_in(&t, TaskStatus::Blocked).await;
+    let busy = task_in(&t, TaskStatus::Doing).await;
+    assert_eq!(t.get_task(&blocked).await["blocked_reason"], "waiting");
+
+    // Neither another agent nor the board's coordinator closes A's blocked task.
+    t.register(C, Some(REPO), None).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(C),
+        Some(json!({ "device": "mac", "agent": C })),
+    )
+    .await;
+    for other in [B, C] {
+        let (s, v) = t.done(other, &blocked, check(0)).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{other}: {v}"
+        );
+    }
+    assert_eq!(t.get_task(&blocked).await["status"], "blocked");
+
+    let (s, v) = t.done(A, &blocked, json!([])).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("evidence_required")),
+        "{v}"
+    );
+    let (s, v) = t.done(A, &blocked, check(0)).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(A)),
+        "{v}"
+    );
+    assert_eq!(v["blocked_reason"], Value::Null, "{v}");
+    assert_eq!(t.get_task(&busy).await["status"], "doing");
+
+    // Nobody's blocked task is not closed by whoever passes: it is claimed first.
+    let first = t.task(A, "factory", "First").await;
+    let unowned = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Unowned", "blockers": [first] }),
+        )
+        .await;
+    let (s, v) = t.patch(A, &unowned, json!({ "status": "blocked" })).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.done(A, &unowned, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("task_claim"), "{v}");
+}
+
+#[tokio::test]
+async fn a_parked_task_moves_between_review_and_blocked() {
+    let t = setup().await;
+    let id = task_in(&t, TaskStatus::Review).await;
+    // A reason or an unfinished blocker is still required.
+    let (s, v) = t.patch(A, &id, json!({ "status": "blocked" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    let (s, v) = t
+        .patch(
+            A,
+            &id,
+            json!({ "status": "blocked", "blocked_reason": "waits on the user's merge" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (
+            v["status"].as_str(),
+            v["owner"].as_str(),
+            v["blocked_reason"].as_str()
+        ),
+        (Some("blocked"), Some(A), Some("waits on the user's merge")),
+        "{v}"
+    );
+    // It parks in review again without going through doing; the reason goes with blocked.
+    let (s, v) = t
+        .patch(
+            A,
+            &id,
+            json!({ "status": "review", "blocked_reason": "still waiting" }),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    let (s, v) = t.patch(A, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("review"), Some(A)),
+        "{v}"
+    );
+    assert_eq!(v["blocked_reason"], Value::Null, "{v}");
+
+    // A blocker alone also parks it in blocked.
+    let blocker = t.task(A, "factory", "Deploy it").await;
+    let (s, v) = t
+        .patch(
+            A,
+            &id,
+            json!({ "status": "blocked", "blockers": [blocker] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "blocked", "{v}");
+
+    // Another agent may not move A's parked task.
+    let (s, v) = t.patch(B, &id, json!({ "status": "review" })).await;
+    assert_eq!(s.as_u16(), 403, "{v}");
+
+    // Whoever parks nobody's blocked task in review owns it, so someone can finish it.
+    let unowned = t.task(A, "factory", "Unowned").await;
+    let (s, v) = t
+        .patch(
+            A,
+            &unowned,
+            json!({ "status": "blocked", "blocked_reason": "waiting" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["owner"], Value::Null, "{v}");
+    let (s, v) = t.patch(B, &unowned, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("review"), Some(B)),
+        "{v}"
+    );
+    let (s, v) = t.done(B, &unowned, check(0)).await;
+    assert!(s.is_success(), "{v}");
+}
+
+#[tokio::test]
+async fn a_claim_held_by_an_open_ask_names_how_to_end_it() {
+    let t = setup().await;
+    let id = task_in(&t, TaskStatus::Doing).await;
+    let ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "task": id, "kind": "decision", "question": "Which one?",
+                "options": ["this", "that"],
+            })),
+        )
+        .await;
+    let ask = ask["id"].as_i64().unwrap();
+    let (s, v) = t.patch(A, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(A, &id).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!("ask #{ask}")) && next.contains(&format!("ask_withdraw {ask}")),
+        "{v}"
+    );
 }

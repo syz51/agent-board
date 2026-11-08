@@ -382,9 +382,12 @@ Reopening a closed board, or any change on it, starts the period again.
     `status: doing` would (the same `task_updated` event, not `task_claimed`), after the
     checks above (blockers done, `not_before` passed, the `doing` limit, not an unaccepted
     proposal). It is refused with 400 `invalid_transition` while the task may wait on the
-    user: a `blocked` task with a `blocked_reason` (`next` quotes the reason and says to
-    resume it with `task_update <id> status=doing` only once it no longer holds), or an
-    open ask on the task (`next` names the ask).
+    user: a `blocked` task with a `blocked_reason` (`next` quotes the reason and says, once
+    it no longer holds, to clear it with `task_update <id> status=open` and claim again, or
+    to resume it with `task_update <id> status=doing`; for the caller's own task also to
+    close it with `task_done` if its work is finished), or an open ask on the task (`next`
+    names the ask and says to wait for its answer, or to withdraw it with `ask_withdraw`,
+    then claim again).
   - owned by another live agent: 409 `claim_refused` naming the owner.
   - owned by a stale agent: 400 `invalid_transition`, with `next` naming `take=true`.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
@@ -392,8 +395,12 @@ Reopening a closed board, or any change on it, starts the period again.
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`; records a
   `task_taken` event naming the previous owner. Taking an `open` task moves it to `doing`,
   so it is refused like a claim while a blocker is not done or `not_before` has not passed.
-- `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only; 400
-  `evidence_required` without evidence, or with `check` evidence missing `exit_code`. The
+- `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner only (403 `forbidden`
+  otherwise, also for a task nobody owns), from `doing`, `review` or `blocked`, else 400
+  `invalid_transition`. The owner closes its `blocked` task directly, also while it has
+  another task in `doing`, since a wait often ends off the board; this clears
+  `blocked_reason`. 400 `evidence_required` without evidence, or with `check` evidence
+  missing `exit_code`. The
   `task_done` event carries the evidence. An optional `summary` (1 to 800 characters,
   `SUMMARY_CHARS_MAX`) tells the user what changed and what they should know; it is stored
   on the task (`Task.summary`, absent without one) and listed in "Updates". It is not in the
@@ -410,16 +417,20 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 |---|---|
 | `open` | `blocked`, `dropped` (claiming moves it to `doing`) |
 | `doing` | `blocked`, `review`, `open` (same as release), `dropped` |
-| `blocked` | `open`, `doing`, `dropped` |
-| `review` | `doing`, `dropped` (`done` only through `/done`) |
+| `blocked` | `open`, `doing`, `review`, `dropped` |
+| `review` | `doing`, `blocked`, `dropped` |
 | `done`, `dropped` | `open` (reopen) |
+
+`done` is reached only through `/done`, from `doing`, `review` or `blocked`. A parked task
+moves between `review` and `blocked` directly as what it waits on changes.
 
 Who may change the status: anyone while the task has no owner or is `done` or `dropped`;
 otherwise only its owner, the board's coordinator or the user (a `--user` token or the
 browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 (`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
-Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
-that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
+Moving it to `doing` makes the caller the owner, within the caller's `doing` limit.
+Moving a `blocked` task nobody owns to `review` makes the caller the owner, with no limit,
+so a task in `review` always has an owner to finish it. When a move changes the owner, the `task_updated` event lists `owner` in `fields` and carries
 `owner` and `previous_owner`.
 
 Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
@@ -437,7 +448,9 @@ a `not_before` still ahead is listed under `waiting` instead. A proposal becomes
 another agent records a `verdict:` note and an accept sets `auto` (`DESIGN.md`,
 "Proposals and triage").
 
-`blocked` needs `blocked_reason` or at least one blocker that is not done. Blockers must
+`blocked` needs `blocked_reason` or at least one blocker that is not done.
+`blocked_reason` is accepted only with status `blocked` (400 `invalid` otherwise), and
+every move out of `blocked` clears it. Blockers must
 exist and must not form a cycle; they may be on any board. A task is not `ready`, and
 cannot be claimed, until every blocker is done, wherever it is. `GET /v1/tasks/{id}` lists
 the tasks waiting on it in `blocks`, from every board, and a blocker's `task_done` event,
