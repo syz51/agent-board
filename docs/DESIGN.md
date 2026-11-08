@@ -473,7 +473,8 @@ settings in use, warned once per edit.
 - **Growing the backlog**: an agent leaves nothing still to do only in chat. Before
   `task_done`, and before it stops, it files the task's remaining scope as sub-tasks (parent
   the task), work it found outside the task as a proposal (see "Proposals and triage"), with
-  the task it found it in as parent, and the user's part as a task blocked on an ask; it
+  the task it found it in as parent when that task is on the same board (a parent must be;
+  otherwise the body names it), and the user's part as a task blocked on an ask; it
   calls `task_done` only when every acceptance check passes, and names what it filed in its
   reply. The MCP instructions say so, the snapshot footer repeats the first two, and the
   `Stop` hook reminds it once per task it marked done that turn. Filing reports it back: while the filed task is neither done

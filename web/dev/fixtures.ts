@@ -29,7 +29,7 @@ export interface BoardFixture {
 }
 
 /** A task as stored: `ready`, `proposal` and `owner_stale` are computed when read. */
-export type TaskFixture = Omit<Task, "ready" | "proposal" | "owner_stale">;
+export type TaskFixture = Omit<Task, "ready" | "proposal" | "owner_stale" | "child_count">;
 
 /** Evidence as stored, with the task it belongs to. */
 export type EvidenceFixture = Evidence & { task: string };
@@ -341,6 +341,7 @@ export function createFixtures(now: number): Fixtures {
     task(
       {
         id: "factory-13",
+        parent: "factory-12",
         title: "Report lease conflicts in the alerts block",
         status: "review",
         owner: id("t3:a91c"),
@@ -384,6 +385,7 @@ export function createFixtures(now: number): Fixtures {
     task(
       {
         id: "factory-19",
+        parent: "factory-12",
         title: "Show handoff age in the snapshot",
         status: "open",
         priority: "p3",
@@ -395,6 +397,7 @@ export function createFixtures(now: number): Fixtures {
     task(
       {
         id: "factory-17",
+        parent: "factory-12",
         title: "Send asks to Telegram",
         status: "blocked",
         priority: "p1",
@@ -419,6 +422,7 @@ export function createFixtures(now: number): Fixtures {
     task(
       {
         id: "factory-8",
+        parent: "factory-12",
         title: "Store device tokens as SHA-256 hashes",
         status: "done",
         owner: id("t3:9d02"),
@@ -427,7 +431,13 @@ export function createFixtures(now: number): Fixtures {
       5 * day,
     ),
     task(
-      { id: "factory-3", title: "Pick the storage engine", status: "done", owner: id("t3:9d02") },
+      {
+        id: "factory-3",
+        parent: "factory-12",
+        title: "Pick the storage engine",
+        status: "done",
+        owner: id("t3:9d02"),
+      },
       40 * day,
       38 * day,
     ),

@@ -272,10 +272,18 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&limit=` → `[Task]` list,
-  sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
-  `proposal=true` lists only pending proposals, `false` leaves them out (see "Pending
-  proposals" below). `limit` defaults to 200, at most 1,000.
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&limit=` → `[Task]`
+  list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+  `parent=<task id>` lists only that task's direct children, not their children; it
+  combines with every other filter, and a task without children, or one that does not
+  exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
+  `parent` ignore it and list every task, up to the limit, which may leave children out;
+  the CLI and MCP then refuse and point to `board show <id>`, whose detail lists every
+  child. Every `Task` has `child_count`, how many tasks name it as parent whatever
+  their status; it is absent when none does, and from servers that predate it. The counts
+  of a list come from one query, along the parent index. `proposal=true` lists only
+  pending proposals, `false` leaves them out (see "Pending proposals" below). `limit`
+  defaults to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -299,8 +307,12 @@ Reopening a closed board, or any change on it, starts the period again.
     predates `claim` ignores it and answers with an `open` task; the CLI and MCP see that
     status and claim the task next (`POST /v1/tasks/{id}/claim`), which another agent may
     win in between.
-- `GET /v1/tasks/{id}` → `[TaskDetail]`. `history` is the task's newest 200 events, oldest
-  first; when it was cut, it does not start with the `task_created` event. `handles` maps
+- `GET /v1/tasks/{id}` → `[TaskDetail]`. `children` lists the ids of the tasks that name it
+  as parent, by id number, and `child_tasks` the same tasks in the same order as
+  `{id, title, status, ready, owner, owner_stale}`, so a parent's view needs no request
+  per child.
+  `child_tasks` is absent when there are none, and from servers that predate it. `history`
+  is the task's newest 200 events, oldest first; when it was cut, it does not start with the `task_created` event. `handles` maps
   each registered agent the detail names (owner, creator, note and evidence authors,
   history actors, feedback resolver) to its short handle when that differs from its id;
   it is absent when none does, and `task_show` names agents by these handles.
@@ -712,6 +724,14 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
+  `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
+  with `children <n>`.
+- `board show <id> --json` → `[TaskDetail]` from `GET /v1/tasks/{id}`. Without `--json`, a
+  task with children has a `children <n>: done 5 · doing 1 · …` line, a count per status
+  (done, review, doing, blocked, open, dropped; statuses without children left out),
+  followed by one indented line per status with its child ids. A task without children
+  has no such line. From a server that predates `child_tasks` the line is
+  `children <ids>`.
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |

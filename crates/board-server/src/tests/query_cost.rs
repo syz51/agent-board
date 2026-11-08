@@ -15,7 +15,7 @@ use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, T
 use crate::snapshot::{
     ALERT_EVENTS, ALERTS_LEFT, RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates,
 };
-use crate::store::{BATCH_BLOCKERS, latest_events_sql};
+use crate::store::{BATCH_BLOCKERS, BATCH_CHILD_COUNTS, latest_events_sql};
 
 const ME: &str = "t3:me";
 const PEERS: usize = 20;
@@ -218,6 +218,12 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
     // A task's children, as deleting a task or a board looks them up.
     let p = plan(&t, "SELECT id FROM tasks WHERE parent = ?1");
     assert!(p.contains("USING INDEX tasks_parent"), "{p}");
+
+    // Child counts of a batch, as every task read fills them in: along the same index, no
+    // scan of tasks.
+    let p = plan(&t, BATCH_CHILD_COUNTS);
+    assert!(p.contains("USING COVERING INDEX tasks_parent"), "{p}");
+    assert!(!p.contains("SCAN tasks"), "{p}");
 
     // Delegated threads: the expression index, not a scan of agents per step.
     for sql in [DELEGATION_FAMILY, DELEGATE_AT_WORK] {

@@ -44,7 +44,10 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "{board, agents} for a board, or {boards: [...]} when none resolves",
     ),
     ("ls", "a JSON array of tasks"),
-    ("show", "{task, notes, evidence, blocks, children, history}"),
+    (
+        "show",
+        "{task, notes, evidence, blocks, children, child_tasks?, history}",
+    ),
     ("add", "the task object {id, status, owner, ...}"),
     ("claim", "the task object {id, status, owner, ...}"),
     ("release", "the task object {id, status, owner, ...}"),
@@ -473,6 +476,9 @@ pub struct LsArgs {
     status: Option<TaskStatus>,
     #[arg(long)]
     owner: Option<board_proto::AgentId>,
+    /// Only the direct children of this task.
+    #[arg(long)]
+    parent: Option<TaskId>,
     #[arg(long)]
     limit: Option<u32>,
     /// Include bodies and acceptance checks.
@@ -973,6 +979,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 ready: a.ready.then_some(true),
                 proposal: a.proposals.then_some(true),
                 mine: a.mine.then_some(true),
+                parent: a.parent,
                 limit: a.limit,
             };
             let ctx = ctx()?;

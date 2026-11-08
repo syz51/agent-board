@@ -15,8 +15,8 @@ use board_proto::{
     CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
     DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen,
     Note, PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches,
-    UpdateBoard, UpdateTask, Updates,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
+    Touches, UpdateBoard, UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -513,6 +513,7 @@ struct TasksQuery {
     ready: Option<bool>,
     proposal: Option<bool>,
     mine: Option<bool>,
+    parent: Option<TaskId>,
     limit: Option<usize>,
 }
 
@@ -539,6 +540,7 @@ async fn list_tasks(
         owner,
         ready: q.ready,
         proposal: q.proposal,
+        parent: q.parent,
         limit: q.limit.unwrap_or(200).clamp(1, 1000),
     };
     Ok(Json(state.read(move |cx| tasks::list(cx, filter)).await?))
