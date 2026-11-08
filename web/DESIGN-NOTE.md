@@ -12,9 +12,9 @@ inset panel, and lists that run edge to edge across it.
 - **Rows**: one row model for lists. A row has one main line and at most one line of
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
-- **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
+- **Density**: 36px task rows and 38px group bands. Boards rows are one 68px height: the
   name, slug, states and open asks (a tinted pill, only when there are some) share one
-  line, none of them cut, the goal keeps to two lines, the task tally to one (on phones it
+  line, none of them cut, the goal keeps to one line (a click shows the rest), the task tally to one (on phones it
   wraps into three even columns, never one count alone) and the coordinator to two; cells
   start level with the name, and a board with no coordinator says "None".
   Agents are a two-column table: who (in a 300px column), with its state, when last seen
@@ -36,21 +36,23 @@ inset panel, and lists that run edge to edge across it.
   board, not Home.
 - **Home**: what the user follows, in sections they collapse and reorder: Needs you (the
   asks, one name for them in the nav, the section and its "See all" link; edge to edge like
-  every list on Home, with a short bar in each kind's colour just left of the text, and an
+  every list on Home, with a short bar in each kind's colour on the content edge, and an
   Answer cue on hover), the boards,
   tasks in progress across boards (Doing and Review under their own headings), and what
   changed since they last looked. Finished tasks there are one-line rows whose summary
   opens on demand. Needs you holds only asks, the things that wait on the user. Board
   status groups collapse, with the chevron left of the label as on Home, and done starts
   collapsed. What a task waits for (blockers, a start date) is muted text with an icon;
-  outlined chips are tags only. A board with nothing to filter has no filter bar. On phones
-  a task row's time sits on its title line.
-- **Asks**: an ask card's left border takes its kind's colour. Send closes the answer
-  group at its left, outlined until there is an answer and filled once there is one, under the options and a
+  tinted chips are tags only, one shape in tones: neutral grey, amber for a warning. Task
+  rows sit under their status's heading and do not repeat its icon. A board with nothing to
+  filter has no filter bar. On phones a task row's time sits on its title line.
+- **Asks**: an ask card's left border takes its kind's colour. A filled Send, the same
+  primary button as Try again, closes the answer group at its left, under the options and a
   two-line field that grows, so it plainly sends either; Cmd or Ctrl with Enter sends from
   the field. A single ask is titled with its kind ("Decision · Ask #9"), across the content
   width with its prose at a reading measure, and its task and the asking agent's handoff in
-  the side panel beside it, split by a rule, or below it on narrow screens.
+  the side panel beside it, split by a rule, level with the card at top and bottom, or
+  below it on narrow screens.
 - **Side panel**: a task's properties and an ask's context sit in one kind of card, 300px
   wide beside the main column, its sections split by rules, and kept in view while the
   main column scrolls on wide screens.

@@ -386,15 +386,6 @@ const columns = column.columns([
     cell: ({ row }) => <PriorityBadge priority={row.original.task.priority} />,
   }),
   column.display({
-    id: "status",
-    cell: ({ row }) => {
-      const { task } = row.original;
-      return (
-        <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
-      );
-    },
-  }),
-  column.display({
     id: "id",
     cell: ({ row }) => row.original.task.id,
   }),
@@ -414,7 +405,6 @@ const columns = column.columns([
 const CELL_CLASS: Record<string, string> = {
   // A step down, so its smaller label sits on the title's baseline.
   priority: "max-md:[grid-area:prio] max-md:self-center md:pt-0.5",
-  status: "max-md:[grid-area:status] max-md:mt-0.75",
   id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center max-md:text-[13px]",
   main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
   owner:
@@ -442,11 +432,11 @@ export function TaskList({
   return (
     // A row's gutter padding sits inside the subgrid's first and last tracks, so those tracks
     // add the gutter to their own width; otherwise priority would run into the status mark.
-    <ul className="grid grid-cols-[calc(var(--gutter)+40px)_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_calc(var(--gutter)+80px)] gap-x-3.5 divide-y max-md:block">
+    <ul className="grid grid-cols-[calc(var(--gutter)+40px)_minmax(84px,max-content)_minmax(0,1fr)_132px_calc(var(--gutter)+80px)] gap-x-3.5 divide-y max-md:block">
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:pt-2.5 max-md:pb-3.5 max-md:[grid-template-areas:'status_main_main_main_updated'_'._id_prio_owner_owner']"
+          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:pt-2.5 max-md:pb-3.5 max-md:[grid-template-areas:'main_main_main_updated'_'id_prio_owner_owner']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>

@@ -201,8 +201,8 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
                 wait on the user, unlike every other row on Home. */}
             <Link
               className={cn(
-                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
-                "before:absolute before:inset-y-2 before:left-[calc(var(--gutter)-12px)] before:w-[3px] before:rounded-full",
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 py-1.5 pr-(--gutter) pl-[calc(var(--gutter)+12px)] text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-2 before:left-(--gutter) before:w-[3px] before:rounded-full",
                 ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
               )}
               to="/asks/$id"
@@ -333,7 +333,7 @@ const CELL_CLASS: Record<string, string> = {
 
 /**
  * The boards table's columns. Every row is one height on wide screens: the name line, with
- * its whole slug, states and open asks, the goal in two lines, the tally in one and the
+ * its whole slug, states and open asks, the goal in one line, the tally in one and the
  * coordinator in two at most. Cells start at the top of the row, level with the name.
  */
 const ROW_GRID =
@@ -379,7 +379,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-(--gutter) py-3 @min-[760px]:min-h-[78px] @min-[760px]:items-start @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-17 @min-[760px]:items-start @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -426,7 +426,7 @@ function BoardName({ board }: { board: Board }) {
         <BoardAsks board={board} />
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={1} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
       )}

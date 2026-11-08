@@ -124,7 +124,7 @@ export function AskScreen() {
           {(data) => (
             // The ask fills the content width, its prose kept to a reading measure; what it is
             // about sits in a column beside it on wide screens and below it on narrow ones.
-            <div className="grid items-start gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_300px]">
+            <div className="grid items-start gap-x-8 gap-y-6 xl:grid-cols-[minmax(0,1fr)_300px] xl:items-stretch">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -388,13 +388,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
               {/* Send closes the whole answer group, so it plainly sends a choice or the text.
                   It sits at the left, under the field, where the eye ends after typing. */}
               <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                {/* The main action, quiet until there is an answer to send; a press with nothing
-                    chosen says what is missing. */}
-                <Button
-                  type="submit"
-                  variant={answer ? "default" : "outline"}
-                  disabled={mutation.isPending}
-                >
+                {/* The page's main action; a press with nothing chosen says what is missing. */}
+                <Button type="submit" disabled={mutation.isPending}>
                   {mutation.isPending ? "Sending…" : "Send answer"}
                 </Button>
                 {answer && !mutation.isPending ? (
