@@ -131,6 +131,10 @@ server's minute sweep.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
+  `paused_until` is accepted only with `paused`. An agent paused until a time still ahead
+  keeps that `paused_until` when it is marked `ended` (T3 closes an idle session, but the
+  usage limit holds until its reset), and the `agent_state_changed` event carries it; any
+  other state, a registration or a call that revives the agent clears it.
   `said`, optional, is the last message of the turn that just ended: the hooks send it
   with the `Stop` update. It is advisory and never fails the update: the server removes
   terminal escape sequences and control characters other than line breaks and tabs, trims

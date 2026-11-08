@@ -144,8 +144,11 @@ pub(crate) struct Stuck {
 }
 
 /// Every task in doing or review, on a board that is not closed, whose newest event not by
-/// the server is at least `quiet_ms` old and not yet reported. Left out: tasks of a
-/// coordinator paused on a usage limit, since that pause has its own message.
+/// the server is at least `quiet_ms` old and not yet reported. Left out, since a usage
+/// limit has its own message: tasks whose owner stopped on a limit and neither resumed nor
+/// saw it reset at least `quiet_ms` ago (the quiet time restarts when the owner resumes, or
+/// at the reset), and those of a coordinator paused until further notice. The owner's
+/// events are read rather than its state, since a resumed owner no longer shows its reset.
 pub(crate) fn stuck(cx: &Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stuck>> {
     let now = cx.now_ms();
     Ok(cx
@@ -162,12 +165,19 @@ pub(crate) fn stuck(cx: &Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stuck>> {
              WHERE t.status IN ('doing', 'review') AND b.status != 'closed' \
                AND COALESCE(e.at, t.updated_at) <= ?1 \
                AND NOT (COALESCE(a.state, '') = 'paused' AND a.role = 'coordinator' \
-                 AND (a.paused_until IS NULL OR a.paused_until > ?2)) \
+                 AND a.paused_until IS NULL) \
                AND NOT EXISTS (SELECT 1 FROM telegram_stuck s \
                  WHERE s.task = t.id AND s.seq = COALESCE(e.seq, 0)) \
+               AND NOT EXISTS (SELECT 1 FROM events p WHERE p.actor = t.owner \
+                 AND p.type = 'agent_state_changed' \
+                 AND json_extract(p.payload, '$.to') = 'paused' \
+                 AND unixepoch(json_extract(p.payload, '$.paused_until')) * 1000 > ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM events r WHERE r.actor = p.actor \
+                   AND r.seq > p.seq AND r.at <= ?1 AND r.type = 'agent_state_changed' \
+                   AND json_extract(r.payload, '$.to') IN ('running', 'idle'))) \
              ORDER BY t.board, t.number",
         )?
-        .query_map(params![now - quiet_ms, now], |r| {
+        .query_map(params![now - quiet_ms], |r| {
             let kind: Option<String> = r.get(5)?;
             let actor: Option<String> = r.get(6)?;
             Ok(Stuck {
@@ -248,8 +258,9 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
              WHERE b.autopilot = 1 AND b.status = 'active' \
                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
                  AND t.status = 'doing') \
-               AND NOT (COALESCE(a.state, '') = 'paused' \
-                 AND (a.paused_until IS NULL OR a.paused_until > :now)) \
+               AND NOT (COALESCE(a.state, '') = 'paused' AND a.paused_until IS NULL) \
+               AND NOT (COALESCE(a.state, '') IN ('paused', 'ended') \
+                 AND a.paused_until > :now) \
              ORDER BY b.slug",
             ready = ready_sql("t"),
         ))?
