@@ -3,6 +3,7 @@
 //! The `board` binary is a thin wrapper around [`cli::run`]; the modules are a library so
 //! integration tests can drive the daemon with a fake `t3`.
 
+pub mod brief;
 pub mod cli;
 pub mod client;
 pub mod config;
