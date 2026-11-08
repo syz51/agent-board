@@ -3574,16 +3574,36 @@ fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
-        "open its PR, turn on auto-merge where the repository's merge rules allow it, park the task in `review` with a `task_note` naming the PR, and end",
+        "open its PR, turn on auto-merge only where the base branch requires status checks or reviews",
+        "`gh api repos/<owner>/<repo>/branches/<base>/protection`",
+        "`gh api repos/<owner>/<repo>/rules/branches/<base>`",
+        "and otherwise leave the PR open, park the task in `review` with a `task_note` naming the PR",
         "Never tell a child to wait for CI or merge after it",
         "The merge is yours, not the child's",
-        "call T3 `watch_pull_request` on the PR, and once its checks pass merge it by the repository's rules or brief a new child to",
+        "elsewhere the PR is still open, so call T3 `watch_pull_request` on the PR, and once its checks pass and your review holds, merge it by the repository's rules or brief a new child to",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+    // In a repository with no required checks, auto-merge would merge before the review.
+    assert!(!prompt.contains("turn on auto-merge where the repository's merge rules allow it"));
     // Children cannot wait for CI, so the brief no longer asks them to.
     assert!(!prompt.contains("while CI runs"));
     assert!(!prompt.contains("a live child finishes its own"));
+}
+
+#[test]
+fn the_coordinator_prompt_names_the_closer_and_parks_a_task_without_a_pr() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "Write each brief as yourself, never in the user's voice",
+        "name who closes the task by role and agent id, such as \"the coordinator (t3:1a2b) reviews and closes it\"",
+        "or for a task with no PR naming its result (a file, a note id, a report)",
+        "A child says a task waits on the user only when the brief says the user must decide or act.",
+        "each task in `review` whose PR has merged (or that has no PR) and whose child has ended",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
