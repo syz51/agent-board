@@ -102,6 +102,7 @@ pub enum Command {
     Lease {
         #[arg(required = true)]
         globs: Vec<String>,
+        /// The task the work is for; the leases end when it moves to done, dropped or open.
         #[arg(long)]
         task: Option<TaskId>,
         #[arg(long)]

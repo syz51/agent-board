@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use board_proto::{
-    AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX, TouchResult,
-    Touches,
+    AgentId, BoardSlug, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX,
+    TaskId, TouchResult, Touches,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::{OptionalExtension, params};
@@ -151,37 +151,54 @@ pub(crate) fn validate_create(mut req: CreateLeases) -> Result<ValidLeases> {
 pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult> {
     let req = valid.req;
     touch_agent(cx, &req.agent)?;
-    let (board, warning) = match &req.task {
-        Some(task) => {
-            let (board, repos) = cx
+    let mut warnings: Vec<String> = Vec::new();
+    // The task the leases name: none for a closed task, whose leases have already ended.
+    let mut task: Option<&TaskId> = req.task.as_ref();
+    let board = match &req.task {
+        Some(id) => {
+            let (board, repos, status) = cx
                 .db
                 .query_row(
-                    "SELECT t.board, b.repos FROM tasks t JOIN boards b ON b.slug = t.board \
-                     WHERE t.id = ?1",
-                    [task.as_str()],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    "SELECT t.board, b.repos, t.status FROM tasks t \
+                     JOIN boards b ON b.slug = t.board WHERE t.id = ?1",
+                    [id.as_str()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .optional()?
                 .ok_or_else(|| {
                     invalid(
-                        format!("task {task} does not exist"),
+                        format!("task {id} does not exist"),
                         "check the task id, or leave task out",
                     )
                 })?;
             let board = parse_id::<board_proto::BoardSlug>(&board)?;
             let repos: Vec<String> = parse_json(&repos)?;
-            let warning = (!repos.is_empty() && !repos.contains(&req.repo)).then(|| {
-                format!(
-                    "task {task} is on board {board}, which lists {}, not {}: peers working \
+            if !repos.is_empty() && !repos.contains(&req.repo) {
+                warnings.push(format!(
+                    "task {id} is on board {board}, which lists {}, not {}: peers working \
                      the task there get no warning from this lease; if you edit one of those \
                      repos, lease its files from a checkout of it",
                     repos.join(", "),
                     req.repo
-                )
-            });
-            (Some(board), warning)
+                ));
+            }
+            if matches!(status.as_str(), "done" | "dropped") {
+                warnings.push(format!(
+                    "task {id} is {status}, so these leases name no task and end with your \
+                     session or on expiry; if the work goes on, reopen and claim it, then \
+                     lease again"
+                ));
+                task = None;
+            }
+            Some(board)
         }
-        None => (None, None),
+        None => None,
     };
     let ttl_ms = req
         .ttl_secs
@@ -189,20 +206,31 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
     let until = expires(cx, ttl_ms);
     let now = cx.now_ms();
     let mut leases = Vec::with_capacity(req.globs.len());
+    let mut shared: Vec<&str> = Vec::new();
     for glob in &req.globs {
-        let existing: Option<i64> = cx
+        let existing: Option<(i64, Option<String>, i64)> = cx
             .db
             .query_row(
-                "SELECT id FROM leases WHERE agent = ?1 AND repo = ?2 AND glob = ?3",
+                "SELECT id, task, expires_at FROM leases WHERE agent = ?1 AND repo = ?2 \
+                 AND glob = ?3",
                 params![req.agent.as_str(), req.repo, glob],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let id = match existing {
-            Some(id) => {
+            Some((id, held_for, expires_at)) => {
+                // One lease row per glob: a live lease leased again for another task (or
+                // none) names no task, so closing either task does not end the other's lease.
+                let renewed = if expires_at > now && held_for.as_deref() != task.map(|t| t.as_str())
+                {
+                    shared.push(glob);
+                    None
+                } else {
+                    task
+                };
                 cx.db.execute(
                     "UPDATE leases SET expires_at = ?2, task = ?3 WHERE id = ?1",
-                    params![id, until, req.task.as_ref().map(|t| t.as_str())],
+                    params![id, until, renewed.map(|t| t.as_str())],
                 )?;
                 id
             }
@@ -212,7 +240,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         req.agent.as_str(),
-                        req.task.as_ref().map(|t| t.as_str()),
+                        task.map(|t| t.as_str()),
                         req.repo,
                         glob,
                         until,
@@ -227,6 +255,19 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             [id],
             lease_row,
         )?);
+    }
+    if !shared.is_empty() {
+        warnings.push(format!(
+            "you already held {} for another task or for none, so {} no task and {} with \
+             your session or on expiry, not with a task",
+            shared.join(", "),
+            if shared.len() == 1 {
+                "it now names"
+            } else {
+                "they now name"
+            },
+            if shared.len() == 1 { "ends" } else { "end" }
+        ));
     }
     let mut conflicts: Vec<Lease> = Vec::new();
     let family = delegation_family(cx, req.agent.as_str())?;
@@ -259,7 +300,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
     Ok(LeaseResult {
         leases,
         conflicts,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
 
@@ -293,6 +334,42 @@ pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> 
         lease.task.as_ref(),
         serde_json::json!({ "id": id, "repo": lease.repo, "glob": lease.glob }),
     )?;
+    Ok(())
+}
+
+/// Deletes the leases that name `task`, which just went to done, dropped or open, recording
+/// `lease_released` on `board` by `actor` for each, with the holder as `agent`. Work on a
+/// closed or unowned task has stopped, so its leases would only warn peers, including the
+/// task's next owner, about edits no one is making.
+pub(crate) fn release_for_task(
+    cx: &mut Ctx<'_>,
+    task: &TaskId,
+    board: &BoardSlug,
+    actor: &str,
+) -> Result<()> {
+    let leases: Vec<Lease> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {LEASE_COLUMNS} FROM leases WHERE task = ?1 ORDER BY id"
+        ))?
+        .query_map([task.as_str()], lease_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    cx.db
+        .execute("DELETE FROM leases WHERE task = ?1", [task.as_str()])?;
+    for lease in leases {
+        cx.emit(
+            Some(board),
+            actor,
+            EventType::LeaseReleased,
+            Some(task),
+            serde_json::json!({
+                "id": lease.id,
+                "agent": lease.agent,
+                "repo": lease.repo,
+                "glob": lease.glob,
+            }),
+        )?;
+    }
     Ok(())
 }
 

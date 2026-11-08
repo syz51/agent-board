@@ -398,7 +398,14 @@ const TOOLS: &[ToolSpec] = &[
                     strings("Globs such as crates/board/**.", PATH_CHARS_MAX),
                     true,
                 ),
-                ("task", task_arg("The task the work is for."), false),
+                (
+                    "task",
+                    task_arg(
+                        "The task the work is for. The leases end when anyone moves it to \
+                         done, dropped or open.",
+                    ),
+                    false,
+                ),
                 (
                     "ttl_secs",
                     json!({
