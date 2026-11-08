@@ -29,6 +29,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_telegram_alerts.sql"),
     include_str!("../migrations/0013_telegram_stalled.sql"),
     include_str!("../migrations/0014_board_parallel_tasks.sql"),
+    include_str!("../migrations/0015_api_errors_source.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

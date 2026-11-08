@@ -78,7 +78,10 @@ starting `claim refused:`; agents race for tasks, and stats count refusals as
 `claims_refused`) and `claim_refused` from
 `POST /v1/boards/{slug}/coordinator` (the daemon renews it). It records the code, the
 route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become
-`N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
+`N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`), with the source `server`. It also
+records the refusals a client made before sending (`POST /v1/errors`), with the source
+`client`, under the signature its own answer would get, so both count towards signals and
+`GET /v1/errors`. Once the same code, route and template reach
 `signal_min_reports` errors from at least `signal_min_agents` agents within
 `signal_window_days`, the server files feedback itself (see "Feedback") with source
 `signal`, about `board` and signature `signal:<code>:<hash>`, giving the count, the agents,
@@ -199,7 +202,22 @@ server's minute sweep deletes older ones.
   oldest kept, and the answer's `since` says so. `code` is an error code (400 `invalid`
   otherwise) and `route` a route template, matched exactly; `q` (at most 200 characters)
   matches the template's text, ignoring ASCII case. Blank `route` and `q` are left out.
-  `limit` is 1 to 1,000, default 100.
+  `limit` is 1 to 1,000, default 100. Each row counts both sources.
+- `POST /v1/errors` `[ClientError]` `{code, route, message}` → 204: records a request the
+  calling agent's client refused before sending, such as text over a limit, as if the
+  server had answered it (see "Signals"): source `client`, the same signature, and a signal
+  item once the threshold is reached. `code` is `invalid`, the only code recorded from
+  clients; `route` is the method and route template the request would have gone to, one of
+  the `/v1` routes in this document but this one (`POST /v1/tasks/{id}/notes`); `message`
+  is the server's message for text over a limit, exactly as the server writes it
+  (`<field> is <n> characters; the limit is <max>`, `n` above `max`), for a field clients
+  check: `title`, `body`, `acceptance`, `blocked_reason`, `evidence value`, `text`, `now`,
+  `next`, `blockers`, `question`, `option`, `answer`, `q`, `signature`, `reason` or `goal`
+  (`board_proto::CLIENT_CHECKED_FIELDS`), so a record carries no text of the client's
+  choosing. It needs a device token and `X-Board-Agent`, and the record is that agent's:
+  the body names no agent. Anything else is 400 `invalid`. Servers before it answer 405,
+  or 404 `not_found` before `GET /v1/errors`; some of those record that 404 as their own
+  error.
 
 #### Temporary boards
 
@@ -588,6 +606,16 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   --declined <reason> | --fixed <what changed>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
 
 All exit 1 with the error on stderr when the server refuses or cannot be reached.
+
+Text over a limit (see "Defaults") is refused before any request, with the server's message
+followed by `(not sent)` and its `next` hint, and exit 1. The CLI then reports the refusal
+to `POST /v1/errors`, waiting at most 2 seconds, so signals count it; it does not report an
+over-long feedback `about`, which the server refuses with another message, or a request it
+would not have sent, such as `board handoff --blockers` alone, which only shows the
+handoff. The report never
+changes the output or the exit code: a server that is unreachable, slow, older or refuses
+it is ignored. MCP tools do not check lengths before sending, so the server answers and
+records those itself.
 
 ### Web view
 
