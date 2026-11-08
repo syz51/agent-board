@@ -16,6 +16,7 @@ pub mod relay;
 pub mod render;
 pub mod state;
 pub mod t3;
+pub mod worktree;
 
 /// The git commit this binary was built from (12 hex digits), or `unknown`.
 pub const COMMIT: &str = env!("BOARD_COMMIT");

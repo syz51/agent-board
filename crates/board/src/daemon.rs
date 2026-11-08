@@ -1274,10 +1274,17 @@ impl<T: T3> Daemon<T> {
                 return Ok((thread.id, true));
             }
         }
+        // Never in the project root, which other threads share: see `worktree`.
+        let worktree = crate::worktree::coordinator_worktree(project, slug, now)
+            .await
+            .context("preparing the coordinator's worktree")?;
         // On disk before T3 can create the thread.
         self.state.pending_starts.entry(slug.clone()).or_insert(now);
         self.save()?;
-        let thread = self.t3.start_thread(project, &title, &message).await?;
+        let thread = self
+            .t3
+            .start_thread(project, &title, &message, worktree.as_ref())
+            .await?;
         Ok((thread, true))
     }
 

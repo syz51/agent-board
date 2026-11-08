@@ -277,6 +277,27 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Where it runs**: never in the project root, which the user's and other threads share.
+  When the project folder is the top of a git repository, the daemon starts the thread
+  with `t3 thread start --worktree <base> --branch <branch>`: T3 creates the branch from
+  `<base>` and runs the thread in a new worktree on it. `<base>` is the remote's default
+  branch (`origin/HEAD`), else the first of `origin/main`, `origin/master`, `main` and
+  `master` that exists, else the start fails and says to set `origin/HEAD`; a remote base
+  is fetched first (a failed fetch is logged, and the local copy used). `<branch>` is
+  `coordinator/<board>`, or `coordinator/<board>-<UTC time>` when that branch exists, since
+  T3 can only create a branch. A folder outside git, or nested in a repository, starts the
+  thread in the folder, as before. The coordinator prompt forbids changing files,
+  switching branches or merging in the project root; file work the coordinator does itself
+  happens in a worktree of its own, on a new branch per task. A coordinator started before
+  this rule, or adopted, still runs in the folder it had; the prompt tells it to add a
+  worktree before such work.
+- **Its worktree when the thread ends**: the daemon never removes a coordinator's
+  worktree or branch. Ending, archiving or replacing the thread leaves both in place,
+  since a thread that lost its record may still run there, and git counts a worktree with
+  only ignored files as clean. The next start finds `coordinator/<board>` taken and starts
+  on a time-stamped branch in a new worktree. Old coordinator worktrees and branches are
+  removed by hand (`git worktree remove`, `git branch -d`) until a cleanup that checks the
+  thread is archived exists.
 - **An owner away from its task**: the server's sweeper finds each task in `doing`, on an
   active board, whose owner has been away for `doing_idle_secs` (30 minutes): not running
   since it last stopped (idle, paused or ended; the spell starts at the stop, so a session
