@@ -368,6 +368,24 @@ settings in use, warned once per edit.
   briefing it once, since what it was briefed with is unknown; a pending adoption replaces
   it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
   the lease first, so the ended agent is not named meanwhile.
+- **A coordinator whose folder is gone**: T3 fails every run of a thread whose folder no
+  longer exists, at once, before the agent starts, while the thread itself stays and
+  `t3 thread show` still lists it. So the daemon counts a coordinator thread live only
+  while its folder exists: its worktree (`worktreePath` in `t3 thread show`), else the
+  board's project folder from `config.toml`. Only a folder that is not found counts as
+  gone; one that cannot be read (a permission) may still be there for T3. A live check T3
+  answered within `THREAD_RECHECK` is not trusted once the folder it found is gone. A
+  thread whose folder is gone is replaced like one T3 no longer has: the lease is released,
+  and the wake-ups queued for it are not sent to it; the flush passes its answers and idle
+  notices to the board's coordinator (its replacement, once started) and drops the rest,
+  as for any gone thread. Starting or adopting a coordinator first checks that the project
+  folder exists, before claiming the lease, so a device without it leaves the lease alone,
+  starts no thread, and retries with the start back-off; the error says to restore the
+  folder, point `config.toml` at where it is now, or switch the board's autopilot off. When
+  the folder comes back, a new thread starts; the old one is left to the user. An ended
+  worker counts as gone the same way when its worktree, else the folder its session
+  registered from, is gone. T3's CLI does not say which folder a thread's project is, so a
+  coordinator thread is checked against the board's project folder in `config.toml`.
 - **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
@@ -389,8 +407,8 @@ settings in use, warned once per edit.
   coordinator instead of a new one. The command refuses when the board has a live
   coordinator (switch autopilot off first), or an ended one of another device whose lease
   still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
-  thread or has archived it, when the device is not a home device, and when it has no
-  `[projects]` path for the board's repos. Otherwise it saves the adoption in
+  thread, has archived it or its worktree is gone, when the device is not a home device,
+  and when it has no `[projects]` path for the board's repos or that folder is gone. Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
   device's daemon never starts a thread for the board in between, and then takes the
   coordinator lease for this device, so no other home device does either. If another
@@ -403,7 +421,7 @@ settings in use, warned once per edit.
   the daemon renews, wakes and, after a lapsed lease, re-claims the thread like one it
   started. A failed brief releases the lease and is retried with the start back-off; an
   adoption newer than the last failed start is tried at once. An adopted thread that T3 no
-  longer has, or has archived, is dropped, and a new thread is started. So is an adoption
+  longer has, has archived, or whose folder is gone, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
   delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
@@ -531,7 +549,7 @@ settings in use, warned once per edit.
     whole state.
   - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
     failure up to 10 minutes, then checks them again before sending. A thread T3 no
-    longer has, or has archived, drops them. A send gets 20 seconds and all agents' sends
+    longer has, has archived, or whose worktree is gone, drops them. A send gets 20 seconds and all agents' sends
     run side by side; one that runs out of time is not sent again, since T3 may have
     delivered it.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its

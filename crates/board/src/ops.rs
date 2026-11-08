@@ -909,6 +909,8 @@ pub async fn board_adopt(
             board.repos.join(", ")
         );
     }
+    // The daemon runs the thread only while the folder is there.
+    let project = daemon::host_folder(&ctx.config, &board)?;
     if let Some(current) = &board.coordinator {
         if *current == agent {
             // Nothing left to adopt: an older request must not replace this thread later.
@@ -951,7 +953,7 @@ pub async fn board_adopt(
         && t3
             .thread_info(&local.thread)
             .await?
-            .is_some_and(|t| !t.archived)
+            .is_some_and(|t| t.runnable(Some(&project)))
     {
         bail!(
             "the daemon on this device still keeps thread {} as the coordinator of board \
@@ -967,6 +969,11 @@ pub async fn board_adopt(
         Some(info) if info.archived => {
             bail!("thread {thread} is archived; unarchive it in T3 or adopt another thread")
         }
+        Some(info) if !info.runnable(Some(&project)) => bail!(
+            "the worktree {} of thread {thread} is gone, so T3 fails every run of it; adopt \
+             another thread",
+            info.folder(Some(&project)).unwrap_or(&project).display()
+        ),
         Some(_) => {}
     }
     daemon::save_adoption(

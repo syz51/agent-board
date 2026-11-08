@@ -118,6 +118,7 @@ impl FakeT3 {
             ThreadInfo {
                 archived: false,
                 runtime: Runtime::Claude,
+                worktree: None,
             },
         );
     }
@@ -226,8 +227,18 @@ struct Env {
     daemon: Daemon<FakeT3>,
 }
 
+/// A project folder named `name` that exists, since the daemon runs no coordinator in a
+/// missing one; the same path on every call.
+fn src(name: &str) -> PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("daemon-projects")
+        .join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
 fn env() -> Env {
-    env_with_projects([(REPO.to_owned(), PathBuf::from("/src/agent-board"))].into())
+    env_with_projects(projects())
 }
 
 fn env_with_projects(projects: BTreeMap<String, PathBuf>) -> Env {
@@ -325,7 +336,7 @@ async fn a_home_device_starts_a_coordinator_when_none_is_live() {
     else {
         panic!("{calls:?}");
     };
-    assert_eq!(project, Path::new("/src/agent-board"));
+    assert_eq!(project, &src("agent-board"));
     assert_eq!(title, "factory coordinator");
     assert!(message.starts_with("# Coordinator"));
     assert!(
@@ -541,6 +552,7 @@ async fn an_ended_coordinator_of_another_device_keeps_its_lease_and_ours_is_adop
         ThreadInfo {
             archived: false,
             runtime: Runtime::Claude,
+            worktree: None,
         },
     );
     e.stub
@@ -687,6 +699,7 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
         ThreadInfo {
             archived: true,
             runtime: Runtime::Claude,
+            worktree: None,
         },
     );
     e.stub.on(
@@ -717,6 +730,246 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
         ["DELETE", "POST", "POST"],
         "release, claim, claim as the agent"
     );
+}
+
+/// A coordinator of ours, named and idle, in the thread `coord`, whose board maps [`REPO`]
+/// to `project`.
+fn coordinator_in(project: &Path) -> Env {
+    let mut e = env_with_projects([(REPO.to_owned(), project.to_path_buf())].into());
+    let agent = "t3:coord";
+    e.t3.live("coord");
+    e.daemon.state.coordinators.insert(
+        factory(),
+        Coordinator {
+            thread: "coord".into(),
+            agent: agent.parse().unwrap(),
+            started_at: at(),
+            renewed_at: at(),
+            resumed_after: None,
+            registered: true,
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
+        },
+    );
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Ended),
+    );
+    for method in ["POST", "DELETE"] {
+        e.stub.on(
+            &format!("{method} /v1/boards/factory/coordinator"),
+            autopilot(None, &[DEVICE]),
+        );
+    }
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(&format!("t3:{NEW_THREAD}"), DEVICE, AgentState::Running),
+    );
+    e
+}
+
+/// T3 fails every run of a thread whose folder is gone, at once, so each wake-up sent to it
+/// would be lost: its coordinator is released and no longer woken, and no new one starts
+/// until the folder is back.
+#[tokio::test]
+async fn a_coordinator_whose_project_folder_is_gone_is_released_and_not_woken() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("factory");
+    std::fs::create_dir(&project).unwrap();
+    let mut e = coordinator_in(&project);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 0, "live while its folder is there");
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !e.daemon.state.wakes.is_empty(),
+        "a wake-up for the coordinator"
+    );
+
+    // Found live just now, but the folder is checked at once, not after the recheck delay.
+    std::fs::remove_dir(&project).unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(releases(&e), 1);
+    assert!(!e.daemon.state.coordinators.contains_key(&factory()));
+    // Its ended agent registered from no folder: the reconcile's verdict holds it back.
+    e.daemon.flush(at()).await;
+    assert!(e.t3.calls().is_empty(), "no send, no new thread");
+    assert!(e.daemon.state.wakes.is_empty(), "its wake-ups are dropped");
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty(),
+        "a device without the folder leaves the lease alone"
+    );
+
+    // Tried again after the back-off, still without the folder: nothing starts.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 0);
+
+    // The folder is back: the next try starts a coordinator in it.
+    std::fs::create_dir(&project).unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(10))
+        .await
+        .unwrap();
+    assert_eq!(started(&e.t3).0, project);
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_worktree_is_gone_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = coordinator_in(dir.path());
+    e.t3.threads.lock().unwrap().insert(
+        "coord".into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+            worktree: Some(dir.path().join("worktree-removed")),
+        },
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+    assert_eq!(started(&e.t3).0, dir.path(), "a new thread in the project");
+    assert_eq!(
+        e.daemon.state.coordinators[&factory()].thread,
+        NEW_THREAD,
+        "{:?}",
+        e.daemon.state.coordinators
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_worktree_goes_is_replaced_at_once_and_its_answers_follow() {
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = dir.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let mut e = coordinator_in(dir.path());
+    e.t3.threads.lock().unwrap().insert(
+        "coord".into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+            worktree: Some(worktree.clone()),
+        },
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 0, "live while its worktree is there");
+    let ev = answered(&e, 11, 3, "t3:coord");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+
+    // Found live just now, but its worktree is checked at once, not after the recheck delay.
+    std::fs::remove_dir(&worktree).unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(releases(&e), 1);
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+
+    // The answer to the gone coordinator's ask goes to its replacement, not to it.
+    let new = format!("t3:{NEW_THREAD}");
+    e.stub.on(
+        &format!("GET {}", agent_path(&new)),
+        agent_fixture(&new, DEVICE, AgentState::Idle),
+    );
+    e.daemon.flush(at() + chrono::Duration::seconds(31)).await;
+    e.daemon.flush(at() + chrono::Duration::seconds(32)).await;
+    let sends = e.t3.sends();
+    assert_eq!(threads(&e.t3), [NEW_THREAD], "{sends:?}");
+    assert!(sends[0].1.contains("ask #3"), "{sends:?}");
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn an_ended_worker_whose_folder_is_gone_has_its_answer_passed_to_the_coordinator() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // One in a worktree T3 names, one in the folder its session registered from.
+    e.t3.threads.lock().unwrap().insert(
+        "worker".into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+            worktree: Some(dir.path().join("worktree-removed")),
+        },
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Ended),
+    );
+    e.t3.live("other");
+    let mut other = agent_fixture("t3:other", DEVICE, AgentState::Ended);
+    other.cwd = Some(dir.path().join("deleted").display().to_string());
+    e.stub
+        .on(&format!("GET {}", agent_path("t3:other")), &other);
+    let ev = answered(&e, 11, 3, "t3:worker");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    let ev = answered(&e, 12, 4, "t3:other");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    e.daemon.flush(at() + chrono::Duration::seconds(1)).await;
+    let sends = e.t3.sends();
+    assert!(
+        sends.iter().all(|(thread, _)| thread == "coord"),
+        "{sends:?}"
+    );
+    let text: String = sends.iter().map(|(_, m)| m.as_str()).collect();
+    assert!(
+        text.contains("ask #3") && text.contains("ask #4"),
+        "{sends:?}"
+    );
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn an_adoption_waits_for_its_project_folder_and_not_for_a_gone_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("factory");
+    let mut e = adoption_env_with([(REPO.to_owned(), project.clone())].into());
+    // No folder: nothing is claimed or asked, and the adoption waits.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    assert!(e.t3.calls().is_empty());
+    assert!(load_adoption(&home_of(&e), &factory()).is_some(), "kept");
+
+    // The folder is back, but the thread's own worktree is gone: a new thread starts.
+    std::fs::create_dir(&project).unwrap();
+    e.t3.threads.lock().unwrap().insert(
+        ADOPTED.into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+            worktree: Some(dir.path().join("worktree-removed")),
+        },
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(10))
+        .await
+        .unwrap();
+    assert_eq!(load_adoption(&home_of(&e), &factory()), None, "dropped");
+    assert!(threads(&e.t3).is_empty(), "the gone thread is not briefed");
+    assert_eq!(started(&e.t3).0, project);
 }
 
 fn coordinator_env(
@@ -1741,6 +1994,7 @@ async fn an_ended_coordinator_whose_thread_is_archived_is_not_woken_and_says_so(
         ThreadInfo {
             archived: true,
             runtime: Runtime::Claude,
+            worktree: None,
         },
     );
     e.stub
@@ -1759,7 +2013,8 @@ async fn an_ended_coordinator_whose_thread_is_archived_is_not_woken_and_says_so(
     assert!(e.t3.sends().is_empty());
     assert!(e.daemon.state.wakes.is_empty());
     let text = logs.text();
-    let gone = "waking t3:coord: it ended and T3 no longer has its thread, or archived it";
+    let gone =
+        "waking t3:coord: T3 no longer has its thread, archived it, or the thread's folder is gone";
     assert_eq!(
         text.matches(&format!("{gone}; 1 wake-ups dropped")).count(),
         1,
@@ -2332,7 +2587,7 @@ fn saved_state(e: &Env) -> board::daemon::WatchState {
 }
 
 fn projects() -> BTreeMap<String, PathBuf> {
-    [(REPO.to_owned(), PathBuf::from("/src/agent-board"))].into()
+    [(REPO.to_owned(), src("agent-board"))].into()
 }
 
 #[tokio::test]
@@ -2377,7 +2632,7 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
     assert_eq!(
         lists,
         [Call::List {
-            project: PathBuf::from("/src/agent-board"),
+            project: src("agent-board"),
             title: "factory coordinator".into()
         }]
     );
@@ -2714,7 +2969,12 @@ fn home_of(e: &Env) -> Home {
 
 /// An env whose device was asked (`board board adopt`) to adopt the live thread [`ADOPTED`].
 fn adoption_env() -> Env {
-    let e = env();
+    adoption_env_with(projects())
+}
+
+/// [`adoption_env`] with these `[projects]`.
+fn adoption_env_with(projects: BTreeMap<String, PathBuf>) -> Env {
+    let e = env_with_projects(projects);
     e.t3.live(ADOPTED);
     save_adoption(
         &home_of(&e),
@@ -2931,6 +3191,7 @@ async fn an_adoption_of_a_gone_or_archived_thread_is_dropped_for_a_new_thread() 
                 ThreadInfo {
                     archived: true,
                     runtime: Runtime::Claude,
+                    worktree: None,
                 },
             );
         } else {
@@ -3357,25 +3618,25 @@ fn started(t3: &FakeT3) -> (PathBuf, String) {
 #[tokio::test]
 async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
     let config = Config {
-        board_projects: [("board-feedback".parse().unwrap(), "/src/feedback".into())].into(),
+        board_projects: [("board-feedback".parse().unwrap(), src("feedback"))].into(),
         ..Config::default()
     };
     let (t3, stub) = start_with(board_fixture("board-feedback", &[]), config).await;
     let (project, _) = started(&t3);
-    assert_eq!(project, Path::new("/src/feedback"));
+    assert_eq!(project, src("feedback"));
     let register = &stub.requests_to("POST /v1/agents")[0].body;
     assert_eq!(register["role"], "coordinator");
     assert_eq!(register["repo"], serde_json::Value::Null);
-    assert_eq!(register["cwd"], "/src/feedback");
+    assert_eq!(register["cwd"], src("feedback").to_str().unwrap());
 
     // A board repo under [projects] wins over [board_projects].
     let config = Config {
         projects: projects(),
-        board_projects: [(factory(), "/src/elsewhere".into())].into(),
+        board_projects: [(factory(), src("elsewhere"))].into(),
         ..Config::default()
     };
     let (t3, stub) = start_with(board_fixture("factory", &[REPO]), config).await;
-    assert_eq!(started(&t3).0, Path::new("/src/agent-board"));
+    assert_eq!(started(&t3).0, src("agent-board"));
     assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
 }
 
@@ -3509,7 +3770,7 @@ async fn a_project_added_to_config_toml_starts_the_coordinator_without_a_restart
     // the failed start's back-off does not hold it either.
     write_config(&e, projects());
     e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+    assert_eq!(started(&e.t3).0, src("agent-board"));
 }
 
 #[tokio::test]
@@ -3530,7 +3791,7 @@ async fn an_unreadable_config_toml_keeps_the_projects_in_use() {
     // Fixed: read again.
     write_config(&e, projects());
     e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+    assert_eq!(started(&e.t3).0, src("agent-board"));
 }
 
 #[tokio::test]
@@ -3540,7 +3801,7 @@ async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
 
     // The default feedback board.
     let config = Config {
-        board_projects: [("board-feedback".parse().unwrap(), "/src/feedback".into())].into(),
+        board_projects: [("board-feedback".parse().unwrap(), src("feedback"))].into(),
         ..Config::default()
     };
     let (t3, _) = start_with(board_fixture("board-feedback", &[]), config).await;
@@ -3571,8 +3832,8 @@ async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
     let config = Config {
         feedback_board: Some("fb".parse().unwrap()),
         board_projects: [
-            ("board-feedback".parse().unwrap(), "/src/feedback".into()),
-            ("fb".parse().unwrap(), "/src/fb".into()),
+            ("board-feedback".parse().unwrap(), src("feedback")),
+            ("fb".parse().unwrap(), src("fb")),
         ]
         .into(),
         ..Config::default()
@@ -3977,6 +4238,7 @@ async fn a_coordinator_whose_checks_time_out_is_still_replaced_once_t3_answers()
             ThreadInfo {
                 archived: true,
                 runtime: Runtime::Claude,
+                worktree: None,
             },
         );
     };
@@ -4235,8 +4497,9 @@ fn a_coordinator_start_is_logged() {
     std::fs::write(
         home.join("config.toml"),
         format!(
-            "{config}t3_bin = {:?}\n[projects]\n{REPO:?} = \"/src/agent-board\"\n",
-            t3.display().to_string()
+            "{config}t3_bin = {:?}\n[projects]\n{REPO:?} = {:?}\n",
+            t3.display().to_string(),
+            src("agent-board").display().to_string()
         ),
     )
     .unwrap();

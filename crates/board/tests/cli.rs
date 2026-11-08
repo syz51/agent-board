@@ -1117,18 +1117,22 @@ for arg; do thread=$arg; done
 case "$thread" in
   live|other-live) echo "{\"thread\":{\"threadId\":\"$thread\",\"archived\":false,\"providerInstanceId\":\"claudeAgent\"}}" ;;
   archived) echo '{"thread":{"threadId":"archived","archived":true}}' ;;
+  unmoored) echo '{"thread":{"threadId":"unmoored","archived":false,"worktreePath":"/nonexistent/worktree"}}' ;;
   *) echo "Thread $thread is no longer available." >&2; exit 1 ;;
 esac
 "#,
     )
     .unwrap();
     std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let project = e.home.join("infra");
+    std::fs::create_dir_all(&project).unwrap();
     let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
     std::fs::write(
         e.home.join("config.toml"),
         format!(
-            "{config}t3_bin = \"{}\"\n\n[projects]\n\"{ADOPT_REPO}\" = \"/src/infra\"\n",
-            t3.display()
+            "{config}t3_bin = \"{}\"\n\n[projects]\n\"{ADOPT_REPO}\" = \"{}\"\n",
+            t3.display(),
+            project.display()
         ),
     )
     .unwrap();
@@ -1315,6 +1319,29 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
     e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
     refused(&e, "gone", "T3 on this device knows no thread gone");
     refused(&e, "archived", "thread archived is archived");
+    refused(
+        &e,
+        "unmoored",
+        "the worktree /nonexistent/worktree of thread unmoored is gone",
+    );
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty(),
+        "no lease claimed"
+    );
+
+    // The project folder is gone: the daemon could not run the thread.
+    let e = adopt_env();
+    e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
+    std::fs::remove_dir(e.home.join("infra")).unwrap();
+    refused(&e, "live", "the project folder");
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty(),
+        "no lease claimed"
+    );
 
     // This device is not a home device.
     let e = adopt_env();
