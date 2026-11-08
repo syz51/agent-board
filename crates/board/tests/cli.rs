@@ -1197,11 +1197,11 @@ fn board_adopt_and_a_coordinator_whose_session_ended() {
     };
 
     // On its own device: T3 closed the idle session, the thread lives on, and the lease
-    // still names it. Adopting that thread is accepted, with nothing left to do.
+    // still names it. Adopting that thread is accepted, with nothing left to do and no need
+    // to look its agent up.
     let e = adopt_env();
     e.stub
         .on("GET /v1/boards/infra", adopt_board(true, Some("t3:live")));
-    ended(&e, "t3:live", DEVICE);
     let out = adopt(&e, "live");
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
@@ -1209,7 +1209,14 @@ fn board_adopt_and_a_coordinator_whose_session_ended() {
         "{}",
         stdout(&out)
     );
-    // Adopting another thread there replaces it.
+    assert!(
+        e.stub
+            .requests_to(&format!("GET /v1/agents/{}", enc("t3:live")))
+            .is_empty()
+    );
+    // Adopting another thread there is saved for the daemon, which releases the ended
+    // coordinator's lease and adopts it (daemon test
+    // an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released).
     let e = adopt_env();
     e.stub
         .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));

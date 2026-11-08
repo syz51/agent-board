@@ -254,6 +254,14 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
+  while its thread lives on, and the server keeps the coordinator lease (only file leases
+  go). The daemon of the lease's device renews it while T3 finds the thread live. Another
+  home device waits for the lease to expire. The coordinator's own device, when its
+  `watch.json` has no record of it (lost or reset), runs its thread again if T3 has it,
+  briefing it once, since what it was briefed with is unknown; a pending adoption replaces
+  it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
+  the lease first, so the ended agent is not named meanwhile.
 - **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
@@ -267,7 +275,8 @@ settings in use, warned once per edit.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
-  coordinator (switch autopilot off first), when T3 on that device does not know the
+  coordinator (switch autopilot off first), or an ended one of another device whose lease
+  still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
   thread or has archived it, when the device is not a home device, and when it has no
   `[projects]` path for the board's repos. Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
@@ -393,9 +402,12 @@ settings in use, warned once per edit.
     passed on. The event retries go on past one the server keeps failing and stop only
     when the server cannot be reached. The daemon reconciles at start and on its tick,
     also while the stream is down. The boards' `t3 thread show` checks run side by side,
-    10 seconds each; one that fails or runs out of time still renews a named coordinator,
-    and only a check that
-    answers replaces it. Each check starts a `t3` process of about 180 MB, so a named
+    10 seconds each; one that fails or runs out of time still renews a named coordinator
+    at work, and only a check that answers replaces it. One whose session ended is not
+    renewed while the checks fail, and once they have failed for 10 minutes its lease is
+    released, so another home device takes over while T3 is down; its record stays, so
+    the thread is adopted again once T3 answers, unless another coordinator is named by
+    then. Each check starts a `t3` process of about 180 MB, so a named
     coordinator's thread that T3 found live is not asked about again for 5 minutes. A
     failed send to it, or its agent ending, makes the next reconcile ask; an archived
     thread is replaced within that interval. The reconnect delay (1 second, doubled up to a minute) resets

@@ -886,8 +886,8 @@ pub async fn board_adopt(
                 "{current} coordinates board {slug} from device {}: its session ended, but \
                  that device keeps the coordinator lease while its thread lives; adopt on that \
                  device, or wait until `board boards` shows {slug} without a coordinator (the \
-                 lease expires within 45 minutes once that device stops renewing it), then \
-                 adopt again",
+                 lease expires once that device stops renewing it: after the server's \
+                 coordinator_ttl_secs, 45 minutes by default), then adopt again",
                 info.device
             ),
             _ => {}

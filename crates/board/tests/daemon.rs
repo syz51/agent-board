@@ -419,15 +419,38 @@ async fn a_failed_thread_check_releases_an_ended_coordinators_lease_and_renews_a
         .unwrap();
     assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (1, 0));
 
-    // Its session ended (T3 closed it while idle) and T3 cannot answer: the lease goes, so
-    // another home device can take over, and the record stays.
+    // T3 answers again: the failures are forgotten.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+
+    // Its session ended (T3 closed it while idle) and T3 cannot answer: not renewed while
+    // the checks fail, and released once they have failed for CHECK_FAIL_RELEASE, so another
+    // home device can take over. The record stays.
+    e.t3.fail_info.store(true, Ordering::SeqCst);
     e.stub.on(
         &format!("GET {}", agent_path(&agent)),
         agent_fixture(&agent, DEVICE, AgentState::Ended),
     );
     e.stub.clear();
     e.daemon
-        .reconcile(at() + chrono::Duration::minutes(32))
+        .reconcile(at() + chrono::Duration::minutes(26))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(30))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(36))
         .await
         .unwrap();
     assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 1));
@@ -514,6 +537,77 @@ async fn an_ended_coordinator_of_another_device_keeps_its_lease_and_ours_is_adop
     assert_eq!(claims[0].body["agent"], agent);
     let slug: board_proto::BoardSlug = "factory".parse().unwrap();
     assert_eq!(e.daemon.state.coordinators[&slug].thread, thread);
+    assert_eq!(
+        e.t3.infos.load(Ordering::SeqCst),
+        1,
+        "the next reconcile does not ask T3 again"
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released() {
+    // Ours and its thread live, but the user asked to adopt another thread: the lease is
+    // released, so the adopted thread is named, not the ended one.
+    let mut e = adoption_env();
+    let thread = "thread:project:p1:idle";
+    let old = format!("t3:{thread}");
+    e.t3.live(thread);
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 0);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order, ["DELETE", "POST", "POST"]);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims[1].body["agent"], format!("t3:{ADOPTED}"));
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+
+    // Ours, its thread gone: released before a new thread starts, so the gone one is not
+    // named meanwhile.
+    let mut e = env();
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order.first().map(String::as_str), Some("DELETE"));
 }
 
 #[tokio::test]
