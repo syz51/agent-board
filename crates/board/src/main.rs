@@ -1,7 +1,5 @@
-use clap::Parser as _;
-
 fn main() {
-    let cli = board::cli::Cli::parse();
+    let cli = board::cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("BOARD_LOG")
