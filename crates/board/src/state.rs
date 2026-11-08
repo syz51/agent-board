@@ -143,6 +143,19 @@ pub struct SessionLocal {
     /// The T3 thread that delegated this session's thread, once T3 named it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t3_parent: Option<String>,
+    /// The T3 thread the facts below were read for; they hold only for that thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_thread: Option<String>,
+    /// The thread's title as T3 last gave it and the hook registered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_title: Option<String>,
+    /// The thread's `https://` link in the T3 app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_link: Option<String>,
+    /// When a `Stop` last asked T3 for the thread's title; `None` before the session's
+    /// first `Stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_checked_at: Option<Timestamp>,
 }
 
 fn runtime_name(runtime: Runtime) -> &'static str {
@@ -506,6 +519,10 @@ mod tests {
         let nested = SessionLocal {
             nested: true,
             t3_parent: Some("parent-1".into()),
+            t3_thread: Some("thread-1".into()),
+            t3_title: Some("Fix the parser".into()),
+            t3_link: Some("https://app.example.test/threads/env-1/thread-1".into()),
+            title_checked_at: Some(chrono::Utc::now()),
         };
         save_session(&home, Runtime::Claude, "s/1", &nested).unwrap();
         assert_eq!(
