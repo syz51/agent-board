@@ -597,6 +597,37 @@ mod tests {
     }
 
     #[test]
+    fn asks_sent_before_their_chat_was_recorded_take_the_paired_chat() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..16].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);
+             INSERT INTO telegram_chat (id, chat_id, paired_at) VALUES (1, 7, 0);
+             INSERT INTO asks (id, board, agent, kind, question, options, status, created_at,
+                               telegram_message_id, telegram_chat_id)
+             VALUES (1, 'b', 'a', 'action', 'q', '[]', 'open', 0, 500, NULL),
+                    (2, 'b', 'a', 'action', 'q', '[]', 'open', 0, 501, 8),
+                    (3, 'b', 'a', 'action', 'q', '[]', 'open', 0, NULL, NULL);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let chats: Vec<Option<i64>> = conn
+            .prepare("SELECT telegram_chat_id FROM asks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(chats, [Some(7), Some(8), None]);
+    }
+
+    #[test]
     fn boards_and_asks_stored_before_temporary_boards_are_kept() {
         let conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();

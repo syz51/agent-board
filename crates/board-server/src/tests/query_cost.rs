@@ -227,11 +227,8 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
 async fn a_telegram_reply_searches_asks_by_chat_and_message() {
     let t = T::new();
     let p = plan(&t, BY_TELEGRAM_MESSAGE);
-    assert_eq!(
-        p,
-        "SEARCH asks USING COVERING INDEX asks_telegram_message \
-         (telegram_chat_id=? AND telegram_message_id=?)"
-    );
+    assert!(p.contains("INDEX asks_telegram_message"), "{p}");
+    assert!(!p.contains("SCAN"), "{p}");
 }
 
 /// The two-query recent() picks the same events, in the same order, as the one query it

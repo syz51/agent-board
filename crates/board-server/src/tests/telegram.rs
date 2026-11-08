@@ -672,13 +672,12 @@ async fn an_answer_that_fails_to_record_is_reported_and_stays_answerable() {
     notifier.await.unwrap();
 }
 
-/// Telegram does not resend an update, so a reply or button press the board cannot read,
-/// for the paired chat or for the ask it answers, asks the user to answer again.
+/// Telegram does not resend an update, so a reply whose ask the board cannot look up asks
+/// the user to send it again. The paired chat is read once, before the first poll, so
+/// answers do not depend on reading it again.
 #[tokio::test]
-async fn an_answer_that_fails_to_read_is_reported_and_stays_answerable() {
+async fn a_reply_that_fails_to_read_is_reported_and_stays_answerable() {
     const PHONE: i64 = 555;
-    const AGAIN: &str =
-        "The board could not record this answer; the ask is still open, so answer again.";
     let (fake, api_base) = fake_api().await;
     let t = T::new();
     t.register(A, None, None).await;
@@ -690,22 +689,8 @@ async fn an_answer_that_fails_to_read_is_reported_and_stays_answerable() {
     fake.handle(start(1, PHONE, "private", &format!("/start {code}")))
         .await;
     fake.wait("sendMessage", 1).await;
-    let text = ask(&t, "Log in to the registry").await;
+    let id = ask(&t, "Log in to the registry").await;
     fake.wait("sendMessage", 2).await;
-    let decision = t
-        .ok(
-            "POST",
-            "/v1/asks",
-            Some(A),
-            Some(json!({
-                "agent": A, "board": "factory", "kind": "decision",
-                "question": "Publish now?", "options": ["yes", "later"],
-            })),
-        )
-        .await["id"]
-        .as_i64()
-        .unwrap();
-    fake.wait("sendMessage", 3).await;
     let reply = |update_id: i64| {
         json!({
             "update_id": update_id,
@@ -715,64 +700,39 @@ async fn an_answer_that_fails_to_read_is_reported_and_stays_answerable() {
             },
         })
     };
-    let press = |update_id: i64| {
-        json!({
-            "update_id": update_id,
-            "callback_query": {
-                "id": format!("cb-{update_id}"),
-                "data": format!("ask:{decision}:0"),
-                "message": { "message_id": 1003, "chat": { "id": PHONE } },
-            },
-        })
-    };
     let sql = |sql: &'static str| {
         t.state.write(move |cx| {
             cx.db.execute_batch(sql)?;
             Ok(())
         })
     };
-
-    // The paired chat cannot be read.
     sql("ALTER TABLE telegram_chat RENAME TO telegram_chat_away;")
-        .await
-        .unwrap();
-    fake.push(reply(2));
-    let sent = fake.wait("sendMessage", 4).await;
-    assert_eq!(
-        (&sent[3]["chat_id"], &sent[3]["text"]),
-        (&json!(PHONE), &json!(AGAIN))
-    );
-    assert_eq!(sent[3]["reply_parameters"]["message_id"], 82);
-    fake.push(press(3));
-    let acks = fake.wait("answerCallbackQuery", 1).await;
-    assert_eq!(
-        acks[0]["text"],
-        format!(
-            "Ask {decision}: the board could not record this answer; it is still open, so answer again."
-        )
-    );
-    sql("ALTER TABLE telegram_chat_away RENAME TO telegram_chat;")
         .await
         .unwrap();
 
     // The ask a reply answers cannot be looked up.
     sql("ALTER TABLE asks RENAME TO asks_away;").await.unwrap();
-    fake.push(reply(4));
-    let sent = fake.wait("sendMessage", 5).await;
+    fake.push(reply(2));
+    let sent = fake.wait("sendMessage", 3).await;
+    assert_eq!(sent[2]["chat_id"], PHONE);
     assert_eq!(
-        (&sent[4]["chat_id"], &sent[4]["text"]),
-        (&json!(PHONE), &json!(AGAIN))
+        sent[2]["text"],
+        "The board could not read this reply; if it answers an ask, send it again."
     );
-    assert_eq!(sent[4]["reply_parameters"]["message_id"], 84);
+    assert_eq!(sent[2]["reply_parameters"]["message_id"], 82);
     sql("ALTER TABLE asks_away RENAME TO asks;").await.unwrap();
     let open = t.ok("GET", "/v1/asks?status=open", None, None).await;
-    assert_eq!(open.as_array().unwrap().len(), 2, "{open}");
+    assert_eq!(open.as_array().unwrap().len(), 1, "{open}");
 
-    // Answering again once the database is back records both answers.
-    fake.push(reply(5));
-    assert_eq!(wait_for_answer(&t, text).await["answer"], "done");
-    fake.push(press(6));
-    assert_eq!(wait_for_answer(&t, decision).await["answer"], "yes");
+    // Sending it again once the asks are back answers it, with the paired chat still
+    // unreadable.
+    fake.push(reply(3));
+    assert_eq!(wait_for_answer(&t, id).await["answer"], "done");
+    let sent = fake.wait("sendMessage", 4).await;
+    assert_eq!(sent[3]["text"], format!("Answered ask {id}: done"));
+    sql("ALTER TABLE telegram_chat_away RENAME TO telegram_chat;")
+        .await
+        .unwrap();
 
     t.state.shutdown();
     notifier.await.unwrap();
