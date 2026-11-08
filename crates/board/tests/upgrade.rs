@@ -26,6 +26,7 @@ case "$1 $2" in
 "auth status")
     echo "gh auth status" >> "$STATE/log"
     [ -z "${STUB_GH_LOGGED_OUT:-}" ] || { echo "You are not logged into any GitHub hosts." >&2; exit 1; }
+    [ -z "${STUB_GH_OFFLINE:-}" ] || { echo "error connecting to api.github.com" >&2; exit 1; }
     ;;
 "attestation verify")
     echo "gh attestation verify $3" >> "$STATE/log"
@@ -294,6 +295,7 @@ impl Env {
             "BOARD_IMAGE",
             "STUB_DIGEST",
             "STUB_GH_LOGGED_OUT",
+            "STUB_GH_OFFLINE",
             "STUB_GH_VERIFY_FAIL",
             "STUB_FAIL_PULL",
             "STUB_FAIL_TAG",
@@ -604,8 +606,9 @@ fn a_failed_provenance_check_stops_before_any_change() {
         (
             "STUB_GH_LOGGED_OUT",
             "1",
-            "gh is not logged in: run gh auth login, or pass --build",
+            "You are not logged into any GitHub hosts.",
         ),
+        ("STUB_GH_OFFLINE", "1", "error connecting to api.github.com"),
         (
             "STUB_GH_VERIFY_FAIL",
             "1",
@@ -632,6 +635,19 @@ fn a_failed_provenance_check_stops_before_any_change() {
         assert_eq!(env.read("cargo-laptop").trim(), old);
         assert!(env.backups().is_empty());
         assert!(!env.lock().exists(), "the lock was not released");
+    }
+    // A failed `gh auth status` names both causes and their fixes, whichever it was.
+    for var in ["STUB_GH_LOGGED_OUT", "STUB_GH_OFFLINE"] {
+        let err = fails(env.run(&["--yes", new], &[(var, "1")]));
+        for want in [
+            "gh auth status failed",
+            "gh is not logged in: run gh auth login",
+            "gh cannot reach GitHub",
+            "pass --build",
+            "nothing was changed",
+        ] {
+            assert!(err.contains(want), "{var}: {want}: {err}");
+        }
     }
     // A verification failure names its other causes too.
     let err = fails(env.run(&["--yes", new], &[("STUB_GH_VERIFY_FAIL", "1")]));

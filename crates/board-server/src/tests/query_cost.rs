@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use super::{REPO, T};
 use crate::db::{live_sql, ready_sql};
 use crate::ops::leases::DELEGATION_FAMILY;
+use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
 use crate::snapshot::{RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates};
 use crate::store::{BATCH_BLOCKERS, latest_events_sql};
 
@@ -167,8 +168,24 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
     assert!(p.contains("USING INDEX tasks_parent"), "{p}");
 
     // Delegated threads: the expression index, not a scan of agents per step.
-    let p = plan(&t, DELEGATION_FAMILY);
-    assert!(p.contains("USING INDEX agents_t3_parent"), "{p}");
+    for sql in [DELEGATION_FAMILY, DELEGATE_AT_WORK] {
+        let p = plan(&t, sql);
+        assert!(p.contains("USING INDEX agents_t3_parent"), "{p}");
+    }
+
+    // The idle-owner sweep: an owner's own events along `events_actor`, read backwards for
+    // its last run; a task's along `events_task`. No scan of events, no sort.
+    for (sql, index) in [
+        (LAST_RUN, "events_actor"),
+        (AWAY_SINCE, "events_actor"),
+        (ENTERED_DOING, "events_task"),
+        (TOLD, "events_task"),
+    ] {
+        let p = plan(&t, sql);
+        assert!(p.contains(&format!("USING INDEX {index}")), "{sql}:\n{p}");
+        assert!(!p.contains("SCAN events"), "{sql}:\n{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{sql}:\n{p}");
+    }
 }
 
 /// The two-query recent() picks the same events, in the same order, as the one query it

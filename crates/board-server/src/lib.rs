@@ -108,7 +108,8 @@ async fn shutdown_signal() {
 }
 
 /// Every minute until shutdown: sweeps expired leases, prunes old API error records,
-/// announces passed `not_before` times and quiet reviews in one transaction, then closes or
+/// announces passed `not_before` times, quiet reviews and owners away from their `doing`
+/// tasks in one transaction, then closes or
 /// deletes idle temporary boards, one transaction per board, then prunes history past the
 /// stats window in batches.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
@@ -123,7 +124,8 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                             ops::leases::sweep_expired(cx)?;
                             ops::feedback::prune_signals(cx)?;
                             ops::tasks::announce_not_before(cx)?;
-                            ops::tasks::announce_quiet_reviews(cx)
+                            ops::tasks::announce_quiet_reviews(cx)?;
+                            ops::tasks::announce_idle_doing(cx)
                         })
                         .await;
                     if let Err(error) = swept {

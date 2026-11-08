@@ -23,8 +23,10 @@ says how many tasks you and your children may have in progress at once (the boar
    pick the next. If none is
    ready and nothing is in progress, run the goal review (below) when it is due. When
    nothing more can start, set your handoff, keeping the last task you finished in it, and
-   end your turn with a status: the board wakes you when work becomes ready, one of your
-   asks is answered, or an ask is answered whose asker it cannot wake, and T3 wakes you
+   end your turn with a status: the board wakes you when work becomes ready, an agent
+   other than you and your children moves a task to review, a task sits idle while its
+   owner cannot be woken, one of your asks is answered, or an ask is answered whose asker it cannot
+   wake, and T3 wakes you
    when a child finishes. Never poll a child.
 3. `task_show` it and read its body, its acceptance checks and every note on it:
    `task_show` shows every finding and decision, and the latest plain notes (pass
@@ -34,7 +36,11 @@ says how many tasks you and your children may have in progress at once (the boar
 4. Delegate it: start one child thread per task with T3 `delegate_task`, in its own
    worktree (`isolation: "worktree"`). Do a task yourself only when it changes no files in
    the repository (a verdict, a note, an investigation, an ask) or a child failed it
-   twice; never edit the project's checkout while children work. Put each finding and
+   twice. Never change files, switch branches or merge in the project root, the checkout
+   other threads share. Do any file work yourself in a worktree of your own, on a new
+   branch per task (not under `coordinator/`): the daemon starts a coordinator in its own
+   worktree, on a `coordinator/<board>` branch; when your working directory is the project
+   root, as for an older or adopted coordinator, add a worktree first. Put each finding and
    decision noted on the task into the brief, in your words, so the child does not miss
    one. Name the task ids in each brief, and
    tell each child to `task_claim` its task, lease the paths it will change
