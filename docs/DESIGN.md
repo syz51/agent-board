@@ -258,12 +258,19 @@ settings in use, warned once per edit.
   active board, whose owner has been away for `doing_idle_secs` (30 minutes): not running
   since it last stopped (idle, paused or ended; the spell starts at the stop, so a session
   T3 closes later is the same spell), or marked running but not seen for that long, as a
-  turn cut short by an error leaves a thread. It skips the task while a thread the owner
-  delegated, at any depth, is at work (running and seen within that time, or paused until
-  a reset still to come). It records one `task_updated` event with `idle_doing` per spell
-  away, so the check runs once, on the server, not on every device. The snapshot alerts
-  the owner, or the board's coordinator when the owner is gone, and the owner's device
-  daemon wakes a T3 owner.
+  turn cut short by an error leaves a thread. A coordinator lease the daemon renews does
+  not count as the agent seen, so a coordinator left marked running is found too. An
+  owner waiting for a usage-limit reset still to come (paused, or ended meanwhile) is not
+  away. It skips the task while a thread the owner delegated, at any depth, is at work
+  (running and seen within that time, or waiting for a reset still to come, paused or
+  ended). It records one `task_updated` event with `idle_doing` and `away` per spell
+  away, so the check runs once, on the server, not on every device: a spell is told once
+  there is a notice for the task and owner after the owner last ran and after the task
+  last came to it. While the task is still in doing and still that owner's, the snapshot
+  alerts the owner, and the board's coordinator when the owner is no T3 thread (no daemon
+  can wake it) or has been away twice `doing_idle_secs`: T3 closes an idle session after
+  30 minutes while the daemon still wakes its thread, so the owner gets the first turn.
+  The owner's device daemon wakes a T3 owner.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another
@@ -374,15 +381,20 @@ settings in use, warned once per edit.
   delegate's brief.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears, a task moves to `review` (to check it against its
-  acceptance checks), or another agent files a proposal on the board (a
+  `not_before` passes), a blocker clears, an agent other than the coordinator and the
+  threads it delegated (at any depth, by `t3_parent`) moves a task to `review` (to check
+  it against its acceptance checks), or another agent files a proposal on the board (a
   new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
   board, so a blocker on another board wakes the coordinator of the waiting task's board;
   and the owner of a `blocked` task is woken when its last blocker is done (told to check
   its blocked reason first when it has one). The owner of a task in `doing` is woken when
   the server announces it has been away from the task (`idle_doing`, below), and told to
-  continue it or park it by what it waits on; a line still queued when the owner runs
-  again is dropped. An answered ask wakes the agent
+  continue it or park it by what it waits on. That line is dropped when the owner runs
+  again before it is sent, or is marked running and was seen after the notice (an owner
+  left running that came back announces no state change), or waits for a usage-limit
+  reset. The coordinator gets the line instead when no device can wake the owner: it is
+  no T3 thread, it is unknown, or its thread is gone (found by the owner's device, so only
+  a coordinator on that device hears of it). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are

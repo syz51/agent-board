@@ -28,25 +28,37 @@ fn matcher(glob: &str) -> Option<GlobMatcher> {
 /// ids ends.
 pub(crate) const DELEGATION_DEPTH: i64 = 8;
 
-/// The query of [`delegation_family`]: `?1` the agent, `?2` the depth. The `down` join
-/// compares the indexed expression `agents_t3_parent` with the parent's id without `t3:`, so
-/// it is an index search rather than a scan of every agent per step.
-pub(crate) const DELEGATION_FAMILY: &str = "WITH RECURSIVE \
+/// The recursive CTE `down(id, depth)`: agent `?1` at depth 0, then the T3 threads it
+/// delegated, down every branch, to depth `?2`. The join compares the indexed expression
+/// `agents_t3_parent` with the parent's id without `t3:`, so it is an index search rather
+/// than a scan of every agent per step. A macro, so queries built with `concat!` stay
+/// constants.
+macro_rules! delegated_down_cte {
+    () => {
+        "down(id, depth) AS ( \
+           SELECT ?1, 0 \
+           UNION \
+           SELECT a.id, down.depth + 1 \
+           FROM down JOIN agents a \
+             ON json_extract(a.native_ids, '$.t3_parent') = substr(down.id, 4) \
+           WHERE substr(down.id, 1, 3) = 't3:' AND down.depth < ?2)"
+    };
+}
+pub(crate) use delegated_down_cte;
+
+/// The query of [`delegation_family`]: `?1` the agent, `?2` the depth.
+pub(crate) const DELEGATION_FAMILY: &str = concat!(
+    "WITH RECURSIVE \
      up(id, depth) AS ( \
        SELECT ?1, 0 \
        UNION \
        SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
        FROM agents a JOIN up ON a.id = up.id \
        WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
-         AND up.depth < ?2), \
-     down(id, depth) AS ( \
-       SELECT ?1, 0 \
-       UNION \
-       SELECT a.id, down.depth + 1 \
-       FROM down JOIN agents a \
-         ON json_extract(a.native_ids, '$.t3_parent') = substr(down.id, 4) \
-       WHERE substr(down.id, 1, 3) = 't3:' AND down.depth < ?2) \
-     SELECT id FROM up UNION SELECT id FROM down";
+         AND up.depth < ?2), ",
+    delegated_down_cte!(),
+    " SELECT id FROM up UNION SELECT id FROM down"
+);
 
 /// The T3 threads that delegated `agent`, up the chain, and those it delegated, down every
 /// branch (each `t3_parent` native id names the thread that delegated it), without `agent`.

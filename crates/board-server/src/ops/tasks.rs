@@ -473,44 +473,65 @@ pub(crate) fn announce_quiet_reviews(cx: &mut Ctx<'_>) -> Result<usize> {
     Ok(quiet.len())
 }
 
-/// When `agent` stopped running: its first state change to anything but `running` after
-/// its last change to `running`. A turn ending, a usage-limit pause and the session's end
-/// all follow the same stop, so the spell away starts at the first of them.
-const AWAY_SINCE: &str = "SELECT MIN(at) FROM events \
+/// The seq of `?1`'s last state change to `running`, 0 when it has none. Read backwards
+/// along `events_actor`, so it stops at the newest match.
+pub(crate) const LAST_RUN: &str = "SELECT COALESCE((SELECT seq FROM events \
      WHERE actor = ?1 AND type = 'agent_state_changed' \
-       AND json_extract(payload, '$.to') <> 'running' \
-       AND seq > COALESCE((SELECT MAX(seq) FROM events \
-         WHERE actor = ?1 AND type = 'agent_state_changed' \
-           AND json_extract(payload, '$.to') = 'running'), 0)";
+       AND json_extract(payload, '$.to') = 'running' \
+     ORDER BY seq DESC LIMIT 1), 0)";
 
-/// Whether a T3 thread `agent` delegated, at any depth, is at work: running and seen
-/// after `?3`, or paused until a reset still to come (`?4`, now).
-const DELEGATE_AT_WORK: &str = "WITH RECURSIVE down(id, depth) AS ( \
-       SELECT ?1, 0 \
-       UNION \
-       SELECT a.id, down.depth + 1 FROM down JOIN agents a \
-         ON json_extract(a.native_ids, '$.t3_parent') = substr(down.id, 4) \
-       WHERE substr(down.id, 1, 3) = 't3:' AND down.depth < ?2) \
-     SELECT EXISTS (SELECT 1 FROM down JOIN agents a ON a.id = down.id \
+/// When `?1` stopped running: its first state change to anything but `running` after seq
+/// `?2`, its last change to `running`. A turn ending, a usage-limit pause and the session's
+/// end all follow the same stop, so the spell away starts at the first of them.
+pub(crate) const AWAY_SINCE: &str = "SELECT at FROM events \
+     WHERE actor = ?1 AND seq > ?2 AND type = 'agent_state_changed' \
+       AND json_extract(payload, '$.to') <> 'running' \
+     ORDER BY seq LIMIT 1";
+
+/// The seq of the last event that put task `?1` in `doing` or in new hands (a claim, a
+/// take, a move to `doing`, a handover), 0 when none. Read backwards along `events_task`.
+pub(crate) const ENTERED_DOING: &str = "SELECT COALESCE((SELECT seq FROM events \
+     WHERE task = ?1 AND (type IN ('task_claimed', 'task_taken') \
+       OR (type = 'task_updated' AND (json_extract(payload, '$.to') = 'doing' \
+         OR json_extract(payload, '$.owner') IS NOT NULL))) \
+     ORDER BY seq DESC LIMIT 1), 0)";
+
+/// Whether task `?1` has an idle notice about agent `?3` after seq `?2`, and at or after
+/// `?4` when that is not null.
+pub(crate) const TOLD: &str = "SELECT EXISTS (SELECT 1 FROM events \
+     WHERE task = ?1 AND seq > ?2 AND type = 'task_updated' \
+       AND json_extract(payload, '$.idle_doing') IS NOT NULL \
+       AND json_extract(payload, '$.away') = ?3 AND (?4 IS NULL OR at >= ?4))";
+
+/// Whether a T3 thread agent `?1` delegated, to depth `?2`, is at work: running and seen
+/// after `?3`, or waiting for a usage-limit reset still to come (`?4`, now), paused or with
+/// its session closed meanwhile.
+pub(crate) const DELEGATE_AT_WORK: &str = concat!(
+    "WITH RECURSIVE ",
+    crate::ops::leases::delegated_down_cte!(),
+    " SELECT EXISTS (SELECT 1 FROM down JOIN agents a ON a.id = down.id \
        WHERE down.depth > 0 \
          AND ((a.state = 'running' AND a.last_seen > ?3) \
-           OR (a.state = 'paused' AND a.paused_until > ?4)))";
+           OR (a.state IN ('paused', 'ended') AND a.paused_until > ?4)))"
+);
 
 /// Announces each task in `doing` on an active board whose owner has been away for
 /// `doing_idle_secs` while no thread it delegated (at any depth) is at work: a
 /// `task_updated` event by `server` (no field changes; `idle_doing` names when the spell
-/// away began, `owner` the owner). Away means not running since then (idle, paused or
-/// ended), or marked running but not seen for that long, as a turn cut short by an error
-/// leaves a thread. Once per spell: an owner that runs again and stops starts a new one.
-/// The snapshot shows it as an alert to the owner, or to the board's coordinator when the
-/// owner is gone, and the owner's device daemon wakes a T3 owner. Run by the sweeper.
+/// away began, `away` the owner). Away means not running since then (idle, paused with no
+/// reset ahead, or ended), or marked running but not seen for that long, as a turn cut
+/// short by an error leaves a thread. An owner waiting for a usage-limit reset still to
+/// come (paused, or ended meanwhile) is not away. Once per spell: an owner that runs again
+/// and stops starts a new one, and so does a running owner seen again. The snapshot shows
+/// it as an alert to the owner, or to the board's coordinator, and the owner's device
+/// daemon wakes a T3 owner. Run by the sweeper.
 pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
     let cutoff = now - cx.s.doing_idle_ms();
-    let doing: Vec<(TaskId, BoardSlug, String, String, i64)> = cx
+    let doing: Vec<(TaskId, BoardSlug, String, String, i64, Option<i64>)> = cx
         .db
         .prepare_cached(
-            "SELECT t.id, t.board, t.owner, a.state, a.last_seen FROM tasks t \
+            "SELECT t.id, t.board, t.owner, a.state, a.last_seen, a.paused_until FROM tasks t \
              JOIN agents a ON a.id = t.owner JOIN boards b ON b.slug = t.board \
              WHERE t.status = 'doing' AND b.status = 'active'",
         )?
@@ -521,30 +542,50 @@ pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
                 r.get(2)?,
                 r.get(3)?,
                 r.get(4)?,
+                r.get(5)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut announced = 0;
-    for (id, board, owner, state, last_seen) in &doing {
-        let since = if state == "running" {
+    for (id, board, owner, state, last_seen, paused_until) in &doing {
+        let running = state == "running";
+        let waits_for_reset =
+            matches!(state.as_str(), "paused" | "ended") && paused_until.is_some_and(|p| p > now);
+        if waits_for_reset {
+            continue;
+        }
+        let last_run: i64 = cx
+            .db
+            .prepare_cached(LAST_RUN)?
+            .query_row([owner], |r| r.get(0))?;
+        let since = if running {
             *last_seen
         } else {
             cx.db
                 .prepare_cached(AWAY_SINCE)?
-                .query_row([owner], |r| r.get::<_, Option<i64>>(0))?
+                .query_row(params![owner, last_run], |r| r.get(0))
+                .optional()?
                 .unwrap_or(*last_seen)
         };
         if since > cutoff {
             continue;
         }
-        let told: bool = cx
+        // Told this spell: a notice after the owner last ran and after the task last came to
+        // it. A session closing later moves neither, so it is the same spell. A running
+        // owner's spell starts when it was last seen, so one seen again is told again.
+        let entered: i64 = cx
             .db
-            .prepare_cached(
-                "SELECT EXISTS (SELECT 1 FROM events WHERE task = ?1 AND type = 'task_updated' \
-               AND json_extract(payload, '$.idle_doing') IS NOT NULL \
-               AND json_extract(payload, '$.owner') = ?2 AND at >= ?3)",
-            )?
-            .query_row(params![id.as_str(), owner, since], |r| r.get(0))?;
+            .prepare_cached(ENTERED_DOING)?
+            .query_row([id.as_str()], |r| r.get(0))?;
+        let told: bool = cx.db.prepare_cached(TOLD)?.query_row(
+            params![
+                id.as_str(),
+                last_run.max(entered),
+                owner,
+                running.then_some(since)
+            ],
+            |r| r.get(0),
+        )?;
         if told {
             continue;
         }
@@ -563,7 +604,7 @@ pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
             serde_json::json!({
                 "fields": [],
                 "idle_doing": ts(since),
-                "owner": owner,
+                "away": owner,
             }),
         )?;
         announced += 1;
