@@ -211,6 +211,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
