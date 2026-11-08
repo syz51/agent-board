@@ -18,7 +18,6 @@ import {
   Empty,
   ErrorNotice,
   ExpandableLine,
-  listClass,
   PageHeader,
   QueryFrame,
   RelTime,
@@ -192,7 +191,7 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
     return <p className="text-meta text-muted-foreground">Nothing waits on you.</p>;
   }
   return (
-    <ul className={listClass}>
+    <ul className="divide-y overflow-hidden rounded-lg border bg-card">
       {newestFirst(asks)
         .slice(0, HOME_ROWS)
         .map((ask) => (
@@ -201,7 +200,7 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
                 wait on the user, unlike every other row on Home. */}
             <Link
               className={cn(
-                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
                 "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
                 ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
               )}
@@ -259,19 +258,13 @@ export function plainLine(text: string): string {
 }
 
 const SEGMENTS = [
-  { key: "done", label: "done", bar: "bg-status-done", dot: "bg-status-done" },
-  { key: "review", label: "review", bar: "bg-status-review", dot: "bg-status-review" },
-  { key: "doing", label: "doing", bar: "bg-status-doing", dot: "bg-status-doing" },
-  { key: "blocked", label: "blocked", bar: "bg-status-blocked", dot: "bg-status-blocked" },
-  { key: "ready", label: "ready", bar: "bg-status-ready", dot: "bg-status-ready" },
-  // Not started: the bar is the track's grey and the dot an open ring, never a grey disc
-  // that reads as done.
-  {
-    key: "waiting",
-    label: "waiting",
-    bar: "bg-input",
-    dot: "border-[1.5px] border-subtle-foreground bg-transparent",
-  },
+  { key: "done", label: "done", bar: "bg-status-done", icon: "done" },
+  { key: "review", label: "review", bar: "bg-status-review", icon: "review" },
+  { key: "doing", label: "doing", bar: "bg-status-doing", icon: "doing" },
+  { key: "blocked", label: "blocked", bar: "bg-status-blocked", icon: "blocked" },
+  { key: "ready", label: "ready", bar: "bg-status-ready", icon: "ready" },
+  // Not started: the track's grey in the bar, and the dashed ring of an open task.
+  { key: "waiting", label: "waiting", bar: "bg-input", icon: "open" },
 ] as const;
 
 function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
@@ -348,10 +341,10 @@ const CELL_CLASS: Record<string, string> = {
 /**
  * The boards table's columns. Every row is one height on wide screens: the name line, with
  * its whole slug and states, the goal in two lines, the tally and the coordinator in two at
- * most, so the cells sit centred in a 78px row.
+ * most. Cells start at the top of the row, level with the name.
  */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,150px)_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-3";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,300px)_minmax(0,184px)_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -396,7 +389,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
             key={row.id}
             className={cn(
               ROW_GRID,
-              "items-center px-(--gutter) py-3 @min-[760px]:min-h-[78px] @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
+              "items-center px-(--gutter) py-3 @min-[760px]:min-h-[78px] @min-[760px]:items-start @min-[760px]:py-2.5 @min-[760px]:hover:bg-muted",
             )}
           >
             {row.getAllCells().map((cell) => (
@@ -475,7 +468,7 @@ function TaskTally({ board }: { board: Board }) {
       ) : (
         <ul
           // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
+          className="flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs @min-[760px]:grid @min-[760px]:grid-cols-3 @min-[760px]:gap-x-3"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -486,10 +479,7 @@ function TaskTally({ board }: { board: Board }) {
                   key={segment.key}
                   className="inline-flex items-center gap-0.75 whitespace-nowrap"
                 >
-                  <span
-                    className={cn("size-2 flex-none rounded-full", segment.dot)}
-                    aria-hidden="true"
-                  />
+                  <StatusIcon status={segment.icon} className="size-3 max-md:size-2" />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}

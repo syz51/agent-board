@@ -14,18 +14,18 @@ inset panel, and lists that run edge to edge across it.
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
   name, slug and states share one line, none of them cut, the goal keeps to two lines, the
-  task tally to one and the coordinator to two; an empty cell is a dash, and the Asks
-  column is right-aligned. Agents are a two-column table: who (in a 300px column), with
-  its state, when last seen and one quiet line of where it runs, its repository and branch
-  set as ids (cut with an ellipsis, whole on hover); then what it is working on, with its
-  handoff. Priority labels share one
-  weight; the bars carry the level.
+  task tally to two rows of three fixed columns and the coordinator to two; cells start
+  level with the name, an empty cell is a dash, and the Asks column is right-aligned.
+  Agents are a two-column table: who (in a 300px column), with its state, when last seen
+  and where it runs in two quiet lines, its machine, then its repository and branch set as
+  ids; then what it is working on, with its handoff. Priority labels share one weight; the
+  bars carry the level.
 - **Type**: Inter at 13px body, 12.5px meta, 24px page titles and 28px task titles; prose
   stops at a 100-character measure.
 - **Color and surfaces**: cool greys, a graphite primary action and one violet signal for
   links, selection and unseen marks. The panel's outline is the only elevation. Status
   colours stay, always with a shape and a word: board tallies spell out "3 done 1 review"
-  after an 8px dot of each bar colour, and an open ring for waiting. Agent and board states are one style everywhere: a dot and
+  after the status icon of each bar colour, the same shapes as on a board. Agent and board states are one style everywhere: a dot and
   a word, no pill.
 - **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
   bottom tabs on phones. Counts there are what waits on the user, in one pill: filled amber
@@ -34,7 +34,8 @@ inset panel, and lists that run edge to edge across it.
   banner and footer say why), and boards that cannot load are placeholder rows. On a board or a task the sidebar marks the
   board, not Home.
 - **Home**: what the user follows, in sections they collapse and reorder: waiting asks (a
-  left edge in each kind's colour, as on Needs you, and an Answer cue on hover), the boards,
+  card inset to the gutter, a left edge in each kind's colour, as on Needs you, and an
+  Answer cue on hover), the boards,
   tasks in progress across boards (Doing and Review under their own headings), and what
   changed since they last looked. Finished tasks there are one-line rows whose summary
   opens on demand. Needs you holds only asks, the things that wait on the user. Board
