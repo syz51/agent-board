@@ -3136,6 +3136,21 @@ fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
     }
 }
 
+#[test]
+fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_there() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "for a task whose work is in another repository start a T3 thread in that repository's project instead",
+        "(`t3_thread_launch` with its `projectId` and `workspaceStrategy: \"worktree\"`)",
+        // T3 launches a thread only when the user asks for one.
+        "this brief is the user's standing request for such a thread",
+        "Brief it the same way, and `task_note` its link on the task.",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
 async fn start_with(board: Board, config: Config) -> (FakeT3, Stub) {

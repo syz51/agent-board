@@ -34,7 +34,11 @@ says how many tasks you and your children may have in progress at once (the boar
    (`task_claim`) only when you do it yourself: you may own one task in `doing`, so leave
    a task you delegate unclaimed for its child.
 4. Delegate it: start one child thread per task with T3 `delegate_task`, in its own
-   worktree (`isolation: "worktree"`). Do a task yourself only when it changes no files in
+   worktree (`isolation: "worktree"`). `delegate_task` runs only in your own project, so
+   for a task whose work is in another repository start a T3 thread in that repository's
+   project instead (`t3_thread_launch` with its `projectId` and `workspaceStrategy:
+   "worktree"`): this brief is the user's standing request for such a thread. Brief it the
+   same way, and `task_note` its link on the task. Do a task yourself only when it changes no files in
    the repository (a verdict, a note, an investigation, an ask) or a child failed it
    twice. Never change files, switch branches or merge in the project root, the checkout
    other threads share. Do any file work yourself in a worktree of your own, on a new

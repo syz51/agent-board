@@ -358,7 +358,9 @@ settings in use, warned once per edit.
   longer has, or has archived, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
 - **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
-  delegate it to a child thread (T3 `delegate_task`, in its own worktree), naming the task
+  delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
+  work is in another repository, a T3 thread launched in that repository's project, since
+  `delegate_task` runs only in the coordinator's own project), naming the task
   id in the brief so the child claims it and owns it through PR, merge and `task_done`;
   review the result against the acceptance checks when the child reports; repeat. The
   coordinator does a task itself only when it changes no repository files (a verdict, an
