@@ -84,8 +84,9 @@ route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers
 `signal`, about `board` and signature `signal:<code>:<hash>`, giving the count, the agents,
 the window, the route and the template. Later errors add reports to that item while it is
 live. Once it is no longer live (its fix is done), only errors after its last report count
-towards a new item, which `recurs` it. Records older than the window are deleted by the
-server's minute sweep.
+towards a new item, which `recurs` it. Records are kept `error_retention_days`, and never less than the window,
+so `GET /v1/errors` can count errors under the threshold, such as since a fix deployed; the
+server's minute sweep deletes older ones.
 
 ## Endpoints
 
@@ -175,6 +176,16 @@ server's minute sweep.
   so a task id an agent still holds never names a new task. Ask ids are never reused
   either.
 - `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
+- `GET /v1/errors?since=&code=&route=&q=&limit=` → `[ErrorLog]` `{since, retention_days,
+  signatures}`: the API errors recorded for signals (see "Signals") at or after `since`,
+  one row per signature, most errors first. A row `[ErrorSignature]` has `signature`
+  (`signal:<code>:<hash>`), `code`, `route` (the template), `template` (the normalized
+  message), `count`, `agents` (distinct), `first_at`, `last_at` and `item`: the newest
+  feedback item with that signature, or `null` when none was filed, as for errors under
+  the signal threshold. `since` is an RFC 3339 time, default `signal_window_days` back from
+  now; the server keeps records `error_retention_days`, so an earlier `since` reads no
+  more. `code` and `route` match exactly; `q` (at most 200 characters) matches the
+  template's text, ignoring case. `limit` is 1 to 1,000, default 100.
 
 #### Temporary boards
 
@@ -507,6 +518,11 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
   it), each within the period. Without `--json` it prints
   a four-line summary.
+- `board errors [--since T] [--code C] [--route R] [--grep TEXT] [--limit N] --json` →
+  `[ErrorLog]` from `GET /v1/errors`. `--since` takes an RFC 3339 time, a date
+  (`YYYY-MM-DD`, midnight UTC) or a duration back from now (`30m`, `12h`, `14d`); `--grep`
+  is sent as `q`. Without `--json` it prints a header naming the window, then one line per
+  signature: count, code, distinct agents, route, item, template and last time.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
@@ -543,6 +559,7 @@ no nonce.
 | Text limits | title 72, note 500, handoff field 300, question 1,000, body 4,000 characters; outside settings, ask option 60 and evidence value 500 |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
+| API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 

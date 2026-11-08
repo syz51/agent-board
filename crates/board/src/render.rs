@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, AgentState, Ask, Board, Event, EventType, Handoff, Lease, LeaseResult, Note, NoteKind,
-    Stats, Task, TaskDetail, TaskStatus, Timestamp, TouchResult,
+    Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Handoff, Lease, LeaseResult, Note,
+    NoteKind, Stats, Task, TaskDetail, TaskStatus, Timestamp, TouchResult,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -578,6 +578,33 @@ pub fn lease_result(result: &LeaseResult) -> String {
 
 /// `board stats`: the feedback-loop counts, one topic per line. A server that predates
 /// feedback items reports zero feedback.
+/// `board errors`: one line per signature, most first, after a header naming the window.
+pub fn errors(log: &ErrorLog) -> String {
+    let since = log.since.format("%Y-%m-%d %H:%MZ");
+    let mut out = format!(
+        "API errors since {since} (kept {} days)",
+        log.retention_days
+    );
+    if log.signatures.is_empty() {
+        out.push_str("\nnone");
+    }
+    for e in &log.signatures {
+        let agents = if e.agents == 1 { "agent" } else { "agents" };
+        let _ = write!(
+            out,
+            "\n{} × {} from {} {agents} · {} · {} · \"{}\" · last {}",
+            e.count,
+            e.code,
+            e.agents,
+            e.route,
+            e.item.as_ref().map_or("no item", |id| id.as_str()),
+            e.template,
+            e.last_at.format("%Y-%m-%d %H:%MZ"),
+        );
+    }
+    out
+}
+
 pub fn stats(stats: &Stats) -> String {
     let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
     let day = if stats.days == 1 { "day" } else { "days" };

@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
-    CreatedAsk, DoneTask, ErrorCode, EventsPage, FeedbackResult, Handoff, JoinBoard, LeaseResult,
-    Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind,
-    Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, TouchResult, Touches, UpdateBoard,
-    UpdateTask,
+    CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard,
+    LeaseResult, Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
+    Touches, UpdateBoard, UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -168,6 +168,20 @@ pub struct SnapshotQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
     pub format: SnapshotFormat,
+}
+
+/// `GET /v1/errors` filters; absent ones are left out.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ErrorsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    pub limit: u32,
 }
 
 /// How long a long-running process (the daemon, the MCP server) waits for one answer, so a
@@ -501,6 +515,10 @@ impl Client {
 
     pub async fn stats(&self, days: u32) -> Result<Stats> {
         self.get_query("/v1/stats", &[("days", days)]).await
+    }
+
+    pub async fn errors(&self, q: &ErrorsQuery) -> Result<ErrorLog> {
+        self.get_query("/v1/errors", q).await
     }
 
     // Snapshots and events

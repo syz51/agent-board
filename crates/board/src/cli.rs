@@ -163,6 +163,26 @@ pub enum Command {
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
         days: u32,
     },
+    /// API errors the server recorded, one line per signature, most first. Counts errors
+    /// under the signal threshold, such as those since a fix deployed.
+    Errors {
+        /// From when: an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now
+        /// (30m, 12h, 14d). Default: the server's signal window (7 days).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only this error code, such as invalid.
+        #[arg(long)]
+        code: Option<String>,
+        /// Only this route, such as "POST /v1/tasks/{id}/notes".
+        #[arg(long)]
+        route: Option<String>,
+        /// Only messages that contain this text, ignoring case.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Most signatures to list, 1 to 1000.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+    },
     /// Print your board snapshot.
     Snapshot {
         #[arg(long, default_value = "full", value_parser = enum_arg::<SnapshotKind>())]
@@ -923,6 +943,25 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::resolve(&ctx()?, &id, req).await?
         }
         Command::Stats { days } => ops::stats(&ctx()?, days).await?,
+        Command::Errors {
+            since,
+            code,
+            route,
+            grep,
+            limit,
+        } => {
+            let since = since
+                .map(|s| ops::parse_since(&s, chrono::Utc::now()))
+                .transpose()?;
+            let q = crate::client::ErrorsQuery {
+                since,
+                code,
+                route,
+                q: grep,
+                limit,
+            };
+            ops::errors(&ctx()?, &q).await?
+        }
         Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")
         }

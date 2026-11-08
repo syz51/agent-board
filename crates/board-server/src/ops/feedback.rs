@@ -3,10 +3,10 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, EventType, EvidenceKind,
-    FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution,
-    FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind, ResolveFeedback,
-    ResolvedCounts, Task, TaskId,
+    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, ErrorLog, ErrorSignature, EventType,
+    EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity,
+    FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind,
+    ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -834,12 +834,115 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     Ok(Some(task.id))
 }
 
-/// Forgets error records older than the signal window. Run by the sweeper.
+/// Forgets error records older than `error_retention_days`. Run by the sweeper.
 pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
     Ok(cx.db.execute(
         "DELETE FROM api_errors WHERE at < ?1",
-        [cx.now_ms() - cx.s.signal_window_ms()],
+        [cx.now_ms() - cx.s.error_retention_ms()],
     )?)
+}
+
+/// Most signatures one [`errors`] answer lists.
+pub(crate) const ERRORS_LIMIT_MAX: usize = 1_000;
+/// Longest `q` filter of [`errors`].
+const ERRORS_Q_MAX: usize = 200;
+
+/// Filters of `GET /v1/errors`, validated by [`ErrorsFilter::new`].
+pub(crate) struct ErrorsFilter {
+    since: i64,
+    code: Option<String>,
+    route: Option<String>,
+    q: Option<String>,
+    limit: usize,
+}
+
+impl ErrorsFilter {
+    /// `since` defaults to the signal window back from now; `limit` to 100.
+    pub(crate) fn new(
+        cx: &Ctx<'_>,
+        since: Option<Timestamp>,
+        code: Option<String>,
+        route: Option<String>,
+        q: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        let limit = limit.unwrap_or(100);
+        if !(1..=ERRORS_LIMIT_MAX).contains(&limit) {
+            return Err(invalid(
+                format!("limit={limit} is out of range"),
+                format!("send limit between 1 and {ERRORS_LIMIT_MAX}"),
+            ));
+        }
+        if let Some(q) = &q {
+            check_line("q", q, ERRORS_Q_MAX)?;
+        }
+        let since = since.map_or_else(
+            || cx.now_ms() - cx.s.signal_window_ms(),
+            |at| at.timestamp_millis(),
+        );
+        let blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        Ok(Self {
+            since,
+            code: blank(code),
+            route: blank(route),
+            q: blank(q),
+            limit,
+        })
+    }
+}
+
+/// `GET /v1/errors`: the recorded API errors since a time, one row per signature, most
+/// first, with the newest feedback item each one filed or added to.
+pub(crate) fn errors(cx: &Ctx<'_>, f: &ErrorsFilter) -> Result<ErrorLog> {
+    let q = f.q.as_ref().map(|q| q.to_lowercase());
+    let rows = cx
+        .db
+        .prepare_cached(
+            "SELECT e.signature, e.code, e.route, e.template, COUNT(*), COUNT(DISTINCT e.agent), \
+             MIN(e.at), MAX(e.at), \
+             (SELECT task FROM feedback WHERE signature = e.signature ORDER BY rowid DESC LIMIT 1) \
+             FROM api_errors e WHERE e.at >= ?1 \
+             AND (?2 IS NULL OR e.code = ?2) AND (?3 IS NULL OR e.route = ?3) \
+             AND (?4 IS NULL OR instr(lower(e.template), ?4) > 0) \
+             GROUP BY e.signature ORDER BY COUNT(*) DESC, MAX(e.at) DESC LIMIT ?5",
+        )?
+        .query_map(params![f.since, f.code, f.route, q, f.limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, u32>(4)?,
+                r.get::<_, u32>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let signatures = rows
+        .into_iter()
+        .map(
+            |(signature, code, route, template, count, agents, first, last, item)| {
+                Ok(ErrorSignature {
+                    signature,
+                    code,
+                    route,
+                    template,
+                    count,
+                    agents,
+                    first_at: ts(first),
+                    last_at: ts(last),
+                    item: item.as_deref().map(parse_id).transpose()?,
+                })
+            },
+        )
+        .collect::<Result<_>>()?;
+    Ok(ErrorLog {
+        since: ts(f.since),
+        retention_days: cx.s.error_retention(),
+        signatures,
+    })
 }
 
 /// Feedback counts since `from` (milliseconds).
