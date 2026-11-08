@@ -1172,3 +1172,62 @@ async fn a_finding_on_a_task_whose_owner_ended_reaches_the_coordinator() {
         "{alerts}"
     );
 }
+
+#[tokio::test]
+async fn the_coordinator_sees_how_many_tasks_it_may_run_at_once() {
+    let t = T::new();
+    let (coordinator, other) = ("t3:coord", "t3:other");
+    t.register(coordinator, Some(REPO), None).await;
+    t.register(other, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let you = |s: &Value| {
+        text(s)
+            .lines()
+            .find(|l| l.starts_with("you: "))
+            .unwrap()
+            .to_owned()
+    };
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(
+        you(&full).ends_with(" · coordinator, one task at a time"),
+        "{full}"
+    );
+
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/auto",
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(
+        you(&full).ends_with(" · coordinator, up to 2 tasks at once"),
+        "{full}"
+    );
+    let yaml = snapshot(&t, coordinator, "kind=full&format=yaml").await;
+    assert!(text(&yaml).contains("  parallel_tasks: 2\n"), "{yaml}");
+
+    // Another agent on the board is not told the coordinator's limit.
+    let full = snapshot(&t, other, "kind=full").await;
+    assert!(!you(&full).contains("coordinator"), "{full}");
+
+    // Nor is a coordinator whose lease lapsed: the prompt then reads the limit as 1.
+    t.advance(super::coordinator_ttl() + TimeDelta::seconds(1));
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(!you(&full).contains("coordinator"), "{full}");
+}

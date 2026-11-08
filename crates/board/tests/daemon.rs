@@ -381,6 +381,237 @@ async fn no_start_off_home_devices_with_a_live_coordinator_or_a_refused_claim() 
 }
 
 #[tokio::test]
+async fn a_failed_thread_check_releases_an_ended_coordinators_lease_and_renews_a_working_one() {
+    let mut e = env();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let agent = format!("t3:{NEW_THREAD}");
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    let lease = |e: &Env, method: &str| {
+        e.stub
+            .requests_to(&format!("{method} /v1/boards/factory/coordinator"))
+            .len()
+    };
+    e.t3.fail_info.store(true, Ordering::SeqCst);
+
+    // At work: a failed check says nothing of the thread, so the lease is renewed.
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(16))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (1, 0));
+
+    // T3 answers again: the failures are forgotten.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+
+    // Its session ended (T3 closed it while idle) and T3 cannot answer: not renewed while
+    // the checks fail, and released once they have failed for CHECK_FAIL_RELEASE, so another
+    // home device can take over. The record stays.
+    e.t3.fail_info.store(true, Ordering::SeqCst);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Ended),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(26))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(30))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(36))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 1));
+    let slug: board_proto::BoardSlug = "factory".parse().unwrap();
+    assert_eq!(e.daemon.state.coordinators[&slug].thread, NEW_THREAD);
+
+    // T3 answers again and no one took the board: the thread is adopted, not replaced.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(48))
+        .await
+        .unwrap();
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body["agent"], agent);
+    assert_eq!(starts(&e.t3), 1, "no new thread");
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_of_another_device_keeps_its_lease_and_ours_is_adopted() {
+    // Another device's coordinator whose session ended: that device's daemon renews or
+    // releases its lease, so this one waits for the lease to expire.
+    let mut e = env();
+    e.stub.on(
+        "GET /v1/boards",
+        [autopilot(Some("t3:elsewhere"), &[DEVICE, "mac-air"])],
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:elsewhere")),
+        agent_fixture("t3:elsewhere", "mac-air", AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    // Once the lease expires the board names no coordinator, and this device starts one.
+    e.stub
+        .on("GET /v1/boards", [autopilot(None, &[DEVICE, "mac-air"])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(46))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1);
+
+    // Ours, its thread still in T3, but unknown to this daemon's state (lost or reset):
+    // adopted again, with no new thread.
+    let mut e = env();
+    let thread = "thread:project:p1:idle";
+    let agent = format!("t3:{thread}");
+    e.t3.threads.lock().unwrap().insert(
+        thread.into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+        },
+    );
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Ended),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 0);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body["agent"], agent);
+    let slug: board_proto::BoardSlug = "factory".parse().unwrap();
+    assert_eq!(e.daemon.state.coordinators[&slug].thread, thread);
+    assert_eq!(
+        e.t3.infos.load(Ordering::SeqCst),
+        1,
+        "the next reconcile does not ask T3 again"
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released() {
+    // Ours and its thread live, but the user asked to adopt another thread: the lease is
+    // released, so the adopted thread is named, not the ended one.
+    let mut e = adoption_env();
+    let thread = "thread:project:p1:idle";
+    let old = format!("t3:{thread}");
+    e.t3.live(thread);
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 0);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order, ["DELETE", "POST", "POST"]);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims[1].body["agent"], format!("t3:{ADOPTED}"));
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+
+    // Ours, its thread gone: released before a new thread starts, so the gone one is not
+    // named meanwhile.
+    let mut e = env();
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order.first().map(String::as_str), Some("DELETE"));
+}
+
+#[tokio::test]
 async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
     let mut e = env();
     e.stub

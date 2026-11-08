@@ -80,6 +80,10 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// each minute costs a home device more than the check is worth. A failed send to the
 /// thread, or its agent ending, asks again on the next reconcile.
 pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
+/// An ended coordinator's lease is released once checks of its thread have failed this
+/// long, so another home device takes over while T3 is down, and one slow check does not
+/// hand the board away.
+pub const CHECK_FAIL_RELEASE: TimeDelta = TimeDelta::minutes(10);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -459,6 +463,28 @@ pub struct Coordinator {
     pub rebrief_backoff: Option<Backoff>,
 }
 
+impl Coordinator {
+    /// A thread taken on as coordinator at `now`, with its lease just renewed.
+    fn new(
+        thread: String,
+        agent: AgentId,
+        now: Timestamp,
+        registered: bool,
+        briefed: Option<String>,
+    ) -> Self {
+        Self {
+            thread,
+            agent,
+            started_at: now,
+            renewed_at: now,
+            resumed_after: None,
+            registered,
+            briefed,
+            rebrief_backoff: None,
+        }
+    }
+}
+
 /// Records written before this field existed were registered before they were saved.
 fn registered_default() -> bool {
     true
@@ -552,7 +578,8 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
     threads_live: BTreeMap<String, Timestamp>,
-    /// When a reconcile last looked for away owners of tasks in `doing`.
+    /// Boards whose coordinator thread check has failed since, and when it first failed.
+    checks_failing: BTreeMap<BoardSlug, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
@@ -576,6 +603,7 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             threads_live: BTreeMap::new(),
+            checks_failing: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
             config_text,
@@ -683,6 +711,8 @@ impl<T: T3> Daemon<T> {
             .coordinators
             .retain(|slug, _| boards.contains_key(slug));
         self.failures.retain(|slug, _| boards.contains_key(slug));
+        self.checks_failing
+            .retain(|slug, _| boards.contains_key(slug));
         self.state
             .pending_starts
             .retain(|slug, _| boards.contains_key(slug));
@@ -768,22 +798,48 @@ impl<T: T3> Daemon<T> {
                     Some(check) => check,
                     None => self.thread_live(&local.thread).await,
                 };
+                let mut info = None;
                 let live = match live {
-                    Ok(live) => live,
-                    // A failed check says nothing of the thread: the named coordinator keeps
-                    // its lease, and only a check that answers replaces it.
+                    Ok(live) => {
+                        self.checks_failing.remove(slug);
+                        live
+                    }
+                    // A failed check says nothing of the thread. A named coordinator at work
+                    // keeps its lease, and only a check that answers replaces it. One whose
+                    // session ended is not renewed while the checks fail, and once they have
+                    // failed for [`CHECK_FAIL_RELEASE`] its lease goes, so another home device
+                    // can take over. The record stays: this device adopts the thread again
+                    // once T3 answers, unless the board names another coordinator by then.
                     Err(err) if named => {
+                        let since = *self.checks_failing.entry(slug.clone()).or_insert(now);
+                        let agent = self.client().agent_info(&local.agent).await?;
+                        if agent.state == AgentState::Ended {
+                            if now - since >= CHECK_FAIL_RELEASE {
+                                tracing::warn!(
+                                    "coordinator of {slug}: checking thread {} has failed since {since}: {err:#}; its session ended, so releasing the lease",
+                                    local.thread
+                                );
+                                self.release(slug).await;
+                            } else {
+                                tracing::warn!(
+                                    "coordinator of {slug}: checking thread {}: {err:#}; its session ended, so not renewing the lease until T3 answers",
+                                    local.thread
+                                );
+                            }
+                            return Ok(());
+                        }
                         tracing::warn!(
                             "coordinator of {slug}: checking thread {}: {err:#}; renewing it as live",
                             local.thread
                         );
+                        info = Some(agent);
                         true
                     }
                     Err(err) => return Err(err),
                 };
                 if live {
                     return if named {
-                        self.keep_alive(board, local, now).await
+                        self.keep_alive(board, local, info, now).await
                     } else {
                         self.adopt(board, local, now).await
                     };
@@ -792,6 +848,7 @@ impl<T: T3> Daemon<T> {
             }
             // The board names someone else, or the thread is gone.
             self.state.coordinators.remove(slug);
+            self.checks_failing.remove(slug);
         }
         if ours_gone {
             // A renewal keeps the coordinator named, so the gone thread would stay named
@@ -800,7 +857,27 @@ impl<T: T3> Daemon<T> {
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
                 Ok(info) if info.state != AgentState::Ended => return Ok(()),
-                Ok(_) => {}
+                // T3 ends a session left idle while its thread lives on, and the server keeps
+                // the lease: the daemon of its device renews or releases it. Taken over once
+                // it expires.
+                Ok(info) if info.device != self.ctx.device => return Ok(()),
+                // Ours, and unknown to this daemon's state. A pending adoption replaces it;
+                // otherwise its thread runs again if T3 has it.
+                Ok(_)
+                    if agent.source() == AgentSource::T3
+                        && load_adoption(&self.ctx.home, slug).is_none() =>
+                {
+                    let thread = agent.native().to_owned();
+                    if self.thread_live(&thread).await? {
+                        self.threads_live.insert(thread.clone(), now);
+                        // What it was briefed with is unknown: briefed again, once.
+                        let local = Coordinator::new(thread, agent.clone(), now, true, None);
+                        return self.adopt(board, local, now).await;
+                    }
+                    // A renewal keeps it named: released first, as for a gone thread above.
+                    self.release(slug).await;
+                }
+                Ok(_) => self.release(slug).await,
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {}
                 Err(err) => return Err(err),
             }
@@ -864,10 +941,12 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Renews the lease of a live coordinator and resumes it after a usage limit.
+    /// `info` is the coordinator's agent when the caller just read it.
     async fn keep_alive(
         &mut self,
         board: &Board,
         mut local: Coordinator,
+        info: Option<Agent>,
         now: Timestamp,
     ) -> Result<()> {
         if now - local.renewed_at >= RENEW_EVERY {
@@ -885,7 +964,10 @@ impl<T: T3> Daemon<T> {
                 Err(err) => tracing::warn!("renewing the coordinator of {}: {err:#}", board.slug),
             }
         }
-        let info = self.client().agent_info(&local.agent).await?;
+        let info = match info {
+            Some(info) => info,
+            None => self.client().agent_info(&local.agent).await?,
+        };
         // An ended coordinator keeps the reset its session stopped on (see `Reach::of`).
         if matches!(info.state, AgentState::Paused | AgentState::Ended)
             && let Some(until) = info.paused_until
@@ -1113,17 +1195,9 @@ impl<T: T3> Daemon<T> {
             }
         };
         tracing::info!("started coordinator thread {thread} for {slug}");
-        let local = Coordinator {
-            thread,
-            agent,
-            started_at: now,
-            renewed_at: now,
-            resumed_after: None,
-            registered: false,
-            // A thread an earlier start launched may hold another prompt: re-brief it.
-            briefed: briefed.then(|| prompt_digest(self.triages(slug)).to_owned()),
-            rebrief_backoff: None,
-        };
+        // A thread an earlier start launched may hold another prompt: re-brief it.
+        let briefed = briefed.then(|| prompt_digest(self.triages(slug)).to_owned());
+        let local = Coordinator::new(thread, agent, now, false, briefed);
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.state.pending_starts.remove(slug);
@@ -1263,16 +1337,8 @@ impl<T: T3> Daemon<T> {
             "adopted thread {} as coordinator of {slug}",
             adoption.thread
         );
-        let local = Coordinator {
-            thread: adoption.thread.clone(),
-            agent,
-            started_at: now,
-            renewed_at: now,
-            resumed_after: None,
-            registered,
-            briefed: Some(prompt_digest(self.triages(slug)).to_owned()),
-            rebrief_backoff: None,
-        };
+        let briefed = Some(prompt_digest(self.triages(slug)).to_owned());
+        let local = Coordinator::new(adoption.thread.clone(), agent, now, registered, briefed);
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.state.pending_starts.remove(slug);
