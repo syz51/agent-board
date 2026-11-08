@@ -174,7 +174,8 @@ server's minute sweep.
   slug may be used again, and its task numbers continue where the deleted board's stopped,
   so a task id an agent still holds never names a new task. Ask ids are never reused
   either.
-- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
+- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7. Its fields are listed
+  under `board stats` in "CLI".
 
 #### Temporary boards
 
@@ -505,8 +506,23 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
-  it), each within the period. Without `--json` it prints
-  a four-line summary.
+  it), each within the period; `since`, the oldest time the numbers cover (`days` back
+  from now, or the server's oldest kept event when that is later; absent from servers that
+  predate it); and `boards` (empty from servers that predate it), one `[BoardStats]` per
+  board with events in the period, by slug: `board`; `claims`, claims of auto tasks that
+  waited ready (tasks created claimed are left out), with `wait_minutes_median` and
+  `wait_minutes_p90` from ready to claimed (ready from the latest of: created, released,
+  moved to `open`, `auto`, blockers or `not_before` changed, `not_before` passed, last
+  blocker done); `tasks_done` and `done_per_day`; `doing_minutes_median`, time in `doing`
+  with `review` excluded; `lease_conflicts`, lease conflicts and file-touch overlaps on the
+  board's repos; `reopened_after_review`, moves from `review` to `open`, `doing` or
+  `blocked`; `pr_links` in the evidence of the tasks done; `limit_pauses` of member agents
+  and `limit_pauses_per_day`; `paused_hours`, until each pause's reset, an earlier move to
+  a working state, or now; and `peak_running_at_pause`, the most member agents running when
+  one paused (`null` without pauses). Rates are per day since `since`, and medians and
+  percentiles are `null` when nothing was measured. Without `--json` it prints a
+  summary, says when the history starts within the period asked, and adds one
+  line per board.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.

@@ -273,6 +273,126 @@ async fn stats_count_the_feedback_signals() {
 }
 
 #[tokio::test]
+async fn stats_give_each_board_its_wait_throughput_collision_and_limit_numbers() {
+    const REPO: &str = "github.com/acme/app";
+    let t = T::new();
+    let at = |minutes: i64| super::iso(super::start() + TimeDelta::minutes(minutes));
+    let (a, b, c) = ("t3:alpha", "t3:beta", "t3:gamma");
+    for agent in [a, b, c] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.board("factory", &[REPO]).await;
+    // Minute 0: two auto tasks, the second blocked by the first; b and c join the board.
+    let first = t
+        .task_with(
+            a,
+            json!({ "board": "factory", "title": "First", "auto": true }),
+        )
+        .await;
+    let second = t
+        .task_with(
+            a,
+            json!({ "board": "factory", "title": "Second", "auto": true, "blockers": [first] }),
+        )
+        .await;
+    let theirs = t.task(b, "factory", "B's").await;
+    t.task(c, "factory", "C's").await;
+
+    // Minute 30: the first is claimed after waiting 30 minutes; b's lease overlaps a's and b
+    // touches a file a leased.
+    t.advance(TimeDelta::minutes(30));
+    assert!(t.claim(a, &first).await.0.is_success());
+    for (agent, glob, task) in [(a, "src/**", &first), (b, "src/lib.rs", &theirs)] {
+        t.ok(
+            "POST",
+            "/v1/leases",
+            Some(agent),
+            Some(json!({ "agent": agent, "repo": REPO, "globs": [glob], "task": task })),
+        )
+        .await;
+    }
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some(b),
+        Some(json!({ "agent": b, "repo": REPO, "paths": ["src/lib.rs"] })),
+    )
+    .await;
+    // Minutes 50-60 in review, then back to doing: reopened once, and those 10 minutes are
+    // not time in doing. Done at minute 70 with a PR: 30 minutes in doing.
+    t.advance(TimeDelta::minutes(20));
+    assert!(
+        t.patch(a, &first, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    t.advance(TimeDelta::minutes(10));
+    assert!(
+        t.patch(a, &first, json!({ "status": "doing" }))
+            .await
+            .0
+            .is_success()
+    );
+    t.advance(TimeDelta::minutes(10));
+    let evidence = json!([
+        { "kind": "pr", "value": "https://github.com/acme/app/pull/1" },
+        { "kind": "check", "value": "cargo test", "exit_code": 0 },
+    ]);
+    assert!(t.done(a, &first, evidence).await.0.is_success());
+    // A task created claimed never waited.
+    t.task_with(
+        a,
+        json!({ "board": "factory", "title": "Mine", "auto": true, "claim": true }),
+    )
+    .await;
+
+    // Minute 90 b goes idle; minute 100 a pauses for a usage limit while a and c run, and
+    // runs again at minute 130: half an hour paused.
+    t.advance(TimeDelta::minutes(20));
+    let state = |agent: &str, body: serde_json::Value| {
+        let path = format!("/v1/agents/{agent}/state");
+        let agent = agent.to_owned();
+        let t = &t;
+        async move { t.ok("POST", &path, Some(&agent), Some(body)).await }
+    };
+    state(b, json!({ "state": "idle" })).await;
+    t.advance(TimeDelta::minutes(10));
+    state(a, json!({ "state": "paused", "paused_until": at(160) })).await;
+    t.advance(TimeDelta::minutes(30));
+    t.register(a, Some(REPO), None).await;
+
+    // Minute 160: the second, ready since its blocker was done at minute 70, is claimed.
+    t.advance(TimeDelta::minutes(30));
+    assert!(t.claim(b, &second).await.0.is_success());
+
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    assert_eq!(
+        stats["since"],
+        at(0),
+        "the oldest event, later than 7 days back"
+    );
+    let boards = stats["boards"].as_array().unwrap();
+    assert_eq!(boards.len(), 1, "{stats}");
+    let f = &boards[0];
+    assert_eq!(f["board"], "factory");
+    assert_eq!(f["claims"], 2);
+    assert_eq!(f["wait_minutes_median"], 60.0);
+    assert_eq!(f["wait_minutes_p90"], 90.0);
+    assert_eq!(f["tasks_done"], 1);
+    // 160 minutes covered: one task is 9 a day.
+    assert_eq!(f["done_per_day"], 9.0);
+    assert_eq!(f["doing_minutes_median"], 30.0);
+    assert_eq!(f["lease_conflicts"], 2);
+    assert_eq!(f["reopened_after_review"], 1);
+    assert_eq!(f["pr_links"], 1);
+    assert_eq!(f["limit_pauses"], 1);
+    assert_eq!(f["limit_pauses_per_day"], 9.0);
+    assert_eq!(f["paused_hours"], 0.5);
+    assert_eq!(f["peak_running_at_pause"], 2);
+}
+
+#[tokio::test]
 async fn web_view_falls_back_to_index() {
     let t = T::new();
     let (s, v) = t.send("GET", "/", &[], None).await;
