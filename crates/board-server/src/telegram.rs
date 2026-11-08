@@ -2,8 +2,8 @@
 //! long-polls the Bot API for answers (a button press, or a reply to the ask's message)
 //! from that chat only. A withdrawn ask's message is edited to say so and loses its
 //! buttons. No public endpoint is needed. An agent stopped by a usage limit is reported once
-//! per reset time, whichever agents stop on it, and a coordinator paused until further
-//! notice each time.
+//! per runtime and reset time, whichever agents stop on it, and a coordinator paused until
+//! further notice each time.
 //!
 //! Every minute it also reports tasks in doing or review that went quiet past
 //! `stuck_after_secs`, in one message per check and once until they change, and sends a
@@ -19,10 +19,10 @@
 //! The bot token is part of every Bot API URL, so request errors are logged without their
 //! URL and the token never reaches the log.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::time::Duration;
 
-use board_proto::{AgentRole, AskStatus, Event, EventType, Timestamp};
+use board_proto::{AgentRole, AskStatus, Event, EventType, Runtime, Timestamp};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeDelta};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,7 +55,6 @@ struct Schedule {
     /// 0 turns the stuck alert off.
     stuck_after_secs: u64,
     digest_at: Option<NaiveTime>,
-    utc_offset: FixedOffset,
 }
 
 #[derive(Clone)]
@@ -195,7 +194,6 @@ pub(crate) fn spawn_with(
     let schedule = Schedule {
         stuck_after_secs: config.stuck_after_secs,
         digest_at: config.digest_at,
-        utc_offset: config.utc_offset,
     };
     let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
     // With both alerts off there is nothing to check.
@@ -408,23 +406,23 @@ async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String
 
 /// The usage-limit resets already reported. While a limit holds, every agent that runs
 /// stops on it, and one stopped agent may stop again each time it is resumed (T3 closes its
-/// idle session, and a message resumes it); the limit is reported once. Kept in memory: a
-/// restart reports a limit still holding at most once more.
+/// idle session, and a message resumes it); the limit is reported once. A limit is told
+/// apart by its runtime and reset time. Kept in memory: a restart reports a limit still
+/// holding at most once more.
 #[derive(Debug, Default)]
 struct Limits {
-    reported: BTreeSet<Timestamp>,
+    reported: HashSet<(Runtime, Timestamp)>,
 }
 
 impl Limits {
-    /// Whether the reset at `until` is new, recording it if so. Resets already past are
-    /// forgotten.
-    fn first(&mut self, until: Timestamp, now: Timestamp) -> bool {
-        self.reported.retain(|reset| *reset > now);
-        self.reported.insert(until)
+    /// Whether the limit was reported. Limits already reset are forgotten.
+    fn reported(&mut self, limit: (Runtime, Timestamp), now: Timestamp) -> bool {
+        self.reported.retain(|(_, reset)| *reset > now);
+        self.reported.contains(&limit)
     }
 }
 
-/// Reports an agent stopped by a usage limit, once per reset time; a coordinator paused
+/// Reports an agent stopped by a usage limit, once per limit; a coordinator paused
 /// with no reset time is reported every time, since only the user resumes it.
 async fn report_paused(
     state: &AppState,
@@ -438,17 +436,19 @@ async fn report_paused(
     let Ok(id) = event.actor.parse::<board_proto::AgentId>() else {
         return Ok(());
     };
-    let agent = state.read(move |cx| get_agent(cx, &id)).await?;
-    let coordinator = agent.role == AgentRole::Coordinator;
     // The event's reset, not the agent's: the agent may have moved on since.
     let until: Option<Timestamp> = event
         .payload
         .get("paused_until")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    match until {
-        Some(until) if until <= state.now() || !limits.first(until, state.now()) => {
-            return Ok(());
-        }
+    if until.is_some_and(|until| until <= state.now()) {
+        return Ok(());
+    }
+    let agent = state.read(move |cx| get_agent(cx, &id)).await?;
+    let coordinator = agent.role == AgentRole::Coordinator;
+    let limit = until.map(|until| (agent.runtime, until));
+    match limit {
+        Some(limit) if limits.reported(limit, state.now()) => return Ok(()),
         None if !coordinator => return Ok(()),
         _ => {}
     }
@@ -471,9 +471,12 @@ async fn report_paused(
         ),
         None => format!("{who} is paused until further notice."),
     };
-    bot.send(json!({ "chat_id": chat, "text": text }))
-        .await
-        .map(|_| ())
+    bot.send(json!({ "chat_id": chat, "text": text })).await?;
+    // Only once sent, so a limit whose report failed is reported by the next pause on it.
+    if let Some(limit) = limit {
+        limits.reported.insert(limit);
+    }
+    Ok(())
 }
 
 /// Checks the stuck alert and the digest every `every` until the state shuts down, and
@@ -521,7 +524,7 @@ async fn check(state: &AppState, bot: &Bot, schedule: &Schedule) {
         tracing::error!(%error, "telegram: the stuck-task alert failed; retrying at the next check");
     }
     if let Some(at) = schedule.digest_at
-        && let Err(error) = send_digest(state, bot, chat, at, schedule.utc_offset).await
+        && let Err(error) = send_digest(state, bot, chat, at, bot.utc_offset).await
     {
         tracing::error!(%error, "telegram: the digest failed; retrying at the next check");
     }
@@ -539,7 +542,7 @@ async fn send_stuck(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule)
     if stuck.is_empty() {
         return Ok(());
     }
-    let (text, shown) = stuck_text(state, &stuck, schedule);
+    let (text, shown) = stuck_text(state, &stuck, schedule, bot.utc_offset);
     bot.send(json!({ "chat_id": chat, "text": text })).await?;
     let sent: Vec<_> = stuck
         .into_iter()
@@ -556,6 +559,7 @@ fn stuck_text(
     state: &AppState,
     stuck: &[telegram_ops::Stuck],
     schedule: &Schedule,
+    offset: FixedOffset,
 ) -> (String, usize) {
     let threshold =
         TimeDelta::seconds(i64::try_from(schedule.stuck_after_secs).unwrap_or(i64::MAX));
@@ -571,7 +575,7 @@ fn stuck_text(
             .owner
             .as_deref()
             .map_or_else(|| "no owner".to_owned(), |h| format!("owner {h}"));
-        let since = local(task.quiet_since, schedule.utc_offset);
+        let since = local(task.quiet_since, offset);
         let last = match &task.last {
             Some((kind, actor)) => format!("Last: {kind} by {actor} at {since}."),
             None => format!("Last change at {since}."),

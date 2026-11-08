@@ -844,6 +844,23 @@ async fn a_coordinator_whose_session_ended_during_a_limit_waits_for_the_reset() 
     assert_eq!(threads(&e.t3), ["coord"]);
 }
 
+#[tokio::test]
+async fn a_coordinator_whose_session_ended_during_a_limit_is_resumed_at_the_reset() {
+    // Nothing is queued for it: reconcile resumes it once the reset passes, as it does a
+    // paused one.
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, _) = coordinator_env(AgentState::Ended, Some(reset));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.reconcile(later).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert!(sends[0].1.contains("the usage limit has reset"));
+}
+
 fn answered_ask(id: i64, agent: &str) -> Ask {
     Ask {
         id,

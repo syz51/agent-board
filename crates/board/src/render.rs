@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task, TaskDetail,
-    TaskStatus, Timestamp, TouchResult,
+    Agent, AgentState, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task,
+    TaskDetail, TaskStatus, Timestamp, TouchResult,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -347,7 +347,10 @@ pub fn agent_line(agent: &Agent) -> String {
         enum_str(&agent.state),
         agent.device
     );
-    if let Some(until) = agent.paused_until {
+    // An ended agent keeps the reset its session stopped on, which matters only until then.
+    if let Some(until) = agent.paused_until
+        && (agent.state == AgentState::Paused || until > Utc::now())
+    {
         let _ = write!(line, " until {}", until.to_rfc3339());
     }
     let _ = write!(line, " · seen {}", ago(agent.last_seen));

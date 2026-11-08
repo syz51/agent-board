@@ -985,16 +985,6 @@ fn stuck_only(texts: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// The stuck alerts sent, once a check that finds one has run.
-async fn first_stuck(notifier: &mut Scheduled, fake: &Fake) -> Vec<String> {
-    loop {
-        let texts = stuck_only(notifier.sent_after_check(fake).await);
-        if !texts.is_empty() {
-            return texts;
-        }
-    }
-}
-
 #[tokio::test]
 async fn finished_and_paused_tasks_are_not_reported() {
     let (fake, api_base) = fake_api().await;
@@ -1028,10 +1018,43 @@ async fn finished_and_paused_tasks_are_not_reported() {
     );
     // Quiet for a whole period after the reset: reported; the done task never is.
     t.advance(stuck_after());
-    let texts = first_stuck(&mut notifier, &fake).await;
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
     assert_eq!(texts.len(), 1, "{texts:?}");
     assert!(texts[0].contains(&format!("\n{paused} doing")), "{texts:?}");
     assert!(!texts[0].contains(done.as_str()), "{texts:?}");
+    assert_eq!(stuck_only(notifier.sent_after_check(&fake).await), texts);
+}
+
+#[tokio::test]
+async fn an_owner_resumed_before_the_reset_restarts_the_quiet_time_then() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let task = t.task(A, "factory", "Wait for the reset").await;
+    assert!(t.claim(A, &task).await.0.is_success());
+    let mut notifier = Scheduled::start(&t, api_base, |_| {});
+
+    // A weekly limit, days away; the user resumes the owner on another account at once.
+    pause(&t, A, Some(t.state.now() + TimeDelta::days(3))).await;
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "running" })),
+    )
+    .await;
+    t.advance(stuck_after() / 2);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // A whole quiet period after the resume, not the reset: reported.
+    t.advance(stuck_after());
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{task} doing")), "{texts:?}");
 }
 
 #[tokio::test]
@@ -1056,10 +1079,11 @@ async fn a_coordinator_paused_until_further_notice_holds_back_its_tasks() {
     let mut notifier = Scheduled::start(&t, api_base, |_| {});
 
     t.advance(stuck_after() * 2);
-    let texts = first_stuck(&mut notifier, &fake).await;
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
     assert_eq!(texts.len(), 1, "{texts:?}");
     assert!(texts[0].starts_with("Stuck: 1 task "), "{texts:?}");
     assert!(texts[0].contains(&format!("\n{worker} doing")), "{texts:?}");
+    assert_eq!(stuck_only(notifier.sent_after_check(&fake).await), texts);
 }
 
 #[tokio::test]
@@ -1080,8 +1104,12 @@ async fn a_usage_limit_is_reported_once_per_reset() {
     });
     let reset = t.state.now() + TimeDelta::hours(9);
 
+    // A report that fails to send is made by the next pause on the limit.
+    *fake.fail_sends.lock().unwrap() = 1;
+    pause(&t, A, Some(reset)).await;
     pause(&t, A, Some(reset)).await;
     let sent = fake.wait("sendMessage", 1).await;
+    assert_eq!(*fake.fail_sends.lock().unwrap(), 0);
     let first = sent[0]["text"].as_str().unwrap();
     let local = reset
         .with_timezone(&tokyo)
