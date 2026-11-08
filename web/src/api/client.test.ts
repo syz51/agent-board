@@ -67,7 +67,7 @@ describe("api client parsing", () => {
     expect((await api.tasks({ board: "factory" })).length).toBeGreaterThan(5);
     const detail = await api.task("factory-12");
     expect(detail.task.blockers).toEqual(["factory-9"]);
-    expect(detail.notes.length).toBe(2);
+    expect(detail.notes.length).toBe(3);
     expect(detail.history.every((event) => event.task === "factory-12")).toBe(true);
     const agents = await api.agents();
     expect(agents.find((agent) => agent.state === "paused")?.paused_until).toEqual(
