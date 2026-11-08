@@ -21,12 +21,14 @@ install -d -o 10001 -g 10001 -m 0700 /var/lib/agent-board
 install -m 0644 /opt/agent-board/deploy/server.example.toml /etc/agent-board/server.toml
 # edit /etc/agent-board/server.toml: users, public_url, optional [telegram] chat_id
 BOARD_COMMIT=$(git -C /opt/agent-board rev-parse --short=12 HEAD) \
+BOARD_BUILT=$(git -C /opt/agent-board log -1 --format=%ct HEAD) \
     docker compose -f /opt/agent-board/deploy/compose.yaml up -d --build
 tailscale serve --bg --https=443 http://127.0.0.1:7377
 curl -fsS https://board-host.your-tailnet.ts.net/healthz
 ```
 
-The image has no `.git`, so the build reads the commit from `BOARD_COMMIT`. Verify the
+The image has no `.git`, so the build reads the commit from `BOARD_COMMIT` and its order
+stamp, the commit's committer time, from `BOARD_BUILT`. Verify the
 deploy with `/healthz`: `commit` matches `git -C /opt/agent-board rev-parse --short=12
 HEAD`, `version` matches the workspace version, and `schema_version` is the number of files
 in `crates/board-server/migrations`. Each device's `board --version` prints the version

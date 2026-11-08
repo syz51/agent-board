@@ -5,8 +5,10 @@ services:
     build:
       context: ..
       args:
-        # Set by the deploy command: BOARD_COMMIT=$(git rev-parse --short=12 HEAD).
+        # Set by the deploy command: BOARD_COMMIT=$(git rev-parse --short=12 HEAD) and
+        # BOARD_BUILT=$(git log -1 --format=%ct HEAD), the order stamp.
         BOARD_COMMIT: ${BOARD_COMMIT:-unknown}
+        BOARD_BUILT: ${BOARD_BUILT:-unknown}
     image: agent-board:local
     restart: unless-stopped
     network_mode: host
