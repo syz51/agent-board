@@ -231,6 +231,11 @@ server's minute sweep deletes older ones.
   `dispatch: daemon` (in `json` and `yaml`, `dispatch` at the top). A `Board` from a server
   that predates it reads as `thread`; a client leaves the field out of `UpdateBoard` unless
   it sets it, and reports a server that ignored it.
+  An update that changes `status` adds the new one to the `board_updated` payload
+  (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
+  reads `active` (see `DESIGN.md`, "Pausing work"). `board pause [<slug>…]` and
+  `board resume [<slug>…]` set every active (or paused) board, or those named, with this
+  endpoint; `--json` prints the changed `[Board]` list.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
@@ -758,6 +763,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   many wait for the next request. Alerts read only the last 10,000 events; an alert names
   the older ones skipped. `json` is
   compact, so all three formats share the same size caps.
+  `held_by` lists the paused boards the agent works for (as their coordinator, a thread it
+  delegated, or the owner of a task in `doing`, or one of its delegates); every kind then
+  has text, starting with the `hold:` line. Empty and left out otherwise, and by servers
+  that predate it, which clients read as not held.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
   resuming from `Last-Event-ID`, else from `since`. Events older than 365 days are pruned

@@ -156,6 +156,8 @@ enum Reply {
     Block(String),
     /// Plain text (PreCompact instructions).
     Plain(String),
+    /// Stop the turn now, telling the user why: a paused board holds the agent.
+    Halt(String),
 }
 
 /// Entry point: reads stdin, handles the event, prints the reply. Never fails.
@@ -204,6 +206,7 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
         ),
         Reply::Block(reason) => Some(json!({"decision": "block", "reason": reason}).to_string()),
         Reply::Plain(text) => Some(text),
+        Reply::Halt(reason) => Some(json!({"continue": false, "stopReason": reason}).to_string()),
         // Codex rejects plain or empty output from Stop.
         Reply::Nothing if event == HookEvent::Stop && runtime == Runtime::Codex => {
             Some("{}".into())
@@ -515,6 +518,15 @@ async fn handle(
     }
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// What the user sees when a heartbeat stops a held agent's turn.
+fn halt_reason(boards: &[board_proto::BoardSlug]) -> String {
+    let names: Vec<String> = boards.iter().map(ToString::to_string).collect();
+    format!(
+        "board: {} paused, so this turn stopped. `board resume` continues the work.",
+        names.join(", ")
+    )
 }
 
 /// When the hook stops waiting for the server: [`BUDGET`] - [`MARGIN`] after it `started`,
@@ -1343,6 +1355,7 @@ impl Hook<'_> {
     /// Records the snapshot's sequence (and caches a full one) and returns its text.
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
         self.local.seq = Some(snap.seq);
+        self.local.held = !snap.held_by.is_empty();
         if snap.kind == SnapshotKind::Full {
             state::save_cached_snapshot(&self.home, &self.agent, &snap)?;
         }
@@ -1476,6 +1489,8 @@ impl Hook<'_> {
         };
         let snap = self.beat_and_fetch(kind).await?;
         let text = self.keep(snap)?;
+        // The snapshot's `hold:` line tells the agent; only the user's request continues.
+        self.local.hold_told = self.local.held;
         Ok(if text.is_empty() {
             Reply::Nothing
         } else {
@@ -1496,7 +1511,14 @@ impl Hook<'_> {
         if heartbeat_due(self.local.last_heartbeat, self.now) {
             self.local.last_heartbeat = Some(self.now);
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
+            let boards = snap.held_by.clone();
             let alerts = self.keep(snap)?;
+            // A turn that was running when its board was paused stops here.
+            if self.local.held && !self.local.hold_told {
+                self.local.hold_told = true;
+                self.set_state(AgentState::Idle, None).await?;
+                return Ok(Reply::Halt(halt_reason(&boards)));
+            }
             if !alerts.is_empty() {
                 lines.push(alerts);
             }
@@ -1541,7 +1563,8 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        let reply = if continued {
+        // A held agent is not asked to go on: the user paused its work.
+        let reply = if continued || self.local.held {
             Reply::Nothing
         } else {
             let handoff = self.handoff_reminder().await?;

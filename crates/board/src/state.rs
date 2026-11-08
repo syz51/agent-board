@@ -24,6 +24,13 @@ pub struct AgentLocal {
     pub reminded_for: Option<Timestamp>,
     /// Set while the server is unreachable and the cached snapshot was already injected.
     pub offline_notified: bool,
+    /// The last snapshot said a paused board holds the agent (`Snapshot::held_by`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+    /// The current turn began held: its prompt's snapshot told the agent, so a heartbeat
+    /// does not stop the turn, which only the user's own request would have continued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_told: bool,
     /// Tasks the `Stop` hook already reminded the agent to file what remains of, newest
     /// last, so each is reminded about once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

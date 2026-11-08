@@ -192,6 +192,12 @@ pub(crate) fn update(
     if fields.is_empty() {
         return Ok(before);
     }
+    // A status change names the new status, so a daemon can wake a resumed board's
+    // coordinator without reading the board.
+    let mut payload = serde_json::json!({ "fields": fields });
+    if let Some(status) = req.status.filter(|&s| s != before.status) {
+        payload["status"] = serde_json::Value::from(enum_str(&status));
+    }
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
@@ -211,13 +217,7 @@ pub(crate) fn update(
             enum_str(&req.dispatch.unwrap_or(before.dispatch)),
         ],
     )?;
-    cx.emit(
-        Some(slug),
-        actor,
-        EventType::BoardUpdated,
-        None,
-        serde_json::json!({ "fields": fields }),
-    )?;
+    cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
 }
 

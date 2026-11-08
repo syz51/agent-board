@@ -94,6 +94,9 @@ struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     board: Option<String>,
     seq: i64,
+    /// The paused boards that hold this agent ([`held_by`]); never cut.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hold: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     you: Option<You>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,12 +307,14 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
+    let held = held_by(cx, &agent.id)?;
 
     let mut model = Model {
         kind: req.kind,
         agent: agent.handle.clone(),
         board: board.as_ref().map(|b| b.to_string()),
         seq,
+        hold: held.iter().map(ToString::to_string).collect(),
         you: None,
         counts: None,
         dispatch: None,
@@ -334,6 +339,9 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             if let Some(board) = &board {
                 fill_full(cx, &mut model, &agent, board, board_counts)?;
                 render_capped(model, req.format, cx.s.snapshot_full_chars)
+            } else if !model.hold.is_empty() {
+                // A thread that joined no board still hears that its work is paused.
+                render_capped(model, req.format, cx.s.snapshot_full_chars)
             } else {
                 String::new()
             }
@@ -343,14 +351,14 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             if shown_now.is_some() && before != shown_now {
                 model.counts = board_counts;
             }
-            if model.alerts.is_empty() && model.counts.is_none() {
+            if model.alerts.is_empty() && model.counts.is_none() && model.hold.is_empty() {
                 String::new()
             } else {
                 render_capped(model, req.format, cx.s.snapshot_delta_chars)
             }
         }
         SnapshotKind::Alerts => {
-            if model.alerts.is_empty() {
+            if model.alerts.is_empty() && model.hold.is_empty() {
                 String::new()
             } else {
                 render_capped(model, req.format, cx.s.snapshot_alerts_chars)
@@ -367,6 +375,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             text,
             seq: scanned_to,
             at: cx.now,
+            held_by: held,
         },
         agent: agent.id,
         shown,
@@ -386,6 +395,41 @@ pub(crate) fn advance(cx: &mut Ctx<'_>, rendered: Rendered) -> Result<Snapshot> 
         params![rendered.agent.as_str(), rendered.snapshot.seq, shown],
     )?;
     Ok(rendered.snapshot)
+}
+
+/// What the `hold:` line tells a held agent to do.
+const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
+task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
+
+/// The query of [`held_by`]: `?1` the agent, `?2` the depth. The agent and the T3 threads
+/// that delegated it, up the chain, as in [`crate::ops::leases::DELEGATION_FAMILY`].
+const HELD_BY: &str = "WITH RECURSIVE \
+     up(id, depth) AS ( \
+       SELECT ?1, 0 \
+       UNION \
+       SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
+       FROM agents a JOIN up ON a.id = up.id \
+       WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
+         AND up.depth < ?2) \
+     SELECT b.slug FROM boards b WHERE b.status = 'paused' \
+       AND (b.coordinator IN (SELECT id FROM up) \
+            OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
+                       AND t.owner IN (SELECT id FROM up))) \
+     ORDER BY b.slug";
+
+/// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
+/// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
+/// threads it started and those working its tasks, and no one else.
+fn held_by(cx: &Ctx<'_>, agent: &AgentId) -> Result<Vec<BoardSlug>> {
+    let held = cx
+        .db
+        .prepare_cached(HELD_BY)?
+        .query_map(
+            params![agent.as_str(), crate::ops::leases::DELEGATION_DEPTH],
+            |r| parse_id(&r.get::<_, String>(0)?),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(held)
 }
 
 /// The board a snapshot is about: the board of the agent's task in `doing`, else a board
@@ -1589,6 +1633,9 @@ fn counts_line(c: &Counts) -> String {
 
 fn render_lines(m: &Model) -> String {
     let mut o = String::new();
+    if !m.hold.is_empty() {
+        let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.hold.join(", "));
+    }
     if m.kind == SnapshotKind::Alerts {
         for a in &m.alerts {
             let _ = writeln!(o, "! {} -> {}", a.alert, a.action);
@@ -1761,6 +1808,11 @@ fn render_yaml(m: &Model) -> String {
         let _ = writeln!(o, "board: {}", q(board));
     }
     let _ = writeln!(o, "seq: {}", m.seq);
+    if !m.hold.is_empty() {
+        o.push_str("hold:\n");
+        let _ = writeln!(o, "  boards: [{}]", m.hold.join(", "));
+        let _ = writeln!(o, "  action: {}", q(HOLD_ACTION));
+    }
     if let Some(you) = &m.you {
         o.push_str("you:\n");
         let _ = writeln!(o, "  handle: {}", q(&you.handle));
