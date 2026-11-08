@@ -278,7 +278,11 @@ fn post_tool_use_records_touches_warns_on_overlap_and_throttles_heartbeats() {
     );
     let (_, text) = e.hook("post-tool-use", "claude", read);
     assert_eq!(text, "");
-    e.hook("post-tool-use", "claude", edit);
+    let (_, text) = e.hook("post-tool-use", "claude", edit);
+    assert_eq!(
+        text, "",
+        "the same overlap is not shown again on the next call"
+    );
     assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 2);
     assert_eq!(
         e.stub.requests_to(&state_path()).len(),
@@ -598,11 +602,24 @@ fn shell_calls_record_the_files_they_changed() {
     }
     e.hook("pre-tool-use", "claude", call("PreToolUse", "toolu_sh3"));
     std::fs::write(e.repo.join("src/lib.rs"), "c\n").unwrap();
+    // Another peer: the first one's alert was already shown.
+    e.stub.on(
+        "POST /v1/touches",
+        TouchResult {
+            overlaps: vec![Overlap {
+                path: "src/lib.rs".into(),
+                agent: "t3:b22d".parse().unwrap(),
+                handle: "t3:b22d".into(),
+                via: "touch".into(),
+                at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            }],
+        },
+    );
     let mut failed = call("PostToolUseFailure", "toolu_sh3");
     failed["error"] = json!("Exit code 1");
     let (reply, _) = e.hook("post-tool-use-failure", "claude", failed);
     assert!(
-        context(&reply, "PostToolUseFailure").contains("! t3:a91c edited"),
+        context(&reply, "PostToolUseFailure").contains("! t3:b22d edited"),
         "{reply:?}"
     );
     let touches = e.stub.requests_to("POST /v1/touches");

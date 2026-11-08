@@ -207,7 +207,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
-| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
+| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
@@ -334,8 +334,11 @@ settings in use, warned once per edit.
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
     So an ended T3 agent on this device is woken like an idle one while T3 has its thread
-    unarchived. The daemon asks T3 once per state change; when T3 does not answer, the
-    send is tried. A thread archived later, which no event announces, is found when a send
+    unarchived, unless its session ended while it waited for a usage-limit reset: the
+    server keeps that reset on the ended agent, and its lines are kept until then like a
+    paused agent's (a wake before the reset would only stop on the limit again); a
+    coordinator in that state is resumed at the reset like a paused one. The daemon asks
+    T3 once per state change; when T3 does not answer, the send is tried. A thread archived later, which no event announces, is found when a send
     to it fails, and its answers then go to the coordinator. Lines dropped for an agent
     the daemon cannot wake from its own device, and answers with no other coordinator to
     go to, are logged as warnings.
@@ -404,7 +407,14 @@ settings in use, warned once per edit.
 - **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
   public endpoint is needed; answers are accepted only from that chat. The same channel
-  reports a coordinator paused on a usage limit. The chat is `[telegram] chat_id` when set;
+  reports a usage limit once per runtime and reset time, naming the first agent that
+  stopped on it and the reset in `utc_offset` time. While a limit holds every agent that
+  runs stops on it, and T3 resumes an agent whose idle session it closed, so one limit
+  would otherwise be reported again and again. A limit counts as reported once its
+  message is sent, so a failed send is made by the next pause on it. A coordinator paused
+  with no reset time is reported each time, since only the user resumes it. The limits
+  reported are kept in memory, so a restart reports a limit still holding at most once
+  more. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
@@ -420,9 +430,13 @@ settings in use, warned once per edit.
     4 hours), is reported once, with its owner, how long it has been quiet, its last event
     and a link. The tasks found at one check share one message; those past its length
     (3,500 characters) go in the next check's message. A task is reported again only
-    after a new event and another quiet period. Tasks of a coordinator paused on a usage
-    limit wait until the reset (or, without an end time, until it resumes), since that
-    pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
+    after a new event and another quiet period. Tasks whose owner stopped on a usage limit
+    wait until a whole quiet period after the owner resumed or the limit reset, whichever
+    comes first, since the limit is reported apart and T3 resumes the owner at the reset;
+    the owner's events are read, as a resumed owner no longer shows the reset. This holds
+    review tasks too: under one account the coordinator that reviews them shares the
+    limit. Tasks of a coordinator paused with no reset time wait
+    until it resumes; a worker's are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
   - *Stalled board*: a board is stalled while it is active, has autopilot on, has no task
     in `doing` and has a ready auto task. Each check records when it first saw a board
@@ -436,7 +450,8 @@ settings in use, warned once per edit.
     that holds its lease, or that none does, with a link. Boards found at one check share
     one message; those past its length go in the next check's message. A board is
     reported again only once it stalls anew. Boards whose lease holder is paused on a
-    usage limit are not stalled, as for stuck tasks. This catches a stopped coordinator or
+    usage limit, or ended while it waits for a reset still ahead, are not stalled, as for
+    stuck tasks. This catches a stopped coordinator or
     device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
