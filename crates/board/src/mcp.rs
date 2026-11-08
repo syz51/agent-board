@@ -978,7 +978,7 @@ impl ServerHandler for BoardMcp {
         };
         // Once per session: a server on another build may answer in shapes this one
         // misreads.
-        if let Some(warning) = crate::client::take_skew_warning() {
+        if let Some(warning) = crate::client::take_skew_warning(crate::client::Reporter::Session) {
             result
                 .content
                 .push(ContentBlock::text(format!("warning: {warning}")));

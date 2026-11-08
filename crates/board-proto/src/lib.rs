@@ -31,3 +31,25 @@ pub const VERSION_HEADER: &str = "x-board-version";
 /// Response header with the commit the server was built from (12 hex digits or `unknown`),
 /// on every answer.
 pub const COMMIT_HEADER: &str = "x-board-commit";
+
+/// Response header with the server build's order stamp, on every answer: its commit's
+/// committer time in seconds since the Unix epoch, or `unknown`. A newer build has a higher
+/// stamp. Servers before it do not send it.
+pub const BUILT_HEADER: &str = "x-board-built";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_header_names_stay_fixed_within_v1() {
+        // Clients of every build read these names: renaming one breaks the skew warning.
+        assert_eq!(VERSION_HEADER, "x-board-version");
+        assert_eq!(COMMIT_HEADER, "x-board-commit");
+        assert_eq!(BUILT_HEADER, "x-board-built");
+        // Lowercase, as `HeaderName::from_static` requires.
+        for name in [AGENT_HEADER, VERSION_HEADER, COMMIT_HEADER, BUILT_HEADER] {
+            assert_eq!(name, name.to_ascii_lowercase());
+        }
+    }
+}

@@ -2640,7 +2640,9 @@ impl<T: T3> Daemon<T> {
                     );
                     // The daemon runs for days: log each server build that differs from
                     // this one.
-                    if let Some(warning) = crate::client::take_skew_warning() {
+                    if let Some(warning) =
+                        crate::client::take_skew_warning(crate::client::Reporter::Daemon)
+                    {
                         tracing::warn!("{warning}");
                     }
                     let opened = tokio::time::Instant::now();
