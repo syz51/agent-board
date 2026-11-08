@@ -146,7 +146,8 @@ pub struct BoardStats {
     pub doing_minutes_median: Option<f64>,
     /// Lease conflicts and file-touch overlaps on the board's repos.
     pub lease_conflicts: u32,
-    /// Tasks moved from `review` back to `open`, `doing` or `blocked`.
+    /// Tasks moved from `review` back to `open` or `doing`; a move to `blocked` only
+    /// parks the task on another wait.
     pub reopened_after_review: u32,
     /// PR links in the evidence of the tasks done.
     pub pr_links: u32,
