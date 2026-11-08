@@ -300,8 +300,17 @@ fn keychain_account(root: &Path, default_root: Option<&Path>) -> String {
         return KEYCHAIN_ACCOUNT.to_owned();
     }
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
-    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("{KEYCHAIN_ACCOUNT}-{hex}")
+    format!("{KEYCHAIN_ACCOUNT}-{}", hex(&digest[..8]))
+}
+
+/// `bytes` as lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn keychain_account_for(home: &Home) -> String {

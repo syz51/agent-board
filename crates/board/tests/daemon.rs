@@ -481,7 +481,8 @@ fn coordinator_env(
             renewed_at: at(),
             resumed_after: None,
             registered: true,
-            briefed: Some(board::daemon::prompt_digest(false)),
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -1734,6 +1735,11 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
         "no thread of this start is left idle"
     );
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // This binary briefed it.
+    assert_eq!(
+        e.daemon.state.coordinators[&factory()].briefed.as_deref(),
+        Some(board::daemon::prompt_digest(false))
+    );
     assert!(saved_state(&e).pending_starts.is_empty());
     let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
     assert_eq!(claims.last().unwrap().body["agent"], format!("t3:{ORPHAN}"));
@@ -1754,6 +1760,8 @@ async fn a_start_that_timed_out_after_delivery_adopts_its_thread_without_briefin
     assert_eq!(starts(&e.t3), 1, "no second thread");
     assert!(e.t3.sends().is_empty(), "its message already got through");
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // The earlier start briefed it, maybe with another prompt: it is re-briefed.
+    assert_eq!(e.daemon.state.coordinators[&factory()].briefed, None);
     assert!(e.daemon.state.pending_starts.is_empty());
 }
 
@@ -2978,7 +2986,8 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
                 renewed_at: at(),
                 resumed_after: None,
                 registered: true,
-                briefed: Some(board::daemon::prompt_digest(false)),
+                briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+                rebrief_backoff: None,
             },
         );
         let mut board = autopilot(Some(&agent), &[DEVICE]);
@@ -3379,7 +3388,8 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             renewed_at: at(),
             resumed_after: None,
             registered: true,
-            briefed: Some(board::daemon::prompt_digest(false)),
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -3428,20 +3438,22 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
         assert!(!text.contains("# Triage"));
         assert_eq!(
             e.daemon.state.coordinators[&slug].briefed,
-            Some(board::daemon::prompt_digest(false))
+            Some(board::daemon::prompt_digest(false).to_owned())
         );
         // Saved, so a restart does not send it again.
         let home = Home::at(e._dir.path().join("home"));
         assert_eq!(
             board::daemon::load_watch_state(&home).coordinators[&slug].briefed,
-            Some(board::daemon::prompt_digest(false))
+            Some(board::daemon::prompt_digest(false).to_owned())
         );
         // Briefed with the current prompt: later reconciles send nothing.
         e.daemon.reconcile(at()).await.unwrap();
         assert_eq!(e.t3.sends().len(), before + 1);
     }
 
-    // Held while the coordinator runs or is paused, then sent.
+    // Held while the coordinator is paused, or runs and was seen lately.
+    let briefed = |e: &Env| e.daemon.state.coordinators[&slug].briefed.clone();
+    let current = Some(board::daemon::prompt_digest(false).to_owned());
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
     for held in [AgentState::Running, AgentState::Paused] {
         let mut info = agent_fixture(&agent, DEVICE, held);
@@ -3454,18 +3466,40 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
         &format!("GET {}", agent_path(&agent)),
         agent_fixture(&agent, DEVICE, AgentState::Idle),
     );
-    // A failed send is tried again at the next reconcile.
+    // A failed send backs off, then is tried again.
     e.t3.fail_send.store(true, Ordering::SeqCst);
     e.daemon.reconcile(at()).await.unwrap();
     e.t3.fail_send.store(false, Ordering::SeqCst);
-    assert_eq!(e.daemon.state.coordinators[&slug].briefed, None);
-    e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(
-        e.daemon.state.coordinators[&slug].briefed,
-        Some(board::daemon::prompt_digest(false))
-    );
-    // The failed attempt and the one that went through.
+    assert_eq!(briefed(&e), None);
+    assert_eq!(e.t3.sends().len(), 3);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.sends().len(), 3, "backing off");
+    let later = at() + chrono::Duration::seconds(31);
+    e.daemon.reconcile(later).await.unwrap();
     assert_eq!(e.t3.sends().len(), 4);
+    assert_eq!(briefed(&e), current);
+
+    // Marked running but not seen for longer than a wake-up is held: sent.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    let mut stuck = agent_fixture(&agent, DEVICE, AgentState::Running);
+    stuck.last_seen = later - board::daemon::WAKE_HOLD_MAX - chrono::Duration::seconds(1);
+    e.stub.on(&format!("GET {}", agent_path(&agent)), &stuck);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 5);
+    assert_eq!(briefed(&e), current);
+
+    // A send that timed out may have got through: it counts as sent and is not repeated.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(later).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends().len(), 6);
+    assert_eq!(briefed(&e), current);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 6);
 }
 
 #[tokio::test]
@@ -3483,7 +3517,7 @@ async fn the_feedback_boards_coordinator_is_re_briefed_with_the_triage_prompt() 
     assert!(sends[0].1.contains(board::daemon::TRIAGE_PROMPT));
     assert_eq!(
         e.daemon.state.coordinators[&slug].briefed,
-        Some(board::daemon::prompt_digest(true))
+        Some(board::daemon::prompt_digest(true).to_owned())
     );
     assert_ne!(
         board::daemon::prompt_digest(true),
@@ -3503,6 +3537,6 @@ async fn a_started_coordinator_is_recorded_as_briefed_with_the_current_prompt() 
     .await;
     assert_eq!(
         daemon.state.coordinators[&factory()].briefed,
-        Some(board::daemon::prompt_digest(false))
+        Some(board::daemon::prompt_digest(false).to_owned())
     );
 }
