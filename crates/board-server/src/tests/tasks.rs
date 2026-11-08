@@ -1596,6 +1596,62 @@ async fn the_previous_owner_is_told_to_stop_and_peers_see_the_handover() {
     assert!(!text.contains("stop work on it"), "{text}");
 }
 
+/// Board counts split the ready work a coordinator may start (`ready_auto`) from the ready
+/// tasks that wait on the user.
+#[tokio::test]
+async fn board_counts_split_ready_auto_work_from_ready_work_for_the_user() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    for (title, auto) in [
+        ("Start me", true),
+        ("Also start me", true),
+        ("Decide", false),
+    ] {
+        t.task_with(
+            A,
+            json!({ "board": "factory", "title": title, "auto": auto }),
+        )
+        .await;
+    }
+    // Not ready, so counted in neither: an auto task that waits on another, a claimed one,
+    // and a pending proposal.
+    let gate = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Gate", "auto": false }),
+        )
+        .await;
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Later", "auto": true, "blockers": [gate] }),
+    )
+    .await;
+    let doing = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Doing", "auto": true }),
+        )
+        .await;
+    assert!(t.claim(A, &doing).await.0.is_success());
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Cache builds",
+                "body": "Proposal: cache the builds. Size S." }),
+    )
+    .await;
+
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    let counts = &board["counts"];
+    assert_eq!(
+        (&counts["ready"], &counts["ready_auto"]),
+        (&json!(4), &json!(2)),
+        "{board}"
+    );
+    let listed = t.ok("GET", "/v1/boards", None, None).await;
+    assert_eq!(listed[0]["counts"], *counts, "{listed}");
+}
+
 /// dotfiles-48: a pending proposal was claimed and fixed with no verdict. A proposal is
 /// stored not auto on every board, is not ready, and cannot be claimed until accepted.
 #[tokio::test]
@@ -1640,6 +1696,7 @@ async fn a_pending_proposal_waits_for_a_verdict_before_it_is_work() {
     assert_eq!(ids, [work.as_str()]);
     let board = t.ok("GET", "/v1/boards/factory", None, None).await;
     assert_eq!(board["counts"]["ready"], 1, "{board}");
+    assert_eq!(board["counts"]["ready_auto"], 1, "{board}");
     // The proposal filter lists it alone, or everything else.
     let only = t
         .ok("GET", "/v1/tasks?board=factory&proposal=true", None, None)

@@ -59,6 +59,10 @@ pub struct ServerConfig {
     /// by the binary that runs the server, never read from the file.
     #[serde(skip, default = "unknown_commit")]
     pub commit: String,
+    /// The build's order stamp (seconds since the Unix epoch, or `unknown`), which every
+    /// answer reports. Set by the binary that runs the server, never read from the file.
+    #[serde(skip, default = "unknown_commit")]
+    pub built: String,
 }
 
 fn default_listen() -> SocketAddr {
@@ -85,6 +89,7 @@ impl ServerConfig {
             telegram: None,
             defaults: Settings::default(),
             commit: unknown_commit(),
+            built: unknown_commit(),
         }
     }
 
@@ -309,6 +314,13 @@ pub struct Settings {
     /// API error records are kept this many days, for revisits, and never less than
     /// `signal_window_days`.
     pub error_retention_days: u32,
+    /// A declined feedback item is reopened once it was declined at least this many days
+    /// ago...
+    pub declined_reopen_after_days: u32,
+    /// ...and has gained at least this many reports since the decline...
+    pub declined_reopen_reports: u32,
+    /// ...from at least this many agents that had not reported it before the decline.
+    pub declined_reopen_agents: u32,
     /// Creating an ask warns of the board's other open asks younger than this.
     pub duplicate_ask_window_secs: u64,
     /// A task in review this long with no note from its owner raises one alert.
@@ -345,6 +357,9 @@ impl Default for Settings {
             signal_min_agents: 2,
             signal_window_days: 7,
             error_retention_days: 35,
+            declined_reopen_after_days: 1,
+            declined_reopen_reports: 5,
+            declined_reopen_agents: 3,
             duplicate_ask_window_secs: 30 * 60,
             review_quiet_secs: 24 * 3600,
             doing_idle_secs: 30 * 60,
@@ -377,6 +392,18 @@ impl Settings {
             ("signal_min_agents", u64::from(self.signal_min_agents)),
             ("signal_window_days", u64::from(self.signal_window_days)),
             ("error_retention_days", u64::from(self.error_retention_days)),
+            (
+                "declined_reopen_after_days",
+                u64::from(self.declined_reopen_after_days),
+            ),
+            (
+                "declined_reopen_reports",
+                u64::from(self.declined_reopen_reports),
+            ),
+            (
+                "declined_reopen_agents",
+                u64::from(self.declined_reopen_agents),
+            ),
             ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
             ("review_quiet_secs", self.review_quiet_secs),
             ("doing_idle_secs", self.doing_idle_secs),
@@ -445,6 +472,10 @@ impl Settings {
 
     pub(crate) fn error_retention_ms(&self) -> i64 {
         secs_ms(u64::from(self.error_retention()) * 86_400)
+    }
+
+    pub(crate) fn declined_reopen_ms(&self) -> i64 {
+        secs_ms(u64::from(self.declined_reopen_after_days) * 86_400)
     }
 
     pub(crate) fn done_hidden_ms(&self) -> i64 {
@@ -553,6 +584,9 @@ mod tests {
             "signal_min_agents",
             "signal_window_days",
             "error_retention_days",
+            "declined_reopen_after_days",
+            "declined_reopen_reports",
+            "declined_reopen_agents",
             "duplicate_ask_window_secs",
         ] {
             assert!(

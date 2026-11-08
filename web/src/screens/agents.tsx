@@ -1,21 +1,23 @@
 import { useQuery } from "@tanstack/react-query";
-import { getRouteApi, Link } from "@tanstack/react-router";
+import { getRouteApi, Link, useLocation } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { PlainText } from "@/text/markdown.tsx";
 import {
+  agentAnchor,
   AgentStateBadge,
   Empty,
   ErrorNotice,
   PageHeader,
   QueryFrame,
   RelTime,
+  threadLink,
   useAgents,
   useTitle,
 } from "@/ui/common.tsx";
 import { Avatar, Icon, StatusIcon } from "@/ui/icons.tsx";
-import { CollapsibleMarkdown } from "./updates.tsx";
+import { CollapsibleMarkdown } from "@/text/collapsible.tsx";
 
 const route = getRouteApi("/agents");
 
@@ -45,6 +47,8 @@ export function sortAgents(agents: Agent[], state: string): Agent[] {
 export function AgentsScreen() {
   useTitle("Agents");
   const state = route.useSearch().state ?? "";
+  // The card another page linked to. CSS `:target` misses the router's in-app navigation.
+  const target = useLocation({ select: (location) => location.hash });
   const agents = useAgents();
   const doing = useQuery(queries.doingTasks());
   const current = new Map<string, Task>();
@@ -105,7 +109,12 @@ export function AgentsScreen() {
                 <span>Working on</span>
               </div>
               {shown.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
+                <AgentCard
+                  key={agent.id}
+                  agent={agent}
+                  task={current.get(agent.id)}
+                  targeted={target === agentAnchor(agent.handle)}
+                />
               ))}
             </div>
           );
@@ -125,7 +134,15 @@ const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
  * coordinator, its turn endings. Narrow lists stack the two.
  */
-function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
+function AgentCard({
+  agent,
+  task,
+  targeted,
+}: {
+  agent: Agent;
+  task: Task | undefined;
+  targeted: boolean;
+}) {
   const where = [
     agent.role === "coordinator" ? "Coordinator" : null,
     agent.device,
@@ -135,23 +152,52 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   ]
     .filter(Boolean)
     .join(" · ");
+  const thread = threadLink(agent);
   return (
-    <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
+    <article
+      id={agentAnchor(agent.handle)}
+      className={cn(
+        `${ROW} scroll-mt-4 gap-y-2.5 py-3 hover:bg-muted/60`,
+        targeted && "bg-accent hover:bg-accent",
+      )}
+    >
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
         <Avatar handle={agent.handle} large className="row-span-3 size-7 self-start text-2xs" />
-        <h2
-          className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
-          title={agent.id}
-        >
-          {agent.handle}
+        {/* The thread's title names the agent where it has one; the handle, which the rest
+            of the view shows, stays beside it. */}
+        <h2 className="flex max-w-full min-w-0 flex-wrap items-baseline gap-x-2 text-sm font-semibold">
+          {agent.title && (
+            <span className="[overflow-wrap:anywhere]">
+              <PlainText className="whitespace-normal" text={agent.title} />
+            </span>
+          )}
+          <span
+            className={cn(
+              "[font-variant-numeric:tabular-nums_slashed-zero]",
+              agent.title && "ident text-meta font-medium text-muted-foreground",
+            )}
+            title={agent.id}
+          >
+            {agent.handle}
+          </span>
         </h2>
         {/* Its state and when it was last seen share a line: together they answer "is it
-            alive?". */}
+            alive?". The thread link sits at its end. */}
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
           <AgentStateBadge agent={agent} />
           <span className="text-meta text-muted-foreground">
             seen <RelTime at={agent.last_seen} />
           </span>
+          {thread && (
+            <a
+              className="inline-flex min-h-6 items-center gap-1 text-meta font-medium max-md:min-h-11"
+              href={thread}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open in T3 Code <Icon name="external" className="size-3.5" />
+            </a>
+          )}
         </div>
         {/* Where it runs, as one quiet line under who it is; a line too long for the column
             ends in an ellipsis and shows whole on hover. */}
@@ -177,8 +223,6 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
               <span className="ident mr-2 text-meta text-muted-foreground">{task.id}</span>
               <PlainText className="whitespace-normal" text={task.title} />
             </Link>
-          ) : agent.title ? (
-            <PlainText className="whitespace-normal" text={agent.title} />
           ) : (
             <span className="text-muted-foreground">No task in doing</span>
           )}

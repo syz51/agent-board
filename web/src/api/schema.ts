@@ -32,6 +32,8 @@ export const statusCounts = object({
   done: integer,
   dropped: integer,
   ready: integer,
+  /** The ready tasks with `auto` on; `null` from a server that predates it. */
+  ready_auto: nullable(integer),
 });
 
 export const board = object({
@@ -198,30 +200,6 @@ export const said = object({
   at: timestamp,
 });
 
-/** A task done since the user last looked, with what its agent told the user. */
-export const doneUpdate = object({
-  task: string,
-  board: string,
-  parent: nullable(string),
-  title: string,
-  summary: nullable(string),
-  /** The agent that completed it. */
-  owner: nullable(string),
-  done_at: timestamp,
-  evidence: array(evidence),
-});
-
-/** `GET /v1/updates`: each list newest first; `more` when either was cut at `UPDATES_MAX`. */
-export const updates = object({
-  seen_at: nullable(timestamp),
-  since: nullable(timestamp),
-  done: array(doneUpdate),
-  said: array(said),
-  more: boolean,
-});
-
-export const seenCursor = object({ seen_at: timestamp });
-
 export const eventsPage = object({ events: array(event), next_since: integer });
 
 export const health = object({ ok: boolean, seq: integer });
@@ -246,6 +224,3 @@ export type BoardEvent = Decoded<typeof event>;
 export type EventsPage = Decoded<typeof eventsPage>;
 export type Health = Decoded<typeof health>;
 export type Said = Decoded<typeof said>;
-export type DoneUpdate = Decoded<typeof doneUpdate>;
-export type Updates = Decoded<typeof updates>;
-export type SeenCursor = Decoded<typeof seenCursor>;

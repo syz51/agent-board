@@ -179,7 +179,7 @@ function TaskView({
             <div>
               <dt>Owner</dt>
               <dd>
-                <Owner task={task} agents={agents} />
+                <Owner task={task} agents={agents} withTitle />
               </dd>
             </div>
             <div>

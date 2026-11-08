@@ -38,7 +38,6 @@ function serve(down = false) {
 function seed(client: QueryClient) {
   client.setQueryData(queries.boards().queryKey, state.boards());
   client.setQueryData(queries.openAsks().queryKey, []);
-  client.setQueryData(queries.updates("").queryKey, state.updates(none));
   client.setQueryData(queries.agents().queryKey, state.agents(none));
 }
 

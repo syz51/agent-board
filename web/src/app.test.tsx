@@ -8,7 +8,6 @@ import { Nav } from "./app.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const state = new DevState(() => now);
-const none = new URLSearchParams();
 
 function seed(client: QueryClient) {
   client.setQueryData(
@@ -16,7 +15,6 @@ function seed(client: QueryClient) {
     state.asks(new URLSearchParams({ status: "open" })),
   );
   client.setQueryData(queries.boards().queryKey, state.boards());
-  client.setQueryData(queries.updates("").queryKey, state.updates(none));
 }
 
 const marked = (value: string) =>
@@ -55,7 +53,6 @@ describe("navigation", () => {
     const asks = screen.getByLabelText(`${open} waiting on you`);
     expect(asks.textContent).toBe(String(open));
     expect(asks.className).toMatch(/(^| )bg-amber( |$)/);
-    // Home has no count: Since you last looked, on the page itself, says what is new.
     const home = screen.getByRole("link", { name: /Home/ });
     expect(home.textContent).toBe("Home");
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);

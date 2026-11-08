@@ -42,7 +42,6 @@ function seed(askId: number) {
     const ask = state.ask(askId);
     client.setQueryData(queries.boards().queryKey, state.boards());
     client.setQueryData(queries.openAsks().queryKey, open);
-    client.setQueryData(queries.updates("").queryKey, state.updates(none));
     client.setQueryData(queries.agents().queryKey, state.agents(none));
     if (ask.task) client.setQueryData(queries.task(ask.task).queryKey, state.task(ask.task));
     client.setQueryData(queries.handoff(ask.agent).queryKey, state.handoff(ask.agent));

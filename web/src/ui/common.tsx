@@ -1,4 +1,5 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { type ComponentProps, type ReactNode, useEffect, useState } from "react";
 import type { ApiFailure } from "@/api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "@/api/schema.ts";
@@ -8,6 +9,7 @@ import { Button } from "@/components/ui/button.tsx";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
+import { safeHref } from "@/text/markdown.tsx";
 import { Avatar, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
 
 export function useTitle(title: string): void {
@@ -280,9 +282,12 @@ export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "pause
 export function Owner({
   task,
   agents,
+  withTitle = false,
 }: {
   task: Pick<Task, "owner" | "owner_stale" | "status">;
   agents: Map<string, Agent>;
+  /** Show the owner's thread title under its handle. */
+  withTitle?: boolean;
 }) {
   if (!task.owner) {
     return (
@@ -295,7 +300,7 @@ export function Owner({
   const closed = task.status === "done" || task.status === "dropped";
   return (
     <span className="inline-flex min-w-0 items-center gap-2">
-      <Who id={task.owner} agents={agents} />
+      <Who id={task.owner} agents={agents} withTitle={withTitle} />
       {task.owner_stale && !closed && (
         <Badge
           variant="warn"
@@ -318,15 +323,85 @@ export function agentIndex(agents: Agent[] | undefined): Map<string, Agent> {
   return new Map((agents ?? []).map((agent) => [agent.id, agent]));
 }
 
-/** An agent's handle, or the id when the agent is unknown; `user` as "you". */
-export function Who({ id, agents }: { id: string; agents: Map<string, Agent> }) {
+/** The https link to the agent's T3 thread, as its hook registered it; null without one. */
+export function threadLink(agent: Agent | undefined): string | null {
+  const link = agent?.native_ids.t3_link;
+  return link && safeHref(link)?.startsWith("https://") ? link : null;
+}
+
+/** The id of an agent's card on the Agents page, for links to it. */
+export function agentAnchor(handle: string): string {
+  return `agent-${handle.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
+/**
+ * An agent's handle, or the id when the agent is unknown; `user` as "you". A known agent
+ * links to its T3 thread, or else to its card on the Agents page. `withTitle` adds the
+ * thread's title under the handle, where there is room for it.
+ */
+export function Who({
+  id,
+  agents,
+  withTitle = false,
+}: {
+  id: string;
+  agents: Map<string, Agent>;
+  withTitle?: boolean;
+}) {
   const agent = agents.get(id);
   if (id === "user") return <span className="font-[550] text-foreground">you</span>;
   const handle = agent ? agent.handle : id;
-  return (
-    <span className="inline-flex min-w-0 items-center gap-1.5 text-subtle-foreground" title={id}>
+  const title = agent?.title ?? null;
+  const thread = threadLink(agent);
+  const body = (
+    <>
       <Avatar handle={handle} />
-      <span className="truncate text-meta font-medium tabular-nums">{handle}</span>
+      <span className={cn("grid min-w-0", withTitle && title && "gap-0.5")}>
+        <span className="truncate text-meta font-medium tabular-nums">{handle}</span>
+        {withTitle && title && (
+          <span className="line-clamp-2 text-xs font-normal whitespace-normal text-muted-foreground">
+            {title}
+          </span>
+        )}
+      </span>
+    </>
+  );
+  // Above a task row's link cover, so the owner opens the agent, not the task.
+  const className = cn(
+    "relative z-1 inline-flex min-w-0 gap-1.5 text-subtle-foreground",
+    withTitle && title ? "items-start" : "items-center",
+  );
+  if (thread) {
+    return (
+      <a
+        className={cn(className, "hover:text-foreground")}
+        href={thread}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`Open ${title ? `“${title}”` : handle} in T3 Code`}
+      >
+        {body}
+        <span className="sr-only"> (opens its T3 Code thread)</span>
+      </a>
+    );
+  }
+  if (agent) {
+    return (
+      <Link
+        className={cn(className, "hover:text-foreground")}
+        to="/agents"
+        // The default list hides ended agents; their cards are under All.
+        search={agent.state === "ended" ? { state: "all" } : {}}
+        hash={agentAnchor(handle)}
+        title={title ? `${title} (${id})` : id}
+      >
+        {body}
+      </Link>
+    );
+  }
+  return (
+    <span className={className} title={id}>
+      {body}
     </span>
   );
 }

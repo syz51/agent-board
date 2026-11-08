@@ -1,5 +1,6 @@
-//! Records the commit this binary is built from as `BOARD_COMMIT` (see `build_commit.rs`).
-//! Only this leaf crate carries it, so a new commit rebuilds `board` alone.
+//! Records the commit this binary is built from as `BOARD_COMMIT`, and its committer time as
+//! the order stamp `BOARD_BUILT` (see `build_commit.rs`). Only this leaf crate carries them,
+//! so a new commit rebuilds `board` alone.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,6 +20,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BOARD_COMMIT");
+    println!("cargo:rerun-if-env-changed=BOARD_BUILT");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_commit.rs");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo"));
@@ -37,6 +39,13 @@ fn main() {
     let commit = normalize_commit(
         std::env::var("BOARD_COMMIT").ok().as_deref(),
         from_git.as_deref(),
+    );
+    let built_from_git = own_repo
+        .then(|| git(&root, &["log", "-1", "--format=%ct", "HEAD"]))
+        .flatten();
+    let built = normalize_built(
+        std::env::var("BOARD_BUILT").ok().as_deref(),
+        built_from_git.as_deref(),
     );
     if own_repo {
         // Build again when HEAD moves. `logs/HEAD` records every move (commits, checkouts,
@@ -57,4 +66,5 @@ fn main() {
         }
     }
     println!("cargo:rustc-env=BOARD_COMMIT={commit}");
+    println!("cargo:rustc-env=BOARD_BUILT={built}");
 }

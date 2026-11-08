@@ -5,6 +5,12 @@
 pub const ASK_OPTION_CHARS_MAX: usize = 60;
 /// Longest evidence value (a check command, commit, PR or artifact), in characters.
 pub const EVIDENCE_VALUE_CHARS_MAX: usize = 500;
+/// Longest agent title (a thread's title), in characters.
+pub const AGENT_TITLE_CHARS_MAX: usize = 200;
+/// Longest native id value, in characters.
+pub const NATIVE_ID_CHARS_MAX: usize = 300;
+/// The scheme every `t3_link` native id starts with.
+pub const T3_LINK_PREFIX: &str = "https://";
 /// Longest feedback resolution `reason`, in characters: with its prefix it stays one
 /// evidence value.
 pub const RESOLUTION_REASON_CHARS_MAX: usize = 280;

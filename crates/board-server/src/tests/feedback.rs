@@ -271,6 +271,288 @@ async fn a_report_after_the_routed_task_is_done_opens_a_new_item_naming_the_old_
 }
 
 #[tokio::test]
+async fn a_duplicate_needs_an_original_that_still_takes_reports() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let text = json!({ "about": "board", "text": "Notes are refused at the limit" });
+    let original = report(&t, A, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let work = t.task(B, "factory", "Raise the note limit").await;
+    assert!(t.claim(C, &original).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &original,
+        json!({ "kind": "routed", "task": work }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // While the routed task is open, the original is live: a duplicate of it works.
+    let other = report(
+        &t,
+        B,
+        json!({ "about": "board", "text": "Long notes bounce" }),
+    )
+    .await;
+    let other = other["task"]["id"].as_str().unwrap().to_owned();
+    assert!(t.claim(C, &other).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &other,
+        json!({ "kind": "duplicate", "task": original }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // Once the fix is done, the recurring item cannot be a duplicate of the original, or of
+    // a duplicate of it: the hint names the fix, its board and its owner.
+    assert!(t.claim(B, &work).await.0.is_success());
+    assert!(t.done(B, &work, check(0)).await.0.is_success());
+    let recurred = report(&t, A, text).await;
+    let item = recurred["task"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(recurred["task"]["feedback"]["recurs"], original.as_str());
+    assert!(t.claim(C, &item).await.0.is_success());
+    let path = format!("/v1/feedback/{item}/resolve");
+    for gone in [&original, &other] {
+        let (code, err, v) = t
+            .fail(
+                "POST",
+                &path,
+                Some(C),
+                Some(json!({ "kind": "duplicate", "task": gone })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("no longer takes reports"),
+            "{v}"
+        );
+        let next = v["next"].as_str().unwrap();
+        for part in [work.as_str(), "is done", B, "board factory", "kind=routed"] {
+            assert!(next.contains(part), "{part}: {v}");
+        }
+    }
+    // The user is refused too: the rule is about the items, not who resolves them.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &path,
+            Some(json!({ "kind": "duplicate", "task": original })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+
+    // With an open revisit of the fix, the hint routes the item there.
+    let revisit = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Revisit: the note limit",
+                "body": "Revisit: did the raised limit hold?",
+                "parent": work,
+            }),
+        )
+        .await;
+    let (_, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(C),
+            Some(json!({ "kind": "duplicate", "task": original })),
+        )
+        .await;
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("kind=routed task={revisit}")),
+        "{v}"
+    );
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &item,
+        json!({ "kind": "routed", "task": revisit }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // A fixed original has no task: the hint routes to the setup's owner.
+    let fixed_text = json!({ "about": "tools", "text": "A tool is missing from PATH" });
+    let fixed = report(&t, A, fixed_text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{fixed}/resolve"),
+            Some(json!({ "kind": "fixed", "reason": "config.toml:12 adds it" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let again = report(&t, B, fixed_text).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{again}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": fixed })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("setup's owner") && next.contains(&fixed),
+        "{v}"
+    );
+
+    // An item cannot be a duplicate of one that passes its reports back to it.
+    let first = report(&t, A, json!({ "about": "t3", "text": "Threads stall" })).await;
+    let first = first["task"]["id"].as_str().unwrap().to_owned();
+    let second = report(&t, B, json!({ "about": "t3", "text": "Threads hang" })).await;
+    let second = second["task"]["id"].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{second}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": first })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{first}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": second })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("passes its reports"),
+        "{v}"
+    );
+}
+
+async fn user_resolve(t: &T, item: &str, body: Value) -> (u16, Value) {
+    let (s, v) = t
+        .as_user("POST", &format!("/v1/feedback/{item}/resolve"), Some(body))
+        .await;
+    (s.as_u16(), v)
+}
+
+async fn item(t: &T, agent: &str, text: &str) -> String {
+    report(t, agent, json!({ "about": "board", "text": text })).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_duplicate_is_refused_when_its_original_closes_or_leads_back() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+
+    // An original routed to the item being resolved leads back to it: refused, rolled back.
+    let (x, y) = (
+        item(&t, A, "Routed loop one").await,
+        item(&t, B, "Routed loop two").await,
+    );
+    let (s, v) = user_resolve(&t, &x, json!({ "kind": "routed", "task": y })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = user_resolve(&t, &y, json!({ "kind": "duplicate", "task": x })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("passes its reports back"),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&y).await["status"], "open", "rolled back");
+
+    // So does a plain task on the feedback board, adopted as it is resolved.
+    let plain = t.task(B, "board-feedback", "Plain loop report").await;
+    let z = item(&t, A, "Plain loop item").await;
+    let (s, v) = user_resolve(&t, &z, json!({ "kind": "duplicate", "task": plain })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = user_resolve(&t, &plain, json!({ "kind": "duplicate", "task": z })).await;
+    assert_eq!(s, 400, "{v}");
+
+    // A plain task off the feedback board is an original while it is open.
+    let open = t.task(B, "factory", "Open plain work").await;
+    let q = item(&t, A, "Duplicate of open work").await;
+    let (s, v) = user_resolve(&t, &q, json!({ "kind": "duplicate", "task": open })).await;
+    assert_eq!(s, 200, "{v}");
+    let done = t.task(B, "factory", "Finished plain work").await;
+    assert!(t.claim(B, &done).await.0.is_success());
+    assert!(t.done(B, &done, check(0)).await.0.is_success());
+    let r = item(&t, A, "Duplicate of finished work").await;
+    let (s, v) = user_resolve(&t, &r, json!({ "kind": "duplicate", "task": done })).await;
+    assert_eq!(s, 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!("{done} is done, owned by {B}")),
+        "{v}"
+    );
+    assert!(next.contains(&format!("names {done}, then")), "{v}");
+
+    // A dropped routed task was declined or merged: the hint points to its verdict.
+    let declined = t.task(B, "factory", "Declined work").await;
+    let text = "Routed then declined";
+    let s1 = item(&t, A, text).await;
+    let (s, v) = user_resolve(&t, &s1, json!({ "kind": "routed", "task": declined })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = t.patch(B, &declined, json!({ "status": "dropped" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let s2 = item(&t, C, text).await;
+    assert_ne!(s1, s2);
+    let (s, v) = user_resolve(&t, &s2, json!({ "kind": "duplicate", "task": s1 })).await;
+    assert_eq!(s, 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains(&format!("{declined} was dropped")) && next.contains("kind=declined"),
+        "{v}"
+    );
+
+    // A routed task whose board is gone: the hint falls back to the setup's owner.
+    t.board("scratch", &[]).await;
+    let gone = t.task(B, "scratch", "Work on a deleted board").await;
+    let text = "Routed to a deleted board";
+    let u1 = item(&t, A, text).await;
+    let (s, v) = user_resolve(&t, &u1, json!({ "kind": "routed", "task": gone })).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/scratch",
+            Some(json!({ "status": "closed" })),
+        )
+        .await;
+    assert!(s.is_success());
+    let (s, _) = t.as_user("DELETE", "/v1/boards/scratch", None).await;
+    assert_eq!(s.as_u16(), 204);
+    let u2 = item(&t, B, text).await;
+    assert_ne!(u1, u2);
+    let (s, v) = user_resolve(&t, &u2, json!({ "kind": "duplicate", "task": u1 })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("setup's owner"), "{v}");
+}
+
+#[tokio::test]
 async fn resolve_is_for_the_owner_or_the_user() {
     let t = setup().await;
     let item = report(
@@ -805,13 +1087,21 @@ async fn errors_lists_recorded_errors_per_signature_since_a_time() {
 async fn refused_claims_are_counted_but_are_not_signals() {
     let t = setup().await;
     t.board("factory", &[]).await;
+    // The read and write transactions a request takes.
+    let cost = |before: (usize, usize)| {
+        let (reads, writes) = t.state.db().transactions();
+        (reads - before.0, writes - before.1)
+    };
+    let mut race = (0, 0);
     // Each agent wins one race and loses two, so three refusals come from each signature's
     // two or more agents.
     for (n, winner) in [A, B, C].into_iter().enumerate() {
         let task = t.task(A, "factory", &format!("Race {n}")).await;
         assert!(t.claim(winner, &task).await.0.is_success());
         for loser in [A, B, C].into_iter().filter(|a| *a != winner) {
+            let before = t.state.db().transactions();
             let (s, v) = t.claim(loser, &task).await;
+            race = cost(before);
             assert_eq!(
                 (s.as_u16(), v["code"].as_str()),
                 (409, Some("claim_refused"))
@@ -825,7 +1115,9 @@ async fn refused_claims_are_counted_but_are_not_signals() {
 
     // A claim past the doing limit is not a race: it is still recorded.
     let task = t.task(A, "factory", "One too many").await;
+    let before = t.state.db().transactions();
     let (s, v) = t.claim(A, &task).await;
+    let limit = cost(before);
     assert_eq!(s.as_u16(), 409, "{v}");
     assert!(
         v["message"]
@@ -835,6 +1127,9 @@ async fn refused_claims_are_counted_but_are_not_signals() {
         "{v}"
     );
     assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 1);
+    // Both refusals take the same transactions in the handler. Recording the unexpected
+    // one adds a read (its credentials) and a write; a lost race skips both.
+    assert_eq!(limit, (race.0 + 1, race.1 + 1), "race {race:?}");
 }
 
 #[tokio::test]
@@ -1150,4 +1445,245 @@ async fn every_route_a_client_may_name_is_routed() {
         assert_ne!(status.as_u16(), 405, "{route}");
         assert_ne!(v["message"], "no such endpoint", "{route}");
     }
+}
+
+/// Files an item reported by `agent`, claimed by it and declined; returns the item's id.
+async fn declined_item(t: &T, agent: &str, text: &Value) -> String {
+    let item = report(t, agent, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    decline(t, agent, &item).await;
+    item
+}
+
+async fn decline(t: &T, agent: &str, item: &str) {
+    assert!(t.claim(agent, item).await.0.is_success());
+    let (s, v) = resolve(
+        t,
+        Some(agent),
+        item,
+        json!({ "kind": "declined", "reason": "works as designed." }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn a_declined_item_reported_again_by_new_agents_goes_back_to_triage() {
+    let t = setup().await;
+    let (d, e) = ("t3:delta", "t3:epsilon");
+    for agent in [d, e] {
+        t.register(agent, None, None).await;
+    }
+    let text = json!({ "about": "board", "text": "Claim refused while one task is in doing" });
+    let item = declined_item(&t, A, &text).await;
+
+    // Five reports from three new agents, but the decline is not a day old yet.
+    for agent in [B, C, d, B, C] {
+        assert_eq!(report(&t, agent, text.clone()).await["duplicate"], true);
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+
+    t.advance(TimeDelta::hours(24));
+    let version = task["version"].as_i64().unwrap();
+    let since = t.count("SELECT COALESCE(MAX(seq), 0) FROM events");
+    let reopened = report(&t, A, text.clone()).await;
+    assert_eq!(reopened["duplicate"], true);
+    let task = &reopened["task"];
+    assert_eq!(task["id"], item.as_str());
+    assert_eq!(task["status"], "open", "back in triage's ready list");
+    assert!(task["owner"].is_null(), "{task}");
+    assert!(task["feedback"].get("resolution").is_none(), "{task}");
+    assert_eq!(task["version"], version + 1);
+    let noted = notes(&t, &item).await;
+    let note = noted.iter().find(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with(
+            "reopened: 6 reports from 4 agents since it was declined at \
+             2026-11-06 12:00Z (3 agents new since then). Declined because: works as designed."
+        ),
+        "{note}"
+    );
+    let types = t.event_types(since).await;
+    assert!(types.contains(&"note_added".to_owned()), "{types:?}");
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    let reopen = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_updated" && e["payload"]["to"] == "open")
+        .unwrap();
+    assert_eq!(reopen["actor"], A);
+    assert_eq!(
+        reopen["payload"],
+        json!({
+            "fields": ["status", "feedback", "owner"],
+            "from": "done",
+            "to": "open",
+            "owner": null,
+            "previous_owner": A,
+            "reopened": { "reports": 6, "agents": 4, "new_agents": 3 },
+        })
+    );
+    // The server's evidence of the decline stays, so triage knows the item.
+    assert_eq!(
+        detail["evidence"][0]["value"],
+        "feedback declined: works as designed."
+    );
+
+    // Declined again: the count starts afresh, and agents counted before are not new.
+    decline(&t, B, &item).await;
+    t.advance(TimeDelta::days(2));
+    for agent in [A, B, C, d, A] {
+        report(&t, agent, text.clone()).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done");
+    report(&t, e, text.clone()).await;
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done", "one new agent is under the bar");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+}
+
+#[tokio::test]
+async fn a_declined_item_under_the_bar_stays_declined_past_twenty_reporters() {
+    let t = setup().await;
+    let agents: Vec<String> = (0..28).map(|n| format!("t3:agent{n}")).collect();
+    for agent in &agents {
+        t.register(agent, None, None).await;
+    }
+    let text = json!({ "about": "hooks", "text": "Stop hook asks twice" });
+    let item = report(&t, &agents[0], text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 25 reporters before the decline: the item lists only the latest 20.
+    for agent in &agents[1..25] {
+        report(&t, agent, text.clone()).await;
+    }
+    let listed = t.get_task(&item).await["feedback"]["reporters"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 20);
+    assert!(!listed.as_array().unwrap().contains(&json!(agents[1])));
+    decline(&t, &agents[24], &item).await;
+    t.advance(TimeDelta::days(3));
+
+    // Agents dropped from the capped list still reported before the decline: not new.
+    for agent in &agents[1..6] {
+        report(&t, agent, text.clone()).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done");
+    // Two new agents are under the bar however many reports they add.
+    for agent in [&agents[25], &agents[26], &agents[25], &agents[26]] {
+        report(&t, agent, text.clone()).await;
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+    assert!(
+        notes(&t, &item)
+            .await
+            .iter()
+            .all(|n| !n.starts_with("reopened:"))
+    );
+
+    // The third new agent reaches it.
+    report(&t, &agents[27], text).await;
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "open");
+    let noted = notes(&t, &item).await;
+    let note = noted.iter().find(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with("reopened: 10 reports from 8 agents since it was declined at"),
+        "{note}"
+    );
+    assert!(note.contains("(3 agents new since then)"), "{note}");
+}
+
+#[tokio::test]
+async fn agents_that_reported_a_duplicate_before_the_decline_are_not_new() {
+    let t = setup().await;
+    let d = "t3:delta";
+    t.register(d, None, None).await;
+    let text = json!({ "about": "board", "text": "Leases warn without the task" });
+    let item = report(&t, A, text).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Before the decline, three agents report the same problem in other words.
+    let other = json!({ "about": "board", "text": "Lease warning names no task" });
+    let dup = report(&t, B, other.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    report(&t, C, other.clone()).await;
+    report(&t, d, other.clone()).await;
+    t.advance(TimeDelta::minutes(1));
+    decline(&t, A, &item).await;
+    assert!(t.claim(B, &dup).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &dup,
+        json!({ "kind": "duplicate", "task": item }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    t.advance(TimeDelta::days(2));
+
+    // The duplicate's reporters report again; their reports go to the declined item.
+    for agent in [B, C, d, B, C, d] {
+        assert_eq!(
+            report(&t, agent, other.clone()).await["task"]["id"],
+            item.as_str()
+        );
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+}
+
+#[tokio::test]
+async fn a_declined_signal_item_goes_back_to_triage_on_errors_from_new_agents() {
+    let t = setup().await;
+    let (d, e) = ("t3:delta", "t3:epsilon");
+    for agent in [d, e] {
+        t.register(agent, None, None).await;
+    }
+    let mut n = 0;
+    let mut miss = async |agent: &str| {
+        n += 1;
+        t.fail("GET", &format!("/v1/tasks/factory-{n}"), Some(agent), None)
+            .await;
+    };
+    for agent in [A, A, B] {
+        miss(agent).await;
+    }
+    let items = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let item = items[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(items[0]["feedback"]["source"], "signal");
+    decline(&t, C, &item).await;
+    t.advance(TimeDelta::days(2));
+
+    for agent in [A, B, C, d] {
+        miss(agent).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done", "two new agents");
+    miss(e).await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    assert_eq!(detail["task"]["status"], "open");
+    let reopen = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_updated" && e["payload"]["to"] == "open")
+        .unwrap();
+    assert_eq!(reopen["actor"], "server");
+    assert_eq!(
+        reopen["payload"]["reopened"],
+        json!({ "reports": 5, "agents": 5, "new_agents": 3 })
+    );
 }

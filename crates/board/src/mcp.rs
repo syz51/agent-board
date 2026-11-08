@@ -321,6 +321,7 @@ const TOOLS: &[ToolSpec] = &[
                                 "exit_code": {"type": "integer"},
                             },
                             "required": ["command", "exit_code"],
+                            "additionalProperties": false,
                         },
                     }),
                     false,
@@ -500,7 +501,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "feedback_resolve",
-        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item, forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
+        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item that still takes reports (never a closed one), forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
         params: || {
             vec![
                 ("id", task_arg("The feedback item."), true),
@@ -515,7 +516,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "task",
                     task_arg(
-                        "For routed and duplicate: the task doing the work, or the original item; any board.",
+                        "For routed and duplicate: the task doing the work, or the original item (still live); any board.",
                     ),
                     false,
                 ),
@@ -551,6 +552,7 @@ fn tool(spec: &ToolSpec) -> Tool {
         "type": "object",
         "properties": properties,
         "required": required,
+        "additionalProperties": false,
     }) {
         Value::Object(map) => map,
         _ => unreachable!("built as an object"),
@@ -628,8 +630,17 @@ impl BoardMcp {
         })
     }
 
-    async fn call(&self, name: &str, args: Value) -> Result<String> {
-        let agent = args.get("agent").and_then(Value::as_str).map(str::to_owned);
+    async fn call(&self, name: &str, mut args: Value) -> Result<String> {
+        refuse_unknown_args(name, &args)?;
+        // Taken here, so the argument types below refuse every field they do not read.
+        let agent = match args.as_object_mut().and_then(|map| map.remove("agent")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(agent)) => Some(agent),
+            Some(other) => anyhow::bail!(
+                "invalid arguments: agent must be an agent id string, not {other}. Call {name} \
+                 again with a string, or leave agent out to act as yourself."
+            ),
+        };
         if let Some(named) = &agent {
             let named: AgentId = named.parse().context("agent")?;
             crate::identity::refuse_borrowed(self.own.as_ref(), &named, "agent=")?;
@@ -643,7 +654,7 @@ impl BoardMcp {
         }
         let out: Output = match name {
             "board_snapshot" => {
-                let a: SnapshotArgs = parse(args)?;
+                let a: SnapshotArgs = parse(name, args)?;
                 let kind = a.kind.unwrap_or(SnapshotKind::Full);
                 let since = match kind {
                     SnapshotKind::Full => None,
@@ -659,11 +670,11 @@ impl BoardMcp {
                 out
             }
             "board_status" => {
-                let a: BoardArgs = parse(args)?;
+                let a: BoardArgs = parse(name, args)?;
                 ops::status(&ctx, a.board, a.detailed).await?
             }
             "task_list" => {
-                let a: ListArgs = parse(args)?;
+                let a: ListArgs = parse(name, args)?;
                 let query = TaskQuery {
                     board: a.board,
                     status: a.status,
@@ -676,11 +687,11 @@ impl BoardMcp {
                 ops::task_list(&ctx, &query, a.detailed).await?
             }
             "task_show" => {
-                let a: ShowArgs = parse(args)?;
+                let a: ShowArgs = parse(name, args)?;
                 ops::task_show(&ctx, &a.id, a.detailed).await?
             }
             "task_add" => {
-                let a: AddArgs = parse(args)?;
+                let a: AddArgs = parse(name, args)?;
                 let new = ops::NewTask {
                     board: a.board,
                     title: a.title,
@@ -696,12 +707,12 @@ impl BoardMcp {
                 ops::task_add(&ctx, new).await?
             }
             "task_claim" => {
-                let a: ClaimArgs = parse(args)?;
+                let a: ClaimArgs = parse(name, args)?;
                 let action = if a.take { "take" } else { "claim" };
                 ops::task_action(&ctx, &a.id, action).await?
             }
             "task_update" => {
-                let a: UpdateArgs = parse(args)?;
+                let a: UpdateArgs = parse(name, args)?;
                 let changes = ops::TaskChanges {
                     status: a.status,
                     title: a.title,
@@ -717,7 +728,7 @@ impl BoardMcp {
                 ops::task_update(&ctx, &a.id, changes).await?
             }
             "task_done" => {
-                let a: DoneArgs = parse(args)?;
+                let a: DoneArgs = parse(name, args)?;
                 let evidence = ops::Evidence {
                     checks: a
                         .checks
@@ -731,19 +742,19 @@ impl BoardMcp {
                 ops::task_done(&ctx, &a.id, evidence, a.summary).await?
             }
             "task_note" => {
-                let a: NoteArgs = parse(args)?;
+                let a: NoteArgs = parse(name, args)?;
                 ops::task_note(&ctx, &a.id, a.kind.unwrap_or(NoteKind::Note), a.text).await?
             }
             "handoff_set" => {
-                let a: HandoffArgs = parse(args)?;
+                let a: HandoffArgs = parse(name, args)?;
                 ops::handoff_set(&ctx, a.now, a.next, a.blockers).await?
             }
             "lease_paths" => {
-                let a: LeaseArgs = parse(args)?;
+                let a: LeaseArgs = parse(name, args)?;
                 ops::lease_paths(&ctx, a.globs, a.task, a.ttl_secs).await?
             }
             "ask_user" => {
-                let a: AskArgs = parse(args)?;
+                let a: AskArgs = parse(name, args)?;
                 let ask = ops::NewAsk {
                     board: a.board,
                     task: a.task,
@@ -754,11 +765,11 @@ impl BoardMcp {
                 ops::ask_user(&ctx, ask).await?
             }
             "ask_withdraw" => {
-                let a: AskIdArgs = parse(args)?;
+                let a: AskIdArgs = parse(name, args)?;
                 ops::ask_withdraw(&ctx, a.id).await?
             }
             "feedback" => {
-                let a: FeedbackArgs = parse(args)?;
+                let a: FeedbackArgs = parse(name, args)?;
                 let req = CreateFeedback {
                     about: a.about,
                     text: a.text,
@@ -769,7 +780,7 @@ impl BoardMcp {
                 ops::feedback(&ctx, req).await?
             }
             "feedback_resolve" => {
-                let a: ResolveArgs = parse(args)?;
+                let a: ResolveArgs = parse(name, args)?;
                 let req = ResolveFeedback {
                     kind: a.kind,
                     task: a.task,
@@ -778,7 +789,7 @@ impl BoardMcp {
                 ops::resolve(&ctx, &a.id, req).await?
             }
             "board_join" => {
-                let a: BoardArgs = parse(args)?;
+                let a: JoinArgs = parse(name, args)?;
                 ops::join(&ctx, a.board).await?
             }
             other => anyhow::bail!("unknown tool {other:?}; see tools/list"),
@@ -787,16 +798,57 @@ impl BoardMcp {
     }
 }
 
-fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
-    serde_json::from_value(args).map_err(|err| anyhow::anyhow!("invalid arguments: {err}"))
+/// Refuses an unknown tool, and arguments the tool's schema does not declare, before
+/// anything is loaded or sent: a guessed name fails instead of being dropped while the
+/// call answers ok.
+fn refuse_unknown_args(name: &str, args: &Value) -> Result<()> {
+    let Some(spec) = TOOLS.iter().find(|spec| spec.name == name) else {
+        anyhow::bail!("unknown tool {name:?}; see tools/list");
+    };
+    let accepted: Vec<&str> = (spec.params)()
+        .into_iter()
+        .map(|(name, ..)| name)
+        .chain(["agent"])
+        .collect();
+    let unknown: Vec<String> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .filter(|key| !accepted.contains(&key.as_str()))
+        .map(|key| format!("`{key}`"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let noun = if unknown.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    anyhow::bail!(
+        "invalid arguments: {name} has no {noun} {}; it accepts {}. Call {name} again with \
+         only those arguments.",
+        unknown.join(", "),
+        accepted.join(", ")
+    )
+}
+
+fn parse<T: DeserializeOwned>(name: &str, args: Value) -> Result<T> {
+    serde_json::from_value(args).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid arguments: {err}. Call {name} again with arguments that match its schema."
+        )
+    })
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SnapshotArgs {
     kind: Option<SnapshotKind>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BoardArgs {
     board: Option<BoardSlug>,
     #[serde(default)]
@@ -804,6 +856,13 @@ struct BoardArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinArgs {
+    board: Option<BoardSlug>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     board: Option<BoardSlug>,
     status: Option<TaskStatus>,
@@ -820,6 +879,7 @@ struct ListArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShowArgs {
     id: TaskId,
     #[serde(default)]
@@ -827,6 +887,7 @@ struct ShowArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddArgs {
     title: String,
     board: Option<BoardSlug>,
@@ -845,6 +906,7 @@ struct AddArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimArgs {
     id: TaskId,
     #[serde(default)]
@@ -852,6 +914,7 @@ struct ClaimArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     id: TaskId,
     status: Option<TaskStatus>,
@@ -876,12 +939,14 @@ fn null_as_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Check {
     command: String,
     exit_code: i32,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoneArgs {
     id: TaskId,
     #[serde(default)]
@@ -896,6 +961,7 @@ struct DoneArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NoteArgs {
     id: TaskId,
     text: String,
@@ -903,6 +969,7 @@ struct NoteArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HandoffArgs {
     now: String,
     next: String,
@@ -911,6 +978,7 @@ struct HandoffArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LeaseArgs {
     globs: Vec<String>,
     task: Option<TaskId>,
@@ -918,6 +986,7 @@ struct LeaseArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskArgs {
     question: String,
     kind: Option<AskKind>,
@@ -928,6 +997,7 @@ struct AskArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FeedbackArgs {
     about: String,
     text: String,
@@ -935,6 +1005,7 @@ struct FeedbackArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveArgs {
     id: TaskId,
     kind: ResolutionKind,
@@ -943,6 +1014,7 @@ struct ResolveArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskIdArgs {
     id: i64,
 }
@@ -978,7 +1050,7 @@ impl ServerHandler for BoardMcp {
         };
         // Once per session: a server on another build may answer in shapes this one
         // misreads.
-        if let Some(warning) = crate::client::take_skew_warning() {
+        if let Some(warning) = crate::client::take_skew_warning(crate::client::Reporter::Session) {
             result
                 .content
                 .push(ContentBlock::text(format!("warning: {warning}")));
@@ -1032,6 +1104,121 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("only when every acceptance check passes; file what remains first")
+        );
+    }
+
+    /// Parses `args` with the argument type `call` uses for `tool`.
+    fn parse_for(tool: &str, args: Value) -> Result<()> {
+        match tool {
+            "board_snapshot" => parse::<SnapshotArgs>(tool, args).map(drop),
+            "board_status" => parse::<BoardArgs>(tool, args).map(drop),
+            "task_list" => parse::<ListArgs>(tool, args).map(drop),
+            "task_show" => parse::<ShowArgs>(tool, args).map(drop),
+            "task_add" => parse::<AddArgs>(tool, args).map(drop),
+            "task_claim" => parse::<ClaimArgs>(tool, args).map(drop),
+            "task_update" => parse::<UpdateArgs>(tool, args).map(drop),
+            "task_done" => parse::<DoneArgs>(tool, args).map(drop),
+            "task_note" => parse::<NoteArgs>(tool, args).map(drop),
+            "handoff_set" => parse::<HandoffArgs>(tool, args).map(drop),
+            "lease_paths" => parse::<LeaseArgs>(tool, args).map(drop),
+            "ask_user" => parse::<AskArgs>(tool, args).map(drop),
+            "ask_withdraw" => parse::<AskIdArgs>(tool, args).map(drop),
+            "feedback" => parse::<FeedbackArgs>(tool, args).map(drop),
+            "feedback_resolve" => parse::<ResolveArgs>(tool, args).map(drop),
+            "board_join" => parse::<JoinArgs>(tool, args).map(drop),
+            other => panic!("no argument type for {other}"),
+        }
+    }
+
+    /// The schema an agent reads and the type `call` parses name the same arguments, so
+    /// refusing undeclared ones drops nothing a tool reads, and no declared one is ignored.
+    #[test]
+    fn schemas_and_argument_types_name_the_same_fields() {
+        for tool in tools() {
+            let schema = &tool.input_schema;
+            assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
+            let mut declared: Vec<String> = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|name| *name != "agent")
+                .cloned()
+                .collect();
+            declared.sort();
+            // serde names the unknown field, then the type's fields, each in backticks.
+            let err = parse_for(&tool.name, json!({"\u{1}": 0}))
+                .unwrap_err()
+                .to_string();
+            let mut read: Vec<String> = err
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            read.sort();
+            assert_eq!(declared, read, "{}: {err}", tool.name);
+        }
+        let done = tools().into_iter().find(|t| t.name == "task_done").unwrap();
+        assert_eq!(
+            done.input_schema["properties"]["checks"]["items"]["additionalProperties"],
+            false
+        );
+        let err = parse_for(
+            "task_done",
+            json!({"id": "factory-1", "checks": [{"command": "x", "exit_code": 0, "ok": true}]}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `ok`"), "{err}");
+    }
+
+    #[test]
+    fn unknown_arguments_are_refused_with_the_accepted_ones() {
+        for tool in tools() {
+            let mut args = json!({"blocked_by": ["factory-2"]});
+            for name in tool.input_schema["properties"].as_object().unwrap().keys() {
+                args[name] = Value::Null;
+            }
+            let err = refuse_unknown_args(&tool.name, &args)
+                .unwrap_err()
+                .to_string();
+            let listed = err
+                .strip_prefix(&format!(
+                    "invalid arguments: {} has no argument `blocked_by`; it accepts ",
+                    tool.name
+                ))
+                .and_then(|rest| {
+                    rest.strip_suffix(&format!(
+                        ". Call {} again with only those arguments.",
+                        tool.name
+                    ))
+                })
+                .unwrap_or_else(|| panic!("{err}"));
+            let mut listed: Vec<&str> = listed.split(", ").collect();
+            listed.sort();
+            let mut declared: Vec<&str> = tool.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            declared.sort();
+            assert_eq!(listed, declared, "{err}");
+            args.as_object_mut().unwrap().remove("blocked_by");
+            refuse_unknown_args(&tool.name, &args).unwrap();
+        }
+        let err = refuse_unknown_args("task_note", &json!({"id": "x", "txt": "a", "knd": "b"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("invalid arguments: task_note has no arguments `"),
+            "{err}"
+        );
+        assert!(err.contains("`txt`") && err.contains("`knd`"), "{err}");
+        let err = refuse_unknown_args("task_notes", &json!({})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"unknown tool "task_notes"; see tools/list"#
         );
     }
 

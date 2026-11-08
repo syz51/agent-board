@@ -7,19 +7,15 @@ import type {
   Ask,
   Board,
   BoardEvent,
-  DoneUpdate,
   EventsPage,
   Handoff,
   Said,
-  SeenCursor,
   Task,
   TaskDetail,
-  Updates,
 } from "../src/api/schema.ts";
 import { type BoardFixture, createFixtures, type Fixtures } from "./fixtures.ts";
 
 const STALE_MS = 24 * 3_600_000;
-const UPDATES_MAX = 100;
 const SAID_LIMIT_MAX = 50;
 
 /** An error the dev server returns as an `ApiError` body. */
@@ -137,58 +133,6 @@ export class DevState {
     return ask;
   }
 
-  /**
-   * Done tasks and coordinators' turn endings after `since` (default: the seen cursor),
-   * newest first. Done time is the task's `updated_at`: fixtures do not change done tasks.
-   */
-  updates(params: URLSearchParams): Updates {
-    const sinceParam = params.get("since");
-    if (sinceParam !== null && !Number.isFinite(Date.parse(sinceParam))) {
-      throw new DevApiError(
-        400,
-        "invalid",
-        "since is not an RFC 3339 time",
-        "send since=2026-11-06T12:00:00Z",
-      );
-    }
-    const board = params.get("board");
-    if (board) this.findBoard(board);
-    const since = sinceParam ?? this.data.seenAt;
-    const after = (at: string) => since === null || Date.parse(at) > Date.parse(since);
-    const newest = <T>(items: T[], at: (item: T) => string) =>
-      items.sort((a, b) => Date.parse(at(b)) - Date.parse(at(a)));
-
-    const done: DoneUpdate[] = newest(
-      this.data.tasks
-        .filter(
-          (task) =>
-            task.status === "done" && (!board || task.board === board) && after(task.updated_at),
-        )
-        .map((task) => ({
-          task: task.id,
-          board: task.board,
-          parent: task.parent,
-          title: task.title,
-          summary: task.summary,
-          owner: task.owner,
-          done_at: task.updated_at,
-          evidence: this.task(task.id).evidence,
-        })),
-      (item) => item.done_at,
-    );
-    const said = newest(
-      this.data.said.filter((item) => (!board || item.board === board) && after(item.at)),
-      (item) => item.at,
-    );
-    return {
-      seen_at: this.data.seenAt,
-      since,
-      done: done.slice(0, UPDATES_MAX),
-      said: said.slice(0, UPDATES_MAX),
-      more: done.length > UPDATES_MAX || said.length > UPDATES_MAX,
-    };
-  }
-
   said(agentId: string, params: URLSearchParams): Said[] {
     if (!this.data.agents.some((agent) => agent.id === agentId)) {
       throw notFound(`agent ${agentId}`, "list agents with GET /v1/agents");
@@ -273,24 +217,6 @@ export class DevState {
       payload: { ask: id, answered_via: "web" },
     });
     return ask;
-  }
-
-  /** Move the seen cursor forward to `at`, capped at now; an earlier `at` leaves it. */
-  markSeen(body: unknown): SeenCursor {
-    const at = isRecord(body) && typeof body.at === "string" ? Date.parse(body.at) : Number.NaN;
-    if (!Number.isFinite(at)) {
-      throw new DevApiError(
-        400,
-        "invalid",
-        "at must be an RFC 3339 time",
-        'send {"at": "<the newest update\'s time>"}',
-      );
-    }
-    const target = Math.min(at, this.now());
-    if (this.data.seenAt === null || target > Date.parse(this.data.seenAt)) {
-      this.data.seenAt = new Date(target).toISOString();
-    }
-    return { seen_at: this.data.seenAt };
   }
 
   // The simulator: one plausible change per call.
@@ -603,6 +529,7 @@ export class DevState {
         done: count("done"),
         dropped: count("dropped"),
         ready: tasks.filter((task) => task.ready).length,
+        ready_auto: tasks.filter((task) => task.ready && task.auto).length,
       },
       open_asks: this.data.asks.filter((ask) => ask.board === board.slug && ask.status === "open")
         .length,

@@ -31,15 +31,18 @@ use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
 use crate::state::{self, AgentLocal, DoneMark, ToolStart};
-use crate::t3::T3Cli;
+use crate::t3::{T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
 const DELEGATED_THREAD: &str = "thread:delegated-task:";
 /// Where T3 tells its threads its CLI is.
 const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
-/// Time for asking T3 for a delegated thread's parent (about 0.2 seconds measured);
-/// past it the agent registers without one.
-const PARENT_BUDGET: Duration = Duration::from_millis(400);
+/// Time for asking T3 about the agent's thread (`t3 thread show`, about 0.2 seconds
+/// measured); past it the agent registers without its title, link or parent.
+const T3_BUDGET: Duration = Duration::from_millis(400);
+/// A `Stop` asks T3 for the thread's title at the session's first `Stop`, then at most this
+/// often: T3 renames a thread after its first turn, and the user may rename it later.
+const TITLE_REFRESH: Duration = Duration::from_secs(3600);
 
 /// Hard limit for the whole hook, start to output.
 const BUDGET: Duration = Duration::from_millis(1500);
@@ -49,6 +52,9 @@ const MARGIN: Duration = Duration::from_millis(200);
 /// tailnet). Past it the server counts as unreachable, not slow: a connect that hangs (a
 /// peer asleep or dropping packets) never answers however long the hook waits.
 const CONNECT_BUDGET: Duration = Duration::from_millis(500);
+/// What a `Stop` leaves of the server share after registering a renamed thread, so the
+/// hook answers before its own deadline.
+const RENAME_MARGIN: Duration = Duration::from_millis(50);
 /// A failure to get an answer within a deadline shorter than this, because the hook's local
 /// steps took the rest of the budget, leaves the breaker as it was.
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
@@ -199,11 +205,15 @@ struct Hook<'a> {
     local: AgentLocal,
     /// At `PostToolUse`, the files to report, in batches the server takes.
     touches: Vec<Touches>,
-    /// At `SessionStart`, the T3 thread that delegated this agent's thread.
-    t3_parent: Option<String>,
+    /// At `SessionStart`, what T3 says of this agent's thread; at `Stop`, the same when
+    /// its title or link changed since the hook registered them.
+    t3: Option<SeenThread>,
     /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
     done_reminder: Option<String>,
     now: Timestamp,
+    /// Shortly before the hook's server share runs out: what a `Stop` may still spend
+    /// registering a renamed thread.
+    deadline: tokio::time::Instant,
 }
 
 async fn handle(
@@ -311,8 +321,23 @@ async fn handle(
     }
     let local = state::load_agent(&home, &agent);
     // Local work comes before the server's share of the budget is set, so a slow work tree
-    // or T3 never looks like a slow server.
-    let repo = if event == HookEvent::SessionStart || !edited.is_empty() || shell_start.is_some() {
+    // or T3 never looks like a slow server. T3 is asked while the Keychain lookup runs.
+    let t3 = match event {
+        _ if nested || !t3_identity_applies(explicit_agent, env) => None,
+        // A hook that skips the server registers nothing, so T3's answer would go unused.
+        _ if breaker.open_at(now).is_some() => None,
+        HookEvent::SessionStart => thread_at_start(&home, runtime, session).await,
+        HookEvent::Stop => thread_renamed(&home, runtime, session, now).await,
+        _ => None,
+    };
+    steps.mark("t3");
+    // A Stop that registers a new title registers where the agent runs too.
+    let renamed = event == HookEvent::Stop && t3.is_some();
+    let repo = if event == HookEvent::SessionStart
+        || renamed
+        || !edited.is_empty()
+        || shell_start.is_some()
+    {
         Some(detect_repo(input_cwd(input)).await?)
     } else {
         None
@@ -347,14 +372,8 @@ async fn handle(
             Route::Direct(token)
         }
     };
-    let t3_parent = match event {
-        HookEvent::SessionStart if !nested && t3_identity_applies(explicit_agent, env) => {
-            delegated_parent(&home, runtime, session).await
-        }
-        _ => None,
-    };
-    steps.mark("t3");
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
+    let deadline = tokio::time::Instant::now() + remaining.saturating_sub(RENAME_MARGIN);
     let relayed = matches!(route, Route::Relay(_));
     let client = match route {
         Route::Relay(client) => client
@@ -377,9 +396,10 @@ async fn handle(
         agent,
         input,
         touches,
-        t3_parent,
+        t3,
         done_reminder: None,
         now,
+        deadline,
     };
     // Turn boundaries for the done reminder hold whether or not the server answers.
     match event {
@@ -624,13 +644,9 @@ async fn nested_session(
     .await?;
     // Nothing to remember at the end of a session.
     if let Some(session) = session.filter(|_| event != HookEvent::SessionEnd) {
-        let t3_parent = state::load_session(home, runtime, session).and_then(|s| s.t3_parent);
-        state::save_session(
-            home,
-            runtime,
-            session,
-            &state::SessionLocal { nested, t3_parent },
-        )?;
+        let mut local = state::load_session(home, runtime, session).unwrap_or_default();
+        local.nested = nested;
+        state::save_session(home, runtime, session, &local)?;
     }
     Ok(nested)
 }
@@ -644,44 +660,128 @@ fn input_cwd(input: &Value) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// The T3 thread that delegated this session's T3 thread, for a thread T3 started for a
-/// parent's `delegate_task`: from the session's cache, else asked of T3 (the `t3` this
-/// thread's T3 names, else the configured one) within [`PARENT_BUDGET`] and cached once
-/// known. `None` for other threads, or when T3 does not answer in time; a later
-/// `SessionStart` asks again.
-async fn delegated_parent(home: &Home, runtime: Runtime, session: Option<&str>) -> Option<String> {
+/// This agent's T3 thread, as the hooks register it.
+#[derive(Debug, Clone, PartialEq)]
+struct SeenThread {
+    id: String,
+    facts: ThreadFacts,
+}
+
+/// The T3 thread id this process runs in, when T3 set one.
+fn t3_thread_id() -> Option<String> {
     let thread = std::env::var(T3_THREAD_ENV).ok()?;
-    let thread = thread.trim();
-    if !thread.starts_with(DELEGATED_THREAD) {
+    Some(thread.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// What T3 says of this session's thread at `SessionStart`: from the session's cache once
+/// the hooks registered it, else asked of T3. The parent is kept only for a thread T3
+/// started for a parent's `delegate_task`. `None` outside T3 or when T3 does not answer in
+/// time; a later `SessionStart` asks again.
+async fn thread_at_start(
+    home: &Home,
+    runtime: Runtime,
+    session: Option<&str>,
+) -> Option<SeenThread> {
+    let id = t3_thread_id()?;
+    let cached = session.and_then(|s| state::load_session(home, runtime, s));
+    if let Some(cached) = cached.filter(|c| c.t3_thread.as_deref() == Some(id.as_str())) {
+        let facts = ThreadFacts {
+            parent: cached.t3_parent,
+            title: cached.t3_title,
+            link: cached.t3_link,
+        };
+        return Some(SeenThread { id, facts });
+    }
+    let mut facts = ask_t3(home, &id).await?;
+    if !id.starts_with(DELEGATED_THREAD) {
+        facts.parent = None;
+    }
+    Some(SeenThread { id, facts })
+}
+
+/// At `Stop`, when a title check is due ([`title_check_due`]): what T3 says of this
+/// session's thread, when its title or link differs from what the hooks registered
+/// ([`thread_changed`]). A check that finds no change, or no answer, counts as done, so a
+/// slow T3 costs one `Stop` an hour; a change counts once the server took it
+/// ([`Hook::register`]), so a failed registration is tried again at the next `Stop`.
+/// `None` without a session cache, which `SessionStart` (or the session's first hook)
+/// writes.
+async fn thread_renamed(
+    home: &Home,
+    runtime: Runtime,
+    session: Option<&str>,
+    now: Timestamp,
+) -> Option<SeenThread> {
+    let id = t3_thread_id()?;
+    let session = session?;
+    let mut cached = state::load_session(home, runtime, session)?;
+    if !title_check_due(cached.title_checked_at, now) {
         return None;
     }
-    let cached = session.and_then(|s| state::load_session(home, runtime, s));
-    if let Some(parent) = cached.as_ref().and_then(|c| c.t3_parent.clone()) {
-        return Some(parent);
+    // What was registered for another thread, or never, says nothing of this one.
+    let same = cached.t3_thread.as_deref() == Some(id.as_str());
+    let (parent, title, link) = if same {
+        (
+            cached.t3_parent.clone(),
+            cached.t3_title.clone(),
+            cached.t3_link.clone(),
+        )
+    } else {
+        (None, None, None)
+    };
+    let read = ask_t3(home, &id).await;
+    let mut facts = match read {
+        Some(facts) if thread_changed(title.as_deref(), link.as_deref(), &facts) => facts,
+        _ => {
+            cached.title_checked_at = Some(now);
+            if let Err(err) = state::save_session(home, runtime, session, &cached) {
+                tracing::debug!("recording the title check: {err:#}");
+            }
+            return None;
+        }
+    };
+    // As at `SessionStart`: a parent only for a delegated thread, else the one registered
+    // (T3's answer may now have one the session's first registration missed).
+    if !id.starts_with(DELEGATED_THREAD) {
+        facts.parent = None;
     }
+    facts.parent = facts.parent.or(parent);
+    Some(SeenThread { id, facts })
+}
+
+/// Whether T3's answer has a title or link other than the ones registered. A field T3 left
+/// out is no change: the server keeps what it has.
+fn thread_changed(title: Option<&str>, link: Option<&str>, read: &ThreadFacts) -> bool {
+    let differs =
+        |read: &Option<String>, had: Option<&str>| read.as_deref().is_some_and(|r| Some(r) != had);
+    differs(&read.title, title) || differs(&read.link, link)
+}
+
+/// True when a `Stop` should ask T3 for the thread's title: at the session's first `Stop`,
+/// then once [`TITLE_REFRESH`] has passed.
+pub fn title_check_due(last: Option<Timestamp>, now: Timestamp) -> bool {
+    due(last, now, TITLE_REFRESH)
+}
+
+/// Asks T3 about `thread` within [`T3_BUDGET`], with the `t3` this thread's T3 names, else
+/// the configured one. `None` when T3 does not know the thread, fails or is too slow.
+async fn ask_t3(home: &Home, thread: &str) -> Option<ThreadFacts> {
     let bin = std::env::var_os(T3_CLI_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| Config::load(home).ok()?.t3_bin);
     let t3 = T3Cli::locate(bin.as_deref());
-    let parent = match tokio::time::timeout(PARENT_BUDGET, t3.thread_parent(thread)).await {
-        Ok(Ok(parent)) => parent?,
+    match tokio::time::timeout(T3_BUDGET, t3.thread_facts(thread)).await {
+        Ok(Ok(facts)) => facts,
         Ok(Err(err)) => {
-            tracing::debug!("parent of thread {thread}: {err:#}");
-            return None;
+            tracing::debug!("thread {thread}: {err:#}");
+            None
         }
         Err(_) => {
-            tracing::debug!("parent of thread {thread}: over budget");
-            return None;
-        }
-    };
-    if let (Some(session), Some(mut local)) = (session, cached) {
-        local.t3_parent = Some(parent.clone());
-        if let Err(err) = state::save_session(home, runtime, session, &local) {
-            tracing::debug!("caching the parent thread: {err:#}");
+            tracing::debug!("thread {thread}: over budget");
+            None
         }
     }
-    Some(parent)
 }
 
 impl Hook<'_> {
@@ -698,7 +798,7 @@ impl Hook<'_> {
             HookEvent::PreToolUse => Ok(Reply::Nothing),
             // A failed shell command may still have changed files.
             HookEvent::PostToolUse | HookEvent::PostToolUseFailure => self.post_tool_use().await,
-            HookEvent::Stop => self.stop().await,
+            HookEvent::Stop => self.stop(repo).await,
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
                 self.set_state(AgentState::Ended, None).await?;
@@ -845,27 +945,32 @@ impl Hook<'_> {
         self.keep(snap)
     }
 
-    async fn session_start(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
-        let thread = std::env::var(T3_THREAD_ENV).ok().filter(|_| !self.nested);
-        let repo = match repo {
-            Some(repo) => repo,
-            None => detect_repo(self.cwd()).await?,
-        };
+    /// Registers the agent where it runs, as a worker (the server keeps a board's
+    /// coordinator its role and title), with the T3 thread's title, link and parent when
+    /// known. Once the server took them, the session's cache keeps them, so a later
+    /// `SessionStart` of the session need not ask T3 and a `Stop` sends only a change.
+    async fn register(&self, repo: &RepoInfo) -> Result<()> {
         let mut native = std::collections::BTreeMap::new();
-        if let Some(session) = self.input["session_id"].as_str() {
+        let session = self.input["session_id"].as_str();
+        if let Some(session) = session {
             let key = match self.runtime {
                 Runtime::Claude => "claude_session",
                 Runtime::Codex => "codex_session",
             };
             native.insert(key.to_owned(), session.to_owned());
         }
-        if let Some(thread) = thread {
-            native.insert("t3_thread".to_owned(), thread);
+        let thread = t3_thread_id().filter(|_| !self.nested);
+        if let Some(thread) = &thread {
+            native.insert("t3_thread".to_owned(), thread.clone());
         }
+        let facts = self.t3.as_ref().map(|t| &t.facts);
         // The server keeps a delegated child's edits and its parent's out of each other's
         // overlaps and alerts.
-        if let Some(parent) = self.t3_parent.clone() {
+        if let Some(parent) = facts.and_then(|f| f.parent.clone()) {
             native.insert("t3_parent".to_owned(), parent);
+        }
+        if let Some(link) = facts.and_then(|f| f.link.clone()) {
+            native.insert("t3_link".to_owned(), link);
         }
         self.client
             .register(&board_proto::RegisterAgent {
@@ -873,7 +978,7 @@ impl Hook<'_> {
                 runtime: self.runtime,
                 device: self.device.clone(),
                 role: board_proto::AgentRole::Worker,
-                title: None,
+                title: facts.and_then(|f| f.title.clone()),
                 repo: repo.key.clone(),
                 branch: repo.branch.clone(),
                 cwd: Some(repo.cwd.display().to_string()),
@@ -881,6 +986,34 @@ impl Hook<'_> {
                 forked_from: None,
             })
             .await?;
+        if let (Some(session), Some(seen)) = (session, &self.t3) {
+            let mut local =
+                state::load_session(&self.home, self.runtime, session).unwrap_or_default();
+            local.t3_thread = Some(seen.id.clone());
+            local.t3_parent = seen.facts.parent.clone();
+            // A field T3 left out keeps what was registered before.
+            if seen.facts.title.is_some() {
+                local.t3_title = seen.facts.title.clone();
+            }
+            if seen.facts.link.is_some() {
+                local.t3_link = seen.facts.link.clone();
+            }
+            if self.event == HookEvent::Stop {
+                local.title_checked_at = Some(self.now);
+            }
+            if let Err(err) = state::save_session(&self.home, self.runtime, session, &local) {
+                tracing::debug!("caching the thread's title and link: {err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn session_start(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
+        let repo = match repo {
+            Some(repo) => repo,
+            None => detect_repo(self.cwd()).await?,
+        };
+        self.register(&repo).await?;
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
@@ -957,7 +1090,7 @@ impl Hook<'_> {
     ///
     /// Both reminders go in one block: the turn continues once, and the `Stop` that follows
     /// has `stop_hook_active` and stays quiet, so a second block would never be seen.
-    async fn stop(&mut self) -> Result<Reply> {
+    async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
         // Before any server call, so it survives a server that fails (`local_stop`).
         self.prepare_done_reminder();
         // A Stop that follows our own block ends the turn that answered a reminder; the
@@ -981,21 +1114,45 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        if continued {
-            return Ok(Reply::Nothing);
-        }
-        let handoff = self.handoff_reminder().await?;
-        let text: Vec<String> = self
-            .done_reminder
-            .take()
-            .into_iter()
-            .chain(handoff)
-            .collect();
-        Ok(if text.is_empty() {
+        let reply = if continued {
             Reply::Nothing
         } else {
-            Reply::Block(text.join("\n"))
-        })
+            let handoff = self.handoff_reminder().await?;
+            let text: Vec<String> = self
+                .done_reminder
+                .take()
+                .into_iter()
+                .chain(handoff)
+                .collect();
+            if text.is_empty() {
+                Reply::Nothing
+            } else {
+                Reply::Block(text.join("\n"))
+            }
+        };
+        if let Some(repo) = &repo {
+            self.register_renamed(repo).await;
+        }
+        Ok(reply)
+    }
+
+    /// T3 renamed the thread: registers it again, last and in the time left, then marks it
+    /// idle again, since registering marks it running. Rare (about once a thread). A failure
+    /// is logged and the next `Stop` tries again; one that cuts off between the two requests
+    /// leaves the agent marked running until its next hook.
+    async fn register_renamed(&self, repo: &RepoInfo) {
+        if self.t3.is_none() {
+            return;
+        }
+        let again = async {
+            self.register(repo).await?;
+            self.set_state(AgentState::Idle, None).await
+        };
+        match tokio::time::timeout_at(self.deadline, again).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::debug!("registering the thread's new title: {err:#}"),
+            Err(_) => tracing::debug!("registering the thread's new title: out of time"),
+        }
     }
 
     /// The handoff reminder: when a task is in `doing` and the handoff is missing or stale.
@@ -1201,11 +1358,13 @@ async fn detect_repo(cwd: PathBuf) -> Result<RepoInfo> {
 
 /// True when the heartbeat (and alert check) should run now.
 pub fn heartbeat_due(last: Option<Timestamp>, now: Timestamp) -> bool {
-    last.is_none_or(|last| {
-        (now - last)
-            .to_std()
-            .map_or(true, |since| since >= HEARTBEAT_EVERY)
-    })
+    due(last, now, HEARTBEAT_EVERY)
+}
+
+/// True when nothing happened yet or `every` has passed since `last`. A clock that went
+/// backwards makes it due, so it never waits forever.
+fn due(last: Option<Timestamp>, now: Timestamp, every: Duration) -> bool {
+    last.is_none_or(|last| (now - last).to_std().map_or(true, |since| since >= every))
 }
 
 /// The shell tool's name on both runtimes.
@@ -1617,6 +1776,57 @@ mod tests {
         assert!(heartbeat_due(Some(t0), t0 + chrono::Duration::seconds(60)));
         // A clock that went backwards does not suppress heartbeats forever.
         assert!(heartbeat_due(Some(t0), t0 - chrono::Duration::seconds(5)));
+    }
+
+    #[test]
+    fn titles_are_checked_at_the_first_stop_then_hourly() {
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0).unwrap();
+        assert!(title_check_due(None, t0), "the session's first Stop checks");
+        assert!(!title_check_due(
+            Some(t0),
+            t0 + chrono::Duration::minutes(59)
+        ));
+        assert!(title_check_due(
+            Some(t0),
+            t0 + chrono::Duration::minutes(60)
+        ));
+        assert!(title_check_due(Some(t0), t0 - chrono::Duration::seconds(5)));
+    }
+
+    #[test]
+    fn only_a_changed_title_or_link_is_sent() {
+        let link = "https://app.example.test/threads/env-1/thread-1";
+        let read = |title: Option<&str>, link: Option<&str>| ThreadFacts {
+            parent: None,
+            title: title.map(str::to_owned),
+            link: link.map(str::to_owned),
+        };
+        // Unchanged: nothing to send.
+        assert!(!thread_changed(
+            Some("Fix the parser"),
+            Some(link),
+            &read(Some("Fix the parser"), Some(link))
+        ));
+        // T3 renamed the thread after its first turn.
+        assert!(thread_changed(
+            Some("New thread"),
+            Some(link),
+            &read(Some("Fix the parser"), Some(link))
+        ));
+        // Nothing registered yet (T3 did not answer at SessionStart).
+        assert!(thread_changed(
+            None,
+            None,
+            &read(Some("Fix the parser"), None)
+        ));
+        assert!(thread_changed(None, None, &read(None, Some(link))));
+        // A field T3 left out is no change: the server keeps what it has.
+        assert!(!thread_changed(
+            Some("Fix the parser"),
+            Some(link),
+            &read(None, None)
+        ));
+        assert!(!thread_changed(None, None, &ThreadFacts::default()));
     }
 
     #[test]
