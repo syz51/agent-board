@@ -1908,6 +1908,7 @@ fn a_delegated_t3_thread_registers_its_parent() {
                 ("T3CODE_THREAD_ID", thread),
                 ("T3CODE_CLI_PATH", &t3),
                 ("BOARD_LOG", "board=debug"),
+                ("NO_COLOR", "1"),
             ],
         );
         let register = e.stub.requests_to("POST /v1/agents").pop().unwrap().body;
