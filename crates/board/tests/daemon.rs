@@ -3114,6 +3114,30 @@ fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
 }
 
 #[test]
+fn coordinators_ask_the_user_only_for_a_named_reason() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(board::daemon::COORDINATOR_PROMPT);
+    for rule in [
+        "Ask the user (`ask_user`) only for one of these reasons, named in the ask as `Reason: <name>`",
+        "`design`",
+        "`cost` (new spending of money)",
+        "`only-me` (a step that needs the user in person",
+        "An `action` ask must be `only-me`",
+        "Never ask because a hook or rule blocked a step",
+        "to approve a step the user asked for or that follows from it (merging, pushing, deploying, cleaning up)",
+        "for a choice with a sensible default (take it, record a `decision` note",
+        "when reviewers disagree, a third reviewer decides",
+        "Changes to this process and to security posture take the two accepts below, not the user",
+        "a split goes to a third reviewer",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    let triage = words(board::daemon::TRIAGE_PROMPT);
+    assert!(triage.contains("route the item to the most likely board"));
+    assert!(triage.contains("Do not ask the user."));
+}
+
+#[test]
 fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let triage = words(board::daemon::TRIAGE_PROMPT);
