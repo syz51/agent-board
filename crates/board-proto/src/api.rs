@@ -201,6 +201,25 @@ pub const ERRORS_LIMIT_DEFAULT: u32 = 100;
 /// Longest `q` filter of `GET /v1/errors`, in characters.
 pub const ERRORS_Q_CHARS_MAX: usize = 200;
 
+/// `POST /v1/errors`: an error the client answered itself, before sending the request it
+/// would have made, such as text over a limit. The server records it with its own errors
+/// (source `client`), for the calling agent, under the signature its own answer to that
+/// request would get.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientError {
+    /// Only `invalid` is recorded.
+    pub code: ErrorCode,
+    /// The route template the request would have gone to, such as
+    /// `POST /v1/tasks/{id}/notes`.
+    pub route: String,
+    /// The message the server would have answered, such as `text is 501 characters; the
+    /// limit is 500`.
+    pub message: String,
+}
+
+/// Longest [`ClientError`] message, in characters.
+pub const CLIENT_ERROR_MESSAGE_CHARS_MAX: usize = 300;
+
 /// One error signature in [`ErrorLog`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorSignature {

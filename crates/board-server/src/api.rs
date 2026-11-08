@@ -11,10 +11,10 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
-    AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
-    CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
-    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note,
-    PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
+    AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
+    CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
+    DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen,
+    Note, PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
     SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches,
     UpdateBoard, UpdateTask, Updates,
 };
@@ -79,7 +79,7 @@ pub(crate) fn router(state: AppState) -> Router {
             post(claim_coordinator).delete(release_coordinator),
         )
         .route("/stats", get(show_stats))
-        .route("/errors", get(show_errors))
+        .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
         .route("/tasks/{id}/claim", post(claim_task))
@@ -112,6 +112,54 @@ pub(crate) fn router(state: AppState) -> Router {
         ))
         .with_state(state)
 }
+
+/// The routes a client may name in `POST /v1/errors`: every `/v1` route but that one, as
+/// method and template. `router` must route each of them (a test checks it).
+pub const CLIENT_ERROR_ROUTES: &[&str] = &[
+    "POST /v1/agents",
+    "GET /v1/agents",
+    "GET /v1/agents/{id}",
+    "POST /v1/agents/{id}/state",
+    "GET /v1/agents/{id}/handoff",
+    "PUT /v1/agents/{id}/handoff",
+    "GET /v1/agents/{id}/said",
+    "GET /v1/updates",
+    "PUT /v1/updates/seen",
+    "GET /v1/boards",
+    "POST /v1/boards",
+    "GET /v1/boards/{slug}",
+    "PATCH /v1/boards/{slug}",
+    "DELETE /v1/boards/{slug}",
+    "POST /v1/boards/{slug}/join",
+    "POST /v1/boards/{slug}/coordinator",
+    "DELETE /v1/boards/{slug}/coordinator",
+    "GET /v1/stats",
+    "GET /v1/errors",
+    "GET /v1/tasks",
+    "POST /v1/tasks",
+    "GET /v1/tasks/{id}",
+    "PATCH /v1/tasks/{id}",
+    "POST /v1/tasks/{id}/claim",
+    "POST /v1/tasks/{id}/release",
+    "POST /v1/tasks/{id}/take",
+    "POST /v1/tasks/{id}/done",
+    "POST /v1/tasks/{id}/notes",
+    "POST /v1/leases",
+    "DELETE /v1/leases/{id}",
+    "POST /v1/touches",
+    "POST /v1/feedback",
+    "POST /v1/feedback/{id}/resolve",
+    "GET /v1/asks",
+    "POST /v1/asks",
+    "GET /v1/asks/{id}",
+    "POST /v1/asks/{id}/answer",
+    "POST /v1/asks/{id}/withdraw",
+    "GET /v1/snapshot",
+    "GET /v1/events",
+    "GET /v1/admin/devices",
+    "POST /v1/admin/devices",
+    "DELETE /v1/admin/devices/{name}",
+];
 
 /// Names this build on every answer, so clients can warn when they and the server differ.
 async fn build_headers(State(state): State<AppState>, mut resp: Response) -> Response {
@@ -153,6 +201,7 @@ async fn record_errors(State(state): State<AppState>, req: Request, next: Next) 
             code: error.code,
             route,
             message: error.message.clone(),
+            source: feedback::ErrorSource::Server,
         };
         if let Err(error) = state
             .write(move |cx| feedback::record_error(cx, seen))
@@ -482,6 +531,20 @@ async fn show_errors(
             .read(move |cx| feedback::errors(cx, &feedback::ErrorsFilter::new(cx, q)?))
             .await?,
     ))
+}
+
+/// `POST /v1/errors`: records a refusal the calling agent's client made before sending,
+/// with the server's own errors (source `client`), so signals count it.
+async fn report_error(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<ClientError>,
+) -> Result<StatusCode> {
+    let seen = feedback::validate_client_error(req, caller.agent()?.clone())?;
+    state
+        .write(move |cx| feedback::record_error(cx, seen))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------------------

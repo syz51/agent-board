@@ -6,11 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
-    BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
-    CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard,
-    LeaseResult, Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
-    Touches, UpdateBoard, UpdateTask,
+    BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
+    CreateTask, CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
+    JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot,
+    SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
+    Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -598,6 +598,19 @@ impl Client {
 
     pub async fn errors(&self, q: &ErrorsQuery) -> Result<ErrorLog> {
         self.get_query("/v1/errors", q).await
+    }
+
+    /// Records a request this client refused before sending (`POST /v1/errors`), waiting
+    /// at most `timeout` in all. Best effort, so it leaves the server's build headers
+    /// unread: a refused command prints nothing it did not print before.
+    pub async fn report_refusal(&self, body: &ClientError, timeout: Duration) -> Result<()> {
+        self.request(Method::POST, "/v1/errors")
+            .json(body)
+            .timeout(timeout)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     // Snapshots and events

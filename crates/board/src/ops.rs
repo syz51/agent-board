@@ -197,6 +197,23 @@ pub fn limits() -> &'static board_server::Settings {
     &LIMITS
 }
 
+/// Text over a limit, refused before the request was sent, with the server's message and
+/// hint. The CLI reports it to the server (`POST /v1/errors`), so signals count it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The message the server would have answered.
+    pub message: String,
+    pub next: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (not sent)\nnext: {}", self.message, self.next)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// Refuses `value` when it has more than `max` characters, with the server's message and
 /// hint, so over-long text fails before a request is sent.
 pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
@@ -206,11 +223,11 @@ pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
 /// [`check_chars`] with `goes` saying where longer text goes, as the server says it.
 pub fn check_chars_or(field: &str, value: &str, max: usize, goes: Option<&str>) -> Result<()> {
     match board_proto::TooLong::check(field, value, max) {
-        Some(long) => bail!(
-            "{} (not sent)\nnext: {}",
-            long.message(),
-            long.next_or(goes)
-        ),
+        Some(long) => Err(Refused {
+            message: long.message(),
+            next: long.next_or(goes),
+        }
+        .into()),
         None => Ok(()),
     }
 }

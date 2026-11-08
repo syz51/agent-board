@@ -939,3 +939,165 @@ async fn kept_errors_older_than_the_signal_window_do_not_count_toward_a_signal()
         "only the errors within the window are its reports"
     );
 }
+
+const NOTE_ROUTE: &str = "POST /v1/tasks/{id}/notes";
+const LONG_NOTE: &str = "text is 501 characters; the limit is 500";
+
+/// Records a refusal `agent`'s client made before sending a note.
+async fn client_refusal(t: &T, agent: &str, body: Value) -> (u16, Value) {
+    let (s, v) = t.call("POST", "/v1/errors", Some(agent), Some(body)).await;
+    (s.as_u16(), v)
+}
+
+fn long_note() -> Value {
+    json!({ "code": "invalid", "route": NOTE_ROUTE, "message": LONG_NOTE })
+}
+
+#[tokio::test]
+async fn a_client_refusal_is_recorded_under_the_signature_of_the_servers_own() {
+    let t = setup().await;
+    // The body cannot name another agent: the record is the caller's.
+    let mut forged = long_note();
+    forged["agent"] = json!(C);
+    assert_eq!(client_refusal(&t, A, forged).await, (204, Value::Null));
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM api_errors WHERE agent = '{A}' AND source = 'client' \
+             AND code = 'invalid' AND route = '{NOTE_ROUTE}'"
+        )),
+        1
+    );
+
+    // The server refusing the same request records one row under the same signature.
+    t.board("factory", &[]).await;
+    let task = t.task(B, "factory", "Noted").await;
+    let (status, code, v) = t
+        .fail(
+            "POST",
+            &format!("/v1/tasks/{task}/notes"),
+            Some(B),
+            Some(json!({ "agent": B, "kind": "note", "text": "x".repeat(501) })),
+        )
+        .await;
+    assert_eq!((status, code.as_str()), (400, "invalid"), "{v}");
+    assert_eq!(v["message"], LONG_NOTE);
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 2);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM api_errors WHERE source = 'server'"),
+        1
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(DISTINCT signature) FROM api_errors"),
+        1,
+        "one signature for both"
+    );
+
+    // `GET /v1/errors` counts both.
+    let log = t.ok("GET", "/v1/errors", Some(A), None).await;
+    let rows = log["signatures"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{log}");
+    assert_eq!(
+        (&rows[0]["count"], &rows[0]["agents"], &rows[0]["route"]),
+        (&json!(2), &json!(2), &json!(NOTE_ROUTE))
+    );
+    assert_eq!(rows[0]["template"], "text is N characters; the limit is N");
+}
+
+#[tokio::test]
+async fn three_client_refusals_from_two_agents_file_a_signal_item() {
+    let t = setup().await;
+    for agent in [A, A] {
+        assert_eq!(client_refusal(&t, agent, long_note()).await.0, 204);
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 0);
+    t.advance(TimeDelta::days(6));
+    assert_eq!(client_refusal(&t, B, long_note()).await.0, 204);
+    let items = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    let item = &items[0];
+    assert_eq!(item["feedback"]["source"], "signal");
+    assert_eq!(item["feedback"]["reports"], 3);
+    assert_eq!(item["feedback"]["reporters"], json!([A, B]));
+    let body = item["body"].as_str().unwrap();
+    for part in [
+        "3 requests (3 of them refused by the client before sending) from 2 agents within 7 days",
+        "Route: POST /v1/tasks/{id}/notes",
+        "text is N characters; the limit is N",
+    ] {
+        assert!(body.contains(part), "{part} missing from {body}");
+    }
+}
+
+#[tokio::test]
+async fn client_refusals_are_checked_like_any_request() {
+    let t = setup().await;
+    let with = |field: &str, value: Value| {
+        let mut body = long_note();
+        body[field] = value;
+        body
+    };
+    for (body, says) in [
+        (
+            with("code", json!("not_found")),
+            "not recorded from clients",
+        ),
+        (with("code", json!("nonsense")), "unknown variant"),
+        (
+            with("route", json!("POST /v1/tasks/{id}/nope")),
+            "is not an API route",
+        ),
+        (
+            with("route", json!("POST /v1/errors")),
+            "is not an API route",
+        ),
+        (with("message", json!(" ")), "message is empty"),
+        (with("message", json!("x\ny")), "line break"),
+        (
+            with("message", json!("x".repeat(301))),
+            "message is 301 characters; the limit is 300",
+        ),
+    ] {
+        let (status, code, v) = t.fail("POST", "/v1/errors", Some(A), Some(body)).await;
+        assert_eq!((status, code.as_str()), (400, "invalid"), "{v}");
+        assert!(v["message"].as_str().unwrap().contains(says), "{says}: {v}");
+    }
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM api_errors WHERE source = 'client'"),
+        0
+    );
+    // Without an agent, or without a valid token, nothing is recorded.
+    let (status, code, _) = t.fail("POST", "/v1/errors", None, Some(long_note())).await;
+    assert_eq!((status, code.as_str()), (400, "invalid"));
+    let (status, _) = t
+        .send(
+            "POST",
+            "/v1/errors",
+            &[("authorization", "Bearer nope"), ("x-board-agent", A)],
+            Some(long_note()),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 401);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM api_errors WHERE source = 'client'"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn every_route_a_client_may_name_is_routed() {
+    let t = setup().await;
+    for route in crate::CLIENT_ERROR_ROUTES {
+        let (method, template) = route.split_once(' ').unwrap();
+        let path = template
+            .replace("{id}", "x")
+            .replace("{slug}", "x")
+            .replace("{name}", "x");
+        let (status, v) = t.call(method, &path, Some(A), Some(json!({}))).await;
+        assert_ne!(status.as_u16(), 405, "{route}");
+        assert_ne!(v["message"], "no such endpoint", "{route}");
+    }
+}
