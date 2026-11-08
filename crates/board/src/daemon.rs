@@ -333,6 +333,8 @@ pub enum WakeAbout {
         since: Timestamp,
         noticed: Timestamp,
     },
+    /// For the coordinator: the board was paused and is active again (`board resume`).
+    Resumed,
 }
 
 impl WakeAbout {
@@ -346,6 +348,7 @@ impl WakeAbout {
             Self::Answered { .. } => "answered",
             Self::Review { .. } => "review",
             Self::Idle { .. } => "idle",
+            Self::Resumed => "resumed",
         }
     }
 }
@@ -1242,9 +1245,12 @@ impl<T: T3> Daemon<T> {
     }
 
     fn is_home(&self, board: &Board) -> bool {
-        board.autopilot
-            && board.status == BoardStatus::Active
-            && board.home_devices.contains(&self.ctx.device)
+        self.hosts(board) && board.status == BoardStatus::Active
+    }
+
+    /// An autopilot board with this device among its homes, whatever its status.
+    fn hosts(&self, board: &Board) -> bool {
+        board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
     /// Starts, renews or resumes the coordinators this device hosts.
@@ -1258,6 +1264,12 @@ impl<T: T3> Daemon<T> {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
                 self.state.pending_starts.remove(&board.slug);
+                // A paused board keeps its coordinator thread and names it still, so the
+                // server holds that thread while paused (`Snapshot::held_by`), and the same
+                // thread is woken when the board resumes instead of a new one starting.
+                if self.hosts(board) && board.status == BoardStatus::Paused {
+                    continue;
+                }
                 if self.state.coordinators.remove(&board.slug).is_some() {
                     self.release(&board.slug).await;
                 }
@@ -2376,6 +2388,20 @@ impl<T: T3> Daemon<T> {
         };
         match event.event_type {
             EventType::BoardCreated => return Ok((true, wakes)),
+            // A board paused and active again: its coordinator, which stopped when it was
+            // paused. The cached board is still paused until the reconcile this event asks
+            // for, so its coordinator is read from it whatever its status; the wake-up is
+            // checked again against the reconciled board when it is sent.
+            EventType::BoardUpdated if event.payload["status"] == "active" => {
+                let board = self.boards.get(slug).filter(|b| b.autopilot);
+                let coordinator = board
+                    .and_then(|b| b.coordinator.as_ref())
+                    .or_else(|| self.state.coordinators.get(slug).map(|c| &c.agent));
+                if let Some(to) = self.wakeable(coordinator, event) {
+                    wakes.push((slug.clone(), to.clone(), WakeAbout::Resumed));
+                }
+                return Ok((true, wakes));
+            }
             // This device's own lease claims and releases change nothing a reconcile would act on.
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
             // The server's notice that a task's owner has been away from it: the owner; the
@@ -3241,6 +3267,14 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<Option<String>> {
         let slug = &wake.board;
+        // A paused board starts no turn; the coordinator is told what to check on resume.
+        if self
+            .boards
+            .get(slug)
+            .is_some_and(|b| b.status == BoardStatus::Paused)
+        {
+            return Ok(None);
+        }
         let coordinator = self.coordinator_here(slug) == Some(agent);
         let line = match &wake.about {
             WakeAbout::Ready { task } if coordinator => {
@@ -3366,8 +3400,16 @@ impl<T: T3> Daemon<T> {
                     }
                 })
             }
+            WakeAbout::Resumed if coordinator => Some(format!(
+                "board {slug}: the user resumed this board after a pause. Read your board \
+                 snapshot and handoff, then continue. The pause stopped the threads on its \
+                 tasks in doing: send each owner thread a message to continue its task, and \
+                 restart a task only when its owner thread is gone. Check blocked tasks and \
+                 answered asks too: their wake-ups were dropped while paused"
+            )),
             // The agent is no longer this board's coordinator.
-            WakeAbout::Ready { .. }
+            WakeAbout::Resumed
+            | WakeAbout::Ready { .. }
             | WakeAbout::Cleared { .. }
             | WakeAbout::Proposal { .. }
             | WakeAbout::Review { .. }

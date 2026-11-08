@@ -659,6 +659,78 @@ fn dispatch_is_set_shown_and_checked() {
     );
 }
 
+#[test]
+fn pause_and_resume_set_every_board_or_the_named_ones() {
+    use board_proto::BoardStatus;
+    let e = env();
+    let with = |slug: &str, status: BoardStatus| {
+        let mut b = board_fixture(slug, &[]);
+        b.status = status;
+        b
+    };
+    e.stub.on(
+        "GET /v1/boards",
+        [
+            with("alpha", BoardStatus::Active),
+            with("beta", BoardStatus::Active),
+            with("gamma", BoardStatus::Paused),
+            with("old", BoardStatus::Closed),
+        ],
+    );
+    for slug in ["alpha", "beta", "gamma"] {
+        e.stub.on(
+            &format!("PATCH /v1/boards/{slug}"),
+            with(slug, BoardStatus::Paused),
+        );
+    }
+    let out = e.run(&["pause"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("paused 2 boards:"), "{text}");
+    assert!(text.contains("alpha") && text.contains("beta") && !text.contains("gamma"));
+    for slug in ["alpha", "beta"] {
+        let body = &e.stub.requests_to(&format!("PATCH /v1/boards/{slug}"))[0].body;
+        assert_eq!(body["status"], "paused", "{body}");
+        assert_eq!(body["autopilot"], Value::Null, "autopilot stays as it is");
+    }
+    assert!(e.stub.requests_to("PATCH /v1/boards/gamma").is_empty());
+    assert!(e.stub.requests_to("PATCH /v1/boards/old").is_empty());
+
+    // Resume, named: only that board, even with others paused.
+    e.stub
+        .on("PATCH /v1/boards/gamma", with("gamma", BoardStatus::Active));
+    let out = e.run(&["resume", "gamma", "gamma"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("resumed 1 board:"),
+        "{}",
+        stdout(&out)
+    );
+    let patches = e.stub.requests_to("PATCH /v1/boards/gamma");
+    assert_eq!(patches.len(), 1, "a name given twice is changed once");
+    assert_eq!(patches[0].body["status"], "active");
+
+    // Nothing to resume among the named; an unknown or closed board fails before any change.
+    let before = e.stub.requests().len();
+    let out = e.run(&["resume", "alpha"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "no boards resumed: none was paused");
+    for (args, says) in [
+        (["pause", "nope"], "no board nope"),
+        (["pause", "old"], "board old is closed"),
+    ] {
+        let out = e.run(&args);
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains(says), "{}", stderr(&out));
+    }
+    assert!(
+        e.stub.requests()[before..]
+            .iter()
+            .all(|r| r.method == "GET"),
+        "no board changed"
+    );
+}
+
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the
 /// ready tasks that wait on the user.
 #[test]

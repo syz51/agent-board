@@ -681,6 +681,11 @@ pub struct Snapshot {
     /// The event sequence this snapshot reflects; pass it as `since` next time.
     pub seq: i64,
     pub at: Timestamp,
+    /// The paused boards this agent works for, by slug: it is their coordinator, a thread
+    /// that coordinator started, or the owner of a task in `doing` on them. The hooks end
+    /// a held agent's turn. Empty, and absent from servers that predate it, otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_by: Vec<BoardSlug>,
 }
 
 /// Answer to `GET /v1/events?since=&board=&limit=`.
@@ -770,6 +775,20 @@ mod tests {
         let touches: Touches = serde_json::from_value(old.clone()).unwrap();
         assert!(!touches.scanned && touches.modified.is_empty());
         assert_eq!(serde_json::to_value(&touches).unwrap(), old);
+    }
+
+    #[test]
+    fn snapshots_from_older_servers_hold_no_one() {
+        let old = serde_json::json!({
+            "kind": "delta", "text": "", "seq": 3, "at": "2026-11-09T00:00:00Z"
+        });
+        let snap: Snapshot = serde_json::from_value(old.clone()).unwrap();
+        assert!(snap.held_by.is_empty());
+        assert_eq!(serde_json::to_value(&snap).unwrap(), old);
+        let mut held = old;
+        held["held_by"] = serde_json::json!(["factory"]);
+        let snap: Snapshot = serde_json::from_value(held).unwrap();
+        assert_eq!(snap.held_by, ["factory".parse::<BoardSlug>().unwrap()]);
     }
 
     #[test]

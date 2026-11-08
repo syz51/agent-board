@@ -76,6 +76,8 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     ("answer", "the ask object {id, status, question, ...}"),
     ("join", "the board object {slug, title, status, ...}"),
     ("boards", "a JSON array of boards"),
+    ("pause", "a JSON array of the boards it paused"),
+    ("resume", "a JSON array of the boards it resumed"),
     ("board", "see each subcommand's --help"),
     (
         "board create",
@@ -279,6 +281,18 @@ pub enum Command {
     Join { board: Option<BoardSlug> },
     /// List boards.
     Boards,
+    /// Pause all your work: every active board, or only those named. Their coordinators,
+    /// the threads they started and the agents on their tasks stop at their next hook, and
+    /// the daemon starts nothing on them. `board resume` undoes it.
+    Pause {
+        /// Boards to pause. Default: every active board.
+        boards: Vec<BoardSlug>,
+    },
+    /// Resume every paused board, or only those named; the daemon wakes their coordinators.
+    Resume {
+        /// Boards to resume. Default: every paused board.
+        boards: Vec<BoardSlug>,
+    },
     /// Create or change a board.
     #[command(subcommand)]
     Board(BoardCommand),
@@ -1166,6 +1180,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Answer { id, answer } => ops::answer(&ctx()?, id, &answer).await?,
         Command::Join { board } => ops::join(&ctx()?, board).await?,
         Command::Boards => ops::boards(&ctx()?).await?,
+        Command::Pause { boards } => {
+            ops::set_boards_status(&ctx()?, boards, BoardStatus::Active, BoardStatus::Paused)
+                .await?
+        }
+        Command::Resume { boards } => {
+            ops::set_boards_status(&ctx()?, boards, BoardStatus::Paused, BoardStatus::Active)
+                .await?
+        }
         Command::Board(BoardCommand::Create {
             slug,
             title,

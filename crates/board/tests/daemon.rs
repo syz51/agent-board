@@ -2207,6 +2207,57 @@ async fn a_coordinator_whose_lease_lapsed_is_still_woken_until_a_reconcile_settl
 }
 
 #[tokio::test]
+async fn a_paused_board_keeps_its_coordinator_and_wakes_it_on_resume() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut paused = autopilot(Some(&agent), &[DEVICE]);
+    paused.status = board_proto::BoardStatus::Paused;
+    e.stub.on("GET /v1/boards", [&paused]);
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+
+    let mut pause = event(20, EventType::BoardUpdated, None, "user");
+    pause.payload = json!({"fields": ["status"], "status": "paused"});
+    assert!(e.daemon.on_event(&pause, at()).await.unwrap());
+    let later = at() + chrono::Duration::hours(2);
+    e.daemon.reconcile(later).await.unwrap();
+    // An answer for a worker on the paused board starts no turn either.
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    e.t3.live("worker");
+    let ev = answered(&e, 21, 3, "t3:worker");
+    e.daemon.on_event(&ev, later).await.unwrap();
+    e.daemon.flush(later).await;
+    assert_eq!(releases(&e), 0, "the paused board keeps its coordinator");
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
+    assert!(e.t3.sends().is_empty(), "a pause wakes no one");
+    assert!(e.daemon.state.wakes.is_empty(), "dropped, not kept");
+    assert_eq!(starts(&e.t3), 0);
+
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    let mut resume = event(22, EventType::BoardUpdated, None, "user");
+    resume.payload = json!({"fields": ["status"], "status": "active"});
+    assert!(e.daemon.on_event(&resume, later).await.unwrap());
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.flush(later).await;
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, "coord");
+    assert!(
+        text.contains("board factory: the user resumed this board after a pause"),
+        "{text}"
+    );
+    assert_eq!(starts(&e.t3), 0, "the same thread carries on");
+}
+
+#[tokio::test]
 async fn a_paused_askers_answer_is_kept_until_its_reset() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     e.daemon.reconcile(at()).await.unwrap();
