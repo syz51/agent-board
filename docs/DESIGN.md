@@ -440,7 +440,8 @@ settings in use, warned once per edit.
     that holds its lease, or that none does, with a link. Boards found at one check share
     one message; those past its length go in the next check's message. A board is
     reported again only once it stalls anew. Boards whose lease holder is paused on a
-    usage limit are not stalled, as for stuck tasks. This catches a stopped coordinator or
+    usage limit, or ended while it waits for a reset still ahead, are not stalled, as for
+    stuck tasks. This catches a stopped coordinator or
     device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls

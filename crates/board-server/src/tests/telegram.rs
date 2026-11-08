@@ -1380,6 +1380,33 @@ async fn a_paused_or_absent_coordinator_decides_whether_a_board_stalls() {
 }
 
 #[tokio::test]
+async fn a_coordinator_ended_during_a_limit_holds_its_board_until_the_reset() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // T3 closed its session while it waited for the reset, and the daemon named it
+    // coordinator again: it keeps the reset, so the board does not stall before it.
+    let reset = t.state.now() + stalled_after() * 2;
+    pause(&t, A, Some(reset)).await;
+    end(&t, A).await;
+    autopilot(&t, "factory");
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() * 3 / 2);
+    assert!(stalled_now(&t).await.is_empty());
+
+    // From the reset on, the clock runs.
+    t.advance(stalled_after());
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    assert_eq!(stalled_now(&t).await, ["factory"]);
+}
+
+#[tokio::test]
 async fn a_new_chat_gets_the_stalled_alert_and_a_long_list_continues() {
     let (fake, api_base) = fake_api().await;
     let t = T::new();

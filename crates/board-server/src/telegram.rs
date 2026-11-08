@@ -628,7 +628,7 @@ async fn send_stalled(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedul
     if stalled.is_empty() {
         return Ok(());
     }
-    let (text, shown) = stalled_text(state, &stalled, schedule);
+    let (text, shown) = stalled_text(state, &stalled, schedule, bot.utc_offset);
     bot.send(json!({ "chat_id": chat, "text": text })).await?;
     let sent: Vec<_> = stalled
         .into_iter()
@@ -646,6 +646,7 @@ fn stalled_text(
     state: &AppState,
     stalled: &[telegram_ops::Stalled],
     schedule: &Schedule,
+    offset: FixedOffset,
 ) -> (String, usize) {
     let threshold =
         TimeDelta::seconds(i64::try_from(schedule.stalled_after_secs).unwrap_or(i64::MAX));
@@ -660,7 +661,7 @@ fn stalled_text(
         let coordinator = match &board.coordinator {
             Some((handle, agent_state, seen)) => format!(
                 "Coordinator {handle}: {agent_state}, last seen {}.",
-                local(*seen, schedule.utc_offset)
+                local(*seen, offset)
             ),
             None => "No coordinator holds the board.".to_owned(),
         };
@@ -670,7 +671,7 @@ fn stalled_text(
             board.ready,
             plural(board.ready, "task", "tasks"),
             span(state.now() - board.since),
-            local(board.since, schedule.utc_offset),
+            local(board.since, offset),
         );
         if let Some(url) = state.public_url() {
             item.push_str(&format!("{url}/boards/{}\n", board.board));

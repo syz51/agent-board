@@ -258,8 +258,9 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
              WHERE b.autopilot = 1 AND b.status = 'active' \
                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
                  AND t.status = 'doing') \
-               AND NOT (COALESCE(a.state, '') = 'paused' \
-                 AND (a.paused_until IS NULL OR a.paused_until > :now)) \
+               AND NOT (COALESCE(a.state, '') = 'paused' AND a.paused_until IS NULL) \
+               AND NOT (COALESCE(a.state, '') IN ('paused', 'ended') \
+                 AND a.paused_until > :now) \
              ORDER BY b.slug",
             ready = ready_sql("t"),
         ))?
