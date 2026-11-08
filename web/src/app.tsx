@@ -6,7 +6,6 @@ import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
 import { useOpenAsks } from "@/screens/asks.tsx";
-import { unseenCount, useUpdates } from "@/screens/updates.tsx";
 import { Count, Empty, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 
@@ -107,10 +106,8 @@ export function Nav() {
   const path = usePathname();
   const asks = useOpenAsks();
   const open = asks.data?.length ?? 0;
-  // Without the asks, the count is unknown, not zero: a dash says so.
+  // Without the asks, the count is unknown, not zero: an offline mark says so.
   const unknown = asks.data === undefined && asks.error !== null;
-  const updates = useUpdates();
-  const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
     <nav
       className="flex flex-1 gap-0.5 max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-10 max-md:h-[calc(60px+env(safe-area-inset-bottom))] max-md:gap-0 max-md:border-t max-md:bg-card max-md:px-1 max-md:pb-[env(safe-area-inset-bottom)] lg:flex-none lg:flex-col"
@@ -136,32 +133,17 @@ export function Nav() {
             />
           )}
           {item.to === "/asks" && unknown && (
-            <Count
-              value="–"
-              tone="neutral"
-              className={NAV_COUNT}
+            <span
+              className={cn(
+                NAV_COUNT,
+                "grid place-items-center text-muted-foreground max-md:bg-card",
+              )}
               title="Unknown until the connection is back"
+              role="img"
               aria-label="Count unknown until the connection is back"
-            />
-          )}
-          {/* Since you last looked is on the home page: its count says how much is new, in
-              the neutral pill, as nothing here waits on the user. */}
-          {item.to === "/" && unseen > 0 && (
-            <>
-              {/* Phones leave it out: Home's own Since you last looked counts the same, and a
-                  second badge over the tab bar's icons reads as one more alarm. */}
-              <Count
-                value={unseen}
-                tone="neutral"
-                word="new"
-                className="ml-auto max-md:hidden"
-                aria-hidden="true"
-                title={`${unseen} new since you last looked`}
-              />
-              <span className="sr-only">
-                , {unseen} unseen {unseen === 1 ? "update" : "updates"}
-              </span>
-            </>
+            >
+              <Icon name="plug" className="size-3.5" />
+            </span>
           )}
         </Link>
       ))}

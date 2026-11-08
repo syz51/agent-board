@@ -49,24 +49,15 @@ describe("navigation", () => {
     },
   );
 
-  test("Needs you counts the open asks in amber; Home its unseen updates in neutral", async () => {
+  test("Needs you counts the open asks in filled amber; Home has no count", async () => {
     await renderInApp(<Nav />, { seed });
     const open = state.asks(new URLSearchParams({ status: "open" })).length;
     const asks = screen.getByLabelText(`${open} waiting on you`);
     expect(asks.textContent).toBe(String(open));
     expect(asks.className).toMatch(/(^| )bg-amber( |$)/);
+    // Home has no count: Since you last looked, on the page itself, says what is new.
     const home = screen.getByRole("link", { name: /Home/ });
-    expect(home.textContent).toMatch(/unseen updates?$/);
-    // The same count as the home page's "Since you last looked".
-    const unseen = state.updates(none);
-    const total = unseen.done.length + unseen.said.length;
-    expect(total).toBeGreaterThan(0);
-    const count = home.querySelector("[title]");
-    expect(count?.getAttribute("title")).toBe(`${total} new since you last looked`);
-    expect(count?.textContent).toBe(`${total}new`);
-    // The same pill as the asks' count, but neutral: nothing here waits on the user.
-    expect(count?.className).toMatch(/(^| )bg-secondary( |$)/);
-    expect(count?.className).not.toMatch(/bg-amber/);
+    expect(home.textContent).toBe("Home");
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
   });
 

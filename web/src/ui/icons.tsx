@@ -181,8 +181,13 @@ export function PriorityMark({ priority, compact }: { priority: Priority; compac
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.25 text-meta tabular-nums",
-        priority === "p1" ? "font-semibold text-foreground" : "font-medium text-subtle-foreground",
+        // One weight for every level: the bars carry the level, and the label only fades.
+        "inline-flex items-center gap-1.25 text-meta font-medium tabular-nums",
+        priority === "p1"
+          ? "text-foreground"
+          : priority === "p2"
+            ? "text-subtle-foreground"
+            : "text-muted-foreground",
         compact && "justify-center",
       )}
       title={`Priority ${priority.toUpperCase()}`}

@@ -14,8 +14,9 @@ inset panel, and lists that run edge to edge across it.
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows keep the name, slug and
   badges on one line and the goal to two lines. Agents are a two-column table: who, with
-  its state, when last seen and one quiet line of where it runs; then what it is working
-  on, with its handoff.
+  its state, when last seen and one quiet line of where it runs (cut with an ellipsis,
+  whole on hover); then what it is working on, with its handoff. Priority labels share one
+  weight; the bars carry the level.
 - **Type**: Inter at 13px body, 12.5px meta, 24px page titles and 28px task titles; prose
   stops at a 100-character measure.
 - **Color and surfaces**: cool greys, a graphite primary action and one violet signal for
@@ -24,23 +25,25 @@ inset panel, and lists that run edge to edge across it.
   after a dot of each bar colour. Agent and board states are one style everywhere: a dot and
   a word, no pill.
 - **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
-  bottom tabs on phones. Every count there is one pill that changes only its colour: filled
-  amber for the total that waits on the user (Needs you), tinted amber for a board's share
-  of it, neutral for what only informs ("6 new" on Home, left off the phone tab bar). A
-  count that cannot load is a dash, and boards that cannot load are placeholder rows. On
-  a board or a task the sidebar marks the board, not Home.
-- **Home**: what the user follows, in sections they collapse and reorder: waiting asks,
-  tasks in progress across boards (Doing and Review under their own headings; the first
-  four, counted "4 of 5", with Show all in the header), the boards, and what changed since
-  they last looked. Finished tasks there are one-line rows whose
-  summary opens on demand. Needs you holds only asks, the things that wait on the user.
-  Board status groups collapse, with the chevron left of the label as on Home, and done
-  starts collapsed. What a task waits for (blockers, a start date) is muted text with an
-  icon; outlined chips are tags only. A board with nothing to filter has no filter bar.
-- **Asks**: a filled Send closes the answer group at its left, under the options and the
-  text field, so it plainly sends either; Cmd or Ctrl with Enter sends from the field. A single ask is titled with its kind ("Decision · Ask #9"),
-  across the content width with its prose at a reading measure, and its task and the asking
-  agent's handoff in matching cards beside it, or below it on narrow screens.
+  bottom tabs on phones. Counts there are what waits on the user, in one pill: filled amber
+  for the total (Needs you), tinted amber for a board's share of it. Home has no count; its
+  Since you last looked says what is new. A count that cannot load is an offline mark, and
+  boards that cannot load are placeholder rows. On a board or a task the sidebar marks the
+  board, not Home.
+- **Home**: what the user follows, in sections they collapse and reorder: waiting asks (a
+  left edge in each kind's colour, as on Needs you, and an Answer cue on hover), the boards,
+  tasks in progress across boards (Doing and Review under their own headings), and what
+  changed since they last looked. Finished tasks there are one-line rows whose summary
+  opens on demand. Needs you holds only asks, the things that wait on the user. Board
+  status groups collapse, with the chevron left of the label as on Home, and done starts
+  collapsed. What a task waits for (blockers, a start date) is muted text with an icon;
+  outlined chips are tags only. A board with nothing to filter has no filter bar. On phones
+  a task row's time sits on its title line.
+- **Asks**: a filled Send closes the answer group at its left, under the options and a
+  two-line field that grows, so it plainly sends either; Cmd or Ctrl with Enter sends from
+  the field. A single ask is titled with its kind ("Decision · Ask #9"), across the content
+  width with its prose at a reading measure, and its task and the asking agent's handoff in
+  one card beside it, split by a rule, or below it on narrow screens.
 - **Failures**: while the connection banner shows, only the banner warns; a failed page is
   a neutral placeholder that says it loads again once the connection is back; its icon
   tile stays error-tinted, so it never reads as an empty state. "Try again" is a filled

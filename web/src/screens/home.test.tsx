@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { QueryClient } from "@tanstack/react-query";
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
 import { renderInApp } from "../../test/render.tsx";
 import { queries } from "../live/query.ts";
@@ -41,42 +41,45 @@ describe("inProgress", () => {
 });
 
 describe("home", () => {
-  test("shows waiting asks, tasks in progress, boards and updates, in that order", async () => {
+  test("shows waiting asks, boards, tasks in progress and updates, in that order", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const titles = screen
       .getAllByRole("heading", { level: 2 })
       .map((heading) => heading.textContent?.replace(/\d.*$/, ""));
-    expect(titles).toEqual(["Waiting on you", "In progress", "Boards", "Since you last looked"]);
+    expect(titles).toEqual(["Waiting on you", "Boards", "In progress", "Since you last looked"]);
   });
 
-  test("shows the first tasks in progress, and all of them on Show all", async () => {
+  test("lists every task in progress, so its counts match its rows", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const progress = screen.getByRole("region", { name: /In progress/ });
     const listed = inProgress(active(), new Set());
-    expect(listed.length).toBeGreaterThan(HOME_ROWS);
-    const visible = () => listed.filter((task) => within(progress).queryByText(task.title));
-    expect(visible()).toEqual(listed.slice(0, HOME_ROWS));
-    // The counts say how many of them are listed.
+    for (const task of listed) {
+      expect(within(progress).getByText(task.title)).toBeTruthy();
+    }
     const heading = screen.getByRole("heading", { level: 2, name: /In progress/ });
-    expect(heading.textContent).toBe(`In progress${HOME_ROWS} of ${listed.length}`);
-    const review = listed.filter((task) => task.status === "review");
-    const reviewShown = listed.slice(0, HOME_ROWS).filter((task) => task.status === "review");
-    expect(within(progress).getByRole("heading", { level: 3, name: /^Review/ }).textContent).toBe(
-      `Review${reviewShown.length} of ${review.length}`,
-    );
-    const more = within(progress).getByRole("button", { name: `Show all ${listed.length}` });
-    expect(more.getAttribute("aria-expanded")).toBe("false");
-    await act(() => fireEvent.click(more));
-    expect(visible()).toEqual(listed);
     expect(heading.textContent).toBe(`In progress${listed.length}`);
-    expect(more.getAttribute("aria-expanded")).toBe("true");
-    expect(more.textContent).toBe("Show fewer");
+    expect(within(progress).queryByRole("button", { name: /^Show/ })).toBeNull();
+  });
+
+  test("marks each waiting ask's row with its kind's colour and lists at most four", async () => {
+    await renderInApp(<HomeScreen />, { seed });
+    const asks = screen.getByRole("region", { name: /Waiting on you/ });
+    const rows = within(asks)
+      .getAllByRole("link")
+      .filter((link) => link.closest("li"));
+    const open = state.asks(new URLSearchParams({ status: "open" }));
+    expect(rows.length).toBe(Math.min(open.length, HOME_ROWS));
+    for (const row of rows) {
+      const ask = open.find((item) => row.getAttribute("href") === `/asks/${item.id}`)!;
+      expect(row.className).toContain(
+        ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
+      );
+    }
   });
 
   test("splits tasks in progress into Doing and Review, each under its own heading", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const progress = screen.getByRole("region", { name: /In progress/ });
-    await act(() => fireEvent.click(within(progress).getByRole("button", { name: /^Show all/ })));
     const groups = within(progress)
       .getAllByRole("heading", { level: 3 })
       .map((heading) => heading.textContent);

@@ -124,7 +124,8 @@ export function UpdatesHeader({
 }) {
   return (
     <>
-      <span className="text-meta whitespace-nowrap text-muted-foreground">
+      {/* Phones leave the time out, so the section title keeps its room. */}
+      <span className="text-meta whitespace-nowrap text-muted-foreground max-md:hidden">
         {updates.since ? (
           <>
             Since <RelTime at={updates.since} />

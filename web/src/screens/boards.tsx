@@ -34,11 +34,12 @@ import { newestFirst, useOpenAsks } from "./asks.tsx";
 import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
 import { unseenCount, Updates, UpdatesHeader, useUpdates } from "./updates.tsx";
 
-const HOME_SECTIONS = ["asks", "progress", "boards", "updates"] as const;
+// Boards come second, so the overview is in reach without scrolling past the work in hand.
+const HOME_SECTIONS = ["asks", "boards", "progress", "updates"] as const;
 
 /**
- * Home: what waits on the user, what is in progress, what changed since they last looked,
- * and every board. Each section collapses and moves; the arrangement is kept per browser.
+ * Home: what waits on the user, every board, what is in progress and what changed since they
+ * last looked. Each section collapses and moves; the arrangement is kept per browser.
  */
 export function HomeScreen() {
   useTitle("Home");
@@ -56,8 +57,6 @@ export function HomeScreen() {
     [boards.data],
   );
   const now = useNow(60_000);
-  const progress = active.data && inProgress(active.data, closed);
-  const [allProgress, setAllProgress] = useState(false);
 
   return (
     <>
@@ -99,37 +98,12 @@ export function HomeScreen() {
               return (
                 <Section
                   title="In progress"
-                  count={
-                    progress &&
-                    (allProgress || progress.length <= HOME_ROWS
-                      ? progress.length
-                      : `${HOME_ROWS} of ${progress.length}`)
-                  }
-                  aside={
-                    // In the header, where All asks sits above, so it costs no row of its own.
-                    progress &&
-                    progress.length > HOME_ROWS && (
-                      <button
-                        type="button"
-                        className="inline-flex min-h-7 cursor-pointer items-center gap-1 text-meta font-medium text-link hover:underline max-md:min-h-11"
-                        aria-expanded={allProgress}
-                        aria-controls={PROGRESS_LIST}
-                        onClick={() => setAllProgress(!allProgress)}
-                      >
-                        {allProgress ? "Show fewer" : `Show all ${progress.length}`}
-                      </button>
-                    )
-                  }
+                  count={active.data && inProgress(active.data, closed).length}
                   {...state}
                 >
                   <QueryFrame query={active} label="Loading tasks">
                     {(list) => (
-                      <InProgress
-                        tasks={inProgress(list, closed)}
-                        all={allProgress}
-                        agents={agents}
-                        now={now}
-                      />
+                      <InProgress tasks={inProgress(list, closed)} agents={agents} now={now} />
                     )}
                   </QueryFrame>
                 </Section>
@@ -168,62 +142,47 @@ export function HomeScreen() {
   );
 }
 
-/** How many rows Home's short lists show before "Show all", so Boards stays in reach. */
+/** How many open asks Home lists; Needs you lists them all. */
 export const HOME_ROWS = 4;
-const PROGRESS_LIST = "home-progress-list";
 
 /**
  * Tasks in progress, under Doing and Review headings as on a board, so the two read apart at
- * a glance. Home shows the first few; the headings count them all.
+ * a glance.
  */
 function InProgress({
   tasks,
-  all,
   agents,
   now,
 }: {
   tasks: Task[];
-  all: boolean;
   agents: Map<string, Agent>;
   now: number;
 }) {
   if (tasks.length === 0) {
     return <p className="text-meta text-muted-foreground">No task is in progress.</p>;
   }
-  const shown = all ? tasks : tasks.slice(0, HOME_ROWS);
   const groups = (["doing", "review"] as const)
-    .map((status) => ({
-      status,
-      count: tasks.filter((task) => task.status === status).length,
-      tasks: shown.filter((task) => task.status === status),
-    }))
-    .filter((group) => group.count > 0);
+    .map((status) => ({ status, tasks: tasks.filter((task) => task.status === status) }))
+    .filter((group) => group.tasks.length > 0);
   return (
-    <div id={PROGRESS_LIST}>
-      <TaskBoard>
-        {groups.map((group) => (
-          <TaskGroupSection
-            key={group.status}
-            id={`progress-${group.status}`}
-            level={3}
-            heading={
-              <>
-                <StatusIcon status={group.status} />
-                {statusLabel(group.status)}
-              </>
-            }
-            // Where some are left out, the count says so, to match the rows listed.
-            count={
-              group.tasks.length < group.count
-                ? `${group.tasks.length} of ${group.count}`
-                : group.count
-            }
-          >
-            <TaskList tasks={group.tasks} agents={agents} now={now} />
-          </TaskGroupSection>
-        ))}
-      </TaskBoard>
-    </div>
+    <TaskBoard>
+      {groups.map((group) => (
+        <TaskGroupSection
+          key={group.status}
+          id={`progress-${group.status}`}
+          level={3}
+          heading={
+            <>
+              <StatusIcon status={group.status} />
+              {statusLabel(group.status)}
+            </>
+          }
+          count={group.tasks.length}
+        >
+          <TaskList tasks={group.tasks} agents={agents} now={now} />
+        </TaskGroupSection>
+      ))}
+    </TaskBoard>
   );
 }
 
@@ -238,8 +197,14 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
         .slice(0, HOME_ROWS)
         .map((ask) => (
           <li key={ask.id}>
+            {/* The left edge takes the kind's colour, as on the Needs you cards: these rows
+                wait on the user, unlike every other row on Home. */}
             <Link
-              className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5"
+              className={cn(
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+                ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
+              )}
               to="/asks/$id"
               params={{ id: String(ask.id) }}
             >
@@ -251,8 +216,17 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
                 {/* Tags show as code here too, as in the ask itself. */}
                 <PlainText className="[white-space:inherit]" text={plainLine(ask.question)} />
               </span>
-              <span className="text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
-                {ask.board} · <RelTime at={ask.created_at} />
+              {/* Where and when; on hover or focus, what a click does. */}
+              <span className="grid text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
+                <span className="col-start-1 row-start-1 [@media(hover:hover)]:group-hover/ask:invisible [@media(hover:hover)]:group-focus-visible/ask:invisible">
+                  {ask.board} · <RelTime at={ask.created_at} />
+                </span>
+                <span
+                  className="invisible col-start-1 row-start-1 inline-flex items-center justify-end gap-1 font-medium text-link [@media(hover:hover)]:group-hover/ask:visible [@media(hover:hover)]:group-focus-visible/ask:visible"
+                  aria-hidden="true"
+                >
+                  Answer <Icon name="arrow" className="size-3.5" />
+                </span>
               </span>
             </Link>
           </li>

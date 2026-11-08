@@ -419,7 +419,7 @@ const CELL_CLASS: Record<string, string> = {
   owner:
     "flex min-w-0 items-center overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
   updated:
-    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
+    "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated] max-md:pt-0.75",
 };
 
 export function TaskList({
@@ -445,7 +445,7 @@ export function TaskList({
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
-          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:py-2.5 max-md:[grid-template-areas:'status_main_main_main_main'_'._id_prio_owner_updated']"
+          className="relative col-span-full grid min-h-9 grid-cols-subgrid items-center gap-x-3 px-(--gutter) py-1 hover:bg-muted max-md:grid-cols-[14px_auto_auto_minmax(0,1fr)_auto] max-md:items-start max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:py-2.5 max-md:[grid-template-areas:'status_main_main_main_updated'_'._id_prio_owner_owner']"
         >
           {row.getAllCells().map((cell) => (
             <div key={cell.id} className={CELL_CLASS[cell.column.id]}>

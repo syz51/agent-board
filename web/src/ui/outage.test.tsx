@@ -119,7 +119,7 @@ describe("a page that fails to load", () => {
     }
   });
 
-  test("with nothing loaded, the sidebar shows placeholder boards and an unknown asks count", async () => {
+  test("with nothing loaded, the sidebar shows placeholder boards and an offline asks mark", async () => {
     outage();
     act(() => setConnection({ kind: "offline" }));
     await renderRoute("/boards/factory");
@@ -127,8 +127,10 @@ describe("a page that fails to load", () => {
     await screen.findByText("Boards show again once the connection is back.");
     const boards = screen.getByRole("navigation", { name: "Boards" });
     expect(boards.querySelectorAll("ul[aria-hidden=true] > li").length).toBe(3);
-    const asks = await screen.findByLabelText("Count unknown until the connection is back");
-    expect(asks.textContent).toBe("–");
+    const asks = await screen.findByRole("img", {
+      name: "Count unknown until the connection is back",
+    });
+    expect(asks.closest("a")?.textContent).toBe("Needs you");
     expect(asks.className).not.toMatch(/bg-amber/);
   });
 

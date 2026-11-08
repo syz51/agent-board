@@ -412,30 +412,24 @@ const COUNT_TONE = {
 
 /**
  * A count in a pill, the one way the sidebar and the phone tab bar show a count. Only its
- * colour changes, with what the count asks of the user. A word after the number says what
- * an informational count counts.
+ * colour changes, with what the count asks of the user.
  */
 export function Count({
   value,
   tone,
-  word,
   className,
   ...props
-}: { value: number | "–"; tone: keyof typeof COUNT_TONE; word?: string } & Omit<
-  ComponentProps<"span">,
-  "children"
->) {
+}: { value: number; tone: keyof typeof COUNT_TONE } & Omit<ComponentProps<"span">, "children">) {
   return (
     <span
       className={cn(
-        "inline-flex h-4.5 min-w-5 flex-none items-center justify-center gap-[0.25em] rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal whitespace-nowrap tabular-nums",
+        "inline-grid h-4.5 min-w-5 flex-none place-items-center rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal tabular-nums",
         COUNT_TONE[tone],
         className,
       )}
       {...props}
     >
       {value}
-      {word && <span className="font-medium">{word}</span>}
     </span>
   );
 }

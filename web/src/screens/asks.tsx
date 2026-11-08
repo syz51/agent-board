@@ -138,20 +138,21 @@ export function AskScreen() {
 /** Beside a single ask: the task it is about and the asking agent's handoff. */
 function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
   const heading = "text-xs font-semibold text-subtle-foreground";
-  // Both sections are the same card, so the column reads as one set.
-  const card = "grid content-start gap-2 rounded-lg border bg-card px-3.5 py-3";
+  const part = "grid content-start gap-2 px-3.5 py-3";
+  // One card, its sections split by a rule: stacked beside the ask on wide screens, side by
+  // side below it on medium ones.
   return (
     <aside
-      className="grid content-start items-start gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-1"
+      className="grid content-start divide-y overflow-hidden rounded-lg border bg-card sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-1 xl:divide-x-0 xl:divide-y"
       aria-label="About this ask"
     >
       {ask.task && (
-        <section className={card}>
+        <section className={part}>
           <h2 className={heading}>Task</h2>
           <AskTask id={ask.task} agents={agents} />
         </section>
       )}
-      <section className={card}>
+      <section className={part}>
         <h2 className={heading}>Asked by</h2>
         <Who id={ask.agent} agents={agents} />
         {/* As on the agents page, an ended agent's handoff is history, not context. */}
@@ -361,9 +362,9 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     </Label>
                     <Textarea
                       id={`${id}-text`}
-                      rows={1}
-                      // One line until the user writes more; it grows with the text.
-                      className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                      rows={2}
+                      // Two lines, so it reads as room to write; it grows with the text.
+                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}

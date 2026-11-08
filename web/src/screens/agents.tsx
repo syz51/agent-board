@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { Fragment } from "react";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
 import { cn } from "@/lib/utils.ts";
@@ -120,13 +119,22 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who and where it runs, then what it is
  * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[300px_minmax(0,1fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[340px_minmax(0,1fr)]";
 
 /**
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
  * coordinator, its turn endings. Narrow lists stack the two.
  */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
+  const where = [
+    agent.role === "coordinator" ? "Coordinator" : null,
+    agent.device,
+    agent.runtime,
+    agent.repo?.replace(/^github\.com\//, ""),
+    agent.branch,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
@@ -145,38 +153,28 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             seen <RelTime at={agent.last_seen} />
           </span>
         </div>
-        {/* Where it runs, as one quiet line under who it is. Lines break between values,
-            never inside one: a value too long for the column ends in an ellipsis and shows
-            whole on hover. */}
-        <p className="col-start-2 text-meta text-muted-foreground" data-slot="where">
-          {[
-            agent.role === "coordinator" ? "Coordinator" : null,
-            agent.device,
-            agent.runtime,
-            agent.repo?.replace(/^github\.com\//, ""),
-            agent.branch,
-          ]
-            .filter((part): part is string => Boolean(part))
-            .map((part, index) => (
-              <Fragment key={index}>
-                {index > 0 && " · "}
-                <span className="inline-block max-w-full truncate align-bottom" title={part}>
-                  {part}
-                </span>
-              </Fragment>
-            ))}
+        {/* Where it runs, as one quiet line under who it is; a line too long for the column
+            ends in an ellipsis and shows whole on hover. */}
+        <p
+          className="col-start-2 w-full truncate text-meta text-muted-foreground"
+          data-slot="where"
+          title={where}
+        >
+          {where}
         </p>
       </header>
       <div className="grid min-w-0 content-start gap-2">
         <p className="font-medium">
           {task ? (
+            // One run of text, so the id and the title share a line and the title wraps after
+            // it, never onto a line of its own.
             <Link
-              className="inline-flex min-h-6 flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
+              className="block min-h-6 py-0.5 text-foreground"
               to="/tasks/$id"
               params={{ id: task.id }}
             >
-              <StatusIcon status="doing" className="self-center" />
-              <span className="ident text-meta text-muted-foreground">{task.id}</span>{" "}
+              <StatusIcon status="doing" className="mr-2 inline-block align-[-2px]" />
+              <span className="ident mr-2 text-meta text-muted-foreground">{task.id}</span>
               <PlainText className="whitespace-normal" text={task.title} />
             </Link>
           ) : agent.title ? (
