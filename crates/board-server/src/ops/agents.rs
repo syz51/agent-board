@@ -79,15 +79,21 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
         )
         .optional()?;
     // The session-start hook registers every agent as a worker; an agent named as a
-    // board's coordinator keeps that role.
-    let role = if cx.exists(
+    // board's coordinator keeps that role, and the title its device's daemon gave it (the
+    // board's name), which a worker's registration (the thread's own title) would replace.
+    let coordinates = cx.exists(
         "SELECT 1 FROM boards WHERE coordinator = ?1",
         [req.id.as_str()],
-    )? {
+    )?;
+    let role = if coordinates {
         AgentRole::Coordinator
     } else {
         req.role
     };
+    let title = req
+        .title
+        .as_deref()
+        .filter(|_| !coordinates || req.role == AgentRole::Coordinator);
     let now = cx.now_ms();
     let is_new = previous.is_none();
     if is_new {
@@ -104,7 +110,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 enum_str(&req.runtime),
                 req.device.as_str(),
                 enum_str(&role),
-                req.title,
+                title,
                 repo,
                 req.branch,
                 req.cwd,
@@ -127,7 +133,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 enum_str(&req.runtime),
                 req.device.as_str(),
                 enum_str(&role),
-                req.title,
+                title,
                 repo,
                 req.branch,
                 req.cwd,

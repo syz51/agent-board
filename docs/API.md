@@ -113,7 +113,10 @@ server's minute sweep deletes older ones.
   `title` or `forked_from` left out keeps the stored one, and `native_ids` are merged into
   the stored ones. A new id with `forked_from` starts with no tasks. A device token
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
-  as a board's coordinator keeps the `coordinator` role whatever role it registers with.
+  as a board's coordinator keeps the `coordinator` role whatever role it registers with,
+  and its stored `title` unless it registers as `coordinator` (the hooks register a T3
+  thread's own title as a worker; the daemon names its coordinator after the board). The
+  hooks send a T3 thread's link as native id `t3_link`.
   Clients register on session start (hooks) and before acting when the agent is unknown.
   Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
   `agent_state_changed` event (`from` its old state, `to` `running`).

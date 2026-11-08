@@ -1817,9 +1817,143 @@ fn a_delegated_t3_thread_registers_its_parent() {
             "{thread}"
         );
     }
-    // Only the delegated thread asked T3, and only once.
+    // Each thread asked T3 once; only the delegated one keeps a parent.
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(calls, format!("thread show --json --messages 0 {CHILD}\n"));
+    assert_eq!(
+        calls,
+        format!(
+            "thread show --json --messages 0 {CHILD}\nthread show --json --messages 0 thread-7\n"
+        )
+    );
+}
+
+/// A `t3` that answers `thread show` with the JSON in `answer` and logs each call to `log`.
+#[cfg(unix)]
+fn fake_t3(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let log = dir.join("t3.log");
+    let answer = dir.join("t3-answer.json");
+    let t3 = dir.join("t3");
+    std::fs::write(
+        &t3,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncat '{}'\n",
+            log.display(),
+            answer.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (t3.to_str().unwrap().to_owned(), log, answer)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
+    const LINK: &str = "https://app.example.test/threads/env-1/thread-7";
+    let e = env();
+    let (t3, log, answer) = fake_t3(&e.home);
+    let titled = |title: &str| {
+        let body = json!({"thread": {"threadId": "thread-7", "title": title, "link": LINK}});
+        std::fs::write(&answer, body.to_string()).unwrap();
+    };
+    let calls = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let agent = "t3:thread-7";
+    let t3_env = [("T3CODE_THREAD_ID", "thread-7"), ("T3CODE_CLI_PATH", &t3)];
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    let start = |source: &str| {
+        let payload = e.with("SessionStart", json!({"source": source}));
+        e.hook_env("session-start", "claude", payload, &t3_env);
+    };
+    let stop = || {
+        let payload = e.with(
+            "Stop",
+            json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
+        );
+        e.hook_env("stop", "claude", payload, &t3_env);
+    };
+    let registered = || {
+        e.stub
+            .requests_to("POST /v1/agents")
+            .into_iter()
+            .map(|r| r.body)
+            .collect::<Vec<_>>()
+    };
+
+    // SessionStart registers the title T3 has then, and the link.
+    titled("New thread");
+    start("startup");
+    let first = registered().pop().unwrap();
+    assert_eq!(first["title"], "New thread");
+    assert_eq!(first["native_ids"]["t3_link"], LINK);
+    assert_eq!(first["native_ids"]["t3_thread"], "thread-7");
+    assert_eq!(calls(), 1);
+
+    // T3 renames the thread after its first turn: the first Stop registers the new title,
+    // before the idle update.
+    titled("Fix the parser");
+    e.stub.clear();
+    stop();
+    assert_eq!(calls(), 2);
+    let requests = e.stub.requests();
+    let routes: Vec<String> = requests
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(routes[0], "POST /v1/agents", "{routes:?}");
+    assert_eq!(requests[0].body["title"], "Fix the parser");
+    assert_eq!(requests[0].body["native_ids"]["t3_link"], LINK);
+    assert_eq!(requests[0].body["repo"], first["repo"]);
+    assert_eq!(requests[0].body["branch"], first["branch"]);
+    assert_eq!(requests[1].body["state"], "idle");
+
+    // Within the hour, no Stop asks T3 again.
+    titled("Renamed again");
+    e.stub.clear();
+    stop();
+    assert_eq!(calls(), 2);
+    assert!(registered().is_empty());
+
+    // An hour later a Stop asks again; an unchanged title sends nothing.
+    let backdate = || {
+        let path = e
+            .home
+            .join("state/sessions")
+            .join(format!("claude-{SESSION}.json"));
+        let mut cached: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hour_ago = chrono::Utc::now() - chrono::Duration::minutes(61);
+        cached["title_checked_at"] = json!(hour_ago);
+        std::fs::write(&path, cached.to_string()).unwrap();
+    };
+    titled("Fix the parser");
+    backdate();
+    stop();
+    assert_eq!(calls(), 3);
+    assert!(registered().is_empty(), "the title did not change");
+
+    // Compaction starts the session again: the cached title, without asking T3.
+    titled("Something else");
+    start("compact");
+    assert_eq!(calls(), 3);
+    assert_eq!(registered().pop().unwrap()["title"], "Fix the parser");
 }
 
 /// Runs a hook two `claude` processes deep, as a `claude -p` started from a T3 thread's
