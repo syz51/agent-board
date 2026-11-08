@@ -62,8 +62,15 @@ const CONNECT_BUDGET: Duration = Duration::from_millis(500);
 /// What a `Stop` leaves of the server share after registering a renamed thread, so the
 /// hook answers before its own deadline.
 const RENAME_MARGIN: Duration = Duration::from_millis(50);
-/// A failure to get an answer within a deadline shorter than this, because the hook's local
-/// steps took the rest of the budget, leaves the breaker as it was.
+/// How long before the request's deadline a direct connect's deadline falls when the server
+/// share leaves less than this beyond [`CONNECT_BUDGET`]: a connect that hangs then fails on
+/// its own deadline, as unreachable, instead of racing the request's.
+const CONNECT_LEAD: Duration = Duration::from_millis(100);
+/// A server share shorter than this, because the hook's local steps took the rest of the
+/// budget, is too little to judge the server: a slow answer leaves the breaker as it was, and
+/// a direct connect gets no deadline of its own, so one that hangs ends with the request, as
+/// slow. A connection that fails at once is unreachable whatever the share. At least
+/// [`CONNECT_LEAD`] plus a fair connect (well over the 0.1 s a tailnet takes).
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
@@ -390,6 +397,13 @@ async fn handle(
         }
     };
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
+    let fair = remaining >= SERVER_SHARE_FAIR;
+    tracing::debug!(
+        "hook {}: server share {}ms{}",
+        event.name(),
+        remaining.as_millis(),
+        if fair { "" } else { ", too little to judge" }
+    );
     let deadline = tokio::time::Instant::now() + remaining.saturating_sub(RENAME_MARGIN);
     let relayed = matches!(route, Route::Relay(_));
     let client = match route {
@@ -397,7 +411,13 @@ async fn handle(
             .with_agent(Some(agent.clone()))
             .with_timeout(remaining),
         Route::Direct(token) => {
-            let connect = CONNECT_BUDGET.min(remaining);
+            // The connect's deadline never races the request's: it falls well before it, or,
+            // with too little time to judge, past it, so a connect that hangs reads as slow.
+            let connect = if fair {
+                CONNECT_BUDGET.min(remaining - CONNECT_LEAD)
+            } else {
+                BUDGET
+            };
             Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
         }
     };
@@ -474,8 +494,8 @@ async fn handle(
     let next = match failure {
         // The relay failed, not the server.
         _ if !judged => breaker.clone(),
-        // This device left the server too little time to judge it.
-        Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
+        // This device left the server too little time to judge it slow.
+        Some(Failure::Slow) if !fair => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
@@ -537,14 +557,14 @@ enum Failure {
     /// The server did not answer within the hook's budget. It may be busy, or this device
     /// may be; board tools and the CLI, which wait longer, still work.
     Slow,
-    /// The connection failed: refused, DNS, TLS, or not open within [`CONNECT_BUDGET`].
-    /// The server cannot take writes now.
+    /// The connection failed: refused, DNS, TLS, or not open within its deadline (at most
+    /// [`CONNECT_BUDGET`]). The server cannot take writes now.
     Unreachable,
 }
 
 impl Failure {
-    /// A request that timed out after it connected is slow; any other failure to get an
-    /// answer is unreachable, a connection not opened within [`CONNECT_BUDGET`] included.
+    /// A request that timed out, unless on the connect's own deadline, is slow; any other
+    /// failure to get an answer is unreachable, a connect that timed out included.
     fn of(err: &anyhow::Error) -> Self {
         match relay_failure(err) {
             Some(RelayFailure::Slow) => return Self::Slow,
