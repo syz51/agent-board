@@ -783,6 +783,9 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
             format!("its owner is stale: take it with {}", take_hint(id))
         } else if task.status.is_closed() {
             format!("reopen it first (task_update {id} status=open) if it needs more work")
+        } else if owned_by_me {
+            // Review and blocked: the owner resumes its own task rather than claiming it.
+            format!("you own it: resume it with task_update {id} status=doing")
         } else {
             "pick another task from ready (task_list ready=true)".to_owned()
         };

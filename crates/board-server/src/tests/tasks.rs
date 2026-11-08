@@ -505,6 +505,56 @@ async fn claims_follow_ownership_blockers_and_the_doing_limit() {
 }
 
 #[tokio::test]
+async fn a_parked_task_s_owner_is_told_to_resume_it_and_others_see_the_owner() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+    let reviewed = t.task(A, "factory", "In review").await;
+    let blocked = t.task(A, "factory", "Blocked").await;
+    for (id, park) in [
+        (&reviewed, json!({ "status": "review" })),
+        (
+            &blocked,
+            json!({ "status": "blocked", "blocked_reason": "waiting" }),
+        ),
+    ] {
+        assert!(t.claim(A, id).await.0.is_success());
+        let (s, v) = t.patch(A, id, park).await;
+        assert!(s.is_success(), "{v}");
+
+        // The owner's claim is refused, and the hint resumes it instead.
+        let (s, v) = t.claim(A, id).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (400, Some("invalid_transition")),
+            "{v}"
+        );
+        let next = v["next"].as_str().unwrap();
+        assert!(
+            next.contains(&format!("task_update {id} status=doing")) && !next.contains("ready"),
+            "{v}"
+        );
+
+        // Another agent is told who owns it.
+        let (s, v) = t.claim(B, id).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (409, Some("claim_refused"))
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("owns {id}")),
+            "{v}"
+        );
+
+        // The hint works: the owner resumes it.
+        let (s, v) = t.patch(A, id, json!({ "status": "doing" })).await;
+        assert!(s.is_success(), "{v}");
+        assert_eq!(v["status"], "doing");
+    }
+}
+
+#[tokio::test]
 async fn fifty_concurrent_claims_have_one_winner() {
     let t = T::new();
     t.board("factory", &[]).await;
