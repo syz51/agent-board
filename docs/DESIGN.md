@@ -254,6 +254,16 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
+  of the standing prompt it briefed the thread with. When that prompt changes (`board` is
+  upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
+  the triage prompt), a reconcile that keeps the coordinator alive sends it one message
+  with the new prompt in full, then records the new digest. The message follows the
+  wake-up rules: it is held while the coordinator is paused, or runs and was seen within
+  `WAKE_HOLD_MAX`; a send that timed out may have got through, so it counts as sent; a
+  failed send backs off from 30 seconds up to 10 minutes, and makes the next reconcile ask
+  T3 whether the thread is gone. A record without a digest (from before this rule), or a
+  thread an earlier unfinished start launched, counts as changed, so it is briefed once.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live

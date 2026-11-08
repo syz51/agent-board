@@ -429,6 +429,13 @@ pub struct Coordinator {
     /// Whether the thread's agent is registered; false right after the thread started.
     #[serde(default = "registered_default")]
     pub registered: bool,
+    /// [`prompt_digest`] of the standing prompt the thread was last briefed with. A record
+    /// without it predates the field, so its prompt counts as changed and is sent once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub briefed: Option<String>,
+    /// Set after a failed re-brief: it is not sent again before `retry_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebrief_backoff: Option<Backoff>,
 }
 
 /// Records written before this field existed were registered before they were saved.
@@ -874,8 +881,80 @@ impl<T: T3> Daemon<T> {
                 .await?;
             local.resumed_after = Some(until);
         }
+        self.rebrief(&board.slug, &mut local, &info, now).await;
         self.state.coordinators.insert(board.slug.clone(), local);
         Ok(())
+    }
+
+    /// Sends a live coordinator the standing prompt again when it changed since the thread
+    /// was briefed (`board` was upgraded, or `feedback_board` changed), once. Held while the
+    /// coordinator is paused, or runs and was seen within [`WAKE_HOLD_MAX`], so it lands
+    /// between turns. Like a wake-up: a send that timed out counts as sent, a failed one
+    /// backs off, and either makes the next reconcile ask T3 whether the thread is gone.
+    async fn rebrief(
+        &mut self,
+        slug: &BoardSlug,
+        local: &mut Coordinator,
+        info: &Agent,
+        now: Timestamp,
+    ) {
+        let triage = self.triages(slug);
+        let digest = prompt_digest(triage);
+        let held = match info.state {
+            AgentState::Paused => true,
+            AgentState::Running => now - info.last_seen < WAKE_HOLD_MAX,
+            _ => false,
+        };
+        if local.briefed.as_deref() == Some(digest)
+            || held
+            || local
+                .rebrief_backoff
+                .as_ref()
+                .is_some_and(|b| now < b.retry_at)
+        {
+            return;
+        }
+        let sent = self
+            .send_wake(&local.agent, &rebrief_message(slug, triage))
+            .await;
+        if !matches!(sent, Sent::Delivered) {
+            self.threads_live.remove(local.agent.native());
+        }
+        match sent {
+            Sent::Delivered => {
+                tracing::info!(
+                    "re-briefed {} of {slug}: its standing prompt changed",
+                    local.agent
+                );
+                local.briefed = Some(digest.to_owned());
+                local.rebrief_backoff = None;
+            }
+            Sent::MaybeDelivered(err) => {
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; not sent again, since T3 may have delivered it",
+                    local.agent
+                );
+                local.briefed = Some(digest.to_owned());
+                local.rebrief_backoff = None;
+            }
+            Sent::Gone(err) | Sent::Failed(err) => {
+                let last = local
+                    .rebrief_backoff
+                    .as_ref()
+                    .map(|b| TimeDelta::seconds(b.delay_secs));
+                let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; trying again in {}s",
+                    local.agent,
+                    delay.num_seconds()
+                );
+                local.rebrief_backoff = Some(Backoff {
+                    delay_secs: delay.num_seconds(),
+                    retry_at: now + delay,
+                    lookup: false,
+                });
+            }
+        }
     }
 
     /// Names a live thread of ours the board's coordinator: registers its agent when that
@@ -997,8 +1076,8 @@ impl<T: T3> Daemon<T> {
             Err(err) => return Err(err),
         }
         let started = self.start_or_find_thread(slug, &project, now).await;
-        let thread = match started {
-            Ok(thread) => thread,
+        let (thread, briefed) = match started {
+            Ok(started) => started,
             Err(err) => {
                 self.release(slug).await;
                 return Err(err);
@@ -1019,6 +1098,9 @@ impl<T: T3> Daemon<T> {
             renewed_at: now,
             resumed_after: None,
             registered: false,
+            // A thread an earlier start launched may hold another prompt: re-brief it.
+            briefed: briefed.then(|| prompt_digest(self.triages(slug)).to_owned()),
+            rebrief_backoff: None,
         };
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -1031,13 +1113,15 @@ impl<T: T3> Daemon<T> {
     /// any, else a new one. An earlier start is unfinished when its pending mark is still
     /// saved (the daemon was killed, or `t3` failed or timed out, after the mark was written);
     /// a thread with the coordinator title created since then is its thread. One that never
-    /// ran is briefed first. Threads older than the mark are never taken.
+    /// ran is briefed first. Threads older than the mark are never taken. The flag says
+    /// whether this binary briefed the thread; one that ran was briefed by the earlier start,
+    /// maybe with another prompt.
     async fn start_or_find_thread(
         &mut self,
         slug: &BoardSlug,
         project: &Path,
         now: Timestamp,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         let title = coordinator_title(slug);
         let message = coordinator_message(slug, self.triages(slug));
         if let Some(&since) = self.state.pending_starts.get(slug) {
@@ -1055,7 +1139,7 @@ impl<T: T3> Daemon<T> {
                         "coordinator of {slug}: adopting thread {}, which a start at {since} launched but did not record",
                         thread.id
                     );
-                    return Ok(thread.id);
+                    return Ok((thread.id, false));
                 }
                 tracing::warn!(
                     "coordinator of {slug}: briefing thread {}, which a start at {since} created but did not send its message",
@@ -1069,13 +1153,14 @@ impl<T: T3> Daemon<T> {
                         thread.id
                     )));
                 }
-                return Ok(thread.id);
+                return Ok((thread.id, true));
             }
         }
         // On disk before T3 can create the thread.
         self.state.pending_starts.entry(slug.clone()).or_insert(now);
         self.save()?;
-        self.t3.start_thread(project, &title, &message).await
+        let thread = self.t3.start_thread(project, &title, &message).await?;
+        Ok((thread, true))
     }
 
     /// Makes the existing thread named by `board board adopt` the board's coordinator: like
@@ -1163,6 +1248,8 @@ impl<T: T3> Daemon<T> {
             renewed_at: now,
             resumed_after: None,
             registered,
+            briefed: Some(prompt_digest(self.triages(slug)).to_owned()),
+            rebrief_backoff: None,
         };
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -1986,6 +2073,24 @@ fn standing_prompt(triage: bool) -> String {
     } else {
         COORDINATOR_PROMPT.to_owned()
     }
+}
+
+/// A digest of the standing prompt for `triage`, as hex: a coordinator briefed with another
+/// one gets [`rebrief_message`]. Both prompts are compiled in, so each is hashed once.
+pub fn prompt_digest(triage: bool) -> &'static str {
+    use sha2::{Digest as _, Sha256};
+    static DIGESTS: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [false, true].map(|triage| crate::config::hex(&Sha256::digest(standing_prompt(triage))))
+    });
+    &DIGESTS[usize::from(triage)]
+}
+
+/// The message that gives a running coordinator its changed standing prompt in full.
+pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
+    format!(
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot."
+    )
 }
 
 /// The first message of a coordinator thread; `triage` for the device's feedback board.

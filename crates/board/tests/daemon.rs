@@ -481,6 +481,8 @@ fn coordinator_env(
             renewed_at: at(),
             resumed_after: None,
             registered: true,
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -1794,6 +1796,11 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
         "no thread of this start is left idle"
     );
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // This binary briefed it.
+    assert_eq!(
+        e.daemon.state.coordinators[&factory()].briefed.as_deref(),
+        Some(board::daemon::prompt_digest(false))
+    );
     assert!(saved_state(&e).pending_starts.is_empty());
     let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
     assert_eq!(claims.last().unwrap().body["agent"], format!("t3:{ORPHAN}"));
@@ -1814,6 +1821,8 @@ async fn a_start_that_timed_out_after_delivery_adopts_its_thread_without_briefin
     assert_eq!(starts(&e.t3), 1, "no second thread");
     assert!(e.t3.sends().is_empty(), "its message already got through");
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // The earlier start briefed it, maybe with another prompt: it is re-briefed.
+    assert_eq!(e.daemon.state.coordinators[&factory()].briefed, None);
     assert!(e.daemon.state.pending_starts.is_empty());
 }
 
@@ -2578,7 +2587,16 @@ fn the_coordinator_prompt_files_what_remains_before_task_done() {
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
-async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
+async fn start_with(board: Board, config: Config) -> (FakeT3, Stub) {
+    let (t3, stub, _, _) = start_daemon(board, config).await;
+    (t3, stub)
+}
+
+/// [`start_with`], keeping the daemon and its home.
+async fn start_daemon(
+    mut board: Board,
+    config: Config,
+) -> (FakeT3, Stub, Daemon<FakeT3>, tempfile::TempDir) {
     board.autopilot = true;
     board.home_devices = vec![DEVICE.parse().unwrap()];
     let slug = board.slug.clone();
@@ -2602,8 +2620,9 @@ async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
         },
         repo: RepoInfo::default(),
     };
-    Daemon::new(ctx, t3.clone()).reconcile(at()).await.unwrap();
-    (t3, stub)
+    let mut daemon = Daemon::new(ctx, t3.clone());
+    daemon.reconcile(at()).await.unwrap();
+    (t3, stub, daemon, dir)
 }
 
 fn started(t3: &FakeT3) -> (PathBuf, String) {
@@ -3028,6 +3047,8 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
                 renewed_at: at(),
                 resumed_after: None,
                 registered: true,
+                briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+                rebrief_backoff: None,
             },
         );
         let mut board = autopilot(Some(&agent), &[DEVICE]);
@@ -3428,6 +3449,8 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             renewed_at: at(),
             resumed_after: None,
             registered: true,
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -3455,5 +3478,126 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             .len(),
         1,
         "the due lease was renewed"
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    // Briefed before this version, or with an older prompt.
+    for old in [None, Some("0123".to_owned())] {
+        e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = old;
+        let before = e.t3.sends().len();
+        e.daemon.reconcile(at()).await.unwrap();
+        let sends = e.t3.sends();
+        assert_eq!(sends.len(), before + 1);
+        let (thread, text) = sends.last().unwrap();
+        assert_eq!(thread, "coord");
+        assert_eq!(*text, board::daemon::rebrief_message(&slug, false));
+        assert!(text.contains(board::daemon::COORDINATOR_PROMPT));
+        assert!(!text.contains("# Triage"));
+        assert_eq!(
+            e.daemon.state.coordinators[&slug].briefed,
+            Some(board::daemon::prompt_digest(false).to_owned())
+        );
+        // Saved, so a restart does not send it again.
+        let home = Home::at(e._dir.path().join("home"));
+        assert_eq!(
+            board::daemon::load_watch_state(&home).coordinators[&slug].briefed,
+            Some(board::daemon::prompt_digest(false).to_owned())
+        );
+        // Briefed with the current prompt: later reconciles send nothing.
+        e.daemon.reconcile(at()).await.unwrap();
+        assert_eq!(e.t3.sends().len(), before + 1);
+    }
+
+    // Held while the coordinator is paused, or runs and was seen lately.
+    let briefed = |e: &Env| e.daemon.state.coordinators[&slug].briefed.clone();
+    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    for held in [AgentState::Running, AgentState::Paused] {
+        let mut info = agent_fixture(&agent, DEVICE, held);
+        info.paused_until = None;
+        e.stub.on(&format!("GET {}", agent_path(&agent)), &info);
+        e.daemon.reconcile(at()).await.unwrap();
+        assert_eq!(e.t3.sends().len(), 2, "{held:?}");
+    }
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    // A failed send backs off, then is tried again.
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    assert_eq!(briefed(&e), None);
+    assert_eq!(e.t3.sends().len(), 3);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.sends().len(), 3, "backing off");
+    let later = at() + chrono::Duration::seconds(31);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 4);
+    assert_eq!(briefed(&e), current);
+
+    // Marked running but not seen for longer than a wake-up is held: sent.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    let mut stuck = agent_fixture(&agent, DEVICE, AgentState::Running);
+    stuck.last_seen = later - board::daemon::WAKE_HOLD_MAX - chrono::Duration::seconds(1);
+    e.stub.on(&format!("GET {}", agent_path(&agent)), &stuck);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 5);
+    assert_eq!(briefed(&e), current);
+
+    // A send that timed out may have got through: it counts as sent and is not repeated.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(later).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends().len(), 6);
+    assert_eq!(briefed(&e), current);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 6);
+}
+
+#[tokio::test]
+async fn the_feedback_boards_coordinator_is_re_briefed_with_the_triage_prompt() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    // This device's feedback board, set by editing config.toml while the daemon runs.
+    let home = Home::at(e._dir.path().join("home"));
+    std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+    std::fs::write(home.config_path(), "feedback_board = \"factory\"\n").unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].1, board::daemon::rebrief_message(&slug, true));
+    assert!(sends[0].1.contains(board::daemon::TRIAGE_PROMPT));
+    assert_eq!(
+        e.daemon.state.coordinators[&slug].briefed,
+        Some(board::daemon::prompt_digest(true).to_owned())
+    );
+    assert_ne!(
+        board::daemon::prompt_digest(true),
+        board::daemon::prompt_digest(false)
+    );
+}
+
+#[tokio::test]
+async fn a_started_coordinator_is_recorded_as_briefed_with_the_current_prompt() {
+    let (_, _, daemon, _dir) = start_daemon(
+        board_fixture("factory", &[REPO]),
+        Config {
+            projects: projects(),
+            ..Config::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        daemon.state.coordinators[&factory()].briefed,
+        Some(board::daemon::prompt_digest(false).to_owned())
     );
 }
