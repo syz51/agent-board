@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use crate::config::Settings;
 use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
-use crate::ops::{expires, join_board, note_agent_seen, touch_agent};
-use crate::store::{board_missing, get_board};
+use crate::ops::{expires, join_board, touch_agent};
+use crate::store::{agent_missing, board_missing, get_board};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
 use board_proto::{BOARD_TITLE_LONGER_TEXT_GOES, PARALLEL_TASKS_MAX};
 
@@ -499,8 +499,16 @@ pub(crate) fn claim_coordinator(
         ));
     }
     if let Some(agent) = &req.agent {
-        // A device claims the lease for the agent: no sign the agent itself is at work.
-        note_agent_seen(cx, agent)?;
+        // A device claims or renews the lease for the agent: no sign the agent itself is at
+        // work, so its last_seen stays, and an agent left marked running is found away.
+        let known: bool = cx.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+            [agent.as_str()],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(agent_missing(agent));
+        }
         join_board(cx, slug, agent)?;
         cx.db.execute(
             "UPDATE agents SET role = 'coordinator' WHERE id = ?1",

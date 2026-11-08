@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 use board_proto::{
-    Agent, AgentId, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot, SnapshotFormat,
-    SnapshotKind, StatusCounts, Task, TaskId, TaskStatus,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot,
+    SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -45,8 +45,9 @@ const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
 /// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
 /// reminders (at most one per task a day) all pass, as a coordinator gets those of its
-/// board's tasks whose owner is gone.
-const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
+/// board's tasks whose owner is gone; idle-owner notices pass for the agent's own tasks and
+/// the boards it coordinates.
+pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
      OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
@@ -56,6 +57,9 @@ const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \
       AND board IN (SELECT slug FROM boards WHERE coordinator = :me)) \
      OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.idle_doing') IS NOT NULL \
+      AND (task IN (SELECT value FROM json_each(:mine)) \
+           OR board IN (SELECT slug FROM boards WHERE coordinator = :me))) \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
      OR (type = 'task_created' AND :any_mine))";
@@ -639,6 +643,10 @@ fn describe(event: &Event) -> Option<String> {
                 let to: TaskStatus = serde_json::from_value(to.clone()).ok()?;
                 format!("moved {} to {}", task?, status_str(to))
             }
+            // The server's notice that the task's owner is away from it.
+            None if p.get("idle_doing").is_some() => {
+                format!("found {} away from {}", p.get("away")?.as_str()?, task?)
+            }
             // A handover without a status change.
             None => format!("handed {} to {}", task?, p.get("owner")?.as_str()?),
         },
@@ -739,8 +747,10 @@ const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
 /// A task left quiet in review: a reminder, so after the alerts about change.
 const QUIET_REVIEW: u8 = 6;
+/// A task left in doing while its owner was away: a reminder, like a quiet review.
+const IDLE_DOING: u8 = 7;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
-const FILED: u8 = 7;
+const FILED: u8 = 8;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -1000,6 +1010,32 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                             "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
                         ),
                         rank: rank(QUIET_REVIEW),
+                    },
+                );
+            }
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let Some(task) = &event.task else { continue };
+                let Some(away) = event.payload.get("away").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let since = event
+                    .payload
+                    .get("idle_doing")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                if !idle_notice_for(cx, task, away, since, me)? {
+                    continue;
+                }
+                let since = since.map_or_else(|| "a while".to_owned(), |at| ago(cx.now - at));
+                let away = actor_name(cx, away, &mut handles)?;
+                out.insert(
+                    (IDLE_DOING, task.to_string()),
+                    Alert {
+                        alert: format!("{task} sat in doing while {away} was away for {since}"),
+                        action: format!(
+                            "continue {task}, or park it by what it waits on: review with a note naming the PR, blocked with the reason, or open with a handoff"
+                        ),
+                        rank: rank(IDLE_DOING),
                     },
                 );
             }
@@ -1273,6 +1309,48 @@ fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str])
     };
     let board: BoardSlug = parse_id(&board)?;
     Ok(gone
+        && get_board(cx, &board)?
+            .coordinator
+            .is_some_and(|c| c.as_str() == me))
+}
+
+/// Whether `me` is told of the server's notice that `away` has been away from `task` since
+/// `since`. Only while the task is still in `doing` and still `away`'s. Then `away` itself
+/// is told, and so is the coordinator of the task's board when `away` is no T3 thread (no
+/// daemon can wake it) or has been away at least twice `doing_idle_secs`: T3 closes an
+/// idle session after 30 minutes while the daemon still wakes its thread, so the owner gets
+/// the first turn.
+fn idle_notice_for(
+    cx: &Ctx<'_>,
+    task: &TaskId,
+    away: &str,
+    since: Option<Timestamp>,
+    me: &str,
+) -> Result<bool> {
+    let row: Option<(Option<String>, String, String)> = cx
+        .db
+        .query_row(
+            "SELECT owner, board, status FROM tasks WHERE id = ?1",
+            [task.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((owner, board, status)) = row else {
+        return Ok(false);
+    };
+    if status != "doing" || owner.as_deref() != Some(away) {
+        return Ok(false);
+    }
+    if away == me {
+        return Ok(true);
+    }
+    let t3 = away
+        .parse::<AgentId>()
+        .is_ok_and(|a| a.source() == AgentSource::T3);
+    let long =
+        since.is_some_and(|s| cx.now - s >= TimeDelta::milliseconds(2 * cx.s.doing_idle_ms()));
+    let board: BoardSlug = parse_id(&board)?;
+    Ok((!t3 || long)
         && get_board(cx, &board)?
             .coordinator
             .is_some_and(|c| c.as_str() == me))
