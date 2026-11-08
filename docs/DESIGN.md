@@ -94,6 +94,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Waiting states**: `review` is where a task waits on CI or a reviewer, with a note naming
   the PR; `blocked` is where it waits on another task or the user (an ask), or on anything
   else with a `blocked_reason`; a wait for a date alone is an `open` task with `not_before`.
+  A `not_before` still ahead holds a `blocked` or `review` task out of `doing` too, as it
+  holds a claim; only an `open` task's date is announced when it passes.
   `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator

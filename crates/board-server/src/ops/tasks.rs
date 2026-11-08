@@ -78,7 +78,9 @@ pub(crate) fn validate_create(req: &CreateTask, s: &Settings) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_update(req: &UpdateTask, s: &Settings) -> Result<()> {
+/// Checks a `PATCH` body and returns it as `update` takes it: a blank `blocked_reason`,
+/// which clients send for "no reason", is read as absent, so it changes nothing.
+pub(crate) fn validate_update(mut req: UpdateTask, s: &Settings) -> Result<UpdateTask> {
     if let Some(title) = &req.title {
         check_line("title", title, s.title_chars)?;
     }
@@ -87,8 +89,8 @@ pub(crate) fn validate_update(req: &UpdateTask, s: &Settings) -> Result<()> {
         req.body.as_deref().unwrap_or(""),
         req.acceptance.as_deref().unwrap_or(""),
     )?;
-    // A blank reason means none, as `update` reads it: it clears the reason.
-    if let Some(reason) = req.blocked_reason.as_ref().filter(|r| !r.trim().is_empty()) {
+    req.blocked_reason = req.blocked_reason.filter(|r| !r.trim().is_empty());
+    if let Some(reason) = &req.blocked_reason {
         check_line("blocked_reason", reason, s.note_chars)?;
     }
     if req.blockers.as_ref().is_some_and(|b| b.len() > 20) {
@@ -97,7 +99,7 @@ pub(crate) fn validate_update(req: &UpdateTask, s: &Settings) -> Result<()> {
             "split the task, or depend on a parent task instead",
         ));
     }
-    Ok(())
+    Ok(req)
 }
 
 pub(crate) fn validate_done(req: &DoneTask, id: &TaskId) -> Result<()> {
@@ -342,17 +344,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
 /// claim checks: no blocker left to finish, no `not_before` ahead, and room in the
 /// creator's `doing` limit. Checked before anything is written.
 fn check_claimable_new(cx: &Ctx<'_>, req: &CreateTask, blockers: &[TaskId]) -> Result<()> {
-    let mut waiting: Vec<String> = Vec::new();
-    for b in blockers {
-        let status: String = cx.db.query_row(
-            "SELECT status FROM tasks WHERE id = ?1",
-            [b.as_str()],
-            |r| r.get(0),
-        )?;
-        if status != "done" {
-            waiting.push(format!("{b} ({status})"));
-        }
-    }
+    let waiting = undone_blockers(cx, blockers)?;
     if !waiting.is_empty() {
         return Err(bad_transition(
             format!(
@@ -1224,45 +1216,47 @@ fn check_ready_to_start(
     blockers: &[TaskId],
     not_before: Option<Timestamp>,
 ) -> Result<()> {
-    let mut waiting: Vec<String> = Vec::new();
+    let waiting = undone_blockers(cx, blockers)?;
+    // Both waits at once, so one refusal names everything that holds the task.
+    let mut waits: Vec<String> = Vec::new();
+    let mut drop: Vec<&str> = Vec::new();
+    if !waiting.is_empty() {
+        waits.push(format!("on {}", waiting.join(", ")));
+        drop.push("blockers=[the rest]");
+    }
+    if let Some(at) = not_before.filter(|&at| at > cx.now) {
+        waits.push(format!("until {}", at.format("%Y-%m-%d %H:%MZ")));
+        drop.push("not_before=none");
+    }
+    if waits.is_empty() {
+        return Ok(());
+    }
+    Err(bad_transition(
+        format!(
+            "{id} waits {}, so it cannot move to doing",
+            waits.join(" and ")
+        ),
+        format!(
+            "wait until that ends, or drop what it no longer waits on in the same request \
+             (task_update {id} status=doing {})",
+            drop.join(" ")
+        ),
+    ))
+}
+
+/// The tasks in `blockers` that are not done, each as `id (status)`.
+fn undone_blockers(cx: &Ctx<'_>, blockers: &[TaskId]) -> Result<Vec<String>> {
+    let mut statement = cx
+        .db
+        .prepare_cached("SELECT status FROM tasks WHERE id = ?1 AND status != 'done'")?;
+    let mut waiting = Vec::new();
     for b in blockers {
-        let status: Option<String> = cx
-            .db
-            .query_row(
-                "SELECT status FROM tasks WHERE id = ?1",
-                [b.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(status) = status.filter(|s| s != "done") {
+        let status: Option<String> = statement.query_row([b.as_str()], |r| r.get(0)).optional()?;
+        if let Some(status) = status {
             waiting.push(format!("{b} ({status})"));
         }
     }
-    if !waiting.is_empty() {
-        return Err(bad_transition(
-            format!(
-                "{id} waits on {}, so it cannot move to doing",
-                waiting.join(", ")
-            ),
-            format!(
-                "help finish them, or drop the ones it no longer waits on in the same request \
-                 (task_update {id} status=doing blockers=[the rest])"
-            ),
-        ));
-    }
-    if let Some(at) = not_before.filter(|&at| at > cx.now) {
-        return Err(bad_transition(
-            format!(
-                "{id} waits until {}, so it cannot move to doing",
-                at.format("%Y-%m-%d %H:%MZ")
-            ),
-            format!(
-                "wait until then, or clear it in the same request if it should start now \
-                 (task_update {id} status=doing not_before=none)"
-            ),
-        ));
-    }
-    Ok(())
+    Ok(waiting)
 }
 
 pub(crate) fn update(
@@ -1350,13 +1344,6 @@ pub(crate) fn update(
         check_handover(cx, &task, agent, by_user, target, owner.is_some(), to)?;
         owner = Some(target.clone());
     }
-    // A task entering doing, or changing hands in doing, counts against its owner's limit.
-    if let Some(worker) = owner
-        .as_ref()
-        .filter(|_| to == TaskStatus::Doing && (from != to || owner != task.owner))
-    {
-        check_owner_doing_limit(cx, worker, agent, id)?;
-    }
     if owner != task.owner {
         fields.push("owner");
     }
@@ -1374,25 +1361,13 @@ pub(crate) fn update(
         None => task.blockers.clone(),
     };
 
+    // Blank reasons were read as absent at the boundary; stored ones are never blank.
     let blocked_reason = if to == TaskStatus::Blocked {
         let reason = req
             .blocked_reason
             .clone()
-            .or_else(|| task.blocked_reason.clone())
-            .filter(|r| !r.trim().is_empty());
-        let mut undone = false;
-        for b in &blockers {
-            let status: Option<String> = cx
-                .db
-                .query_row(
-                    "SELECT status FROM tasks WHERE id = ?1",
-                    [b.as_str()],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            undone |= status.is_some_and(|s| s != "done");
-        }
-        if reason.is_none() && !undone {
+            .or_else(|| task.blocked_reason.clone());
+        if reason.is_none() && undone_blockers(cx, &blockers)?.is_empty() {
             return Err(invalid(
                 format!("blocked needs a reason or a blocker that is not done ({id})"),
                 "send blocked_reason, or blockers naming the tasks it waits on",
@@ -1400,11 +1375,7 @@ pub(crate) fn update(
         }
         reason
     } else {
-        if req
-            .blocked_reason
-            .as_ref()
-            .is_some_and(|r| !r.trim().is_empty())
-        {
+        if req.blocked_reason.is_some() {
             return Err(invalid(
                 "blocked_reason applies only to blocked tasks",
                 format!("send status=blocked with the reason, or leave blocked_reason out ({id})"),
@@ -1445,9 +1416,17 @@ pub(crate) fn update(
         fields.push("not_before");
     }
     // Starting work waits as a claim does, on what the task names after this request: the
-    // same request may remove the blockers or the not_before it no longer waits on.
+    // same request may remove the blockers or the not_before it no longer waits on. Checked
+    // before the doing limit, as a claim does, so no task is parked for a refused move.
     if to == TaskStatus::Doing && from != TaskStatus::Doing {
         check_ready_to_start(cx, id, &blockers, not_before)?;
+    }
+    // A task entering doing, or changing hands in doing, counts against its owner's limit.
+    if let Some(worker) = owner
+        .as_ref()
+        .filter(|_| to == TaskStatus::Doing && (from != to || owner != task.owner))
+    {
+        check_owner_doing_limit(cx, worker, agent, id)?;
     }
     if fields.is_empty() {
         return Ok(task);

@@ -432,12 +432,14 @@ browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 (`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
-`owner` and `previous_owner`. Like a claim, a move to `doing` (from `blocked` or `review`)
-is refused with 400 `invalid_transition` while a blocker is not done or `not_before` has
-not passed. The check reads the task as the request leaves it, so the same request may
-drop those blockers (`blockers`) or clear `not_before` (`null`); `next` says which. A `blocked` task nobody owns is refused a move to `review`
-with 400 `invalid_transition` (`next` says to resume it first): a task in `review` has an
-owner to finish it, who brought it through `doing`.
+`owner` and `previous_owner`. Like a claim, a move to `doing` (from `blocked` or
+`review`) is refused with 400 `invalid_transition` while a blocker is not done or
+`not_before` has not passed, before the `doing` limit is checked. The check reads the task
+as the request leaves it, so the same request may drop those blockers (`blockers`) or clear
+`not_before` (`null`); the message names every wait and `next` what to drop. A `blocked`
+task nobody owns is refused a move to `review` with 400 `invalid_transition` (`next` says
+to resume it first): a task in `review` has an owner to finish it, who brought it through
+`doing`.
 
 Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
 body is a reporter's text, triaged instead), and its body starts `Proposal:` after leading
@@ -458,12 +460,13 @@ another agent records a `verdict:` note and an accept sets `auto` (`DESIGN.md`,
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. A
 `blocked_reason` that is not blank is accepted only with status `blocked` (400 `invalid`
-otherwise). A blank one (empty or only spaces) means no reason, with any status: it
-clears the reason and is never refused for being empty. Every move out of `blocked`
-clears it. Blockers
-must exist and must not form a cycle; they may be on any board. A task is not `ready`, and
-cannot be claimed, until every blocker is done, wherever it is. `GET /v1/tasks/{id}` lists
-the tasks waiting on it in `blocks`, from every board, and a blocker's `task_done` event,
+otherwise). A blank one (empty or only whitespace) counts as absent, with any status: it
+leaves a stored reason as it is, so `blocked` with a blank reason still needs a stored
+reason or a blocker that is not done. Every move out of `blocked` clears the reason.
+Blockers must exist and must not form a cycle; they may be on any board. A task is not
+`ready`, and cannot be claimed, until every blocker is done, wherever it is.
+`GET /v1/tasks/{id}` lists the tasks waiting on it in `blocks`, from every board, and a
+blocker's `task_done` event,
 on its own board's feed, wakes the waiting task's board coordinator and the owner of a
 task blocked on it (`DESIGN.md`, "Waking it"). Deleting a board removes its tasks' links
 both ways: a task on another board that waited on one of them loses that blocker, with a

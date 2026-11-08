@@ -402,9 +402,9 @@ async fn blocked_needs_a_reason_or_an_open_blocker() {
 }
 
 #[tokio::test]
-async fn a_blank_blocked_reason_clears_it() {
+async fn a_blank_blocked_reason_counts_as_absent() {
     let t = setup().await;
-    // Resuming with a cleared reason, as agents send it: the blank reason means none.
+    // Resuming with a blank reason, as agents send it: the move out of blocked clears it.
     for blank in ["", "  "] {
         let id = task_in(&t, TaskStatus::Blocked).await;
         let (s, v) = t
@@ -420,9 +420,21 @@ async fn a_blank_blocked_reason_clears_it() {
             (&json!("doing"), &Value::Null),
             "{v}"
         );
+        // Blank on a task in doing is ignored, not refused as a reason off blocked.
+        let (s, v) = t.patch(A, &id, json!({ "blocked_reason": blank })).await;
+        assert!(s.is_success(), "{v}");
         let (s, v) = t.done(A, &id, check(0)).await;
         assert!(s.is_success(), "{v}");
     }
+    // A task that stays blocked keeps its reason: a blank one sent with other changes,
+    // as a tool filling every field does, does not erase it.
+    let id = task_in(&t, TaskStatus::Blocked).await;
+    let other = t.task(A, "factory", "Other step").await;
+    let (s, v) = t
+        .patch(A, &id, json!({ "blockers": [other], "blocked_reason": "" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["blocked_reason"], "waiting", "{v}");
     // Blocked with a blank reason and nothing to wait on is still refused, for that.
     let id = task_in(&t, TaskStatus::Doing).await;
     let (s, v) = t
@@ -516,13 +528,46 @@ async fn moving_to_doing_waits_on_blockers_and_not_before_as_a_claim_does() {
     assert!(s.is_success(), "{v}");
     assert_eq!(v["status"], "doing", "{v}");
 
-    // Review to doing waits the same way; once the date passes the move goes through.
+    // Review to doing waits the same way, on a blocker and on a date; one refusal names
+    // both, and so does its next step.
     let (s, v) = t
-        .patch(A, &second, json!({ "status": "review", "not_before": at }))
+        .patch(
+            A,
+            &second,
+            json!({ "status": "review", "blockers": [first], "not_before": at }),
+        )
         .await;
     assert!(s.is_success(), "{v}");
     let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
     assert_eq!(s.as_u16(), 400, "{v}");
+    let message = v["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("{first} (open)")) && message.contains("until"),
+        "{v}"
+    );
+    assert!(
+        v["next"].as_str().unwrap().contains(&format!(
+            "task_update {second} status=doing blockers=[the rest] not_before=none"
+        )),
+        "{v}"
+    );
+
+    // The wait is checked before the doing limit, as a claim does: an agent at its limit
+    // is not told to park its task in doing for a move that would be refused anyway.
+    let busy = t.task(A, "factory", "Busy").await;
+    assert!(t.claim(A, &busy).await.0.is_success());
+    let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let (s, v) = t.patch(A, &busy, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+
+    // Once the blocker is done and the date passed, the move goes through.
+    assert!(t.claim(B, &first).await.0.is_success());
+    assert!(t.done(B, &first, check(0)).await.0.is_success());
     t.advance(TimeDelta::days(1));
     let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
     assert!(s.is_success(), "{v}");
