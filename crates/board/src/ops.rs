@@ -1,15 +1,16 @@
 //! Board operations shared by the CLI and the MCP server: each returns concise text and
 //! the JSON the server answered.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
-    DoneTask, ErrorCode, EvidenceKind, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
-    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, Task, TaskId, TaskStatus, Timestamp,
-    UpdateBoard, UpdateTask,
+    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
+    RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, Task, TaskId,
+    TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -663,7 +664,33 @@ pub async fn lease_paths(
             ttl_secs,
         })
         .await?;
-    Ok(Output::new(render::lease_result(&result), &result))
+    let holders = lease_holders(&ctx.client, &result.conflicts).await;
+    Ok(Output::new(
+        render::lease_result(&result, &holders),
+        &result,
+    ))
+}
+
+/// Looks up the status of each overlapping lease's task and its holder's short handle. Best
+/// effort: a failed lookup leaves that entry out, and the warning prints the bare id.
+async fn lease_holders(client: &Client, conflicts: &[Lease]) -> render::LeaseHolders {
+    let tasks: BTreeSet<&TaskId> = conflicts.iter().filter_map(|l| l.task.as_ref()).collect();
+    let agents: BTreeSet<&AgentId> = conflicts.iter().map(|l| &l.agent).collect();
+    let (statuses, handles) = futures_util::future::join(
+        futures_util::future::join_all(tasks.into_iter().map(|id| async move {
+            let detail = client.task(id).await.ok()?;
+            Some((id.clone(), detail.task.status))
+        })),
+        futures_util::future::join_all(agents.into_iter().map(|id| async move {
+            let agent = client.agent_info(id).await.ok()?;
+            Some((id.to_string(), agent.handle))
+        })),
+    )
+    .await;
+    render::LeaseHolders {
+        statuses: statuses.into_iter().flatten().collect(),
+        handles: handles.into_iter().flatten().collect(),
+    }
 }
 
 pub struct NewAsk {
