@@ -236,7 +236,8 @@ function AskCard({
           )}
         </span>
       </header>
-      <div className="max-w-[72ch] text-sm leading-normal text-foreground">
+      {/* The question runs the card's width, as the answer controls below it do. */}
+      <div className="text-sm leading-normal text-foreground">
         <Markdown text={ask.question} />
       </div>
       {ask.status === "open" && <AnswerForm ask={ask} />}

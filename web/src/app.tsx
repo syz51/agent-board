@@ -138,6 +138,8 @@ export function Nav() {
                 title={`${unseen} new since you last looked`}
               >
                 {unseen}
+                {/* Says what it counts where there is room; phones keep the bare count. */}
+                <span className="max-md:hidden"> new</span>
               </span>
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}

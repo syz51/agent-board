@@ -332,6 +332,13 @@
   .md .md-raw {
     @apply font-mono text-meta whitespace-pre-wrap text-muted-foreground;
   }
+  .md .md-chip {
+    @apply whitespace-nowrap;
+  }
+  /* A tag in plain agent text: inert code, as raw HTML is in agent markdown. */
+  .raw-tag {
+    @apply rounded-[4px] bg-secondary px-1 py-px font-mono text-[0.9em] whitespace-nowrap text-muted-foreground;
+  }
   .md .md-table {
     @apply overflow-x-auto;
   }

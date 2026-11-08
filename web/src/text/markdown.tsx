@@ -49,9 +49,38 @@ export function Markdown({ text }: { text: string }) {
   return <div className="md">{blocks(tokens)}</div>;
 }
 
-/** Agent text shown as written, keeping line breaks. */
+/** An HTML-like tag in agent text, such as `</board>` or `<b class="x">`. */
+const TAG = /(<\/?[A-Za-z][^<>]*>)/;
+
+/**
+ * Agent text shown as written, keeping line breaks. Tags in it show as code, as raw HTML
+ * does in agent markdown, so markup reads as inert text and not as the page's own.
+ */
 export function PlainText({ text, className }: { text: string; className?: string }) {
-  return <span className={cn("whitespace-pre-wrap", className)}>{text}</span>;
+  const parts = text.split(TAG);
+  return (
+    <span className={cn("whitespace-pre-wrap", className)}>
+      {parts.length === 1
+        ? text
+        : parts.map((part, index) =>
+            // split() with a capturing group puts the tags at odd indexes.
+            index % 2 === 1 ? (
+              <code key={index} className="raw-tag">
+                {part}
+              </code>
+            ) : (
+              part
+            ),
+          )}
+    </span>
+  );
+}
+
+/** Short inline code stays whole on one line; the line breaks between chips instead. */
+const CHIP_MAX = 32;
+
+function chip(text: string): string | undefined {
+  return text.length <= CHIP_MAX ? "md-chip" : undefined;
 }
 
 function blocks(tokens: Token[]): ReactNode[] {
@@ -182,8 +211,14 @@ function inlineToken(token: Token, key: number): ReactNode {
       return <em key={key}>{inline((token as Tokens.Em).tokens)}</em>;
     case "del":
       return <del key={key}>{inline((token as Tokens.Del).tokens)}</del>;
-    case "codespan":
-      return <code key={key}>{(token as Tokens.Codespan).text}</code>;
+    case "codespan": {
+      const { text } = token as Tokens.Codespan;
+      return (
+        <code key={key} className={chip(text)}>
+          {text}
+        </code>
+      );
+    }
     case "br":
       return <br key={key} />;
     case "link": {
@@ -205,7 +240,7 @@ function inlineToken(token: Token, key: number): ReactNode {
     }
     case "html":
       return (
-        <code key={key} className="md-raw">
+        <code key={key} className={cn("md-raw", chip((token as Tokens.Tag).text))}>
           {(token as Tokens.Tag).text}
         </code>
       );

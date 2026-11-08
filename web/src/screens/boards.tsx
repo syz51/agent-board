@@ -309,7 +309,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,320px)_minmax(0,180px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-6";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,392px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-5";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -433,7 +433,7 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(

@@ -119,7 +119,8 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who, what it is working on (at most a reading
  * width), and where it runs, which takes the rest so no gap opens in the middle.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[200px_minmax(0,1fr)_260px]";
+const ROW =
+  "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[minmax(180px,22fr)_minmax(0,50fr)_minmax(220px,28fr)]";
 
 /**
  * One agent per row: who and its state, then its task, handoff and, for a coordinator, its

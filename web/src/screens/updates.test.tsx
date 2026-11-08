@@ -79,7 +79,7 @@ describe("updates section", () => {
     // The summary is markdown: bold and code become elements.
     expect(html).toContain("<strong>Review the PR</strong>");
     expect(html).toContain('href="https://github.com/example/board-web/pull/12"');
-    expect(html).toContain("<code>9b3f0d1</code>");
+    expect(html).toContain(">9b3f0d1</code>");
     // Checks are on the task page; the update shows what to open.
     expect(html).not.toContain("bun run check");
     // A task done without a summary, and its parent.

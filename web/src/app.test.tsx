@@ -55,14 +55,13 @@ describe("navigation", () => {
     expect(screen.getByLabelText(`${open} waiting on you`).textContent).toBe(String(open));
     const home = screen.getByRole("link", { name: /Home/ });
     expect(home.textContent).toMatch(/unseen updates?$/);
-    // A count, not a bare dot, with what it counts on hover.
+    // The same count as the home page's "Since you last looked", saying what it counts.
     const unseen = state.updates(none);
+    const total = unseen.done.length + unseen.said.length;
+    expect(total).toBeGreaterThan(0);
     const count = home.querySelector("[title]");
-    expect(count?.getAttribute("title")).toMatch(/^\d+ new since you last looked$/);
-    expect(Number(count?.textContent)).toBeGreaterThan(0);
-    expect(unseen.done.length + unseen.said.length).toBeGreaterThanOrEqual(
-      Number(count?.textContent),
-    );
+    expect(count?.getAttribute("title")).toBe(`${total} new since you last looked`);
+    expect(count?.textContent).toBe(`${total} new`);
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
   });
 

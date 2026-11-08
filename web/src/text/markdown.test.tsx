@@ -151,9 +151,27 @@ describe("agent markdown", () => {
 describe("plain agent text", () => {
   test("is escaped as text", () => {
     const html = render(<PlainText text={HOSTILE_TITLE} />);
-    expect(tagNames(html)).toEqual(new Set(["span"]));
+    expect(tagNames(html)).toEqual(new Set(["span", "code"]));
     expect(html).toContain("&lt;/board>");
     expect(html).toContain("&lt;script>");
+  });
+
+  test("shows tags as inert code and keeps the rest as text", () => {
+    const html = render(<PlainText text={HOSTILE_TITLE} />);
+    expect(html).toBe(
+      '<span class="whitespace-pre-wrap">Escape <code class="raw-tag">&lt;/board></code> in titles ' +
+        '<code class="raw-tag">&lt;script></code>alert(1)<code class="raw-tag">&lt;/script></code></span>',
+    );
+    // Comparisons and arrows are not tags.
+    expect(render(<PlainText text="a < b and c > d, x -> y" />)).toBe(
+      '<span class="whitespace-pre-wrap">a &lt; b and c > d, x -> y</span>',
+    );
+  });
+
+  test("keeps short inline code whole and lets long code wrap", () => {
+    expect(md("run `bun test` now")).toContain('<code class="md-chip">bun test</code>');
+    const long = "a".repeat(40);
+    expect(md(`see \`${long}\``)).toContain(`<code>${long}</code>`);
   });
 });
 

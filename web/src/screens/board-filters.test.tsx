@@ -68,6 +68,27 @@ describe("a board's filter bar", () => {
     expect(bar()).toBeNull();
   });
 
+  test("without the board list the page names the board by its slug, as an identifier", async () => {
+    serve(true);
+    await renderRoute("/boards/factory", {
+      seed: (client) => client.setQueryData(queries.agents().queryKey, state.agents(none)),
+    });
+    await waitFor(() => expect(screen.getByText(/board server is down/)).toBeTruthy(), {
+      timeout: 4000,
+    });
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe("factory");
+    expect(heading.querySelector(".ident")?.textContent).toBe("factory");
+  });
+
+  test("names the board by its title once the list is there", async () => {
+    serve();
+    await renderRoute("/boards/factory", { seed });
+    const title = state.boards().find((board) => board.slug === "factory")!.title;
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(title));
+    expect(screen.getByRole("heading", { level: 1 }).querySelector(".ident")).toBeNull();
+  });
+
   test("stays while filters are set, so they can be cleared", async () => {
     serve();
     await renderRoute("/boards/sandbox?q=nothing", { seed });

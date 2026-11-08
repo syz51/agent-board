@@ -114,6 +114,9 @@ export function BoardScreen() {
     [tasks.data],
   );
   useTitle(board?.title ?? slug);
+  // Without the board list, as in an outage, the title is unknown: the slug stands in, shown
+  // as the identifier it is.
+  const name = board?.title ?? <span className="ident">{slug}</span>;
   // One choice for every board: done work starts folded away.
   const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
 
@@ -127,10 +130,10 @@ export function BoardScreen() {
 
   return (
     <>
-      <Crumbs current={board?.title ?? slug}>
+      <Crumbs current={name}>
         <Link to="/">Home</Link>
       </Crumbs>
-      <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
+      <PageHeader title={name} sub={board?.goal && <PlainText text={board.goal} />}>
         {board && board.title !== slug && (
           <span className="ident text-meta text-muted-foreground">{slug}</span>
         )}
@@ -307,7 +310,7 @@ export function TaskGroupSection({
             type="button"
             className={cn(
               row,
-              "text-left hover:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+              "group/toggle cursor-pointer text-left hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
             )}
             aria-expanded={!collapsed}
             aria-controls={bodyId}
@@ -317,7 +320,7 @@ export function TaskGroupSection({
             <Icon
               name="chevronDown"
               className={cn(
-                "size-3.5 flex-none text-muted-foreground transition-transform motion-reduce:transition-none",
+                "size-3.5 flex-none text-muted-foreground transition-transform group-hover/toggle:text-foreground motion-reduce:transition-none",
                 collapsed && "-rotate-90",
               )}
             />
