@@ -173,11 +173,13 @@ host.
   server for a minute. A reply that misses the budget says the server is slow and that
   board tools and the CLI, which wait longer, still work; the next hook tries again, and
   only three slow replies in a row make the device's hooks skip the server, for ten
-  seconds. A connection not open (TLS included) within half a second counts as
-  unreachable. Any answer resets both.
+  seconds. A connection not open (TLS included) within half a second, or 0.1 seconds
+  before the reply's deadline when that comes first, counts as unreachable. Any answer
+  resets both.
   The server's deadline is set after the hook's local steps (Keychain, process table, T3,
-  git), and a failure changes nothing when those steps left the server under half a
-  second.
+  git). When those steps left the server under half a second, it is too little to judge:
+  a connection that does not open then ends with the reply's deadline, as slow, and a slow
+  reply changes nothing; a connection that fails at once still counts as unreachable.
 - **Hook relay**: while `board watch` runs, hooks reach the server through it, so a hook
   pays for neither a TLS handshake (0.04 to 0.3 seconds over a relayed tailnet path) nor a
   Keychain lookup. The daemon serves `$BOARD_HOME/run/hook.sock`: the directory has mode
