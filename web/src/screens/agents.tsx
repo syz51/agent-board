@@ -137,8 +137,9 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         >
           {agent.handle}
         </h2>
-        {/* When it was last seen sits with its state: the two answer "is it alive?". */}
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        {/* When it was last seen sits under its state, on its own line in every row: the
+            two answer "is it alive?". */}
+        <div className="grid justify-items-start gap-0.5">
           <AgentStateBadge agent={agent} />
           <span className="text-meta text-muted-foreground">
             seen <RelTime at={agent.last_seen} />
@@ -224,7 +225,7 @@ export function HandoffView({ agentId }: { agentId: string }) {
           · <RelTime at={updated_at} />
         </span>
       </p>
-      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-subtle-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-sm [&_dd]:text-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
         <div>
           <dt>Now</dt>
           <dd>

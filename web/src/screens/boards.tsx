@@ -234,7 +234,7 @@ const column = createColumnHelper<typeof features, BoardRowData>();
 /**
  * The boards table: name and goal, tasks by status, coordinator, open asks and autopilot.
  * At 760px of width and up the cells line up in columns under a header; below, a row
- * stacks name, tasks, then coordinator, asks and autopilot.
+ * stacks name, tasks, coordinator, then asks and autopilot.
  */
 const columns = column.columns([
   column.display({
@@ -282,7 +282,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,330px)_minmax(0,208px)_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-6";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,320px)_minmax(0,180px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-6";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -342,13 +342,25 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
-          <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
+      {/* One line in every row: the slug gives way first, then the title; both keep their
+          full text in a tooltip, and the board page shows them whole. */}
+      <div className="flex min-w-0 items-center gap-x-2.5">
+        <h3 className="min-w-0 truncate text-sm font-semibold tracking-[-0.006em]">
+          <Link
+            className="text-foreground"
+            to="/boards/$slug"
+            params={{ slug: board.slug }}
+            title={board.title}
+          >
             {board.title}
           </Link>
         </h3>
-        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
+        <span
+          className="ident min-w-0 shrink-[4] truncate text-meta text-muted-foreground"
+          title={board.slug}
+        >
+          {board.slug}
+        </span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}
@@ -362,7 +374,7 @@ function BoardName({ board }: { board: Board }) {
         )}
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={1} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
       )}
@@ -400,9 +412,12 @@ function TaskTally({ board }: { board: Board }) {
           {SEGMENTS.map(
             (segment) =>
               counts[segment.key] > 0 && (
-                // A count and its word, in the bar's order: the words carry the status and
-                // the bar above carries the colour, so the legend stays quiet.
-                <li key={segment.key} className="whitespace-nowrap">
+                // A count and its word, in the bar's order, after a dot of its bar colour.
+                <li key={segment.key} className="inline-flex items-center gap-1 whitespace-nowrap">
+                  <span
+                    className={cn("size-1.5 flex-none rounded-full", segment.bar)}
+                    aria-hidden="true"
+                  />
                   <strong className="font-semibold text-foreground tabular-nums">
                     {counts[segment.key]}
                   </strong>{" "}
@@ -424,7 +439,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   return (
     <>
       <Who id={coordinator.id} agents={agents} />
-      <AgentStateBadge agent={coordinator} bare />
+      <AgentStateBadge agent={coordinator} />
     </>
   );
 }

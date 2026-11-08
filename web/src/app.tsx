@@ -45,8 +45,8 @@ export function Shell() {
         <ConnectionPill />
       </header>
       {/* The content sits on an inset panel, raised off the sidebar's tone on wide screens. */}
-      <div className="min-w-0 lg:py-2 lg:pr-2">
-        <div className="bg-background [--gutter:--spacing(4)] lg:min-h-[calc(100vh-16px)] lg:overflow-clip lg:rounded-lg lg:shadow-panel lg:[--gutter:--spacing(7)]">
+      <div className="min-w-0 lg:py-3 lg:pr-3">
+        <div className="bg-background [--gutter:--spacing(4)] lg:min-h-[calc(100vh-24px)] lg:overflow-clip lg:rounded-lg lg:shadow-panel lg:[--gutter:--spacing(7)]">
           <ConnectionBanner />
           <main
             id="main"
@@ -164,11 +164,13 @@ function BoardLinks() {
                 </span>
                 <span className="min-w-0 flex-1 truncate">{board.title}</span>
                 {board.open_asks > 0 && (
-                  <span
-                    className="h-4.5 min-w-5 px-1 text-right text-xs leading-4.5 font-medium tracking-normal text-sidebar-foreground tabular-nums"
-                    aria-label={`${board.open_asks} open asks`}
-                  >
+                  // The inbox icon marks the count as open asks, as the boards table does.
+                  <span className="inline-flex h-4.5 items-center gap-1 px-1 text-xs font-medium tracking-normal text-sidebar-foreground tabular-nums">
+                    <Icon name="inbox" className="size-3.5 text-muted-foreground" />
                     {board.open_asks}
+                    <span className="sr-only">
+                      {board.open_asks === 1 ? " open ask" : " open asks"}
+                    </span>
                   </span>
                 )}
               </Link>

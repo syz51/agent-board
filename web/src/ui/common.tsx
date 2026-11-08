@@ -40,11 +40,10 @@ export function ErrorNotice({
   retry?: (() => void) | undefined;
   compact?: boolean;
 }) {
-  // While the connection banner shows, a failed page is most likely the same outage: the card
-  // then speaks the banner's language (a plug, the banner's tone) instead of raising a second alarm.
+  // While the connection banner shows, a failed page is most likely the same outage. The
+  // banner alone raises the alarm; the card is a neutral placeholder that says when it loads.
   const { kind } = useConnection();
   const linkDown = kind === "offline" || kind === "reconnecting";
-  const warn = kind === "reconnecting";
   return (
     <Alert
       variant={compact ? "error" : "default"}
@@ -52,17 +51,17 @@ export function ErrorNotice({
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
         // A rail on the left edge, as ask cards have, so the failure reads before the details.
-        !compact && "overflow-hidden before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
         !compact &&
-          (warn ? "border-warn-border before:bg-amber" : "border-error-border before:bg-error"),
+          !linkDown &&
+          "overflow-hidden border-error-border before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:bg-error",
       )}
     >
       {!compact && (
         <span
           className={cn(
             "grid size-9 flex-none place-items-center rounded-[9px] border",
-            warn
-              ? "border-warn-border bg-warn-soft text-warn"
+            linkDown
+              ? "bg-muted text-muted-foreground"
               : "border-error-border bg-error-soft text-error",
           )}
         >
@@ -79,7 +78,11 @@ export function ErrorNotice({
           {error.message}
         </AlertTitle>
         <AlertDescription className="col-start-1 text-foreground!">
-          {error.next && <p className="first-letter:uppercase">{error.next}</p>}
+          {linkDown && !compact ? (
+            <p>This page loads again once the connection is back.</p>
+          ) : (
+            error.next && <p className="first-letter:uppercase">{error.next}</p>
+          )}
           <p className="text-xs text-muted-foreground">
             {error.status > 0 ? `HTTP ${error.status} · ` : ""}
             <code>{error.code}</code>
@@ -87,7 +90,7 @@ export function ErrorNotice({
         </AlertDescription>
       </div>
       {retry && (
-        <Button type="button" variant="outline" onClick={retry}>
+        <Button type="button" onClick={retry}>
           Try again
         </Button>
       )}
@@ -211,27 +214,23 @@ export function StateDot({ state }: { state: "running" | "paused" | "idle" | "en
   );
 }
 
-/** A pill with a state dot: agent and board states. `bare` drops the fill, for table cells. */
+/** A state dot and its word: agent and board states, drawn the same on every page. */
 export function StatePill({
   state,
-  bare,
   children,
 }: {
   state: "running" | "paused" | "idle" | "ended" | "closed";
-  bare?: boolean | undefined;
   children: ReactNode;
 }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
-        !bare && "h-5.5 rounded-full pr-2.25 pl-1.75",
+        "inline-flex min-h-5 items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
         state === "running"
-          ? "bg-status-ready-soft text-status-ready"
+          ? "text-status-ready"
           : state === "paused"
-            ? "bg-amber-soft text-amber"
-            : "bg-status-open-soft text-status-open",
-        bare && "bg-transparent",
+            ? "text-amber"
+            : "text-status-open",
       )}
     >
       <StateDot state={state} />
@@ -240,16 +239,10 @@ export function StatePill({
   );
 }
 
-export function AgentStateBadge({
-  agent,
-  bare,
-}: {
-  agent: Pick<Agent, "state" | "paused_until">;
-  bare?: boolean;
-}) {
+export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
   const now = useNow();
   return (
-    <StatePill state={agent.state} bare={bare}>
+    <StatePill state={agent.state}>
       {agent.state === "paused" && agent.paused_until ? (
         <>
           Paused until{" "}
@@ -408,14 +401,16 @@ export function AskKind({ kind }: { kind: "action" | "decision" }) {
 }
 
 /**
- * Agent text cut to two lines with an ellipsis. It is a button: a click, tap, Enter or Space
- * shows the whole text, so it can be read without hovering.
+ * Agent text cut to two lines (or `lines`) with an ellipsis. It is a button: a click, tap,
+ * Enter or Space shows the whole text, so it can be read without hovering.
  */
 export function ExpandableLine({
   text,
+  lines = 2,
   className,
 }: {
   text: string;
+  lines?: 1 | 2;
   className?: string | undefined;
 }) {
   const [open, setOpen] = useState(false);
@@ -424,7 +419,7 @@ export function ExpandableLine({
       type="button"
       className={cn(
         "block min-h-6 w-full min-w-0 cursor-pointer rounded-xs text-left text-inherit",
-        open ? "whitespace-pre-wrap" : "line-clamp-2",
+        open ? "whitespace-pre-wrap" : lines === 1 ? "line-clamp-1" : "line-clamp-2",
         className,
       )}
       aria-expanded={open}

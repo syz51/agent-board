@@ -287,7 +287,11 @@ export function TaskGroupSection({
     <section aria-labelledby={id}>
       <h2
         id={id}
-        className={cn("bg-muted text-sm font-semibold", !collapsed && "border-b", !onToggle && row)}
+        className={cn(
+          "bg-muted/45 text-sm font-semibold",
+          !collapsed && "border-b",
+          !onToggle && row,
+        )}
       >
         {onToggle ? (
           <button
@@ -435,7 +439,7 @@ function TaskMain({ task, done, now }: TaskRowData) {
             <Fragment key={id}>
               {index > 0 && ", "}
               <Link
-                className="inline-flex min-h-6 items-center tabular-nums"
+                className="inline-flex min-h-6 items-center text-foreground tabular-nums"
                 to="/tasks/$id"
                 params={{ id }}
               >

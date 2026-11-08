@@ -214,7 +214,10 @@ function inlineToken(token: Token, key: number): ReactNode {
   }
 }
 
-/** A link that shows where it goes. Unsafe targets are shown, not linked. */
+/**
+ * A link that shows where it goes: the host after its text (the whole URL in a tooltip), so
+ * link text cannot hide another site. Unsafe targets are shown, not linked.
+ */
 export function SafeLink({ href, children }: { href: string; children: ReactNode }): ReactElement {
   const url = safeHref(href);
   if (url === null) {
@@ -230,23 +233,20 @@ export function SafeLink({ href, children }: { href: string; children: ReactNode
   const shown = url.startsWith("mailto:") ? url.slice(7) : url;
   const childText = typeof children === "string" ? children : flatText(children);
   const showTarget = childText !== href && childText !== url && childText !== shown;
+  const target = url.startsWith("mailto:") ? shown : new URL(url).host;
   return (
     <span className="md-link">
       <a href={url} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer">
         {children}
       </a>
       {showTarget && (
-        <span className="link-target text-meta text-muted-foreground"> ({breakable(shown)})</span>
+        <span className="link-target text-meta text-muted-foreground" title={url}>
+          {" "}
+          ({target})
+        </span>
       )}
     </span>
   );
-}
-
-/** A URL with line-break opportunities after its separators, so it wraps between parts. */
-function breakable(url: string): ReactNode {
-  return url
-    .split(/(?<=[/?#&=])/)
-    .flatMap((part, index) => (index === 0 ? [part] : [<wbr key={index} />, part]));
 }
 
 function flatText(children: ReactNode): string {

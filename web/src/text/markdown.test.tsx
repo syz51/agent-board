@@ -100,19 +100,20 @@ describe("agent markdown", () => {
     expect(html).toContain("link not followed: javascript:alert(3)");
   });
 
-  test("a safe link opens in a new tab without a referrer and shows its target", () => {
+  test("a safe link opens in a new tab without a referrer and shows its host", () => {
     const html = md(
       "See [the design](https://github.com/example/factory/blob/main/docs/DESIGN.md).",
     );
     expect(html).toContain('href="https://github.com/example/factory/blob/main/docs/DESIGN.md"');
     expect(html).toContain('rel="noopener noreferrer nofollow"');
     expect(html).toContain('target="_blank"');
-    expect(html).toContain("(https://github.com/example/factory/blob/main/docs/DESIGN.md)");
+    expect(html).toContain("(github.com)");
+    expect(html).toContain('title="https://github.com/example/factory/blob/main/docs/DESIGN.md"');
   });
 
   test("link text that looks like another URL cannot hide the real target", () => {
     const html = md("[https://github.com/example](https://evil.example/login)");
-    expect(html).toContain("(https://evil.example/login)");
+    expect(html).toContain("(evil.example)");
   });
 
   test("a bare URL is linked without repeating it", () => {
@@ -125,7 +126,7 @@ describe("agent markdown", () => {
     const html = md("![pixel](https://tracker.example/pixel.png) ![x](javascript:alert(1))");
     expect(tagNames(html).has("img")).toBe(false);
     expect(html).toContain("image: pixel");
-    expect(html).toContain("(https://tracker.example/pixel.png)");
+    expect(html).toContain("(tracker.example)");
     expect(hrefs(html)).toEqual(["https://tracker.example/pixel.png"]);
   });
 

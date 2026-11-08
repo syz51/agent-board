@@ -100,8 +100,11 @@ export function AskScreen() {
   const valid = Number.isSafeInteger(askId) && askId > 0;
   // The number as read, so `/asks/012` is titled "Ask #12".
   const label = valid ? `Ask #${askId}` : `Ask #${id}`;
-  useTitle(label);
   const ask = useQuery({ ...queries.ask(askId), enabled: valid });
+  // Once loaded, the title says what kind of ask it is, as a card in a list does.
+  const kind = ask.data && (ask.data.kind === "action" ? "Action" : "Decision");
+  const title = kind ? `${kind} · ${label}` : label;
+  useTitle(title);
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
 
@@ -110,12 +113,13 @@ export function AskScreen() {
       <Crumbs current={label}>
         <Link to="/asks">Needs you</Link>
       </Crumbs>
-      <PageHeader title={label} />
+      <PageHeader title={title} />
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
-            // The answer comes first; what the ask is about sits beside it on wide screens.
-            <div className="grid items-start gap-x-8 gap-y-6 lg:grid-cols-[minmax(0,2fr)_minmax(240px,1fr)] xl:grid-cols-[minmax(0,1fr)_300px]">
+            // The answer comes first, at a reading width; what the ask is about follows it,
+            // and sits beside it only where both fit at full width.
+            <div className="grid max-w-[820px] items-start gap-x-8 gap-y-6 2xl:max-w-none 2xl:grid-cols-[minmax(0,820px)_300px]">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -132,7 +136,10 @@ export function AskScreen() {
 function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
   const heading = "text-xs font-semibold text-subtle-foreground";
   return (
-    <aside className="grid content-start gap-5" aria-label="About this ask">
+    <aside
+      className="grid content-start items-start gap-x-6 gap-y-5 sm:grid-cols-2 2xl:grid-cols-1"
+      aria-label="About this ask"
+    >
       {ask.task && (
         <section className="grid gap-2">
           <h2 className={heading}>Task</h2>
@@ -200,8 +207,8 @@ function AskCard({
       data-status={ask.status}
     >
       <header className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-meta">
-        <AskKind kind={ask.kind} />
-        {/* On its own page the ask's number is the page title. */}
+        {/* On its own page the ask's kind and number are the page title. */}
+        {!standalone && <AskKind kind={ask.kind} />}
         {!standalone && (
           <h2 className="text-meta font-semibold">
             <Link className="text-foreground" to="/asks/$id" params={{ id: String(ask.id) }}>
@@ -337,45 +344,45 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                   </div>
                 </fieldset>
               )}
-              {/* Send sits beside the answer field, so an ask stays short in a list. */}
-              <div className="flex flex-wrap items-end gap-x-2.5 gap-y-2">
-                <form.Field name="text">
-                  {(field) => (
-                    <div className="grid min-w-[min(100%,280px)] flex-1 gap-1.5">
-                      <Label
-                        htmlFor={`${id}-text`}
-                        className="text-meta font-medium text-subtle-foreground"
-                      >
-                        {ask.options.length > 0 ? "Or write your own answer" : "Your answer"}
-                      </Label>
-                      <Textarea
-                        id={`${id}-text`}
-                        rows={2}
-                        className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
-                        value={field.state.value}
-                        aria-invalid={missing ? true : undefined}
-                        aria-describedby={missing ? `${id}-missing` : undefined}
-                        onChange={(event) => field.handleChange(event.currentTarget.value)}
-                      />
-                    </div>
-                  )}
-                </form.Field>
-                {/* The page's main action; a press with nothing chosen says what is missing. */}
-                <Button type="submit" disabled={mutation.isPending}>
-                  {mutation.isPending ? "Sending…" : "Send answer"}
-                </Button>
-              </div>
+              <form.Field name="text">
+                {(field) => (
+                  <div className="grid gap-1.5">
+                    <Label
+                      htmlFor={`${id}-text`}
+                      className="text-meta font-medium text-subtle-foreground"
+                    >
+                      {ask.options.length > 0 ? "Or write your own answer" : "Your answer"}
+                    </Label>
+                    <Textarea
+                      id={`${id}-text`}
+                      rows={2}
+                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                      value={field.state.value}
+                      aria-invalid={missing ? true : undefined}
+                      aria-describedby={missing ? `${id}-missing` : undefined}
+                      onChange={(event) => field.handleChange(event.currentTarget.value)}
+                    />
+                  </div>
+                )}
+              </form.Field>
               {missing && (
                 <p id={`${id}-missing`} className="text-meta font-medium text-error" role="alert">
                   {missing}
                 </p>
               )}
               {mutation.error && <ErrorNotice error={mutation.error} compact />}
-              {answer && !mutation.isPending && (
-                <span className="text-meta [overflow-wrap:anywhere] text-muted-foreground">
-                  Sends “{answer}”
-                </span>
-              )}
+              {/* Send closes the whole answer group, so it plainly sends a choice or the text. */}
+              <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
+                {answer && !mutation.isPending && (
+                  <span className="mr-auto line-clamp-2 min-w-0 flex-1 text-meta [overflow-wrap:anywhere] text-muted-foreground">
+                    Sends “{answer}”
+                  </span>
+                )}
+                {/* The page's main action; a press with nothing chosen says what is missing. */}
+                <Button type="submit" disabled={mutation.isPending}>
+                  {mutation.isPending ? "Sending…" : "Send answer"}
+                </Button>
+              </div>
             </>
           );
         }}

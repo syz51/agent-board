@@ -41,14 +41,17 @@ export function TaskScreen() {
     [boardTasks.data],
   );
   useTitle(detail.data ? `${detail.data.task.id} ${detail.data.task.title}` : id);
+  // The crumb names the board as its page does, from the list the sidebar already holds.
+  const slug = detail.data?.task.board ?? board;
+  const boardTitle = useQuery(queries.boards()).data?.find((item) => item.slug === slug)?.title;
 
   return (
     <>
       <Crumbs current={id}>
         <Link to="/">Home</Link>
         <Icon name="chevron" className="size-3 opacity-70" />
-        <Link to="/boards/$slug" params={{ slug: detail.data?.task.board ?? board }}>
-          {detail.data?.task.board ?? board}
+        <Link to="/boards/$slug" params={{ slug }}>
+          {boardTitle ?? slug}
         </Link>
       </Crumbs>
       <QueryFrame query={detail} label="Loading task">

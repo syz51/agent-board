@@ -104,7 +104,8 @@ event payloads) is untrusted:
 - Short fields render as text. Bodies and questions render as markdown through tokens:
   raw HTML shows as literal text, and headings start at `h3`.
 - Links work only for absolute `http`, `https` and `mailto` targets. They always show their
-  target, and open in a new tab with `noopener noreferrer`. Other links show what they
+  target's host (the address for `mailto`, the whole URL in a tooltip), and open in a new
+  tab with `noopener noreferrer`. Other links show what they
   pointed to, struck through. Images are never loaded; they become a link.
 - `build.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
   styles and connections only, no remote images. `<style>` elements need a nonce, which the
