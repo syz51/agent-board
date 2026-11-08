@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Handoff, Lease, LeaseResult, Note,
-    NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
+    Agent, AgentState, Ask, Board, Dispatch, ErrorLog, Event, EventType, Handoff, Lease,
+    LeaseResult, Note, NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
+    TouchResult,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -469,11 +470,18 @@ pub fn board_line(board: &Board) -> String {
     if board.parallel_tasks > 1 {
         let _ = write!(line, " · {} tasks at once", board.parallel_tasks);
     }
+    if board.dispatch == Dispatch::Daemon {
+        line.push_str(" · dispatch daemon");
+    }
     line
 }
 
 pub fn board_detail(board: &Board, agents: &[Agent], detailed: bool) -> String {
     let mut out = board_line(board);
+    // The line names daemon dispatch; the default is named here, so the setting always shows.
+    if board.dispatch == Dispatch::Thread {
+        out.push_str("\ndispatch thread");
+    }
     if !board.repos.is_empty() {
         let _ = write!(out, "\nrepos {}", board.repos.join(", "));
     }

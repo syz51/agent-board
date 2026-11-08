@@ -39,6 +39,11 @@ pub struct Board {
     pub parallel_tasks: u32,
     /// The agent currently acting as the board's coordinator, if any.
     pub coordinator: Option<AgentId>,
+    /// Who runs the board's autopilot: a coordinator thread, or the daemon of the device
+    /// that holds the coordinator lease. Absent from servers that predate it, so it
+    /// defaults to [`Dispatch::Thread`].
+    #[serde(default)]
+    pub dispatch: Dispatch,
     /// Devices allowed to host the coordinator, in order of preference.
     pub home_devices: Vec<DeviceName>,
     pub counts: StatusCounts,
@@ -46,6 +51,54 @@ pub struct Board {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+
+/// Who runs a board's autopilot (`docs/API.md`, "Daemon dispatch").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dispatch {
+    /// A coordinator thread that lives for days.
+    #[default]
+    Thread,
+    /// The device daemon that holds the coordinator lease, as `dispatch:<device>`: it does
+    /// the routine steps in code and starts one short-lived thread per task or judgment.
+    Daemon,
+}
+
+/// What a judge was started for (`docs/API.md`, "Daemon dispatch").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeKind {
+    /// Reviews a parked task against its acceptance checks.
+    Review,
+    /// Gives verdicts on proposals.
+    Verdict,
+    /// Reviews the board against its goal.
+    Goal,
+    /// Triages a feedback item.
+    Triage,
+}
+
+/// A judge registered by the holder of a board's coordinator lease: a short-lived thread
+/// with the coordinator's rights on that board until its agent ends or `expires_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Judge {
+    pub board: BoardSlug,
+    pub agent: AgentId,
+    pub kind: JudgeKind,
+    /// The tasks it was started for, on the board; empty for a goal review.
+    pub tasks: Vec<TaskId>,
+    /// The lease holder that registered it.
+    pub registered_by: AgentId,
+    pub created_at: Timestamp,
+    /// At most [`JUDGE_HOURS_MAX`] hours after `created_at`.
+    pub expires_at: Timestamp,
+}
+
+/// How long a judge keeps the coordinator's rights at most.
+pub const JUDGE_HOURS_MAX: i64 = 2;
+
+/// The most tasks one judge registration names.
+pub const JUDGE_TASKS_MAX: usize = 20;
 
 /// The most tasks a board's coordinator may run at once (see [`Board::parallel_tasks`]).
 /// The usage limit is shared by every agent, so the range stays small.

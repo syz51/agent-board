@@ -603,6 +603,59 @@ fn parallel_tasks_are_set_shown_and_checked() {
     );
 }
 
+#[test]
+fn dispatch_is_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.dispatch = board_proto::Dispatch::Daemon;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "set", "factory", "--dispatch", "daemon"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["dispatch"], "daemon");
+    assert!(
+        stdout(&out).trim_end().ends_with(" · dispatch daemon"),
+        "{}",
+        stdout(&out)
+    );
+    let out = e.run(&["board", "set", "factory", "--dispatch", "cron"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+
+    // board status names the setting either way.
+    e.stub.on("GET /v1/boards/factory", &board);
+    e.stub
+        .on("GET /v1/agents", &Vec::<board_proto::Agent>::new());
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(
+        stdout(&out).contains(" · dispatch daemon"),
+        "{}",
+        stdout(&out)
+    );
+    e.stub
+        .on("GET /v1/boards/factory", &board_fixture("factory", &[]));
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(
+        stdout(&out).contains("\ndispatch thread"),
+        "{}",
+        stdout(&out)
+    );
+
+    // A server that predates the setting answers without it: the user is told.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("dispatch");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "set", "factory", "--dispatch", "daemon"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored dispatch=daemon")
+            && err.contains("board board set factory --dispatch daemon"),
+        "{err}"
+    );
+}
+
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the
 /// ready tasks that wait on the user.
 #[test]
