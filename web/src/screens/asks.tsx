@@ -11,7 +11,7 @@ import { Textarea } from "@/components/ui/textarea.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
-import { Markdown } from "@/text/markdown.tsx";
+import { Markdown, PlainText } from "@/text/markdown.tsx";
 import {
   agentIndex,
   AskKind,
@@ -173,7 +173,7 @@ function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
         params={{ id }}
         title={task.title}
       >
-        {task.title}
+        <PlainText className="whitespace-normal" text={task.title} />
       </Link>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-meta">
         <StatusBadge status={task.status} ready={task.ready} />

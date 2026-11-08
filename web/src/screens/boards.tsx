@@ -9,6 +9,7 @@ import { Switch } from "@/components/ui/switch.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
+import { PlainText } from "@/text/markdown.tsx";
 import { useNow } from "@/live/runtime.ts";
 import {
   AgentStateBadge,
@@ -81,7 +82,7 @@ export function HomeScreen() {
                   count={openAsks.length}
                   aside={
                     <Link
-                      className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
+                      className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
                       to="/asks"
                     >
                       All asks <Icon name="arrow" className="size-3.5" />
@@ -191,10 +192,11 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
             >
               <AskKind kind={ask.kind} />
               <span
-                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-2 max-md:whitespace-normal"
+                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-3 max-md:whitespace-normal"
                 title={plainLine(ask.question)}
               >
-                {plainLine(ask.question)}
+                {/* Tags show as code here too, as in the ask itself. */}
+                <PlainText className="[white-space:inherit]" text={plainLine(ask.question)} />
               </span>
               <span className="text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
                 {ask.board} · <RelTime at={ask.created_at} />
@@ -401,7 +403,7 @@ function BoardName({ board }: { board: Board }) {
         )}
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={1} />
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
       )}

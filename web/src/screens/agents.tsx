@@ -116,11 +116,10 @@ export function AgentsScreen() {
 }
 
 /**
- * The agents list's columns from 820px of width: who, what it is working on (at most a reading
- * width), and where it runs, which takes the rest so no gap opens in the middle.
+ * The agents list's columns from 820px of width: who, what it is working on, which takes the
+ * spare width, and where it runs, at a fixed width so its pairs sit together.
  */
-const ROW =
-  "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[minmax(180px,22fr)_minmax(0,50fr)_minmax(220px,28fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[200px_minmax(0,1fr)_260px]";
 
 /**
  * One agent per row: who and its state, then its task, handoff and, for a coordinator, its
@@ -139,7 +138,8 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         </h2>
         {/* When it was last seen sits under its state, on its own line in every row: the
             two answer "is it alive?". */}
-        <div className="grid justify-items-start gap-0.5">
+        {/* On narrow lists the two share a line, so more agents fit on a screen. */}
+        <div className="grid justify-items-start gap-0.5 @max-[819px]:flex @max-[819px]:flex-wrap @max-[819px]:items-center @max-[819px]:gap-x-2.5">
           <AgentStateBadge agent={agent} />
           <span className="text-meta text-muted-foreground">
             seen <RelTime at={agent.last_seen} />
@@ -167,7 +167,21 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
         {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
       </div>
-      <dl className="m-0 grid content-start gap-0.5 text-meta leading-5 [&_code]:text-xs [&_dd]:m-0 [&_dd]:min-w-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+      {/* Narrow lists say where it runs in one line; wide ones as label and value pairs. */}
+      <p
+        className="text-meta [overflow-wrap:anywhere] text-muted-foreground @min-[820px]:hidden"
+        data-slot="where"
+      >
+        {[
+          agent.role === "coordinator" ? "Coordinator" : null,
+          `${agent.device} · ${agent.runtime}`,
+          agent.repo?.replace(/^github\.com\//, ""),
+          agent.branch,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+      </p>
+      <dl className="m-0 grid content-start gap-0.5 text-meta leading-5 @max-[819px]:hidden [&_code]:text-xs [&_dd]:m-0 [&_dd]:min-w-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
         {agent.role === "coordinator" && (
           <div>
             <dt>Role</dt>

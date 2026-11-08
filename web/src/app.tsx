@@ -133,13 +133,14 @@ export function Nav() {
           {item.to === "/" && unseen > 0 && (
             <>
               <span
-                className="ml-auto h-4.5 min-w-5 rounded-full bg-primary-soft px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-link tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
+                className="ml-auto text-xs font-medium tracking-normal text-muted-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:h-4 max-md:min-w-4 max-md:rounded-full max-md:bg-secondary max-md:px-1 max-md:text-center max-md:text-2xs max-md:leading-4"
                 aria-hidden="true"
                 title={`${unseen} new since you last looked`}
               >
                 {unseen}
-                {/* Says what it counts where there is room; phones keep the bare count. */}
-                <span className="max-md:hidden"> new</span>
+                {/* Plain text, not a badge: badges are for what waits on the user. It says
+                    what it counts where there is room; phones keep a small grey count. */}
+                <span className="max-md:hidden"> {unseen === 1 ? "update" : "updates"}</span>
               </span>
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}

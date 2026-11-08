@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
-import { Fragment, type ReactNode, useId, useMemo } from "react";
+import { Fragment, type ReactNode, useEffect, useId, useMemo } from "react";
 import type { Agent, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
@@ -96,6 +96,33 @@ export function filtersOf(search: BoardSearch): TaskFilters {
   };
 }
 
+const TITLES_KEY = "board-titles";
+
+/** Board names last seen in this browser, by slug; a convenience, so failures are ignored. */
+function storedTitles(): Record<string, string> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(TITLES_KEY) ?? "{}");
+    return value && typeof value === "object" ? (value as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberedTitle(slug: string): string | undefined {
+  const title = storedTitles()[slug];
+  return typeof title === "string" ? title : undefined;
+}
+
+function rememberTitle(slug: string, title: string) {
+  const titles = storedTitles();
+  if (titles[slug] === title) return;
+  try {
+    localStorage.setItem(TITLES_KEY, JSON.stringify({ ...titles, [slug]: title }));
+  } catch {
+    // Storage may be full or blocked; the slug then stands in during an outage.
+  }
+}
+
 export function BoardScreen() {
   const { slug } = route.useParams();
   const search = route.useSearch();
@@ -113,10 +140,13 @@ export function BoardScreen() {
       new Set((tasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id)),
     [tasks.data],
   );
-  useTitle(board?.title ?? slug);
-  // Without the board list, as in an outage, the title is unknown: the slug stands in, shown
-  // as the identifier it is.
-  const name = board?.title ?? <span className="ident">{slug}</span>;
+  // Without the board list, as in an outage, the name last seen in this browser stands in,
+  // or else the slug.
+  useEffect(() => {
+    if (board) rememberTitle(slug, board.title);
+  }, [slug, board]);
+  const name = board?.title ?? rememberedTitle(slug) ?? slug;
+  useTitle(name);
   // One choice for every board: done work starts folded away.
   const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
 

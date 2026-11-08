@@ -61,7 +61,9 @@ describe("navigation", () => {
     expect(total).toBeGreaterThan(0);
     const count = home.querySelector("[title]");
     expect(count?.getAttribute("title")).toBe(`${total} new since you last looked`);
-    expect(count?.textContent).toBe(`${total} new`);
+    expect(count?.textContent).toBe(`${total} updates`);
+    // Plain text, unlike the asks' badge: nothing here waits on the user.
+    expect(count?.className).not.toMatch(/(^| )bg-/);
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
   });
 
