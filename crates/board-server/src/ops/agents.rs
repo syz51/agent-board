@@ -21,7 +21,7 @@ pub(crate) struct Registration {
 pub(crate) fn validate_register(req: RegisterAgent) -> Result<Registration> {
     if let Some(title) = &req.title {
         // A thread's title: there is no body to move detail to.
-        check_line_or("title", title, 200, None)?;
+        check_line_or("title", title, board_proto::AGENT_TITLE_CHARS_MAX, None)?;
     }
     if let Some(branch) = &req.branch {
         check_line("branch", branch, 200)?;
@@ -37,7 +37,18 @@ pub(crate) fn validate_register(req: RegisterAgent) -> Result<Registration> {
     }
     for (key, value) in &req.native_ids {
         check_line("native_ids key", key, 64)?;
-        check_line("native_ids value", value, 300)?;
+        check_line("native_ids value", value, board_proto::NATIVE_ID_CHARS_MAX)?;
+        // The web view links it, so only a web link is kept.
+        if key == "t3_link"
+            && (!value.starts_with(board_proto::T3_LINK_PREFIX)
+                || value.len() == board_proto::T3_LINK_PREFIX.len()
+                || value.chars().any(char::is_whitespace))
+        {
+            return Err(invalid(
+                "native_ids t3_link is not an https:// link",
+                "send the thread's https:// link as t3_link, or leave it out",
+            ));
+        }
     }
     if req.forked_from.as_ref() == Some(&req.id) {
         return Err(invalid(
@@ -70,24 +81,35 @@ fn new_handle(cx: &Ctx<'_>, id: &AgentId) -> Result<String> {
 pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
     let Registration { req, repo } = reg;
     let native_ids = serde_json::to_string(&req.native_ids).expect("maps serialize");
-    let previous: Option<(Option<String>, Option<String>, String)> = cx
+    let previous: Option<(Option<String>, Option<String>, String, String)> = cx
         .db
         .query_row(
-            "SELECT repo, branch, state FROM agents WHERE id = ?1",
+            "SELECT repo, branch, state, role FROM agents WHERE id = ?1",
             [req.id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
     // The session-start hook registers every agent as a worker; an agent named as a
-    // board's coordinator keeps that role.
-    let role = if cx.exists(
+    // board's coordinator keeps that role, and the title its device's daemon gave it (the
+    // board's name), which a worker's registration (the thread's own title) would replace.
+    let coordinates = cx.exists(
         "SELECT 1 FROM boards WHERE coordinator = ?1",
         [req.id.as_str()],
-    )? {
+    )?;
+    let role = if coordinates {
         AgentRole::Coordinator
     } else {
         req.role
     };
+    // The daemon registers its coordinator before it claims the lease: a worker's
+    // registration landing in between keeps the coordinator's title too.
+    let was_coordinator = previous
+        .as_ref()
+        .is_some_and(|(_, _, _, role)| *role == enum_str(&AgentRole::Coordinator));
+    let title = req
+        .title
+        .as_deref()
+        .filter(|_| req.role == AgentRole::Coordinator || !(coordinates || was_coordinator));
     let now = cx.now_ms();
     let is_new = previous.is_none();
     if is_new {
@@ -104,7 +126,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 enum_str(&req.runtime),
                 req.device.as_str(),
                 enum_str(&role),
-                req.title,
+                title,
                 repo,
                 req.branch,
                 req.cwd,
@@ -127,7 +149,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
                 enum_str(&req.runtime),
                 req.device.as_str(),
                 enum_str(&role),
-                req.title,
+                title,
                 repo,
                 req.branch,
                 req.cwd,
@@ -140,7 +162,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
     // A registration marks the agent running, such as a T3 thread resumed after its idle
     // session was closed: announced like any state change, so followers such as the device
     // daemon see it.
-    if let Some((_, _, before)) = &previous
+    if let Some((_, _, before, _)) = &previous
         && before != "running"
     {
         cx.emit(
@@ -155,7 +177,7 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
             }),
         )?;
     }
-    let moved = previous.is_some_and(|(r, b, _)| r != repo || b != req.branch);
+    let moved = previous.is_some_and(|(r, b, _, _)| r != repo || b != req.branch);
     if is_new || moved {
         cx.emit(
             None,

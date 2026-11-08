@@ -757,13 +757,6 @@ fn digest_text(state: &AppState, digest: &telegram_ops::Digest, day: &str) -> St
         text.push('\n');
         left -= usize::from(item);
     }
-    if digest.done_since_seen > 0 {
-        text.push_str(&format!(
-            "\nDone since you last looked: {} {}.",
-            digest.done_since_seen,
-            plural(digest.done_since_seen, "task", "tasks"),
-        ));
-    }
     if let Some(url) = state.public_url() {
         text.push_str(&format!("\n{url}/asks"));
     }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { BoardEvent } from "../api/schema.ts";
-import { plainLine } from "./boards.tsx";
+import { plainLine } from "./asks.tsx";
 import { describe as describeEvent, detail, eventMark } from "./events.tsx";
 import { monogram } from "../ui/icons.tsx";
 

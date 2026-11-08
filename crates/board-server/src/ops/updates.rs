@@ -72,23 +72,6 @@ fn seen_at(cx: &Ctx<'_>) -> Result<Option<Timestamp>> {
         .map(ts))
 }
 
-/// How many done tasks the Updates page lists past the seen cursor, counted in full;
-/// `None` before the user first marks updates seen.
-pub(crate) fn done_since_seen(cx: &Ctx<'_>) -> Result<Option<usize>> {
-    let Some(seen) = seen_at(cx)? else {
-        return Ok(None);
-    };
-    let count: i64 = cx.db.query_row(
-        "SELECT COUNT(*) FROM tasks \
-         WHERE status = 'done' AND done_at IS NOT NULL AND done_at > ?1 \
-           AND NOT EXISTS (SELECT 1 FROM feedback f \
-                           WHERE f.task = tasks.id AND f.resolution IS NOT NULL)",
-        [seen.timestamp_millis()],
-        |r| r.get(0),
-    )?;
-    Ok(Some(usize::try_from(count).unwrap_or(0)))
-}
-
 /// Done tasks and turn endings after `since` (else the seen cursor), newest first.
 pub(crate) fn updates(
     cx: &Ctx<'_>,

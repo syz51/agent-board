@@ -10,8 +10,8 @@ export const tags = {
   asks: "asks",
   /** Tasks across boards, such as the agents screen's current tasks. */
   tasks: "tasks",
-  /** What finished and what coordinators said, for the user (`GET /v1/updates`, said lists). */
-  updates: "updates",
+  /** What coordinators said at the end of their turns (the agents screen's said lists). */
+  said: "said",
   board: (slug: string) => `board:${slug}`,
   task: (id: string) => `task:${id}`,
   handoff: (agentId: string) => `handoff:${agentId}`,
@@ -43,7 +43,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "board_updated":
       if (isDeletion(event)) {
         // Its tasks, asks and memberships went with it.
-        onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.updates);
+        onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.said);
       } else {
         onBoard(tags.boards);
       }
@@ -55,13 +55,10 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "task_claimed":
     case "task_released":
     case "task_taken":
-      // Counts on the boards screen and current tasks on the agents screen change too.
-      onBoard(tags.boards, tags.tasks);
-      break;
     case "task_updated":
     case "task_done":
-      // A done task joins the updates; a reopened one leaves them and loses its summary.
-      onBoard(tags.boards, tags.tasks, tags.updates);
+      // Counts on the boards screen and current tasks on the agents screen change too.
+      onBoard(tags.boards, tags.tasks);
       break;
     case "note_added":
     case "evidence_added":
@@ -76,7 +73,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
       break;
     case "agent_state_changed":
       // A coordinator's turn ending is stored on the same Stop that changes its state.
-      out.push(tags.agents, tags.boards, tags.updates);
+      out.push(tags.agents, tags.boards, tags.said);
       break;
     case "ask_created":
     case "ask_answered":
@@ -86,7 +83,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
       break;
     default:
       // A type this view does not know yet: refresh everything it could touch.
-      onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.updates);
+      onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.said);
   }
   return out;
 }

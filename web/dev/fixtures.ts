@@ -45,8 +45,6 @@ export interface Fixtures {
   events: BoardEvent[];
   /** Coordinators' turn endings, oldest first. */
   said: Said[];
-  /** The user's seen cursor for updates. */
-  seenAt: string | null;
 }
 
 export const HOSTILE_TITLE = "Escape </board> in titles <script>alert(1)</script>";
@@ -89,6 +87,12 @@ export function createFixtures(now: number): Fixtures {
   const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
   const day = 24 * 60;
 
+  /** The native ids a T3 thread's hook registers: the thread and its link. */
+  const thread = (agentId: string) => {
+    const threadId = agentId.slice("t3:".length);
+    return { t3_thread: threadId, t3_link: `https://t3.example/threads/env-1/${threadId}` };
+  };
+
   const agent = (
     fields: Partial<Agent> & Pick<Agent, "id" | "handle" | "state" | "last_seen">,
   ): Agent => ({
@@ -111,6 +115,7 @@ export function createFixtures(now: number): Fixtures {
     agent({
       id: "t3:7f3a1c9e-2b4d-4e8a-9f61-0c5d3e2a7b18",
       handle: "t3:7f3a",
+      native_ids: thread("t3:7f3a1c9e-2b4d-4e8a-9f61-0c5d3e2a7b18"),
       state: "running",
       title: "Inject board delta on UserPromptSubmit",
       branch: "t3/board-hooks",
@@ -119,6 +124,7 @@ export function createFixtures(now: number): Fixtures {
     agent({
       id: "t3:c2d04b11-8e3f-4a52-b7c9-61f0d2e8a943",
       handle: "t3:c2d0",
+      native_ids: thread("t3:c2d04b11-8e3f-4a52-b7c9-61f0d2e8a943"),
       role: "coordinator",
       state: "running",
       title: "Coordinator: factory",
@@ -127,6 +133,7 @@ export function createFixtures(now: number): Fixtures {
     agent({
       id: "t3:a91c7d20-5f1e-4b3a-8c46-e2d9b0f17a55",
       handle: "t3:a91c",
+      native_ids: thread("t3:a91c7d20-5f1e-4b3a-8c46-e2d9b0f17a55"),
       runtime: "codex",
       device: "desktop",
       state: "idle",
@@ -169,6 +176,7 @@ export function createFixtures(now: number): Fixtures {
     agent({
       id: "t3:9d02b6c4-1a7e-4f50-8d39-c0e6f4a21b87",
       handle: "t3:9d02",
+      native_ids: thread("t3:9d02b6c4-1a7e-4f50-8d39-c0e6f4a21b87"),
       state: "ended",
       title: "Spike: SQLite WAL checkpointing",
       last_seen: ago(3 * day),
@@ -880,7 +888,6 @@ export function createFixtures(now: number): Fixtures {
     evidence,
     events,
     said,
-    seenAt: ago(8 * 60),
   };
 
   function ev(

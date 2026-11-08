@@ -17,6 +17,7 @@ import {
   AskKind,
   Crumbs,
   Empty,
+  listClass,
   ErrorNotice,
   Owner,
   PageHeader,
@@ -46,6 +47,81 @@ export function useOpenAsks() {
 export function newestFirst(asks: Ask[]): Ask[] {
   return [...asks].sort(
     (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id,
+  );
+}
+
+/** The first line of agent markdown without its markup, for a one-line preview. */
+export function plainLine(text: string): string {
+  const line = text.trim().split("\n")[0] ?? "";
+  return line
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__|`|~~)/g, "")
+    .replace(/^#+\s*/, "");
+}
+
+/**
+ * Open asks one line each, newest first, each opening its ask page: on Home across boards
+ * (`showBoard`), on a board page for that board. `limit` cuts the list; Needs you has them all.
+ * `inFrame` drops the list's own frame, for a list inside a framed card.
+ */
+export function AskRows({
+  asks,
+  limit,
+  empty,
+  showBoard = false,
+  inFrame = false,
+}: {
+  asks: Ask[];
+  limit?: number;
+  empty: string;
+  showBoard?: boolean;
+  inFrame?: boolean;
+}) {
+  if (asks.length === 0) {
+    return <p className="text-meta text-muted-foreground">{empty}</p>;
+  }
+  return (
+    <ul className={inFrame ? "divide-y" : listClass}>
+      {newestFirst(asks)
+        .slice(0, limit)
+        .map((ask) => (
+          <li key={ask.id}>
+            {/* The left edge takes the kind's colour, as on the Needs you cards: these rows
+                wait on the user, unlike the rows around them. */}
+            <Link
+              className={cn(
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+                ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
+              )}
+              to="/asks/$id"
+              params={{ id: String(ask.id) }}
+            >
+              <AskKind kind={ask.kind} />
+              <span
+                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-3 max-md:whitespace-normal"
+                title={plainLine(ask.question)}
+              >
+                {/* Tags show as code here too, as in the ask itself. */}
+                <PlainText className="[white-space:inherit]" text={plainLine(ask.question)} />
+              </span>
+              {/* Where and when; on hover or focus, what a click does. */}
+              <span className="grid text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
+                <span className="col-start-1 row-start-1 [@media(hover:hover)]:group-hover/ask:invisible [@media(hover:hover)]:group-focus-visible/ask:invisible">
+                  {showBoard ? `${ask.board} · ` : ask.task ? `${ask.task} · ` : ""}
+                  <RelTime at={ask.created_at} />
+                </span>
+                <span
+                  className="invisible col-start-1 row-start-1 inline-flex items-center justify-end gap-1 font-medium text-link [@media(hover:hover)]:group-hover/ask:visible [@media(hover:hover)]:group-focus-visible/ask:visible"
+                  aria-hidden="true"
+                >
+                  Answer <Icon name="arrow" className="size-3.5" />
+                </span>
+              </span>
+            </Link>
+          </li>
+        ))}
+    </ul>
   );
 }
 
@@ -154,7 +230,7 @@ function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
       )}
       <section className={part}>
         <h2 className={heading}>Asked by</h2>
-        <Who id={ask.agent} agents={agents} />
+        <Who id={ask.agent} agents={agents} withTitle />
         {/* As on the agents page, an ended agent's handoff is history, not context. */}
         {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} stacked />}
       </section>

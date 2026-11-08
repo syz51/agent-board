@@ -356,13 +356,11 @@ pub(crate) fn record_digest(cx: &mut Ctx<'_>, day: &str) -> Result<()> {
 pub(crate) struct Digest {
     /// Boards in slug order, each with its open asks.
     pub boards: BTreeMap<String, Vec<Ask>>,
-    /// Tasks done since the user last marked updates seen, as the Updates page counts them.
-    pub done_since_seen: usize,
 }
 
 impl Digest {
     pub(crate) fn is_empty(&self) -> bool {
-        self.boards.is_empty() && self.done_since_seen == 0
+        self.boards.is_empty()
     }
 }
 
@@ -377,8 +375,5 @@ pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
             .or_default()
             .push(ask);
     }
-    // Before the user first marks updates seen there is no cursor, and every done task
-    // would count.
-    digest.done_since_seen = crate::ops::updates::done_since_seen(cx)?.unwrap_or(0);
     Ok(digest)
 }
