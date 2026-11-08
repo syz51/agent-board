@@ -816,6 +816,23 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
                 fixed: 2,
             },
         },
+        since: Some(chrono::Utc::now() - chrono::TimeDelta::days(30)),
+        boards: vec![board_proto::BoardStats {
+            board: "factory".parse().unwrap(),
+            claims: 2,
+            wait_minutes_median: Some(60.0),
+            wait_minutes_p90: Some(90.0),
+            tasks_done: 1,
+            done_per_day: 9.0,
+            doing_minutes_median: Some(30.0),
+            lease_conflicts: 2,
+            reopened_after_review: 1,
+            pr_links: 1,
+            limit_pauses: 1,
+            limit_pauses_per_day: 9.0,
+            paused_hours: 0.5,
+            peak_running_at_pause: Some(2),
+        }],
     };
     e.stub.on("GET /v1/stats", &stats);
 
@@ -827,9 +844,39 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
          tasks: 5 created · 3 done (1 without a check, 2 under a minute in doing) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
          asks: 2 created · 1 answered · median 4m to answer\n\
-         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed"
+         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed\n\
+         board factory: wait median 60m, p90 90m over 2 claims · 9.0 done a day, median 30m in doing · \
+         1 reopened after review · 2 lease conflicts · 1 PR link · limit: 1 pause (9.0 a day), 0.5h paused, 2 running at most when one paused"
     );
     assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
+
+    // A server whose history starts within the window says what the numbers cover.
+    let since = chrono::Utc::now() - chrono::TimeDelta::hours(30);
+    let mut recent = stats.clone();
+    recent.since = Some(since);
+    e.stub.on("GET /v1/stats", &recent);
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with(&format!(
+            "stats, since {}, where the server's history starts (asked: last 7 days)\n",
+            since.format("%Y-%m-%d %H:%MZ")
+        )),
+        "{}",
+        stdout(&out)
+    );
+    // A server clock a few minutes ahead of this one is not a history that starts late.
+    recent.since =
+        Some(chrono::Utc::now() - chrono::TimeDelta::days(7) + chrono::TimeDelta::minutes(5));
+    e.stub.on("GET /v1/stats", &recent);
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("stats, last 7 days\n"),
+        "{}",
+        stdout(&out)
+    );
+    e.stub.on("GET /v1/stats", &stats);
 
     // `--json` prints the server's `Stats` unchanged: the weekly review reads it.
     let out = e.run(&["stats", "--days", "30", "--json"]);
@@ -838,12 +885,13 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     assert_eq!(printed, stats);
     let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(json["doing_minutes_median"], Value::Null);
-    assert_eq!(e.stub.requests_to("GET /v1/stats")[1].query, "days=30");
+    assert_eq!(json["boards"][0]["wait_minutes_p90"], 90.0);
+    assert_eq!(e.stub.requests_to("GET /v1/stats")[3].query, "days=30");
 
     // Out-of-range days fail before any request; stats do not register the agent.
     let out = e.run(&["stats", "--days", "0"]);
     assert!(!out.status.success());
-    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 2);
+    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 4);
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
 }
 

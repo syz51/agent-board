@@ -953,7 +953,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let req = ResolveFeedback { kind, task, reason };
             ops::resolve(&ctx()?, &id, req).await?
         }
-        Command::Stats { days } => ops::stats(&ctx()?, days).await?,
+        Command::Stats { days } => ops::stats(&ctx()?, days, chrono::Utc::now()).await?,
         Command::Errors {
             since,
             code,

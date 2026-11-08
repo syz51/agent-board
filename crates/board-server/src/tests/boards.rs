@@ -1,5 +1,5 @@
 use chrono::TimeDelta;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{T, check, coordinator_ttl};
 
@@ -270,6 +270,300 @@ async fn stats_count_the_feedback_signals() {
     assert_eq!(stats["done_under_a_minute"], 1, "{stats}");
     let (s, _) = t.call("GET", "/v1/stats?days=0", None, None).await;
     assert_eq!(s.as_u16(), 400);
+}
+
+#[tokio::test]
+async fn stats_give_each_board_its_wait_throughput_collision_and_limit_numbers() {
+    const REPO: &str = "github.com/acme/app";
+    let t = T::new();
+    let at = |minutes: i64| super::iso(super::start() + TimeDelta::minutes(minutes));
+    let (a, b, c) = ("t3:alpha", "t3:beta", "t3:gamma");
+    for agent in [a, b, c] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.board("factory", &[REPO]).await;
+    // Minute 0: two auto tasks, the second blocked by the first; b and c join the board.
+    let first = t
+        .task_with(
+            a,
+            json!({ "board": "factory", "title": "First", "auto": true }),
+        )
+        .await;
+    let second = t
+        .task_with(
+            a,
+            json!({ "board": "factory", "title": "Second", "auto": true, "blockers": [first] }),
+        )
+        .await;
+    let theirs = t.task(b, "factory", "B's").await;
+    t.task(c, "factory", "C's").await;
+
+    // Minute 30: the first is claimed after waiting 30 minutes; b's lease overlaps a's and b
+    // touches a file a leased.
+    t.advance(TimeDelta::minutes(30));
+    assert!(t.claim(a, &first).await.0.is_success());
+    for (agent, glob, task) in [(a, "src/**", &first), (b, "src/lib.rs", &theirs)] {
+        t.ok(
+            "POST",
+            "/v1/leases",
+            Some(agent),
+            Some(json!({ "agent": agent, "repo": REPO, "globs": [glob], "task": task })),
+        )
+        .await;
+    }
+    t.ok(
+        "POST",
+        "/v1/touches",
+        Some(b),
+        Some(json!({ "agent": b, "repo": REPO, "paths": ["src/lib.rs"] })),
+    )
+    .await;
+    // Minutes 50-60 in review, then back to doing: reopened once, and those 10 minutes are
+    // not time in doing. Done at minute 70 with a PR: 30 minutes in doing.
+    t.advance(TimeDelta::minutes(20));
+    assert!(
+        t.patch(a, &first, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    t.advance(TimeDelta::minutes(10));
+    assert!(
+        t.patch(a, &first, json!({ "status": "doing" }))
+            .await
+            .0
+            .is_success()
+    );
+    t.advance(TimeDelta::minutes(10));
+    let evidence = json!([
+        { "kind": "pr", "value": "https://github.com/acme/app/pull/1" },
+        { "kind": "check", "value": "cargo test", "exit_code": 0 },
+    ]);
+    assert!(t.done(a, &first, evidence).await.0.is_success());
+    // A task created claimed never waited.
+    t.task_with(
+        a,
+        json!({ "board": "factory", "title": "Mine", "auto": true, "claim": true }),
+    )
+    .await;
+
+    // Minute 90 b goes idle; minute 100 a pauses for a usage limit while a and c run, and
+    // runs again at minute 130: half an hour paused.
+    t.advance(TimeDelta::minutes(20));
+    let state = |agent: &str, body: serde_json::Value| {
+        let path = format!("/v1/agents/{agent}/state");
+        let agent = agent.to_owned();
+        let t = &t;
+        async move { t.ok("POST", &path, Some(&agent), Some(body)).await }
+    };
+    state(b, json!({ "state": "idle" })).await;
+    t.advance(TimeDelta::minutes(10));
+    state(a, json!({ "state": "paused", "paused_until": at(160) })).await;
+    t.advance(TimeDelta::minutes(30));
+    t.register(a, Some(REPO), None).await;
+
+    // Minute 160: the second, ready since its blocker was done at minute 70, is claimed.
+    t.advance(TimeDelta::minutes(30));
+    assert!(t.claim(b, &second).await.0.is_success());
+
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    assert_eq!(
+        stats["since"],
+        at(0),
+        "the oldest event, later than 7 days back"
+    );
+    let boards = stats["boards"].as_array().unwrap();
+    assert_eq!(boards.len(), 1, "{stats}");
+    let f = &boards[0];
+    assert_eq!(f["board"], "factory");
+    assert_eq!(f["claims"], 2);
+    assert_eq!(f["wait_minutes_median"], 60.0);
+    assert_eq!(f["wait_minutes_p90"], 90.0);
+    assert_eq!(f["tasks_done"], 1);
+    // 160 minutes covered: one task is 9 a day.
+    assert_eq!(f["done_per_day"], 9.0);
+    assert_eq!(f["doing_minutes_median"], 30.0);
+    assert_eq!(f["lease_conflicts"], 2);
+    assert_eq!(f["reopened_after_review"], 1);
+    assert_eq!(f["pr_links"], 1);
+    assert_eq!(f["limit_pauses"], 1);
+    assert_eq!(f["limit_pauses_per_day"], 9.0);
+    assert_eq!(f["paused_hours"], 0.5);
+    assert_eq!(f["peak_running_at_pause"], 2);
+}
+
+/// One board's numbers from `GET /v1/stats?days=7`.
+async fn board_stats(t: &T, slug: &str) -> Value {
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    stats["boards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["board"] == slug)
+        .unwrap_or_else(|| panic!("no board {slug} in {stats}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn board_waits_count_from_when_the_task_last_became_ready() {
+    const REPO: &str = "github.com/acme/app";
+    let t = T::new();
+    let at = |minutes: i64| super::iso(super::start() + TimeDelta::minutes(minutes));
+    let (a, b, c) = ("t3:alpha", "t3:beta", "t3:gamma");
+    for slug in ["cleared", "earlier", "created"] {
+        t.board(slug, &[REPO]).await;
+    }
+    for agent in [a, b, c] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    // Minute 0: three auto tasks; the last may start at minute 40, set when it was created.
+    let auto = |board: &str| json!({ "board": board, "title": "Work", "auto": true });
+    let cleared = t.task_with(a, auto("cleared")).await;
+    let earlier = t.task_with(a, auto("earlier")).await;
+    let mut body = auto("created");
+    body["not_before"] = json!(at(40));
+    let created = t.task_with(a, body).await;
+    // Minute 5: the first two may not start before minute 200; at minute 10 the first's
+    // date is cleared and the second's moved to minute 20.
+    t.advance(TimeDelta::minutes(5));
+    for task in [&cleared, &earlier] {
+        let (s, _) = t.patch(a, task, json!({ "not_before": at(200) })).await;
+        assert!(s.is_success());
+    }
+    t.advance(TimeDelta::minutes(5));
+    for (task, not_before) in [(&cleared, json!(null)), (&earlier, json!(at(20)))] {
+        let (s, _) = t.patch(a, task, json!({ "not_before": not_before })).await;
+        assert!(s.is_success());
+    }
+    // Minute 30: the first is claimed, ready for 20 minutes.
+    t.advance(TimeDelta::minutes(20));
+    assert!(t.claim(a, &cleared).await.0.is_success());
+    // Minute 45: the second, ready since minute 20, and the third, ready since minute 40
+    // though the sweeper has not announced that yet.
+    t.advance(TimeDelta::minutes(15));
+    assert!(t.claim(b, &earlier).await.0.is_success());
+    assert!(t.claim(c, &created).await.0.is_success());
+
+    for (slug, wait) in [("cleared", 20.0), ("earlier", 25.0), ("created", 5.0)] {
+        let s = board_stats(&t, slug).await;
+        assert_eq!(
+            (s["claims"].clone(), s["wait_minutes_median"].clone()),
+            (json!(1), json!(wait)),
+            "{slug}: {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn board_lease_conflicts_count_every_lease_on_the_boards_repos() {
+    const APP: &str = "github.com/acme/app";
+    const SITE: &str = "github.com/acme/site";
+    let t = T::new();
+    let (a, b) = ("t3:alpha", "t3:beta");
+    t.board("app", &[APP]).await;
+    t.board("site", &[SITE]).await;
+    for agent in [a, b] {
+        t.register(agent, Some(APP), None).await;
+    }
+    t.task(a, "app", "App work").await;
+    let site_task = t.task(b, "site", "Site work").await;
+    // a leases without a task; b's overlapping lease names a task of the site board, but
+    // the conflict is on the app board's repo.
+    for (agent, glob, task) in [(a, "src/**", None), (b, "src/lib.rs", Some(&site_task))] {
+        t.ok(
+            "POST",
+            "/v1/leases",
+            Some(agent),
+            Some(json!({ "agent": agent, "repo": APP, "globs": [glob], "task": task })),
+        )
+        .await;
+    }
+    assert_eq!(board_stats(&t, "app").await["lease_conflicts"], 1);
+    assert_eq!(board_stats(&t, "site").await["lease_conflicts"], 0);
+}
+
+#[tokio::test]
+async fn board_doing_time_counts_each_cycle_once() {
+    let t = T::new();
+    let a = "t3:alpha";
+    t.board("factory", &[super::REPO]).await;
+    t.register(a, Some(super::REPO), None).await;
+    let task = t.task(a, "factory", "Twice").await;
+    // Ten minutes in doing, done, reopened, then five more and done again.
+    assert!(t.claim(a, &task).await.0.is_success());
+    t.advance(TimeDelta::minutes(10));
+    assert!(t.done(a, &task, check(0)).await.0.is_success());
+    let (s, _) = t.patch(a, &task, json!({ "status": "open" })).await;
+    assert!(s.is_success());
+    t.advance(TimeDelta::minutes(10));
+    assert!(t.claim(a, &task).await.0.is_success());
+    t.advance(TimeDelta::minutes(5));
+    assert!(t.done(a, &task, check(0)).await.0.is_success());
+
+    let s = board_stats(&t, "factory").await;
+    assert_eq!(s["tasks_done"], 2);
+    assert_eq!(s["doing_minutes_median"], 7.5, "{s}");
+}
+
+#[tokio::test]
+async fn board_pauses_follow_resets_sessions_membership_and_who_was_running() {
+    const REPO: &str = "github.com/acme/app";
+    let t = T::new();
+    let (a, c, d, e, g, h) = (
+        "t3:alpha", "t3:gamma", "t3:delta", "t3:echo", "t3:golf", "t3:hotel",
+    );
+    t.board("factory", &[REPO]).await;
+    t.board("quiet", &["github.com/acme/quiet"]).await;
+    for agent in [a, c, e, g] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    for agent in [d, h] {
+        t.register(agent, None, None).await;
+    }
+    let state = |agent: &str, body: Value| {
+        let path = format!("/v1/agents/{agent}/state");
+        let agent = agent.to_owned();
+        let t = &t;
+        async move { t.ok("POST", &path, Some(&agent), Some(body)).await }
+    };
+    // Minute 0: d pauses before it joins factory, which it does at minute 1. h works on
+    // quiet alone and never pauses.
+    state(d, json!({ "state": "paused" })).await;
+    t.advance(TimeDelta::minutes(1));
+    t.task(d, "factory", "D's").await;
+    t.task(h, "quiet", "Quiet").await;
+    // g's registration has left the history: it has no state on record.
+    t.exec("DELETE FROM events WHERE type = 'agent_registered' AND actor = 't3:golf'");
+    // A day later e, silent since it registered, is stale; a, c and g are seen working.
+    t.advance(super::stale_after());
+    let paused_at = super::start() + TimeDelta::minutes(1) + super::stale_after();
+    let until = |minutes: i64| super::iso(paused_at + TimeDelta::minutes(minutes));
+    for agent in [a, c, g] {
+        t.task(agent, "factory", "Seen").await;
+    }
+    // a pauses with only c also running, until +30; at +20 it learns the reset is +60, and
+    // it runs again at +90: an hour paused.
+    state(a, json!({ "state": "paused", "paused_until": until(30) })).await;
+    t.advance(TimeDelta::minutes(20));
+    state(a, json!({ "state": "paused", "paused_until": until(60) })).await;
+    t.advance(TimeDelta::minutes(70));
+    t.register(a, Some(REPO), None).await;
+    // +100: c pauses with no reset named, with a running again; its session ends at +130,
+    // which ends the pause: half an hour.
+    t.advance(TimeDelta::minutes(10));
+    state(c, json!({ "state": "paused" })).await;
+    t.advance(TimeDelta::minutes(30));
+    state(c, json!({ "state": "ended" })).await;
+    t.advance(TimeDelta::minutes(70));
+
+    let f = board_stats(&t, "factory").await;
+    assert_eq!(f["limit_pauses"], 2, "{f}");
+    assert_eq!(f["paused_hours"], 1.5, "{f}");
+    assert_eq!(f["peak_running_at_pause"], 2, "{f}");
+    let q = board_stats(&t, "quiet").await;
+    assert_eq!(q["limit_pauses"], 0);
+    assert_eq!(q["paused_hours"].to_string(), "0.0", "not -0.0");
+    assert_eq!(q["peak_running_at_pause"], Value::Null);
 }
 
 #[tokio::test]
