@@ -13,7 +13,7 @@
 //!   the hooks read a thread's title, link and, for a delegated thread, its parent
 //!   (`parentThreadId`); with `--messages 100` the daemon reads whether a re-brief whose
 //!   send timed out reached the thread (`messages`: `{role, text}`, oldest first, and
-//!   `thread.activeRunId`, null unless a run is active).
+//!   `thread.status`, the active run's state, else the latest run's, or `idle`).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
@@ -62,8 +62,9 @@ pub fn folder_gone(folder: &Path) -> bool {
 /// A thread's latest messages, as far as the daemon reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecentMessages {
-    /// Whether a run is active: a message sent meanwhile may wait as its next turn.
-    pub running: bool,
+    /// Whether a run is active or queued: a message sent meanwhile may wait in T3's queue,
+    /// out of the messages until its run starts.
+    pub busy: bool,
     /// The text of each user message, oldest first.
     pub user: Vec<String>,
 }
@@ -264,10 +265,10 @@ impl T3 for T3Cli {
     }
 
     async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
-        Ok(self
-            .thread_show(thread, &RECENT_MESSAGES.to_string())
+        self.thread_show(thread, &RECENT_MESSAGES.to_string())
             .await?
-            .map(|value| parse_recent_messages(&value)))
+            .map(|value| parse_recent_messages(&value))
+            .transpose()
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
@@ -352,19 +353,29 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     }
 }
 
-/// Reads `{"thread": {"activeRunId": …}, "messages": [{"role", "text", …}]}` from
-/// `t3 thread show --json`. A message without a text is left out.
-pub fn parse_recent_messages(value: &Value) -> RecentMessages {
-    RecentMessages {
-        running: !value["thread"]["activeRunId"].is_null(),
-        user: value["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
+/// Run states in which T3 may still deliver a queued message: `thread.status` is the
+/// active run's state, else the latest run's (`queued` while its queue is held).
+const BUSY_STATUSES: [&str; 5] = ["preparing", "queued", "starting", "running", "waiting"];
+
+/// Reads `{"thread": {"status": …, "activeRunId": …}, "messages": [{"role", "text", …}]}`
+/// from `t3 thread show --json`. Output without `thread.status` or the `messages` array is
+/// an error, so a changed format never makes a delivered message look missing.
+pub fn parse_recent_messages(value: &Value) -> Result<RecentMessages> {
+    let thread = &value["thread"];
+    let status = thread["status"]
+        .as_str()
+        .context("t3 thread show --json printed no thread.status")?;
+    let messages = value["messages"]
+        .as_array()
+        .context("t3 thread show --json printed no messages")?;
+    Ok(RecentMessages {
+        busy: BUSY_STATUSES.contains(&status) || !thread["activeRunId"].is_null(),
+        user: messages
+            .iter()
             .filter(|m| m["role"].as_str() == Some("user"))
             .filter_map(|m| m["text"].as_str().map(str::to_owned))
             .collect(),
-    }
+    })
 }
 
 /// Reads `{"thread": {"parentThreadId": …, "relationshipToParent": …}}`: the parent of a
@@ -670,24 +681,39 @@ mod tests {
     }
 
     #[test]
-    fn recent_messages_read_the_user_texts_and_whether_a_run_is_active() {
+    fn recent_messages_read_the_user_texts_and_whether_a_run_may_take_a_message() {
         let recent = parse_recent_messages(&json!({
-            "thread": {"activeRunId": "run:1"},
+            "thread": {"status": "running", "activeRunId": "run:1"},
             "messages": [
                 {"role": "user", "runId": "run:0", "text": "first"},
                 {"role": "assistant", "runId": "run:0", "text": "reply"},
                 {"role": "user", "runId": "run:1"},
                 {"role": "user", "runId": "run:1", "text": "second"},
             ],
-        }));
+        }))
+        .unwrap();
         assert_eq!(
             recent,
             RecentMessages {
-                running: true,
+                busy: true,
                 user: vec!["first".to_owned(), "second".to_owned()],
             }
         );
-        let idle = parse_recent_messages(&json!({"thread": {"activeRunId": null}}));
-        assert_eq!(idle, RecentMessages::default());
+        // A queued or waiting run has no active run id, but may still take a message.
+        for status in ["queued", "waiting", "preparing", "starting"] {
+            let value = json!({"thread": {"status": status, "activeRunId": null}, "messages": []});
+            assert!(parse_recent_messages(&value).unwrap().busy, "{status}");
+        }
+        for status in ["idle", "completed", "failed", "interrupted", "cancelled"] {
+            let value = json!({"thread": {"status": status, "activeRunId": null}, "messages": []});
+            assert_eq!(
+                parse_recent_messages(&value).unwrap(),
+                RecentMessages::default(),
+                "{status}"
+            );
+        }
+        // Another format is an error, never an empty thread.
+        assert!(parse_recent_messages(&json!({"thread": {"status": "idle"}})).is_err());
+        assert!(parse_recent_messages(&json!({"messages": []})).is_err());
     }
 }

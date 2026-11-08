@@ -403,14 +403,20 @@ settings in use, warned once per edit.
   (from before this rule), or a thread an earlier unfinished start launched, counts as
   changed, so it is briefed once.
 - **A re-brief whose send timed out**: T3 may or may not have delivered it, so the daemon
-  records the new digest and keeps the re-brief as unsure in its state. The next
-  reconcile that would send a re-brief (the coordinator is not held) reads the thread's
-  100 latest messages with `t3 thread show`. A user message with the marker settles it.
-  When no message has the marker and T3 runs no turn of the thread, which might still
-  take a queued message, the prompt is owed again and sent by the rules above. A second
-  send that times out counts as delivered, so a digest is sent at most twice. A check
-  that fails or times out backs off like a failed send and sends nothing, so a re-brief
-  that arrived is never sent twice.
+  records the new digest and keeps the re-brief as unsure in its state, with the time of
+  the send. This covers a wake-up or a usage-limit resume that carried it, and a flush
+  cut short while sending it. From one minute after the send, so T3 has handled the
+  request, each reconcile reads the thread's 100 latest messages with `t3 thread show`,
+  while the coordinator works too, so its turns do not push the message out of them.
+  The newest user message with a re-brief marker of the board settles it when that
+  marker carries this digest. Otherwise, while T3 has a run of the thread active or
+  queued (`thread.status` preparing, queued, starting, running or waiting), the message
+  may still wait in T3's queue, so it is read again on the next reconcile. With no such
+  run, the prompt is owed again and sent by the rules above. A second send that times out
+  counts as delivered, so a digest is sent at most twice. A check that fails, times out
+  or reads an unknown format backs off like a failed send and sends nothing, so a
+  re-brief that arrived is not sent twice. One that answers that T3 does not know the
+  thread makes the next reconcile ask whether the thread is gone.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
