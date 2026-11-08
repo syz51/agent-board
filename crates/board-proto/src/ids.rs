@@ -83,8 +83,10 @@ string_id!(
 
 string_id!(
     /// An agent (thread) id: `<source>:<native id>`, where the source is `t3` (a T3 Code
-    /// thread), `claude` (a standalone Claude Code session) or `codex` (a standalone Codex
-    /// session). The native id is 1–256 characters of `A-Z a-z 0-9 . _ - : %`.
+    /// thread), `claude` (a standalone Claude Code session), `codex` (a standalone Codex
+    /// session) or `dispatch` (a device daemon that dispatches a board's work, named after
+    /// its device: `dispatch:<device name>`). The native id is 1–256 characters of
+    /// `A-Z a-z 0-9 . _ - : %`; a `dispatch` one is a [`DeviceName`].
     AgentId,
     "agent id",
     check_agent_id
@@ -103,6 +105,8 @@ pub enum AgentSource {
     T3,
     Claude,
     Codex,
+    /// A device daemon dispatching a board's work (`docs/API.md`, "Daemon dispatch").
+    Dispatch,
 }
 
 impl AgentId {
@@ -110,12 +114,23 @@ impl AgentId {
         match self.0.split_once(':').map(|(source, _)| source) {
             Some("t3") => AgentSource::T3,
             Some("claude") => AgentSource::Claude,
+            Some("dispatch") => AgentSource::Dispatch,
             _ => AgentSource::Codex,
         }
     }
 
     pub fn native(&self) -> &str {
         self.0.split_once(':').map_or("", |(_, native)| native)
+    }
+
+    /// The dispatch agent of `device`: `dispatch:<device>`.
+    pub fn dispatch(device: &DeviceName) -> Self {
+        Self(format!("dispatch:{device}"))
+    }
+
+    /// The device a dispatch agent is named after; `None` for other sources.
+    pub fn dispatch_device(&self) -> Option<DeviceName> {
+        (self.source() == AgentSource::Dispatch).then(|| DeviceName(self.native().to_owned()))
     }
 }
 
@@ -174,8 +189,12 @@ fn check_agent_id(value: &str) -> Result<(), &'static str> {
     let (source, native) = value
         .split_once(':')
         .ok_or("must be <source>:<native id>")?;
-    if !matches!(source, "t3" | "claude" | "codex") {
-        return Err("source must be t3, claude or codex");
+    if !matches!(source, "t3" | "claude" | "codex" | "dispatch") {
+        return Err("source must be t3, claude, codex or dispatch");
+    }
+    if source == "dispatch" {
+        return check_slug(native)
+            .map_err(|_| "a dispatch agent is dispatch:<device name> (a-z, 0-9 and -)");
     }
     if native.is_empty() || native.len() > 256 {
         return Err("native id must be 1-256 characters");
@@ -230,6 +249,21 @@ mod tests {
             .unwrap();
         assert_eq!(id.source(), AgentSource::T3);
         assert_eq!(id.native(), "thread:delegated-task:command%3Amcp%3A47f9");
+    }
+
+    #[test]
+    fn dispatch_agents_are_named_after_their_device() {
+        let device: DeviceName = "mac-pro".parse().unwrap();
+        let id = AgentId::dispatch(&device);
+        assert_eq!(id.as_str(), "dispatch:mac-pro");
+        assert_eq!(id.source(), AgentSource::Dispatch);
+        assert_eq!(id.dispatch_device(), Some(device));
+        assert_eq!("dispatch:mac-pro".parse::<AgentId>().unwrap(), id);
+        let t3: AgentId = "t3:abc".parse().unwrap();
+        assert_eq!(t3.dispatch_device(), None);
+        for bad in ["dispatch:", "dispatch:Mac", "dispatch:a:b", "dispatch:-a"] {
+            assert!(bad.parse::<AgentId>().is_err(), "{bad}");
+        }
     }
 
     #[test]

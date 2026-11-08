@@ -11,14 +11,14 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot,
-    SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, Dispatch, Event, EventType, Runtime,
+    Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Ctx, parse_id, parse_json};
+use crate::db::{Ctx, parse_enum, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
@@ -98,6 +98,10 @@ struct Model {
     you: Option<You>,
     #[serde(skip_serializing_if = "Option::is_none")]
     counts: Option<Counts>,
+    /// Set in full snapshots of a board whose autopilot runs on its device daemon
+    /// (`dispatch: daemon`); thread dispatch, the default, is not shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mine: Vec<Mine>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,6 +312,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
         seq,
         you: None,
         counts: None,
+        dispatch: None,
         mine: Vec::new(),
         handoff: None,
         alerts,
@@ -458,15 +463,12 @@ fn fill_full(
     board_counts: Option<Counts>,
 ) -> Result<()> {
     // Only the board's coordinator, with its lease live, is told the limit.
-    let parallel_tasks: Option<u32> = cx
-        .db
-        .query_row(
-            "SELECT parallel_tasks FROM boards WHERE slug = ?1 AND coordinator = ?2 \
-             AND coordinator_expires_at > ?3",
-            params![board.as_str(), agent.id.as_str(), cx.now_ms()],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let (parallel_tasks, dispatch): (Option<u32>, Dispatch) = cx.db.query_row(
+        "SELECT CASE WHEN coordinator = ?2 AND coordinator_expires_at > ?3 \
+                THEN parallel_tasks END, dispatch FROM boards WHERE slug = ?1",
+        params![board.as_str(), agent.id.as_str(), cx.now_ms()],
+        |r| Ok((r.get(0)?, parse_enum(&r.get::<_, String>(1)?)?)),
+    )?;
     model.you = Some(You {
         handle: agent.handle.clone(),
         runtime: runtime_str(agent.runtime),
@@ -477,6 +479,7 @@ fn fill_full(
         parallel_tasks,
     });
     model.counts = board_counts;
+    model.dispatch = (dispatch == Dispatch::Daemon).then_some("daemon");
 
     // mine: owned tasks that are not closed, on any board.
     let me = agent.id.as_str();
@@ -1616,6 +1619,9 @@ fn render_lines(m: &Model) -> String {
     if let Some(c) = &m.counts {
         let _ = writeln!(o, "counts: {}", counts_line(c));
     }
+    if let Some(dispatch) = m.dispatch {
+        let _ = writeln!(o, "dispatch: {dispatch}");
+    }
     if !m.mine.is_empty() {
         o.push_str("mine:\n");
         for t in &m.mine {
@@ -1777,6 +1783,9 @@ fn render_yaml(m: &Model) -> String {
             "counts: {{open: {}, doing: {}, blocked: {}, review: {}, ready: {}, auto: {}}}",
             c.open, c.doing, c.blocked, c.review, c.ready, c.ready_auto
         );
+    }
+    if let Some(dispatch) = m.dispatch {
+        let _ = writeln!(o, "dispatch: {dispatch}");
     }
     if !m.mine.is_empty() {
         o.push_str("mine:\n");

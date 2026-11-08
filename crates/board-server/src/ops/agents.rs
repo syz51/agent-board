@@ -50,6 +50,17 @@ pub(crate) fn validate_register(req: RegisterAgent) -> Result<Registration> {
             ));
         }
     }
+    if let Some(device) = req.id.dispatch_device()
+        && device != req.device
+    {
+        return Err(invalid(
+            format!(
+                "{} is the dispatch agent of device {device}, not of {}",
+                req.id, req.device
+            ),
+            format!("send device={device}, or register your own device's dispatch:<device>"),
+        ));
+    }
     if req.forked_from.as_ref() == Some(&req.id) {
         return Err(invalid(
             "forked_from names the agent itself",
@@ -61,12 +72,14 @@ pub(crate) fn validate_register(req: RegisterAgent) -> Result<Registration> {
 }
 
 /// The handle for a new agent: its source plus the shortest unused hex prefix (at least
-/// four characters) of the SHA-256 of its id. Stored, so it never changes.
+/// four characters) of the SHA-256 of its id. A dispatch agent's handle is its id, which is
+/// short and unique: one per device. Stored, so it never changes.
 fn new_handle(cx: &Ctx<'_>, id: &AgentId) -> Result<String> {
     let prefix = match id.source() {
         AgentSource::T3 => "t3",
         AgentSource::Claude => "claude",
         AgentSource::Codex => "codex",
+        AgentSource::Dispatch => return Ok(id.to_string()),
     };
     let digest = hex(&Sha256::digest(id.as_str().as_bytes()));
     for len in 4..=digest.len() {
@@ -305,6 +318,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
     let now = cx.now_ms();
     if update.state == AgentState::Ended {
         release_leases(cx, id)?;
+        crate::ops::judges::end_agent(cx, id)?;
     } else {
         cx.db.execute(
             "UPDATE leases SET expires_at = MAX(expires_at, ?3) WHERE agent = ?1 AND expires_at > ?2",

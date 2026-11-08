@@ -666,10 +666,13 @@ settings in use, warned once per edit.
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
 
-## Daemon dispatch (planned)
+## Daemon dispatch (partly built)
 
-Status: planned, not built (agent-board-308; the user chose it on 2026-11-08). It replaces
-the coordinator thread above one board at a time. Until a board switches, the previous
+Status: partly built (agent-board-308; the user chose it on 2026-11-08). Built: the
+`dispatch` board setting, the `dispatch` agent and judge registration, with their rights
+and records (marked "built" below; `docs/API.md`, "Daemon dispatch"). Not built yet: the
+daemon's dispatcher, the briefs, the switch steps and the rollout. It replaces the
+coordinator thread above one board at a time. Until a board switches, the previous
 section holds for that board.
 
 **Why**: a coordinator is one Claude session that lives for days. On agent-board
@@ -697,7 +700,8 @@ one task and one section of the prompt, not the days before it.
   needs is on the board.
 
 **The switch**: a board setting `dispatch`, either `thread` (the coordinator, default) or
-`daemon`, set with `board board set <slug> --dispatch daemon`. When a board switches to
+`daemon`, set with `board board set <slug> --dispatch daemon` (built: the setting, shown by
+`board_status` and full snapshots; the daemon does not act on it yet). When a board switches to
 `daemon`:
 
 1. The daemon stops waking the coordinator thread.
@@ -771,13 +775,15 @@ the work.
   dispatcher hands the task to itself and calls `task_done`. The evidence is the PR, the
   merge commit and the checks the judge recorded. The summary is the judge's.
 
-**Rights and records**:
+**Rights and records** (built):
 
 - The server learns two new things:
-  - a `dispatch` agent kind;
-  - the judges a lease holder registers for its board (agent, kind, tasks).
+  - a `dispatch` agent kind: `dispatch:<device>`, which only that device's daemon acts as
+    and names in the coordinator lease;
+  - the judges a lease holder registers for its board (agent, kind, tasks), listed so the
+    dispatcher can count the running judges.
 - A registered judge has the coordinator's rights on that board until its agent ends,
-  or for at most 2 hours.
+  or for at most 2 hours, and only while the agent that registered it holds the lease.
 - Turn endings are kept for judges as they are for a coordinator today (Reporting to the
   user).
 - Workers are ordinary agents.
