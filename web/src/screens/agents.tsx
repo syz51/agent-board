@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { Fragment } from "react";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
+import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { PlainText } from "@/text/markdown.tsx";
 import {
@@ -118,7 +120,7 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who and where it runs, then what it is
  * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[260px_minmax(0,1fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[300px_minmax(0,1fr)]";
 
 /**
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
@@ -143,19 +145,26 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             seen <RelTime at={agent.last_seen} />
           </span>
         </div>
-        {/* Where it runs, as one quiet line under who it is. */}
-        <p
-          className="col-start-2 text-meta [overflow-wrap:anywhere] text-muted-foreground"
-          data-slot="where"
-        >
+        {/* Where it runs, as one quiet line under who it is. Lines break between values,
+            never inside one: a value too long for the column ends in an ellipsis and shows
+            whole on hover. */}
+        <p className="col-start-2 text-meta text-muted-foreground" data-slot="where">
           {[
             agent.role === "coordinator" ? "Coordinator" : null,
-            `${agent.device} · ${agent.runtime}`,
+            agent.device,
+            agent.runtime,
             agent.repo?.replace(/^github\.com\//, ""),
             agent.branch,
           ]
-            .filter(Boolean)
-            .join(" · ")}
+            .filter((part): part is string => Boolean(part))
+            .map((part, index) => (
+              <Fragment key={index}>
+                {index > 0 && " · "}
+                <span className="inline-block max-w-full truncate align-bottom" title={part}>
+                  {part}
+                </span>
+              </Fragment>
+            ))}
         </p>
       </header>
       <div className="grid min-w-0 content-start gap-2">
@@ -183,10 +192,13 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   );
 }
 
-const handoffBox = "grid gap-1 border-l-2 pl-3 text-meta";
-
-export function HandoffView({ agentId }: { agentId: string }) {
+/**
+ * An agent's handoff. Beside a task, a rule sets it off and its labels sit left of their
+ * values; `stacked`, for a narrow card, drops the rule and puts each label above its value.
+ */
+export function HandoffView({ agentId, stacked }: { agentId: string; stacked?: boolean }) {
   const handoff = useQuery(queries.handoff(agentId));
+  const handoffBox = stacked ? "grid gap-1 text-meta" : "grid gap-1 border-l-2 pl-3 text-meta";
   if (handoff.error && handoff.data === undefined) {
     return <ErrorNotice error={handoff.error} retry={() => void handoff.refetch()} compact />;
   }
@@ -207,7 +219,14 @@ export function HandoffView({ agentId }: { agentId: string }) {
           · <RelTime at={updated_at} />
         </span>
       </p>
-      <dl className="m-0 grid gap-0.5 [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-sm [&_dd]:text-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+      <dl
+        className={cn(
+          "m-0 grid [&_dd]:m-0 [&_dd]:max-w-[72ch] [&_dd]:text-sm [&_dd]:text-foreground [&_dt]:text-meta [&_dt]:text-muted-foreground [&>div]:grid",
+          stacked
+            ? "gap-2 [&>div]:gap-0.5"
+            : "gap-0.5 [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2",
+        )}
+      >
         <div>
           <dt>Now</dt>
           <dd>

@@ -99,7 +99,12 @@ export function HomeScreen() {
               return (
                 <Section
                   title="In progress"
-                  count={progress?.length}
+                  count={
+                    progress &&
+                    (allProgress || progress.length <= HOME_ROWS
+                      ? progress.length
+                      : `${HOME_ROWS} of ${progress.length}`)
+                  }
                   aside={
                     // In the header, where All asks sits above, so it costs no row of its own.
                     progress &&
@@ -207,7 +212,12 @@ function InProgress({
                 {statusLabel(group.status)}
               </>
             }
-            count={group.count}
+            // Where some are left out, the count says so, to match the rows listed.
+            count={
+              group.tasks.length < group.count
+                ? `${group.tasks.length} of ${group.count}`
+                : group.count
+            }
           >
             <TaskList tasks={group.tasks} agents={agents} now={now} />
           </TaskGroupSection>
@@ -354,7 +364,7 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,392px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,432px)_minmax(0,172px)_36px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(

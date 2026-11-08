@@ -106,7 +106,8 @@ export function Section({
   children,
 }: {
   title: string;
-  count?: number | undefined;
+  /** How many it holds, or "4 of 5" where it lists only some. */
+  count?: number | string | undefined;
   icon?: ReactNode;
   /** Links or actions beside the heading; hidden while collapsed. */
   aside?: ReactNode;

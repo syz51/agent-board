@@ -45,7 +45,7 @@ describe("home", () => {
     await renderInApp(<HomeScreen />, { seed });
     const titles = screen
       .getAllByRole("heading", { level: 2 })
-      .map((heading) => heading.textContent?.replace(/\d+$/, ""));
+      .map((heading) => heading.textContent?.replace(/\d.*$/, ""));
     expect(titles).toEqual(["Waiting on you", "In progress", "Boards", "Since you last looked"]);
   });
 
@@ -56,10 +56,19 @@ describe("home", () => {
     expect(listed.length).toBeGreaterThan(HOME_ROWS);
     const visible = () => listed.filter((task) => within(progress).queryByText(task.title));
     expect(visible()).toEqual(listed.slice(0, HOME_ROWS));
+    // The counts say how many of them are listed.
+    const heading = screen.getByRole("heading", { level: 2, name: /In progress/ });
+    expect(heading.textContent).toBe(`In progress${HOME_ROWS} of ${listed.length}`);
+    const review = listed.filter((task) => task.status === "review");
+    const reviewShown = listed.slice(0, HOME_ROWS).filter((task) => task.status === "review");
+    expect(within(progress).getByRole("heading", { level: 3, name: /^Review/ }).textContent).toBe(
+      `Review${reviewShown.length} of ${review.length}`,
+    );
     const more = within(progress).getByRole("button", { name: `Show all ${listed.length}` });
     expect(more.getAttribute("aria-expanded")).toBe("false");
     await act(() => fireEvent.click(more));
     expect(visible()).toEqual(listed);
+    expect(heading.textContent).toBe(`In progress${listed.length}`);
     expect(more.getAttribute("aria-expanded")).toBe("true");
     expect(more.textContent).toBe("Show fewer");
   });

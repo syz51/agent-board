@@ -63,7 +63,7 @@ describe("navigation", () => {
     expect(total).toBeGreaterThan(0);
     const count = home.querySelector("[title]");
     expect(count?.getAttribute("title")).toBe(`${total} new since you last looked`);
-    expect(count?.textContent).toBe(String(total));
+    expect(count?.textContent).toBe(`${total}new`);
     // The same pill as the asks' count, but neutral: nothing here waits on the user.
     expect(count?.className).toMatch(/(^| )bg-secondary( |$)/);
     expect(count?.className).not.toMatch(/bg-amber/);

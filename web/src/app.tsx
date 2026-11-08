@@ -105,7 +105,10 @@ const NAV_COUNT =
 
 export function Nav() {
   const path = usePathname();
-  const open = useOpenAsks().data?.length ?? 0;
+  const asks = useOpenAsks();
+  const open = asks.data?.length ?? 0;
+  // Without the asks, the count is unknown, not zero: a dash says so.
+  const unknown = asks.data === undefined && asks.error !== null;
   const updates = useUpdates();
   const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
@@ -125,15 +128,33 @@ export function Nav() {
           <Icon name={item.icon} />
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
-            <Count value={open} act className={NAV_COUNT} aria-label={`${open} waiting on you`} />
+            <Count
+              value={open}
+              tone="solid"
+              className={NAV_COUNT}
+              aria-label={`${open} waiting on you`}
+            />
+          )}
+          {item.to === "/asks" && unknown && (
+            <Count
+              value="–"
+              tone="neutral"
+              className={NAV_COUNT}
+              title="Unknown until the connection is back"
+              aria-label="Count unknown until the connection is back"
+            />
           )}
           {/* Since you last looked is on the home page: its count says how much is new, in
               the neutral pill, as nothing here waits on the user. */}
           {item.to === "/" && unseen > 0 && (
             <>
+              {/* Phones leave it out: Home's own Since you last looked counts the same, and a
+                  second badge over the tab bar's icons reads as one more alarm. */}
               <Count
                 value={unseen}
-                className={NAV_COUNT}
+                tone="neutral"
+                word="new"
+                className="ml-auto max-md:hidden"
                 aria-hidden="true"
                 title={`${unseen} new since you last looked`}
               />
@@ -158,11 +179,25 @@ function BoardLinks() {
       <p className="px-2 pb-1 text-xs font-medium text-muted-foreground" aria-hidden="true">
         Boards
       </p>
-      {boards.data === undefined && (
-        <p className="px-2.5 py-1 text-meta text-muted-foreground">
-          {boards.error ? "Boards are unavailable" : "Loading…"}
-        </p>
-      )}
+      {boards.data === undefined &&
+        (boards.error ? (
+          // Placeholder rows where the boards go, so the list reads as not loaded, not empty.
+          <>
+            <ul className="grid gap-px" aria-hidden="true">
+              {[64, 88, 72].map((width) => (
+                <li key={width} className="flex min-h-7.5 items-center gap-2.25 px-2 py-1">
+                  <span className="size-4.5 flex-none rounded-[5px] bg-sidebar-accent" />
+                  <span className="h-2 rounded-full bg-sidebar-accent" style={{ width }} />
+                </li>
+              ))}
+            </ul>
+            <p className="px-2 pt-1 text-meta text-muted-foreground">
+              Boards show again once the connection is back.
+            </p>
+          </>
+        ) : (
+          <p className="px-2.5 py-1 text-meta text-muted-foreground">Loading…</p>
+        ))}
       <ul className="grid gap-px">
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
@@ -184,7 +219,7 @@ function BoardLinks() {
                 <span className="min-w-0 flex-1 truncate">{board.title}</span>
                 {board.open_asks > 0 && (
                   <>
-                    <Count value={board.open_asks} act aria-hidden="true" />
+                    <Count value={board.open_asks} tone="soft" aria-hidden="true" />
                     <span className="sr-only">
                       , {board.open_asks} {board.open_asks === 1 ? "open ask" : "open asks"}
                     </span>

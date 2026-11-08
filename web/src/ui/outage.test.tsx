@@ -119,6 +119,19 @@ describe("a page that fails to load", () => {
     }
   });
 
+  test("with nothing loaded, the sidebar shows placeholder boards and an unknown asks count", async () => {
+    outage();
+    act(() => setConnection({ kind: "offline" }));
+    await renderRoute("/boards/factory");
+    await screen.findByText(MESSAGE);
+    await screen.findByText("Boards show again once the connection is back.");
+    const boards = screen.getByRole("navigation", { name: "Boards" });
+    expect(boards.querySelectorAll("ul[aria-hidden=true] > li").length).toBe(3);
+    const asks = await screen.findByLabelText("Count unknown until the connection is back");
+    expect(asks.textContent).toBe("–");
+    expect(asks.className).not.toMatch(/bg-amber/);
+  });
+
   test("Try again is the card's primary action and asks the server again", async () => {
     const calls = await failedBoard({ kind: "reconnecting", attempt: 1, retryAt: now });
     const before = calls.filter((path) => path === "/v1/tasks").length;

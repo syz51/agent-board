@@ -138,22 +138,24 @@ export function AskScreen() {
 /** Beside a single ask: the task it is about and the asking agent's handoff. */
 function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
   const heading = "text-xs font-semibold text-subtle-foreground";
+  // Both sections are the same card, so the column reads as one set.
+  const card = "grid content-start gap-2 rounded-lg border bg-card px-3.5 py-3";
   return (
     <aside
       className="grid content-start items-start gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-1"
       aria-label="About this ask"
     >
       {ask.task && (
-        <section className="grid gap-2">
+        <section className={card}>
           <h2 className={heading}>Task</h2>
           <AskTask id={ask.task} agents={agents} />
         </section>
       )}
-      <section className="grid gap-2">
+      <section className={card}>
         <h2 className={heading}>Asked by</h2>
         <Who id={ask.agent} agents={agents} />
         {/* As on the agents page, an ended agent's handoff is history, not context. */}
-        {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} />}
+        {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} stacked />}
       </section>
     </aside>
   );
@@ -169,7 +171,7 @@ function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
   }
   const { task } = detail.data;
   return (
-    <div className="grid gap-2 rounded-lg border bg-card px-3.5 py-3">
+    <div className="grid gap-2">
       <Link
         className="line-clamp-2 text-sm font-medium [overflow-wrap:anywhere] text-foreground"
         to="/tasks/$id"

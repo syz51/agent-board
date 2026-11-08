@@ -309,7 +309,8 @@ export function TaskGroupSection({
 }: {
   id: string;
   heading: ReactNode;
-  count: number;
+  /** The number of tasks, or "1 of 2" where only some are listed. */
+  count: number | string;
   collapsed?: boolean;
   onToggle?: () => void;
   /** 3 where the groups sit inside a titled section, as on the home page. */

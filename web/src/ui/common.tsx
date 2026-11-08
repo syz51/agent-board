@@ -401,28 +401,41 @@ export function SectionTitle({
   );
 }
 
+const COUNT_TONE = {
+  /** The total that waits on the user: the one filled count, so it is seen first. */
+  solid: "bg-amber text-card",
+  /** A share of that total, such as one board's asks: amber, but tinted. */
+  soft: "bg-amber-soft text-amber ring-1 ring-amber/30 ring-inset",
+  /** A count that only informs. */
+  neutral: "bg-secondary text-subtle-foreground ring-1 ring-input ring-inset",
+};
+
 /**
- * A count in a pill, the one way the sidebar and the phone tab bar show a count: amber
- * where the count waits on the user, neutral where it only informs.
+ * A count in a pill, the one way the sidebar and the phone tab bar show a count. Only its
+ * colour changes, with what the count asks of the user. A word after the number says what
+ * an informational count counts.
  */
 export function Count({
   value,
-  act,
+  tone,
+  word,
   className,
   ...props
-}: { value: number; act?: boolean } & Omit<ComponentProps<"span">, "children">) {
+}: { value: number | "–"; tone: keyof typeof COUNT_TONE; word?: string } & Omit<
+  ComponentProps<"span">,
+  "children"
+>) {
   return (
     <span
       className={cn(
-        "inline-grid h-4.5 min-w-5 flex-none place-items-center rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal tabular-nums",
-        act
-          ? "bg-amber text-card"
-          : "bg-secondary text-subtle-foreground ring-1 ring-input ring-inset",
+        "inline-flex h-4.5 min-w-5 flex-none items-center justify-center gap-[0.25em] rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal whitespace-nowrap tabular-nums",
+        COUNT_TONE[tone],
         className,
       )}
       {...props}
     >
       {value}
+      {word && <span className="font-medium">{word}</span>}
     </span>
   );
 }

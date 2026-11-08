@@ -89,7 +89,7 @@
     --border: #2a2b32;
     --input: #383a42;
     --ring: #8d8ef2;
-    --sidebar: #111215;
+    --sidebar: #0e0f12;
     --sidebar-foreground: #c4c5cc;
     --sidebar-accent: #22232a;
     --sidebar-accent-foreground: #e5e6ea;
@@ -122,7 +122,7 @@
     --error-border: #5b2618;
     --shadow-raise: 0 0 0 0 transparent;
     --shadow-overlay: 0 16px 48px rgb(0 0 0 / 0.6);
-    --shadow-panel: 0 1px 3px rgb(0 0 0 / 0.4), 0 0 0 1px rgb(255 255 255 / 0.1);
+    --shadow-panel: 0 1px 3px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.13);
   }
 }
 
