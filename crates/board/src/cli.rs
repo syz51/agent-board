@@ -755,7 +755,7 @@ pub async fn run(cli: Cli) -> i32 {
             1
         }
     };
-    if let Some(warning) = crate::client::take_skew_warning() {
+    if let Some(warning) = crate::client::take_skew_warning(crate::client::Reporter::Cli) {
         eprintln!("board: warning: {warning}");
     }
     code

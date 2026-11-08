@@ -178,16 +178,18 @@ impl Stub {
     }
 
     /// Names a server build in the headers of every answer.
+    /// Its order stamp is `unknown`, as from a server built without one.
     pub fn build(&self, version: &str, commit: &str) {
-        self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned(), None));
+        self.build_stamped(version, commit, Some("unknown"));
     }
 
-    /// Names a server build with its order stamp in the headers of every answer.
-    pub fn build_stamped(&self, version: &str, commit: &str, built: &str) {
+    /// Names a server build with its order stamp in the headers of every answer; `None`
+    /// sends no stamp header, as a server from before stamps.
+    pub fn build_stamped(&self, version: &str, commit: &str, built: Option<&str>) {
         self.state.lock().unwrap().build = Some((
             version.to_owned(),
             commit.to_owned(),
-            Some(built.to_owned()),
+            built.map(str::to_owned),
         ));
     }
 

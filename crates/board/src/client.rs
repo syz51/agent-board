@@ -61,20 +61,48 @@ pub struct Build {
     pub built: Option<u64>,
 }
 
-impl Build {
-    /// This binary's build.
-    pub fn this() -> Self {
-        Self {
-            version: board_proto::VERSION.to_owned(),
-            commit: crate::COMMIT.to_owned(),
-            built: crate::BUILT.parse().ok(),
-        }
-    }
+/// This binary's build.
+static THIS: std::sync::LazyLock<Build> = std::sync::LazyLock::new(|| Build {
+    version: board_proto::VERSION.to_owned(),
+    commit: crate::COMMIT.to_owned(),
+    built: crate::BUILT.parse().ok(),
+});
 
+impl Build {
     /// Whether `other` is another build: by version, or by commit when both know theirs.
     fn differs(&self, other: &Self) -> bool {
         let known = self.commit != "unknown" && other.commit != "unknown";
         self.version != other.version || (known && self.commit != other.commit)
+    }
+}
+
+/// The process that reports a skew warning, which decides what picks up a newer build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reporter {
+    /// A one-shot CLI command. It just started from the installed board, so that board is
+    /// this build and is not asked.
+    Cli,
+    /// An MCP server, which runs as long as its agent session.
+    Session,
+    /// The device daemon, `board watch`.
+    Daemon,
+}
+
+impl Reporter {
+    /// The process's board, as the warning names it.
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Cli | Self::Session => "this session's board",
+            Self::Daemon => "this board watch daemon",
+        }
+    }
+
+    /// What starts this process again on the installed board.
+    fn restart(self) -> &'static str {
+        match self {
+            Self::Cli | Self::Session => "restarting this session",
+            Self::Daemon => "restarting board watch",
+        }
     }
 }
 
@@ -92,7 +120,8 @@ impl SkewWatch {
     /// Notes the build headers of an answer, against this process's build `this`. A server
     /// that predates them sends none, and a value that is not a plain token (at most 64
     /// letters, digits, `.`, `-` or `_`) is ignored, so header text never reaches an agent
-    /// unchecked. A stamp that is not seconds counts as unknown.
+    /// unchecked. A server that sends no stamp predates stamps, so it counts as the oldest
+    /// (0); a stamp that is not seconds counts as unknown.
     pub fn note(
         &mut self,
         this: &Build,
@@ -112,9 +141,11 @@ impl SkewWatch {
         let build = Build {
             version: version.to_owned(),
             commit: commit.filter(|c| plain(c)).unwrap_or("unknown").to_owned(),
-            built: built
-                .filter(|b| !b.is_empty() && b.bytes().all(|d| d.is_ascii_digit()))
-                .and_then(|b| b.parse().ok()),
+            built: match built {
+                None => Some(0),
+                Some(b) if !b.is_empty() && b.bytes().all(|d| d.is_ascii_digit()) => b.parse().ok(),
+                Some(_) => None,
+            },
         };
         if self.seen.as_ref() == Some(&build) {
             return;
@@ -139,73 +170,77 @@ fn note_server_build(headers: &reqwest::header::HeaderMap) {
     SKEW.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .note(
-            &Build::this(),
+            &THIS,
             get(board_proto::VERSION_HEADER),
             get(board_proto::COMMIT_HEADER),
             get(board_proto::BUILT_HEADER),
         );
 }
 
-/// The warning when the server's build differs from this one (`client`), naming the older
+/// The warning for a server build that differs from this one (`client`), naming the older
 /// side by the order stamps and what picks up the newer build. `installed` gives the commit
-/// of the board installed on this device; it is asked only when the client is older. Without
-/// both stamps, or with equal ones, the order is unknown and the warning says so.
+/// of the board installed at this process's path; it is asked only when the client is older.
+/// Without both stamps, or with equal ones, the order is unknown and the warning says so.
 pub fn skew_warning(
     server: &Build,
     client: &Build,
+    reporter: Reporter,
     installed: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    if !server.differs(client) {
-        return None;
-    }
+) -> String {
     let server_build = format!("{} ({})", server.version, server.commit);
     let client_build = format!("{} ({})", client.version, client.commit);
+    let subject = reporter.subject();
+    let restart = reporter.restart();
     let order = match (server.built, client.built) {
         (Some(server), Some(client)) => server.cmp(&client),
         _ => std::cmp::Ordering::Equal,
     };
-    Some(match order {
+    match order {
         std::cmp::Ordering::Greater => {
             let next = match installed() {
-                Some(commit) if commit == server.commit => {
-                    "The server's build is already installed on this device: restarting this \
-                     session picks it up."
-                        .to_owned()
-                }
+                Some(commit) if commit == server.commit => format!(
+                    "The server's build is already installed on this device: {restart} picks \
+                     it up."
+                ),
                 Some(commit) if commit == client.commit => {
                     "This device is not upgraded yet: the device upgrade (deploy/upgrade.sh, run \
                      by whoever deploys) installs the new build; nothing is needed from you."
                         .to_owned()
                 }
-                Some(commit) => format!(
-                    "Build {commit} is installed on this device: restarting this session \
-                     picks it up."
+                Some(commit) => {
+                    format!("Build {commit} is installed on this device; {restart} runs it.")
+                }
+                None => format!(
+                    "Once this device is upgraded (deploy/upgrade.sh), {restart} picks up the \
+                     new build."
                 ),
-                None => "Restarting this session after this device's upgrade \
-                         (deploy/upgrade.sh) picks up the new build."
-                    .to_owned(),
             };
             format!(
-                "this session's board, {client_build}, is older than the board server, \
-                 {server_build}; calls still work, so keep working. {next}"
+                "{subject}, {client_build}, is older than the board server, {server_build}; \
+                 calls still work, so keep working. {next}"
             )
         }
         std::cmp::Ordering::Less => format!(
-            "the board server, {server_build}, is older than this session's board, \
-             {client_build}; calls still work, so keep working. Whoever deploys should upgrade \
-             the server (docs/DEPLOY.md)."
+            "the board server, {server_build}, is older than {subject}, {client_build}: whoever \
+             deploys should upgrade the server (docs/DEPLOY.md). Until then, calls new in this \
+             build may fail."
         ),
         std::cmp::Ordering::Equal => format!(
             "the board server runs {server_build} but this client is {client_build}: upgrade \
              the older one (docs/DEPLOY.md), then restart any session whose MCP server started \
              before the upgrade"
         ),
-    })
+    }
 }
 
+/// How long the installed board may take to print its version.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The commit of the board binary at this process's path, as its `--version` prints it. It
-/// differs from this process's commit once the device was upgraded after it started.
+/// differs from this process's commit once the device was upgraded after it started. `None`
+/// when it cannot tell within [`VERSION_PROBE_TIMEOUT`].
 fn installed_commit() -> Option<String> {
+    use std::io::Read as _;
     let exe = std::env::current_exe().ok()?;
     // Linux names a binary replaced since this process started `<path> (deleted)`.
     let exe = match exe
@@ -215,16 +250,35 @@ fn installed_commit() -> Option<String> {
         Some(path) => std::path::PathBuf::from(path),
         None => exe,
     };
-    let out = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("--version")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    // Bounded, as it blocks the caller: a stalled binary must not hold up a tool result.
+    let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                // Best effort: the answer is `None` whether or not the child is gone.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    version_commit(std::str::from_utf8(&out.stdout).ok()?)
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    version_commit(&text)
 }
 
 /// The commit in `board --version` output (`board <version> (<commit>)`), when it is 12
@@ -241,12 +295,15 @@ fn version_commit(text: &str) -> Option<String> {
 
 /// The warning for a server build that differs from this one, once per server build met
 /// by this process; `None` when the builds match or it was already taken.
-pub fn take_skew_warning() -> Option<String> {
+pub fn take_skew_warning(reporter: Reporter) -> Option<String> {
     let server = SKEW
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()?;
-    skew_warning(&server, &Build::this(), installed_commit)
+    Some(skew_warning(&server, &THIS, reporter, || match reporter {
+        Reporter::Cli => Some(crate::COMMIT.to_owned()),
+        Reporter::Session | Reporter::Daemon => installed_commit(),
+    }))
 }
 
 /// An answer the device daemon's hook relay made itself (`relay::RELAY_HEADER`).
@@ -946,11 +1003,11 @@ mod tests {
         assert_eq!(watch.take(), None);
 
         // Upgraded to match, then to yet another build: that one warns again. A server
-        // that predates the stamp header still counts.
+        // without the stamp header predates stamps: the oldest.
         watch.note(&this, Some("0.1.0"), Some(OLD), Some("100"));
         assert_eq!(watch.take(), None);
         watch.note(&this, Some("0.0.2"), Some("0a0a0a0a0a0a"), None);
-        assert_eq!(watch.take(), Some(build("0.0.2", "0a0a0a0a0a0a", None)));
+        assert_eq!(watch.take(), Some(build("0.0.2", "0a0a0a0a0a0a", Some(0))));
 
         // Header text that is not a plain token is never shown; a stamp that is not seconds
         // is unknown.
@@ -966,40 +1023,43 @@ mod tests {
         assert_eq!(watch.take(), None);
         watch.note(&this, Some("0.0.4"), Some("bad commit\n"), Some("+5"));
         assert_eq!(watch.take(), Some(build("0.0.4", "unknown", None)));
+        watch.note(&this, Some("0.0.5"), Some(OLD), Some("unknown"));
+        assert_eq!(watch.take(), Some(build("0.0.5", OLD, None)));
     }
 
     #[test]
     fn a_commit_difference_counts_only_when_both_know_theirs() {
-        let none = || -> Option<String> { panic!("asked for the installed build") };
-        let warn = |server: Build, client: Build| skew_warning(&server, &client, none);
-        assert_eq!(
-            warn(build("0.1.0", OLD, None), build("0.1.0", OLD, None)),
-            None
-        );
-        assert!(warn(build("0.1.0", OLD, None), build("0.1.0", NEW, None)).is_some());
-        assert_eq!(
-            warn(build("0.1.0", "unknown", None), build("0.1.0", NEW, None)),
-            None
-        );
-        assert_eq!(
-            warn(build("0.1.0", OLD, None), build("0.1.0", "unknown", None)),
-            None
-        );
-        assert!(
-            warn(
-                build("0.2.0", "unknown", None),
-                build("0.1.0", "unknown", None)
-            )
-            .is_some()
-        );
+        let differs = |a: Build, b: Build| a.differs(&b);
+        assert!(!differs(
+            build("0.1.0", OLD, None),
+            build("0.1.0", OLD, Some(1))
+        ));
+        assert!(differs(
+            build("0.1.0", OLD, None),
+            build("0.1.0", NEW, None)
+        ));
+        assert!(!differs(
+            build("0.1.0", "unknown", None),
+            build("0.1.0", NEW, None)
+        ));
+        assert!(!differs(
+            build("0.1.0", OLD, None),
+            build("0.1.0", "unknown", None)
+        ));
+        assert!(differs(
+            build("0.2.0", "unknown", None),
+            build("0.1.0", "unknown", None)
+        ));
     }
 
     #[test]
-    fn an_older_client_says_calls_work_and_what_picks_up_the_new_build() {
+    fn an_older_session_says_calls_work_and_what_picks_up_the_new_build() {
         let server = build("0.1.0", NEW, Some(200));
         let client = build("0.1.0", OLD, Some(100));
         let warn = |installed: Option<&str>| {
-            skew_warning(&server, &client, || installed.map(str::to_owned)).unwrap()
+            skew_warning(&server, &client, Reporter::Session, || {
+                installed.map(str::to_owned)
+            })
         };
         let older = format!(
             "this session's board, 0.1.0 ({OLD}), is older than the board server, 0.1.0 \
@@ -1023,43 +1083,68 @@ mod tests {
             )
         );
         // Yet another build installed, or none readable.
-        assert!(warn(Some("0a0a0a0a0a0a")).ends_with(
-            "Build 0a0a0a0a0a0a is installed on this device: restarting this session \
-                 picks it up."
-        ));
-        assert!(warn(None).starts_with(&older));
-        assert!(warn(None).contains("deploy/upgrade.sh"));
-        for text in [warn(Some(NEW)), warn(Some(OLD)), warn(None)] {
-            assert!(!text.contains("upgrade the older one"), "{text}");
-        }
-    }
-
-    #[test]
-    fn an_older_server_says_to_upgrade_the_server() {
-        let server = build("0.1.0", OLD, Some(100));
-        let client = build("0.1.0", NEW, Some(200));
-        let warning = skew_warning(&server, &client, || panic!("not asked")).unwrap();
         assert_eq!(
-            warning,
+            warn(Some("0a0a0a0a0a0a")),
             format!(
-                "the board server, 0.1.0 ({OLD}), is older than this session's board, 0.1.0 \
-                 ({NEW}); calls still work, so keep working. Whoever deploys should upgrade \
-                 the server (docs/DEPLOY.md)."
+                "{older}Build 0a0a0a0a0a0a is installed on this device; restarting this session \
+                 runs it."
+            )
+        );
+        assert_eq!(
+            warn(None),
+            format!(
+                "{older}Once this device is upgraded (deploy/upgrade.sh), restarting this session \
+                 picks up the new build."
             )
         );
     }
 
     #[test]
+    fn an_older_daemon_names_board_watch() {
+        let server = build("0.1.0", NEW, Some(200));
+        let client = build("0.1.0", OLD, Some(100));
+        assert_eq!(
+            skew_warning(&server, &client, Reporter::Daemon, || Some(NEW.to_owned())),
+            format!(
+                "this board watch daemon, 0.1.0 ({OLD}), is older than the board server, 0.1.0 \
+                 ({NEW}); calls still work, so keep working. The server's build is already \
+                 installed on this device: restarting board watch picks it up."
+            )
+        );
+    }
+
+    #[test]
+    fn an_older_server_says_to_upgrade_the_server() {
+        let client = build("0.1.0", NEW, Some(200));
+        let expected = |server_commit: &str| {
+            format!(
+                "the board server, 0.1.0 ({server_commit}), is older than this session's board, \
+                 0.1.0 ({NEW}): whoever deploys should upgrade the server (docs/DEPLOY.md). \
+                 Until then, calls new in this build may fail."
+            )
+        };
+        // By its stamp, or by sending none (it predates stamps).
+        for server in [build("0.1.0", OLD, Some(100)), build("0.1.0", OLD, Some(0))] {
+            let warning = skew_warning(&server, &client, Reporter::Session, || panic!("not asked"));
+            assert_eq!(warning, expected(OLD));
+        }
+    }
+
+    #[test]
     fn without_an_order_the_warning_names_no_side() {
-        let none = || -> Option<String> { panic!("not asked") };
-        // A server that predates the stamp, a client built without one, equal stamps.
-        for (server, client) in [(None, Some(100)), (Some(200), None), (Some(100), Some(100))] {
+        // A server built without a stamp, a client built without one, equal stamps.
+        for (server, client) in [
+            (None, Some(100)),
+            (Some(200), None),
+            (Some(0), None),
+            (Some(100), Some(100)),
+        ] {
             let warning = skew_warning(
                 &build("0.1.0", NEW, server),
                 &build("0.1.0", OLD, client),
-                none,
-            )
-            .unwrap();
+                Reporter::Session,
+                || panic!("not asked"),
+            );
             assert_eq!(
                 warning,
                 format!(

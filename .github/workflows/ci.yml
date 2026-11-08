@@ -110,10 +110,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # The order stamp every answer reports: the commit's committer time in seconds.
+      # The order stamp every answer reports: the commit's committer time in seconds. An
+      # image without it would leave every client's warning without an order, so fail.
       - id: stamp
         name: Read the order stamp
-        run: echo "built=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          built=$(git log -1 --format=%ct HEAD)
+          case "$built" in ''|*[!0-9]*) echo "::error::no committer time for HEAD: '$built'"; exit 1 ;; esac
+          echo "built=$built" >> "$GITHUB_OUTPUT"
       # /healthz reports BOARD_COMMIT; the build keeps its first 12 characters, lowercase
       # (crates/board/build_commit.rs), which upgrade.sh waits for.
       - name: Build the image
