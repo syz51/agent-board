@@ -210,7 +210,7 @@ async fn handoffs_carry_the_agents_last_change() {
 }
 
 #[tokio::test]
-async fn ended_agents_release_leases_and_coordinator() {
+async fn ended_agents_release_file_leases_and_keep_the_coordinator_lease() {
     let t = T::new();
     let a = "t3:alpha";
     t.register(a, Some(REPO), None).await;
@@ -251,10 +251,20 @@ async fn ended_agents_release_leases_and_coordinator() {
         .await;
     assert_eq!(ended["state"], "ended");
     assert_eq!(t.count("SELECT COUNT(*) FROM leases"), 0);
-    assert_eq!(
-        t.ok("GET", "/v1/boards/auto", None, None).await["coordinator"],
-        json!(null)
-    );
+    // T3 ends an idle session while its thread lives on: the coordinator lease runs on
+    // until the daemon renews or releases it, or it expires.
+    let coordinator =
+        async || t.ok("GET", "/v1/boards/auto", None, None).await["coordinator"].clone();
+    assert_eq!(coordinator().await, json!(a));
+    let events = t.ok("GET", "/v1/events?board=auto", None, None).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "board_updated")
+        .count();
+    assert_eq!(events, 1, "only the claim: ending changes no coordinator");
+    t.advance(TimeDelta::minutes(46));
+    assert_eq!(coordinator().await, json!(null), "not renewed while ended");
     let (s, _) = t
         .call(
             "POST",

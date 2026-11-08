@@ -32,6 +32,11 @@ pub struct Board {
     pub repos: Vec<String>,
     /// When on, a coordinator thread works off the ready queue without the user.
     pub autopilot: bool,
+    /// How many tasks the board's coordinator and its child threads may have in progress
+    /// at once, 1 to [`PARALLEL_TASKS_MAX`]. Absent from servers that predate it, so it
+    /// defaults to 1, one task at a time.
+    #[serde(default = "one_parallel_task")]
+    pub parallel_tasks: u32,
     /// The agent currently acting as the board's coordinator, if any.
     pub coordinator: Option<AgentId>,
     /// Devices allowed to host the coordinator, in order of preference.
@@ -40,6 +45,14 @@ pub struct Board {
     pub open_asks: u32,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// The most tasks a board's coordinator may run at once (see [`Board::parallel_tasks`]).
+/// The usage limit is shared by every agent, so the range stays small.
+pub const PARALLEL_TASKS_MAX: u32 = 4;
+
+fn one_parallel_task() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

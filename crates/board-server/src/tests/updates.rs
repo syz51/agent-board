@@ -219,9 +219,14 @@ async fn ending_a_session_keeps_its_last_turn_ending() {
         .await;
     assert_eq!(s.as_u16(), 200, "{v}");
     assert_eq!(updates(&t, "").await["said"][0]["text"], "Signing off.");
-    // Ending released the coordinator, so the next ending is not kept.
+    // Ending keeps the coordinator lease (T3 closes idle sessions), so the session that
+    // resumes it still coordinates and its turn ending is kept.
     stop(&t, COORD, Some("Back again.")).await;
-    assert_eq!(updates(&t, "").await["said"].as_array().unwrap().len(), 1);
+    assert_eq!(updates(&t, "").await["said"].as_array().unwrap().len(), 2);
+    // Once the lease has expired, it coordinates nothing, and its endings are not kept.
+    t.advance(TimeDelta::minutes(46));
+    stop(&t, COORD, Some("Later.")).await;
+    assert_eq!(updates(&t, "").await["said"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -131,7 +131,11 @@ server's minute sweep deletes older ones.
   than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
-  `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
+  `ended` releases the agent's file leases; owned tasks stay owned. Its coordinator lease
+  runs on until it expires: T3 ends a session left idle for 30 minutes while the thread
+  lives on, and the daemon of the lease's device renews the lease while the thread is live,
+  or releases it when the thread is gone or T3 cannot say. (Servers before this change
+  released the coordinator lease too.)
   `paused_until` is accepted only with `paused`. An agent paused until a time still ahead
   keeps that `paused_until` when it is marked `ended` (T3 closes an idle session, but the
   usage limit holds until its reset), and the `agent_state_changed` event carries it; any
@@ -158,6 +162,12 @@ server's minute sweep deletes older ones.
 
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
+  `parallel_tasks` (1 to 4; 400 `invalid` otherwise) is how many tasks the board's
+  coordinator and its child threads may have in progress at once. The coordinator keeps to
+  it; the server does not refuse claims over it. Raising it is user only (403
+  `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
+  restate or lower it. A `Board` from a server that predates it reads as 1, and a client
+  leaves the field out of `UpdateBoard` unless it sets it.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
