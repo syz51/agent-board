@@ -795,6 +795,14 @@ report, not a free-form task (`API.md`, "Feedback"):
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
   changed. A declined item stays live, so repeat reports keep counting against the
   decision; a fixed one does not, so a repeat opens a new item that recurs it.
+- **Counts across duplicates.** Triage often resolves a report worded differently as a
+  `duplicate` of an earlier item, so a problem's weight spreads over many items. An item's
+  `reports` and `reporters` therefore include those of its duplicates, counted when it is
+  read rather than copied: each report keeps one row, so the stats count it once, and
+  reopening a duplicate takes its reports back. Owners and the priority scale ("five or
+  more agents met it") see the whole count. The resolve announces the added reports on the
+  original as a repeat report would, so an open routed task's owner hears of them. A
+  signal item's reports are API errors; the routed task's note counts them apart.
 - **Declines that keep coming back.** A decline stands only while agents stop hitting the
   problem. When many agents trip on intended behaviour, the rule may be right but the
   interface or the instructions are wrong, and that is the owner's call. So the server

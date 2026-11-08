@@ -183,7 +183,7 @@ pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
     touch_agent(cx, &r.reporter)?;
     let actor = r.reporter.to_string();
     let (task, duplicate) = match prior(cx, &r.signature)? {
-        Prior::Live(item) => (add_report(cx, &item, &r.reporter, &actor, &r.title)?, true),
+        Prior::Live(item) => (add_report(cx, &item, &r.reporter, &r.title, false)?, true),
         Prior::Gone(earlier) => (
             file(cx, &r, &actor, vec![r.reporter.clone()], 1, Some(earlier))?,
             false,
@@ -194,7 +194,7 @@ pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
         ),
     };
     if !duplicate {
-        record_report(cx, &task.id, &r.reporter)?;
+        record_report(cx, &task.id, &r.reporter, false)?;
     }
     let reports = task.feedback.as_ref().map_or(1, |f| f.reports);
     Ok(FeedbackResult {
@@ -242,10 +242,13 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
     Ok(match (kind, target) {
         (None, _) => task_open(cx, id)?.then(|| id.clone()),
         (Some(ResolutionKind::Declined), _) => Some(id.clone()),
-        (Some(ResolutionKind::Duplicate), Some(original))
-            if depth < DUPLICATE_DEPTH_MAX && is_feedback(cx, &original)? =>
-        {
-            live_item(cx, &original, depth + 1)?
+        // Past the depth limit (or in a loop), the item takes no reports.
+        (Some(ResolutionKind::Duplicate), Some(original)) if is_feedback(cx, &original)? => {
+            if depth < DUPLICATE_DEPTH_MAX {
+                live_item(cx, &original, depth + 1)?
+            } else {
+                None
+            }
         }
         // A duplicate of a plain task counts as routed to it.
         (Some(ResolutionKind::Routed | ResolutionKind::Duplicate), Some(task)) => {
@@ -473,148 +476,178 @@ fn file(
     get_task(cx, &id)
 }
 
-fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId) -> Result<()> {
+/// Records one report of `item` by `agent`; `signal` marks an API error the server counted.
+fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId, signal: bool) -> Result<()> {
     cx.db.execute(
-        "INSERT INTO feedback_reports (task, agent, at) VALUES (?1, ?2, ?3)",
-        params![item.as_str(), agent.as_str(), cx.now_ms()],
+        "INSERT INTO feedback_reports (task, agent, at, signal) VALUES (?1, ?2, ?3, ?4)",
+        params![item.as_str(), agent.as_str(), cx.now_ms(), signal],
     )?;
     Ok(())
 }
 
-/// Adds a report to a live item: counts it, records the reporter and, at most once an
-/// hour, notes it (with the routed task, if any). The same hourly report also notes the
-/// task doing the work while it is open, since its owner acts on new evidence and nobody
-/// watches the resolved item.
+/// Adds a report to a live item: counts it, records the reporter and announces it
+/// (`note_reports`). A `signal` report is an API error the server counted; the server is
+/// its actor.
 fn add_report(
     cx: &mut Ctx<'_>,
     item: &TaskId,
     reporter: &AgentId,
-    actor: &str,
     summary: &str,
+    signal: bool,
 ) -> Result<Task> {
-    let (reports, reporters, last_noted, kind, source): (
-        u32,
-        String,
-        Option<i64>,
-        Option<String>,
-        String,
-    ) = cx.db.query_row(
-        "SELECT reports, reporters, last_noted_at, resolution, source FROM feedback \
-         WHERE task = ?1",
+    let actor = if signal {
+        "server".to_owned()
+    } else {
+        reporter.to_string()
+    };
+    let (reports, reporters, kind): (u32, String, Option<String>) = cx.db.query_row(
+        "SELECT reports, reporters, resolution FROM feedback WHERE task = ?1",
         [item.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let reports = reports.saturating_add(1);
     let mut reporters: Vec<AgentId> = parse_json(&reporters)?;
-    reporters.retain(|a| a != reporter);
-    reporters.push(reporter.clone());
-    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
-    reporters.drain(..excess);
-    let now = cx.now_ms();
-    let note = last_noted.is_none_or(|at| now - at >= NOTE_EVERY_MS);
+    push_reporter(&mut reporters, reporter.clone());
     cx.db.execute(
-        "UPDATE feedback SET reports = ?2, reporters = ?3, last_reported_at = ?4, \
-         last_noted_at = CASE WHEN ?5 THEN ?4 ELSE last_noted_at END WHERE task = ?1",
+        "UPDATE feedback SET reports = ?2, reporters = ?3, last_reported_at = ?4 WHERE task = ?1",
         params![
             item.as_str(),
             reports,
             serde_json::to_string(&reporters).expect("ids serialize"),
-            now,
-            note,
+            cx.now_ms(),
         ],
     )?;
-    record_report(cx, item, reporter)?;
-    // The count is not a field anyone edits: it leaves the version alone, so an owner's
-    // update does not conflict with reports, and is announced with the hourly note. Only
-    // the report that sends a declined item back to triage changes the task itself.
-    let board = item.board();
-    if note {
-        cx.db.execute(
-            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
-            params![item.as_str(), now],
-        )?;
-        // The task doing the work: the routed one, or a plain task the item duplicates.
-        let working = match routed_task(cx, item)? {
-            Some(task) => {
-                let status = match task_status(cx, &task)? {
-                    Some(status) => Some(parse_enum::<TaskStatus>(&status)?),
-                    None => None,
-                };
-                Some((task, status))
-            }
-            None => None,
-        };
-        let routed = working.as_ref().map_or_else(String::new, |(task, status)| {
-            format!("; routed to {task} ({})", status.map_or("gone", status_str))
-        });
-        let text = cut(
-            &format!("reported again ({reports} reports){routed}: {summary}"),
-            cx.s.note_chars,
-        );
-        cx.db.execute(
-            "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'feedback', ?3, ?4)",
-            params![item.as_str(), reporter.as_str(), text, now],
-        )?;
-        let note_id = cx.db.last_insert_rowid();
-        cx.emit(
-            Some(&board),
-            actor,
-            EventType::NoteAdded,
-            Some(item),
-            serde_json::json!({ "note": note_id, "kind": "feedback" }),
-        )?;
-        cx.emit(
-            Some(&board),
-            actor,
-            EventType::TaskUpdated,
-            Some(item),
-            serde_json::json!({ "fields": ["feedback"], "reports": reports }),
-        )?;
-        if let Some((task, Some(status))) = working
-            && !status.is_closed()
-        {
-            let text = routed_note(cx, item, &source, reports, &reporters, summary);
-            cx.db.execute(
-                "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'note', ?3, ?4)",
-                params![task.as_str(), reporter.as_str(), text, now],
-            )?;
-            let note_id = cx.db.last_insert_rowid();
-            cx.emit(
-                Some(&task.board()),
-                actor,
-                EventType::NoteAdded,
-                Some(&task),
-                serde_json::json!({ "note": note_id, "kind": "note" }),
-            )?;
-        }
-    }
+    record_report(cx, item, reporter, signal)?;
+    note_reports(cx, item, reporter, &actor, summary, signal)?;
     if kind.as_deref() == Some("declined") {
-        reopen_declined(cx, item, reporter, actor)?;
+        reopen_declined(cx, item, reporter, &actor)?;
     }
     get_task(cx, item)
 }
 
+/// Announces new reports on live item `item`, at most once an hour: a `feedback` note on it
+/// (with the routed task, if any) and, while it is open, a plain note on the task doing the
+/// work, since its owner acts on new evidence and nobody watches the resolved item. The
+/// counts are those `load` shows, duplicates included. `author` is the reporter, and
+/// `summary` the report's first line, or the error when `signal` (the server's own).
+///
+/// New reports are not a field anyone edits: they leave the version alone, so an owner's
+/// update does not conflict with them. Only the report that sends a declined item back to
+/// triage changes the task itself.
+fn note_reports(
+    cx: &mut Ctx<'_>,
+    item: &TaskId,
+    author: &AgentId,
+    actor: &str,
+    summary: &str,
+    signal: bool,
+) -> Result<()> {
+    let now = cx.now_ms();
+    let due = cx.db.execute(
+        "UPDATE feedback SET last_noted_at = ?2 WHERE task = ?1 \
+         AND (last_noted_at IS NULL OR ?2 - last_noted_at >= ?3)",
+        params![item.as_str(), now, NOTE_EVERY_MS],
+    )? > 0;
+    if !due {
+        return Ok(());
+    }
+    cx.db.execute(
+        "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+        params![item.as_str(), now],
+    )?;
+    let merged = load(cx, item)?.expect("the row was just updated");
+    let reports = merged.reports;
+    // The task doing the work: the routed one, or a plain task the item duplicates.
+    let working = match routed_task(cx, item)? {
+        Some(task) => {
+            let status = match task_status(cx, &task)? {
+                Some(status) => Some(parse_enum::<TaskStatus>(&status)?),
+                None => None,
+            };
+            Some((task, status))
+        }
+        None => None,
+    };
+    let routed = working.as_ref().map_or_else(String::new, |(task, status)| {
+        format!("; routed to {task} ({})", status.map_or("gone", status_str))
+    });
+    let text = cut(
+        &format!("reported again ({reports} reports){routed}: {summary}"),
+        cx.s.note_chars,
+    );
+    cx.db.execute(
+        "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'feedback', ?3, ?4)",
+        params![item.as_str(), author.as_str(), text, now],
+    )?;
+    let note_id = cx.db.last_insert_rowid();
+    let board = item.board();
+    cx.emit(
+        Some(&board),
+        actor,
+        EventType::NoteAdded,
+        Some(item),
+        serde_json::json!({ "note": note_id, "kind": "feedback" }),
+    )?;
+    cx.emit(
+        Some(&board),
+        actor,
+        EventType::TaskUpdated,
+        Some(item),
+        serde_json::json!({ "fields": ["feedback"], "reports": reports }),
+    )?;
+    if let Some((task, Some(status))) = working
+        && !status.is_closed()
+    {
+        let errors: u32 = cx
+            .db
+            .prepare_cached(CLUSTER_ERRORS)?
+            .query_row(params![item.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+                r.get(0)
+            })?;
+        let text = routed_note(cx, item, signal, &merged, errors, summary);
+        cx.db.execute(
+            "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'note', ?3, ?4)",
+            params![task.as_str(), author.as_str(), text, now],
+        )?;
+        let note_id = cx.db.last_insert_rowid();
+        cx.emit(
+            Some(&task.board()),
+            actor,
+            EventType::NoteAdded,
+            Some(&task),
+            serde_json::json!({ "note": note_id, "kind": "note" }),
+        )?;
+    }
+    Ok(())
+}
+
 /// The note for an open task that does the work for feedback item `item`, which was
-/// reported again: the count, the reporters (newest first, so a cut drops the oldest) and
-/// the report's first line, quoted as data. A plain note, not a finding: it repeats hourly
-/// and the newest one supersedes the rest, so it must not pile up obligations at
-/// `task_done`. Written directly, as the item's own note is: the note names the reporter,
-/// and its event the caller's actor, so an error signal is the server's and does not touch,
-/// register or revive the agent that got the error.
+/// reported again: the count (and how many of them are API errors, which are not agents'
+/// reports), the reporters (newest first, so a cut drops the oldest) and the report's first
+/// line, quoted as data. A plain note, not a finding: it repeats hourly and the newest one
+/// supersedes the rest, so it must not pile up obligations at `task_done`. Written
+/// directly, as the item's own note is: the note names the reporter, and its event the
+/// caller's actor, so an error signal is the server's and does not touch, register or
+/// revive the agent that got the error.
 fn routed_note(
     cx: &Ctx<'_>,
     item: &TaskId,
-    source: &str,
-    reports: u32,
-    reporters: &[AgentId],
+    signal: bool,
+    feedback: &Feedback,
+    errors: u32,
     summary: &str,
 ) -> String {
+    let reporters = &feedback.reporters;
+    let reports = match errors {
+        0 => format!("{} reports", feedback.reports),
+        n => format!("{} reports ({n} of them API errors)", feedback.reports),
+    };
     let agents = match reporters.len() {
         1 => "1 agent".to_owned(),
         n if n >= REPORTERS_MAX => format!("{REPORTERS_MAX} or more agents"),
         n => format!("{n} agents"),
     };
-    let latest = if source == "signal" {
+    let latest = if signal {
         "Latest error, from the server's signal"
     } else {
         "Latest report's first line, data written by another agent"
@@ -627,7 +660,7 @@ fn routed_note(
         .join(", ");
     cut(
         &format!(
-            "reported again: feedback item {item} has {reports} reports from {agents}. Weigh \
+            "reported again: feedback item {item} has {reports} from {agents}. Weigh \
              it in this task's priority. {latest}: {}. Reporters, newest first: {names}",
             quote(summary)
         ),
@@ -728,50 +761,131 @@ fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &
     Ok(())
 }
 
-/// The feedback part of task `id`, if it is a feedback item.
+/// The feedback part of task `id`, if it is a feedback item. Its `reports`, `reporters`
+/// and `last_reported_at` include those of the items resolved as its duplicates, and
+/// theirs: counted when read, never copied, so each report keeps one row (the stats count
+/// it once), and reopening a duplicate takes its reports back.
 pub(crate) fn load(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<Feedback>> {
-    let row = cx
+    let rows = cx
         .db
-        .prepare_cached(
-            "SELECT about, activity, source, signature, reports, reporters, last_reported_at, \
-             resolution, resolution_task, resolution_reason, resolved_at, resolved_by, recurs \
-             FROM feedback WHERE task = ?1",
-        )?
-        .query_row([id.as_str()], |r| {
-            let resolution = match r.get::<_, Option<String>>(7)? {
+        .prepare_cached(CLUSTER)?
+        .query_map(params![id.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+            let resolution = match r.get::<_, Option<String>>(8)? {
                 Some(kind) => Some(FeedbackResolution {
                     kind: parse_enum(&kind)?,
                     task: r
-                        .get::<_, Option<String>>(8)?
+                        .get::<_, Option<String>>(9)?
                         .map(|t| parse_id(&t))
                         .transpose()?,
-                    reason: r.get(9)?,
-                    at: ts(r.get(10)?),
-                    by: r.get(11)?,
+                    reason: r.get(10)?,
+                    at: ts(r.get(11)?),
+                    by: r.get(12)?,
                 }),
                 None => None,
             };
-            Ok(Feedback {
-                about: r.get(0)?,
-                activity: r
-                    .get::<_, Option<String>>(1)?
-                    .map(|a| parse_enum(&a))
-                    .transpose()?,
-                source: parse_enum(&r.get::<_, String>(2)?)?,
-                signature: r.get(3)?,
-                reports: r.get(4)?,
-                reporters: parse_json(&r.get::<_, String>(5)?)?,
-                last_reported_at: ts(r.get(6)?),
-                resolution,
-                recurs: r
-                    .get::<_, Option<String>>(12)?
-                    .map(|t| parse_id(&t))
-                    .transpose()?,
-            })
-        })
-        .optional()?;
-    Ok(row)
+            Ok((
+                r.get::<_, String>(0)?,
+                Feedback {
+                    about: r.get(1)?,
+                    activity: r
+                        .get::<_, Option<String>>(2)?
+                        .map(|a| parse_enum(&a))
+                        .transpose()?,
+                    source: parse_enum(&r.get::<_, String>(3)?)?,
+                    signature: r.get(4)?,
+                    reports: r.get(5)?,
+                    reporters: parse_json(&r.get::<_, String>(6)?)?,
+                    last_reported_at: ts(r.get(7)?),
+                    resolution,
+                    recurs: r
+                        .get::<_, Option<String>>(13)?
+                        .map(|t| parse_id(&t))
+                        .transpose()?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let merged = rows.len() > 1;
+    let mut reports = 0u32;
+    // Agents listed by the items, in the order of the items' last reports.
+    let mut listed: Vec<AgentId> = Vec::new();
+    let mut last_reported_at = None;
+    let mut own = None;
+    for (task, mut feedback) in rows {
+        reports = reports.saturating_add(feedback.reports);
+        listed.extend(std::mem::take(&mut feedback.reporters));
+        last_reported_at = last_reported_at.max(Some(feedback.last_reported_at));
+        if task == id.as_str() {
+            own = Some(feedback);
+        }
+    }
+    let Some(mut feedback) = own else {
+        return Ok(None);
+    };
+    let last_reported_at = last_reported_at.unwrap_or(feedback.last_reported_at);
+    if !merged {
+        feedback.reporters = listed;
+        return Ok(Some(feedback));
+    }
+    // Across items, each agent's newest report row orders the reporters. An item adopted
+    // from a plain task has no row for its creator: the agents only a list names go first.
+    let by_row: Vec<AgentId> = cx
+        .db
+        .prepare_cached(CLUSTER_REPORTERS)?
+        .query_map(params![id.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+            parse_id(&r.get::<_, String>(0)?)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let listed_only: Vec<AgentId> = listed.into_iter().filter(|a| !by_row.contains(a)).collect();
+    let mut reporters = Vec::new();
+    for agent in listed_only.into_iter().chain(by_row) {
+        push_reporter(&mut reporters, agent);
+    }
+    feedback.reports = reports;
+    feedback.reporters = reporters;
+    feedback.last_reported_at = last_reported_at;
+    Ok(Some(feedback))
 }
+
+/// Adds `agent` as the newest of `reporters`, keeping the latest [`REPORTERS_MAX`].
+fn push_reporter(reporters: &mut Vec<AgentId>, agent: AgentId) {
+    reporters.retain(|a| a != &agent);
+    reporters.push(agent);
+    let excess = reporters.len().saturating_sub(REPORTERS_MAX);
+    reporters.drain(..excess);
+}
+
+/// The CTE `cluster`: feedback item `?1` and the items resolved as its duplicates, and
+/// theirs, at most `?2` links deep, as `live_item` follows them.
+macro_rules! cluster {
+    () => {
+        "WITH RECURSIVE cluster (task, depth) AS (SELECT ?1, 0 UNION SELECT f.task, \
+         c.depth + 1 FROM cluster c JOIN feedback f ON f.resolution_task = c.task \
+         AND f.resolution = 'duplicate' WHERE c.depth < ?2) "
+    };
+}
+
+/// The items of the cluster, oldest last report first.
+pub(crate) const CLUSTER: &str = concat!(
+    cluster!(),
+    "SELECT task, about, activity, source, signature, reports, reporters, last_reported_at, \
+     resolution, resolution_task, resolution_reason, resolved_at, resolved_by, recurs \
+     FROM feedback WHERE task IN (SELECT task FROM cluster) ORDER BY last_reported_at, rowid"
+);
+
+/// The agents that reported the cluster, by their newest report, oldest first.
+pub(crate) const CLUSTER_REPORTERS: &str = concat!(
+    cluster!(),
+    "SELECT agent FROM feedback_reports WHERE task IN (SELECT task FROM cluster) \
+     GROUP BY agent ORDER BY MAX(id)"
+);
+
+/// The cluster's reports that are API errors.
+pub(crate) const CLUSTER_ERRORS: &str = concat!(
+    cluster!(),
+    "SELECT COUNT(*) FROM feedback_reports WHERE signal = 1 \
+     AND task IN (SELECT task FROM cluster)"
+);
 
 /// Forgets the resolution of a reopened item, so it is live again.
 pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
@@ -950,17 +1064,24 @@ pub(crate) fn resolve(
     // The checks above see `id` still open. Once it is resolved, a chain of duplicates that
     // leads back to it (or runs past the depth limit) leaves it taking no reports; the
     // error rolls the resolution back.
+    let mut takes_reports = None;
     if req.kind == ResolutionKind::Duplicate
         && let Some(original) = &req.task
-        && live_item(cx, id, 0)?.is_none()
     {
-        return Err(invalid(
-            format!("{original} passes its reports back to {id}, so {id} cannot be its duplicate"),
-            format!(
-                "name the item that takes the reports, at the end of the duplicate links, not \
-                 one that leads back to {id}"
-            ),
-        ));
+        let Some(live) = live_item(cx, id, 0)? else {
+            return Err(invalid(
+                format!(
+                    "{original} passes its reports back to {id}, or on through more than \
+                     {DUPLICATE_DEPTH_MAX} duplicate links, so {id} cannot be its duplicate"
+                ),
+                format!(
+                    "name the item that takes the reports, at the end of the duplicate links, \
+                     not one that leads back to {id}"
+                ),
+            ));
+        };
+        // A duplicate of a plain task keeps its own reports.
+        takes_reports = (&live != id).then_some(live);
     }
     crate::ops::leases::release_for_task(cx, id, &task.board, &by)?;
     let doing_since: Option<i64> = cx.db.query_row(
@@ -979,6 +1100,18 @@ pub(crate) fn resolve(
             "resolution": { "kind": req.kind, "task": req.task, "reason": req.reason },
         }),
     )?;
+    // The item's reports now count on the original, which announces them as a repeat
+    // report does, crediting the item's latest reporter and quoting its title.
+    if let Some(live) = takes_reports {
+        let feedback = load(cx, id)?.expect("adopted above if it was plain");
+        let author = feedback
+            .reporters
+            .last()
+            .cloned()
+            .unwrap_or_else(|| task.created_by.clone());
+        let signal = feedback.source == FeedbackSource::Signal;
+        note_reports(cx, &live, &author, &by, &task.title, signal)?;
+    }
     get_task(cx, id)
 }
 
@@ -1124,7 +1257,7 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
                     format!("{code} from {}, refused by the client", e.route)
                 }
             };
-            add_report(cx, &item, &e.agent, "server", &summary)?;
+            add_report(cx, &item, &e.agent, &summary, true)?;
             return Ok(Some(item));
         }
         Prior::Gone(earlier) => Some(earlier),
@@ -1197,7 +1330,7 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     let reporters = agents[excess..].to_vec();
     let task = file(cx, &report, "server", reporters, count, earlier)?;
     cx.db.execute(
-        "INSERT INTO feedback_reports (task, agent, at) SELECT ?1, agent, at FROM api_errors \
+        "INSERT INTO feedback_reports (task, agent, at, signal) SELECT ?1, agent, at, 1 FROM api_errors \
          WHERE signature = ?2 AND at >= ?3 ORDER BY id",
         params![task.id.as_str(), report.signature, from],
     )?;
