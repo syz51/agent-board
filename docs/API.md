@@ -518,7 +518,17 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   next step. `kind` is one of:
   - `routed`: `task` (any board) does the work. Reports go to this item until that task is
     done or dropped; then a report opens a new item that `recurs` this one.
-  - `duplicate`: `task` is the original item, which takes later reports.
+  - `duplicate`: `task` is the original item, which takes later reports. The original must
+    still take reports: live as above (a plain task: not done or dropped). Otherwise 400
+    `invalid`, since a duplicate of an item that is no longer live is not live either and
+    the next report would open yet another item. The hint says where to route this item
+    instead (kind `routed`): the open revisit of the original's routed task (a child task
+    whose title starts `Revisit:`) by id; else, when that task is dropped, its verdict
+    (decline citing it, or file a new proposal with evidence it did not weigh); else a
+    `Proposal:` task on that task's board, naming the task and its owner; else, when the
+    original has no routed task (fixed, forwarded, closed unresolved, or its task is
+    gone), a proposal for the setup's owner. Also 400 `invalid` when the resolved item
+    would take no reports because the duplicate links lead back to it.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
   - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the
