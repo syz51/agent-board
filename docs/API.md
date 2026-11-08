@@ -530,7 +530,12 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   (`duplicate: true`): `reports` grows by one, the reporter joins `reporters` (the latest
   20), and at most once an hour a `feedback` note says it was reported again, naming the
   routed task and its status when routed, with a `task_updated` event
-  `{"fields": ["feedback"], "reports": n}`. A report leaves the task's `version` alone, so
+  `{"fields": ["feedback"], "reports": n}`. The same hourly report also adds a `finding`
+  note, by the reporter, to the task doing the work while it is not done or dropped: the
+  routed task, or a plain task the item is a duplicate of. It gives the item, the report
+  count, the distinct reporters (the latest 20) and the report's first line, quoted as
+  data written by another agent, so the task's owner sees the new evidence in its alerts.
+  A report leaves the task's `version` alone, so
   it never makes the owner's update conflict, except the one that reopens a declined item
   (below), which changes its status. The newest item with the signature is live
   while it is unresolved and not done or dropped, declined, a duplicate of a live item (the

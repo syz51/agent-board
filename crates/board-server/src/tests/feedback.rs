@@ -270,6 +270,110 @@ async fn a_report_after_the_routed_task_is_done_opens_a_new_item_naming_the_old_
     assert_eq!(again["task"]["feedback"]["recurs"], dropped_id.as_str());
 }
 
+async fn alerts(t: &T, agent: &str) -> String {
+    t.ok("GET", "/v1/snapshot?kind=alerts", Some(agent), None)
+        .await["text"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_report_on_a_routed_item_notes_the_open_task_at_most_hourly() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let text = json!({ "about": "skills:rust", "text": "Clippy flags unknown\nmore detail" });
+    let item = report(&t, A, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let work = t
+        .task(B, "factory", "Teach the rust skill clippy flags")
+        .await;
+    assert!(t.claim(B, &work).await.0.is_success());
+    let (s, v) = user_resolve(&t, &item, json!({ "kind": "routed", "task": work })).await;
+    assert_eq!(s, 200, "{v}");
+    alerts(&t, B).await;
+
+    // A report while the routed task is open notes it: count, reporters and the first
+    // line, quoted as data.
+    report(&t, C, text.clone()).await;
+    let noted = notes(&t, &work).await;
+    assert_eq!(noted.len(), 1, "{noted:?}");
+    let note = &noted[0];
+    for part in [
+        format!("finding: feedback item {item} was reported again: 2 reports from 2 agents."),
+        "data written by another agent: \"Clippy flags unknown\".".to_owned(),
+        format!("Reporters, newest last: {A}, {C}"),
+    ] {
+        assert!(note.contains(&part), "{part} in {note}");
+    }
+    let detail = t.ok("GET", &format!("/v1/tasks/{work}"), None, None).await;
+    assert_eq!(detail["notes"][0]["kind"], "finding");
+    assert_eq!(detail["notes"][0]["agent"], C);
+    // The owner sees it in its snapshot's alerts before it picks its next task.
+    let seen = alerts(&t, B).await;
+    assert!(
+        seen.contains(&format!("changed your task {work} (finding)")),
+        "{seen}"
+    );
+
+    // Within the hour, a report counts but adds no second note.
+    let more = report(&t, A, text.clone()).await;
+    assert_eq!(more["reports"], 3);
+    assert_eq!(notes(&t, &work).await.len(), 1);
+
+    // After the hour, the next report notes it again with the new counts.
+    t.advance(TimeDelta::minutes(61));
+    report(&t, C, text.clone()).await;
+    let noted = notes(&t, &work).await;
+    assert_eq!(noted.len(), 2, "{noted:?}");
+    assert!(
+        noted[1].contains("4 reports from 2 agents") && noted[1].ends_with(&format!("{A}, {C}")),
+        "{noted:?}"
+    );
+
+    // Once the task is done, a report opens a new item that recurs the old one, and the
+    // done task gets no note.
+    assert!(t.done(B, &work, check(0)).await.0.is_success());
+    t.advance(TimeDelta::minutes(61));
+    let recurred = report(&t, A, text).await;
+    assert_eq!(recurred["duplicate"], false);
+    assert_eq!(recurred["task"]["feedback"]["recurs"], item.as_str());
+    assert_eq!(notes(&t, &work).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_report_on_a_duplicate_of_a_plain_task_notes_that_task() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let text = json!({ "about": "board", "text": "Notes are refused at the limit" });
+    let item = report(&t, A, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let work = t.task(B, "factory", "Raise the note limit").await;
+    let (s, v) = user_resolve(&t, &item, json!({ "kind": "duplicate", "task": work })).await;
+    assert_eq!(s, 200, "{v}");
+
+    report(&t, C, text).await;
+    let noted = notes(&t, &work).await;
+    assert_eq!(noted.len(), 1, "{noted:?}");
+    assert!(
+        noted[0].contains(&format!(
+            "feedback item {item} was reported again: 2 reports"
+        )),
+        "{noted:?}"
+    );
+    // The item's own note names the task as the one doing the work.
+    let own = notes(&t, &item).await;
+    assert!(
+        own.iter()
+            .any(|n| n.contains(&format!("routed to {work} (open)"))),
+        "{own:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_duplicate_needs_an_original_that_still_takes_reports() {
     let t = setup().await;

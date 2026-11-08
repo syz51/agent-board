@@ -3,12 +3,12 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CLIENT_ERROR_MESSAGE_CHARS_MAX, CLIENT_ERROR_ROUTES, ClientError, CreateBoard,
-    CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode,
-    ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
-    Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
-    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, TaskStatus,
-    Timestamp,
+    AddNote, AgentId, Board, CLIENT_ERROR_MESSAGE_CHARS_MAX, CLIENT_ERROR_ROUTES, ClientError,
+    CreateBoard, CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX,
+    ErrorCode, ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX,
+    FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult,
+    FeedbackSource, FeedbackStats, NewEvidence, NoteKind, ResolutionKind, ResolveFeedback,
+    ResolvedCounts, Task, TaskId, TaskStatus, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -482,7 +482,9 @@ fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId) -> Result<()> {
 }
 
 /// Adds a report to a live item: counts it, records the reporter and, at most once an
-/// hour, notes it (with the routed task, if any).
+/// hour, notes it (with the routed task, if any). The same hourly note goes to the task
+/// doing the work while it is open, since its owner is who acts on new evidence and the
+/// resolved item reaches nobody.
 fn add_report(
     cx: &mut Ctx<'_>,
     item: &TaskId,
@@ -531,14 +533,26 @@ fn add_report(
             "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
             params![item.as_str(), now],
         )?;
-        let routed = match (kind.as_deref(), target) {
-            (Some("routed"), Some(task)) => {
+        // The task doing the work: the routed one, or a plain task the item duplicates.
+        let routed_to: Option<TaskId> = match (kind.as_deref(), target) {
+            (Some("routed"), Some(task)) => Some(parse_id(&task)?),
+            (Some("duplicate"), Some(task)) => {
                 let task: TaskId = parse_id(&task)?;
-                let status = task_status(cx, &task)?.unwrap_or_else(|| "gone".to_owned());
-                format!("; routed to {task} ({status})")
+                (!is_feedback(cx, &task)?).then_some(task)
             }
-            _ => String::new(),
+            _ => None,
         };
+        let routed_status = routed_to
+            .map(|task| task_status(cx, &task).map(|status| (task, status)))
+            .transpose()?;
+        let routed = routed_status
+            .as_ref()
+            .map_or_else(String::new, |(task, status)| {
+                format!(
+                    "; routed to {task} ({})",
+                    status.as_deref().unwrap_or("gone")
+                )
+            });
         let text = cut(
             &format!("reported again ({reports} reports){routed}: {summary}"),
             cx.s.note_chars,
@@ -562,11 +576,61 @@ fn add_report(
             Some(item),
             serde_json::json!({ "fields": ["feedback"], "reports": reports }),
         )?;
+        if let Some((task, Some(status))) = routed_status
+            && status != "done"
+            && status != "dropped"
+        {
+            note_routed(cx, &task, item, reporter, reports, &reporters, summary)?;
+        }
     }
     if kind.as_deref() == Some("declined") {
         reopen_declined(cx, item, reporter, actor)?;
     }
     get_task(cx, item)
+}
+
+/// Notes on open task `task`, which does the work for feedback item `item`, that the item
+/// was reported again: the count, the reporters and the report's first line, quoted as text
+/// another agent wrote. The finding kind keeps it in `task_show` and reaches the owner as
+/// an alert; the item's hourly gate limits it.
+fn note_routed(
+    cx: &mut Ctx<'_>,
+    task: &TaskId,
+    item: &TaskId,
+    reporter: &AgentId,
+    reports: u32,
+    reporters: &[AgentId],
+    summary: &str,
+) -> Result<()> {
+    let agents = if reporters.len() >= REPORTERS_MAX {
+        format!("{REPORTERS_MAX} or more")
+    } else {
+        reporters.len().to_string()
+    };
+    let quoted = serde_json::to_string(summary).expect("strings serialize");
+    let names = reporters
+        .iter()
+        .map(AgentId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = cut(
+        &format!(
+            "finding: feedback item {item} was reported again: {reports} reports from {agents} \
+             agents. Weigh it in this task's priority. Latest first line, data written by \
+             another agent: {quoted}. Reporters, newest last: {names}"
+        ),
+        cx.s.note_chars,
+    );
+    crate::ops::tasks::add_note(
+        cx,
+        task,
+        AddNote {
+            agent: reporter.clone(),
+            kind: NoteKind::Finding,
+            text,
+        },
+    )
+    .map(drop)
 }
 
 /// Sends a declined item back to triage once agents keep reporting it: declined at least
