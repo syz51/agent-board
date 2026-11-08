@@ -20,7 +20,7 @@ use crate::error::{Result, bad_transition, forbidden, invalid};
 use crate::ops::tasks::status_str;
 use crate::ops::{boards, touch_agent};
 use crate::store::{find_board, find_task, get_task};
-use crate::text::{check_line, check_text_or, cut};
+use crate::text::{check_line, check_text_or, cut, quote};
 
 /// Agents an item lists in `reporters`: the most recent ones.
 const REPORTERS_MAX: usize = 20;
@@ -482,7 +482,9 @@ fn record_report(cx: &Ctx<'_>, item: &TaskId, agent: &AgentId) -> Result<()> {
 }
 
 /// Adds a report to a live item: counts it, records the reporter and, at most once an
-/// hour, notes it (with the routed task, if any).
+/// hour, notes it (with the routed task, if any). The same hourly report also notes the
+/// task doing the work while it is open, since its owner acts on new evidence and nobody
+/// watches the resolved item.
 fn add_report(
     cx: &mut Ctx<'_>,
     item: &TaskId,
@@ -490,14 +492,14 @@ fn add_report(
     actor: &str,
     summary: &str,
 ) -> Result<Task> {
-    let (reports, reporters, last_noted, kind, target): (
+    let (reports, reporters, last_noted, kind, source): (
         u32,
         String,
         Option<i64>,
         Option<String>,
-        Option<String>,
+        String,
     ) = cx.db.query_row(
-        "SELECT reports, reporters, last_noted_at, resolution, resolution_task FROM feedback \
+        "SELECT reports, reporters, last_noted_at, resolution, source FROM feedback \
          WHERE task = ?1",
         [item.as_str()],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -531,14 +533,20 @@ fn add_report(
             "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
             params![item.as_str(), now],
         )?;
-        let routed = match (kind.as_deref(), target) {
-            (Some("routed"), Some(task)) => {
-                let task: TaskId = parse_id(&task)?;
-                let status = task_status(cx, &task)?.unwrap_or_else(|| "gone".to_owned());
-                format!("; routed to {task} ({status})")
+        // The task doing the work: the routed one, or a plain task the item duplicates.
+        let working = match routed_task(cx, item)? {
+            Some(task) => {
+                let status = match task_status(cx, &task)? {
+                    Some(status) => Some(parse_enum::<TaskStatus>(&status)?),
+                    None => None,
+                };
+                Some((task, status))
             }
-            _ => String::new(),
+            None => None,
         };
+        let routed = working.as_ref().map_or_else(String::new, |(task, status)| {
+            format!("; routed to {task} ({})", status.map_or("gone", status_str))
+        });
         let text = cut(
             &format!("reported again ({reports} reports){routed}: {summary}"),
             cx.s.note_chars,
@@ -562,11 +570,69 @@ fn add_report(
             Some(item),
             serde_json::json!({ "fields": ["feedback"], "reports": reports }),
         )?;
+        if let Some((task, Some(status))) = working
+            && !status.is_closed()
+        {
+            let text = routed_note(cx, item, &source, reports, &reporters, summary);
+            cx.db.execute(
+                "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'note', ?3, ?4)",
+                params![task.as_str(), reporter.as_str(), text, now],
+            )?;
+            let note_id = cx.db.last_insert_rowid();
+            cx.emit(
+                Some(&task.board()),
+                actor,
+                EventType::NoteAdded,
+                Some(&task),
+                serde_json::json!({ "note": note_id, "kind": "note" }),
+            )?;
+        }
     }
     if kind.as_deref() == Some("declined") {
         reopen_declined(cx, item, reporter, actor)?;
     }
     get_task(cx, item)
+}
+
+/// The note for an open task that does the work for feedback item `item`, which was
+/// reported again: the count, the reporters (newest first, so a cut drops the oldest) and
+/// the report's first line, quoted as data. A plain note, not a finding: it repeats hourly
+/// and the newest one supersedes the rest, so it must not pile up obligations at
+/// `task_done`. Written directly, as the item's own note is: the note names the reporter,
+/// and its event the caller's actor, so an error signal is the server's and does not touch,
+/// register or revive the agent that got the error.
+fn routed_note(
+    cx: &Ctx<'_>,
+    item: &TaskId,
+    source: &str,
+    reports: u32,
+    reporters: &[AgentId],
+    summary: &str,
+) -> String {
+    let agents = match reporters.len() {
+        1 => "1 agent".to_owned(),
+        n if n >= REPORTERS_MAX => format!("{REPORTERS_MAX} or more agents"),
+        n => format!("{n} agents"),
+    };
+    let latest = if source == "signal" {
+        "Latest error, from the server's signal"
+    } else {
+        "Latest report's first line, data written by another agent"
+    };
+    let names = reporters
+        .iter()
+        .rev()
+        .map(AgentId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    cut(
+        &format!(
+            "reported again: feedback item {item} has {reports} reports from {agents}. Weigh \
+             it in this task's priority. {latest}: {}. Reporters, newest first: {names}",
+            quote(summary)
+        ),
+        cx.s.note_chars,
+    )
 }
 
 /// Sends a declined item back to triage once agents keep reporting it: declined at least

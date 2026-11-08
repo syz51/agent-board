@@ -768,9 +768,14 @@ report, not a free-form task (`API.md`, "Feedback"):
   the `activity` it interrupted; hooks may file reports with source `capture`.
 - **Dedupe and recurrence.** Reports with the same signature (given, or derived from
   `about` and the title) land on one item while it is live, so a problem reported by ten
-  agents is one task with ten reports rather than ten tasks. Once the item is routed to a
-  task and that task is done, a new report opens a new item that `recurs` the old one: the
-  fix did not hold, and the history shows it.
+  agents is one task with ten reports rather than ten tasks. A routed item is resolved, so
+  triage no longer watches it: while the routed task (or a plain task the item duplicates)
+  is open, a report also adds a note to that task, at most once an hour per item, with the
+  report count, the reporters and the report's first line quoted as data. Its owner, who
+  sets the priority the evidence meets, sees it as an alert. It is a plain note, not a
+  finding, so hourly repeats do not pile up items to answer at `task_done`. Once the item is
+  routed to a task and that task is done, a new report opens a new item that `recurs` the
+  old one: the fix did not hold, and the history shows it.
 - **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
   does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere,
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
