@@ -815,6 +815,12 @@ export function createFixtures(now: number): Fixtures {
     }),
     ev(31 * 60, "factory", id("t3:e4b7"), "handoff_updated", null, {}),
     ev(5 * 60, "factory", id("t3:e4b7"), "task_created", "factory-20", {}),
+    // A handover: the coordinator gives a task in doing to another agent.
+    ev(4 * 60, "factory", id("t3:c2d0"), "task_updated", "factory-14", {
+      fields: ["owner"],
+      owner: id("t3:e4b7"),
+      previous_owner: id("t3:61aa"),
+    }),
     ev(3 * 60, "web-view", id("claude:5be1"), "task_updated", "web-view-3", {
       from: "doing",
       to: "review",
