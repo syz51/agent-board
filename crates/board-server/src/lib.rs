@@ -2,7 +2,7 @@
 //! snapshot rendering, the embedded web view and the Telegram notifier.
 //!
 //! The binary (`board serve`, `board admin`) uses [`serve`], [`create_device`],
-//! [`telegram_pair`] and [`backup`]; tests build [`app`] over [`Db::open_in_memory`] with a [`ManualClock`].
+//! [`telegram_pair`] and [`backup`]; tests build [`app`] over a [`Db`] with a [`ManualClock`].
 
 mod api;
 mod auth;

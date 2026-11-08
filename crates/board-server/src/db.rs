@@ -1,11 +1,11 @@
-use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use board_proto::{BoardSlug, DeviceName, Event, EventType, TaskId, Timestamp};
 use chrono::DateTime;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
@@ -38,35 +38,34 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// statements; rusqlite's default of 16 would evict and reparse them on every snapshot.
 const STATEMENT_CACHE: usize = 128;
 
-/// The board database: one SQLite connection that every request uses in turn, so writes
-/// are serialized, each in a `BEGIN IMMEDIATE` transaction. Committed events are
-/// broadcast to subscribers (SSE streams, the notifier).
+/// Read-only connections kept open beside the writer.
+const READERS: usize = 4;
+
+/// The board database. One writer connection serializes writes, each in a `BEGIN IMMEDIATE`
+/// transaction. Reads run on a small pool of read-only connections, which WAL lets read
+/// while a write is in progress. Committed events are broadcast to subscribers (SSE
+/// streams, the notifier).
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    // Fields drop in order: the readers close before the writer, so the writer is the last
+    // connection and checkpoints the WAL into the database file as it closes.
+    readers: Arc<Readers>,
+    writer: Arc<Mutex<Connection>>,
     events: broadcast::Sender<Event>,
 }
 
 impl Db {
     /// Opens (creating if needed) and migrates a database file, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self::from_connection(open_file(path)?))
-    }
-
-    /// A fresh, migrated in-memory database, for tests.
-    pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        configure(&conn)?;
-        migrate(&conn)?;
-        Ok(Self::from_connection(conn))
-    }
-
-    fn from_connection(conn: Connection) -> Self {
+        // The writer migrates and turns on WAL before any reader opens.
+        let writer = open_file(path)?;
+        let readers = Readers::open(path)?;
         let (events, _) = broadcast::channel(1024);
-        Self {
-            conn: Arc::new(Mutex::new(conn)),
+        Ok(Self {
+            readers: Arc::new(readers),
+            writer: Arc::new(Mutex::new(writer)),
             events,
-        }
+        })
     }
 
     /// Creates a device (a user device when `user`) and returns its token, shown once.
@@ -95,9 +94,7 @@ impl Db {
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        // A panic mid-transaction rolls the transaction back when it unwinds, so the
-        // connection is still usable.
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.writer)
     }
 
     /// Runs `f` in an immediate (write) transaction, commits, then broadcasts the events it
@@ -127,14 +124,15 @@ impl Db {
         Ok(out)
     }
 
-    /// Runs `f` in a read transaction, so it sees one consistent state.
+    /// Runs `f` in a read transaction, so it sees one consistent state: the last commit
+    /// before it began. It runs on a read connection and never waits for the writer.
     pub(crate) fn read<T>(
         &self,
         now: Timestamp,
         settings: &Settings,
         f: impl FnOnce(&Ctx<'_>) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = self.lock();
+        let mut conn = self.readers.lend();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let cx = Ctx {
             db: &tx,
@@ -149,12 +147,109 @@ impl Db {
     }
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // A panic mid-transaction rolls the transaction back when it unwinds, so the
+    // connection is still usable.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A fixed set of read-only connections, each lent to one read at a time.
+struct Readers {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+    returned: Condvar,
+}
+
+impl Readers {
+    fn open(path: &Path) -> Result<Self> {
+        let idle = (0..READERS)
+            .map(|_| open_reader(path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            path: path.to_owned(),
+            idle: Mutex::new(idle),
+            returned: Condvar::new(),
+        })
+    }
+
+    /// Takes back a lent connection. One still in a transaction (its rollback failed) would
+    /// fail every later read, so it is rolled back again, or else replaced.
+    fn give_back(&self, mut conn: Connection) {
+        if !conn.is_autocommit() && conn.execute_batch("ROLLBACK").is_err() {
+            match open_reader(&self.path) {
+                Ok(fresh) => conn = fresh,
+                Err(error) => {
+                    // Keep the connection: a pool one short would leave reads waiting.
+                    tracing::error!(%error, "replacing a read connection stuck in a transaction failed");
+                }
+            }
+        }
+        lock(&self.idle).push(conn);
+        self.returned.notify_one();
+    }
+
+    /// Lends an idle connection, waiting for one when every one is in use.
+    fn lend(&self) -> Lent<'_> {
+        let mut idle = self
+            .returned
+            .wait_while(lock(&self.idle), |idle| idle.is_empty())
+            .unwrap_or_else(PoisonError::into_inner);
+        let conn = idle.pop().expect("waited for an idle connection");
+        Lent {
+            conn: Some(conn),
+            readers: self,
+        }
+    }
+}
+
+/// A read connection on loan; it goes back to the pool when dropped.
+struct Lent<'a> {
+    conn: Option<Connection>,
+    readers: &'a Readers,
+}
+
+impl std::ops::Deref for Lent<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("lent until dropped")
+    }
+}
+
+impl std::ops::DerefMut for Lent<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("lent until dropped")
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.readers.give_back(conn);
+        }
+    }
+}
+
 pub(crate) fn open_file(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     configure(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     migrate(&conn)?;
+    Ok(conn)
+}
+
+/// A read-only connection to a database the writer has opened and migrated, set up as the
+/// writer is, so reads can call the same SQL functions.
+fn open_reader(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        // As `Connection::open` does for the writer, so both read a `file:` URI path alike.
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure(&conn)?;
     Ok(conn)
 }
 
@@ -488,6 +583,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexes, 1);
+    }
+
+    #[test]
+    fn reads_run_on_read_only_connections_set_up_like_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("board.db")).unwrap();
+        let settings = Settings::default();
+        let now = DateTime::UNIX_EPOCH;
+        // configure() ran: the SQL function the writer has is there.
+        let proposal: bool = db
+            .read(now, &settings, |cx| {
+                Ok(cx
+                    .db
+                    .query_row("SELECT is_proposal_body('Proposal: x')", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert!(proposal);
+        let write = db.read(now, &settings, |cx| {
+            Ok(cx.db.execute("DELETE FROM devices", [])?)
+        });
+        assert!(
+            write.is_err_and(|e| e.to_string().contains("readonly")),
+            "a read wrote"
+        );
+    }
+
+    #[test]
+    fn a_read_connection_returned_in_a_transaction_is_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("board.db")).unwrap();
+        {
+            let conn = db.readers.lend();
+            conn.execute_batch("BEGIN; SELECT COUNT(*) FROM boards;")
+                .unwrap();
+            assert!(!conn.is_autocommit());
+        }
+        assert!(lock(&db.readers.idle).iter().all(Connection::is_autocommit));
+        for _ in 0..READERS * 2 {
+            db.read(DateTime::UNIX_EPOCH, &Settings::default(), |cx| {
+                cx.max_seq()
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_beyond_the_pool_wait_for_a_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("board.db")).unwrap();
+        let (active, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..READERS * 3 {
+                scope.spawn(|| {
+                    db.read(DateTime::UNIX_EPOCH, &Settings::default(), |cx| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        cx.max_seq()
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let most = most.into_inner();
+        assert!((2..=READERS).contains(&most), "{most} reads at once");
     }
 
     #[test]
