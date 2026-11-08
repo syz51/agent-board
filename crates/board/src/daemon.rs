@@ -2384,7 +2384,7 @@ impl<T: T3> Daemon<T> {
                 .iter()
                 .filter(|w| is_fresh(w, paused_until, now))
             {
-                lines.push(self.recheck(agent, wake).await);
+                lines.push(self.recheck(agent, wake, now).await);
             }
             Some(lines)
         } else {
@@ -2729,7 +2729,12 @@ impl<T: T3> Daemon<T> {
     }
 
     /// The line for `wake` when what it is about still holds, else `None`.
-    async fn recheck(&self, agent: &AgentId, wake: &Wake) -> Result<Option<String>> {
+    async fn recheck(
+        &self,
+        agent: &AgentId,
+        wake: &Wake,
+        now: Timestamp,
+    ) -> Result<Option<String>> {
         let slug = &wake.board;
         let coordinator = self.coordinator_here(slug) == Some(agent);
         let line = match &wake.about {
@@ -2774,6 +2779,13 @@ impl<T: T3> Daemon<T> {
                 let next = if task.blocked_reason.is_some() {
                     format!(
                         "check its blocked reason (task_show {}) before resuming",
+                        task.id
+                    )
+                } else if let Some(at) = task.not_before.filter(|&at| at > now) {
+                    // The server refuses the move to doing until then.
+                    format!(
+                        "it waits until {}; resume it then (task_update {} status=doing)",
+                        at.format("%Y-%m-%d %H:%MZ"),
                         task.id
                     )
                 } else {

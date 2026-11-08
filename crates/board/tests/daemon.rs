@@ -1613,6 +1613,20 @@ async fn a_blocker_done_on_another_board_wakes_the_waiting_boards_coordinator_an
     e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 2);
     assert!(e.daemon.state.wakes.is_empty());
+
+    // A not_before still ahead holds the move to doing: the wake names the date.
+    blocked.task.status = board_proto::TaskStatus::Blocked;
+    blocked.task.not_before = Some(at() + chrono::Duration::days(1));
+    e.stub.on("GET /v1/tasks/factory-13", &blocked);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 3, "{sends:?}");
+    let wait = format!(
+        "it waits until {}; resume it then",
+        (at() + chrono::Duration::days(1)).format("%Y-%m-%d %H:%MZ")
+    );
+    assert!(sends[2].1.contains(&wait), "{sends:?}");
 }
 
 /// A task created with `claim` is in doing when the daemon reads it: no ready wake.
@@ -3492,14 +3506,20 @@ fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
         "When the earlier task has an open revisit (a child task titled `Revisit: …`, or one a note on that task names), route the item to the revisit as the rule above says",
         // The dropped-proposal rule still follows the recurring rule it is named from.
         "when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's owner (see \"Finding the owner\") and cite the earlier item and its reason: a fix that did not hold goes to the owner, not back to you. - When the owner declines or merges a routed proposal",
-        // Repeats without `recurs` go there too, and a signal brings the revisit forward.
+        // Repeats without `recurs` go there too. A signal is noted on the revisit and keeps
+        // its `not_before`, unless it shows p1 harm or already exceeds the whole-window bar.
         "Any item that repeats a problem whose fix has an open revisit goes to that revisit, with or without `recurs`",
         "Find open revisits with `task_list` on the owner's board",
         "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
-        "When the item is a `signal`, also clear the revisit's `not_before`",
+        "When the item is a `signal`, also `task_note` it on the revisit with its count and window",
+        "Keep the revisit's `not_before`: a revisit judges a rate over its whole window",
+        "so the revisit runs now only in two cases",
+        "the signal shows p1 harm on the Priority scale in the coordinator instructions; counts alone never make p1",
+        "already exceeds the whole-window bar: the bar's rate times the time from the watched deploy to `not_before`",
     ] {
         assert!(triage.contains(rule), "missing {rule:?}");
     }
+    assert!(!triage.contains("also clear the revisit's `not_before`"));
 }
 
 #[test]
