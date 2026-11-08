@@ -2223,15 +2223,24 @@ async fn a_paused_board_keeps_its_coordinator_and_wakes_it_on_resume() {
     assert!(e.daemon.on_event(&pause, at()).await.unwrap());
     let later = at() + chrono::Duration::hours(2);
     e.daemon.reconcile(later).await.unwrap();
+    // An answer for a worker on the paused board starts no turn either.
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    e.t3.live("worker");
+    let ev = answered(&e, 21, 3, "t3:worker");
+    e.daemon.on_event(&ev, later).await.unwrap();
     e.daemon.flush(later).await;
     assert_eq!(releases(&e), 0, "the paused board keeps its coordinator");
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
     assert!(e.t3.sends().is_empty(), "a pause wakes no one");
+    assert!(e.daemon.state.wakes.is_empty(), "dropped, not kept");
     assert_eq!(starts(&e.t3), 0);
 
     e.stub
         .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
-    let mut resume = event(21, EventType::BoardUpdated, None, "user");
+    let mut resume = event(22, EventType::BoardUpdated, None, "user");
     resume.payload = json!({"fields": ["status"], "status": "active"});
     assert!(e.daemon.on_event(&resume, later).await.unwrap());
     e.daemon.reconcile(later).await.unwrap();

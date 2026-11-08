@@ -1245,16 +1245,12 @@ impl<T: T3> Daemon<T> {
     }
 
     fn is_home(&self, board: &Board) -> bool {
-        board.autopilot
-            && board.status == BoardStatus::Active
-            && board.home_devices.contains(&self.ctx.device)
+        self.hosts(board) && board.status == BoardStatus::Active
     }
 
-    /// A board this device would host but for its pause.
-    fn is_paused_home(&self, board: &Board) -> bool {
-        board.autopilot
-            && board.status == BoardStatus::Paused
-            && board.home_devices.contains(&self.ctx.device)
+    /// An autopilot board with this device among its homes, whatever its status.
+    fn hosts(&self, board: &Board) -> bool {
+        board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
     /// Starts, renews or resumes the coordinators this device hosts.
@@ -1271,7 +1267,7 @@ impl<T: T3> Daemon<T> {
                 // A paused board keeps its coordinator thread and names it still, so the
                 // server holds that thread while paused (`Snapshot::held_by`), and the same
                 // thread is woken when the board resumes instead of a new one starting.
-                if self.is_paused_home(board) {
+                if self.hosts(board) && board.status == BoardStatus::Paused {
                     continue;
                 }
                 if self.state.coordinators.remove(&board.slug).is_some() {
@@ -3271,6 +3267,14 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<Option<String>> {
         let slug = &wake.board;
+        // A paused board starts no turn; the coordinator is told what to check on resume.
+        if self
+            .boards
+            .get(slug)
+            .is_some_and(|b| b.status == BoardStatus::Paused)
+        {
+            return Ok(None);
+        }
         let coordinator = self.coordinator_here(slug) == Some(agent);
         let line = match &wake.about {
             WakeAbout::Ready { task } if coordinator => {
@@ -3398,8 +3402,10 @@ impl<T: T3> Daemon<T> {
             }
             WakeAbout::Resumed if coordinator => Some(format!(
                 "board {slug}: the user resumed this board after a pause. Read your board \
-                 snapshot and handoff, then continue: check tasks in doing whose threads \
-                 the pause stopped, and resume or restart them"
+                 snapshot and handoff, then continue. The pause stopped the threads on its \
+                 tasks in doing: send each owner thread a message to continue its task, and \
+                 restart a task only when its owner thread is gone. Check blocked tasks and \
+                 answered asks too: their wake-ups were dropped while paused"
             )),
             // The agent is no longer this board's coordinator.
             WakeAbout::Resumed

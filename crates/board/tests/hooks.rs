@@ -1285,10 +1285,14 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
         e.stub.requests_to(&state_path()).last().unwrap().body["state"],
         "idle"
     );
+    // A runtime that went on anyway (a subagent's tool call) is halted again.
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a second halt")["continue"], false);
     assert_eq!(
         stop(&e),
         None,
-        "no handoff reminder while held: it would continue the turn"
+        "no handoff reminder in a halted turn: it would continue the turn"
     );
 
     // A turn the user starts while held is told, not stopped.
@@ -1304,12 +1308,17 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
         reply.as_ref().is_none_or(|r| r.get("continue").is_none()),
         "{reply:?}"
     );
-    assert_eq!(stop(&e), None);
+    assert_eq!(
+        stop(&e).unwrap()["decision"],
+        "block",
+        "the user's own turn gets its reminders"
+    );
 
-    // Resumed: the reminders come back.
+    // Resumed: no hold line and no halt.
     serve_hold(&e, false);
     prompt(&e, "go on");
-    assert_eq!(stop(&e).unwrap()["decision"], "block");
+    heartbeat_due_again(&e);
+    assert_eq!(read_tool(&e).0, None);
 }
 
 #[test]

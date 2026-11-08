@@ -659,8 +659,6 @@ fn dispatch_is_set_shown_and_checked() {
     );
 }
 
-/// `board boards` shows how much of the ready work a coordinator may start, apart from the
-/// ready tasks that wait on the user.
 #[test]
 fn pause_and_resume_set_every_board_or_the_named_ones() {
     use board_proto::BoardStatus;
@@ -701,17 +699,16 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     // Resume, named: only that board, even with others paused.
     e.stub
         .on("PATCH /v1/boards/gamma", with("gamma", BoardStatus::Active));
-    let out = e.run(&["resume", "gamma"]);
+    let out = e.run(&["resume", "gamma", "gamma"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
         stdout(&out).starts_with("resumed 1 board:"),
         "{}",
         stdout(&out)
     );
-    assert_eq!(
-        e.stub.requests_to("PATCH /v1/boards/gamma")[0].body["status"],
-        "active"
-    );
+    let patches = e.stub.requests_to("PATCH /v1/boards/gamma");
+    assert_eq!(patches.len(), 1, "a name given twice is changed once");
+    assert_eq!(patches[0].body["status"], "active");
 
     // Nothing to resume among the named; an unknown or closed board fails before any change.
     let before = e.stub.requests().len();
@@ -734,6 +731,8 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     );
 }
 
+/// `board boards` shows how much of the ready work a coordinator may start, apart from the
+/// ready tasks that wait on the user.
 #[test]
 fn boards_show_ready_auto_apart_from_ready() {
     let e = env();

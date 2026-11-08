@@ -1191,7 +1191,10 @@ impl Hook<'_> {
             // A failed shell command may still have changed files.
             HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
                 let reply = self.post_tool_use().await?;
-                self.register_again(repo.as_ref()).await;
+                // Registering marks the agent running, which a halted turn is not.
+                if !matches!(reply, Reply::Halt(_)) {
+                    self.register_again(repo.as_ref()).await;
+                }
                 Ok(reply)
             }
             HookEvent::Stop => self.stop(repo).await,
@@ -1499,6 +1502,8 @@ impl Hook<'_> {
     }
 
     async fn post_tool_use(&mut self) -> Result<Reply> {
+        // A halt shows no overlap, so it marks none as shown.
+        let shown = self.local.overlaps_shown.clone();
         let mut lines = Vec::new();
         for touches in &self.touches {
             let mut result = self.client.touches(touches).await?;
@@ -1513,9 +1518,11 @@ impl Hook<'_> {
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
             let boards = snap.held_by.clone();
             let alerts = self.keep(snap)?;
-            // A turn that was running when its board was paused stops here.
-            if self.local.held && !self.local.hold_told {
-                self.local.hold_told = true;
+            // A turn that was running when its board was paused stops here, at every
+            // heartbeat until it ends: a runtime may not end it at the first (a subagent's
+            // tool call, or a runtime that ignores the halt).
+            if self.halted() {
+                self.local.overlaps_shown = shown;
                 self.set_state(AgentState::Idle, None).await?;
                 return Ok(Reply::Halt(halt_reason(&boards)));
             }
@@ -1528,6 +1535,12 @@ impl Hook<'_> {
         } else {
             Reply::Context(lines.join("\n"))
         })
+    }
+
+    /// The agent is held, as of the last heartbeat, and its turn began before that: the
+    /// heartbeat halts the turn.
+    fn halted(&self) -> bool {
+        self.local.held && !self.local.hold_told
     }
 
     /// A `Stop` that follows our own block, ending the turn that answered a reminder.
@@ -1563,8 +1576,9 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        // A held agent is not asked to go on: the user paused its work.
-        let reply = if continued || self.local.held {
+        // A halted turn is not asked to go on: the user paused its work. A turn begun
+        // while held (the user's own request) gets the reminders as any other.
+        let reply = if continued || self.halted() {
             Reply::Nothing
         } else {
             let handoff = self.handoff_reminder().await?;

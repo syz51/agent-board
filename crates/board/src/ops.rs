@@ -872,7 +872,9 @@ pub async fn set_boards_status(
                      active, or leave it out"
                 );
             }
-            targets.push(board);
+            if !targets.iter().any(|t: &&Board| t.slug == board.slug) {
+                targets.push(board);
+            }
         }
         targets
     };

@@ -765,8 +765,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   compact, so all three formats share the same size caps.
   `held_by` lists the paused boards the agent works for (as their coordinator, a thread it
   delegated, or the owner of a task in `doing`, or one of its delegates); every kind then
-  has text, starting with the `hold:` line. Empty and left out otherwise, and by servers
-  that predate it, which clients read as not held.
+  has text. In `lines`, the `hold:` line names the boards and what to do, first after the
+  header (a full snapshot's intro comes before it); `yaml` has `hold` with `boards` and
+  `action`; `json` has `hold` with the slugs only. Empty and left out otherwise, and by
+  servers that predate it, which clients read as not held.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
   resuming from `Last-Event-ID`, else from `since`. Events older than 365 days are pruned

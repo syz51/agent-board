@@ -288,17 +288,24 @@ kind, also when nothing else changed. The hooks act on it:
 
 - `PostToolUse` with a heartbeat due (so within about a minute of the pause, at the next
   tool call that returns) ends a turn that began unheld: `{"continue": false,
-  "stopReason": …}`, after marking the agent idle. A tool call that runs long is not
-  stopped until it returns.
+  "stopReason": …}`, after marking the agent idle, without registering it again (which
+  would mark it running) and without marking any overlap shown. Each later heartbeat of
+  that turn halts it again, in case the runtime ended only a subagent or ignored the
+  halt. A tool call that runs long is not stopped until it returns.
 - `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
   own message asks for the work) and does not stop the turn, since the hook cannot tell
   the user's message from a T3 notification. That turn is not stopped later either.
-- `Stop` gives no handoff or done reminders while held, since a reminder continues the
-  turn.
+- `Stop` gives no handoff or done reminders in a halted turn, since a reminder continues
+  the turn; the done marks it took are then dropped. A turn begun while held gets them as
+  any other. Both read the hold as of the last heartbeat, so a pause or resume within the
+  last minute is not seen yet; the next heartbeat halts a turn a reminder continued.
 
 The daemon keeps a paused board's coordinator and wakes it once on resume (see "Autopilot
-and the coordinator"). Held workers are not woken on resume; the coordinator restarts
-their tasks.
+and the coordinator"). While a board is paused, the daemon drops every wake-up about it
+(ready work, answers, unblocked tasks, idle owners) at its send; the resume wake-up tells
+the coordinator to check those, and to message each halted owner thread to continue its
+task, restarting a task only when its thread is gone. An owner not messaged gets the
+server's idle notice once it has been away `doing_idle_secs`, as usual.
 
 ## Runtime integration
 
@@ -416,8 +423,9 @@ settings in use, warned once per edit.
   lapses while paused; on resume, the reconcile claims it again for the same thread when
   T3 finds it live, as for any lapsed lease. A `board_updated` event that sets the status
   back to `active` queues one `resumed` wake-up for that coordinator, telling it to read
-  its snapshot and handoff and to resume or restart the tasks in `doing` whose threads the
-  pause stopped. A board paused by a daemon that predates this rule released its lease,
+  its snapshot and handoff, to message each owner thread the pause stopped to continue its
+  task (restarting a task only when its thread is gone), and to check blocked tasks and
+  answered asks, whose wake-ups were dropped while paused. A board paused by a daemon that predates this rule released its lease,
   so its coordinator is not held and a new one starts on resume.
 - **A coordinator whose folder is gone**: T3 fails every run of a thread whose folder no
   longer exists, at once, before the agent starts, while the thread itself stays and
