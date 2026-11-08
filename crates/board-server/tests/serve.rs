@@ -57,4 +57,9 @@ async fn serve_stops_on_sigterm() {
     })
     .await;
     assert!(ended.is_ok(), "the event stream ends");
+    // The last connection to close checkpoints the WAL into board.db and removes it, so the
+    // file alone is the whole database, as a restore that replaces it expects.
+    for leftover in ["board.db-wal", "board.db-shm"] {
+        assert!(!dir.path().join(leftover).exists(), "{leftover} is left");
+    }
 }

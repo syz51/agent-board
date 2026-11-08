@@ -10,7 +10,9 @@ use super::{REPO, T};
 use crate::db::{live_sql, ready_sql};
 use crate::ops::leases::DELEGATION_FAMILY;
 use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
-use crate::snapshot::{RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates};
+use crate::snapshot::{
+    ALERT_EVENTS, ALERTS_LEFT, RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates,
+};
 use crate::store::{BATCH_BLOCKERS, latest_events_sql};
 
 const ME: &str = "t3:me";
@@ -88,11 +90,15 @@ async fn big_board(t: &T, tasks: u32, events: u32) {
     ));
 }
 
-async fn full(t: &T) -> String {
-    t.ok("GET", "/v1/snapshot?kind=full", Some(ME), None).await["text"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+/// How long a full snapshot that scans alerts from `since=0` takes.
+async fn time_full(t: &T) -> Duration {
+    let at = Instant::now();
+    let snap = t
+        .ok("GET", "/v1/snapshot?kind=full&since=0", Some(ME), None)
+        .await;
+    let took = at.elapsed();
+    assert!(!snap["text"].as_str().unwrap().is_empty());
+    took
 }
 
 /// A full snapshot over 5k tasks and 100k events stays under 50 ms. Timing depends on the
@@ -101,27 +107,42 @@ async fn full(t: &T) -> String {
 #[tokio::test]
 #[ignore = "timing; run in a release build"]
 async fn snapshot_stays_fast_on_a_big_board() {
+    time_full_snapshots(100_000, Duration::from_millis(50)).await;
+}
+
+/// A year of history: a full snapshot over 1M events stays under 20 ms, as the alert scan
+/// reads only the seq range of its window, not each watched type's whole history.
+#[tokio::test]
+#[ignore = "timing; run in a release build"]
+async fn snapshot_stays_fast_over_a_million_events() {
+    time_full_snapshots(1_000_000, Duration::from_millis(20)).await;
+}
+
+/// Times full snapshots over 5k tasks and `events` events against `budget` (the median).
+/// Each one scans alerts from `since=0`, so the whole alert window is read every time.
+async fn time_full_snapshots(events: u32, budget: Duration) {
     // On disk in WAL mode, as in production. `BOARD_BENCH_DB` keeps the file for a look at
     // its query plans.
     let dir = tempfile::tempdir().unwrap();
     let path =
         std::env::var_os("BOARD_BENCH_DB").map_or_else(|| dir.path().join("board.db"), Into::into);
     let t = T::over(crate::Db::open(&path).unwrap(), |_| {});
-    big_board(&t, 5_000, 100_000).await;
-    let first = Instant::now();
-    full(&t).await;
-    let first = first.elapsed();
+    let built = Instant::now();
+    big_board(&t, 5_000, events).await;
+    let built = built.elapsed();
+    let first = time_full(&t).await;
     let mut runs: Vec<Duration> = Vec::new();
     for _ in 0..30 {
-        let at = Instant::now();
-        full(&t).await;
-        runs.push(at.elapsed());
+        runs.push(time_full(&t).await);
     }
     runs.sort();
     let median = runs[runs.len() / 2];
     let max = runs[runs.len() - 1];
-    println!("full snapshot: first {first:?}, median {median:?}, max {max:?}");
-    assert!(median < Duration::from_millis(50), "median {median:?}");
+    println!(
+        "{events} events (built in {built:?}): full snapshot first {first:?}, \
+         median {median:?}, max {max:?}"
+    );
+    assert!(median < budget, "median {median:?}");
 }
 
 /// The query plan of `sql`, one step per line.
@@ -156,6 +177,17 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
         &latest_events_sql("seq <= :seq AND (board = :board OR board IS NULL) AND actor != :me"),
     );
     assert!(both.contains("TEMP B-TREE"), "{both}");
+
+    // Alerts: the seq range between the cursor (or the window's start) and `seq`, not each
+    // watched type's whole history along `events_type`.
+    for sql in [&*ALERT_EVENTS, &*ALERTS_LEFT] {
+        let p = plan(&t, sql);
+        assert!(
+            p.starts_with("SEARCH events USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+            "{p}"
+        );
+        assert!(!p.contains("events_type"), "{p}");
+    }
 
     // Blockers of a batch: a primary-key search per task, no scan of task_blockers. Only
     // the batch's own blocker rows are sorted.
