@@ -15,7 +15,7 @@ use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, T
 use crate::snapshot::{
     ALERT_EVENTS, ALERTS_LEFT, RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates,
 };
-use crate::store::{BATCH_BLOCKERS, latest_events_sql};
+use crate::store::{BATCH_BLOCKERS, BATCH_CHILD_COUNTS, latest_events_sql};
 
 const ME: &str = "t3:me";
 const PEERS: usize = 20;
@@ -219,6 +219,12 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
     let p = plan(&t, "SELECT id FROM tasks WHERE parent = ?1");
     assert!(p.contains("USING INDEX tasks_parent"), "{p}");
 
+    // Child counts of a batch, as every task read fills them in: along the same index, no
+    // scan of tasks.
+    let p = plan(&t, BATCH_CHILD_COUNTS);
+    assert!(p.contains("USING COVERING INDEX tasks_parent"), "{p}");
+    assert!(!p.contains("SCAN tasks"), "{p}");
+
     // Delegated threads: the expression index, not a scan of agents per step.
     for sql in [DELEGATION_FAMILY, DELEGATE_AT_WORK] {
         let p = plan(&t, sql);
@@ -248,6 +254,23 @@ async fn a_telegram_reply_searches_asks_by_chat_and_message() {
     let p = plan(&t, BY_TELEGRAM_MESSAGE);
     assert!(p.contains("INDEX asks_telegram_message"), "{p}");
     assert!(!p.contains("SCAN"), "{p}");
+}
+
+/// touch() finds the caller's device peers along `agents_device`, not by scanning every
+/// agent ever registered, once per touched path.
+#[tokio::test]
+async fn touch_peer_lookups_search_agents_by_device() {
+    use crate::ops::leases::{OVERLAP_TOUCHES, PEER_SCANS_DROP, PEER_WROTE};
+    let t = T::new();
+    big_board(&t, 30, 30).await;
+    for sql in [&*PEER_WROTE, &*PEER_SCANS_DROP, &*OVERLAP_TOUCHES] {
+        let p = plan(&t, sql);
+        assert!(
+            p.contains("SEARCH agents USING INDEX agents_device"),
+            "{sql}:\n{p}"
+        );
+        assert!(!p.contains("SCAN agents"), "{sql}:\n{p}");
+    }
 }
 
 /// The two-query recent() picks the same events, in the same order, as the one query it

@@ -54,3 +54,17 @@ describe("formatDay", () => {
     expect(formatDay("2026-11-22T11:47:00Z", now)).not.toMatch(/:/);
   });
 });
+
+describe("an umbrella task's row", () => {
+  test("links its child count to the list narrowed to its children", async () => {
+    const item = await row({ ...base, id: "factory-12", board: "factory", child_count: 6 });
+    const children = item.querySelector("[data-dependency=children]");
+    expect(children?.textContent).toBe("6 subtasks");
+    expect(children?.getAttribute("href")).toBe("/boards/factory?parent=factory-12");
+  });
+
+  test("a task without children has no such link", async () => {
+    const item = await row({ ...base, child_count: 0 });
+    expect(item.querySelector("[data-dependency=children]")).toBeNull();
+  });
+});

@@ -181,6 +181,7 @@ fn note_server_build(headers: &reqwest::header::HeaderMap) {
 /// side by the order stamps and what picks up the newer build. `installed` gives the commit
 /// of the board installed at this process's path; it is asked only when the client is older.
 /// Without both stamps, or with equal ones, the order is unknown and the warning says so.
+/// Every variant ends with [`SKEW_NO_REPORT`].
 pub fn skew_warning(
     server: &Build,
     client: &Build,
@@ -195,7 +196,7 @@ pub fn skew_warning(
         (Some(server), Some(client)) => server.cmp(&client),
         _ => std::cmp::Ordering::Equal,
     };
-    match order {
+    let warning = match order {
         std::cmp::Ordering::Greater => {
             let next = match installed() {
                 Some(commit) if commit == server.commit => format!(
@@ -228,10 +229,15 @@ pub fn skew_warning(
         std::cmp::Ordering::Equal => format!(
             "the board server runs {server_build} but this client is {client_build}: upgrade \
              the older one (docs/DEPLOY.md), then restart any session whose MCP server started \
-             before the upgrade"
+             before the upgrade."
         ),
-    }
+    };
+    format!("{warning} {SKEW_NO_REPORT}")
 }
+
+/// The end of every skew warning: agents report setup friction as feedback, and this
+/// warning is not friction.
+const SKEW_NO_REPORT: &str = "This is expected during an upgrade, so no feedback report is needed.";
 
 /// How long the installed board may take to print its version.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -362,6 +368,9 @@ pub struct TaskQuery {
     pub proposal: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mine: Option<bool>,
+    /// Only the direct children of this task; servers before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -775,6 +784,15 @@ impl Client {
         if let Some(want) = q.proposal {
             tasks.retain(|t| t.is_pending_proposal() == want);
         }
+        // Servers that predate the `parent` filter ignore it. Trimming their list here would
+        // miss children past its limit, so say so instead.
+        if let Some(parent) = &q.parent
+            && tasks.iter().any(|t| t.parent.as_ref() != Some(parent))
+        {
+            anyhow::bail!(
+                "the server does not filter by parent yet; upgrade it, or run `board show {parent}` (MCP: task_show) for its children"
+            );
+        }
         Ok(tasks)
     }
 
@@ -1053,6 +1071,8 @@ mod tests {
 
     const OLD: &str = "0123456789ab";
     const NEW: &str = "fedcba987654";
+    /// The sentence that ends every skew warning.
+    const NO_REPORT: &str = "This is expected during an upgrade, so no feedback report is needed.";
 
     #[test]
     fn each_new_server_build_that_differs_warns_once() {
@@ -1138,7 +1158,7 @@ mod tests {
             warn(Some(NEW)),
             format!(
                 "{older}The server's build is already installed on this device: restarting \
-                 this session picks it up."
+                 this session picks it up. {NO_REPORT}"
             )
         );
         // The device still has this build.
@@ -1146,7 +1166,8 @@ mod tests {
             warn(Some(OLD)),
             format!(
                 "{older}This device is not upgraded yet: the device upgrade (deploy/upgrade.sh, \
-                 run by whoever deploys) installs the new build; nothing is needed from you."
+                 run by whoever deploys) installs the new build; nothing is needed from you. \
+                 {NO_REPORT}"
             )
         );
         // Yet another build installed, or none readable.
@@ -1154,14 +1175,14 @@ mod tests {
             warn(Some("0a0a0a0a0a0a")),
             format!(
                 "{older}Build 0a0a0a0a0a0a is installed on this device; restarting this session \
-                 runs it."
+                 runs it. {NO_REPORT}"
             )
         );
         assert_eq!(
             warn(None),
             format!(
                 "{older}Once this device is upgraded (deploy/upgrade.sh), restarting this session \
-                 picks up the new build."
+                 picks up the new build. {NO_REPORT}"
             )
         );
     }
@@ -1175,7 +1196,7 @@ mod tests {
             format!(
                 "this board watch daemon, 0.1.0 ({OLD}), is older than the board server, 0.1.0 \
                  ({NEW}); calls still work, so keep working. The server's build is already \
-                 installed on this device: restarting board watch picks it up."
+                 installed on this device: restarting board watch picks it up. {NO_REPORT}"
             )
         );
     }
@@ -1187,7 +1208,7 @@ mod tests {
             format!(
                 "the board server, 0.1.0 ({server_commit}), is older than this session's board, \
                  0.1.0 ({NEW}): whoever deploys should upgrade the server (docs/DEPLOY.md). \
-                 Until then, calls new in this build may fail."
+                 Until then, calls new in this build may fail. {NO_REPORT}"
             )
         };
         // By its stamp, or by sending none (it predates stamps).
@@ -1217,7 +1238,7 @@ mod tests {
                 format!(
                     "the board server runs 0.1.0 ({NEW}) but this client is 0.1.0 ({OLD}): \
                      upgrade the older one (docs/DEPLOY.md), then restart any session whose \
-                     MCP server started before the upgrade"
+                     MCP server started before the upgrade. {NO_REPORT}"
                 )
             );
         }

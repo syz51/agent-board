@@ -1262,6 +1262,7 @@ fn mark_done(e: &Env, id: &str, agent: Option<&str>) {
         evidence: vec![],
         blocks: vec![],
         children: vec![],
+        child_tasks: vec![],
         history: vec![],
         handles: Default::default(),
     };

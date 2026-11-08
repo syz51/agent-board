@@ -244,7 +244,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         if parent.board() != req.board {
             return Err(invalid(
                 format!("parent {parent} is on another board"),
-                "a parent must be on the same board",
+                "a parent must be on the same board; for a task on another board, name it in the body, or make that task wait for this one by adding this one to its blockers",
             ));
         }
         if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [parent.as_str()])? {
@@ -651,6 +651,8 @@ pub(crate) struct TaskFilter {
     pub ready: Option<bool>,
     /// Only pending proposals (true), or none of them (false).
     pub proposal: Option<bool>,
+    /// Only the direct children of this task.
+    pub parent: Option<TaskId>,
     pub limit: usize,
 }
 
@@ -676,6 +678,11 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     if let Some(owner) = &owner {
         clauses.push("t.owner = :owner");
         params.push((":owner", owner));
+    }
+    let parent = filter.parent.as_ref().map(TaskId::as_str);
+    if let Some(parent) = &parent {
+        clauses.push("t.parent = :parent");
+        params.push((":parent", parent));
     }
     // The same test as `Task::ready`, so the limit applies in SQL.
     let ready = match filter.ready {
