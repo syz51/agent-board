@@ -431,6 +431,39 @@ settings in use, warned once per edit.
   or reads an unknown format backs off like a failed send and sends nothing, so a
   re-brief that arrived is not sent twice. One that answers that T3 does not know the
   thread makes the next reconcile ask whether the thread is gone.
+- **Fresh sessions**: a coordinator thread runs one Claude session for days; it
+  auto-compacts about hourly, its calls carry ~170K tokens, and each compaction summary
+  carries old chat-only state forward. T3 can start a new Claude session in the same
+  thread (`t3_thread_send` with `freshContext: true`), which keeps the thread, the agent
+  id, its asks, children and pull request watches. `t3 thread send` cannot pass that flag
+  yet, so the daemon only says when one is due, and the coordinator sends it to itself at
+  a safe point (`prompts/coordinator.md`, Fresh sessions). The daemon keeps, per
+  coordinator, the thread's `runCount` from the reconcile's `t3 thread show`, and the count
+  at the last notice (the first count read starts it). Once the thread has run
+  `FRESH_SESSION_RUNS` (10) more times, the flush that is about to send the coordinator a
+  wake-up first reads the thread's 100 latest messages, within the flush's check, so a
+  read cut short keeps the wake-up queued. A user message is one that does not start with
+  `board <slug>:`, the coordinator prompt's title (the daemon's own brief), `Delegated
+  task`, `Update on pull request` or `Background task completed`, and is not `/compact`
+  (T3's idle compaction). T3's CLI gives messages no time and no sender, so the daemon
+  records the newest user message by a digest of its run id and text (never the text)
+  with the time it first saw it, and holds the notice while that is under `USER_QUIET`
+  (60 minutes) old, without reading again meanwhile. Otherwise that wake-up ends with the
+  line `board <slug>: a fresh session is due …`, and the count starts again from the last
+  one read: a coordinator that cannot rotate then (it owns a task in doing, runs
+  background work, or the user is talking with it) hears again `FRESH_SESSION_RUNS` runs
+  later. A read that fails sends the wake-up without the notice, and a failed send leaves
+  the notice for the retry. A message another agent sent the thread looks like the
+  user's, which only delays the notice. The coordinator writes its
+  state to the board first: its handoff, a thread link on each dispatched task, and a
+  `decision` note for each instruction the user gave in chat. The user's board-wide
+  decisions go on one `dropped` task per board, `Board decisions from the user`, named in
+  the coordinator's handoff. The fresh session's first message runs `board brief <slug>`,
+  which prints the standing prompt the daemon briefs with on that device (the triage
+  prompt added on the feedback board), from the same source. The interval is a tuned
+  value with a revisit. Rejected: a new thread (it changes the agent id, and breaks asks,
+  owned tasks, children and pull request watches), and a lower compaction threshold (it
+  keeps the summary drift).
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live

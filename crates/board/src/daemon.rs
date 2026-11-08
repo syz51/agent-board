@@ -13,6 +13,9 @@
 //!   server announces it has been away from it (`idle_doing`), or the coordinator when no
 //!   device can wake that owner, and the asker (worker or coordinator) when its ask is
 //!   answered, or the coordinator when the asker cannot be woken;
+//! - adds to a coordinator's wake-up that a fresh session is due, once its thread has run
+//!   [`FRESH_SESSION_RUNS`] times since the last notice and no user message is recent
+//!   (see [`FreshSession`]);
 //! - never wakes a paused agent before its `paused_until`;
 //! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
 //!   session left idle, which marks its agent ended, and a message resumes the thread. One
@@ -76,6 +79,14 @@ const FLUSH_CHECKS_AT_ONCE: usize = 8;
 /// How many delegations up [`Daemon::delegated_by`] follows, as deep as the server's
 /// delegation family goes, so a cycle of `t3_parent` ids ends.
 const DELEGATION_DEPTH: usize = 8;
+
+/// A coordinator's next wake-up says a fresh session is due once its thread has run this
+/// many more times than when the last one said so (T3's `runCount`). A tuned value, with a
+/// revisit on the board.
+pub const FRESH_SESSION_RUNS: u64 = 10;
+/// No wake-up says a fresh session is due while the coordinator's thread has a user message
+/// the daemon first saw less than this long ago: the user may be talking to it.
+pub const USER_QUIET: TimeDelta = TimeDelta::minutes(60);
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
@@ -415,6 +426,15 @@ struct Outgoing {
     /// The re-briefs held while the coordinator's boards were idle, sent in front of the
     /// wake-up lines.
     rebriefs: Vec<HeldRebrief>,
+    /// The boards whose coordinator this message tells that a fresh session is due.
+    fresh: Vec<FreshMark>,
+}
+
+/// A fresh-session line that goes out with a wake-up: the coordinator's board, and its
+/// [`FreshSession::since`] before, restored if the send fails.
+struct FreshMark {
+    slug: BoardSlug,
+    since_before: Option<u64>,
 }
 
 /// A re-brief that goes out with a wake-up: the coordinator's board, whether the prompt
@@ -636,6 +656,124 @@ pub struct Coordinator {
     /// sends it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebrief_unsure: Option<UnsureRebrief>,
+    /// What tells the coordinator when a fresh session is due.
+    #[serde(default, skip_serializing_if = "FreshSession::is_empty")]
+    pub fresh: FreshSession,
+}
+
+/// When a coordinator's next wake-up says a fresh session is due: a new Claude session in
+/// the same thread, which the coordinator starts itself at a safe point (see
+/// `prompts/coordinator.md`, Fresh sessions). A candidate once the thread has run
+/// [`FRESH_SESSION_RUNS`] times since [`Self::since`] and no user message seen there is
+/// younger than [`USER_QUIET`]; the flush that would carry the notice reads the thread's
+/// messages first, and a user message new to the daemon holds it. T3 gives messages no
+/// time, so a user message counts from when the daemon first saw it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FreshSession {
+    /// The thread's `runCount` when a wake-up last said a fresh session was due, or when
+    /// the daemon first read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+    /// Its `runCount` as last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs: Option<u64>,
+    /// The newest user message seen in the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message: Option<SeenMessage>,
+}
+
+/// A user message, by [`message_key`], and when the daemon first saw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeenMessage {
+    pub key: String,
+    pub seen_at: Timestamp,
+}
+
+impl FreshSession {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Records the thread's `runCount`, as T3 just gave it. The first one starts the count,
+    /// and so does one lower than where it started.
+    pub fn observe(&mut self, runs: u64) {
+        self.runs = Some(runs);
+        if self.since.is_none_or(|since| runs < since) {
+            self.since = Some(runs);
+        }
+    }
+
+    /// Whether the next wake-up may say a fresh session is due, once a read of the thread's
+    /// messages finds no new user message: it has run [`FRESH_SESSION_RUNS`] times since
+    /// [`Self::since`], and no user message seen holds it.
+    pub fn due(&self, now: Timestamp) -> bool {
+        let reached = matches!(
+            (self.since, self.runs),
+            (Some(since), Some(runs)) if runs.saturating_sub(since) >= FRESH_SESSION_RUNS
+        );
+        let held = self
+            .user_message
+            .as_ref()
+            .is_some_and(|m| now - m.seen_at < USER_QUIET);
+        reached && !held
+    }
+
+    /// Records a read of the thread's messages at `now`: `newest_user` is the
+    /// [`message_key`] of the newest user message among them ([`is_user_message`]), if any.
+    /// One the daemon has not seen before holds the notice for [`USER_QUIET`].
+    pub fn note_read(&mut self, newest_user: Option<String>, now: Timestamp) {
+        if let Some(key) = newest_user
+            && self.user_message.as_ref().is_none_or(|m| m.key != key)
+        {
+            self.user_message = Some(SeenMessage { key, seen_at: now });
+        }
+    }
+}
+
+/// Names a user message without keeping its text: a digest of the run it started and its
+/// text, so a message steered into a run already named by another still counts as new.
+pub fn message_key(message: &crate::t3::UserMessage) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(message.run.as_deref().unwrap_or_default());
+    hash.update([0]);
+    hash.update(&message.text);
+    crate::config::hex(&hash.finalize())[..16].to_owned()
+}
+
+/// Whether `text`, a user message of a coordinator thread, is from the user: not a board
+/// message (`board <slug>: …`), the daemon's own brief (it starts with the coordinator
+/// prompt's title), a delegated child's report (`Delegated task …`), a pull request update
+/// (`Update on pull request …`), or a turn T3 starts itself (`/compact` on an idle
+/// thread, `Background task completed.`). Other agents' `t3_thread_send` messages look
+/// like the user's: T3's CLI names no sender.
+pub fn is_user_message(text: &str) -> bool {
+    let from_board = text
+        .strip_prefix("board ")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(slug, _)| slug.parse::<BoardSlug>().is_ok());
+    let brief_title = COORDINATOR_PROMPT.lines().next().unwrap_or_default();
+    !from_board
+        && !text.starts_with(brief_title)
+        && !text.starts_with("Delegated task")
+        && !text.starts_with("Update on pull request")
+        && !text.starts_with("Background task completed")
+        && text.trim() != "/compact"
+}
+
+/// The line that tells the coordinator of `slug` that a fresh session is due.
+pub fn fresh_session_line(slug: &BoardSlug) -> String {
+    format!(
+        "board {slug}: a fresh session is due. When your loop is done, follow \"Fresh sessions\" in your instructions."
+    )
+}
+
+/// The message a coordinator sends its own thread, with `freshContext`, to start a fresh
+/// session.
+pub fn fresh_session_message(slug: &BoardSlug) -> String {
+    format!(
+        "board {slug}: fresh session. Run `board brief {slug}` and follow what it prints, then call board_snapshot."
+    )
 }
 
 impl Coordinator {
@@ -657,6 +795,7 @@ impl Coordinator {
             briefed,
             rebrief_backoff: None,
             rebrief_unsure: None,
+            fresh: FreshSession::default(),
         }
     }
 }
@@ -745,9 +884,16 @@ struct StartFailure {
     retry_at: Timestamp,
 }
 
-/// What T3 said of a thread: `None` when it cannot run it; else the folder it runs it in,
-/// when known.
-type RunsIn = Option<Option<PathBuf>>;
+/// What T3 said of a thread: `None` when it cannot run it.
+type RunsIn = Option<Runnable>;
+
+/// A thread T3 can run.
+struct Runnable {
+    /// The folder T3 runs it in, when known.
+    folder: Option<PathBuf>,
+    /// Its `runCount`, when T3 gave it.
+    runs: Option<u64>,
+}
 
 /// How a coordinator thread's last check went, when it spares the next ones for
 /// [`THREAD_RECHECK`].
@@ -989,9 +1135,15 @@ impl<T: T3> Daemon<T> {
         answers.sort_by_key(|(i, _)| *i);
         for ((slug, thread, _), (_, answer)) in ask.into_iter().zip(answers) {
             let answer = answer.map(|answer| match answer {
-                Ok(Some(folder)) => {
+                Ok(Some(live)) => {
+                    if let Some(runs) = live.runs
+                        && let Some(local) = self.state.coordinators.get_mut(&slug)
+                        && local.thread == thread
+                    {
+                        local.fresh.observe(runs);
+                    }
                     self.last_checks
-                        .insert(thread, (LastCheck::Live(folder), now));
+                        .insert(thread, (LastCheck::Live(live.folder), now));
                     Ok(true)
                 }
                 Ok(None) => {
@@ -1031,9 +1183,10 @@ impl<T: T3> Daemon<T> {
     async fn thread_runs_in(&self, thread: &str, project: Option<&Path>) -> Result<RunsIn> {
         let limit = self.timing.thread_check;
         match tokio::time::timeout(limit, self.t3.thread_info(thread)).await {
-            Ok(info) => Ok(info?
-                .filter(|t| t.runnable(project))
-                .map(|t| t.folder(project).map(Path::to_path_buf))),
+            Ok(info) => Ok(info?.filter(|t| t.runnable(project)).map(|t| Runnable {
+                folder: t.folder(project).map(Path::to_path_buf),
+                runs: t.runs,
+            })),
             Err(_) => Err(TimedOut(format!("t3 thread show {thread}")).into()),
         }
     }
@@ -1142,9 +1295,9 @@ impl<T: T3> Daemon<T> {
                         && load_adoption(&self.ctx.home, slug).is_none() =>
                 {
                     let thread = agent.native().to_owned();
-                    if let Some(folder) = self.thread_runs_in(&thread, project.as_deref()).await? {
+                    if let Some(live) = self.thread_runs_in(&thread, project.as_deref()).await? {
                         self.last_checks
-                            .insert(thread.clone(), (LastCheck::Live(folder), now));
+                            .insert(thread.clone(), (LastCheck::Live(live.folder), now));
                         // What it was briefed with is unknown: briefed again, once.
                         let local = Coordinator::new(thread, agent.clone(), now, true, None);
                         return self.adopt(board, local, now).await;
@@ -1283,6 +1436,70 @@ impl<T: T3> Daemon<T> {
         Ok(())
     }
 
+    /// `thread`'s [`crate::t3::RECENT_MESSAGES`] latest messages, read within
+    /// [`Timing::thread_check`]; `None` when T3 does not know the thread.
+    async fn read_messages(&self, thread: &str) -> Result<Option<crate::t3::RecentMessages>> {
+        tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
+            .await
+            .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()))
+    }
+
+    /// The [`message_key`] of the newest user message in `agent`'s thread
+    /// ([`is_user_message`]), when a coordinator record of `agent` here has a fresh session
+    /// [`FreshSession::due`]: `None` when none has, so nothing is read.
+    async fn fresh_read(&self, agent: &AgentId, now: Timestamp) -> Option<Result<Option<String>>> {
+        let due = self
+            .state
+            .coordinators
+            .values()
+            .any(|local| local.agent == *agent && local.fresh.due(now));
+        if !due {
+            return None;
+        }
+        let read = match self.read_messages(agent.native()).await {
+            Ok(Some(recent)) => Ok(recent
+                .user
+                .iter()
+                .rev()
+                .find(|m| is_user_message(&m.text))
+                .map(message_key)),
+            Ok(None) => Err(anyhow::anyhow!(
+                "T3 does not know thread {}",
+                agent.native()
+            )),
+            Err(err) => Err(err),
+        };
+        Some(read)
+    }
+
+    /// Records `read`, a [`Self::fresh_read`] of `agent`'s thread, on each coordinator
+    /// record of `agent` whose fresh session is due, and returns whether the read worked:
+    /// one that failed says nothing of the user, so no notice goes with this wake-up.
+    fn note_fresh_read(
+        &mut self,
+        agent: &AgentId,
+        read: Option<Result<Option<String>>>,
+        now: Timestamp,
+    ) -> bool {
+        match read {
+            None => false,
+            Some(Ok(newest)) => {
+                for local in self.state.coordinators.values_mut() {
+                    if local.agent == *agent && local.fresh.due(now) {
+                        local.fresh.note_read(newest.clone(), now);
+                    }
+                }
+                true
+            }
+            Some(Err(err)) => {
+                tracing::warn!(
+                    "waking {agent}: reading its thread for a fresh session: {err:#}; no notice this time"
+                );
+                false
+            }
+        }
+    }
+
     /// Sends a live coordinator the standing prompt again when it changed since the thread
     /// was briefed (`board` was upgraded, or `feedback_board` changed), once. Held while the
     /// coordinator is paused, or runs and was seen within [`WAKE_HOLD_MAX`], so it lands
@@ -1390,10 +1607,7 @@ impl<T: T3> Daemon<T> {
     /// missing only when T3 has no run of the thread active or queued, which might still
     /// take the message.
     async fn rebrief_arrival(&self, thread: &str, slug: &BoardSlug, triage: bool) -> Arrival {
-        let read = tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
-            .await
-            .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()));
-        let recent = match read {
+        let recent = match self.read_messages(thread).await {
             Ok(Some(recent)) => recent,
             Ok(None) => {
                 return Arrival::Unknown {
@@ -1409,6 +1623,7 @@ impl<T: T3> Daemon<T> {
             .user
             .iter()
             .rev()
+            .map(|m| &m.text)
             .find(|text| text.contains("(re-brief ") && text.contains(&any_marker));
         if newest.is_some_and(|text| text.contains(&marker)) {
             Arrival::Found
@@ -1442,6 +1657,21 @@ impl<T: T3> Daemon<T> {
                         unsure_before,
                     }
                 })
+            })
+            .collect()
+    }
+
+    /// The boards this device hosts `agent` as coordinator of whose [`FreshSession`] is due,
+    /// each restarted from its last `runCount` at once, so a flush cut short while sending
+    /// does not say it twice.
+    fn take_fresh_marks(&mut self, agent: &AgentId, now: Timestamp) -> Vec<FreshMark> {
+        self.state
+            .coordinators
+            .iter_mut()
+            .filter(|(_, local)| local.agent == *agent && local.fresh.due(now))
+            .map(|(slug, local)| FreshMark {
+                slug: slug.clone(),
+                since_before: std::mem::replace(&mut local.fresh.since, local.fresh.runs),
             })
             .collect()
     }
@@ -2032,18 +2262,31 @@ impl<T: T3> Daemon<T> {
             .map(|(agent, queue)| (agent.clone(), queue.clone()))
             .collect();
         let this = &*self;
-        let checked: Vec<Checked> =
+        let checked: Vec<(Checked, Option<Result<Option<String>>>)> =
             futures_util::stream::iter(queues.iter().map(|(agent, queue)| async move {
-                tokio::time::timeout_at(deadline, this.check(agent, queue, now))
-                    .await
-                    .unwrap_or(Checked::NotReached)
+                tokio::time::timeout_at(deadline, async {
+                    let checked = this.check(agent, queue, now).await;
+                    // Read only for a message about to go out.
+                    let fresh = match &checked {
+                        Checked::Known {
+                            rechecks: Some(lines),
+                            ..
+                        } if lines.iter().any(|l| matches!(l, Ok(Some(_)))) => {
+                            this.fresh_read(agent, now).await
+                        }
+                        _ => None,
+                    };
+                    (checked, fresh)
+                })
+                .await
+                .unwrap_or((Checked::NotReached, None))
             }))
             .buffered(FLUSH_CHECKS_AT_ONCE)
             .collect()
             .await;
         let late = checked
             .iter()
-            .filter(|c| matches!(c, Checked::NotReached))
+            .filter(|(c, _)| matches!(c, Checked::NotReached))
             .count();
         if late > 0 {
             tracing::warn!(
@@ -2052,7 +2295,8 @@ impl<T: T3> Daemon<T> {
             );
         }
         let mut outgoing = Vec::new();
-        for ((agent, queue), checked) in queues.into_iter().zip(checked) {
+        for ((agent, queue), (checked, fresh)) in queues.into_iter().zip(checked) {
+            let fresh_read = self.note_fresh_read(&agent, fresh, now);
             if let Some(mut out) = self.apply(agent, queue, checked, now) {
                 out.rebriefs = self.take_owed_rebriefs(&out.agent, now);
                 for held in out.rebriefs.iter().rev() {
@@ -2061,6 +2305,12 @@ impl<T: T3> Daemon<T> {
                         rebrief_message(&held.slug, held.triage),
                         out.message
                     );
+                }
+                if fresh_read {
+                    out.fresh = self.take_fresh_marks(&out.agent, now);
+                }
+                for mark in &out.fresh {
+                    out.message = format!("{}\n{}", out.message, fresh_session_line(&mark.slug));
                 }
                 outgoing.push(out);
             }
@@ -2308,6 +2558,7 @@ impl<T: T3> Daemon<T> {
             wakes: sent,
             backoff,
             rebriefs: Vec::new(),
+            fresh: Vec::new(),
         })
     }
 
@@ -2415,6 +2666,19 @@ impl<T: T3> Daemon<T> {
                 Sent::Gone(_) | Sent::Failed(_) => {
                     local.briefed = held.before;
                     local.rebrief_unsure = held.unsure_before;
+                }
+            }
+        }
+        // A failed send leaves the fresh session due, for the retry.
+        if matches!(sent, Sent::Gone(_) | Sent::Failed(_)) {
+            for mark in out.fresh {
+                if let Some(local) = self
+                    .state
+                    .coordinators
+                    .get_mut(&mark.slug)
+                    .filter(|c| c.agent == agent)
+                {
+                    local.fresh.since = mark.since_before;
                 }
             }
         }
@@ -2809,10 +3073,10 @@ pub fn prompt_digest(triage: bool) -> &'static str {
 /// The message that gives a running coordinator its changed standing prompt in full,
 /// ending with its [`rebrief_marker`].
 pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
-    let prompt = standing_prompt(triage);
+    let brief = brief(slug, triage);
     let marker = rebrief_marker(slug, triage);
     format!(
-        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot.\n{marker}"
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop: call board_snapshot.\n{marker}"
     )
 }
 
@@ -2825,10 +3089,17 @@ pub fn rebrief_marker(slug: &BoardSlug, triage: bool) -> String {
     )
 }
 
+/// The standing prompt the coordinator of `slug` is briefed with, naming the board;
+/// `triage` for the device's feedback board. `board brief <slug>` prints it, for a fresh
+/// session in the same thread.
+pub fn brief(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
+    format!("{prompt}\nYou are the coordinator of board {slug}.")
+}
+
 /// The first message of a coordinator thread; `triage` for the device's feedback board.
 pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
-    let prompt = standing_prompt(triage);
-    format!("{prompt}\nYou are the coordinator of board {slug}. Start now: call board_snapshot.")
+    format!("{} Start now: call board_snapshot.", brief(slug, triage))
 }
 
 /// The message that briefs an existing thread adopted as a board's coordinator; `triage`
