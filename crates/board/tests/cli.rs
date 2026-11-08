@@ -562,6 +562,45 @@ fn board_create_and_update_carry_autopilot_and_home_devices() {
 }
 
 #[test]
+fn parallel_tasks_are_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.parallel_tasks = 2;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["parallel_tasks"], 2);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · 2 tasks at once"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Out of range never reaches the server.
+    for value in ["0", "5"] {
+        let out = e.run(&["board", "update", "factory", "--parallel-tasks", value]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    }
+    assert_eq!(e.stub.requests_to("PATCH /v1/boards/factory").len(), 1);
+
+    // A server that predates the setting answers without it: the user is told.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("parallel_tasks");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored parallel_tasks=2")
+            && err.contains("board board update factory --parallel-tasks 2"),
+        "{err}"
+    );
+}
+
+#[test]
 fn temporary_boards_are_created_marked_and_deleted() {
     let e = env();
     let mut scratch = board_fixture("scratch", &[]);

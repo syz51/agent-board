@@ -293,13 +293,31 @@ settings in use, warned once per edit.
   adoption newer than the last failed start is tried at once. An adopted thread that T3 no
   longer has, or has archived, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
-- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
-  or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
-  briefs so the children claim them; review the result against the acceptance checks; mark
-  done with evidence; repeat. One task at a time per project, as a person would. When it
-  needs the user it creates an ask and moves on to other ready work. When nothing is ready
-  it stops, after a goal review when the board has a goal and the last task it finished has
-  no `review:` note.
+- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
+  delegate it to a child thread (T3 `delegate_task`, in its own worktree), naming the task
+  id in the brief so the child claims it and owns it through PR, merge and `task_done`;
+  review the result against the acceptance checks when the child reports; repeat. The
+  coordinator does a task itself only when it changes no repository files (a verdict, an
+  investigation, an ask) or a child failed it twice, so its context stays small and it
+  keeps answering alerts and proposals while children work. When it needs the user it
+  creates an ask and moves on to other ready work. When nothing is ready it stops, after a
+  goal review when the board has a goal and the last task it finished has no `review:`
+  note.
+- **Parallel tasks**: the board's `parallel_tasks` (1 to 4, default 1) is how many tasks
+  the coordinator and its children may have in progress at once: in `doing`, or dispatched
+  to a child that has not claimed it yet; a task parked in `review`, `blocked` or `open`
+  does not count. The coordinator keeps to it; the server stores and shows it but does not
+  refuse claims over it, since it cannot tell a coordinator's children from other agents
+  on the board. The coordinator's snapshot shows it on the `you:` line (`coordinator, up
+  to 2 tasks at once`), and the prompt reads a missing line as 1. Only the user raises it, since every agent
+  shares one usage limit; anyone may lower it. Beside a task in progress, another starts
+  only when neither waits on the other, its likely files miss the in-flight leases, it does
+  not change the same kind of widely shared file (design and API docs, wire types,
+  migrations, shared styles), it is not size L and needs no ask, and no agent of the
+  coordinator's stopped on a usage limit since the tasks in progress started. A child whose
+  lease overlaps another task in progress stops and leaves its task `open`. PRs merge by
+  the repository's own rules. A raise pays when, per board, wait drops and throughput
+  rises while merge cost per PR and rework stay within 20% of the week before.
 - **Triage**: the feedback board's coordinator routes its items rather than doing them:
   for each ready item it reads the reports and resolves it as a duplicate of an earlier
   item, routed to a new task on the owner's board (done once the fix is deployed where
@@ -521,6 +539,7 @@ keeping untrusted text out of those channels, so:
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  the board's coordinator finds its `parallel_tasks` limit at the end of `you`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
