@@ -523,7 +523,8 @@ fn add_report(
     )?;
     record_report(cx, item, reporter)?;
     // The count is not a field anyone edits: it leaves the version alone, so an owner's
-    // update does not conflict with reports, and is announced with the hourly note.
+    // update does not conflict with reports, and is announced with the hourly note. Only
+    // the report that sends a declined item back to triage changes the task itself.
     let board = item.board();
     if note {
         cx.db.execute(
@@ -562,7 +563,103 @@ fn add_report(
             serde_json::json!({ "fields": ["feedback"], "reports": reports }),
         )?;
     }
+    if kind.as_deref() == Some("declined") {
+        reopen_declined(cx, item, reporter, actor)?;
+    }
     get_task(cx, item)
+}
+
+/// Sends a declined item back to triage once agents keep reporting it: declined at least
+/// `declined_reopen_after_days` ago, with `declined_reopen_reports` reports since then from
+/// `declined_reopen_agents` agents that had not reported it before. It moves to `open`,
+/// unowned and unresolved, with a note giving the counts since the decline. Every report
+/// is a row of `feedback_reports`, and `resolved_report` is the newest row (of any item) at
+/// the decline, so the counts do not depend on the capped `reporters` or on clock ties; a
+/// later decline starts afresh.
+fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &str) -> Result<()> {
+    let (declined_at, last_report, reason): (i64, i64, Option<String>) = cx.db.query_row(
+        "SELECT resolved_at, resolved_report, resolution_reason FROM feedback WHERE task = ?1",
+        [item.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let now = cx.now_ms();
+    if now - declined_at < cx.s.declined_reopen_ms() {
+        return Ok(());
+    }
+    // A declined item is done: resolving moves it there, and reopening clears the
+    // resolution.
+    let (owner, created_by): (Option<String>, String) = cx.db.query_row(
+        "SELECT owner, created_by FROM tasks WHERE id = ?1",
+        [item.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    // An agent counts as new when it had not reported the problem by the decline: not on
+    // this item, nor on an item resolved as its duplicate. The creator reported it first,
+    // even on an item adopted from a plain task, which has no row.
+    let (since, agents, new_agents): (u32, u32, u32) = cx.db.query_row(
+        "SELECT COUNT(*), COUNT(DISTINCT agent), COUNT(DISTINCT CASE WHEN agent <> ?3 \
+         AND agent NOT IN (SELECT agent FROM feedback_reports WHERE id <= ?2 AND (task = ?1 \
+         OR task IN (SELECT task FROM feedback WHERE resolution = 'duplicate' \
+         AND resolution_task = ?1))) \
+         THEN agent END) FROM feedback_reports WHERE task = ?1 AND id > ?2",
+        params![item.as_str(), last_report, created_by],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if since < cx.s.declined_reopen_reports || new_agents < cx.s.declined_reopen_agents {
+        return Ok(());
+    }
+    reopen(cx, item)?;
+    cx.db.execute(
+        "UPDATE tasks SET status = 'open', owner = NULL, blocked_reason = NULL, \
+         doing_since = NULL, done_at = NULL, summary = NULL, version = version + 1, \
+         updated_at = ?2 WHERE id = ?1",
+        params![item.as_str(), now],
+    )?;
+    let declined = ts(declined_at).format("%Y-%m-%d %H:%MZ");
+    let text = cut(
+        &format!(
+            "reopened: {since} reports from {agents} agents since it was declined at \
+             {declined} ({new_agents} agents new since then). Declined because: {}. Route it \
+             to the setup's owner or ask the user.",
+            reason
+                .as_deref()
+                .map_or("no reason given", |r| r.trim_end_matches('.'))
+        ),
+        cx.s.note_chars,
+    );
+    cx.db.execute(
+        "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'finding', ?3, ?4)",
+        params![item.as_str(), reporter.as_str(), text, now],
+    )?;
+    let note_id = cx.db.last_insert_rowid();
+    let board = item.board();
+    cx.emit(
+        Some(&board),
+        actor,
+        EventType::NoteAdded,
+        Some(item),
+        serde_json::json!({ "note": note_id, "kind": "finding" }),
+    )?;
+    let mut payload = serde_json::json!({
+        "fields": ["status", "feedback"],
+        "from": "done",
+        "to": "open",
+        "reopened": { "reports": since, "agents": agents, "new_agents": new_agents },
+    });
+    // As `task_update` does when the owner changes.
+    if let Some(owner) = owner {
+        payload["fields"] = serde_json::json!(["status", "feedback", "owner"]);
+        payload["owner"] = serde_json::Value::Null;
+        payload["previous_owner"] = serde_json::json!(owner);
+    }
+    cx.emit(
+        Some(&board),
+        actor,
+        EventType::TaskUpdated,
+        Some(item),
+        payload,
+    )?;
+    Ok(())
 }
 
 /// The feedback part of task `id`, if it is a feedback item.
@@ -614,7 +711,8 @@ pub(crate) fn load(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<Feedback>> {
 pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
     cx.db.execute(
         "UPDATE feedback SET resolution = NULL, resolution_task = NULL, \
-         resolution_reason = NULL, resolved_at = NULL, resolved_by = NULL WHERE task = ?1",
+         resolution_reason = NULL, resolved_at = NULL, resolved_by = NULL, \
+         resolved_report = NULL WHERE task = ?1",
         [id.as_str()],
     )?;
     Ok(())
@@ -762,7 +860,8 @@ pub(crate) fn resolve(
     }
     cx.db.execute(
         "UPDATE feedback SET resolution = ?2, resolution_task = ?3, resolution_reason = ?4, \
-         resolved_at = ?5, resolved_by = ?6 WHERE task = ?1",
+         resolved_at = ?5, resolved_by = ?6, \
+         resolved_report = (SELECT COALESCE(MAX(id), 0) FROM feedback_reports) WHERE task = ?1",
         params![
             id.as_str(),
             kind,

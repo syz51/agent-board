@@ -774,6 +774,25 @@ report, not a free-form task (`API.md`, "Feedback"):
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
   changed. A declined item stays live, so repeat reports keep counting against the
   decision; a fixed one does not, so a repeat opens a new item that recurs it.
+- **Declines that keep coming back.** A decline stands only while agents stop hitting the
+  problem. When many agents trip on intended behaviour, the rule may be right but the
+  interface or the instructions are wrong, and that is the owner's call. So the server
+  sends a declined item back to triage when all three hold (defaults in brackets):
+  - it was declined at least `declined_reopen_after_days` ago (1 day);
+  - it has gained at least `declined_reopen_reports` reports since the decline (5), from
+    any agent;
+  - at least `declined_reopen_agents` of the agents behind them are new (3): they had not
+    reported the problem before the decline, on this item, on an item resolved as its
+    duplicate, or as its creator.
+
+  The check runs on each report to a declined item, on the injected clock, so reports that
+  met the bar during the wait take effect with the next report. The item moves to `open`,
+  unowned and unresolved, with a `reopened:` finding note giving the counts since the
+  decline and its reason. Triage routes it to the setup's owner or asks the user, and
+  does not decline it again for the same reason. The server keeps the newest report row,
+  of any item, at the decline (`resolved_report`) and counts every report after it, so
+  the capped `reporters` list does not limit the count. A new decline starts a new count.
+  API.md "Defaults" lists the settings.
 - **Signals.** The server files feedback itself when agents keep hitting the same API
   error: by default 3 errors from 2 agents within 7 days with the same code, route and
   normalized message. Agents rarely report a refusal they could work around; the error log

@@ -1446,3 +1446,244 @@ async fn every_route_a_client_may_name_is_routed() {
         assert_ne!(v["message"], "no such endpoint", "{route}");
     }
 }
+
+/// Files an item reported by `agent`, claimed by it and declined; returns the item's id.
+async fn declined_item(t: &T, agent: &str, text: &Value) -> String {
+    let item = report(t, agent, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    decline(t, agent, &item).await;
+    item
+}
+
+async fn decline(t: &T, agent: &str, item: &str) {
+    assert!(t.claim(agent, item).await.0.is_success());
+    let (s, v) = resolve(
+        t,
+        Some(agent),
+        item,
+        json!({ "kind": "declined", "reason": "works as designed." }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn a_declined_item_reported_again_by_new_agents_goes_back_to_triage() {
+    let t = setup().await;
+    let (d, e) = ("t3:delta", "t3:epsilon");
+    for agent in [d, e] {
+        t.register(agent, None, None).await;
+    }
+    let text = json!({ "about": "board", "text": "Claim refused while one task is in doing" });
+    let item = declined_item(&t, A, &text).await;
+
+    // Five reports from three new agents, but the decline is not a day old yet.
+    for agent in [B, C, d, B, C] {
+        assert_eq!(report(&t, agent, text.clone()).await["duplicate"], true);
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+
+    t.advance(TimeDelta::hours(24));
+    let version = task["version"].as_i64().unwrap();
+    let since = t.count("SELECT COALESCE(MAX(seq), 0) FROM events");
+    let reopened = report(&t, A, text.clone()).await;
+    assert_eq!(reopened["duplicate"], true);
+    let task = &reopened["task"];
+    assert_eq!(task["id"], item.as_str());
+    assert_eq!(task["status"], "open", "back in triage's ready list");
+    assert!(task["owner"].is_null(), "{task}");
+    assert!(task["feedback"].get("resolution").is_none(), "{task}");
+    assert_eq!(task["version"], version + 1);
+    let noted = notes(&t, &item).await;
+    let note = noted.iter().find(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with(
+            "reopened: 6 reports from 4 agents since it was declined at \
+             2026-11-06 12:00Z (3 agents new since then). Declined because: works as designed."
+        ),
+        "{note}"
+    );
+    let types = t.event_types(since).await;
+    assert!(types.contains(&"note_added".to_owned()), "{types:?}");
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    let reopen = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_updated" && e["payload"]["to"] == "open")
+        .unwrap();
+    assert_eq!(reopen["actor"], A);
+    assert_eq!(
+        reopen["payload"],
+        json!({
+            "fields": ["status", "feedback", "owner"],
+            "from": "done",
+            "to": "open",
+            "owner": null,
+            "previous_owner": A,
+            "reopened": { "reports": 6, "agents": 4, "new_agents": 3 },
+        })
+    );
+    // The server's evidence of the decline stays, so triage knows the item.
+    assert_eq!(
+        detail["evidence"][0]["value"],
+        "feedback declined: works as designed."
+    );
+
+    // Declined again: the count starts afresh, and agents counted before are not new.
+    decline(&t, B, &item).await;
+    t.advance(TimeDelta::days(2));
+    for agent in [A, B, C, d, A] {
+        report(&t, agent, text.clone()).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done");
+    report(&t, e, text.clone()).await;
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done", "one new agent is under the bar");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+}
+
+#[tokio::test]
+async fn a_declined_item_under_the_bar_stays_declined_past_twenty_reporters() {
+    let t = setup().await;
+    let agents: Vec<String> = (0..28).map(|n| format!("t3:agent{n}")).collect();
+    for agent in &agents {
+        t.register(agent, None, None).await;
+    }
+    let text = json!({ "about": "hooks", "text": "Stop hook asks twice" });
+    let item = report(&t, &agents[0], text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 25 reporters before the decline: the item lists only the latest 20.
+    for agent in &agents[1..25] {
+        report(&t, agent, text.clone()).await;
+    }
+    let listed = t.get_task(&item).await["feedback"]["reporters"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 20);
+    assert!(!listed.as_array().unwrap().contains(&json!(agents[1])));
+    decline(&t, &agents[24], &item).await;
+    t.advance(TimeDelta::days(3));
+
+    // Agents dropped from the capped list still reported before the decline: not new.
+    for agent in &agents[1..6] {
+        report(&t, agent, text.clone()).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done");
+    // Two new agents are under the bar however many reports they add.
+    for agent in [&agents[25], &agents[26], &agents[25], &agents[26]] {
+        report(&t, agent, text.clone()).await;
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+    assert!(
+        notes(&t, &item)
+            .await
+            .iter()
+            .all(|n| !n.starts_with("reopened:"))
+    );
+
+    // The third new agent reaches it.
+    report(&t, &agents[27], text).await;
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "open");
+    let noted = notes(&t, &item).await;
+    let note = noted.iter().find(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with("reopened: 10 reports from 8 agents since it was declined at"),
+        "{note}"
+    );
+    assert!(note.contains("(3 agents new since then)"), "{note}");
+}
+
+#[tokio::test]
+async fn agents_that_reported_a_duplicate_before_the_decline_are_not_new() {
+    let t = setup().await;
+    let d = "t3:delta";
+    t.register(d, None, None).await;
+    let text = json!({ "about": "board", "text": "Leases warn without the task" });
+    let item = report(&t, A, text).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Before the decline, three agents report the same problem in other words.
+    let other = json!({ "about": "board", "text": "Lease warning names no task" });
+    let dup = report(&t, B, other.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    report(&t, C, other.clone()).await;
+    report(&t, d, other.clone()).await;
+    t.advance(TimeDelta::minutes(1));
+    decline(&t, A, &item).await;
+    assert!(t.claim(B, &dup).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &dup,
+        json!({ "kind": "duplicate", "task": item }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    t.advance(TimeDelta::days(2));
+
+    // The duplicate's reporters report again; their reports go to the declined item.
+    for agent in [B, C, d, B, C, d] {
+        assert_eq!(
+            report(&t, agent, other.clone()).await["task"]["id"],
+            item.as_str()
+        );
+    }
+    let task = t.get_task(&item).await;
+    assert_eq!(task["status"], "done");
+    assert_eq!(task["feedback"]["resolution"]["kind"], "declined");
+}
+
+#[tokio::test]
+async fn a_declined_signal_item_goes_back_to_triage_on_errors_from_new_agents() {
+    let t = setup().await;
+    let (d, e) = ("t3:delta", "t3:epsilon");
+    for agent in [d, e] {
+        t.register(agent, None, None).await;
+    }
+    let mut n = 0;
+    let mut miss = async |agent: &str| {
+        n += 1;
+        t.fail("GET", &format!("/v1/tasks/factory-{n}"), Some(agent), None)
+            .await;
+    };
+    for agent in [A, A, B] {
+        miss(agent).await;
+    }
+    let items = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let item = items[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(items[0]["feedback"]["source"], "signal");
+    decline(&t, C, &item).await;
+    t.advance(TimeDelta::days(2));
+
+    for agent in [A, B, C, d] {
+        miss(agent).await;
+    }
+    assert_eq!(t.get_task(&item).await["status"], "done", "two new agents");
+    miss(e).await;
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    assert_eq!(detail["task"]["status"], "open");
+    let reopen = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_updated" && e["payload"]["to"] == "open")
+        .unwrap();
+    assert_eq!(reopen["actor"], "server");
+    assert_eq!(
+        reopen["payload"]["reopened"],
+        json!({ "reports": 5, "agents": 5, "new_agents": 3 })
+    );
+}
