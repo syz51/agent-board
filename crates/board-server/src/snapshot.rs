@@ -139,6 +139,11 @@ struct You {
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The tasks the agent holds in `doing`, on any board.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    doing: Vec<String>,
+    /// How many tasks the agent may hold in `doing` at once (`max_doing_per_agent`).
+    doing_limit: u32,
     /// Set when the agent is the snapshot board's coordinator: how many tasks it and its
     /// child threads may have in progress at once.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -461,6 +466,8 @@ fn fill_full(
         runtime: runtime_str(agent.runtime),
         repo: agent.repo.clone(),
         branch: agent.branch.clone(),
+        doing: Vec::new(),
+        doing_limit: cx.s.max_doing_per_agent,
         parallel_tasks,
     });
     model.counts = board_counts;
@@ -473,6 +480,13 @@ fn fill_full(
         &vec![(":me", &me)],
     )?;
     mine.sort_by_key(|t| (status_rank(t.status), t.priority, t.id.number()));
+    if let Some(you) = &mut model.you {
+        you.doing = mine
+            .iter()
+            .filter(|t| t.status == TaskStatus::Doing)
+            .map(|t| t.id.to_string())
+            .collect();
+    }
     for task in &mine {
         let mut blockers = Vec::new();
         for blocker in &task.blockers {
@@ -1540,6 +1554,12 @@ fn render_lines(m: &Model) -> String {
         if let Some(branch) = &you.branch {
             parts.push(path(branch));
         }
+        let doing = if you.doing.is_empty() {
+            "none".to_owned()
+        } else {
+            you.doing.join(", ")
+        };
+        parts.push(format!("doing {doing} (limit {})", you.doing_limit));
         match you.parallel_tasks {
             Some(1) => parts.push("coordinator, one task at a time".to_owned()),
             Some(n) => parts.push(format!("coordinator, up to {n} tasks at once")),
@@ -1694,6 +1714,8 @@ fn render_yaml(m: &Model) -> String {
         if let Some(branch) = &you.branch {
             let _ = writeln!(o, "  branch: {}", q(branch));
         }
+        let _ = writeln!(o, "  doing: [{}]", you.doing.join(", "));
+        let _ = writeln!(o, "  doing_limit: {}", you.doing_limit);
         if let Some(n) = you.parallel_tasks {
             let _ = writeln!(o, "  parallel_tasks: {n}");
         }
