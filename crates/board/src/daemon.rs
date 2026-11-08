@@ -8,11 +8,16 @@
 //! - renews the coordinator lease while the thread is live;
 //! - wakes the coordinator when a task becomes ready or a blocker clears (the coordinator
 //!   of the waiting task's board, which may differ from the blocker's), the owner of a
-//!   blocked task when its last blocker is done, and the asker (worker or coordinator) when
-//!   its ask is answered, or the coordinator when the asker cannot be woken;
+//!   blocked task when its last blocker is done, the coordinator when an agent outside its
+//!   own delegation moves a task to `review`, the owner of a task in `doing` when the
+//!   server announces it has been away from it (`idle_doing`), or the coordinator when no
+//!   device can wake that owner, and the asker (worker or coordinator) when its ask is
+//!   answered, or the coordinator when the asker cannot be woken;
 //! - never wakes a paused agent before its `paused_until`;
 //! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
-//!   session left idle, which marks its agent ended, and a message resumes the thread.
+//!   session left idle, which marks its agent ended, and a message resumes the thread. One
+//!   whose session closed while it waited for a usage-limit reset keeps that reset, and
+//!   waits for it like a paused agent.
 //!
 //! Wake-ups are queued as what they are about (a task, an ask), not as text. Each flush
 //! checks them again before sending: a task no longer ready and auto drops its line. Lines
@@ -43,7 +48,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, error_code, is_unreachable};
-use crate::config::Home;
+use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut};
@@ -68,6 +73,9 @@ pub const WAKE_RETRY_MAX: TimeDelta = TimeDelta::minutes(10);
 const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many agents' wake-ups a flush checks at once.
 const FLUSH_CHECKS_AT_ONCE: usize = 8;
+/// How many delegations up [`Daemon::delegated_by`] follows, as deep as the server's
+/// delegation family goes, so a cycle of `t3_parent` ids ends.
+const DELEGATION_DEPTH: usize = 8;
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
@@ -76,6 +84,10 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// each minute costs a home device more than the check is worth. A failed send to the
 /// thread, or its agent ending, asks again on the next reconcile.
 pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
+/// An ended coordinator's lease is released once checks of its thread have failed this
+/// long, so another home device takes over while T3 is down, and one slow check does not
+/// hand the board away.
+pub const CHECK_FAIL_RELEASE: TimeDelta = TimeDelta::minutes(10);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -199,6 +211,32 @@ pub enum WakeAbout {
     /// The user answered `asker`'s ask: for the asker, or for the coordinator when the
     /// asker cannot be woken.
     Answered { ask: i64, asker: AgentId },
+    /// For the coordinator: an agent outside its own delegation moved `task` to `review`.
+    Review { task: TaskId },
+    /// The server noticed at `noticed` that `away`, the owner of `task` in `doing`, has been
+    /// away from it since `since`: for `away`, or for the coordinator when `away` cannot be
+    /// woken from any device.
+    Idle {
+        task: TaskId,
+        away: AgentId,
+        since: Timestamp,
+        noticed: Timestamp,
+    },
+}
+
+impl WakeAbout {
+    /// Its kind, as `watch.log` names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::Cleared { .. } => "cleared",
+            Self::Proposal { .. } => "proposal",
+            Self::Unblocked { .. } => "unblocked",
+            Self::Answered { .. } => "answered",
+            Self::Review { .. } => "review",
+            Self::Idle { .. } => "idle",
+        }
+    }
 }
 
 /// Each agent's queue read on its own, so one this version cannot read (a newer kind, a
@@ -338,6 +376,9 @@ impl Reach {
             // the thread unless T3 says it is gone. When T3 did not answer, the send finds out.
             AgentState::Ended => match seen.thread {
                 ThreadCheck::Gone => Self::Never(Unreachable::ThreadGone),
+                // The session closed while it waited for a usage-limit reset: the limit
+                // still holds, and a message before the reset would only stop on it again.
+                _ if agent.paused_until.is_some_and(|until| until > now) => Self::Paused,
                 ThreadCheck::NotAsked | ThreadCheck::Live | ThreadCheck::NoAnswer => Self::Now,
             },
             AgentState::Paused => match agent.paused_until {
@@ -399,9 +440,22 @@ fn is_fresh(wake: &Wake, paused_until: Option<Timestamp>, now: Timestamp) -> boo
     now - from < WAKE_TTL
 }
 
+/// Whether a wake-up about `about`, for `from`, goes to the coordinator when `from` cannot
+/// be woken: an answer to `from`'s own ask, and, when no device can wake `from` (`idle`),
+/// the notice that `from` is away from its task.
+fn passed_on(from: &AgentId, about: &WakeAbout, idle: bool) -> bool {
+    match about {
+        WakeAbout::Answered { asker, .. } => asker == from,
+        WakeAbout::Idle { away, .. } => idle && away == from,
+        _ => false,
+    }
+}
+
+/// The usage-limit reset `seen` waits for: a paused agent's, or that of one whose session
+/// ended while it waited, which the server keeps.
 fn paused_until(seen: &Seen) -> Option<Timestamp> {
     match seen.agent.state {
-        AgentState::Paused => seen.agent.paused_until,
+        AgentState::Paused | AgentState::Ended => seen.agent.paused_until,
         _ => None,
     }
 }
@@ -422,6 +476,35 @@ pub struct Coordinator {
     /// Whether the thread's agent is registered; false right after the thread started.
     #[serde(default = "registered_default")]
     pub registered: bool,
+    /// [`prompt_digest`] of the standing prompt the thread was last briefed with. A record
+    /// without it predates the field, so its prompt counts as changed and is sent once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub briefed: Option<String>,
+    /// Set after a failed re-brief: it is not sent again before `retry_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebrief_backoff: Option<Backoff>,
+}
+
+impl Coordinator {
+    /// A thread taken on as coordinator at `now`, with its lease just renewed.
+    fn new(
+        thread: String,
+        agent: AgentId,
+        now: Timestamp,
+        registered: bool,
+        briefed: Option<String>,
+    ) -> Self {
+        Self {
+            thread,
+            agent,
+            started_at: now,
+            renewed_at: now,
+            resumed_after: None,
+            registered,
+            briefed,
+            rebrief_backoff: None,
+        }
+    }
 }
 
 /// Records written before this field existed were registered before they were saved.
@@ -517,11 +600,15 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
     threads_live: BTreeMap<String, Timestamp>,
+    /// Boards whose coordinator thread check has failed since, and when it first failed.
+    checks_failing: BTreeMap<BoardSlug, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
     /// them here: their lines count as maybe delivered, never sent twice.
     sending: Vec<AgentId>,
+    /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
+    config_text: Option<String>,
     pub timing: Timing,
 }
 
@@ -530,6 +617,7 @@ impl<T: T3> Daemon<T> {
     pub fn new(ctx: Ctx, t3: T) -> Self {
         // A file it cannot read is kept aside rather than lost on the next save.
         let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
+        let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
         Self {
             ctx,
             t3,
@@ -537,9 +625,72 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             threads_live: BTreeMap::new(),
+            checks_failing: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
+            config_text,
             timing: Timing::default(),
+        }
+    }
+
+    /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
+    /// `feedback_board` take effect at once, and boards whose start failed are tried again,
+    /// since a missing project may be what failed. `server`, `device` and `t3_bin` are
+    /// fixed while the daemon runs, so changing them asks for a restart. A file gone or
+    /// unreadable keeps the settings in use, with one warning per edit.
+    fn reload_config(&mut self) {
+        let path = self.ctx.home.config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                if self.config_text.take().is_some() {
+                    tracing::warn!(
+                        "reading {}: {err}; keeping the configuration in use",
+                        path.display()
+                    );
+                }
+                return;
+            }
+        };
+        if self.config_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let parsed = toml::from_str::<Config>(&text);
+        self.config_text = Some(text);
+        let new = match parsed {
+            Ok(new) => new,
+            Err(err) => {
+                tracing::warn!(
+                    "invalid {}: {err}; keeping the configuration in use until it is fixed",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let current = &mut self.ctx.config;
+        if (&new.server, &new.device, &new.t3_bin)
+            != (&current.server, &current.device, &current.t3_bin)
+        {
+            tracing::warn!(
+                "{} changes server, device or t3_bin: restart board watch to apply them",
+                path.display()
+            );
+        }
+        if (&new.projects, &new.board_projects, &new.feedback_board)
+            != (
+                &current.projects,
+                &current.board_projects,
+                &current.feedback_board,
+            )
+        {
+            current.projects = new.projects;
+            current.board_projects = new.board_projects;
+            current.feedback_board = new.feedback_board;
+            self.failures.clear();
+            tracing::info!(
+                "re-read {}: projects and feedback board updated",
+                path.display()
+            );
         }
     }
 
@@ -559,6 +710,7 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
+        self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         let mut checks = self.check_threads(&boards, now).await;
@@ -581,6 +733,8 @@ impl<T: T3> Daemon<T> {
             .coordinators
             .retain(|slug, _| boards.contains_key(slug));
         self.failures.retain(|slug, _| boards.contains_key(slug));
+        self.checks_failing
+            .retain(|slug, _| boards.contains_key(slug));
         self.state
             .pending_starts
             .retain(|slug, _| boards.contains_key(slug));
@@ -666,22 +820,48 @@ impl<T: T3> Daemon<T> {
                     Some(check) => check,
                     None => self.thread_live(&local.thread).await,
                 };
+                let mut info = None;
                 let live = match live {
-                    Ok(live) => live,
-                    // A failed check says nothing of the thread: the named coordinator keeps
-                    // its lease, and only a check that answers replaces it.
+                    Ok(live) => {
+                        self.checks_failing.remove(slug);
+                        live
+                    }
+                    // A failed check says nothing of the thread. A named coordinator at work
+                    // keeps its lease, and only a check that answers replaces it. One whose
+                    // session ended is not renewed while the checks fail, and once they have
+                    // failed for [`CHECK_FAIL_RELEASE`] its lease goes, so another home device
+                    // can take over. The record stays: this device adopts the thread again
+                    // once T3 answers, unless the board names another coordinator by then.
                     Err(err) if named => {
+                        let since = *self.checks_failing.entry(slug.clone()).or_insert(now);
+                        let agent = self.client().agent_info(&local.agent).await?;
+                        if agent.state == AgentState::Ended {
+                            if now - since >= CHECK_FAIL_RELEASE {
+                                tracing::warn!(
+                                    "coordinator of {slug}: checking thread {} has failed since {since}: {err:#}; its session ended, so releasing the lease",
+                                    local.thread
+                                );
+                                self.release(slug).await;
+                            } else {
+                                tracing::warn!(
+                                    "coordinator of {slug}: checking thread {}: {err:#}; its session ended, so not renewing the lease until T3 answers",
+                                    local.thread
+                                );
+                            }
+                            return Ok(());
+                        }
                         tracing::warn!(
                             "coordinator of {slug}: checking thread {}: {err:#}; renewing it as live",
                             local.thread
                         );
+                        info = Some(agent);
                         true
                     }
                     Err(err) => return Err(err),
                 };
                 if live {
                     return if named {
-                        self.keep_alive(board, local, now).await
+                        self.keep_alive(board, local, info, now).await
                     } else {
                         self.adopt(board, local, now).await
                     };
@@ -690,6 +870,7 @@ impl<T: T3> Daemon<T> {
             }
             // The board names someone else, or the thread is gone.
             self.state.coordinators.remove(slug);
+            self.checks_failing.remove(slug);
         }
         if ours_gone {
             // A renewal keeps the coordinator named, so the gone thread would stay named
@@ -698,7 +879,27 @@ impl<T: T3> Daemon<T> {
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
                 Ok(info) if info.state != AgentState::Ended => return Ok(()),
-                Ok(_) => {}
+                // T3 ends a session left idle while its thread lives on, and the server keeps
+                // the lease: the daemon of its device renews or releases it. Taken over once
+                // it expires.
+                Ok(info) if info.device != self.ctx.device => return Ok(()),
+                // Ours, and unknown to this daemon's state. A pending adoption replaces it;
+                // otherwise its thread runs again if T3 has it.
+                Ok(_)
+                    if agent.source() == AgentSource::T3
+                        && load_adoption(&self.ctx.home, slug).is_none() =>
+                {
+                    let thread = agent.native().to_owned();
+                    if self.thread_live(&thread).await? {
+                        self.threads_live.insert(thread.clone(), now);
+                        // What it was briefed with is unknown: briefed again, once.
+                        let local = Coordinator::new(thread, agent.clone(), now, true, None);
+                        return self.adopt(board, local, now).await;
+                    }
+                    // A renewal keeps it named: released first, as for a gone thread above.
+                    self.release(slug).await;
+                }
+                Ok(_) => self.release(slug).await,
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {}
                 Err(err) => return Err(err),
             }
@@ -762,10 +963,12 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Renews the lease of a live coordinator and resumes it after a usage limit.
+    /// `info` is the coordinator's agent when the caller just read it.
     async fn keep_alive(
         &mut self,
         board: &Board,
         mut local: Coordinator,
+        info: Option<Agent>,
         now: Timestamp,
     ) -> Result<()> {
         if now - local.renewed_at >= RENEW_EVERY {
@@ -783,8 +986,12 @@ impl<T: T3> Daemon<T> {
                 Err(err) => tracing::warn!("renewing the coordinator of {}: {err:#}", board.slug),
             }
         }
-        let info = self.client().agent_info(&local.agent).await?;
-        if info.state == AgentState::Paused
+        let info = match info {
+            Some(info) => info,
+            None => self.client().agent_info(&local.agent).await?,
+        };
+        // An ended coordinator keeps the reset its session stopped on (see `Reach::of`).
+        if matches!(info.state, AgentState::Paused | AgentState::Ended)
             && let Some(until) = info.paused_until
             && until <= now
             && local.resumed_after != Some(until)
@@ -800,8 +1007,80 @@ impl<T: T3> Daemon<T> {
                 .await?;
             local.resumed_after = Some(until);
         }
+        self.rebrief(&board.slug, &mut local, &info, now).await;
         self.state.coordinators.insert(board.slug.clone(), local);
         Ok(())
+    }
+
+    /// Sends a live coordinator the standing prompt again when it changed since the thread
+    /// was briefed (`board` was upgraded, or `feedback_board` changed), once. Held while the
+    /// coordinator is paused, or runs and was seen within [`WAKE_HOLD_MAX`], so it lands
+    /// between turns. Like a wake-up: a send that timed out counts as sent, a failed one
+    /// backs off, and either makes the next reconcile ask T3 whether the thread is gone.
+    async fn rebrief(
+        &mut self,
+        slug: &BoardSlug,
+        local: &mut Coordinator,
+        info: &Agent,
+        now: Timestamp,
+    ) {
+        let triage = self.triages(slug);
+        let digest = prompt_digest(triage);
+        let held = match info.state {
+            AgentState::Paused => true,
+            AgentState::Running => now - info.last_seen < WAKE_HOLD_MAX,
+            _ => false,
+        };
+        if local.briefed.as_deref() == Some(digest)
+            || held
+            || local
+                .rebrief_backoff
+                .as_ref()
+                .is_some_and(|b| now < b.retry_at)
+        {
+            return;
+        }
+        let sent = self
+            .send_wake(&local.agent, &rebrief_message(slug, triage))
+            .await;
+        if !matches!(sent, Sent::Delivered) {
+            self.threads_live.remove(local.agent.native());
+        }
+        match sent {
+            Sent::Delivered => {
+                tracing::info!(
+                    "re-briefed {} of {slug}: its standing prompt changed",
+                    local.agent
+                );
+                local.briefed = Some(digest.to_owned());
+                local.rebrief_backoff = None;
+            }
+            Sent::MaybeDelivered(err) => {
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; not sent again, since T3 may have delivered it",
+                    local.agent
+                );
+                local.briefed = Some(digest.to_owned());
+                local.rebrief_backoff = None;
+            }
+            Sent::Gone(err) | Sent::Failed(err) => {
+                let last = local
+                    .rebrief_backoff
+                    .as_ref()
+                    .map(|b| TimeDelta::seconds(b.delay_secs));
+                let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; trying again in {}s",
+                    local.agent,
+                    delay.num_seconds()
+                );
+                local.rebrief_backoff = Some(Backoff {
+                    delay_secs: delay.num_seconds(),
+                    retry_at: now + delay,
+                    lookup: false,
+                });
+            }
+        }
     }
 
     /// Names a live thread of ours the board's coordinator: registers its agent when that
@@ -923,8 +1202,8 @@ impl<T: T3> Daemon<T> {
             Err(err) => return Err(err),
         }
         let started = self.start_or_find_thread(slug, &project, now).await;
-        let thread = match started {
-            Ok(thread) => thread,
+        let (thread, briefed) = match started {
+            Ok(started) => started,
             Err(err) => {
                 self.release(slug).await;
                 return Err(err);
@@ -938,14 +1217,9 @@ impl<T: T3> Daemon<T> {
             }
         };
         tracing::info!("started coordinator thread {thread} for {slug}");
-        let local = Coordinator {
-            thread,
-            agent,
-            started_at: now,
-            renewed_at: now,
-            resumed_after: None,
-            registered: false,
-        };
+        // A thread an earlier start launched may hold another prompt: re-brief it.
+        let briefed = briefed.then(|| prompt_digest(self.triages(slug)).to_owned());
+        let local = Coordinator::new(thread, agent, now, false, briefed);
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.state.pending_starts.remove(slug);
@@ -957,13 +1231,15 @@ impl<T: T3> Daemon<T> {
     /// any, else a new one. An earlier start is unfinished when its pending mark is still
     /// saved (the daemon was killed, or `t3` failed or timed out, after the mark was written);
     /// a thread with the coordinator title created since then is its thread. One that never
-    /// ran is briefed first. Threads older than the mark are never taken.
+    /// ran is briefed first. Threads older than the mark are never taken. The flag says
+    /// whether this binary briefed the thread; one that ran was briefed by the earlier start,
+    /// maybe with another prompt.
     async fn start_or_find_thread(
         &mut self,
         slug: &BoardSlug,
         project: &Path,
         now: Timestamp,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         let title = coordinator_title(slug);
         let message = coordinator_message(slug, self.triages(slug));
         if let Some(&since) = self.state.pending_starts.get(slug) {
@@ -981,7 +1257,7 @@ impl<T: T3> Daemon<T> {
                         "coordinator of {slug}: adopting thread {}, which a start at {since} launched but did not record",
                         thread.id
                     );
-                    return Ok(thread.id);
+                    return Ok((thread.id, false));
                 }
                 tracing::warn!(
                     "coordinator of {slug}: briefing thread {}, which a start at {since} created but did not send its message",
@@ -995,13 +1271,21 @@ impl<T: T3> Daemon<T> {
                         thread.id
                     )));
                 }
-                return Ok(thread.id);
+                return Ok((thread.id, true));
             }
         }
+        // Never in the project root, which other threads share: see `worktree`.
+        let worktree = crate::worktree::coordinator_worktree(project, slug, now)
+            .await
+            .context("preparing the coordinator's worktree")?;
         // On disk before T3 can create the thread.
         self.state.pending_starts.entry(slug.clone()).or_insert(now);
         self.save()?;
-        self.t3.start_thread(project, &title, &message).await
+        let thread = self
+            .t3
+            .start_thread(project, &title, &message, worktree.as_ref())
+            .await?;
+        Ok((thread, true))
     }
 
     /// Makes the existing thread named by `board board adopt` the board's coordinator: like
@@ -1082,14 +1366,8 @@ impl<T: T3> Daemon<T> {
             "adopted thread {} as coordinator of {slug}",
             adoption.thread
         );
-        let local = Coordinator {
-            thread: adoption.thread.clone(),
-            agent,
-            started_at: now,
-            renewed_at: now,
-            resumed_after: None,
-            registered,
-        };
+        let briefed = Some(prompt_digest(self.triages(slug)).to_owned());
+        let local = Coordinator::new(adoption.thread.clone(), agent, now, registered, briefed);
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
         self.state.pending_starts.remove(slug);
@@ -1109,6 +1387,18 @@ impl<T: T3> Daemon<T> {
                 self.threads_live.remove(agent.native());
             }
             self.note_state(event, now);
+            // Back at work: a notice that it was away no longer holds, for it or for the
+            // coordinator it was passed to.
+            if event.payload["to"] == "running"
+                && let Ok(agent) = event.actor.parse::<AgentId>()
+            {
+                for queue in self.state.wakes.values_mut() {
+                    queue.wakes.retain(
+                        |w| !matches!(&w.about, WakeAbout::Idle { away, .. } if *away == agent),
+                    );
+                }
+                self.state.wakes.retain(|_, queue| !queue.wakes.is_empty());
+            }
         }
         let (reconcile, wakes) = self.examine(event).await?;
         for (board, agent, about) in wakes {
@@ -1170,10 +1460,48 @@ impl<T: T3> Daemon<T> {
             EventType::BoardCreated => return Ok((true, wakes)),
             // This device's own lease claims and releases change nothing a reconcile would act on.
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
+            // The server's notice that a task's owner has been away from it: the owner; the
+            // coordinator when the owner is no T3 thread, which no daemon can wake. Whether
+            // the owner is on this device and still away is checked when the wake-up is sent.
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let away = event.payload["away"]
+                    .as_str()
+                    .and_then(|a| a.parse::<AgentId>().ok());
+                let since =
+                    serde_json::from_value::<Timestamp>(event.payload["idle_doing"].clone());
+                if let (Some(task), Some(away), Ok(since)) = (&event.task, away, since) {
+                    let to = match self.wakeable(Some(&away), event) {
+                        Some(owner) => Some(owner.clone()),
+                        None => self
+                            .wakeable(self.coordinator_here(slug), event)
+                            .filter(|c| **c != away)
+                            .cloned(),
+                    };
+                    if let Some(to) = to {
+                        let about = WakeAbout::Idle {
+                            task: task.clone(),
+                            away,
+                            since,
+                            noticed: event.at,
+                        };
+                        wakes.push((slug.clone(), to, about));
+                    }
+                }
+            }
             EventType::TaskCreated | EventType::TaskReleased | EventType::TaskUpdated => {
                 if let Some(task) = &event.task
                     && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
+                    // A move to review by the coordinator's own delegated threads is its own
+                    // work in progress; any other is checked again when the line is sent.
+                    if event.event_type == EventType::TaskUpdated && event.payload["to"] == "review"
+                    {
+                        if !self.delegated_by(&event.actor, coordinator).await? {
+                            let about = WakeAbout::Review { task: task.clone() };
+                            wakes.push((slug.clone(), coordinator.clone(), about));
+                        }
+                        return Ok((false, wakes));
+                    }
                     let detail = self.client().task(task).await?;
                     let about = if detail.task.ready && detail.task.auto {
                         Some(WakeAbout::Ready { task: task.clone() })
@@ -1266,6 +1594,50 @@ impl<T: T3> Daemon<T> {
             }
         }
         Ok(true)
+    }
+
+    /// Whether `away` showed activity after the server's notice at `noticed`: marked running
+    /// and seen since. A return to running from another state drops the notice when its
+    /// event arrives; this finds an owner left marked running that came back, which no
+    /// state change announces. Being seen in another state does not count: a session that
+    /// T3 closes marks its agent ended, which records it as seen.
+    async fn back_since(&self, away: &AgentId, noticed: Timestamp) -> Result<bool> {
+        match self.client().agent_info(away).await {
+            Ok(info) => Ok(info.state == AgentState::Running && info.last_seen > noticed),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Whether `actor` is `coordinator` or a T3 thread it delegated, at any depth: the chain
+    /// of `t3_parent` native ids from `actor` reaches `coordinator` within
+    /// [`DELEGATION_DEPTH`] steps, as the server's delegation family follows it.
+    async fn delegated_by(&self, actor: &str, coordinator: &AgentId) -> Result<bool> {
+        let Ok(mut agent) = actor.parse::<AgentId>() else {
+            return Ok(false);
+        };
+        for _ in 0..DELEGATION_DEPTH {
+            if agent == *coordinator {
+                return Ok(true);
+            }
+            if agent.source() != AgentSource::T3 {
+                return Ok(false);
+            }
+            let info = match self.client().agent_info(&agent).await {
+                Ok(info) => info,
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(false),
+                Err(err) => return Err(err),
+            };
+            let parent = info
+                .native_ids
+                .get("t3_parent")
+                .and_then(|p| format!("t3:{p}").parse::<AgentId>().ok());
+            let Some(parent) = parent else {
+                return Ok(false);
+            };
+            agent = parent;
+        }
+        Ok(agent == *coordinator)
     }
 
     /// A lease claim this device made (the server records the claiming device).
@@ -1452,13 +1824,13 @@ impl<T: T3> Daemon<T> {
                 self.requeue(agent.clone(), queue);
                 return None;
             }
-            // Unknown to the server: its answers go to the coordinator.
+            // Unknown to the server: its answers and idle notices go to the coordinator.
             Checked::Unknown => {
-                let unheard = self.forward_answers(agent, &mut queue.wakes);
+                let unheard = self.forward(agent, &mut queue.wakes, true);
                 if unheard > 0 {
                     tracing::warn!(
                         "waking {agent}: unknown to the server; {unheard} answers to its asks \
-                         dropped, with no coordinator here to pass them to"
+                         or idle notices dropped, with no coordinator here to pass them to"
                     );
                 }
                 return None;
@@ -1501,27 +1873,34 @@ impl<T: T3> Daemon<T> {
             // Kept for the reset; meanwhile the coordinator hears of its answers, once one
             // is named.
             Reach::Paused => {
-                self.forward_answers(agent, &mut queue.wakes);
+                // Waiting for a usage-limit reset is not being away: its idle notices no
+                // longer hold, so none is sent at the reset.
+                queue
+                    .wakes
+                    .retain(|w| !matches!(&w.about, WakeAbout::Idle { away, .. } if away == agent));
+                self.forward(agent, &mut queue.wakes, false);
                 self.requeue(agent.clone(), queue);
                 return None;
             }
             // Another device's, or not to be woken by the daemon: its answers go to the
-            // coordinator, and the rest is not ours to send.
+            // coordinator, and so do its idle notices when no device can wake it; the rest
+            // is not ours to send.
             Reach::Never(why) => {
+                let idle = matches!(why, Unreachable::NotT3 | Unreachable::ThreadGone);
                 let dropped = queue
                     .wakes
                     .iter()
-                    .filter(|w| !matches!(&w.about, WakeAbout::Answered { asker, .. } if asker == agent))
+                    .filter(|w| !passed_on(agent, &w.about, idle))
                     .count();
-                let unheard = self.forward_answers(agent, &mut queue.wakes);
+                let unheard = self.forward(agent, &mut queue.wakes, idle);
                 if !why.expected() {
                     if dropped > 0 {
                         tracing::warn!("waking {agent}: {why}; {dropped} wake-ups dropped");
                     }
                     if unheard > 0 {
                         tracing::warn!(
-                            "waking {agent}: {why}; {unheard} answers to its asks dropped, \
-                             with no other coordinator here to pass them to"
+                            "waking {agent}: {why}; {unheard} answers to its asks or idle \
+                             notices dropped, with no other coordinator here to pass them to"
                         );
                     }
                 }
@@ -1581,15 +1960,15 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Passes the answers to `from`'s own asks, which `from` cannot be woken for now, to the
-    /// board's coordinator, once each: an answer no one hears of would stall its task.
-    /// Returns how many have no coordinator to go to (none named, or `from` is it); a queue
-    /// kept for later tries those again.
-    fn forward_answers(&mut self, from: &AgentId, wakes: &mut [Wake]) -> usize {
+    /// Passes the wake-ups [`passed_on`] names, which `from` cannot be woken for now, to the
+    /// board's coordinator, once each: an answer or an idle notice no one hears of would
+    /// stall its task. `idle` when no device can wake `from`. Returns how many have no
+    /// coordinator to go to (none named, or `from` is it); a queue kept for later tries
+    /// those again.
+    fn forward(&mut self, from: &AgentId, wakes: &mut [Wake], idle: bool) -> usize {
         let mut unheard = 0;
         for wake in wakes {
-            let own = matches!(&wake.about, WakeAbout::Answered { asker, .. } if asker == from);
-            if !own || wake.forwarded {
+            if !passed_on(from, &wake.about, idle) || wake.forwarded {
                 continue;
             }
             let coordinator = self
@@ -1638,14 +2017,22 @@ impl<T: T3> Daemon<T> {
             // A send that failed may mean the thread is gone: the next reconcile asks T3.
             self.threads_live.remove(agent.native());
         }
+        let kinds = || {
+            let mut kinds: Vec<&str> = out.wakes.iter().map(|w| w.about.kind()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            kinds.join(", ")
+        };
         match sent {
             Sent::Delivered => {
+                tracing::info!("woke {agent}: {}", kinds());
                 if let Some(queue) = self.state.wakes.get_mut(&agent) {
                     queue.backoff = None;
                 }
             }
             Sent::MaybeDelivered(err) => tracing::warn!(
-                "waking {agent}: {err:#}; not sent again, since T3 may have delivered it"
+                "waking {agent} ({}): {err:#}; not sent again, since T3 may have delivered it",
+                kinds()
             ),
             Sent::Gone(err) => {
                 tracing::warn!(
@@ -1655,11 +2042,11 @@ impl<T: T3> Daemon<T> {
                 if let Some(queue) = self.state.wakes.remove(&agent) {
                     wakes.extend(queue.wakes);
                 }
-                let unheard = self.forward_answers(&agent, &mut wakes);
+                let unheard = self.forward(&agent, &mut wakes, true);
                 if unheard > 0 {
                     tracing::warn!(
-                        "waking {agent}: {unheard} answers to its asks dropped, with no other \
-                         coordinator here to pass them to"
+                        "waking {agent}: {unheard} answers to its asks or idle notices dropped, \
+                         with no other coordinator here to pass them to"
                     );
                 }
                 self.agents.remove(&agent);
@@ -1755,10 +2142,54 @@ impl<T: T3> Daemon<T> {
                     ask.id
                 ))
             }
+            WakeAbout::Review { task } if coordinator => {
+                let task = self.client().task(task).await?.task;
+                (task.status == TaskStatus::Review).then(|| {
+                    format!(
+                        "board {slug}: {} moved to review; check it against its acceptance \
+                         checks, or note what it still waits on",
+                        task.id
+                    )
+                })
+            }
+            // For the owner, or the coordinator it was passed to: still the owner's, still in
+            // doing, and the owner not back since the notice.
+            WakeAbout::Idle {
+                task,
+                away,
+                since,
+                noticed,
+            } if away == agent || coordinator => {
+                let task = self.client().task(task).await?.task;
+                let due = task.owner.as_ref() == Some(away)
+                    && task.status == TaskStatus::Doing
+                    && !self.back_since(away, *noticed).await?;
+                let since = since.format("%Y-%m-%d %H:%MZ");
+                due.then(|| {
+                    if away == agent {
+                        format!(
+                            "board {slug}: your {} is in doing, and you have been away from it \
+                             since {since}. Continue it, or park it by what it waits on: review \
+                             with a note naming the PR, blocked with the reason, or open with \
+                             your handoff",
+                            task.id
+                        )
+                    } else {
+                        format!(
+                            "board {slug}: {} is in doing, and its owner {away}, which cannot \
+                             be woken, has been away from it since {since}. Check it, then \
+                             continue it, hand it over, or park it by what it waits on",
+                            task.id
+                        )
+                    }
+                })
+            }
             // The agent is no longer this board's coordinator.
             WakeAbout::Ready { .. }
             | WakeAbout::Cleared { .. }
             | WakeAbout::Proposal { .. }
+            | WakeAbout::Review { .. }
+            | WakeAbout::Idle { .. }
             | WakeAbout::Answered { .. } => None,
         };
         Ok(line)
@@ -1874,13 +2305,14 @@ fn is_transient(err: &anyhow::Error) -> bool {
 fn no_project(board: &Board) -> String {
     if board.repos.is_empty() {
         return format!(
-            "no T3 project for board {} on this device: add it under [board_projects] in config.toml",
+            "no T3 project for board {} on this device: add it under [board_projects] in \
+             config.toml; board watch reads it within a minute",
             board.slug
         );
     }
     format!(
         "no T3 project for {} on this device: add it under [projects] (or the board under \
-         [board_projects]) in config.toml",
+         [board_projects]) in config.toml; board watch reads it within a minute",
         board.repos.join(", ")
     )
 }
@@ -1913,6 +2345,24 @@ fn standing_prompt(triage: bool) -> String {
     }
 }
 
+/// A digest of the standing prompt for `triage`, as hex: a coordinator briefed with another
+/// one gets [`rebrief_message`]. Both prompts are compiled in, so each is hashed once.
+pub fn prompt_digest(triage: bool) -> &'static str {
+    use sha2::{Digest as _, Sha256};
+    static DIGESTS: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [false, true].map(|triage| crate::config::hex(&Sha256::digest(standing_prompt(triage))))
+    });
+    &DIGESTS[usize::from(triage)]
+}
+
+/// The message that gives a running coordinator its changed standing prompt in full.
+pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
+    let prompt = standing_prompt(triage);
+    format!(
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot."
+    )
+}
+
 /// The first message of a coordinator thread; `triage` for the device's feedback board.
 pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
@@ -1924,7 +2374,7 @@ pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
 pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
     format!(
-        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
+        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, a task moves to review, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
     )
 }
 
@@ -1988,6 +2438,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         ctx.device,
         t3.bin.display()
     );
+    // Hooks of this home reach the server through the relay while the daemon runs; without
+    // it they call the server directly, so a relay that cannot start costs only speed.
+    let _relay = if once { None } else { start_relay(&ctx) };
     let mut daemon = Daemon::new(ctx, t3);
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
@@ -2005,6 +2458,25 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         return daemon.save();
     }
     daemon.follow(&mut shutdown).await
+}
+
+/// Starts the hook relay for `ctx`'s home with the server and token `ctx` loaded, or says
+/// why not and carries on without it.
+fn start_relay(ctx: &Ctx) -> Option<crate::relay::Relay> {
+    let started = ctx.config.require_login().and_then(|(server, _)| {
+        let token = ctx.client.token().context("no device token")?;
+        crate::relay::start(&ctx.home, server, token.to_owned())
+    });
+    match started {
+        Ok(relay) => {
+            tracing::info!("serving hooks on {}", relay.path().display());
+            Some(relay)
+        }
+        Err(err) => {
+            tracing::warn!("hooks will call the server directly: {err:#}");
+            None
+        }
+    }
 }
 
 /// A request to stop: Ctrl-C, SIGTERM from launchd or systemd stopping the service, or a

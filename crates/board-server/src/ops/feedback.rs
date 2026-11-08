@@ -3,12 +3,14 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, EventType, EvidenceKind,
-    FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution,
-    FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind, ResolveFeedback,
-    ResolvedCounts, Task, TaskId,
+    AgentId, Board, CLIENT_ERROR_MESSAGE_CHARS_MAX, CLIENT_ERROR_ROUTES, ClientError, CreateBoard,
+    CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode,
+    ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
+    Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
+    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Settings;
@@ -723,6 +725,52 @@ pub(crate) struct ApiErrorSeen {
     /// Method and route template, such as `POST /v1/tasks/{id}/claim`.
     pub route: String,
     pub message: String,
+    pub source: ErrorSource,
+}
+
+/// Who answered a recorded error (`api_errors.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ErrorSource {
+    /// The server, to a request it received.
+    Server,
+    /// The client, which refused the request before sending it (`POST /v1/errors`).
+    Client,
+}
+
+/// Checks a client's record of a refusal it made before sending (`POST /v1/errors`): an
+/// `invalid` answer to an API route, whose message is the server's own for text over a
+/// limit, so a client cannot put text of its choosing in a signal item. It is recorded for
+/// `agent`, the caller, whatever the body says.
+pub(crate) fn validate_client_error(req: ClientError, agent: AgentId) -> Result<ApiErrorSeen> {
+    if req.code != ErrorCode::Invalid {
+        return Err(invalid(
+            format!("code {} is not recorded from clients", enum_str(&req.code)),
+            "send code invalid: clients report only the requests they refused as invalid",
+        ));
+    }
+    if !CLIENT_ERROR_ROUTES.contains(&req.route.as_str()) {
+        return Err(invalid(
+            format!("route {:?} is not an API route", cut(&req.route, 80)),
+            "send the method and route template, such as POST /v1/tasks/{id}/notes \
+             (docs/API.md)",
+        ));
+    }
+    check_line("message", &req.message, CLIENT_ERROR_MESSAGE_CHARS_MAX)?;
+    if board_proto::TooLong::parse(&req.message).is_none() {
+        return Err(invalid(
+            "message is not a refusal of text over a limit",
+            "send the server's message for it, such as text is 501 characters; the limit \
+             is 500, for a field clients check (docs/API.md)",
+        ));
+    }
+    Ok(ApiErrorSeen {
+        agent,
+        code: req.code,
+        route: req.route,
+        message: req.message,
+        source: ErrorSource::Client,
+    })
 }
 
 /// Errors that are an expected answer, not friction, by code, route and the start of the
@@ -760,20 +808,34 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     let signature = format!("signal:{code}:{}", &hash[..12]);
     let now = cx.now_ms();
     cx.db.execute(
-        "INSERT INTO api_errors (signature, agent, code, route, template, at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![signature, e.agent.as_str(), code, e.route, template, now],
+        "INSERT INTO api_errors (signature, agent, code, route, template, at, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            signature,
+            e.agent.as_str(),
+            code,
+            e.route,
+            template,
+            now,
+            enum_str(&e.source)
+        ],
     )?;
     let earlier = match prior(cx, &signature)? {
         Prior::Live(item) => {
-            let summary = format!("{code} from {}", e.route);
+            let summary = match e.source {
+                ErrorSource::Server => format!("{code} from {}", e.route),
+                ErrorSource::Client => {
+                    format!("{code} from {}, refused by the client", e.route)
+                }
+            };
             add_report(cx, &item, &e.agent, "server", &summary)?;
             return Ok(Some(item));
         }
         Prior::Gone(earlier) => Some(earlier),
         Prior::None => None,
     };
-    // Errors that an earlier item took (before its fix) do not count towards a new one.
+    // Records outlive the signal window (error_retention_days), so only those within it
+    // count. Errors that an earlier item took (before its fix) do not count towards a new one.
     let mut from = now - cx.s.signal_window_ms();
     if let Some(earlier) = &earlier {
         let last: i64 = cx.db.query_row(
@@ -783,10 +845,11 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         )?;
         from = from.max(last + 1);
     }
-    let count: u32 = cx.db.query_row(
-        "SELECT COUNT(*) FROM api_errors WHERE signature = ?1 AND at >= ?2",
-        params![signature, from],
-        |r| r.get(0),
+    let (count, refused): (u32, u32) = cx.db.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE source = ?3) FROM api_errors \
+         WHERE signature = ?1 AND at >= ?2",
+        params![signature, from, enum_str(&ErrorSource::Client)],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let agents: Vec<AgentId> = cx
         .db
@@ -801,6 +864,17 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     if count < cx.s.signal_min_reports || (agents.len() as u32) < cx.s.signal_min_agents {
         return Ok(None);
     }
+    let answered = match refused {
+        0 => format!("The server answered `{code}` to {count} requests"),
+        n if n == count => {
+            format!("Clients refused {count} requests as `{code}` before sending them")
+        }
+        n => format!(
+            "Agents got `{code}` on {count} requests ({} answered by the server, {n} refused \
+             by the client before sending)",
+            count - n
+        ),
+    };
     let days = cx.s.signal_window_days;
     let listed: Vec<&str> = agents.iter().map(AgentId::as_str).collect();
     let title = cut(
@@ -808,8 +882,8 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         cx.s.title_chars,
     );
     let body = format!(
-        "{title}\n\nThe server answered `{code}` to {count} requests from {} agents within \
-         {days} days.\n\nRoute: {}\nMessage (normalized): {template}\nAgents: {}",
+        "{title}\n\n{answered} from {} agents within {days} days.\n\nRoute: {}\n\
+         Message (normalized): {template}\nAgents: {}",
         agents.len(),
         e.route,
         listed.join(", "),
@@ -834,12 +908,120 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     Ok(Some(task.id))
 }
 
-/// Forgets error records older than the signal window. Run by the sweeper.
+/// Forgets error records older than `error_retention_days`. Run by the sweeper.
 pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
     Ok(cx.db.execute(
         "DELETE FROM api_errors WHERE at < ?1",
-        [cx.now_ms() - cx.s.signal_window_ms()],
+        [cx.now_ms() - cx.s.error_retention_ms()],
     )?)
+}
+
+/// `GET /v1/errors` query, validated by [`ErrorsFilter::new`].
+#[derive(Deserialize)]
+pub(crate) struct ErrorsQuery {
+    since: Option<Timestamp>,
+    code: Option<ErrorCode>,
+    route: Option<String>,
+    q: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Filters of `GET /v1/errors`.
+pub(crate) struct ErrorsFilter {
+    since: i64,
+    code: Option<ErrorCode>,
+    route: Option<String>,
+    /// ASCII-lowercased, as SQLite's `lower` folds the template.
+    q: Option<String>,
+    limit: u32,
+}
+
+impl ErrorsFilter {
+    /// `since` defaults to the signal window back from now, and never reaches back past the
+    /// records kept; `limit` defaults to [`ERRORS_LIMIT_DEFAULT`]. Blank text filters are
+    /// left out.
+    pub(crate) fn new(cx: &Ctx<'_>, q: ErrorsQuery) -> Result<Self> {
+        let limit = q.limit.unwrap_or(ERRORS_LIMIT_DEFAULT);
+        if !(1..=ERRORS_LIMIT_MAX).contains(&limit) {
+            return Err(invalid(
+                format!("limit={limit} is out of range"),
+                format!("send limit between 1 and {ERRORS_LIMIT_MAX}"),
+            ));
+        }
+        let blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let text = blank(q.q);
+        if let Some(text) = &text {
+            check_line("q", text, ERRORS_Q_CHARS_MAX)?;
+        }
+        let now = cx.now_ms();
+        let kept = now - cx.s.error_retention_ms();
+        let since = q
+            .since
+            .map_or_else(|| now - cx.s.signal_window_ms(), |at| at.timestamp_millis());
+        Ok(Self {
+            since: since.max(kept),
+            code: q.code,
+            route: blank(q.route),
+            q: text.map(|t| t.to_ascii_lowercase()),
+            limit,
+        })
+    }
+}
+
+/// `GET /v1/errors`: the recorded API errors since a time, one row per signature, most
+/// first, with the newest feedback item each one filed or added to.
+pub(crate) fn errors(cx: &Ctx<'_>, f: &ErrorsFilter) -> Result<ErrorLog> {
+    let code = f.code.as_ref().map(enum_str);
+    // The item lookup runs on the rows kept, not on every signature.
+    let rows = cx
+        .db
+        .prepare_cached(
+            "SELECT g.*, (SELECT task FROM feedback WHERE signature = g.signature \
+             ORDER BY rowid DESC LIMIT 1) FROM ( \
+             SELECT signature, code, route, template, COUNT(*) AS n, COUNT(DISTINCT agent), \
+             MIN(at), MAX(at) AS last FROM api_errors WHERE at >= ?1 \
+             AND (?2 IS NULL OR code = ?2) AND (?3 IS NULL OR route = ?3) \
+             AND (?4 IS NULL OR instr(lower(template), ?4) > 0) \
+             GROUP BY signature ORDER BY n DESC, last DESC LIMIT ?5) g \
+             ORDER BY g.n DESC, g.last DESC",
+        )?
+        .query_map(params![f.since, code, f.route, f.q, f.limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, u32>(4)?,
+                r.get::<_, u32>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let signatures = rows
+        .into_iter()
+        .map(
+            |(signature, code, route, template, count, agents, first, last, item)| {
+                Ok(ErrorSignature {
+                    signature,
+                    code,
+                    route,
+                    template,
+                    count,
+                    agents,
+                    first_at: ts(first),
+                    last_at: ts(last),
+                    item: item.as_deref().map(parse_id).transpose()?,
+                })
+            },
+        )
+        .collect::<Result<_>>()?;
+    Ok(ErrorLog {
+        since: ts(f.since),
+        retention_days: cx.s.error_retention(),
+        signatures,
+    })
 }
 
 /// Feedback counts since `from` (milliseconds).

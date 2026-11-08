@@ -74,6 +74,10 @@ pub struct UpdateBoard {
     /// Turning it on for a board that is not temporary is for the user only, since the
     /// board is then deleted once idle.
     pub temporary: Option<bool>,
+    /// 1 to [`crate::PARALLEL_TASKS_MAX`]. Raising it is for the user only, since more
+    /// tasks at once spend the shared usage limit faster; anyone may lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks: Option<u32>,
 }
 
 /// `POST /v1/boards/{slug}/join`: the calling agent joins the board.
@@ -116,6 +120,43 @@ pub struct Stats {
     /// Feedback reports and items. Absent from servers that predate feedback items.
     #[serde(default)]
     pub feedback: FeedbackStats,
+    /// The oldest time the numbers cover: `days` back from now, or the oldest event the
+    /// server keeps when that is later. Absent from servers that predate it.
+    #[serde(default)]
+    pub since: Option<Timestamp>,
+    /// Per-board numbers over the same window, for each board with events in it, by slug.
+    /// Empty from servers that predate them.
+    #[serde(default)]
+    pub boards: Vec<BoardStats>,
+}
+
+/// One board's numbers in [`Stats`]. Medians and percentiles are `None` when nothing was
+/// measured; rates are per day of the window covered (from [`Stats::since`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardStats {
+    pub board: BoardSlug,
+    /// Claims of auto tasks that waited ready, not counting tasks created claimed.
+    pub claims: u32,
+    /// Minutes those tasks waited from ready to claimed.
+    pub wait_minutes_median: Option<f64>,
+    pub wait_minutes_p90: Option<f64>,
+    pub tasks_done: u32,
+    pub done_per_day: f64,
+    /// Median minutes the tasks done spent in `doing`, time in `review` excluded.
+    pub doing_minutes_median: Option<f64>,
+    /// Lease conflicts and file-touch overlaps on the board's repos.
+    pub lease_conflicts: u32,
+    /// Tasks moved from `review` back to `open`, `doing` or `blocked`.
+    pub reopened_after_review: u32,
+    /// PR links in the evidence of the tasks done.
+    pub pr_links: u32,
+    /// Usage-limit pauses of the board's member agents.
+    pub limit_pauses: u32,
+    pub limit_pauses_per_day: f64,
+    /// Hours those agents spent paused, within the window.
+    pub paused_hours: f64,
+    /// The most member agents running at the moment one of them paused.
+    pub peak_running_at_pause: Option<u32>,
 }
 
 /// Feedback counts in [`Stats`].
@@ -138,6 +179,114 @@ pub struct ResolvedCounts {
     /// Absent from servers that predate the `fixed` kind.
     #[serde(default)]
     pub fixed: u32,
+}
+
+/// Answer to `GET /v1/errors?since=`: the API errors the server recorded since a time,
+/// one row per signature, so errors under the signal threshold can be counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorLog {
+    /// Errors at or after this time are counted: the time asked for, or the oldest record
+    /// kept when that is later.
+    pub since: Timestamp,
+    /// The server keeps error records this many days; `since` before that reads less.
+    pub retention_days: u32,
+    /// Most errors first.
+    pub signatures: Vec<ErrorSignature>,
+}
+
+/// Most signatures one `GET /v1/errors` answer lists.
+pub const ERRORS_LIMIT_MAX: u32 = 1_000;
+/// Signatures `GET /v1/errors` lists when the request names no `limit`.
+pub const ERRORS_LIMIT_DEFAULT: u32 = 100;
+/// Longest `q` filter of `GET /v1/errors`, in characters.
+pub const ERRORS_Q_CHARS_MAX: usize = 200;
+
+/// `POST /v1/errors`: an error the client answered itself, before sending the request it
+/// would have made, such as text over a limit. The server records it with its own errors
+/// (source `client`), for the calling agent, under the signature its own answer to that
+/// request would get.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientError {
+    /// Only `invalid` is recorded.
+    pub code: ErrorCode,
+    /// The route template the request would have gone to, such as
+    /// `POST /v1/tasks/{id}/notes`.
+    pub route: String,
+    /// The message the server would have answered for text over a limit, such as `text is
+    /// 501 characters; the limit is 500` ([`crate::TooLong::message`]), for one of
+    /// [`crate::CLIENT_CHECKED_FIELDS`].
+    pub message: String,
+}
+
+/// The routes a client may name in `POST /v1/errors`: every `/v1` route but that one, as
+/// method and template (`docs/API.md`). The server's tests check that it routes each.
+pub const CLIENT_ERROR_ROUTES: &[&str] = &[
+    "POST /v1/agents",
+    "GET /v1/agents",
+    "GET /v1/agents/{id}",
+    "POST /v1/agents/{id}/state",
+    "GET /v1/agents/{id}/handoff",
+    "PUT /v1/agents/{id}/handoff",
+    "GET /v1/agents/{id}/said",
+    "GET /v1/updates",
+    "PUT /v1/updates/seen",
+    "GET /v1/boards",
+    "POST /v1/boards",
+    "GET /v1/boards/{slug}",
+    "PATCH /v1/boards/{slug}",
+    "DELETE /v1/boards/{slug}",
+    "POST /v1/boards/{slug}/join",
+    "POST /v1/boards/{slug}/coordinator",
+    "DELETE /v1/boards/{slug}/coordinator",
+    "GET /v1/stats",
+    "GET /v1/errors",
+    "GET /v1/tasks",
+    "POST /v1/tasks",
+    "GET /v1/tasks/{id}",
+    "PATCH /v1/tasks/{id}",
+    "POST /v1/tasks/{id}/claim",
+    "POST /v1/tasks/{id}/release",
+    "POST /v1/tasks/{id}/take",
+    "POST /v1/tasks/{id}/done",
+    "POST /v1/tasks/{id}/notes",
+    "POST /v1/leases",
+    "DELETE /v1/leases/{id}",
+    "POST /v1/touches",
+    "POST /v1/feedback",
+    "POST /v1/feedback/{id}/resolve",
+    "GET /v1/asks",
+    "POST /v1/asks",
+    "GET /v1/asks/{id}",
+    "POST /v1/asks/{id}/answer",
+    "POST /v1/asks/{id}/withdraw",
+    "GET /v1/snapshot",
+    "GET /v1/events",
+    "GET /v1/admin/devices",
+    "POST /v1/admin/devices",
+    "DELETE /v1/admin/devices/{name}",
+];
+
+/// Longest [`ClientError`] message, in characters.
+pub const CLIENT_ERROR_MESSAGE_CHARS_MAX: usize = 300;
+
+/// One error signature in [`ErrorLog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorSignature {
+    /// `signal:<code>:<hash>`, as on the signal feedback items.
+    pub signature: String,
+    /// The error code, as the wire spells it.
+    pub code: String,
+    /// The route template, such as `POST /v1/tasks/{id}/notes`.
+    pub route: String,
+    /// The message with numbers, task ids, agent ids and quoted text normalized.
+    pub template: String,
+    pub count: u32,
+    /// Distinct agents that got it.
+    pub agents: u32,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    /// The newest feedback item with this signature, when one was filed.
+    pub item: Option<TaskId>,
 }
 
 /// Longest feedback `about`.
@@ -663,6 +812,7 @@ mod tests {
         .unwrap();
         assert_eq!(stats.feedback, FeedbackStats::default());
         assert_eq!(stats.done_under_a_minute, None);
+        assert_eq!((stats.since, stats.boards.len()), (None, 0));
         let create: CreateFeedback =
             serde_json::from_value(serde_json::json!({ "about": "board", "text": "Slow" }))
                 .unwrap();
@@ -773,5 +923,15 @@ mod tests {
         }))
         .unwrap();
         assert!(!board.temporary);
+        assert_eq!(
+            board.parallel_tasks, 1,
+            "older servers run one task at a time"
+        );
+        assert_eq!(update.parallel_tasks, None);
+        // Older servers reject no field they do not know, and an unset one is not sent.
+        assert_eq!(
+            serde_json::to_value(UpdateBoard::default()).unwrap()["parallel_tasks"],
+            serde_json::Value::Null
+        );
     }
 }

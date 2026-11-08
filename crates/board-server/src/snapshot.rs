@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 use board_proto::{
-    Agent, AgentId, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot, SnapshotFormat,
-    SnapshotKind, StatusCounts, Task, TaskId, TaskStatus,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot,
+    SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -45,15 +45,21 @@ const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
 /// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
 /// reminders (at most one per task a day) all pass, as a coordinator gets those of its
-/// board's tasks whose owner is gone.
-const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
+/// board's tasks whose owner is gone; idle-owner notices pass for the agent's own tasks and
+/// the boards it coordinates.
+pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
      OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
       AND (task IN (SELECT value FROM json_each(:mine)) \
            OR json_extract(payload, '$.previous_owner') = :me)) \
+     OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \
+      AND board IN (SELECT slug FROM boards WHERE coordinator = :me)) \
      OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.idle_doing') IS NOT NULL \
+      AND (task IN (SELECT value FROM json_each(:mine)) \
+           OR board IN (SELECT slug FROM boards WHERE coordinator = :me))) \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
      OR (type = 'task_created' AND :any_mine))";
@@ -114,6 +120,10 @@ struct You {
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// Set when the agent is the snapshot board's coordinator: how many tasks it and its
+    /// child threads may have in progress at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tasks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,11 +402,22 @@ fn fill_full(
     board: &BoardSlug,
     board_counts: Option<Counts>,
 ) -> Result<()> {
+    // Only the board's coordinator, with its lease live, is told the limit.
+    let parallel_tasks: Option<u32> = cx
+        .db
+        .query_row(
+            "SELECT parallel_tasks FROM boards WHERE slug = ?1 AND coordinator = ?2 \
+             AND coordinator_expires_at > ?3",
+            params![board.as_str(), agent.id.as_str(), cx.now_ms()],
+            |r| r.get(0),
+        )
+        .optional()?;
     model.you = Some(You {
         handle: agent.handle.clone(),
         runtime: runtime_str(agent.runtime),
         repo: agent.repo.clone(),
         branch: agent.branch.clone(),
+        parallel_tasks,
     });
     model.counts = board_counts;
 
@@ -622,6 +643,10 @@ fn describe(event: &Event) -> Option<String> {
                 let to: TaskStatus = serde_json::from_value(to.clone()).ok()?;
                 format!("moved {} to {}", task?, status_str(to))
             }
+            // The server's notice that the task's owner is away from it.
+            None if p.get("idle_doing").is_some() => {
+                format!("found {} away from {}", p.get("away")?.as_str()?, task?)
+            }
             // A handover without a status change.
             None => format!("handed {} to {}", task?, p.get("owner")?.as_str()?),
         },
@@ -722,8 +747,10 @@ const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
 /// A task left quiet in review: a reminder, so after the alerts about change.
 const QUIET_REVIEW: u8 = 6;
+/// A task left in doing while its owner was away: a reminder, like a quiet review.
+const IDLE_DOING: u8 = 7;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
-const FILED: u8 = 7;
+const FILED: u8 = 8;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -958,32 +985,8 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 let Some(task) = &event.task else { continue };
                 // The owner is reminded; when the owner is gone (such as an ended child),
                 // the board's coordinator is, so the wait is not lost.
-                let to_me = mine_ids.contains(task) || {
-                    let row: Option<(Option<String>, String, String, Option<String>)> = cx
-                        .db
-                        .query_row(
-                            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
-                             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
-                            [task.as_str()],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                        )
-                        .optional()?;
-                    match row {
-                        Some((owner, board, status, state)) if status == "review" => {
-                            let board: BoardSlug = parse_id(&board)?;
-                            let gone = match &owner {
-                                Some(owner) => {
-                                    state.as_deref() == Some("ended") || !is_live(cx, owner)?
-                                }
-                                None => true,
-                            };
-                            gone && get_board(cx, &board)?
-                                .coordinator
-                                .is_some_and(|c| c.as_str() == me)
-                        }
-                        _ => false,
-                    }
-                };
+                let to_me =
+                    mine_ids.contains(task) || stands_in_for_owner(cx, task, me, &["review"])?;
                 if !to_me {
                     continue;
                 }
@@ -1010,12 +1013,45 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     },
                 );
             }
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let Some(task) = &event.task else { continue };
+                let Some(away) = event.payload.get("away").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let since = event
+                    .payload
+                    .get("idle_doing")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                if !idle_notice_for(cx, task, away, since, me)? {
+                    continue;
+                }
+                let since = since.map_or_else(|| "a while".to_owned(), |at| ago(cx.now - at));
+                let away = actor_name(cx, away, &mut handles)?;
+                out.insert(
+                    (IDLE_DOING, task.to_string()),
+                    Alert {
+                        alert: format!("{task} sat in doing while {away} was away for {since}"),
+                        action: format!(
+                            "continue {task}, or park it by what it waits on: review with a note naming the PR, blocked with the reason, or open with a handoff"
+                        ),
+                        rank: rank(IDLE_DOING),
+                    },
+                );
+            }
             EventType::TaskUpdated | EventType::TaskReleased | EventType::NoteAdded => {
                 let Some(task) = &event.task else { continue };
                 // A task moved away from me still concerns me.
                 let was_mine =
                     event.payload.get("previous_owner").and_then(|o| o.as_str()) == Some(me);
-                if !mine_ids.contains(task) && !was_mine {
+                // A finding on a task whose owner is gone (such as an ended child) reaches
+                // the board's coordinator, so it is not lost.
+                if !mine_ids.contains(task)
+                    && !was_mine
+                    && !(event.event_type == EventType::NoteAdded
+                        && event.payload.get("kind").and_then(|k| k.as_str()) == Some("finding")
+                        && stands_in_for_owner(cx, task, me, &["doing", "review"])?)
+                {
                     continue;
                 }
                 // Handed to another agent: no longer mine to work on.
@@ -1039,7 +1075,15 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     continue;
                 }
                 let what = match event.event_type {
-                    EventType::NoteAdded => vec!["note".to_owned()],
+                    // The note's kind (note, finding or decision), set by the server.
+                    EventType::NoteAdded => vec![
+                        event
+                            .payload
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("note")
+                            .to_owned(),
+                    ],
                     EventType::TaskReleased => vec!["owner".to_owned()],
                     _ => str_list(&event.payload, "fields"),
                 };
@@ -1182,12 +1226,18 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         }
     }
     for ((task, actor), (seq, what)) in changed {
+        let finding = what.contains("finding");
         let what: Vec<String> = what.into_iter().collect();
         out.insert(
             (CHANGED, format!("{task}|{actor}")),
             Alert {
                 alert: format!("{actor} changed your task {task} ({})", what.join(", ")),
-                action: format!("task_show {task}"),
+                // Short: alerts share a small budget.
+                action: if finding {
+                    format!("task_show {task}; address the finding before task_done")
+                } else {
+                    format!("task_show {task}")
+                },
                 rank: (CHANGED, seq),
             },
         );
@@ -1233,6 +1283,77 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         );
     }
     Ok((alerts, scanned_to))
+}
+
+/// Whether `me` is told what `task`'s owner would be: the task is in one of `statuses`,
+/// its owner is gone (ended, not live, or none) and `me` coordinates its board.
+fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str]) -> Result<bool> {
+    let row: Option<(Option<String>, String, String, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT t.owner, t.board, t.status, a.state FROM tasks t \
+             LEFT JOIN agents a ON a.id = t.owner WHERE t.id = ?1",
+            [task.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((owner, board, status, state)) = row else {
+        return Ok(false);
+    };
+    if !statuses.contains(&status.as_str()) {
+        return Ok(false);
+    }
+    let gone = match &owner {
+        Some(owner) => state.as_deref() == Some("ended") || !is_live(cx, owner)?,
+        None => true,
+    };
+    let board: BoardSlug = parse_id(&board)?;
+    Ok(gone
+        && get_board(cx, &board)?
+            .coordinator
+            .is_some_and(|c| c.as_str() == me))
+}
+
+/// Whether `me` is told of the server's notice that `away` has been away from `task` since
+/// `since`. Only while the task is still in `doing` and still `away`'s. Then `away` itself
+/// is told, and so is the coordinator of the task's board when `away` is no T3 thread (no
+/// daemon can wake it) or has been away at least twice `doing_idle_secs`: T3 closes an
+/// idle session after 30 minutes while the daemon still wakes its thread, so the owner gets
+/// the first turn.
+fn idle_notice_for(
+    cx: &Ctx<'_>,
+    task: &TaskId,
+    away: &str,
+    since: Option<Timestamp>,
+    me: &str,
+) -> Result<bool> {
+    let row: Option<(Option<String>, String, String)> = cx
+        .db
+        .query_row(
+            "SELECT owner, board, status FROM tasks WHERE id = ?1",
+            [task.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((owner, board, status)) = row else {
+        return Ok(false);
+    };
+    if status != "doing" || owner.as_deref() != Some(away) {
+        return Ok(false);
+    }
+    if away == me {
+        return Ok(true);
+    }
+    let t3 = away
+        .parse::<AgentId>()
+        .is_ok_and(|a| a.source() == AgentSource::T3);
+    let long =
+        since.is_some_and(|s| cx.now - s >= TimeDelta::milliseconds(2 * cx.s.doing_idle_ms()));
+    let board: BoardSlug = parse_id(&board)?;
+    Ok((!t3 || long)
+        && get_board(cx, &board)?
+            .coordinator
+            .is_some_and(|c| c.as_str() == me))
 }
 
 fn record_change(
@@ -1370,6 +1491,11 @@ fn render_lines(m: &Model) -> String {
         }
         if let Some(branch) = &you.branch {
             parts.push(path(branch));
+        }
+        match you.parallel_tasks {
+            Some(1) => parts.push("coordinator, one task at a time".to_owned()),
+            Some(n) => parts.push(format!("coordinator, up to {n} tasks at once")),
+            None => {}
         }
         let _ = writeln!(o, "you: {}", parts.join(" · "));
     }
@@ -1519,6 +1645,9 @@ fn render_yaml(m: &Model) -> String {
         }
         if let Some(branch) = &you.branch {
             let _ = writeln!(o, "  branch: {}", q(branch));
+        }
+        if let Some(n) = you.parallel_tasks {
+            let _ = writeln!(o, "  parallel_tasks: {n}");
         }
     }
     if let Some(c) = &m.counts {

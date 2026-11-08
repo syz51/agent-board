@@ -165,7 +165,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_show",
-        description: "One task with its acceptance checks, recent notes, evidence and links. detailed adds every note and the history.",
+        description: "One task with its acceptance checks, every finding and decision note, the latest plain notes, evidence and links. detailed adds every note and the history.",
         params: || {
             vec![
                 ("id", task_arg("Task id, such as factory-12."), true),
@@ -238,7 +238,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_claim",
-        description: "Claim a task before working on it: it moves to doing with you as owner. Refused when a live agent owns it. take=true takes a task whose owner is stale. To release, set status open with task_update.",
+        description: "Claim a task before working on it: it moves to doing with you as owner; the result counts its notes, all to read. Refused when a live agent owns it. take=true takes a task whose owner is stale. To release, set status open with task_update.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),

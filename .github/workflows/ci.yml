@@ -81,3 +81,59 @@ jobs:
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=ci' || '' }}
       - name: Smoke test the image
         run: docker run --rm agent-board:ci --version
+
+  # On a push to main: publish the image of that commit as `sha-<commit>` with build
+  # provenance, so deploy/upgrade.sh pulls it by digest instead of building on the server.
+  # It runs after every other check passes, is built without the shared cache for
+  # linux/amd64 only (a server on another platform upgrades with --build), and is smoke
+  # tested before it is pushed.
+  image:
+    needs: [rust, web, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # /healthz reports BOARD_COMMIT; the build keeps its first 12 characters, lowercase
+      # (crates/board/build_commit.rs), which upgrade.sh waits for.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: BOARD_COMMIT=${{ github.sha }}
+      - name: Smoke test the image
+        run: docker run --rm "$IMAGE:sha-$GITHUB_SHA" --version
+      # The same inputs again: the builder reuses the build above and pushes it.
+      - id: push
+        name: Push the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: BOARD_COMMIT=${{ github.sha }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

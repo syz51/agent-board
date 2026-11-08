@@ -11,12 +11,12 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
-    AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
-    CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
-    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note, PutHandoff,
-    RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
-    Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateTask, Updates,
+    AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
+    CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
+    DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen,
+    Note, PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches,
+    UpdateBoard, UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -79,6 +79,7 @@ pub(crate) fn router(state: AppState) -> Router {
             post(claim_coordinator).delete(release_coordinator),
         )
         .route("/stats", get(show_stats))
+        .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
         .route("/tasks/{id}/claim", post(claim_task))
@@ -152,6 +153,7 @@ async fn record_errors(State(state): State<AppState>, req: Request, next: Next) 
             code: error.code,
             route,
             message: error.message.clone(),
+            source: feedback::ErrorSource::Server,
         };
         if let Err(error) = state
             .write(move |cx| feedback::record_error(cx, seen))
@@ -469,6 +471,32 @@ async fn show_stats(
 ) -> Result<Json<Stats>> {
     let days = stats::validate_days(q.days)?;
     Ok(Json(state.read(move |cx| stats::stats(cx, days)).await?))
+}
+
+async fn show_errors(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<feedback::ErrorsQuery>,
+) -> Result<Json<ErrorLog>> {
+    Ok(Json(
+        state
+            .read(move |cx| feedback::errors(cx, &feedback::ErrorsFilter::new(cx, q)?))
+            .await?,
+    ))
+}
+
+/// `POST /v1/errors`: records a refusal the calling agent's client made before sending,
+/// with the server's own errors (source `client`), so signals count it.
+async fn report_error(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<ClientError>,
+) -> Result<StatusCode> {
+    let seen = feedback::validate_client_error(req, caller.agent()?.clone())?;
+    state
+        .write(move |cx| feedback::record_error(cx, seen))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------------------

@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use crate::config::Settings;
 use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
-use crate::ops::{expires, join_board, note_agent_seen, touch_agent};
-use crate::store::{board_missing, get_board};
+use crate::ops::{expires, join_board, touch_agent};
+use crate::store::{agent_missing, board_missing, get_board};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
-use board_proto::BOARD_TITLE_LONGER_TEXT_GOES;
+use board_proto::{BOARD_TITLE_LONGER_TEXT_GOES, PARALLEL_TASKS_MAX};
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
     if repos.len() > 20 {
@@ -73,6 +73,14 @@ pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<Upda
     }
     req.repos = req.repos.map(check_repos).transpose()?;
     req.home_devices = req.home_devices.map(check_devices).transpose()?;
+    if let Some(n) = req.parallel_tasks
+        && !(1..=PARALLEL_TASKS_MAX).contains(&n)
+    {
+        return Err(invalid(
+            format!("parallel_tasks={n} is out of range"),
+            format!("send parallel_tasks between 1 and {PARALLEL_TASKS_MAX}"),
+        ));
+    }
     Ok(req)
 }
 
@@ -132,6 +140,16 @@ pub(crate) fn update(
              new board with temporary set",
         ));
     }
+    if let Some(n) = req.parallel_tasks
+        && n > before.parallel_tasks
+        && !by_user
+    {
+        return Err(forbidden(
+            format!("only the user may raise parallel_tasks on board {slug}"),
+            "more tasks at once spend the shared usage limit faster; ask the user (ask_user) \
+             to raise it",
+        ));
+    }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -162,12 +180,18 @@ pub(crate) fn update(
         "temporary",
         req.temporary.is_some_and(|v| v != before.temporary),
     );
+    set(
+        "parallel_tasks",
+        req.parallel_tasks
+            .is_some_and(|v| v != before.parallel_tasks),
+    );
     if fields.is_empty() {
         return Ok(before);
     }
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
-         home_devices = ?7, updated_at = ?8, temporary = ?9 WHERE slug = ?1",
+         home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10 \
+         WHERE slug = ?1",
         params![
             slug.as_str(),
             req.title.unwrap_or(before.title),
@@ -179,6 +203,7 @@ pub(crate) fn update(
                 .expect("serializes"),
             cx.now_ms(),
             req.temporary.unwrap_or(before.temporary),
+            req.parallel_tasks.unwrap_or(before.parallel_tasks),
         ],
     )?;
     cx.emit(
@@ -474,8 +499,16 @@ pub(crate) fn claim_coordinator(
         ));
     }
     if let Some(agent) = &req.agent {
-        // A device claims the lease for the agent: no sign the agent itself is at work.
-        note_agent_seen(cx, agent)?;
+        // A device claims or renews the lease for the agent: no sign the agent itself is at
+        // work, so its last_seen stays, and an agent left marked running is found away.
+        let known: bool = cx.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+            [agent.as_str()],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(agent_missing(agent));
+        }
         join_board(cx, slug, agent)?;
         cx.db.execute(
             "UPDATE agents SET role = 'coordinator' WHERE id = ?1",

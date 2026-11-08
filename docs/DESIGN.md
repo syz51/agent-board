@@ -164,6 +164,29 @@ host.
   The server's deadline is set after the hook's local steps (Keychain, process table, T3,
   git), and a failure changes nothing when those steps left the server under half a
   second.
+- **Hook relay**: while `board watch` runs, hooks reach the server through it, so a hook
+  pays for neither a TLS handshake (0.04 to 0.3 seconds over a relayed tailnet path) nor a
+  Keychain lookup. The daemon serves `$BOARD_HOME/run/hook.sock`: the directory has mode
+  0700 and must belong to the daemon's user, the socket has mode 0600, and the daemon serves
+  only peers with its own user id (`getpeereid`, `SO_PEERCRED`). It forwards each request
+  with the device token and the caller's own `X-Board-Agent`, never an identity of its own,
+  and only the routes hooks call: registering, state and handoff of the agent the request
+  names, snapshot, touches, boards and tasks. The server's rules for that agent apply as
+  for a direct call. A hook uses the relay only when the home and the socket belong to its
+  user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a
+  token of the session's own, and the relay's status (`GET /relay`, answered by the relay
+  within 0.1 seconds) names the hook's own build and server; otherwise it calls the server
+  directly. So a daemon left on an older binary after an upgrade, or stopped, is passed by.
+  The relay rereads the server and token when `config.toml` changes, as `board login`
+  rewrites it. It keeps two connections to the server warm (a health check on both every
+  30 seconds, idle ones kept five minutes), sends a request again once when a kept
+  connection fails without a timeout, and gives up on the server after two seconds. When it
+  gets no connection or answer, it answers `502` or `504` with `X-Board-Relay: unreachable`
+  or `slow`, and the hook judges the server as it would directly; a request it does not
+  forward is marked `refused`. Neither a refusal nor the relay's own connection failing (a
+  daemon stopping mid-hook) changes the breaker. Directly, a hook sends its requests one
+  after another on one connection; through the relay, the heartbeat and the snapshot go at
+  once.
 - Client configuration and the cached snapshots live in `$BOARD_HOME` (default
   `~/.local/share/agent-board`); the token lives in the macOS Keychain, or a 0600 file
   (`$BOARD_HOME/token`) on Linux, or `BOARD_TOKEN`, read in that order (`BOARD_TOKEN`,
@@ -207,12 +230,12 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. A T3 thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) registers its parent as native id `t3_parent`, read from `t3 thread show` (`parentThreadId`, about 0.2 seconds, at most 0.4) once per session and kept locally |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
-| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer |
+| `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
 | `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user) |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
-| `SessionEnd` | Mark ended; release leases |
+| `SessionEnd` | Mark ended; release file leases. A coordinator lease runs on: T3 ends idle sessions while the thread lives on, and the daemon of the lease's device renews it while the thread is live, or releases it |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
 
 T3 Code runs Claude Code and Codex underneath, so these hooks fire in T3 threads too; T3
@@ -236,7 +259,11 @@ Each autopilot board has one **coordinator thread**: a T3 Code thread in the boa
 on one of the board's home devices. The project is the device's `[projects]` folder for one
 of the board's repos; a board none of whose repos is mapped there, such as a feedback board
 with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
-registers without a repo).
+registers without a repo). Each reconcile first re-reads `config.toml` when its text
+changed: new `[projects]`, `[board_projects]` and `feedback_board` apply at once and clear
+the start back-offs, since a missing project may be what failed; `server`, `device` and
+`t3_bin` stay as started, with a warning to restart; a file gone or invalid keeps the
+settings in use, warned once per edit.
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
@@ -250,10 +277,67 @@ registers without a repo).
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **Where it runs**: never in the project root, which the user's and other threads share.
+  When the project folder is the top of a git repository, the daemon starts the thread
+  with `t3 thread start --worktree <base> --branch <branch>`: T3 creates the branch from
+  `<base>` and runs the thread in a new worktree on it. `<base>` is the remote's default
+  branch (`origin/HEAD`), else the first of `origin/main`, `origin/master`, `main` and
+  `master` that exists, else the start fails and says to set `origin/HEAD`; a remote base
+  is fetched first (a failed fetch is logged, and the local copy used). `<branch>` is
+  `coordinator/<board>`, or `coordinator/<board>-<UTC time>` when that branch exists, since
+  T3 can only create a branch. A folder outside git, or nested in a repository, starts the
+  thread in the folder, as before. The coordinator prompt forbids changing files,
+  switching branches or merging in the project root; file work the coordinator does itself
+  happens in a worktree of its own, on a new branch per task. A coordinator started before
+  this rule, or adopted, still runs in the folder it had; the prompt tells it to add a
+  worktree before such work.
+- **Its worktree when the thread ends**: the daemon never removes a coordinator's
+  worktree or branch. Ending, archiving or replacing the thread leaves both in place,
+  since a thread that lost its record may still run there, and git counts a worktree with
+  only ignored files as clean. The next start finds `coordinator/<board>` taken and starts
+  on a time-stamped branch in a new worktree. Old coordinator worktrees and branches are
+  removed by hand (`git worktree remove`, `git branch -d`) until a cleanup that checks the
+  thread is archived exists.
+- **An owner away from its task**: the server's sweeper finds each task in `doing`, on an
+  active board, whose owner has been away for `doing_idle_secs` (30 minutes): not running
+  since it last stopped (idle, paused or ended; the spell starts at the stop, so a session
+  T3 closes later is the same spell), or marked running but not seen for that long, as a
+  turn cut short by an error leaves a thread. A coordinator lease the daemon renews does
+  not count as the agent seen, so a coordinator left marked running is found too. An
+  owner waiting for a usage-limit reset still to come (paused, or ended meanwhile) is not
+  away. It skips the task while a thread the owner delegated, at any depth, is at work
+  (running and seen within that time, or waiting for a reset still to come, paused or
+  ended). It records one `task_updated` event with `idle_doing` and `away` per spell
+  away, so the check runs once, on the server, not on every device: a spell is told once
+  there is a notice for the task and owner after the owner last ran and after the task
+  last came to it. While the task is still in doing and still that owner's, the snapshot
+  alerts the owner, and the board's coordinator when the owner is no T3 thread (no daemon
+  can wake it) or has been away twice `doing_idle_secs`: T3 closes an idle session after
+  30 minutes while the daemon still wakes its thread, so the owner gets the first turn.
+  The owner's device daemon wakes a T3 owner.
+- **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
+  while its thread lives on, and the server keeps the coordinator lease (only file leases
+  go). The daemon of the lease's device renews it while T3 finds the thread live. Another
+  home device waits for the lease to expire. The coordinator's own device, when its
+  `watch.json` has no record of it (lost or reset), runs its thread again if T3 has it,
+  briefing it once, since what it was briefed with is unknown; a pending adoption replaces
+  it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
+  the lease first, so the ended agent is not named meanwhile.
+- **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
+  of the standing prompt it briefed the thread with. When that prompt changes (`board` is
+  upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
+  the triage prompt), a reconcile that keeps the coordinator alive sends it one message
+  with the new prompt in full, then records the new digest. The message follows the
+  wake-up rules: it is held while the coordinator is paused, or runs and was seen within
+  `WAKE_HOLD_MAX`; a send that timed out may have got through, so it counts as sent; a
+  failed send backs off from 30 seconds up to 10 minutes, and makes the next reconcile ask
+  T3 whether the thread is gone. A record without a digest (from before this rule), or a
+  thread an earlier unfinished start launched, counts as changed, so it is briefed once.
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
-  coordinator (switch autopilot off first), when T3 on that device does not know the
+  coordinator (switch autopilot off first), or an ended one of another device whose lease
+  still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
   thread or has archived it, when the device is not a home device, and when it has no
   `[projects]` path for the board's repos. Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
@@ -270,13 +354,31 @@ registers without a repo).
   adoption newer than the last failed start is tried at once. An adopted thread that T3 no
   longer has, or has archived, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
-- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`; do it
-  or delegate parts to child threads (T3 `delegate_task`), naming the task ids in their
-  briefs so the children claim them; review the result against the acceptance checks; mark
-  done with evidence; repeat. One task at a time per project, as a person would. When it
-  needs the user it creates an ask and moves on to other ready work. When nothing is ready
-  it stops, after a goal review when the board has a goal and the last task it finished has
-  no `review:` note.
+- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
+  delegate it to a child thread (T3 `delegate_task`, in its own worktree), naming the task
+  id in the brief so the child claims it and owns it through PR, merge and `task_done`;
+  review the result against the acceptance checks when the child reports; repeat. The
+  coordinator does a task itself only when it changes no repository files (a verdict, an
+  investigation, an ask) or a child failed it twice, so its context stays small and it
+  keeps answering alerts and proposals while children work. When it needs the user it
+  creates an ask and moves on to other ready work. When nothing is ready it stops, after a
+  goal review when the board has a goal and the last task it finished has no `review:`
+  note.
+- **Parallel tasks**: the board's `parallel_tasks` (1 to 4, default 1) is how many tasks
+  the coordinator and its children may have in progress at once: in `doing`, or dispatched
+  to a child that has not claimed it yet; a task parked in `review`, `blocked` or `open`
+  does not count. The coordinator keeps to it; the server stores and shows it but does not
+  refuse claims over it, since it cannot tell a coordinator's children from other agents
+  on the board. The coordinator's snapshot shows it on the `you:` line (`coordinator, up
+  to 2 tasks at once`), and the prompt reads a missing line as 1. Only the user raises it, since every agent
+  shares one usage limit; anyone may lower it. Beside a task in progress, another starts
+  only when neither waits on the other, its likely files miss the in-flight leases, it does
+  not change the same kind of widely shared file (design and API docs, wire types,
+  migrations, shared styles), it is not size L and needs no ask, and no agent of the
+  coordinator's stopped on a usage limit since the tasks in progress started. A child whose
+  lease overlaps another task in progress stops and leaves its task `open`. PRs merge by
+  the repository's own rules. A raise pays when, per board, wait drops and throughput
+  rises while merge cost per PR and rework stay within 20% of the week before.
 - **Triage**: the feedback board's coordinator routes its items rather than doing them:
   for each ready item it reads the reports and resolves it as a duplicate of an earlier
   item, routed to a new task on the owner's board (done once the fix is deployed where
@@ -305,13 +407,38 @@ registers without a repo).
   reviewer child before any becomes `auto`; work that needs the user's decision gets an ask
   and waits `blocked`. When every proposal of a review is declined or merged, the next
   review waits for the next finished task.
+- **Reading every note**: the agent doing a task must not miss a finding captured on it;
+  some duplicate reading is the price. `task_show` shows every `finding` and `decision`
+  note; without `detailed`, only plain and `feedback` notes are cut to the latest five,
+  with the count cut. A claim or take answers with the task's note count, by kind, and
+  says to read them, with `detailed` when `task_show` would cut some.
+  A note by another agent on a task its owner has open (`doing` and `review` included)
+  raises an alert for the owner, `<agent> changed your task <id> (finding)`, naming the
+  note's kind. A finding on a `doing` or `review` task whose owner is gone (ended, not
+  live, or none) raises it for the board's coordinator instead. After the done,
+  `task_done` lists the findings noted since the task's latest claim in its history (not
+  a later handover, so findings noted while a child held the task are included; every
+  finding when no claim is there), read after the done so none added meanwhile is
+  missed. The owner then notes how each one the evidence does not cover was addressed,
+  or reopens the task. The coordinator prompt says
+  to read every note after the claim and to put each finding and decision into a
+  delegate's brief.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
+  `not_before` passes), a blocker clears, an agent other than the coordinator and the
+  threads it delegated (at any depth, by `t3_parent`) moves a task to `review` (to check
+  it against its acceptance checks), or another agent files a proposal on the board (a
   new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
   board, so a blocker on another board wakes the coordinator of the waiting task's board;
   and the owner of a `blocked` task is woken when its last blocker is done (told to check
-  its blocked reason first when it has one). An answered ask wakes the agent
+  its blocked reason first when it has one). The owner of a task in `doing` is woken when
+  the server announces it has been away from the task (`idle_doing`, below), and told to
+  continue it or park it by what it waits on. That line is dropped when the owner runs
+  again before it is sent, or is marked running and was seen after the notice (an owner
+  left running that came back announces no state change), or waits for a usage-limit
+  reset. The coordinator gets the line instead when no device can wake the owner: it is
+  no T3 thread, it is unknown, or its thread is gone (found by the owner's device, so only
+  a coordinator on that device hears of it). An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
@@ -320,11 +447,15 @@ registers without a repo).
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
     So an ended T3 agent on this device is woken like an idle one while T3 has its thread
-    unarchived. The daemon asks T3 once per state change; when T3 does not answer, the
-    send is tried. A thread archived later, which no event announces, is found when a send
+    unarchived, unless its session ended while it waited for a usage-limit reset: the
+    server keeps that reset on the ended agent, and its lines are kept until then like a
+    paused agent's (a wake before the reset would only stop on the limit again); a
+    coordinator in that state is resumed at the reset like a paused one. The daemon asks
+    T3 once per state change; when T3 does not answer, the send is tried. A thread archived later, which no event announces, is found when a send
     to it fails, and its answers then go to the coordinator. Lines dropped for an agent
     the daemon cannot wake from its own device, and answers with no other coordinator to
-    go to, are logged as warnings.
+    go to, are logged as warnings. Each delivered send logs one INFO line naming the
+    agent and the kinds of its lines.
   - **Lapsed lease**: while the board names no coordinator (its lease lapsed, and naming
     it again has not happened yet), the coordinator thread this device runs for the board
     still gets the board's wake-ups.
@@ -360,9 +491,12 @@ registers without a repo).
     passed on. The event retries go on past one the server keeps failing and stop only
     when the server cannot be reached. The daemon reconciles at start and on its tick,
     also while the stream is down. The boards' `t3 thread show` checks run side by side,
-    10 seconds each; one that fails or runs out of time still renews a named coordinator,
-    and only a check that
-    answers replaces it. Each check starts a `t3` process of about 180 MB, so a named
+    10 seconds each; one that fails or runs out of time still renews a named coordinator
+    at work, and only a check that answers replaces it. One whose session ended is not
+    renewed while the checks fail, and once they have failed for 10 minutes its lease is
+    released, so another home device takes over while T3 is down; its record stays, so
+    the thread is adopted again once T3 answers, unless another coordinator is named by
+    then. Each check starts a `t3` process of about 180 MB, so a named
     coordinator's thread that T3 found live is not asked about again for 5 minutes. A
     failed send to it, or its agent ending, makes the next reconcile ask; an archived
     thread is replaced within that interval. The reconnect delay (1 second, doubled up to a minute) resets
@@ -390,7 +524,14 @@ registers without a repo).
 - **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
   public endpoint is needed; answers are accepted only from that chat. The same channel
-  reports a coordinator paused on a usage limit. The chat is `[telegram] chat_id` when set;
+  reports a usage limit once per runtime and reset time, naming the first agent that
+  stopped on it and the reset in `utc_offset` time. While a limit holds every agent that
+  runs stops on it, and T3 resumes an agent whose idle session it closed, so one limit
+  would otherwise be reported again and again. A limit counts as reported once its
+  message is sent, so a failed send is made by the next pause on it. A coordinator paused
+  with no reset time is reported each time, since only the user resumes it. The limits
+  reported are kept in memory, so a restart reports a limit still holding at most once
+  more. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
@@ -406,20 +547,41 @@ registers without a repo).
     4 hours), is reported once, with its owner, how long it has been quiet, its last event
     and a link. The tasks found at one check share one message; those past its length
     (3,500 characters) go in the next check's message. A task is reported again only
-    after a new event and another quiet period. Tasks of a coordinator paused on a usage
-    limit wait until the reset (or, without an end time, until it resumes), since that
-    pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
+    after a new event and another quiet period. Tasks whose owner stopped on a usage limit
+    wait until a whole quiet period after the owner resumed or the limit reset, whichever
+    comes first, since the limit is reported apart and T3 resumes the owner at the reset;
+    the owner's events are read, as a resumed owner no longer shows the reset. This holds
+    review tasks too: under one account the coordinator that reviews them shares the
+    limit. Tasks of a coordinator paused with no reset time wait
+    until it resumes; a worker's are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
+  - *Stalled board*: a board is stalled while it is active, has autopilot on, has no task
+    in `doing` and has a ready auto task. Each check records when it first saw a board
+    stalled. A board that stops being stalled, or where a task moved into or out of
+    `doing` since then (claim, take, release, done, or a status change from or to
+    `doing`), starts over. A board that stays stalled for `[telegram] stalled_after_secs`
+    (default 2 hours) is reported once. So work that became claimable by any route
+    (autopilot switched on, a board resumed, a blocker done, a pause over) gives a
+    coordinator the whole threshold to claim it. The message names the board, its ready
+    auto count, since when it stalled, and the state and last-seen time of the coordinator
+    that holds its lease, or that none does, with a link. Boards found at one check share
+    one message; those past its length go in the next check's message. A board is
+    reported again only once it stalls anew. Boards whose lease holder is paused on a
+    usage limit, or ended while it waits for a reset still ahead, are not stalled, as for
+    stuck tasks. This catches a stopped coordinator or
+    device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
     after local midnight, one message lists the Needs you items by board,
     by the web view's rule: the open asks. It adds how many tasks were done since the
     user last marked updates seen. Nothing is sent when every list is empty.
-  - The sent state is stored (`telegram_stuck`, `telegram_digest`) after each send, so a
-    restart repeats neither, and an alert that cannot be sent, or is cut off by shutdown,
-    is tried again at the next check; a crash between a send and its record repeats that
-    alert once. Nothing is recorded while no chat is paired, and pairing a new chat
-    forgets what was sent to the old one. With both alerts off, nothing is checked.
+  - The sent state is stored (`telegram_stuck`, `telegram_stalled`, `telegram_digest`)
+    after each send, so a restart repeats none, and an alert that cannot be sent, or is
+    cut off by shutdown, is tried again at the next check; a crash between a send and its
+    record repeats that alert once. Nothing is checked or recorded while no chat is
+    paired, so a stalled board's clock starts at the first check with a chat. Pairing a
+    new chat forgets what was sent to the old one. With all three alerts off, nothing is
+    checked.
 - **Web view** (served at `/` on the tailnet, phone-friendly): a home page with the open
   asks, the tasks in progress (doing and review) on every board, **Since you last looked**
   and the boards with counts, autopilot switches and coordinator state, in sections the
@@ -448,6 +610,7 @@ keeping untrusted text out of those channels, so:
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  the board's coordinator finds its `parallel_tasks` limit at the end of `you`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with
   `->` and the action; cut from the bottom when over the cap. **Delta** (≤ 600): the same
@@ -584,6 +747,78 @@ report, not a free-form task (`API.md`, "Feedback"):
   and the agents' instructions, and files them as proposals (see "Proposals and triage")
   before they become reviewed pull requests.
 
+## Revisits
+
+A fix or a tuned value (a text limit, a signal threshold, a TTL) ships on a guess. The
+feedback loop reacts only when a problem crosses the signal threshold again, so a problem
+that stays under it is never seen, and nothing confirms that a fix held. A revisit checks
+back on purpose: did the fix hold, and do the chosen values still fit.
+
+- **What it is.** A child task of the task that shipped the fix, titled `Revisit: …`, with
+  a body starting `Revisit:`, `auto`, the fixed task's priority and a `not_before` about
+  14 days after the fix deployed. The body names the deploy time (counts start there), the
+  feedback items and error signatures it watches (or a route and message), the values under
+  review, and the bar for "held", such as at most two errors a week. A revisit is
+  scope the fix declared, not a proposal.
+- **Trigger.** The date, with an earlier event: when a `signal` item (the threshold reached
+  again) is routed to the revisit, triage clears its `not_before`, and it runs at once.
+- **Who declares it.** The coordinator that finishes the fix, at `task_done`, when the task
+  changed a tuned value, fixed a feedback item that recurs or that two or more agents
+  reported, or when the user asks. Routine tasks get none. One revisit per fix, and at most
+  three open revisits per board: past that, add the new watch to the open revisit due
+  soonest.
+- **Who runs it.** The coordinator of the board, in its usual loop: the task becomes ready
+  on its date. There is no new job or process.
+- **Server errors.** The server keeps its error records for `error_retention_days`
+  (default 35), apart from the signal window, which still bounds what counts toward a
+  signal. `GET /v1/errors` and `board errors --since <time>` list, per signature, the code,
+  route, normalized message, count, distinct agents, first and last time, and the feedback
+  item that took them. That is where errors under the signal threshold are counted and
+  shown; the revisit copies the counts into its outcome.
+- **Client refusals.** The CLI refuses over-long text before sending, so the server never
+  sees it. The CLI reports each refusal, best effort, to the server, which records it with
+  its own errors (source `client`), so signals and revisits both count it. MCP calls reach
+  the server already. A client that checks a schema itself and never sends is not counted;
+  friction capture covers it.
+- **Friction reports.** Their free text gives each a different signature, so the server
+  cannot link them. Triage does: a report that repeats a problem whose fix has an open
+  revisit is resolved `routed` to the revisit task. Later reports of that item then land on
+  the revisit too. The revisit counts the items routed to it and their reports.
+- **Outcome.** The coordinator counts the errors since the deploy, reads the items routed
+  to the revisit and decides:
+  - `held`: under the bar.
+  - `adjust`: over the bar, or the values no longer fit (for example, agents write up to the
+    limit and overshoot it by a few characters). It files a proposal, a child of the
+    revisit, with the counts and the change. A value the user chose goes to the user
+    instead: an ask with the counts and a recommendation.
+
+  It records a `decision` note starting `revisit: held` or `revisit: adjust`, with the
+  counts, the window and the bar, on the fixed task and on each watched feedback item, so
+  their reporters see the answer. Then it calls `task_done` with the counts as evidence. A
+  shipped adjustment gets its own revisit; a second adjustment of one value in a row goes
+  to the user.
+- **Noise.** Revisits are declared, never automatic; the cap and one per fix bound them. A
+  held revisit reaches the user only as its `task_done` summary. Nothing new reaches the
+  phone.
+- **Any board.** Revisits use only tasks, `not_before`, notes and the error log, so every
+  board can declare them. When the measure is not an API error (a benchmark choice, for
+  example), the body names the command that measures it; the outcome rules stay the same.
+
+Alternatives dropped:
+
+- **A server job that re-checks every resolved feedback item** some days after its routed
+  task closes. Most items are one-offs, so it files noise, and a server cannot judge
+  whether a value needs adjusting.
+- **A `revisit_at` field set at `task_done`.** A wire change that does what a child task
+  with `not_before` already does, and it would not show in task lists.
+- **A `revisit:` note alone.** Nothing brings it back.
+- **The metric trigger alone** (the existing recurrence). It misses problems under the
+  threshold and never confirms that a fix held. It stays, as the early trigger.
+- **Matching friction reports by a normalized title.** Reports of one problem differ in
+  wording.
+- **Leaving revisits to a weekly review in another repository.** It ties the board to that
+  repository, and a review sees counts, not the decision behind a value.
+
 ## Security
 
 - Private network only; device tokens; the user identity from Tailscale for the web view.
@@ -604,7 +839,9 @@ report, not a free-form task (`API.md`, "Feedback"):
 - Devices: `board login` stores the server URL and token; `board install claude` adds the
   hooks and MCP server to Claude Code's user settings; `board watch` runs under launchd or
   systemd, one per `$BOARD_HOME`: it holds a lock on `state/watch.lock` while it runs, and
-  a second one exits naming the first one's pid.
+  a second one exits naming the first one's pid. It serves the hook relay on
+  `run/hook.sock` (see Network, auth and offline behaviour), replaces a socket left by a
+  daemon that died, and removes it when it stops.
 
 ## Testing
 
@@ -613,6 +850,7 @@ report, not a free-form task (`API.md`, "Feedback"):
 - Concurrency: many parallel claims of one task; exactly one wins.
 - API contract tests through the HTTP layer; CLI and MCP tests against an in-process server.
 - Hook tests with recorded Claude Code and Codex payloads; timeouts against an unreachable
-  server; size caps.
+  server; size caps; the hook relay (socket modes, forwarded identity and token, refused
+  routes) and the fallback to direct calls.
 - A two-device end-to-end test; a restore drill; live tests with a real Claude Code session in
   the consuming setup.

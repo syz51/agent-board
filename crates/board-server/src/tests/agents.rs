@@ -1,3 +1,4 @@
+use board_proto::Timestamp;
 use chrono::TimeDelta;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -209,7 +210,7 @@ async fn handoffs_carry_the_agents_last_change() {
 }
 
 #[tokio::test]
-async fn ended_agents_release_leases_and_coordinator() {
+async fn ended_agents_release_file_leases_and_keep_the_coordinator_lease() {
     let t = T::new();
     let a = "t3:alpha";
     t.register(a, Some(REPO), None).await;
@@ -250,10 +251,20 @@ async fn ended_agents_release_leases_and_coordinator() {
         .await;
     assert_eq!(ended["state"], "ended");
     assert_eq!(t.count("SELECT COUNT(*) FROM leases"), 0);
-    assert_eq!(
-        t.ok("GET", "/v1/boards/auto", None, None).await["coordinator"],
-        json!(null)
-    );
+    // T3 ends an idle session while its thread lives on: the coordinator lease runs on
+    // until the daemon renews or releases it, or it expires.
+    let coordinator =
+        async || t.ok("GET", "/v1/boards/auto", None, None).await["coordinator"].clone();
+    assert_eq!(coordinator().await, json!(a));
+    let events = t.ok("GET", "/v1/events?board=auto", None, None).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "board_updated")
+        .count();
+    assert_eq!(events, 1, "only the claim: ending changes no coordinator");
+    t.advance(TimeDelta::minutes(46));
+    assert_eq!(coordinator().await, json!(null), "not renewed while ended");
     let (s, _) = t
         .call(
             "POST",
@@ -466,6 +477,68 @@ async fn registering_an_agent_that_is_not_running_announces_it_running() {
     t.register(a, Some(REPO), None).await;
     assert_eq!(t.count(changes), 4);
     assert_eq!(t.strings(last), ["paused>running"]);
+}
+
+#[tokio::test]
+async fn a_usage_limit_outlasts_the_session_that_stopped_on_it() {
+    let t = T::new();
+    let a = "t3:limited";
+    t.register(a, Some(REPO), None).await;
+    let path = format!("/v1/agents/{a}/state");
+    let agent = format!("/v1/agents/{a}");
+    let last_until = "SELECT json_extract(payload, '$.to') || ' ' || \
+                      COALESCE(json_extract(payload, '$.paused_until'), '-') \
+                      FROM events WHERE type = 'agent_state_changed' ORDER BY seq DESC LIMIT 1";
+    let reset = t.state.now() + TimeDelta::hours(6);
+    t.ok(
+        "POST",
+        &path,
+        Some(a),
+        Some(json!({ "state": "paused", "paused_until": reset.to_rfc3339() })),
+    )
+    .await;
+
+    // T3 closes the idle session: ended, still waiting for the reset, and announced so.
+    t.advance(TimeDelta::minutes(30));
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    let ended = t.ok("GET", &agent, None, None).await;
+    assert_eq!(ended["state"], "ended", "{ended}");
+    let kept: Timestamp = serde_json::from_value(ended["paused_until"].clone()).unwrap();
+    assert_eq!(kept, reset);
+    let row = t.strings(last_until);
+    let (to, until) = row[0].split_once(' ').unwrap();
+    assert_eq!(to, "ended");
+    assert_eq!(
+        serde_json::from_value::<Timestamp>(json!(until)).unwrap(),
+        reset
+    );
+
+    // A second session end keeps it too; once the reset is past, an end clears it.
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    let again = t.ok("GET", &agent, None, None).await;
+    assert_eq!(again["paused_until"], ended["paused_until"], "{again}");
+    t.advance(TimeDelta::hours(6));
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    let past = t.ok("GET", &agent, None, None).await;
+    assert!(past["paused_until"].is_null(), "{past}");
+
+    // Resumed: a session start clears the reset.
+    t.ok(
+        "POST",
+        &path,
+        Some(a),
+        Some(json!({ "state": "paused", "paused_until": (t.state.now() + TimeDelta::hours(1)).to_rfc3339() })),
+    )
+    .await;
+    t.ok("POST", &path, Some(a), Some(json!({ "state": "ended" })))
+        .await;
+    t.register(a, Some(REPO), None).await;
+    let resumed = t.ok("GET", &agent, None, None).await;
+    assert_eq!(resumed["state"], "running", "{resumed}");
+    assert!(resumed["paused_until"].is_null(), "{resumed}");
 }
 
 #[tokio::test]

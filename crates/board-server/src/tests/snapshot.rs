@@ -861,6 +861,452 @@ fn sweep_quiet_reviews(t: &T) -> usize {
         .unwrap()
 }
 
+async fn set_state(t: &T, agent: &str, state: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": state })),
+    )
+    .await;
+}
+
+fn sweep_idle_doing(t: &T) -> usize {
+    t.state
+        .db()
+        .write(
+            || t.state.now(),
+            t.state.settings(),
+            crate::ops::tasks::announce_idle_doing,
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_owner_away_from_its_doing_task_is_announced_once_per_spell() {
+    let t = T::new();
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Long job").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    snapshot(&t, owner, "kind=delta").await;
+    set_state(&t, owner, "idle").await;
+
+    // Seen since (a snapshot) is not being back: the spell runs from the stop.
+    t.advance(TimeDelta::minutes(20));
+    snapshot(&t, owner, "kind=delta").await;
+    assert_eq!(sweep_idle_doing(&t), 0, "20 minutes away");
+    t.advance(TimeDelta::minutes(11));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    assert_eq!(sweep_idle_doing(&t), 0, "once per spell");
+    let delta = snapshot(&t, owner, "kind=delta").await;
+    // The alert names the owner by its short handle.
+    let handle = handle(&t, owner);
+    assert!(
+        text(&delta).contains(&format!(
+            "{id} sat in doing while {handle} was away for 31m"
+        )) && text(&delta).contains(&format!("continue {id}, or park it")),
+        "{}",
+        text(&delta)
+    );
+
+    // The session closing later is the same spell.
+    set_state(&t, owner, "ended").await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0);
+
+    // Back at work, then stopped again: a new spell.
+    t.register(owner, Some(REPO), None).await;
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(29));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::minutes(2));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // Out of doing: never announced.
+    let review = json!({ "status": "review" });
+    assert!(t.patch(owner, &id, review).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_idle_doing(&t), 0);
+}
+
+#[tokio::test]
+async fn an_owner_left_marked_running_is_away_once_unseen_for_the_period() {
+    let t = T::new();
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Cut short").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    t.advance(TimeDelta::minutes(29));
+    assert_eq!(sweep_idle_doing(&t), 0, "running and seen recently");
+    t.advance(TimeDelta::minutes(2));
+    assert_eq!(sweep_idle_doing(&t), 1);
+}
+
+#[tokio::test]
+async fn a_delegate_at_work_or_a_paused_board_holds_the_announcement() {
+    let t = T::new();
+    let (parent, child, grandchild) = ("t3:parent", "t3:child", "t3:grandchild");
+    t.register(parent, Some(REPO), None).await;
+    for (agent, up) in [(child, parent), (grandchild, child)] {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(agent),
+            Some(json!({
+                "id": agent, "runtime": "claude", "device": "mac", "repo": REPO,
+                "native_ids": {"t3_thread": &agent[3..], "t3_parent": &up[3..]},
+            })),
+        )
+        .await;
+    }
+    t.board("factory", &[REPO]).await;
+    let id = t.task(parent, "factory", "Delegated").await;
+    assert!(t.claim(parent, &id).await.0.is_success());
+    set_state(&t, parent, "idle").await;
+    set_state(&t, child, "idle").await;
+
+    // The child waits on the grandchild, which works: the parent is not away from the task.
+    t.advance(TimeDelta::minutes(25));
+    t.register(grandchild, Some(REPO), None).await;
+    t.advance(TimeDelta::minutes(10));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    // A grandchild paused until a reset still to come is at work too.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{grandchild}/state"),
+        Some(grandchild),
+        Some(json!({ "state": "paused", "paused_until": t.state.now() + TimeDelta::hours(1) })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    // Past the reset and unseen: nobody is at work.
+    t.advance(TimeDelta::minutes(30));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // A paused board: its work is meant to stand still.
+    let owner = "t3:gamma";
+    t.register(owner, Some(REPO), None).await;
+    t.board("quiet", &[REPO]).await;
+    let other = t.task(owner, "quiet", "Paused board").await;
+    assert!(t.claim(owner, &other).await.0.is_success());
+    t.ok(
+        "PATCH",
+        "/v1/boards/quiet",
+        None,
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::hours(1));
+    assert_eq!(sweep_idle_doing(&t), 0);
+}
+
+fn handle(t: &T, agent: &str) -> String {
+    t.strings(&format!("SELECT handle FROM agents WHERE id = '{agent}'"))
+        .remove(0)
+}
+
+/// The idle notices recorded, oldest first, each as `<task> <away>`.
+fn idle_notices(t: &T) -> Vec<String> {
+    t.strings(
+        "SELECT task || ' ' || json_extract(payload, '$.away') FROM events \
+         WHERE json_extract(payload, '$.idle_doing') IS NOT NULL ORDER BY seq",
+    )
+}
+
+async fn pause_until(t: &T, agent: &str, state: &str, until: chrono::DateTime<chrono::Utc>) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": state, "paused_until": until })),
+    )
+    .await;
+}
+
+/// The autopilot board `auto`, its coordinator lease held for `coordinator` from `mac`.
+async fn autopilot_board(t: &T, coordinator: &str) {
+    t.register(coordinator, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    renew_lease(t, coordinator).await;
+}
+
+/// What the device daemon does every 10 minutes while the coordinator's thread lives.
+async fn renew_lease(t: &T, coordinator: &str) {
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_idle_notice_reads_as_one_in_recent_activity() {
+    let t = T::new();
+    let (owner, peer) = ("t3:alpha", "t3:beta");
+    t.register(owner, Some(REPO), None).await;
+    t.register(peer, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Long job").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    assert_eq!(idle_notices(&t), [format!("{id} {owner}")]);
+    let full = snapshot(&t, peer, "kind=full").await;
+    let full = text(&full);
+    assert!(
+        full.contains(&format!("server found {owner} away from {id}")),
+        "{full}"
+    );
+    assert!(!full.contains("handed"), "{full}");
+}
+
+#[tokio::test]
+async fn an_owner_left_running_then_ended_is_announced_once() {
+    let t = T::new();
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Cut short").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    // T3 closes the session later: its end is no new spell.
+    set_state(&t, owner, "ended").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::hours(3));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    assert_eq!(idle_notices(&t).len(), 1);
+
+    // Running again and stopping is a new spell.
+    t.register(owner, Some(REPO), None).await;
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+}
+
+#[tokio::test]
+async fn an_owner_or_delegate_waiting_for_a_usage_limit_reset_is_not_away() {
+    let t = T::new();
+    let (owner, child) = ("t3:alpha", "t3:child");
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Limited").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+
+    // The owner paused on a usage limit, its session closed meanwhile: waiting, not away.
+    let reset = t.state.now() + TimeDelta::hours(2);
+    pause_until(&t, owner, "paused", reset).await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0, "paused");
+    set_state(&t, owner, "ended").await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0, "ended with the reset ahead");
+    // Past the reset and still not back: away since it stopped.
+    t.advance(TimeDelta::minutes(41));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // A delegate paused on a usage limit whose session T3 closed is still at work.
+    let parent = "t3:parent";
+    t.register(parent, Some(REPO), None).await;
+    let other = t.task(parent, "factory", "Delegated").await;
+    assert!(t.claim(parent, &other).await.0.is_success());
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(child),
+        Some(json!({
+            "id": child, "runtime": "claude", "device": "mac", "repo": REPO,
+            "native_ids": {"t3_thread": "child", "t3_parent": "parent"},
+        })),
+    )
+    .await;
+    set_state(&t, parent, "idle").await;
+    pause_until(&t, child, "paused", t.state.now() + TimeDelta::hours(2)).await;
+    set_state(&t, child, "ended").await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0, "a delegate waits for its reset");
+    t.advance(TimeDelta::minutes(81));
+    assert_eq!(sweep_idle_doing(&t), 1, "once the delegate's reset passed");
+    assert_eq!(
+        idle_notices(&t),
+        [format!("{id} {owner}"), format!("{other} {parent}")]
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_left_running_is_announced_despite_lease_renewals() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let id = t.task(coordinator, "auto", "Its own task").await;
+    assert!(t.claim(coordinator, &id).await.0.is_success());
+    let seen = || {
+        t.count(&format!(
+            "SELECT last_seen FROM agents WHERE id = '{coordinator}'"
+        ))
+    };
+    let before = seen();
+    for _ in 0..4 {
+        t.advance(TimeDelta::minutes(10));
+        renew_lease(&t, coordinator).await;
+    }
+    assert_eq!(seen(), before, "a renewal is not the agent at work");
+    assert_eq!(sweep_idle_doing(&t), 1);
+    // The lease itself was renewed.
+    let expires = t.count("SELECT coordinator_expires_at FROM boards WHERE slug = 'auto'");
+    assert!(expires > t.state.now().timestamp_millis());
+}
+
+#[tokio::test]
+async fn the_coordinator_stands_in_for_an_unwakeable_or_long_away_owner() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let (t3_owner, codex_owner) = ("t3:alpha", "codex:b");
+    t.register(t3_owner, Some(REPO), None).await;
+    t.register_as(codex_owner, "codex", Some(REPO), None).await;
+    let t3_task = t.task(t3_owner, "auto", "T3 owner").await;
+    let codex_task = t.task(codex_owner, "auto", "Codex owner").await;
+    assert!(t.claim(t3_owner, &t3_task).await.0.is_success());
+    assert!(t.claim(codex_owner, &codex_task).await.0.is_success());
+    set_state(&t, t3_owner, "idle").await;
+    set_state(&t, codex_owner, "idle").await;
+    snapshot(&t, coordinator, "kind=delta").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 2);
+    let sat = |s: &Value, task: &str| text(s).contains(&format!("{task} sat in doing"));
+
+    // Early on, a T3 owner is the daemon's to wake; a Codex owner no daemon can wake.
+    let early = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(sat(&early, &codex_task), "{}", text(&early));
+    assert!(
+        text(&early).contains(&format!("while {} was away", handle(&t, codex_owner))),
+        "{}",
+        text(&early)
+    );
+    assert!(!sat(&early, &t3_task), "{}", text(&early));
+    // Each owner hears of its own.
+    assert!(sat(&snapshot(&t, t3_owner, "kind=delta").await, &t3_task));
+    assert!(sat(
+        &snapshot(&t, codex_owner, "kind=delta").await,
+        &codex_task
+    ));
+
+    // A T3 owner away less than twice the period stays the daemon's to wake; away that long,
+    // the coordinator stands in for it too.
+    let t = T::new();
+    autopilot_board(&t, coordinator).await;
+    t.register(t3_owner, Some(REPO), None).await;
+    let t3_task = t.task(t3_owner, "auto", "T3 owner").await;
+    assert!(t.claim(t3_owner, &t3_task).await.0.is_success());
+    set_state(&t, t3_owner, "idle").await;
+    snapshot(&t, coordinator, "kind=delta").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    renew_lease(&t, coordinator).await;
+    t.advance(TimeDelta::minutes(28));
+    let early = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(!sat(&early, &t3_task), "{}", text(&early));
+
+    let t = T::new();
+    autopilot_board(&t, coordinator).await;
+    t.register(t3_owner, Some(REPO), None).await;
+    let t3_task = t.task(t3_owner, "auto", "T3 owner").await;
+    assert!(t.claim(t3_owner, &t3_task).await.0.is_success());
+    set_state(&t, t3_owner, "idle").await;
+    snapshot(&t, coordinator, "kind=delta").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    renew_lease(&t, coordinator).await;
+    t.advance(TimeDelta::minutes(29));
+    let late = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(sat(&late, &t3_task), "{}", text(&late));
+}
+
+#[tokio::test]
+async fn an_idle_notice_is_dropped_once_the_task_is_parked_or_handed_over() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    // Codex owners, so the coordinator stands in at once.
+    let (owner, giver, other) = ("codex:b", "codex:g", "t3:other");
+    t.register_as(owner, "codex", Some(REPO), None).await;
+    t.register_as(giver, "codex", Some(REPO), None).await;
+    t.register(other, Some(REPO), None).await;
+    let parked = t.task(owner, "auto", "Parked").await;
+    let handed = t.task(giver, "auto", "Handed over").await;
+    assert!(t.claim(owner, &parked).await.0.is_success());
+    assert!(t.claim(giver, &handed).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    set_state(&t, giver, "idle").await;
+    for agent in [coordinator, owner, giver, other] {
+        snapshot(&t, agent, "kind=delta").await;
+    }
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 2);
+    let blocked = json!({ "status": "blocked", "blocked_reason": "waits on CI" });
+    assert!(t.patch(owner, &parked, blocked).await.0.is_success());
+    let hand = json!({ "owner": other });
+    let (s, v) = t.patch(giver, &handed, hand).await;
+    assert!(s.is_success(), "{v}");
+    for agent in [coordinator, owner, giver, other] {
+        let delta = snapshot(&t, agent, "kind=delta").await;
+        assert!(
+            !text(&delta).contains("sat in doing"),
+            "{agent}: {}",
+            text(&delta)
+        );
+    }
+}
+
+#[tokio::test]
+async fn idle_notices_of_other_boards_stay_out_of_the_alert_scan() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let (owner, stranger) = ("t3:alpha", "t3:stranger");
+    t.register(owner, Some(REPO), None).await;
+    t.register(stranger, Some(REPO), None).await;
+    let id = t.task(owner, "auto", "Long job").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    let passes = |agent: &str, mine: &str| {
+        let sql = format!(
+            "SELECT COUNT(*) FROM events WHERE json_extract(payload, '$.idle_doing') IS NOT NULL \
+             AND {}",
+            crate::snapshot::ALERT_FILTER
+                .replace(":seq", "1000000")
+                .replace(":me", &format!("'{agent}'"))
+                .replace(":repos", "'[]'")
+                .replace(":watched", "'[]'")
+                .replace(":mine", &format!("'{mine}'"))
+                .replace(":any_mine", "0")
+        );
+        t.count(&sql)
+    };
+    assert_eq!(passes(stranger, "[]"), 0);
+    assert_eq!(passes(owner, &format!("[\"{id}\"]")), 1);
+    assert_eq!(passes(coordinator, "[]"), 1);
+}
+
 #[tokio::test]
 async fn snapshots_list_pending_proposals_apart_from_ready_work() {
     let t = T::new();
@@ -908,4 +1354,183 @@ async fn snapshots_list_pending_proposals_apart_from_ready_work() {
         yaml.contains(&format!("proposals:\n  total: 1\n  items:\n    - {{id: factory-2, priority: p2, title: \"Cache builds\", by: \"{handle}\"}}")),
         "{yaml}"
     );
+}
+
+#[tokio::test]
+async fn a_note_by_another_agent_on_my_doing_or_review_task_reaches_my_alerts() {
+    let t = T::new();
+    t.register(ME, None, None).await;
+    t.register(B, None, None).await;
+    t.board("factory", &[]).await;
+    let id = t.task(ME, "factory", "Ship it").await;
+    assert!(t.claim(ME, &id).await.0.is_success());
+    // Read up to now, so only what follows alerts.
+    snapshot(&t, ME, "kind=alerts").await;
+
+    let note = |kind: &'static str| json!({ "agent": B, "kind": kind, "text": format!("{kind}: the parser drops tabs") });
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(B),
+        Some(note("finding")),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("changed your task {id} (finding)")),
+        "{alerts}"
+    );
+    assert!(
+        alerts.contains(&format!(
+            "task_show {id}; address the finding before task_done"
+        )),
+        "{alerts}"
+    );
+    // The author is not alerted about its own note.
+    let own = text(&snapshot(&t, B, "kind=alerts").await).to_owned();
+    assert!(!own.contains("changed your task"), "{own}");
+
+    // In review, too.
+    let (s, v) = t.patch(ME, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    snapshot(&t, ME, "kind=alerts").await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(B),
+        Some(note("decision")),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("changed your task {id} (decision)")),
+        "{alerts}"
+    );
+    // No finding: the action does not ask to address one.
+    assert!(!alerts.contains("address the finding"), "{alerts}");
+}
+
+#[tokio::test]
+async fn a_finding_on_a_task_whose_owner_ended_reaches_the_coordinator() {
+    let t = T::new();
+    let (coordinator, child, reviewer) = ("t3:coord", "t3:child", "t3:reviewer");
+    for agent in [coordinator, child, reviewer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let id = t.task(child, "auto", "Wait on review").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    assert!(
+        t.patch(child, &id, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    snapshot(&t, coordinator, "kind=alerts").await;
+    let finding = json!({ "agent": reviewer, "kind": "finding", "text": "finding: off by one" });
+    let notes = format!("/v1/tasks/{id}/notes");
+    let note = || t.ok("POST", &notes, Some(reviewer), Some(finding.clone()));
+    let changed = format!("changed your task {id} (finding)");
+
+    // While the owner lives, the finding is the owner's alone.
+    note().await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(!alerts.contains(&changed), "{alerts}");
+
+    // Once the owner has ended, the coordinator gets it.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{child}/state"),
+        Some(child),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    note().await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(alerts.contains(&changed), "{alerts}");
+    // A plain note on it is not forwarded.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(reviewer),
+        Some(json!({ "agent": reviewer, "kind": "note", "text": "CI queued" })),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, coordinator, "kind=alerts").await).to_owned();
+    assert!(
+        !alerts.contains(&format!("changed your task {id}")),
+        "{alerts}"
+    );
+}
+
+#[tokio::test]
+async fn the_coordinator_sees_how_many_tasks_it_may_run_at_once() {
+    let t = T::new();
+    let (coordinator, other) = ("t3:coord", "t3:other");
+    t.register(coordinator, Some(REPO), None).await;
+    t.register(other, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let you = |s: &Value| {
+        text(s)
+            .lines()
+            .find(|l| l.starts_with("you: "))
+            .unwrap()
+            .to_owned()
+    };
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(
+        you(&full).ends_with(" · coordinator, one task at a time"),
+        "{full}"
+    );
+
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/auto",
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(
+        you(&full).ends_with(" · coordinator, up to 2 tasks at once"),
+        "{full}"
+    );
+    let yaml = snapshot(&t, coordinator, "kind=full&format=yaml").await;
+    assert!(text(&yaml).contains("  parallel_tasks: 2\n"), "{yaml}");
+
+    // Another agent on the board is not told the coordinator's limit.
+    let full = snapshot(&t, other, "kind=full").await;
+    assert!(!you(&full).contains("coordinator"), "{full}");
+
+    // Nor is a coordinator whose lease lapsed: the prompt then reads the limit as 1.
+    t.advance(super::coordinator_ttl() + TimeDelta::seconds(1));
+    let full = snapshot(&t, coordinator, "kind=full").await;
+    assert!(!you(&full).contains("coordinator"), "{full}");
 }

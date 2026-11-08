@@ -1,13 +1,16 @@
 //! Telegram notifier: sends each new ask to the chat, with its options as buttons, and
 //! long-polls the Bot API for answers (a button press, or a reply to the ask's message)
 //! from that chat only. A withdrawn ask's message is edited to say so and loses its
-//! buttons. No public endpoint is needed.
+//! buttons. No public endpoint is needed. An agent stopped by a usage limit is reported once
+//! per runtime and reset time, whichever agents stop on it, and a coordinator paused until
+//! further notice each time.
 //!
 //! Every minute it also reports tasks in doing or review that went quiet past
-//! `stuck_after_secs`, in one message per check and once until they change, and sends a
-//! daily Needs you digest at `digest_at` (skipped when there is nothing to list). Both are
-//! recorded only once sent, so an alert is never lost; a crash between the send and the
-//! record repeats it once.
+//! `stuck_after_secs`, in one message per check and once until they change; reports active
+//! autopilot boards whose ready work sat unclaimed past `stalled_after_secs`, once until
+//! the board stalls anew; and sends a daily Needs you digest at
+//! `digest_at` (skipped when there is nothing to list). Each is recorded only once sent, so
+//! an alert is never lost; a crash between the send and the record repeats it once.
 //!
 //! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
 //! the first private chat that sends `/start <code>` with a live code from `board admin
@@ -17,9 +20,10 @@
 //! The bot token is part of every Bot API URL, so request errors are logged without their
 //! URL and the token never reaches the log.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use board_proto::{AgentRole, AskStatus, Event, EventType, Timestamp};
+use board_proto::{AgentRole, AskStatus, Event, EventType, Runtime, Timestamp};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeDelta};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,9 +41,9 @@ use crate::store::{find_task, get_agent, get_ask, get_board};
 /// Long-poll timeout passed to `getUpdates`.
 const POLL_SECS: u64 = 25;
 const RETRY: Duration = Duration::from_secs(5);
-/// How often the stuck alert and the digest are checked.
+/// How often the scheduled alerts are checked.
 const CHECK_EVERY: Duration = Duration::from_secs(60);
-/// Room for the digest and stuck texts: Telegram takes at most 4,096 characters per message.
+/// Room for the digest, stuck and stalled texts: Telegram takes at most 4,096 characters per message.
 const DIGEST_CHARS: usize = 3_500;
 /// How long after its time a day's digest still goes out once the local date has turned.
 const DIGEST_GRACE_MINS: i64 = 60;
@@ -51,8 +55,9 @@ const DIGEST_LINE_CHARS: usize = 140;
 struct Schedule {
     /// 0 turns the stuck alert off.
     stuck_after_secs: u64,
+    /// 0 turns the stalled-board alert off.
+    stalled_after_secs: u64,
     digest_at: Option<NaiveTime>,
-    utc_offset: FixedOffset,
 }
 
 #[derive(Clone)]
@@ -62,6 +67,8 @@ struct Bot {
     base: String,
     /// `[telegram] chat_id`, which wins over a paired chat.
     configured: Option<i64>,
+    /// Offset that times in messages are shown in.
+    utc_offset: FixedOffset,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +181,7 @@ pub(crate) fn spawn_with(
         http,
         base: format!("{}/bot{token}", config.api_base.trim_end_matches('/')),
         configured: config.chat_id,
+        utc_offset: config.utc_offset,
     };
     if config.chat_id.is_none()
         && state
@@ -188,12 +196,15 @@ pub(crate) fn spawn_with(
     }
     let schedule = Schedule {
         stuck_after_secs: config.stuck_after_secs,
+        stalled_after_secs: config.stalled_after_secs,
         digest_at: config.digest_at,
-        utc_offset: config.utc_offset,
     };
     let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
-    // With both alerts off there is nothing to check.
-    let alerts = (schedule.stuck_after_secs > 0 || schedule.digest_at.is_some()).then(|| {
+    // With every alert off there is nothing to check.
+    let alerts = (schedule.stuck_after_secs > 0
+        || schedule.stalled_after_secs > 0
+        || schedule.digest_at.is_some())
+    .then(|| {
         tokio::spawn(alert_loop(
             state.clone(),
             bot.clone(),
@@ -221,6 +232,7 @@ async fn notify_loop(
     mut events: broadcast::Receiver<Event>,
     mut last: i64,
 ) {
+    let mut limits = Limits::default();
     loop {
         let received = tokio::select! {
             () = state.stopped() => return,
@@ -232,14 +244,14 @@ async fn notify_loop(
                     continue;
                 }
                 last = event.seq;
-                notify(&state, &bot, &event).await;
+                notify(&state, &bot, &event, &mut limits).await;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(
                     missed = n,
                     "telegram notifier fell behind the event feed; replaying"
                 );
-                if let Err(error) = replay(&state, &bot, &mut last).await {
+                if let Err(error) = replay(&state, &bot, &mut last, &mut limits).await {
                     tracing::error!(%error, after = last, "telegram replay failed");
                 }
             }
@@ -249,7 +261,7 @@ async fn notify_loop(
 }
 
 /// Notifies the stored events after `last`, advancing it.
-async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
+async fn replay(state: &AppState, bot: &Bot, last: &mut i64, limits: &mut Limits) -> Result<()> {
     loop {
         let since = *last;
         let page = state
@@ -258,7 +270,7 @@ async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
         let full = page.events.len() == events::MAX_LIMIT as usize;
         for event in &page.events {
             *last = event.seq;
-            notify(state, bot, event).await;
+            notify(state, bot, event, limits).await;
         }
         if !full {
             return Ok(());
@@ -266,11 +278,11 @@ async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
     }
 }
 
-async fn notify(state: &AppState, bot: &Bot, event: &Event) {
+async fn notify(state: &AppState, bot: &Bot, event: &Event, limits: &mut Limits) {
     let result = match event.event_type {
         EventType::AskCreated => send_ask(state, bot, event).await,
         EventType::AskWithdrawn => mark_withdrawn(state, bot, event).await,
-        EventType::AgentStateChanged => report_paused(state, bot, event).await,
+        EventType::AgentStateChanged => report_paused(state, bot, event, limits).await,
         _ => Ok(()),
     };
     if let Err(error) = result {
@@ -399,36 +411,82 @@ async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String
     Ok((ask, text))
 }
 
-/// Reports a coordinator that stopped on a usage limit.
-async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
+/// The usage-limit resets already reported. While a limit holds, every agent that runs
+/// stops on it, and one stopped agent may stop again each time it is resumed (T3 closes its
+/// idle session, and a message resumes it); the limit is reported once. A limit is told
+/// apart by its runtime and reset time. Kept in memory: a restart reports a limit still
+/// holding at most once more.
+#[derive(Debug, Default)]
+struct Limits {
+    reported: HashSet<(Runtime, Timestamp)>,
+}
+
+impl Limits {
+    /// Whether the limit was reported. Limits already reset are forgotten.
+    fn reported(&mut self, limit: (Runtime, Timestamp), now: Timestamp) -> bool {
+        self.reported.retain(|(_, reset)| *reset > now);
+        self.reported.contains(&limit)
+    }
+}
+
+/// Reports an agent stopped by a usage limit, once per limit; a coordinator paused
+/// with no reset time is reported every time, since only the user resumes it.
+async fn report_paused(
+    state: &AppState,
+    bot: &Bot,
+    event: &Event,
+    limits: &mut Limits,
+) -> Result<()> {
     if event.payload.get("to").and_then(Value::as_str) != Some("paused") {
         return Ok(());
     }
     let Ok(id) = event.actor.parse::<board_proto::AgentId>() else {
         return Ok(());
     };
-    let agent = state.read(move |cx| get_agent(cx, &id)).await?;
-    if agent.role != AgentRole::Coordinator {
+    // The event's reset, not the agent's: the agent may have moved on since.
+    let until: Option<Timestamp> = event
+        .payload
+        .get("paused_until")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    if until.is_some_and(|until| until <= state.now()) {
         return Ok(());
+    }
+    let agent = state.read(move |cx| get_agent(cx, &id)).await?;
+    let coordinator = agent.role == AgentRole::Coordinator;
+    let limit = until.map(|until| (agent.runtime, until));
+    match limit {
+        Some(limit) if limits.reported(limit, state.now()) => return Ok(()),
+        None if !coordinator => return Ok(()),
+        _ => {}
     }
     let Some(chat) = bot.chat(state).await? else {
         return Ok(());
     };
-    let until = agent
-        .paused_until
-        .map_or_else(|| "further notice".to_owned(), |t| t.to_rfc3339());
-    let boards: Vec<String> = agent.boards.iter().map(ToString::to_string).collect();
-    let text = format!(
-        "Coordinator {} ({}) is paused until {until}.",
-        agent.handle,
-        boards.join(", ")
-    );
-    bot.send(json!({ "chat_id": chat, "text": text }))
-        .await
-        .map(|_| ())
+    let who = if coordinator && !agent.boards.is_empty() {
+        let boards: Vec<String> = agent.boards.iter().map(ToString::to_string).collect();
+        format!("Coordinator {} ({})", agent.handle, boards.join(", "))
+    } else if coordinator {
+        format!("Coordinator {}", agent.handle)
+    } else {
+        format!("Agent {}", agent.handle)
+    };
+    let text = match until {
+        Some(until) => format!(
+            "Usage limit: {who} is paused until {}. Other agents that stop on this limit are \
+             not reported, and their tasks are not reported stuck before it resets.",
+            local(until, bot.utc_offset)
+        ),
+        None => format!("{who} is paused until further notice."),
+    };
+    bot.send(json!({ "chat_id": chat, "text": text })).await?;
+    // Only once sent, so a limit whose report failed is reported by the next pause on it.
+    if let Some(limit) = limit {
+        limits.reported.insert(limit);
+    }
+    Ok(())
 }
 
-/// Checks the stuck alert and the digest every `every` until the state shuts down, and
+/// Checks the scheduled alerts every `every` until the state shuts down, and
 /// counts each finished check in `checked` (tests wait on it).
 async fn alert_loop(
     state: AppState,
@@ -472,8 +530,13 @@ async fn check(state: &AppState, bot: &Bot, schedule: &Schedule) {
     {
         tracing::error!(%error, "telegram: the stuck-task alert failed; retrying at the next check");
     }
+    if schedule.stalled_after_secs > 0
+        && let Err(error) = send_stalled(state, bot, chat, schedule).await
+    {
+        tracing::error!(%error, "telegram: the stalled-board alert failed; retrying at the next check");
+    }
     if let Some(at) = schedule.digest_at
-        && let Err(error) = send_digest(state, bot, chat, at, schedule.utc_offset).await
+        && let Err(error) = send_digest(state, bot, chat, at, bot.utc_offset).await
     {
         tracing::error!(%error, "telegram: the digest failed; retrying at the next check");
     }
@@ -491,7 +554,7 @@ async fn send_stuck(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule)
     if stuck.is_empty() {
         return Ok(());
     }
-    let (text, shown) = stuck_text(state, &stuck, schedule);
+    let (text, shown) = stuck_text(state, &stuck, schedule, bot.utc_offset);
     bot.send(json!({ "chat_id": chat, "text": text })).await?;
     let sent: Vec<_> = stuck
         .into_iter()
@@ -508,6 +571,7 @@ fn stuck_text(
     state: &AppState,
     stuck: &[telegram_ops::Stuck],
     schedule: &Schedule,
+    offset: FixedOffset,
 ) -> (String, usize) {
     let threshold =
         TimeDelta::seconds(i64::try_from(schedule.stuck_after_secs).unwrap_or(i64::MAX));
@@ -523,7 +587,7 @@ fn stuck_text(
             .owner
             .as_deref()
             .map_or_else(|| "no owner".to_owned(), |h| format!("owner {h}"));
-        let since = local(task.quiet_since, schedule.utc_offset);
+        let since = local(task.quiet_since, offset);
         let last = match &task.last {
             Some((kind, actor)) => format!("Last: {kind} by {actor} at {since}."),
             None => format!("Last change at {since}."),
@@ -543,6 +607,80 @@ fn stuck_text(
             text.push_str(&format!(
                 "\n… and {} more in the next message.",
                 stuck.len() - shown
+            ));
+            break;
+        }
+        text.push_str(&item);
+        shown += 1;
+    }
+    (text.trim_end().to_owned(), shown)
+}
+
+/// Reports the autopilot boards whose ready work sits unclaimed, in one message, each once
+/// until it stalls anew. Only what was sent is recorded, so a failed send, or boards past
+/// the message's length, go in the next check's message.
+async fn send_stalled(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule) -> Result<()> {
+    let quiet_ms =
+        i64::try_from(schedule.stalled_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let stalled = state
+        .write(move |cx| telegram_ops::stalled(cx, quiet_ms))
+        .await?;
+    if stalled.is_empty() {
+        return Ok(());
+    }
+    let (text, shown) = stalled_text(state, &stalled, schedule, bot.utc_offset);
+    bot.send(json!({ "chat_id": chat, "text": text })).await?;
+    let sent: Vec<_> = stalled
+        .into_iter()
+        .take(shown)
+        .map(|b| (b.board, b.since))
+        .collect();
+    state
+        .write(move |cx| telegram_ops::record_stalled(cx, &sent))
+        .await
+}
+
+/// The stalled message, and how many of `stalled` it lists: per board, its ready count,
+/// since when it stalled, and the coordinator that holds its lease.
+fn stalled_text(
+    state: &AppState,
+    stalled: &[telegram_ops::Stalled],
+    schedule: &Schedule,
+    offset: FixedOffset,
+) -> (String, usize) {
+    let threshold =
+        TimeDelta::seconds(i64::try_from(schedule.stalled_after_secs).unwrap_or(i64::MAX));
+    let mut text = format!(
+        "Stalled: {} autopilot {} with ready work and nothing claimed for {} or more.\n",
+        stalled.len(),
+        plural(stalled.len(), "board", "boards"),
+        span(threshold),
+    );
+    let mut shown = 0;
+    for board in stalled {
+        let coordinator = match &board.coordinator {
+            Some((handle, agent_state, seen)) => format!(
+                "Coordinator {handle}: {agent_state}, last seen {}.",
+                local(*seen, offset)
+            ),
+            None => "No coordinator holds the board.".to_owned(),
+        };
+        let mut item = format!(
+            "\n{}: {} ready auto {}, no task in doing, stalled for {} (since {}).\n{coordinator}\n",
+            board.board,
+            board.ready,
+            plural(board.ready, "task", "tasks"),
+            span(state.now() - board.since),
+            local(board.since, offset),
+        );
+        if let Some(url) = state.public_url() {
+            item.push_str(&format!("{url}/boards/{}\n", board.board));
+        }
+        // The first board always fits: slugs and handles are short, and the cap leaves room.
+        if shown > 0 && text.chars().count() + item.chars().count() > DIGEST_CHARS {
+            text.push_str(&format!(
+                "\n… and {} more in the next message.",
+                stalled.len() - shown
             ));
             break;
         }

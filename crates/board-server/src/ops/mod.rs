@@ -21,8 +21,8 @@ use crate::store::agent_missing;
 
 /// Checks that `agent` is registered and records that it was seen now. For calls the agent
 /// makes as itself: one marked ended is working after all, so it is running again,
-/// announced once. Calls made for it (a device claiming the coordinator lease, the user)
-/// use [`note_agent_seen`].
+/// announced once. Calls made for it by the user use [`note_agent_seen`]; a device claiming
+/// the coordinator lease for it marks neither.
 pub(crate) fn touch_agent(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
     let state: String = cx
         .db

@@ -954,6 +954,37 @@ async fn a_long_stuck_list_continues_in_the_next_message() {
     assert_eq!(notifier.sent_after_check(&fake).await.len(), 2);
 }
 
+/// Marks `agent` stopped by a usage limit, as its hook does, until `until` (or until
+/// further notice).
+async fn pause(t: &T, agent: &str, until: Option<chrono::DateTime<chrono::Utc>>) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "paused", "paused_until": until })),
+    )
+    .await;
+}
+
+/// Marks `agent` ended, as the hook does when T3 closes its idle session.
+async fn end(t: &T, agent: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+}
+
+/// The stuck alerts among `texts`.
+fn stuck_only(texts: Vec<String>) -> Vec<String> {
+    texts
+        .into_iter()
+        .filter(|text| text.starts_with("Stuck:"))
+        .collect()
+}
+
 #[tokio::test]
 async fn finished_and_paused_tasks_are_not_reported() {
     let (fake, api_base) = fake_api().await;
@@ -968,25 +999,66 @@ async fn finished_and_paused_tasks_are_not_reported() {
     // Done before the threshold, and the done event itself: no message.
     assert!(t.done(A, &done, super::check(0)).await.0.is_success());
     assert!(t.claim(A, &paused).await.0.is_success());
-    // The coordinator stops on a usage limit: the pause has its own message.
-    let until = (t.state.now() + stuck_after() * 3).timestamp_millis();
-    t.exec(&format!(
-        "UPDATE agents SET role = 'coordinator', state = 'paused', paused_until = {until} \
-         WHERE id = '{A}'"
-    ));
+    // The owner stops on a usage limit, which has its own message; T3 closes its idle
+    // session meanwhile.
+    let reset = t.state.now() + stuck_after() * 3;
+    pause(&t, A, Some(reset)).await;
+    t.advance(TimeDelta::minutes(30));
+    end(&t, A).await;
     t.advance(stuck_after() * 2);
-    assert_eq!(notifier.sent_after_check(&fake).await, Vec::<String>::new());
-    // Past the reset the paused task is reported; the done one never is.
-    t.advance(stuck_after() * 2);
-    let sent = fake.wait("sendMessage", 1).await;
-    let text = sent[0]["text"].as_str().unwrap();
-    assert!(text.contains(&format!("\n{paused} doing")), "{text}");
-    assert!(!text.contains(done.as_str()), "{text}");
-    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // Reset less than a quiet period ago: T3 has just resumed it.
+    t.advance(stuck_after() * 3 / 2);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // Quiet for a whole period after the reset: reported; the done task never is.
+    t.advance(stuck_after());
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{paused} doing")), "{texts:?}");
+    assert!(!texts[0].contains(done.as_str()), "{texts:?}");
+    assert_eq!(stuck_only(notifier.sent_after_check(&fake).await), texts);
 }
 
 #[tokio::test]
-async fn only_a_paused_coordinator_holds_back_its_stuck_tasks() {
+async fn an_owner_resumed_before_the_reset_restarts_the_quiet_time_then() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    let task = t.task(A, "factory", "Wait for the reset").await;
+    assert!(t.claim(A, &task).await.0.is_success());
+    let mut notifier = Scheduled::start(&t, api_base, |_| {});
+
+    // A weekly limit, days away; the user resumes the owner on another account at once.
+    pause(&t, A, Some(t.state.now() + TimeDelta::days(3))).await;
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "running" })),
+    )
+    .await;
+    t.advance(stuck_after() / 2);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // A whole quiet period after the resume, not the reset: reported.
+    t.advance(stuck_after());
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{task} doing")), "{texts:?}");
+}
+
+#[tokio::test]
+async fn a_coordinator_paused_until_further_notice_holds_back_its_tasks() {
     const W: &str = "t3:worker";
     let (fake, api_base) = fake_api().await;
     let t = T::new();
@@ -997,22 +1069,406 @@ async fn only_a_paused_coordinator_holds_back_its_stuck_tasks() {
     assert!(t.claim(A, &coordinator).await.0.is_success());
     let worker = t.task(A, "factory", "Build it").await;
     assert!(t.claim(W, &worker).await.0.is_success());
-    // A worker's pause has no message of its own, so its task is reported. A coordinator
-    // paused until further notice holds its task back.
-    let until = (t.state.now() + stuck_after() * 3).timestamp_millis();
+    // With no reset time only the user resumes them: a coordinator's pause is reported and
+    // holds its task back; a worker's is not reported, so its task is.
     t.exec(&format!(
-        "UPDATE agents SET state = 'paused', paused_until = {until} WHERE id = '{W}';
-         UPDATE agents SET role = 'coordinator', state = 'paused', paused_until = NULL \
-         WHERE id = '{A}';"
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
     ));
+    pause(&t, A, None).await;
+    pause(&t, W, None).await;
     let mut notifier = Scheduled::start(&t, api_base, |_| {});
 
     t.advance(stuck_after() * 2);
+    let texts = stuck_only(notifier.sent_after_check(&fake).await);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].starts_with("Stuck: 1 task "), "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{worker} doing")), "{texts:?}");
+    assert_eq!(stuck_only(notifier.sent_after_check(&fake).await), texts);
+}
+
+#[tokio::test]
+async fn a_usage_limit_is_reported_once_per_reset() {
+    const W: &str = "t3:worker";
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.register(W, None, None).await;
+    t.board("factory", &[A]).await;
+    t.exec(&format!(
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
+    ));
+    let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+    let _notifier = Scheduled::start(&t, api_base, |c| {
+        c.stuck_after_secs = 0;
+        c.utc_offset = tokyo;
+    });
+    let reset = t.state.now() + TimeDelta::hours(9);
+
+    // A report that fails to send is made by the next pause on the limit.
+    *fake.fail_sends.lock().unwrap() = 1;
+    pause(&t, A, Some(reset)).await;
+    pause(&t, A, Some(reset)).await;
+    let sent = fake.wait("sendMessage", 1).await;
+    assert_eq!(*fake.fail_sends.lock().unwrap(), 0);
+    let first = sent[0]["text"].as_str().unwrap();
+    let local = reset
+        .with_timezone(&tokyo)
+        .format("%Y-%m-%d %H:%M +09:00")
+        .to_string();
+    assert!(first.starts_with("Usage limit: Coordinator "), "{first}");
+    assert!(
+        first.contains(&format!(" is paused until {local}. Other agents")),
+        "{first}"
+    );
+
+    // While the limit holds: its session ends, a wake resumes it and it stops again, and a
+    // worker stops on the same limit. None of it is reported again.
+    for _ in 0..3 {
+        t.advance(TimeDelta::minutes(30));
+        end(&t, A).await;
+        t.register(A, None, None).await;
+        pause(&t, A, Some(reset)).await;
+    }
+    pause(&t, W, Some(reset)).await;
+    // Another limit, with its own reset, is reported, for a worker too.
+    pause(&t, W, Some(reset + TimeDelta::hours(1))).await;
+    let sent = fake.wait("sendMessage", 2).await;
+    let second = sent[1]["text"].as_str().unwrap();
+    assert!(second.starts_with("Usage limit: Agent "), "{second}");
+    // A coordinator paused until further notice is reported each time; a worker is not.
+    pause(&t, W, None).await;
+    // (Registering again made it a worker: no board names it coordinator.)
+    t.exec(&format!(
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
+    ));
+    pause(&t, A, None).await;
+    pause(&t, A, None).await;
+    let sent = fake.wait("sendMessage", 4).await;
+    for message in &sent[2..] {
+        let text = message["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Coordinator ") && text.ends_with(" is paused until further notice."),
+            "{text}"
+        );
+    }
+    // Events are notified in order, so nothing earlier is still on its way.
+    assert_eq!(texts(&fake).len(), 4, "{:?}", texts(&fake));
+}
+
+fn stalled_after() -> TimeDelta {
+    TimeDelta::seconds(i64::try_from(TelegramConfig::default().stalled_after_secs).unwrap())
+}
+
+/// Switches autopilot on for `board`, with `A` holding its coordinator lease.
+fn autopilot(t: &T, board: &str) {
+    let expires = (t.state.now() + TimeDelta::days(365)).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET autopilot = 1, coordinator = '{A}', \
+         coordinator_expires_at = {expires} WHERE slug = '{board}'"
+    ));
+}
+
+/// One check of the stalled boards, without sending: the boards due an alert.
+async fn stalled_now(t: &T) -> Vec<String> {
+    let quiet_ms = stalled_after().num_milliseconds();
+    t.state
+        .write(move |cx| crate::ops::telegram::stalled(cx, quiet_ms))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.board)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_stalled_autopilot_board_is_reported_once_until_a_claim() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::with(|c| c.public_url = Some("https://board.example".to_owned()));
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    let first = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Ready work", "auto": true }),
+        )
+        .await;
+    let mut notifier = Scheduled::start(&t, api_base, |c| c.stuck_after_secs = 0);
+    // The first check sees the board stalled; the clock starts there.
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    // Just under the threshold: nothing.
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 1).await;
+    assert_eq!(sent[0]["chat_id"], CHAT);
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "Stalled: 1 autopilot board with ready work and nothing claimed for 2 h 0 min or \
+             more.\n\nfactory: 1 ready auto task, no task in doing, stalled for 2 h 1 min \
+             (since "
+        ),
+        "{text}"
+    );
+    assert!(text.contains(").\nCoordinator t3:"), "{text}");
+    assert!(text.contains(", last seen "), "{text}");
+    assert!(
+        text.ends_with("https://board.example/boards/factory"),
+        "{text}"
+    );
+    // Still stalled: no repeat.
+    t.advance(stalled_after() * 2);
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+
+    // A claim ends it; work in doing never stalls, however long it takes.
+    assert!(t.claim(A, &first).await.0.is_success());
+    let second = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "More work", "auto": true }),
+        )
+        .await;
+    t.advance(stalled_after() * 3);
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+
+    // Once the work is done and the rest sits unclaimed again, it is reported again.
+    assert!(t.done(A, &first, super::check(0)).await.0.is_success());
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 2).await;
+    let text = sent[1]["text"].as_str().unwrap();
+    assert!(text.contains("\nfactory: 1 ready auto task,"), "{text}");
+    assert!(
+        !text.contains(&second),
+        "tasks are counted, not listed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_board_stalls_from_when_its_work_became_claimable() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    // Ready auto work, but no autopilot yet.
+    t.board("manual", &[]).await;
+    t.task_with(
+        A,
+        json!({ "board": "manual", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // Autopilot, but only work that waits on the user.
+    t.board("waits", &[]).await;
+    autopilot(&t, "waits");
+    t.task_with(
+        A,
+        json!({ "board": "waits", "title": "Decide", "auto": false }),
+    )
+    .await;
+    // Autopilot and ready auto work, but a task in doing.
+    t.board("busy", &[]).await;
+    autopilot(&t, "busy");
+    let doing = t.task(A, "busy", "In progress").await;
+    assert!(t.claim(A, &doing).await.0.is_success());
+    t.task_with(A, json!({ "board": "busy", "title": "Next", "auto": true }))
+        .await;
+    // Autopilot and an empty board.
+    t.board("fresh", &[]).await;
+    autopilot(&t, "fresh");
+    let mut notifier = Scheduled::start(&t, api_base, |c| c.stuck_after_secs = 0);
+
+    t.advance(stalled_after() * 3);
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    // Work that just became claimable is the coordinator's to claim first, however long
+    // the board was quiet or the work waited: a new task, and old work on a board that
+    // just switched autopilot on.
+    t.task_with(A, json!({ "board": "fresh", "title": "New", "auto": true }))
+        .await;
+    autopilot(&t, "manual");
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+    t.advance(TimeDelta::minutes(2));
     let sent = fake.wait("sendMessage", 1).await;
     let text = sent[0]["text"].as_str().unwrap();
-    assert!(text.starts_with("Stuck: 1 task "), "{text}");
-    assert!(text.contains(&format!("\n{worker} doing")), "{text}");
-    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    assert!(text.starts_with("Stalled: 2 autopilot boards "), "{text}");
+    assert!(text.contains("\nfresh: 1 ready auto task,"), "{text}");
+    assert!(text.contains("\nmanual: 1 ready auto task,"), "{text}");
+}
+
+#[tokio::test]
+async fn a_move_through_doing_between_checks_restarts_the_clock() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    let id = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Ready", "auto": true }),
+        )
+        .await;
+    assert!(stalled_now(&t).await.is_empty());
+
+    // Into doing (here without an event) and out by a status change, both between two
+    // checks.
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    t.exec(&format!(
+        "UPDATE tasks SET status = 'doing', owner = '{A}' WHERE id = '{id}'"
+    ));
+    let (s, v) = t.patch(A, &id, json!({ "status": "open" })).await;
+    assert!(s.is_success(), "{v}");
+    t.advance(TimeDelta::minutes(2));
+    assert!(stalled_now(&t).await.is_empty());
+    // A claim and a release do the same.
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert!(t.claim(A, &id).await.0.is_success());
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/release"),
+        Some(A),
+        Some(json!({ "agent": A })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(2));
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after());
+    assert_eq!(stalled_now(&t).await, ["factory"]);
+}
+
+#[tokio::test]
+async fn a_paused_or_absent_coordinator_decides_whether_a_board_stalls() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // The coordinator stops on a usage limit until further notice: its pause has its own
+    // message, so the board does not stall.
+    t.exec(&format!(
+        "UPDATE agents SET role = 'coordinator', state = 'paused', paused_until = NULL \
+         WHERE id = '{A}'"
+    ));
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() * 2);
+    assert!(stalled_now(&t).await.is_empty());
+
+    // Its lease runs out: no coordinator holds the board, so the clock starts.
+    let expired = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET coordinator_expires_at = {expired} WHERE slug = 'factory'"
+    ));
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    let quiet_ms = stalled_after().num_milliseconds();
+    let due = t
+        .state
+        .write(move |cx| crate::ops::telegram::stalled(cx, quiet_ms))
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].coordinator, None);
+}
+
+#[tokio::test]
+async fn a_coordinator_ended_during_a_limit_holds_its_board_until_the_reset() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // T3 closed its session while it waited for the reset, and the daemon named it
+    // coordinator again: it keeps the reset, so the board does not stall before it.
+    let reset = t.state.now() + stalled_after() * 2;
+    pause(&t, A, Some(reset)).await;
+    end(&t, A).await;
+    autopilot(&t, "factory");
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() * 3 / 2);
+    assert!(stalled_now(&t).await.is_empty());
+
+    // From the reset on, the clock runs.
+    t.advance(stalled_after());
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    assert_eq!(stalled_now(&t).await, ["factory"]);
+}
+
+#[tokio::test]
+async fn a_new_chat_gets_the_stalled_alert_and_a_long_list_continues() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    let slug = |n: usize| format!("{}-{n:02}", "s".repeat(36));
+    for n in 0..30 {
+        t.board(&slug(n), &[]).await;
+        autopilot(&t, &slug(n));
+        t.task_with(
+            A,
+            json!({ "board": slug(n), "title": "Ready", "auto": true }),
+        )
+        .await;
+    }
+    let mut notifier = Scheduled::start(&t, api_base, |c| c.stuck_after_secs = 0);
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    let sent = fake.wait("sendMessage", 2).await;
+    let listed = |text: &str| {
+        text.lines()
+            .filter(|l| l.starts_with("ssss"))
+            .map(|l| l.split(':').next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let first = sent[0]["text"].as_str().unwrap();
+    assert!(
+        first.starts_with("Stalled: 30 autopilot boards "),
+        "{first}"
+    );
+    assert!(first.chars().count() <= 4096, "{first}");
+    let shown = listed(first);
+    assert!(!shown.is_empty() && shown.len() < 30, "{first}");
+    assert!(
+        first.ends_with(&format!(
+            "… and {} more in the next message.",
+            30 - shown.len()
+        )),
+        "{first}"
+    );
+    let mut all: Vec<_> = shown
+        .into_iter()
+        .chain(listed(sent[1]["text"].as_str().unwrap()))
+        .collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 30);
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 2);
+
+    // A new chat is paired: it gets the alert too, without waiting the threshold again.
+    let code = t
+        .state
+        .write(|cx| crate::ops::telegram::create_code(cx, true))
+        .await
+        .unwrap();
+    assert!(
+        t.state
+            .write(move |cx| crate::ops::telegram::redeem(cx, &code, 7))
+            .await
+            .unwrap()
+    );
+    assert_eq!(stalled_now(&t).await.len(), 30);
 }
 
 #[tokio::test]

@@ -59,6 +59,7 @@ by default; set them in `[telegram]` and restart the container:
 ```toml
 [telegram]
 stuck_after_secs = 14400   # report a doing or review task quiet this long, once; 0 = off
+stalled_after_secs = 7200  # report an autopilot board whose ready work sat unclaimed this long; 0 = off
 digest_at = "09:00"        # daily Needs you digest at this local time; "off" = off
 utc_offset = "+08:00"      # the local time's offset from UTC (fixed: no daylight saving)
 ```
@@ -66,7 +67,9 @@ utc_offset = "+08:00"      # the local time's offset from UTC (fixed: no dayligh
 The first digest goes out at the first check past `digest_at` after the upgrade, which can
 be right away; days with nothing to list send nothing. Set `utc_offset`: without it,
 `digest_at` is read as UTC. The first check after the upgrade also reports every task
-already quiet past `stuck_after_secs`, in one message.
+already quiet past `stuck_after_secs`, in one message. A board's stalled clock starts at the
+first check that sees it stalled, so an autopilot board already stalled at the upgrade is
+reported `stalled_after_secs` later.
 
 To upgrade, use `deploy/upgrade.sh` (section 5). Migrations run on start. Since pairing
 came in, `BOARD_TELEGRAM_TOKEN` alone starts the notifier, without a `[telegram]` table; it
@@ -98,12 +101,20 @@ a desktop session (a login over SSH, or a locked Keychain), `board login` stores
 Each `$BOARD_HOME` keeps its own token, so a second login with another `BOARD_HOME` (for
 the `--user` token you answer asks with) does not replace the device's token.
 
+While `board watch` runs, hooks reach the server through it, on the socket
+`$BOARD_HOME/run/hook.sock`, and skip the TLS handshake and the token lookup. It follows a
+new `board login` by itself. After upgrading `board`, restart it: until then hooks pass the
+older daemon by and call the server directly, as they do without one.
+
 ### Coordinators and the feedback board
 
 A board with autopilot on gets a coordinator thread on one of its home devices, in a T3
 project on that device. `board watch` finds the project in the device's
 `$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
+A running `board watch` re-reads the file within a minute of an edit and applies these two
+tables and `feedback_board` without a restart; a change to `server`, `device` or `t3_bin`
+needs one, and the daemon's log says so.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
@@ -167,6 +178,28 @@ commit SHA on `main`, or a `v*` release tag whose commit is on `main`. Both are 
 against the repository the hosts install from (`BOARD_GIT_URL`, default this one on
 GitHub), not against the clone's own remotes.
 
+The server runs the image CI publishes for each push to `main`, once every other check
+passes: `ghcr.io/syz51/agent-board:sha-<commit>` (built on a GitHub-hosted runner, smoke
+tested, with build provenance). When a run with `--yes` upgrades the server, the script
+checks that provenance on the device it runs on with `gh attestation verify`: the image
+must come from this repository's `ci.yml`, from that commit on `main`, on a GitHub-hosted
+runner. The server then pulls the image by the verified digest, so it runs exactly what
+was checked. The device needs `gh`, logged in (`gh auth login`); the server needs to reach
+`ghcr.io`. A plan without `--yes`, and a rerun that only finishes the devices, do not call
+`gh`. `BOARD_IMAGE` (default `ghcr.io/syz51/agent-board`) names another image for a fork.
+
+`--build` builds the image on the server instead, as before (minutes of full CPU on a
+small host). Pass it when there is no image to pull:
+
+- The server is not linux/amd64. CI publishes that platform only.
+- The commit's CI run was cancelled or has not finished: wait for the `image` job, upgrade
+  to a later commit, or build.
+- The commit was never the head of a push to `main`: a commit in the middle of a pushed
+  range, a `v*` tag on such a commit, or a commit from before CI published images.
+
+The rollback command the script prints passes `--build`, so it works for any earlier
+commit.
+
 ```sh
 deploy/upgrade.sh 0123456789abcdef0123456789abcdef01234567          # print the plan only
 deploy/upgrade.sh --yes 0123456789abcdef0123456789abcdef01234567    # apply it
@@ -194,17 +227,22 @@ nothing. With `--yes` it:
    that died, and is replaced.
 2. Refuses a revision older than any host's current one, so a late run cannot install an
    older build. `--rollback` allows it on purpose.
-3. On the server, checks out the revision (a detached `HEAD`) and builds the image while
-   the old server keeps running. A failed build puts the clone back.
-4. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
+3. Verifies the image's provenance, unless the server already runs the revision or
+   `--build` is given.
+4. On the server, checks out the revision (a detached `HEAD`) and pulls the verified image
+   and tags it `agent-board:local` (or builds it with `--build`) while the old server keeps
+   running. A failed pull or build puts the clone and the tag back.
+5. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
    admin backup` in the running container, and checks it is not empty. It keeps the five
-   newest of these copies; the backup timer keeps the history.
-5. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
-   reports that commit.
-6. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
+   newest of these copies; the backup timer keeps the history. A failed backup puts the
+   clone and the tag back.
+6. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
+   reports that commit. Then it removes the image the old container ran; it removes no
+   other image.
+7. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
    it is already installed, restarts `board watch` (launchd or the systemd user unit), and
    checks `cargo install --list`.
-7. Prints each device's revision, the previous ones, and the rollback command.
+8. Prints each device's revision, the previous ones, and the rollback command.
 
 It stops at the first failed step and says what to do next. A failed server step leaves
 every device unchanged. After any failure, fix the cause and run the same command again:

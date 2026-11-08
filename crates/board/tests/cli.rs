@@ -117,6 +117,72 @@ fn claim_posts_the_agent_and_relays_refusals_with_next() {
     assert!(stderr(&out).contains("no agent id"));
 }
 
+/// factory-12 in the task detail's shape, with `notes` as (kind, text, minute past 10:00)
+/// and a claim by `ME` at 10:05.
+fn noted_detail(notes: &[(&str, &str, u32)]) -> Value {
+    let at = |m: u32| format!("2026-11-07T10:{m:02}:00Z");
+    json!({
+        "task": task_fixture("factory-12", "Do it"),
+        "notes": notes.iter().enumerate().map(|(i, (kind, text, m))| json!({
+            "id": i + 1, "task": "factory-12", "agent": "t3:peer", "kind": kind,
+            "text": text, "at": at(*m),
+        })).collect::<Vec<_>>(),
+        "evidence": [], "blocks": [], "children": [],
+        "history": [{
+            "seq": 1, "at": at(5), "board": "factory", "actor": ME,
+            "type": "task_claimed", "task": "factory-12", "payload": {},
+        }],
+    })
+}
+
+#[test]
+fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Do it"),
+    );
+    e.stub.on(
+        "GET /v1/tasks/factory-12",
+        noted_detail(&[
+            ("finding", "checked before the claim", 1),
+            ("note", "plain", 2),
+        ]),
+    );
+    let out = e.run(&["claim", "factory-12"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "\n2 notes on factory-12 (1 finding, 0 decisions, 1 plain): task_show factory-12 and \
+             read every one before starting"
+        ),
+        "{text}"
+    );
+
+    e.stub.on(
+        "GET /v1/tasks/factory-12",
+        noted_detail(&[
+            ("finding", "checked before the claim", 1),
+            ("finding", "found after the claim", 7),
+        ]),
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-12/done",
+        task_fixture("factory-12", "Do it"),
+    );
+    let out = e.run(&["done", "factory-12", "--commit", "4e1c2ab"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("done factory-12"), "{text}");
+    assert!(
+        text.contains("\n1 finding since the claim; the task is done: for each one"),
+        "{text}"
+    );
+    assert!(text.contains("found after the claim"), "{text}");
+    assert!(!text.contains("checked before the claim"), "{text}");
+}
+
 #[test]
 fn done_reads_the_version_and_sends_paired_evidence() {
     let e = env();
@@ -496,6 +562,45 @@ fn board_create_and_update_carry_autopilot_and_home_devices() {
 }
 
 #[test]
+fn parallel_tasks_are_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.parallel_tasks = 2;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["parallel_tasks"], 2);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · 2 tasks at once"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Out of range never reaches the server.
+    for value in ["0", "5"] {
+        let out = e.run(&["board", "update", "factory", "--parallel-tasks", value]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    }
+    assert_eq!(e.stub.requests_to("PATCH /v1/boards/factory").len(), 1);
+
+    // A server that predates the setting answers without it: the user is told.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("parallel_tasks");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored parallel_tasks=2")
+            && err.contains("board board update factory --parallel-tasks 2"),
+        "{err}"
+    );
+}
+
+#[test]
 fn temporary_boards_are_created_marked_and_deleted() {
     let e = env();
     let mut scratch = board_fixture("scratch", &[]);
@@ -711,6 +816,23 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
                 fixed: 2,
             },
         },
+        since: Some(chrono::Utc::now() - chrono::TimeDelta::days(30)),
+        boards: vec![board_proto::BoardStats {
+            board: "factory".parse().unwrap(),
+            claims: 2,
+            wait_minutes_median: Some(60.0),
+            wait_minutes_p90: Some(90.0),
+            tasks_done: 1,
+            done_per_day: 9.0,
+            doing_minutes_median: Some(30.0),
+            lease_conflicts: 2,
+            reopened_after_review: 1,
+            pr_links: 1,
+            limit_pauses: 1,
+            limit_pauses_per_day: 9.0,
+            paused_hours: 0.5,
+            peak_running_at_pause: Some(2),
+        }],
     };
     e.stub.on("GET /v1/stats", &stats);
 
@@ -722,9 +844,39 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
          tasks: 5 created · 3 done (1 without a check, 2 under a minute in doing) · median n/a in doing\n\
          claims: 2 refused · 1 stale owners taken over · 4 lease conflicts\n\
          asks: 2 created · 1 answered · median 4m to answer\n\
-         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed"
+         feedback: 6 reported · 2 filed · resolved 1 routed, 0 duplicate, 0 forwarded, 1 declined, 2 fixed\n\
+         board factory: wait median 60m, p90 90m over 2 claims · 9.0 done a day, median 30m in doing · \
+         1 reopened after review · 2 lease conflicts · 1 PR link · limit: 1 pause (9.0 a day), 0.5h paused, 2 running at most when one paused"
     );
     assert_eq!(e.stub.requests_to("GET /v1/stats")[0].query, "days=7");
+
+    // A server whose history starts within the window says what the numbers cover.
+    let since = chrono::Utc::now() - chrono::TimeDelta::hours(30);
+    let mut recent = stats.clone();
+    recent.since = Some(since);
+    e.stub.on("GET /v1/stats", &recent);
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with(&format!(
+            "stats, since {}, where the server's history starts (asked: last 7 days)\n",
+            since.format("%Y-%m-%d %H:%MZ")
+        )),
+        "{}",
+        stdout(&out)
+    );
+    // A server clock a few minutes ahead of this one is not a history that starts late.
+    recent.since =
+        Some(chrono::Utc::now() - chrono::TimeDelta::days(7) + chrono::TimeDelta::minutes(5));
+    e.stub.on("GET /v1/stats", &recent);
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("stats, last 7 days\n"),
+        "{}",
+        stdout(&out)
+    );
+    e.stub.on("GET /v1/stats", &stats);
 
     // `--json` prints the server's `Stats` unchanged: the weekly review reads it.
     let out = e.run(&["stats", "--days", "30", "--json"]);
@@ -733,13 +885,85 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     assert_eq!(printed, stats);
     let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(json["doing_minutes_median"], Value::Null);
-    assert_eq!(e.stub.requests_to("GET /v1/stats")[1].query, "days=30");
+    assert_eq!(json["boards"][0]["wait_minutes_p90"], 90.0);
+    assert_eq!(e.stub.requests_to("GET /v1/stats")[3].query, "days=30");
 
     // Out-of-range days fail before any request; stats do not register the agent.
     let out = e.run(&["stats", "--days", "0"]);
     assert!(!out.status.success());
-    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 2);
+    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 4);
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
+}
+
+#[test]
+fn errors_asks_since_a_time_and_prints_one_line_per_signature_or_the_json() {
+    let e = env();
+    let at = |s: &str| s.parse::<board_proto::Timestamp>().unwrap();
+    let log = board_proto::ErrorLog {
+        since: at("2026-11-07T07:45:00Z"),
+        retention_days: 35,
+        signatures: vec![board_proto::ErrorSignature {
+            signature: "signal:invalid:0123456789ab".into(),
+            code: "invalid".into(),
+            route: "POST /v1/tasks/{id}/notes".into(),
+            template: "text is N characters; the limit is N".into(),
+            count: 2,
+            agents: 1,
+            first_at: at("2026-11-07T08:00:00Z"),
+            last_at: at("2026-11-08T09:30:00Z"),
+            item: None,
+        }],
+    };
+    e.stub.on("GET /v1/errors", &log);
+
+    let out = e.run(&[
+        "errors",
+        "--since",
+        "2026-11-07T07:45:00Z",
+        "--code",
+        "invalid",
+        "--grep",
+        "the limit",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        "API errors since 2026-11-07 07:45Z (kept 35 days)\n\
+         2 × invalid from 1 agent · POST /v1/tasks/{id}/notes · no item · \"text is N characters; the limit is N\" · last 2026-11-08 09:30Z"
+    );
+    assert_eq!(
+        e.stub.requests_to("GET /v1/errors")[0].query,
+        "since=2026-11-07T07%3A45%3A00Z&code=invalid&q=the+limit&limit=100"
+    );
+
+    // A duration counts back from now; `--json` prints the server's answer unchanged.
+    let out = e.run(&["errors", "--since", "14d", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed: board_proto::ErrorLog = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(printed, log);
+    let query = &e.stub.requests_to("GET /v1/errors")[1].query;
+    assert!(
+        query.starts_with("since=") && query.ends_with("&limit=100"),
+        "{query}"
+    );
+
+    // A since that is no time, an unknown code and an over-long grep fail before any
+    // request.
+    let grep = "x".repeat(201);
+    for (args, says) in [
+        (vec!["--since", "last week"], "duration back from now"),
+        (vec!["--since", "100000000d"], "reaches back too far"),
+        (vec!["--code", "NotFound"], "not_found"),
+        (
+            vec!["--grep", grep.as_str()],
+            "q is 201 characters; the limit is 200",
+        ),
+    ] {
+        let out = e.run(&[&["errors"][..], &args].concat());
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(e.stub.requests_to("GET /v1/errors").len(), 2);
 }
 
 #[test]
@@ -1113,6 +1337,79 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
 
 #[cfg(unix)]
 #[test]
+fn board_adopt_and_a_coordinator_whose_session_ended() {
+    let adopt = |e: &Env, thread: &str| {
+        board(
+            &e.home,
+            &e.cwd,
+            &[],
+            &["board", "adopt", "infra", thread],
+            "",
+        )
+    };
+    let ended = |e: &Env, agent: &str, device: &str| {
+        e.stub.on(
+            &format!("GET /v1/agents/{}", enc(agent)),
+            agent_fixture(agent, device, board_proto::AgentState::Ended),
+        );
+    };
+
+    // On its own device: T3 closed the idle session, the thread lives on, and the lease
+    // still names it. Adopting that thread is accepted, with nothing left to do and no need
+    // to look its agent up.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:live")));
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("t3:live already coordinates infra"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        e.stub
+            .requests_to(&format!("GET /v1/agents/{}", enc("t3:live")))
+            .is_empty()
+    );
+    // Adopting another thread there is saved for the daemon, which releases the ended
+    // coordinator's lease and adopts it (daemon test
+    // an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released).
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", DEVICE);
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+
+    // On another device: refused while that device's lease runs, with nothing changed.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", "mac-air");
+    let out = adopt(&e, "live");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("t3:old coordinates board infra from device mac-air: its session ended"),
+        "{err}"
+    );
+    assert_eq!(adoption_file(&e), None);
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty()
+    );
+    // Once the lease has expired the board names no coordinator, and the adoption goes on.
+    e.stub.on("GET /v1/boards/infra", adopt_board(true, None));
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+}
+
+#[cfg(unix)]
+#[test]
 fn board_adopt_undoes_the_adoption_when_another_device_wins_the_lease() {
     let e = adopt_env();
     e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
@@ -1336,7 +1633,7 @@ fn over_long_text_fails_before_any_request() {
         let err = stderr(&out);
         assert!(err.contains(message), "{err}");
         assert!(err.contains("\nnext: shorten"), "{err}");
-        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+        assert_only_the_refusal_was_sent(&e, &args);
     }
 
     let out = e.run(&["note", "factory-12", &"x".repeat(450)]);
@@ -1438,8 +1735,117 @@ fn other_over_long_text_fails_before_any_request() {
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let err = stderr(&out);
         assert!(err.contains(message) && err.contains(goes), "{err}");
-        assert!(e.stub.requests().is_empty(), "{args:?} reached the server");
+        assert_only_the_refusal_was_sent(&e, &args);
     }
+}
+
+/// The request refused never reached the stub: only the record of its refusal did.
+fn assert_only_the_refusal_was_sent(e: &Env, args: &[&str]) {
+    let sent = e.stub.requests();
+    let routes: Vec<String> = sent
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(routes, ["POST /v1/errors"], "{args:?}");
+    assert_eq!(sent[0].body["code"], "invalid", "{args:?}");
+    e.stub.clear();
+}
+
+const REFUSED_NOTE: &str = "board: text is 501 characters; the limit is 500 (not sent)\n\
+    next: shorten text to at most 500 characters, or split it across notes and put the \
+    detail in the task body or task_done evidence\n";
+
+#[test]
+fn a_refused_note_is_recorded_on_the_server_and_never_sent() {
+    let e = env();
+    e.stub.on_status("POST /v1/errors", 204, ());
+    let out = e.run(&["note", "factory-12", &"x".repeat(501)]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), REFUSED_NOTE);
+    assert!(stdout(&out).is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-12/notes")
+            .is_empty()
+    );
+    let sent = e.stub.requests_to("POST /v1/errors");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        json!({
+            "code": "invalid",
+            "route": "POST /v1/tasks/{id}/notes",
+            "message": "text is 501 characters; the limit is 500",
+        })
+    );
+    assert_eq!(sent[0].agent.as_deref(), Some(ME));
+    assert_eq!(
+        sent[0].auth.as_deref(),
+        Some(format!("Bearer {TOKEN}").as_str())
+    );
+}
+
+#[test]
+fn a_refusal_prints_the_same_whether_or_not_the_server_records_it() {
+    let note = "x".repeat(501);
+    let args = ["note", "factory-12", note.as_str()];
+
+    // A server of another build: its build headers add no warning.
+    let e = env();
+    e.stub.on_status("POST /v1/errors", 204, ());
+    e.stub.build("9.9.9", "0123456789ab");
+    let out = e.run(&args);
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+    assert_eq!(e.stub.requests_to("POST /v1/errors").len(), 1);
+
+    // A server that refuses the record.
+    let e = env();
+    e.stub
+        .on_error("POST /v1/errors", 400, "invalid", "no", "fix it");
+    let out = e.run(&args);
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+
+    // An unreachable server: nothing listens on the port.
+    let dir = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let home = home_for(dir.path(), &format!("http://127.0.0.1:{port}"));
+    let out = board(
+        &home,
+        dir.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &args,
+        "",
+    );
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
+    assert!(stdout(&out).is_empty());
+
+    // A server that never answers holds the refusal up at most the report's timeout.
+    let e = env();
+    e.stub.hang(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let out = e.run(&args);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        (out.status.code(), stderr(&out)),
+        (Some(1), REFUSED_NOTE.into())
+    );
 }
 
 #[test]

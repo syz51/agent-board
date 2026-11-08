@@ -14,9 +14,10 @@ use board::config::{Config, Home};
 use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{ListedThread, T3, ThreadInfo, TimedOut};
+use board::t3::{ListedThread, NewWorktree, T3, ThreadInfo, TimedOut};
 use board_proto::{
-    AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, Timestamp,
+    AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, TaskStatus,
+    Timestamp,
 };
 use common::*;
 use serde_json::json;
@@ -31,6 +32,7 @@ enum Call {
         project: PathBuf,
         title: String,
         message: String,
+        worktree: Option<NewWorktree>,
     },
     Send {
         thread: String,
@@ -119,11 +121,18 @@ impl FakeT3 {
 }
 
 impl T3 for FakeT3 {
-    async fn start_thread(&self, project: &Path, title: &str, message: &str) -> Result<String> {
+    async fn start_thread(
+        &self,
+        project: &Path,
+        title: &str,
+        message: &str,
+        worktree: Option<&NewWorktree>,
+    ) -> Result<String> {
         self.calls.lock().unwrap().push(Call::Start {
             project: project.to_path_buf(),
             title: title.to_owned(),
             message: message.to_owned(),
+            worktree: worktree.cloned(),
         });
         if self.fail_start.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread start failed: no such project");
@@ -297,6 +306,7 @@ async fn a_home_device_starts_a_coordinator_when_none_is_live() {
             project,
             title,
             message,
+            worktree: None,
         },
     ] = calls.as_slice()
     else {
@@ -377,6 +387,237 @@ async fn no_start_off_home_devices_with_a_live_coordinator_or_a_refused_claim() 
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn a_failed_thread_check_releases_an_ended_coordinators_lease_and_renews_a_working_one() {
+    let mut e = env();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let agent = format!("t3:{NEW_THREAD}");
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    let lease = |e: &Env, method: &str| {
+        e.stub
+            .requests_to(&format!("{method} /v1/boards/factory/coordinator"))
+            .len()
+    };
+    e.t3.fail_info.store(true, Ordering::SeqCst);
+
+    // At work: a failed check says nothing of the thread, so the lease is renewed.
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(16))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (1, 0));
+
+    // T3 answers again: the failures are forgotten.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+
+    // Its session ended (T3 closed it while idle) and T3 cannot answer: not renewed while
+    // the checks fail, and released once they have failed for CHECK_FAIL_RELEASE, so another
+    // home device can take over. The record stays.
+    e.t3.fail_info.store(true, Ordering::SeqCst);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Ended),
+    );
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(26))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(30))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 0));
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(36))
+        .await
+        .unwrap();
+    assert_eq!((lease(&e, "POST"), lease(&e, "DELETE")), (0, 1));
+    let slug: board_proto::BoardSlug = "factory".parse().unwrap();
+    assert_eq!(e.daemon.state.coordinators[&slug].thread, NEW_THREAD);
+
+    // T3 answers again and no one took the board: the thread is adopted, not replaced.
+    e.t3.fail_info.store(false, Ordering::SeqCst);
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(48))
+        .await
+        .unwrap();
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body["agent"], agent);
+    assert_eq!(starts(&e.t3), 1, "no new thread");
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_of_another_device_keeps_its_lease_and_ours_is_adopted() {
+    // Another device's coordinator whose session ended: that device's daemon renews or
+    // releases its lease, so this one waits for the lease to expire.
+    let mut e = env();
+    e.stub.on(
+        "GET /v1/boards",
+        [autopilot(Some("t3:elsewhere"), &[DEVICE, "mac-air"])],
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:elsewhere")),
+        agent_fixture("t3:elsewhere", "mac-air", AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+    // Once the lease expires the board names no coordinator, and this device starts one.
+    e.stub
+        .on("GET /v1/boards", [autopilot(None, &[DEVICE, "mac-air"])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(46))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1);
+
+    // Ours, its thread still in T3, but unknown to this daemon's state (lost or reset):
+    // adopted again, with no new thread.
+    let mut e = env();
+    let thread = "thread:project:p1:idle";
+    let agent = format!("t3:{thread}");
+    e.t3.threads.lock().unwrap().insert(
+        thread.into(),
+        ThreadInfo {
+            archived: false,
+            runtime: Runtime::Claude,
+        },
+    );
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&agent), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Ended),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 0);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body["agent"], agent);
+    let slug: board_proto::BoardSlug = "factory".parse().unwrap();
+    assert_eq!(e.daemon.state.coordinators[&slug].thread, thread);
+    assert_eq!(
+        e.t3.infos.load(Ordering::SeqCst),
+        1,
+        "the next reconcile does not ask T3 again"
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released() {
+    // Ours and its thread live, but the user asked to adopt another thread: the lease is
+    // released, so the adopted thread is named, not the ended one.
+    let mut e = adoption_env();
+    let thread = "thread:project:p1:idle";
+    let old = format!("t3:{thread}");
+    e.t3.live(thread);
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 0);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order, ["DELETE", "POST", "POST"]);
+    let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
+    assert_eq!(claims[1].body["agent"], format!("t3:{ADOPTED}"));
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, ADOPTED);
+
+    // Ours, its thread gone: released before a new thread starts, so the gone one is not
+    // named meanwhile.
+    let mut e = env();
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(&old), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(&old)),
+        agent_fixture(&old, DEVICE, AgentState::Ended),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let order: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/boards/factory/coordinator")
+        .map(|r| r.method)
+        .collect();
+    assert_eq!(order.first().map(String::as_str), Some("DELETE"));
 }
 
 #[tokio::test]
@@ -481,6 +722,8 @@ fn coordinator_env(
             renewed_at: at(),
             resumed_after: None,
             registered: true,
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -565,6 +808,291 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
         )
         .await
         .unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn a_task_moved_to_review_wakes_the_coordinator_and_each_send_is_logged() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut review = detail("factory-6", false, &[]);
+    review.task.status = TaskStatus::Review;
+    e.stub.on("GET /v1/tasks/factory-6", &review);
+    let mut moved = event(20, EventType::TaskUpdated, Some("factory-6"), "t3:worker");
+    moved.payload = json!({ "fields": ["status"], "from": "doing", "to": "review" });
+    e.daemon.on_event(&moved, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-6 moved to review; check it against its acceptance checks, \
+             or note what it still waits on\nRun board_snapshot and continue."
+                .to_owned()
+        )]
+    );
+    assert!(
+        logs.text().contains("woke t3:coord: review"),
+        "{}",
+        logs.text()
+    );
+
+    // Moved on before the flush: nothing to check.
+    let mut again = moved.clone();
+    again.seq = 21;
+    e.daemon.on_event(&again, at()).await.unwrap();
+    review.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/factory-6", &review);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+/// An env whose board is hosted elsewhere, with `factory-7` in doing, owned by the idle T3
+/// thread `worker` on this device, and the server's notice that it has been away since
+/// 40 minutes before [`at`].
+fn idle_owner_env() -> (Env, Event, String) {
+    let e = env();
+    let owner = "t3:worker".to_owned();
+    e.t3.live("worker");
+    e.stub.on("GET /v1/boards", [autopilot(None, &["mac-air"])]);
+    let mut doing = detail("factory-7", false, &[]);
+    doing.task.status = TaskStatus::Doing;
+    doing.task.owner = Some(owner.parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-7", &doing);
+    e.stub.on(
+        &format!("GET {}", agent_path(&owner)),
+        agent_fixture(&owner, DEVICE, AgentState::Idle),
+    );
+    let since = at() - chrono::Duration::minutes(40);
+    let mut notice = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
+    notice.payload = json!({ "fields": [], "idle_doing": since, "away": owner });
+    (e, notice, owner)
+}
+
+#[tokio::test]
+async fn the_servers_idle_notice_wakes_the_owner_away_from_its_doing_task() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let (mut e, notice, _) = idle_owner_env();
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    let since = (at() - chrono::Duration::minutes(40)).format("%Y-%m-%d %H:%MZ");
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "worker".to_owned(),
+            format!(
+                "board factory: your factory-7 is in doing, and you have been away from it since \
+                 {since}. Continue it, or park it by what it waits on: review with a note naming \
+                 the PR, blocked with the reason, or open with your handoff\n\
+                 Run board_snapshot and continue."
+            )
+        )]
+    );
+    assert!(
+        logs.text().contains("woke t3:worker: idle"),
+        "{}",
+        logs.text()
+    );
+    // The daemon reads no task list of its own: the server finds idle owners.
+    assert!(e.stub.requests_to("GET /v1/tasks").is_empty());
+}
+
+#[tokio::test]
+async fn an_owner_back_at_work_or_off_its_task_gets_no_idle_line() {
+    // Back at work before the line went out: it no longer holds.
+    let (mut e, notice, owner) = idle_owner_env();
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut running = agent_fixture(&owner, DEVICE, AgentState::Running);
+    running.last_seen = at();
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &running);
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "held while it runs");
+    let mut back = event(31, EventType::AgentStateChanged, None, &owner);
+    back.payload = json!({ "from": "idle", "to": "running", "paused_until": null });
+    e.daemon.on_event(&back, at()).await.unwrap();
+    let mut stopped = event(32, EventType::AgentStateChanged, None, &owner);
+    stopped.payload = json!({ "from": "running", "to": "idle", "paused_until": null });
+    e.daemon.on_event(&stopped, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // The task left doing, or another agent owns it, before the send.
+    for change in ["review", "handed"] {
+        let (mut e, notice, _) = idle_owner_env();
+        e.daemon.reconcile(at()).await.unwrap();
+        let mut moved = detail("factory-7", false, &[]);
+        if change == "review" {
+            moved.task.status = TaskStatus::Review;
+            moved.task.owner = Some("t3:worker".parse().unwrap());
+        } else {
+            moved.task.status = TaskStatus::Doing;
+            moved.task.owner = Some("t3:other".parse().unwrap());
+        }
+        e.stub.on("GET /v1/tasks/factory-7", &moved);
+        e.daemon.on_event(&notice, at()).await.unwrap();
+        e.daemon.flush(at()).await;
+        assert!(e.t3.sends().is_empty(), "{change}");
+    }
+}
+
+#[tokio::test]
+async fn an_idle_notice_for_another_devices_or_a_non_t3_owner_is_not_sent_here() {
+    // Another device's owner: its own daemon wakes it.
+    let (mut e, notice, owner) = idle_owner_env();
+    e.stub.on(
+        &format!("GET {}", agent_path(&owner)),
+        agent_fixture(&owner, "mac-air", AgentState::Idle),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+
+    // A Claude Code owner has no thread to send to: nothing is queued.
+    let (mut e, mut notice, _) = idle_owner_env();
+    notice.payload["away"] = json!("claude:abc");
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn an_owner_waiting_for_a_usage_limit_reset_gets_no_idle_line_at_the_reset() {
+    for state in [AgentState::Paused, AgentState::Ended] {
+        let (mut e, notice, owner) = idle_owner_env();
+        let reset = at() + chrono::Duration::hours(1);
+        let mut paused = agent_fixture(&owner, DEVICE, state);
+        paused.paused_until = Some(reset);
+        e.stub.on(&format!("GET {}", agent_path(&owner)), &paused);
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&notice, at()).await.unwrap();
+        e.daemon.flush(at()).await;
+        assert!(e.daemon.state.wakes.is_empty(), "{state:?}");
+        e.daemon.flush(reset + chrono::Duration::minutes(1)).await;
+        assert!(e.t3.sends().is_empty(), "{state:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_owner_left_running_that_shows_activity_after_the_notice_gets_no_idle_line() {
+    // Marked running all along, so no state change announces it is back.
+    for (seen, sent) in [
+        (chrono::Duration::minutes(1), 0),
+        (-chrono::Duration::minutes(40), 1),
+    ] {
+        let (mut e, notice, owner) = idle_owner_env();
+        let mut running = agent_fixture(&owner, DEVICE, AgentState::Running);
+        running.last_seen = at() + seen;
+        e.stub.on(&format!("GET {}", agent_path(&owner)), &running);
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&notice, at()).await.unwrap();
+        // Held while it runs, then sent anyway unless it was seen since the notice.
+        e.daemon.flush(at()).await;
+        assert!(e.t3.sends().is_empty());
+        e.daemon.flush(at() + chrono::Duration::minutes(4)).await;
+        assert_eq!(e.t3.sends().len(), sent, "seen {seen}");
+    }
+}
+
+#[tokio::test]
+async fn an_idle_notice_for_an_owner_no_device_can_wake_goes_to_the_coordinator() {
+    let line = |owner: &str| {
+        let since = (at() - chrono::Duration::minutes(40)).format("%Y-%m-%d %H:%MZ");
+        (
+            "coord".to_owned(),
+            format!(
+                "board factory: factory-7 is in doing, and its owner {owner}, which cannot be \
+                 woken, has been away from it since {since}. Check it, then continue it, hand it \
+                 over, or park it by what it waits on\nRun board_snapshot and continue."
+            ),
+        )
+    };
+    let notice_for = |owner: &str| {
+        let since = at() - chrono::Duration::minutes(40);
+        let mut notice = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
+        notice.payload = json!({ "fields": [], "idle_doing": since, "away": owner });
+        notice
+    };
+    let doing = |owner: &str| {
+        let mut doing = detail("factory-7", false, &[]);
+        doing.task.status = TaskStatus::Doing;
+        doing.task.owner = Some(owner.parse().unwrap());
+        doing
+    };
+
+    // Not a T3 thread: queued for the coordinator at once.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let codex = "codex:b";
+    e.stub.on("GET /v1/tasks/factory-7", doing(codex));
+    e.stub.on(
+        &format!("GET {}", agent_path(codex)),
+        agent_fixture(codex, DEVICE, AgentState::Idle),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice_for(codex), at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends(), [line(codex)]);
+
+    // A T3 owner whose thread is gone: found at the flush, then passed on.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let gone = "t3:gone";
+    e.stub.on("GET /v1/tasks/factory-7", doing(gone));
+    e.stub.on(
+        &format!("GET {}", agent_path(gone)),
+        agent_fixture(gone, DEVICE, AgentState::Ended),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice_for(gone), at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends(), [line(gone)]);
+
+    // The owner running again before the send: the passed-on line no longer holds.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/tasks/factory-7", doing(codex));
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice_for(codex), at()).await.unwrap();
+    let mut back = event(31, EventType::AgentStateChanged, None, codex);
+    back.payload = json!({ "from": "idle", "to": "running", "paused_until": null });
+    e.daemon.on_event(&back, at()).await.unwrap();
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_move_to_review_by_the_coordinators_own_delegates_does_not_wake_it() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut review = detail("factory-6", false, &[]);
+    review.task.status = TaskStatus::Review;
+    e.stub.on("GET /v1/tasks/factory-6", &review);
+    for (agent, parent) in [("t3:child", "coord"), ("t3:grandchild", "child")] {
+        let mut info = agent_fixture(agent, DEVICE, AgentState::Running);
+        info.native_ids
+            .insert("t3_parent".to_owned(), parent.to_owned());
+        e.stub.on(&format!("GET {}", agent_path(agent)), info);
+    }
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Running),
+    );
+    for (seq, mover) in [(20, "t3:coord"), (21, "t3:child"), (22, "t3:grandchild")] {
+        let mut moved = event(seq, EventType::TaskUpdated, Some("factory-6"), mover);
+        moved.payload = json!({ "fields": ["status"], "from": "doing", "to": "review" });
+        e.daemon.on_event(&moved, at()).await.unwrap();
+    }
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // Any other mover wakes it.
+    let mut moved = event(23, EventType::TaskUpdated, Some("factory-6"), "t3:worker");
+    moved.payload = json!({ "fields": ["status"], "from": "doing", "to": "review" });
+    e.daemon.on_event(&moved, at()).await.unwrap();
     e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 1);
 }
@@ -809,6 +1337,67 @@ async fn a_paused_coordinator_is_not_woken_before_its_reset() {
     assert!(e.t3.sends().is_empty());
 }
 
+#[tokio::test]
+async fn a_coordinator_whose_session_ended_during_a_limit_waits_for_the_reset() {
+    // Paused on a usage limit, then T3 closed its idle session: the server keeps the
+    // reset on the ended agent. Waking it before the reset would only stop on the limit
+    // again (and report another pause).
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, agent) = coordinator_env(AgentState::Paused, Some(reset));
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "user"),
+            at(),
+        )
+        .await
+        .unwrap();
+    // Read as paused at the first flush, then followed through its events.
+    e.daemon.flush(at()).await;
+    e.daemon
+        .on_event(
+            &state_changed(11, &agent, AgentState::Ended, Some(reset)),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon
+        .on_event(
+            &event(12, EventType::TaskCreated, Some("factory-4"), "user"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // From the reset on, the ended thread is woken like any other.
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.flush(later).await;
+    assert_eq!(threads(&e.t3), ["coord"]);
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_session_ended_during_a_limit_is_resumed_at_the_reset() {
+    // Nothing is queued for it: reconcile resumes it once the reset passes, as it does a
+    // paused one.
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, _) = coordinator_env(AgentState::Ended, Some(reset));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.reconcile(later).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert!(sends[0].1.contains("the usage limit has reset"));
+}
+
 fn answered_ask(id: i64, agent: &str) -> Ask {
     Ask {
         id,
@@ -996,11 +1585,15 @@ struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl Logs {
     fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        self.capture_at(tracing::Level::WARN)
+    }
+
+    fn capture_at(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
         let logs = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || logs.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(level)
             .finish();
         tracing::subscriber::set_default(subscriber)
     }
@@ -1102,7 +1695,8 @@ async fn an_ended_coordinator_whose_thread_is_archived_is_not_woken_and_says_so(
     );
     assert_eq!(
         text.matches(&format!(
-            "{gone}; 1 answers to its asks dropped, with no other coordinator here to pass them to"
+            "{gone}; 1 answers to its asks or idle notices dropped, with no other coordinator \
+             here to pass them to"
         ))
         .count(),
         1,
@@ -1733,6 +2327,11 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
         "no thread of this start is left idle"
     );
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // This binary briefed it.
+    assert_eq!(
+        e.daemon.state.coordinators[&factory()].briefed.as_deref(),
+        Some(board::daemon::prompt_digest(false))
+    );
     assert!(saved_state(&e).pending_starts.is_empty());
     let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
     assert_eq!(claims.last().unwrap().body["agent"], format!("t3:{ORPHAN}"));
@@ -1753,6 +2352,8 @@ async fn a_start_that_timed_out_after_delivery_adopts_its_thread_without_briefin
     assert_eq!(starts(&e.t3), 1, "no second thread");
     assert!(e.t3.sends().is_empty(), "its message already got through");
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, ORPHAN);
+    // The earlier start briefed it, maybe with another prompt: it is re-briefed.
+    assert_eq!(e.daemon.state.coordinators[&factory()].briefed, None);
     assert!(e.daemon.state.pending_starts.is_empty());
 }
 
@@ -2384,15 +2985,22 @@ async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
 
 #[test]
 fn the_coordinator_prompt_says_how_to_run_a_climb() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = board::daemon::coordinator_message(&factory(), false);
     for rule in [
         "A climb is a task whose acceptance is a score command",
         "note starting `score:`",
-        "rounds in a row gain no more than the score's noise",
+        "use its verdict, do not judge a plateau yourself",
+        "report friction in the climb process",
+        "applies from the next run: start one and note why",
+        "Never change the bar, judges or references within a run",
+        "which judges scored it, the gap to the bar and the budget spent",
         "merges only on the user's decision",
     ] {
-        assert!(prompt.contains(rule), "missing {rule:?}");
+        assert!(words(&prompt).contains(rule), "missing {rule:?}");
     }
+    // The stop test is the score command's own, not restated here.
+    assert!(!prompt.contains("rounds in a row gain no more than"));
     // Generic: no tool paths of one setup.
     assert!(!prompt.contains("factory/cli.js"));
 }
@@ -2515,9 +3123,31 @@ fn the_coordinator_prompt_files_what_remains_before_task_done() {
     }
 }
 
+#[test]
+fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "Never change files, switch branches or merge in the project root",
+        "Do any file work yourself in a worktree of your own, on a new branch per task",
+        "when your working directory is the project root, as for an older or adopted coordinator, add a worktree first",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
-async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
+async fn start_with(board: Board, config: Config) -> (FakeT3, Stub) {
+    let (t3, stub, _, _) = start_daemon(board, config).await;
+    (t3, stub)
+}
+
+/// [`start_with`], keeping the daemon and its home.
+async fn start_daemon(
+    mut board: Board,
+    config: Config,
+) -> (FakeT3, Stub, Daemon<FakeT3>, tempfile::TempDir) {
     board.autopilot = true;
     board.home_devices = vec![DEVICE.parse().unwrap()];
     let slug = board.slug.clone();
@@ -2541,8 +3171,9 @@ async fn start_with(mut board: Board, config: Config) -> (FakeT3, Stub) {
         },
         repo: RepoInfo::default(),
     };
-    Daemon::new(ctx, t3.clone()).reconcile(at()).await.unwrap();
-    (t3, stub)
+    let mut daemon = Daemon::new(ctx, t3.clone());
+    daemon.reconcile(at()).await.unwrap();
+    (t3, stub, daemon, dir)
 }
 
 fn started(t3: &FakeT3) -> (PathBuf, String) {
@@ -2581,6 +3212,160 @@ async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
     let (t3, stub) = start_with(board_fixture("factory", &[REPO]), config).await;
     assert_eq!(started(&t3).0, Path::new("/src/agent-board"));
     assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
+}
+
+/// Runs git in `dir` with no user or system config, and panics when it fails.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+#[tokio::test]
+async fn a_git_project_starts_the_coordinator_in_its_own_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=trunk"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let config = Config {
+        projects: [(REPO.to_owned(), repo.clone())].into(),
+        ..Config::default()
+    };
+    let (t3, _) = start_with(board_fixture("factory", &[REPO]), config.clone()).await;
+    let calls = t3.calls();
+    let [
+        Call::Start {
+            project, worktree, ..
+        },
+    ] = calls.as_slice()
+    else {
+        panic!("{calls:?}");
+    };
+    assert_eq!(project, &repo, "T3 finds the project by its folder");
+    // The remote's default branch, not `main`, and a stable branch per board.
+    let expected = NewWorktree {
+        base: "origin/trunk".into(),
+        branch: "coordinator/factory".into(),
+    };
+    assert_eq!(worktree.as_ref(), Some(&expected));
+
+    // A re-start leaves the branch and worktree an earlier coordinator left, which a live
+    // thread may still use, and takes a branch of its own.
+    let old = dir.path().join("old");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "coordinator/factory",
+            old.to_str().unwrap(),
+            "origin/trunk",
+        ],
+    );
+    let (t3, _) = start_with(board_fixture("factory", &[REPO]), config).await;
+    let calls = t3.calls();
+    let [Call::Start { worktree, .. }] = calls.as_slice() else {
+        panic!("{calls:?}");
+    };
+    let branch = worktree.as_ref().map(|w| w.branch.as_str()).unwrap_or("");
+    assert!(branch.starts_with("coordinator/factory-"), "{worktree:?}");
+    assert!(old.exists());
+
+    // A folder outside git starts in the folder itself.
+    let config = Config {
+        board_projects: [(factory(), dir.path().join("plain"))].into(),
+        ..Config::default()
+    };
+    std::fs::create_dir(dir.path().join("plain")).unwrap();
+    let (t3, _) = start_with(board_fixture("factory", &[]), config).await;
+    let calls = t3.calls();
+    let [Call::Start { worktree, .. }] = calls.as_slice() else {
+        panic!("{calls:?}");
+    };
+    assert_eq!(worktree, &None);
+}
+
+/// An env whose daemon has no project for the factory board yet, nor a `config.toml`.
+fn unmapped_env() -> Env {
+    let e = env_with_projects(BTreeMap::new());
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e
+}
+
+/// Writes the env daemon's `config.toml` with the given projects.
+fn write_config(e: &Env, projects: BTreeMap<String, PathBuf>) {
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects,
+        ..Config::default()
+    }
+    .save(&Home::at(e._dir.path().join("home")))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_project_added_to_config_toml_starts_the_coordinator_without_a_restart() {
+    let mut e = unmapped_env();
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "no project: nothing to start");
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+
+    // Mapped while the daemon runs: the next reconcile starts it, at the same instant, so
+    // the failed start's back-off does not hold it either.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+}
+
+#[tokio::test]
+async fn an_unreadable_config_toml_keeps_the_projects_in_use() {
+    let mut e = unmapped_env();
+    write_config(&e, BTreeMap::new());
+    let home = Home::at(e._dir.path().join("home"));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+
+    std::fs::write(home.config_path(), "projects = [not toml").unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "an invalid file changes nothing");
+    std::fs::remove_file(home.config_path()).unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "a missing file changes nothing");
+
+    // Fixed: read again.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
 }
 
 #[tokio::test]
@@ -2900,6 +3685,8 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
                 renewed_at: at(),
                 resumed_after: None,
                 registered: true,
+                briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+                rebrief_backoff: None,
             },
         );
         let mut board = autopilot(Some(&agent), &[DEVICE]);
@@ -3300,6 +4087,8 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             renewed_at: at(),
             resumed_after: None,
             registered: true,
+            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            rebrief_backoff: None,
         },
     );
     e.stub
@@ -3327,5 +4116,126 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             .len(),
         1,
         "the due lease was renewed"
+    );
+}
+
+#[tokio::test]
+async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    // Briefed before this version, or with an older prompt.
+    for old in [None, Some("0123".to_owned())] {
+        e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = old;
+        let before = e.t3.sends().len();
+        e.daemon.reconcile(at()).await.unwrap();
+        let sends = e.t3.sends();
+        assert_eq!(sends.len(), before + 1);
+        let (thread, text) = sends.last().unwrap();
+        assert_eq!(thread, "coord");
+        assert_eq!(*text, board::daemon::rebrief_message(&slug, false));
+        assert!(text.contains(board::daemon::COORDINATOR_PROMPT));
+        assert!(!text.contains("# Triage"));
+        assert_eq!(
+            e.daemon.state.coordinators[&slug].briefed,
+            Some(board::daemon::prompt_digest(false).to_owned())
+        );
+        // Saved, so a restart does not send it again.
+        let home = Home::at(e._dir.path().join("home"));
+        assert_eq!(
+            board::daemon::load_watch_state(&home).coordinators[&slug].briefed,
+            Some(board::daemon::prompt_digest(false).to_owned())
+        );
+        // Briefed with the current prompt: later reconciles send nothing.
+        e.daemon.reconcile(at()).await.unwrap();
+        assert_eq!(e.t3.sends().len(), before + 1);
+    }
+
+    // Held while the coordinator is paused, or runs and was seen lately.
+    let briefed = |e: &Env| e.daemon.state.coordinators[&slug].briefed.clone();
+    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    for held in [AgentState::Running, AgentState::Paused] {
+        let mut info = agent_fixture(&agent, DEVICE, held);
+        info.paused_until = None;
+        e.stub.on(&format!("GET {}", agent_path(&agent)), &info);
+        e.daemon.reconcile(at()).await.unwrap();
+        assert_eq!(e.t3.sends().len(), 2, "{held:?}");
+    }
+    e.stub.on(
+        &format!("GET {}", agent_path(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    // A failed send backs off, then is tried again.
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    assert_eq!(briefed(&e), None);
+    assert_eq!(e.t3.sends().len(), 3);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.sends().len(), 3, "backing off");
+    let later = at() + chrono::Duration::seconds(31);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 4);
+    assert_eq!(briefed(&e), current);
+
+    // Marked running but not seen for longer than a wake-up is held: sent.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    let mut stuck = agent_fixture(&agent, DEVICE, AgentState::Running);
+    stuck.last_seen = later - board::daemon::WAKE_HOLD_MAX - chrono::Duration::seconds(1);
+    e.stub.on(&format!("GET {}", agent_path(&agent)), &stuck);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 5);
+    assert_eq!(briefed(&e), current);
+
+    // A send that timed out may have got through: it counts as sent and is not repeated.
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(later).await.unwrap();
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    assert_eq!(e.t3.sends().len(), 6);
+    assert_eq!(briefed(&e), current);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 6);
+}
+
+#[tokio::test]
+async fn the_feedback_boards_coordinator_is_re_briefed_with_the_triage_prompt() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let slug = factory();
+    // This device's feedback board, set by editing config.toml while the daemon runs.
+    let home = Home::at(e._dir.path().join("home"));
+    std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+    std::fs::write(home.config_path(), "feedback_board = \"factory\"\n").unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].1, board::daemon::rebrief_message(&slug, true));
+    assert!(sends[0].1.contains(board::daemon::TRIAGE_PROMPT));
+    assert_eq!(
+        e.daemon.state.coordinators[&slug].briefed,
+        Some(board::daemon::prompt_digest(true).to_owned())
+    );
+    assert_ne!(
+        board::daemon::prompt_digest(true),
+        board::daemon::prompt_digest(false)
+    );
+}
+
+#[tokio::test]
+async fn a_started_coordinator_is_recorded_as_briefed_with_the_current_prompt() {
+    let (_, _, daemon, _dir) = start_daemon(
+        board_fixture("factory", &[REPO]),
+        Config {
+            projects: projects(),
+            ..Config::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        daemon.state.coordinators[&factory()].briefed,
+        Some(board::daemon::prompt_digest(false).to_owned())
     );
 }

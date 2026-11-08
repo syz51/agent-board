@@ -26,7 +26,7 @@ use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::client::{Client, SnapshotQuery, TaskQuery};
+use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failure};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
@@ -186,6 +186,8 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
 
 struct Hook<'a> {
     event: HookEvent,
+    /// The hook reaches the server through the device daemon's relay.
+    relayed: bool,
     runtime: Runtime,
     /// The session runs inside another agent session (`identity::is_nested`).
     nested: bool,
@@ -279,10 +281,22 @@ async fn handle(
     } else {
         Vec::new()
     };
+    // A PostToolUse hook other than an edit tool's often has nothing to send, so it asks
+    // for the relay or the token only once it knows it has.
+    let early = !post || !edited.is_empty();
+    // The device daemon's relay holds the device token, so a hook using it needs none. A
+    // session given its own token in `BOARD_TOKEN` keeps it, and so calls directly.
+    let socket = std::env::var_os("BOARD_TOKEN")
+        .is_none_or(|t| t.is_empty())
+        .then(|| crate::relay::safe_socket(&home))
+        .flatten();
+    let mut relay = match &socket {
+        Some(socket) if early => crate::relay::connect(socket, server).await,
+        _ => None,
+    };
     // The Keychain lookup runs a process, while the process table and the work tree are
-    // read below. A PostToolUse hook other than an edit tool's often has nothing to send,
-    // so it looks the token up only once it knows it has.
-    let mut token = (!post || !edited.is_empty()).then(|| spawn_token(&home));
+    // read below.
+    let mut token = (early && relay.is_none()).then(|| spawn_token(&home));
     let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
     let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
@@ -313,14 +327,26 @@ async fn handle(
         // Nothing to send: no server call and no Keychain lookup.
         return Ok(Reply::Nothing);
     }
-    let token = match token.take() {
-        Some(token) => token,
-        None => spawn_token(&home),
+    if !early && let Some(socket) = &socket {
+        relay = crate::relay::connect(socket, server).await;
+    }
+    let route = match relay {
+        Some(client) => {
+            steps.mark("relay");
+            Route::Relay(client)
+        }
+        None => {
+            let token = match token.take() {
+                Some(token) => token,
+                None => spawn_token(&home),
+            };
+            let Some(token) = token.await?? else {
+                return Ok(Reply::Nothing);
+            };
+            steps.mark("token");
+            Route::Direct(token)
+        }
     };
-    let Some(token) = token.await?? else {
-        return Ok(Reply::Nothing);
-    };
-    steps.mark("token");
     let t3_parent = match event {
         HookEvent::SessionStart if !nested && t3_identity_applies(explicit_agent, env) => {
             delegated_parent(&home, runtime, session).await
@@ -329,10 +355,18 @@ async fn handle(
     };
     steps.mark("t3");
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
-    let connect = CONNECT_BUDGET.min(remaining);
-    let client =
-        Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?;
+    let relayed = matches!(route, Route::Relay(_));
+    let client = match route {
+        Route::Relay(client) => client
+            .with_agent(Some(agent.clone()))
+            .with_timeout(remaining),
+        Route::Direct(token) => {
+            let connect = CONNECT_BUDGET.min(remaining);
+            Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
+        }
+    };
     let mut hook = Hook {
+        relayed,
         event,
         runtime,
         nested,
@@ -365,28 +399,44 @@ async fn handle(
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
-    let (reply, failure) = match tokio::time::timeout(remaining, hook.online(repo)).await {
+    // `judged`: whether a failure says anything about the server.
+    let (reply, failure, judged) = match tokio::time::timeout(remaining, hook.online(repo)).await {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
-            (reply, None)
+            (reply, None, true)
         }
         // The server answered with an error: it is reachable, so the cache is no better.
         Ok(Err(err)) if crate::client::error_code(&err).is_some() => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            (hook.local_stop(), None)
+            (hook.local_stop(), None, true)
+        }
+        // The relay did not forward the request: nothing is known about the server.
+        Ok(Err(err)) if relay_failure(&err) == Some(RelayFailure::Refused) => {
+            tracing::debug!("hook {}: {err:#}", event.name());
+            (hook.local_stop(), None, false)
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
             let failure = Failure::of(&err);
-            (hook.offline(failure), Some(failure))
+            // The relay's own connection failing (a daemon stopping mid-hook) says nothing
+            // about the server. The relay reports the server's failures in an answer, and a
+            // timeout counts as the server's.
+            let relay_broke = hook.relayed
+                && err
+                    .chain()
+                    .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+                    .any(|e| !e.is_timeout());
+            (hook.offline(failure), Some(failure), !relay_broke)
         }
         Err(_) => {
             tracing::debug!("hook {}: no answer within {remaining:?}", event.name());
-            (hook.offline(Failure::Slow), Some(Failure::Slow))
+            (hook.offline(Failure::Slow), Some(Failure::Slow), true)
         }
     };
     steps.mark("server");
     let next = match failure {
+        // The relay failed, not the server.
+        _ if !judged => breaker.clone(),
         // This device left the server too little time to judge it.
         Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
@@ -436,6 +486,14 @@ impl Drop for Steps {
     }
 }
 
+/// How a hook reaches the server.
+enum Route {
+    /// Through the device daemon's relay, with this client.
+    Relay(Client),
+    /// Directly, with this token.
+    Direct(String),
+}
+
 /// Why the hook got no answer from the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Failure {
@@ -451,6 +509,11 @@ impl Failure {
     /// A request that timed out after it connected is slow; any other failure to get an
     /// answer is unreachable, a connection not opened within [`CONNECT_BUDGET`] included.
     fn of(err: &anyhow::Error) -> Self {
+        match relay_failure(err) {
+            Some(RelayFailure::Slow) => return Self::Slow,
+            Some(RelayFailure::Unreachable) => return Self::Unreachable,
+            Some(RelayFailure::Refused) | None => {}
+        }
         let timed_out = err
             .chain()
             .filter_map(|e| e.downcast_ref::<reqwest::Error>())
@@ -752,6 +815,22 @@ impl Hook<'_> {
             .await
     }
 
+    /// Marks the agent running and fetches a snapshot of `kind`. Directly, one request after
+    /// the other, so both use one connection: two at once would open two, each with its own
+    /// TLS handshake (the client speaks HTTP/1.1). Through the relay, at once: its
+    /// connections to the server are already open.
+    async fn beat_and_fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
+        let beat = self.set_state(AgentState::Running, None);
+        if self.relayed {
+            let (beat, snap) = tokio::join!(beat, self.fetch(kind));
+            beat?;
+            snap
+        } else {
+            beat.await?;
+            self.fetch(kind).await
+        }
+    }
+
     /// Records the snapshot's sequence (and caches a full one) and returns its text.
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
         self.local.seq = Some(snap.seq);
@@ -838,17 +917,8 @@ impl Hook<'_> {
         } else {
             SnapshotKind::Delta
         };
-        let heartbeat = self.client.set_state(
-            &self.agent,
-            &AgentStateUpdate {
-                state: AgentState::Running,
-                paused_until: None,
-                said: None,
-            },
-        );
-        let (beat, snap) = tokio::join!(heartbeat, self.fetch(kind));
-        beat?;
-        let text = self.keep(snap?)?;
+        let snap = self.beat_and_fetch(kind).await?;
+        let text = self.keep(snap)?;
         Ok(if text.is_empty() {
             Reply::Nothing
         } else {
@@ -859,13 +929,17 @@ impl Hook<'_> {
     async fn post_tool_use(&mut self) -> Result<Reply> {
         let mut lines = Vec::new();
         for touches in &self.touches {
-            let result = self.client.touches(touches).await?;
+            let mut result = self.client.touches(touches).await?;
+            // Every call reports every overlap; each is shown once per peer change.
+            result
+                .overlaps
+                .retain(|o| self.local.first_sight(o, self.now));
             lines.extend(render::overlaps(&result));
         }
         if heartbeat_due(self.local.last_heartbeat, self.now) {
             self.local.last_heartbeat = Some(self.now);
-            self.set_state(AgentState::Running, None).await?;
-            let alerts = self.snapshot(SnapshotKind::Alerts).await?;
+            let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
+            let alerts = self.keep(snap)?;
             if !alerts.is_empty() {
                 lines.push(alerts);
             }
@@ -1497,6 +1571,20 @@ pub fn current_exe() -> PathBuf {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn the_relays_reports_count_as_the_servers_own_failures() {
+        let err = |f: RelayFailure| anyhow::Error::from(f).context("board server unreachable");
+        assert_eq!(Failure::of(&err(RelayFailure::Slow)), Failure::Slow);
+        assert_eq!(
+            Failure::of(&err(RelayFailure::Unreachable)),
+            Failure::Unreachable
+        );
+        assert_eq!(
+            relay_failure(&err(RelayFailure::Refused)),
+            Some(RelayFailure::Refused)
+        );
+    }
 
     #[test]
     fn edit_tools_yield_paths() {

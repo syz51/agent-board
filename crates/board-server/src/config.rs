@@ -22,6 +22,7 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 /// [telegram]
 /// chat_id = 123456789          # optional; else paired with `board admin telegram-pair`
 /// stuck_after_secs = 14400      # 0 turns the stuck-task alert off
+/// stalled_after_secs = 7200     # 0 turns the stalled-board alert off
 /// digest_at = "09:00"           # daily Needs you digest, local time; "off" turns it off
 /// utc_offset = "+00:00"         # the local time's offset from UTC
 ///
@@ -158,6 +159,11 @@ pub struct TelegramConfig {
     /// turns the alert off. Default 4 hours.
     #[serde(default = "default_stuck_after")]
     pub stuck_after_secs: u64,
+    /// An active autopilot board with ready auto work, no task in doing, and no task moved
+    /// into or out of doing for this long is reported once, and again only after such a
+    /// move. 0 turns the alert off. Default 2 hours.
+    #[serde(default = "default_stalled_after")]
+    pub stalled_after_secs: u64,
     /// Local time of the daily Needs you digest (`HH:MM`, at `utc_offset`); `None`
     /// (`"off"` in the file) sends none. Default 09:00.
     #[serde(default = "default_digest_at", deserialize_with = "digest_time")]
@@ -170,6 +176,10 @@ pub struct TelegramConfig {
 
 fn default_stuck_after() -> u64 {
     4 * 3600
+}
+
+fn default_stalled_after() -> u64 {
+    2 * 3600
 }
 
 fn default_digest_at() -> Option<NaiveTime> {
@@ -213,6 +223,7 @@ impl Default for TelegramConfig {
             chat_id: None,
             api_base: default_telegram_api(),
             stuck_after_secs: default_stuck_after(),
+            stalled_after_secs: default_stalled_after(),
             digest_at: default_digest_at(),
             utc_offset: utc(),
         }
@@ -244,6 +255,7 @@ impl fmt::Debug for TelegramConfig {
             .field("chat_id", &self.chat_id)
             .field("api_base", &self.api_base)
             .field("stuck_after_secs", &self.stuck_after_secs)
+            .field("stalled_after_secs", &self.stalled_after_secs)
             .field("digest_at", &self.digest_at)
             .field("utc_offset", &self.utc_offset)
             .finish()
@@ -292,12 +304,18 @@ pub struct Settings {
     pub signal_min_reports: u32,
     /// ...from at least this many agents...
     pub signal_min_agents: u32,
-    /// ...within this many days. Older error records are pruned.
+    /// ...within this many days.
     pub signal_window_days: u32,
+    /// API error records are kept this many days, for revisits, and never less than
+    /// `signal_window_days`.
+    pub error_retention_days: u32,
     /// Creating an ask warns of the board's other open asks younger than this.
     pub duplicate_ask_window_secs: u64,
     /// A task in review this long with no note from its owner raises one alert.
     pub review_quiet_secs: u64,
+    /// A task in doing whose owner has been away this long, with no thread it delegated
+    /// still at work, is announced once per spell away.
+    pub doing_idle_secs: u64,
 }
 
 impl Default for Settings {
@@ -326,8 +344,10 @@ impl Default for Settings {
             signal_min_reports: 3,
             signal_min_agents: 2,
             signal_window_days: 7,
+            error_retention_days: 35,
             duplicate_ask_window_secs: 30 * 60,
             review_quiet_secs: 24 * 3600,
+            doing_idle_secs: 30 * 60,
         }
     }
 }
@@ -356,8 +376,10 @@ impl Settings {
             ("signal_min_reports", u64::from(self.signal_min_reports)),
             ("signal_min_agents", u64::from(self.signal_min_agents)),
             ("signal_window_days", u64::from(self.signal_window_days)),
+            ("error_retention_days", u64::from(self.error_retention_days)),
             ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
             ("review_quiet_secs", self.review_quiet_secs),
+            ("doing_idle_secs", self.doing_idle_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -404,12 +426,25 @@ impl Settings {
         secs_ms(self.review_quiet_secs)
     }
 
+    pub(crate) fn doing_idle_ms(&self) -> i64 {
+        secs_ms(self.doing_idle_secs)
+    }
+
     pub(crate) fn touch_ms(&self) -> i64 {
         secs_ms(self.touch_window_secs)
     }
 
     pub(crate) fn signal_window_ms(&self) -> i64 {
         secs_ms(u64::from(self.signal_window_days) * 86_400)
+    }
+
+    /// Days of API error records kept: the setting, and never less than the signal window.
+    pub(crate) fn error_retention(&self) -> u32 {
+        self.error_retention_days.max(self.signal_window_days)
+    }
+
+    pub(crate) fn error_retention_ms(&self) -> i64 {
+        secs_ms(u64::from(self.error_retention()) * 86_400)
     }
 
     pub(crate) fn done_hidden_ms(&self) -> i64 {
@@ -462,17 +497,24 @@ mod tests {
         let paired = paired.telegram.unwrap();
         assert_eq!(paired.chat_id, None);
         assert_eq!(paired.stuck_after_secs, 4 * 3600);
+        assert_eq!(paired.stalled_after_secs, 2 * 3600);
         assert_eq!(paired.digest_at, NaiveTime::from_hms_opt(9, 0, 0));
         assert_eq!(paired.utc_offset, FixedOffset::east_opt(0).unwrap());
         let alerts = ServerConfig::from_toml(
-            "db = \"b\"\n[telegram]\nstuck_after_secs = 0\ndigest_at = \"off\"\nutc_offset = \"+08:00\"",
+            "db = \"b\"\n[telegram]\nstuck_after_secs = 0\nstalled_after_secs = 0\n\
+             digest_at = \"off\"\nutc_offset = \"+08:00\"",
         )
         .unwrap()
         .telegram
         .unwrap();
         assert_eq!(
-            (alerts.stuck_after_secs, alerts.digest_at, alerts.utc_offset),
-            (0, None, FixedOffset::east_opt(8 * 3600).unwrap())
+            (
+                alerts.stuck_after_secs,
+                alerts.stalled_after_secs,
+                alerts.digest_at,
+                alerts.utc_offset
+            ),
+            (0, 0, None, FixedOffset::east_opt(8 * 3600).unwrap())
         );
         let at = ServerConfig::from_toml("db = \"b\"\n[telegram]\ndigest_at = \"18:30\"").unwrap();
         assert_eq!(
@@ -510,6 +552,7 @@ mod tests {
             "signal_min_reports",
             "signal_min_agents",
             "signal_window_days",
+            "error_retention_days",
             "duplicate_ask_window_secs",
         ] {
             assert!(

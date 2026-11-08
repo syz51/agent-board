@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, SnapshotQuery, TaskQuery, error_code};
+use crate::client::{Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code};
 use crate::config::{Config, Home, load_token};
 use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
@@ -197,6 +197,23 @@ pub fn limits() -> &'static board_server::Settings {
     &LIMITS
 }
 
+/// Text over a limit, refused before the request was sent, with the server's message and
+/// hint. The CLI reports it to the server (`POST /v1/errors`), so signals count it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The message the server would have answered.
+    pub message: String,
+    pub next: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (not sent)\nnext: {}", self.message, self.next)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// Refuses `value` when it has more than `max` characters, with the server's message and
 /// hint, so over-long text fails before a request is sent.
 pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
@@ -206,11 +223,11 @@ pub fn check_chars(field: &str, value: &str, max: usize) -> Result<()> {
 /// [`check_chars`] with `goes` saying where longer text goes, as the server says it.
 pub fn check_chars_or(field: &str, value: &str, max: usize, goes: Option<&str>) -> Result<()> {
     match board_proto::TooLong::check(field, value, max) {
-        Some(long) => bail!(
-            "{} (not sent)\nnext: {}",
-            long.message(),
-            long.next_or(goes)
-        ),
+        Some(long) => Err(Refused {
+            message: long.message(),
+            next: long.next_or(goes),
+        }
+        .into()),
         None => Ok(()),
     }
 }
@@ -414,10 +431,20 @@ pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output>
         "release" => "released",
         _ => "took",
     };
-    Ok(Output::new(
-        format!("{verb} {}", render::task_line(&task)),
-        &task,
-    ))
+    let mut text = format!("{verb} {}", render::task_line(&task));
+    if action != "release" {
+        // The task is the agent's now either way, so a failed read only loses the count.
+        let notes = match ctx.client.task(id).await {
+            Ok(detail) => render::claim_notes(&detail),
+            Err(err) => {
+                tracing::warn!("reading {id}'s notes after the {action}: {err:#}");
+                format!("task_show {id} and read every note before starting")
+            }
+        };
+        text.push('\n');
+        text.push_str(&notes);
+    }
+    Ok(Output::new(text, &task))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -519,14 +546,14 @@ pub async fn task_done(
             "done needs evidence: a check with its exit code (--check <cmd> --exit <code>), a commit, a PR or an artifact"
         );
     }
-    let version = ctx.client.task(id).await?.task.version;
+    let detail = ctx.client.task(id).await?;
     let task = ctx
         .client
         .done(
             id,
             &DoneTask {
                 agent: ctx.agent()?.clone(),
-                version,
+                version: detail.task.version,
                 evidence,
                 summary,
             },
@@ -539,10 +566,22 @@ pub async fn task_done(
     {
         tracing::warn!("recording {} done for the Stop hook: {err:#}", task.id);
     }
-    Ok(Output::new(
-        format!("done {}", render::task_line(&task)),
-        &task,
-    ))
+    let mut text = format!("done {}", render::task_line(&task));
+    // Read again: a note does not change the version, so one added after the read above
+    // would be missed. When the read fails, the one above still lists the earlier ones.
+    let detail = match ctx.client.task(id).await {
+        Ok(after) => after,
+        Err(err) => {
+            tracing::warn!("reading {id}'s findings after done: {err:#}");
+            detail
+        }
+    };
+    let findings = render::done_findings(&detail, ctx.agent()?.as_str());
+    if !findings.is_empty() {
+        text.push('\n');
+        text.push_str(&findings);
+    }
+    Ok(Output::new(text, &task))
 }
 
 pub async fn task_note(ctx: &Ctx, id: &TaskId, kind: NoteKind, text: String) -> Result<Output> {
@@ -750,6 +789,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
     if let Some(temporary) = body.temporary {
         check_temporary(&board, temporary, "updated")?;
     }
+    if let Some(wanted) = body.parallel_tasks
+        && board.parallel_tasks != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored parallel_tasks={wanted}: it predates \
+             parallel tasks. Upgrade the server, then run board board update {slug} \
+             --parallel-tasks {wanted}"
+        );
+    }
     Ok(Output::new(
         format!("updated {}", render::board_line(&board)),
         &board,
@@ -846,18 +894,29 @@ pub async fn board_adopt(
                 &board,
             ));
         }
-        // A coordinator that has ended is replaced by the daemon, as when none is named.
-        let live = match ctx.client.agent_info(current).await {
-            Ok(info) => info.state != AgentState::Ended,
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+        let info = match ctx.client.agent_info(current).await {
+            Ok(info) => Some(info),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
             Err(err) => return Err(err),
         };
-        if live {
-            bail!(
+        match info {
+            Some(info) if info.state != AgentState::Ended => bail!(
                 "{current} coordinates board {slug} now; switch autopilot off (board board \
                  update {slug} --autopilot false), wait until `board boards` shows it without \
                  a coordinator, then adopt again"
-            );
+            ),
+            // T3 ends a session left idle while its thread lives on, and that device's
+            // daemon keeps the lease while the thread is live. On this device, the adoption
+            // replaces it, as when none is named.
+            Some(info) if info.device != *device => bail!(
+                "{current} coordinates board {slug} from device {}: its session ended, but \
+                 that device keeps the coordinator lease while its thread lives; adopt on that \
+                 device, or wait until `board boards` shows {slug} without a coordinator (the \
+                 lease expires once that device stops renewing it: after the server's \
+                 coordinator_ttl_secs, 45 minutes by default), then adopt again",
+                info.device
+            ),
+            _ => {}
         }
     }
     if let Some(local) = daemon::load_watch_state(&ctx.home).coordinators.get(slug)
@@ -947,9 +1006,40 @@ pub async fn log(
     Ok(Output::new(render::event_list(&page.events), &page))
 }
 
-pub async fn stats(ctx: &Ctx, days: u32) -> Result<Output> {
+/// A `--since` argument: an RFC 3339 time, a date (`YYYY-MM-DD`, midnight UTC), or a
+/// duration back from `now` (`30m`, `12h`, `14d`).
+pub fn parse_since(value: &str, now: Timestamp) -> Result<Timestamp> {
+    let value = value.trim();
+    let back = value
+        .strip_suffix(['m', 'h', 'd'])
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(|n| match value.as_bytes()[value.len() - 1] {
+            b'm' => chrono::TimeDelta::minutes(n.into()),
+            b'h' => chrono::TimeDelta::hours(n.into()),
+            _ => chrono::TimeDelta::days(n.into()),
+        });
+    if let Some(back) = back {
+        return now.checked_sub_signed(back).with_context(|| {
+            format!("since {value:?} reaches back too far; send a shorter duration")
+        });
+    }
+    match parse_not_before(Some(value)) {
+        Ok(Some(Some(at))) => Ok(at),
+        _ => bail!(
+            "since {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now (30m, 12h, 14d)"
+        ),
+    }
+}
+
+/// API errors the server recorded since a time, one line per signature (`GET /v1/errors`).
+pub async fn errors(ctx: &Ctx, q: &ErrorsQuery) -> Result<Output> {
+    let log = ctx.client.errors(q).await?;
+    Ok(Output::new(render::errors(&log), &log))
+}
+
+pub async fn stats(ctx: &Ctx, days: u32, now: Timestamp) -> Result<Output> {
     let stats = ctx.client.stats(days).await?;
-    Ok(Output::new(render::stats(&stats), &stats))
+    Ok(Output::new(render::stats(&stats, now), &stats))
 }
 
 /// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a
@@ -985,6 +1075,24 @@ pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Out
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_takes_a_time_a_date_or_a_duration_back() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        for (since, want) in [
+            ("30m", "2026-11-08T11:30:00Z"),
+            ("12h", "2026-11-08T00:00:00Z"),
+            ("14d", "2026-10-25T12:00:00Z"),
+            ("2026-11-07", "2026-11-07T00:00:00Z"),
+            ("2026-11-07T07:45:00Z", "2026-11-07T07:45:00Z"),
+        ] {
+            assert_eq!(parse_since(since, now).unwrap(), at(want), "{since}");
+        }
+        for bad in ["", "d", "14w", "-3d", "none", "yesterday", "100000000d"] {
+            assert!(parse_since(bad, now).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn enum_values_are_the_wire_spellings() {

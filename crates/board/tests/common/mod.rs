@@ -83,6 +83,8 @@ struct Stream {
 pub struct Stub {
     pub url: String,
     state: Arc<Mutex<StubState>>,
+    /// Connections accepted so far.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Stub {
@@ -93,18 +95,35 @@ impl Stub {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(StubState::default()));
         let shared = state.clone();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                use axum::serve::ListenerExt as _;
+                let listener =
+                    tokio::net::TcpListener::from_std(listener)
+                        .unwrap()
+                        .tap_io(move |_| {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        });
                 let app = axum::Router::new().fallback(handle).with_state(shared);
                 axum::serve(listener, app).await.unwrap();
             });
         });
-        Self { url, state }
+        Self {
+            url,
+            state,
+            connections,
+        }
+    }
+
+    /// How many connections clients opened to the stub so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Answers `"<METHOD> <path>"` (path as sent, percent-encoded) with `body`.
@@ -480,6 +499,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         temporary: false,
         repos: repos.iter().map(|r| (*r).to_owned()).collect(),
         autopilot: false,
+        parallel_tasks: 1,
         coordinator: None,
         home_devices: Vec::new(),
         counts: StatusCounts::default(),

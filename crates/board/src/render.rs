@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task, TaskDetail,
-    TaskStatus, Timestamp, TouchResult,
+    Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Handoff, Lease, LeaseResult, Note,
+    NoteKind, Stats, Task, TaskDetail, TaskStatus, Timestamp, TouchResult,
 };
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 
 /// Header above peer-written free text.
@@ -212,12 +212,24 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
             ago(ev.at)
         );
     }
-    let notes: &[Note] = if detailed {
-        &detail.notes
+    // Every finding and decision, so the agent doing the task misses none; plain notes
+    // only the latest few unless detailed.
+    let plain = detail.notes.iter().filter(|n| is_plain(n.kind)).count();
+    let cut = if detailed {
+        0
     } else {
-        let n = detail.notes.len();
-        &detail.notes[n.saturating_sub(5)..]
+        plain.saturating_sub(PLAIN_NOTES)
     };
+    let mut skipped = 0;
+    let notes: Vec<&Note> = detail
+        .notes
+        .iter()
+        .filter(|n| {
+            let skip = is_plain(n.kind) && skipped < cut;
+            skipped += usize::from(skip);
+            !skip
+        })
+        .collect();
     if detailed {
         for event in &detail.history {
             let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
@@ -250,22 +262,114 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         peer.push(json!({"task": task.id, "field": "resolution_reason", "text": reason}));
     }
     for note in notes {
-        peer.push(json!({
-            "task": task.id, "field": "note", "kind": note.kind, "by": short(handles, note.agent.as_str()),
-            "at": note.at, "text": note.text,
-        }));
+        peer.push(note_line(note, handles));
     }
     let block = peer_block(&peer);
     if !block.is_empty() {
         out.push('\n');
         out.push_str(&block);
     }
-    if !detailed && detail.notes.len() > notes.len() {
+    if cut > 0 {
         let _ = write!(
             out,
-            "\n({} older notes; pass detailed for all and the history)",
-            detail.notes.len() - notes.len()
+            "\n({}; every finding and decision is shown; pass detailed for all and the \
+             history)",
+            plural(cut, "older plain note", "older plain notes"),
         );
+    }
+    out
+}
+
+/// Plain notes `task_show` shows without detailed: the latest few.
+const PLAIN_NOTES: usize = 5;
+
+/// Notes `task_show` cuts to the latest few without detailed: all but findings and
+/// decisions.
+fn is_plain(kind: NoteKind) -> bool {
+    matches!(kind, NoteKind::Note | NoteKind::Feedback)
+}
+
+/// `"1 note"`, `"2 notes"`.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A note as one line of peer text.
+fn note_line(note: &Note, handles: &BTreeMap<String, String>) -> Value {
+    json!({
+        "task": note.task, "field": "note", "kind": note.kind,
+        "by": short(handles, note.agent.as_str()), "at": note.at, "text": note.text,
+    })
+}
+
+/// What a claim adds below the task line: how many notes the task has, and to read them.
+pub fn claim_notes(detail: &TaskDetail) -> String {
+    let id = &detail.task.id;
+    if detail.notes.is_empty() {
+        return format!("no notes on {id}; task_show {id} for its body and acceptance checks");
+    }
+    let count = |kind| detail.notes.iter().filter(|n| n.kind == kind).count();
+    let (findings, decisions) = (count(NoteKind::Finding), count(NoteKind::Decision));
+    let plain = detail.notes.len() - findings - decisions;
+    // Without detailed, task_show cuts plain notes past the latest few.
+    let show = if plain > PLAIN_NOTES {
+        format!("task_show {id} with detailed")
+    } else {
+        format!("task_show {id}")
+    };
+    let mut text = format!(
+        "{} on {id} ({}, {}, {plain} plain): {show} and read every one before starting",
+        plural(detail.notes.len(), "note", "notes"),
+        plural(findings, "finding", "findings"),
+        plural(decisions, "decision", "decisions"),
+    );
+    if findings + decisions > 0 {
+        text.push_str("; pass each finding and decision into a delegate's brief");
+    }
+    text
+}
+
+/// What `task_done` adds below the task line: the finding notes added since the task's
+/// latest claim (every finding when no claim is in the history), so the agent can confirm
+/// each is addressed. The window starts at the claim, not at a later handover, so a
+/// finding noted while a child held the task is listed when it is handed back. Empty when
+/// there are none.
+pub fn done_findings(detail: &TaskDetail, agent: &str) -> String {
+    let handles = &detail.handles;
+    let claimed = detail
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.event_type == EventType::TaskClaimed)
+        .map(|e| e.at);
+    let (own, peers): (Vec<&Note>, Vec<&Note>) = detail
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Finding && claimed.is_none_or(|at| n.at >= at))
+        .partition(|n| n.agent.as_str() == agent);
+    if own.is_empty() && peers.is_empty() {
+        return String::new();
+    }
+    let since = if claimed.is_some() {
+        "since the claim"
+    } else {
+        "on the task"
+    };
+    let mut out = format!(
+        "{} {since}; the task is done: for each one the evidence does not cover, task_note \
+         {} how it was addressed (done, or declined with a reason), or reopen the task \
+         (status open) if it was not",
+        plural(own.len() + peers.len(), "finding", "findings"),
+        detail.task.id,
+    );
+    for note in own {
+        let _ = write!(out, "\nyours: {}", json_line(&note_line(note, handles)));
+    }
+    let peers: Vec<Value> = peers.iter().map(|n| note_line(n, handles)).collect();
+    let block = peer_block(&peers);
+    if !block.is_empty() {
+        out.push('\n');
+        out.push_str(&block);
     }
     out
 }
@@ -303,6 +407,9 @@ pub fn board_line(board: &Board) -> String {
             }
             None => line.push_str(" (no coordinator)"),
         }
+    }
+    if board.parallel_tasks > 1 {
+        let _ = write!(line, " · {} tasks at once", board.parallel_tasks);
     }
     line
 }
@@ -347,7 +454,10 @@ pub fn agent_line(agent: &Agent) -> String {
         enum_str(&agent.state),
         agent.device
     );
-    if let Some(until) = agent.paused_until {
+    // An ended agent keeps the reset its session stopped on, which matters only until then.
+    if let Some(until) = agent.paused_until
+        && (agent.state == AgentState::Paused || until > Utc::now())
+    {
         let _ = write!(line, " until {}", until.to_rfc3339());
     }
     let _ = write!(line, " · seen {}", ago(agent.last_seen));
@@ -469,18 +579,55 @@ pub fn lease_result(result: &LeaseResult) -> String {
     lines.join("\n")
 }
 
+/// `board errors`: one line per signature, most first, after a header naming the window.
+pub fn errors(log: &ErrorLog) -> String {
+    let since = log.since.format("%Y-%m-%d %H:%MZ");
+    let mut out = format!(
+        "API errors since {since} (kept {} days)",
+        log.retention_days
+    );
+    if log.signatures.is_empty() {
+        out.push_str("\nnone");
+    }
+    for e in &log.signatures {
+        let agents = if e.agents == 1 { "agent" } else { "agents" };
+        let _ = write!(
+            out,
+            "\n{} × {} from {} {agents} · {} · {} · \"{}\" · last {}",
+            e.count,
+            e.code,
+            e.agents,
+            e.route,
+            e.item.as_ref().map_or("no item", |id| id.as_str()),
+            e.template,
+            e.last_at.format("%Y-%m-%d %H:%MZ"),
+        );
+    }
+    out
+}
+
 /// `board stats`: the feedback-loop counts, one topic per line. A server that predates
-/// feedback items reports zero feedback.
-pub fn stats(stats: &Stats) -> String {
+/// feedback items reports zero feedback. `now` is the caller's clock.
+pub fn stats(stats: &Stats, now: Timestamp) -> String {
     let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
     let day = if stats.days == 1 { "day" } else { "days" };
-    format!(
-        "stats, last {} {day}\n\
+    // The server's history starts after the window asked for: say what it covers. The hour
+    // of slack keeps a server clock a little ahead of this one from setting it off.
+    let truncated_after = now - TimeDelta::days(i64::from(stats.days)) + TimeDelta::hours(1);
+    let window = match stats.since {
+        Some(since) if since > truncated_after => format!(
+            "since {}, where the server's history starts (asked: last {} {day})",
+            since.format("%Y-%m-%d %H:%MZ"),
+            stats.days
+        ),
+        _ => format!("last {} {day}", stats.days),
+    };
+    let mut out = format!(
+        "stats, {window}\n\
          tasks: {} created · {} done ({} without a check, {} under a minute in doing) · median {} in doing\n\
          claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
          asks: {} created · {} answered · median {} to answer\n\
          feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined, {} fixed",
-        stats.days,
         stats.tasks_created,
         stats.tasks_done,
         stats.done_without_check_evidence,
@@ -501,7 +648,33 @@ pub fn stats(stats: &Stats) -> String {
         stats.feedback.resolved.forwarded,
         stats.feedback.resolved.declined,
         stats.feedback.resolved.fixed,
-    )
+    );
+    for b in &stats.boards {
+        let _ = write!(
+            out,
+            "\nboard {}: wait median {}, p90 {} over {} · {:.1} done a day, median {} in doing · \
+             {} reopened after review · {} · {} · limit: {} ({:.1} a day), {:.1}h paused, {} running at most when one paused",
+            b.board,
+            minutes(b.wait_minutes_median),
+            minutes(b.wait_minutes_p90),
+            plural(b.claims as usize, "claim", "claims"),
+            b.done_per_day,
+            minutes(b.doing_minutes_median),
+            b.reopened_after_review,
+            plural(
+                b.lease_conflicts as usize,
+                "lease conflict",
+                "lease conflicts"
+            ),
+            plural(b.pr_links as usize, "PR link", "PR links"),
+            plural(b.limit_pauses as usize, "pause", "pauses"),
+            b.limit_pauses_per_day,
+            b.paused_hours,
+            b.peak_running_at_pause
+                .map_or_else(|| "n/a".to_owned(), |n| n.to_string()),
+        );
+    }
+    out
 }
 
 /// One warning line per overlap, or nothing.
@@ -547,6 +720,160 @@ mod tests {
         assert!(cut.ends_with("…\""));
         assert_eq!(title("<b>"), "\"\\u003cb\\u003e\"");
     }
+    /// A doing task owned by `t3:me`, with `notes` as (kind, text, minute) and `history`
+    /// as (type, actor, minute, payload), at minutes past 10:00.
+    fn noted(notes: &[(&str, &str, u32)], history: &[(&str, &str, u32, Value)]) -> TaskDetail {
+        let at = |m: u32| format!("2026-11-07T10:{m:02}:00Z");
+        serde_json::from_value(json!({
+            "task": {
+                "id": "factory-12", "board": "factory", "parent": null, "title": "Fix it",
+                "body": "Body", "acceptance": "", "status": "doing", "priority": "p2",
+                "blocked_reason": null, "owner": "t3:me", "owner_stale": false,
+                "blockers": [], "ready": false, "not_before": null, "auto": true,
+                "created_by": "t3:me", "version": 3, "summary": null,
+                "created_at": at(0), "updated_at": at(0),
+            },
+            "notes": notes.iter().enumerate().map(|(i, (kind, text, m))| json!({
+                "id": i + 1, "task": "factory-12", "agent": "t3:peer", "kind": kind,
+                "text": text, "at": at(*m),
+            })).collect::<Vec<_>>(),
+            "evidence": [], "blocks": [], "children": [],
+            "history": history.iter().enumerate().map(|(i, (kind, actor, m, payload))| json!({
+                "seq": i + 1, "at": at(*m), "board": "factory", "actor": actor,
+                "type": kind, "task": "factory-12", "payload": payload,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn task_show_keeps_every_finding_and_decision_and_cuts_only_plain_notes() {
+        let mut notes = vec![
+            ("finding", "early finding", 1),
+            ("decision", "verdict: accept", 2),
+        ];
+        let plain: Vec<String> = (0..8).map(|i| format!("plain {i}")).collect();
+        notes.extend(plain.iter().map(|t| ("note", t.as_str(), 3)));
+        notes.push(("finding", "late finding", 4));
+        let detail = noted(&notes, &[]);
+
+        let text = task_detail(&detail, false);
+        for kept in ["early finding", "verdict: accept", "late finding"] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
+        for i in 0..3 {
+            assert!(!text.contains(&format!("\"plain {i}\"")), "{text}");
+        }
+        for i in 3..8 {
+            assert!(text.contains(&format!("\"plain {i}\"")), "{text}");
+        }
+        assert!(
+            text.ends_with(
+                "(3 older plain notes; every finding and decision is shown; pass detailed \
+                 for all and the history)"
+            ),
+            "{text}"
+        );
+        // Detailed shows all, with no count.
+        let all = task_detail(&detail, true);
+        assert!(
+            all.contains("\"plain 0\"") && !all.contains("older plain"),
+            "{all}"
+        );
+        // Five plain notes or fewer: nothing cut.
+        let few = noted(&[("note", "a", 1), ("finding", "b", 2)], &[]);
+        assert!(!task_detail(&few, false).contains("older"));
+    }
+
+    #[test]
+    fn task_show_cuts_feedback_notes_like_plain_ones() {
+        let notes: Vec<(&str, &str, u32)> = (0..7).map(|_| ("feedback", "again", 1)).collect();
+        let text = task_detail(&noted(&notes, &[]), false);
+        assert_eq!(text.matches("\"again\"").count(), 5, "{text}");
+        assert!(text.contains("(2 older plain notes;"), "{text}");
+    }
+
+    #[test]
+    fn claims_count_the_notes_and_done_lists_findings_since_the_claim() {
+        let claimed = (
+            "task_claimed",
+            "t3:me",
+            5,
+            json!({ "previous_owner": null }),
+        );
+        let detail = noted(
+            &[
+                ("finding", "before the claim", 1),
+                ("decision", "verdict: accept", 2),
+                ("note", "plain", 6),
+                ("finding", "after the claim", 7),
+            ],
+            std::slice::from_ref(&claimed),
+        );
+        assert_eq!(
+            claim_notes(&detail),
+            "4 notes on factory-12 (2 findings, 1 decision, 1 plain): task_show factory-12 and \
+             read every one before starting; pass each finding and decision into a delegate's \
+             brief"
+        );
+        let empty = noted(&[], &[]);
+        assert_eq!(
+            claim_notes(&empty),
+            "no notes on factory-12; task_show factory-12 for its body and acceptance checks"
+        );
+        // Plain notes past what task_show shows: say detailed; no findings or decisions:
+        // nothing to brief.
+        let plain: Vec<(&str, &str, u32)> = (0..6).map(|_| ("feedback", "again", 1)).collect();
+        assert_eq!(
+            claim_notes(&noted(&plain, &[])),
+            "6 notes on factory-12 (0 findings, 0 decisions, 6 plain): task_show factory-12 \
+             with detailed and read every one before starting"
+        );
+
+        let done = done_findings(&detail, "t3:me");
+        assert!(
+            done.starts_with(
+                "1 finding since the claim; the task is done: for each one the evidence does \
+                 not cover, task_note factory-12 how it was addressed (done, or declined with a \
+                 reason), or reopen the task (status open) if it was not\n"
+            ),
+            "{done}"
+        );
+        assert!(done.contains(PEER_HEADER), "{done}");
+        assert!(done.contains("after the claim"), "{done}");
+        assert!(!done.contains("before the claim"), "{done}");
+        // The window starts at the claim, not at a later handover: a finding noted while
+        // a child held the task is listed when the task is handed back.
+        let handed = noted(
+            &[
+                ("finding", "before", 1),
+                ("finding", "while the child had it", 4),
+                ("finding", "after", 7),
+            ],
+            &[
+                ("task_claimed", "t3:me", 2, json!({})),
+                ("task_updated", "t3:me", 3, json!({ "owner": "t3:child" })),
+                ("task_updated", "t3:me", 5, json!({ "owner": "t3:me" })),
+            ],
+        );
+        let done = done_findings(&handed, "t3:me");
+        assert!(done.starts_with("2 findings since the claim;"), "{done}");
+        assert!(
+            done.contains("while the child had it") && !done.contains("\"before\""),
+            "{done}"
+        );
+        // My own findings are listed as mine, not under the peer header.
+        let mut own = noted(&[("finding", "my own", 7)], std::slice::from_ref(&claimed));
+        own.notes[0].agent = serde_json::from_value(json!("t3:me")).unwrap();
+        let done = done_findings(&own, "t3:me");
+        assert!(done.contains("\nyours: {"), "{done}");
+        assert!(!done.contains(PEER_HEADER), "{done}");
+        // No claim in the history: every finding.
+        let unknown = noted(&[("finding", "a", 1), ("finding", "b", 7)], &[]);
+        assert!(done_findings(&unknown, "t3:me").starts_with("2 findings on the task;"));
+        assert_eq!(done_findings(&empty, "t3:me"), "");
+    }
+
     #[test]
     fn task_detail_names_agents_by_their_handles() {
         const LONG: &str = "t3:thread:delegated-task:command%3Amcp%3A8f8e";

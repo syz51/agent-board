@@ -54,7 +54,8 @@ pub enum Command {
     },
     /// List tasks.
     Ls(LsArgs),
-    /// Show a task with its notes and evidence.
+    /// Show a task with its evidence, every finding and decision note, and the latest plain
+    /// notes (--detailed for all and the history).
     Show {
         id: TaskId,
         #[arg(long)]
@@ -161,6 +162,30 @@ pub enum Command {
         /// Days to count back from now, 1 to 365.
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
         days: u32,
+    },
+    /// API errors the server recorded, one line per signature, most first. Counts errors
+    /// under the signal threshold, such as those since a fix deployed.
+    Errors {
+        /// From when: an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now
+        /// (30m, 12h, 14d). Default: the server's signal window (signal_window_days).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only this error code, such as invalid.
+        #[arg(long, value_parser = enum_arg::<board_proto::ErrorCode>())]
+        code: Option<board_proto::ErrorCode>,
+        /// Only this route, such as "POST /v1/tasks/{id}/notes".
+        #[arg(long)]
+        route: Option<String>,
+        /// Only messages that contain this text, ignoring case.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Most signatures to list, 1 to 1000.
+        #[arg(
+            long,
+            default_value_t = board_proto::ERRORS_LIMIT_DEFAULT,
+            value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::ERRORS_LIMIT_MAX))
+        )]
+        limit: u32,
     },
     /// Print your board snapshot.
     Snapshot {
@@ -459,6 +484,10 @@ pub enum BoardCommand {
         /// user may turn it on for an existing board.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         temporary: Option<bool>,
+        /// How many tasks the coordinator and its child threads may have in progress at
+        /// once (1 to 4). Only the user may raise it.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
+        parallel_tasks: Option<u32>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -608,13 +637,17 @@ impl Command {
                 check_all("option", options, ASK_OPTION_CHARS_MAX)?;
             }
             Self::Answer { answer, .. } => check_chars("answer", answer, l.question_chars)?,
+            Self::Errors { grep, .. } => check_opt("q", grep, board_proto::ERRORS_Q_CHARS_MAX)?,
             Self::Feedback {
                 about,
                 signature,
                 text,
                 ..
             } => {
-                check_chars("about", about, FEEDBACK_ABOUT_MAX)?;
+                // A plain error, not reported: the server answers an over-long about
+                // with `about "…" is not a setup name`, under another signature.
+                check_chars("about", about, FEEDBACK_ABOUT_MAX)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
                 check_opt("signature", signature, FEEDBACK_SIGNATURE_MAX)?;
                 ops::check_chars_or(
                     "text",
@@ -646,6 +679,31 @@ impl Command {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The route template of the request whose text [`Self::check_text_limits`] checks, as
+    /// the server records its errors.
+    fn checked_route(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Add(_) => "POST /v1/tasks",
+            Self::Update(_) => "PATCH /v1/tasks/{id}",
+            Self::Done(_) => "POST /v1/tasks/{id}/done",
+            Self::Note { .. } => "POST /v1/tasks/{id}/notes",
+            // Without both, it shows the handoff and sends no text.
+            Self::Handoff {
+                now: Some(_),
+                next: Some(_),
+                ..
+            } => "PUT /v1/agents/{id}/handoff",
+            Self::Ask { .. } => "POST /v1/asks",
+            Self::Answer { .. } => "POST /v1/asks/{id}/answer",
+            Self::Errors { .. } => "GET /v1/errors",
+            Self::Feedback { .. } => "POST /v1/feedback",
+            Self::Resolve { .. } => "POST /v1/feedback/{id}/resolve",
+            Self::Board(BoardCommand::Create { .. }) => "POST /v1/boards",
+            Self::Board(BoardCommand::Update { .. }) => "PATCH /v1/boards/{slug}",
+            _ => return None,
+        })
     }
 
     /// Commands that act as the calling agent, which must then be registered.
@@ -701,6 +759,30 @@ pub async fn run(cli: Cli) -> i32 {
     code
 }
 
+/// How long a refused command waits for the server to record the refusal.
+const REFUSAL_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Records a refusal made before sending, so the server's signals count it like its own
+/// (`POST /v1/errors`). Best effort: a failure is logged at debug level only, so the
+/// command's output and exit code stay as they were.
+async fn report_refusal(ctx: &Ctx, route: &str, refused: &ops::Refused) {
+    if ctx.client.agent().is_none() {
+        return;
+    }
+    let body = board_proto::ClientError {
+        code: board_proto::ErrorCode::Invalid,
+        route: route.to_owned(),
+        message: refused.message.clone(),
+    };
+    if let Err(err) = ctx
+        .client
+        .report_refusal(&body, REFUSAL_REPORT_TIMEOUT)
+        .await
+    {
+        tracing::debug!("recording the refusal on the server failed: {err:#}");
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<()> {
     let home = Home::from_env()?;
     let json = cli.json;
@@ -717,7 +799,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
         let ctx = Ctx::load(home.clone(), agent()?, None)?;
         Ok(loaded.get_or_init(|| ctx).clone())
     };
-    cli.command.check_text_limits()?;
+    if let Err(err) = cli.command.check_text_limits() {
+        if let (Some(refused), Some(route)) = (
+            err.downcast_ref::<ops::Refused>(),
+            cli.command.checked_route(),
+        ) {
+            match ctx() {
+                Ok(ctx) => report_refusal(&ctx, route, refused).await,
+                Err(err) => tracing::debug!("not recording the refusal on the server: {err:#}"),
+            }
+        }
+        return Err(err);
+    }
     if cli.command.acts_as_agent() {
         ctx()?.ensure_registered().await?;
     }
@@ -858,6 +951,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             autopilot,
             home_devices,
             temporary,
+            parallel_tasks,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -867,6 +961,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 autopilot,
                 home_devices,
                 temporary,
+                parallel_tasks,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
@@ -921,7 +1016,26 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let req = ResolveFeedback { kind, task, reason };
             ops::resolve(&ctx()?, &id, req).await?
         }
-        Command::Stats { days } => ops::stats(&ctx()?, days).await?,
+        Command::Stats { days } => ops::stats(&ctx()?, days, chrono::Utc::now()).await?,
+        Command::Errors {
+            since,
+            code,
+            route,
+            grep,
+            limit,
+        } => {
+            let since = since
+                .map(|s| ops::parse_since(&s, chrono::Utc::now()))
+                .transpose()?;
+            let q = crate::client::ErrorsQuery {
+                since,
+                code,
+                route,
+                q: grep,
+                limit,
+            };
+            ops::errors(&ctx()?, &q).await?
+        }
         Command::Hook { .. } | Command::Serve { .. } | Command::Admin(_) => {
             unreachable!("handled in run")
         }
@@ -998,5 +1112,49 @@ mod tests {
             update.contains("[possible values: open, doing, blocked, review, dropped]"),
             "done goes through board done: {update}"
         );
+    }
+
+    #[test]
+    fn every_refusal_names_a_route_the_server_records() {
+        let long = "x".repeat(5000);
+        let long = long.as_str();
+        let cases: &[&[&str]] = &[
+            &["add", long],
+            &["update", "factory-1", "--title", long],
+            &["done", "factory-1", "--pr", long],
+            &["note", "factory-1", long],
+            &["handoff", "--now", long, "--next", "x"],
+            &["ask", long],
+            &["answer", "7", long],
+            &["errors", "--grep", long],
+            &["feedback", long],
+            &["resolve", "board-feedback-1", "--declined", long],
+            &["board", "create", "factory", "--title", long],
+            &["board", "update", "factory", "--goal", long],
+        ];
+        let parse = |args: &[&str]| Cli::try_parse_from([&["board"][..], args].concat()).unwrap();
+        for args in cases {
+            let cli = parse(args);
+            let err = cli.command.check_text_limits().unwrap_err();
+            let refused = err.downcast_ref::<ops::Refused>().unwrap();
+            assert!(
+                board_proto::TooLong::parse(&refused.message).is_some(),
+                "{args:?}: the server would refuse {refused}"
+            );
+            let route = cli.command.checked_route().unwrap();
+            assert!(
+                board_proto::CLIENT_ERROR_ROUTES.contains(&route),
+                "{args:?}: {route}"
+            );
+        }
+
+        // Not reported: a handoff that only shows, and an about the server refuses with
+        // another message.
+        let show = parse(&["handoff", "--blockers", long]);
+        assert!(show.command.check_text_limits().is_err());
+        assert_eq!(show.command.checked_route(), None);
+        let about = parse(&["feedback", "--about", long, "x"]);
+        let err = about.command.check_text_limits().unwrap_err();
+        assert!(err.downcast_ref::<ops::Refused>().is_none(), "{err}");
     }
 }

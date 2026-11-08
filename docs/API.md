@@ -78,14 +78,18 @@ starting `claim refused:`; agents race for tasks, and stats count refusals as
 `claims_refused`) and `claim_refused` from
 `POST /v1/boards/{slug}/coordinator` (the daemon renews it). It records the code, the
 route template (`POST /v1/tasks/{id}/claim`) and the message normalized (numbers become
-`N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`). Once the same code, route and template reach
+`N`, task ids `ID`, agent ids `AGENT`, quoted text `"…"`), with the source `server`. It also
+records the refusals a client made before sending (`POST /v1/errors`), with the source
+`client`, under the signature its own answer would get, so both count towards signals and
+`GET /v1/errors`. Once the same code, route and template reach
 `signal_min_reports` errors from at least `signal_min_agents` agents within
 `signal_window_days`, the server files feedback itself (see "Feedback") with source
 `signal`, about `board` and signature `signal:<code>:<hash>`, giving the count, the agents,
 the window, the route and the template. Later errors add reports to that item while it is
 live. Once it is no longer live (its fix is done), only errors after its last report count
-towards a new item, which `recurs` it. Records older than the window are deleted by the
-server's minute sweep.
+towards a new item, which `recurs` it. Records are kept `error_retention_days`, and never less than the window,
+so `GET /v1/errors` can count errors under the threshold, such as since a fix deployed; the
+server's minute sweep deletes older ones.
 
 ## Endpoints
 
@@ -116,9 +120,10 @@ server's minute sweep.
 - Every call that acts as an agent marks it seen. One marked `ended` that makes such a call
   itself (a task, note, lease, touch, ask, handoff, board join, feedback call, or snapshot
   that advances its cursor) is `running` again, announced by one `agent_state_changed`
-  event (`from` `ended`, `to` `running`). Calls made for it leave its state alone: a
-  device claiming or renewing the coordinator lease, a state update, and task changes
-  through the user token.
+  event (`from` `ended`, `to` `running`). Calls made for it leave its state alone: a state
+  update and task changes through the user token mark it seen; a device claiming or
+  renewing the coordinator lease for it does not, so `last_seen` says when the agent itself
+  last acted.
 - Wherever a request names an agent to look up (`owner` in `[UpdateTask]` and in
   `GET /v1/tasks`), its short handle works too.
 - Clients act only as themselves: in a T3 thread, outside a nested session, `--agent`
@@ -130,7 +135,15 @@ server's minute sweep.
   than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
-  `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
+  `ended` releases the agent's file leases; owned tasks stay owned. Its coordinator lease
+  runs on until it expires: T3 ends a session left idle for 30 minutes while the thread
+  lives on, and the daemon of the lease's device renews the lease while the thread is live,
+  or releases it when the thread is gone or T3 cannot say. (Servers before this change
+  released the coordinator lease too.)
+  `paused_until` is accepted only with `paused`. An agent paused until a time still ahead
+  keeps that `paused_until` when it is marked `ended` (T3 closes an idle session, but the
+  usage limit holds until its reset), and the `agent_state_changed` event carries it; any
+  other state, a registration or a call that revives the agent clears it.
   `said`, optional, is the last message of the turn that just ended: the hooks send it
   with the `Stop` update. It is advisory and never fails the update: the server removes
   terminal escape sequences and control characters other than line breaks and tabs, trims
@@ -153,6 +166,12 @@ server's minute sweep.
 
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
+  `parallel_tasks` (1 to 4; 400 `invalid` otherwise) is how many tasks the board's
+  coordinator and its child threads may have in progress at once. The coordinator keeps to
+  it; the server does not refuse claims over it. Raising it is user only (403
+  `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
+  restate or lower it. A `Board` from a server that predates it reads as 1, and a client
+  leaves the field out of `UpdateBoard` unless it sets it.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
@@ -170,7 +189,35 @@ server's minute sweep.
   slug may be used again, and its task numbers continue where the deleted board's stopped,
   so a task id an agent still holds never names a new task. Ask ids are never reused
   either.
-- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7.
+- `GET /v1/stats?days=7` → `[Stats]`. `days` is 1 to 365, default 7. Its fields are listed
+  under `board stats` in "CLI".
+- `GET /v1/errors?since=&code=&route=&q=&limit=` → `[ErrorLog]` `{since, retention_days,
+  signatures}`: the API errors recorded for signals (see "Signals") at or after `since`,
+  one row per signature, most errors first. A row `[ErrorSignature]` has `signature`
+  (`signal:<code>:<hash>`), `code`, `route` (the template), `template` (the normalized
+  message), `count`, `agents` (distinct), `first_at`, `last_at` and `item`: the newest
+  feedback item with that signature, or `null` when none was filed, as for errors under
+  the signal threshold. `since` is an RFC 3339 time, default `signal_window_days` back from
+  now; the server keeps records `error_retention_days`, so an earlier `since` reads from the
+  oldest kept, and the answer's `since` says so. `code` is an error code (400 `invalid`
+  otherwise) and `route` a route template, matched exactly; `q` (at most 200 characters)
+  matches the template's text, ignoring ASCII case. Blank `route` and `q` are left out.
+  `limit` is 1 to 1,000, default 100. Each row counts both sources.
+- `POST /v1/errors` `[ClientError]` `{code, route, message}` → 204: records a request the
+  calling agent's client refused before sending, such as text over a limit, as if the
+  server had answered it (see "Signals"): source `client`, the same signature, and a signal
+  item once the threshold is reached. `code` is `invalid`, the only code recorded from
+  clients; `route` is the method and route template the request would have gone to, one of
+  the `/v1` routes in this document but this one (`POST /v1/tasks/{id}/notes`); `message`
+  is the server's message for text over a limit, exactly as the server writes it
+  (`<field> is <n> characters; the limit is <max>`, `n` above `max`), for a field clients
+  check: `title`, `body`, `acceptance`, `blocked_reason`, `evidence value`, `text`, `now`,
+  `next`, `blockers`, `question`, `option`, `answer`, `q`, `signature`, `reason` or `goal`
+  (`board_proto::CLIENT_CHECKED_FIELDS`), so a record carries no text of the client's
+  choosing. It needs a device token and `X-Board-Agent`, and the record is that agent's:
+  the body names no agent. Anything else is 400 `invalid`. Servers before it answer 405,
+  or 404 `not_found` before `GET /v1/errors`; some of those record that 404 as their own
+  error.
 
 #### Temporary boards
 
@@ -259,6 +306,27 @@ Reopening a closed board, or any change on it, starts the period again.
   `review_quiet_secs`; a note from the owner or a new move to `review` restarts the clock.
   The snapshot shows it as an alert to the owner, or to the board's coordinator when the
   owner has ended or is not live.
+- Within a minute of a task in `doing`, on an active board, passing `doing_idle_secs` with
+  its owner away, the server records one `task_updated` event by actor `server` with
+  payload `{"fields": [], "idle_doing": <time>, "away": <agent id>}`: `idle_doing` is when
+  the spell away began, `away` the owner then (unlike `owner` in a handover, it names no
+  new owner). Away means the owner has not run since its first state change after its
+  last change to `running`, or is marked `running` but was last seen `doing_idle_secs`
+  ago. An owner waiting for a usage-limit reset still to come (`paused`, or `ended` with
+  that `paused_until` kept) is not away. No event is recorded while an agent the owner
+  delegated (a T3 thread whose `t3_parent` chain leads to the owner) is running and was
+  seen within `doing_idle_secs`, or waits for a reset still to come (`paused` or `ended`).
+  The task is unchanged. The event is recorded once per spell: none is recorded while one
+  exists for the same task and owner after the owner's last change to `running` and after
+  the task last came to it (claimed, taken, moved to `doing`, handed over); a session
+  ending later is the same spell. A running owner's spell starts when it was last seen, so
+  one seen again starts a new one. The snapshot shows it as an alert while the task is
+  still in `doing` and still that owner's: to the owner, and to the board's coordinator
+  when the owner is no T3 thread or has been away at least twice `doing_idle_secs`.
+  `board watch` on the owner's device wakes a T3 owner. It wakes the board's coordinator
+  instead when the owner is no T3 thread, or when the owner's thread is gone and the
+  coordinator runs on the owner's device. Recent activity shows it as `found <agent> away
+  from <task>`.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
@@ -501,8 +569,34 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `[FeedbackStats]`: `reported` (reports
   received, repeats included), `filed` (items created) and `resolved` (`routed`,
   `duplicate`, `forwarded`, `declined`, `fixed`; `fixed` reads 0 from servers that predate
-  it), each within the period. Without `--json` it prints
-  a four-line summary.
+  it), each within the period; `since`, the oldest time the numbers cover (`days` back
+  from now, or the server's oldest kept event when that is later; absent from servers that
+  predate it); and `boards` (empty from servers that predate it), one `[BoardStats]` per
+  board with events in the period, by slug: `board`; `claims`, claims of auto tasks that
+  waited ready (tasks created claimed are left out), with `wait_minutes_median` and
+  `wait_minutes_p90` from ready to claimed. A task is ready at the latest of: its last
+  creation, release, move to `open`, or change of `auto`, blockers or `not_before`; the
+  `not_before` it has then (the one it was created with until a change); and its last
+  blocker done. A cleared or earlier `not_before` makes it ready sooner. `tasks_done` and
+  `done_per_day`; `doing_minutes_median`, time in `doing` since the task was last done,
+  with `review` excluded; `lease_conflicts`, lease conflicts and file-touch overlaps in the
+  board's repos, whichever task a lease names, if any; `reopened_after_review`, moves from
+  `review` to `open`, `doing` or `blocked`; `pr_links` in the evidence of the tasks done;
+  `limit_pauses` of member agents after they joined, and `limit_pauses_per_day`;
+  `paused_hours`, until each pause's reset, an earlier move to a working state, the
+  session's end when the pause named no reset, or now (a repeated pause before the reset
+  extends it to a later reset named; one after the reset is a new pause); and `peak_running_at_pause`, the most member agents running when one
+  paused (`null` without pauses). A member counts as running when its latest registration
+  or state change before the pause left it running and it acted within the owner
+  staleness threshold before it. Rates are per day since `since`, and medians and
+  percentiles are `null` when nothing was measured. Without `--json` it prints a summary,
+  says when the history starts more than an hour into the period asked, and adds one line
+  per board.
+- `board errors [--since T] [--code C] [--route R] [--grep TEXT] [--limit N] --json` →
+  `[ErrorLog]` from `GET /v1/errors`. `--since` takes an RFC 3339 time, a date
+  (`YYYY-MM-DD`, midnight UTC) or a duration back from now (`30m`, `12h`, `14d`); `--grep`
+  is sent as `q`. Without `--json` it prints a header naming the window, then one line per
+  signature: count, code, distinct agents, route, item, template and last time.
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
@@ -512,6 +606,16 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   --declined <reason> | --fixed <what changed>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
 
 All exit 1 with the error on stderr when the server refuses or cannot be reached.
+
+Text over a limit (see "Defaults") is refused before any request, with the server's message
+followed by `(not sent)` and its `next` hint, and exit 1. The CLI then reports the refusal
+to `POST /v1/errors`, waiting at most 2 seconds, so signals count it; it does not report an
+over-long feedback `about`, which the server refuses with another message, or a request it
+would not have sent, such as `board handoff --blockers` alone, which only shows the
+handoff. The report never
+changes the output or the exit code: a server that is unreachable, slow, older or refuses
+it is ignored. MCP tools do not check lengths before sending, so the server answers and
+records those itself.
 
 ### Web view
 
@@ -539,7 +643,9 @@ no nonce.
 | Text limits | title 72, note 500, handoff field 300, question 1,000, body 4,000 characters; outside settings, ask option 60 and evidence value 500 |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
+| API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
+| Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).
