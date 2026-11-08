@@ -95,7 +95,15 @@ export function AgentsScreen() {
             );
           }
           return (
-            <div className="edge divide-y border-y">
+            <div className="edge @container divide-y border-y">
+              <div
+                className={`${ROW} hidden h-8 items-center bg-muted text-xs font-medium text-muted-foreground @min-[820px]:grid`}
+                aria-hidden="true"
+              >
+                <span>Agent</span>
+                <span>Working on</span>
+                <span>Where</span>
+              </div>
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
               ))}
@@ -107,65 +115,31 @@ export function AgentsScreen() {
   );
 }
 
+/** The agents list's columns from 820px of width: who, what it is working on, where it runs. */
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[200px_minmax(0,1fr)_232px]";
+
 /**
- * One agent per row: who and its state on the first line, where it runs on the second,
- * then its task, handoff and, for a coordinator, its turn endings. Every row starts the
- * same way, so the rows line up whether or not a fact is present.
+ * One agent per row: who and its state, then its task, handoff and, for a coordinator, its
+ * turn endings, then where it runs as label and value pairs. Narrow lists stack the three.
  */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
-    <article className="grid grid-cols-[28px_minmax(0,1fr)] gap-x-3 px-(--gutter) py-3 hover:bg-muted/60">
-      <Avatar handle={agent.handle} large className="mt-px size-7 text-2xs" />
-      <div className="grid min-w-0 gap-1.5">
-        <header className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-          <h2
-            className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
-            title={agent.id}
-          >
-            {agent.handle}
-          </h2>
-          <AgentStateBadge agent={agent} />
-        </header>
-        <dl className="m-0 flex flex-wrap gap-x-4 gap-y-0.5 text-meta [&_code]:text-xs [&_dd]:m-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:flex [&>div]:min-w-0 [&>div]:gap-1.5">
-          {agent.role === "coordinator" && (
-            <div>
-              <dt>Role</dt>
-              <dd>Coordinator</dd>
-            </div>
-          )}
-          <div>
-            <dt>Device</dt>
-            <dd>
-              {agent.device} · {agent.runtime}
-            </dd>
-          </div>
-          {agent.repo && (
-            <div>
-              <dt>Repo</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.repo.replace(/^github\.com\//, "")}</code>
-              </dd>
-            </div>
-          )}
-          {agent.branch && (
-            <div>
-              <dt>Branch</dt>
-              <dd className="[overflow-wrap:anywhere]">
-                <code>{agent.branch}</code>
-              </dd>
-            </div>
-          )}
-          <div>
-            <dt>Last seen</dt>
-            <dd>
-              <RelTime at={agent.last_seen} />
-            </dd>
-          </div>
-        </dl>
-        <p className="mt-1 font-medium">
+    <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
+      <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
+        <Avatar handle={agent.handle} large className="row-span-2 size-7 self-start text-2xs" />
+        <h2
+          className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
+          title={agent.id}
+        >
+          {agent.handle}
+        </h2>
+        <AgentStateBadge agent={agent} />
+      </header>
+      <div className="grid min-w-0 content-start gap-2">
+        <p className="font-medium">
           {task ? (
             <Link
-              className="inline-flex flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
+              className="inline-flex min-h-6 flex-wrap items-baseline gap-x-2 gap-y-1 text-foreground"
               to="/tasks/$id"
               params={{ id: task.id }}
             >
@@ -182,6 +156,42 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
         {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
       </div>
+      <dl className="m-0 grid content-start gap-0.5 text-meta leading-5 [&_code]:text-xs [&_dd]:m-0 [&_dd]:min-w-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
+        {agent.role === "coordinator" && (
+          <div>
+            <dt>Role</dt>
+            <dd>Coordinator</dd>
+          </div>
+        )}
+        <div>
+          <dt>Device</dt>
+          <dd>
+            {agent.device} · {agent.runtime}
+          </dd>
+        </div>
+        {agent.repo && (
+          <div>
+            <dt>Repo</dt>
+            <dd className="[overflow-wrap:anywhere]">
+              <code>{agent.repo.replace(/^github\.com\//, "")}</code>
+            </dd>
+          </div>
+        )}
+        {agent.branch && (
+          <div>
+            <dt>Branch</dt>
+            <dd className="[overflow-wrap:anywhere]">
+              <code>{agent.branch}</code>
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt>Last seen</dt>
+          <dd>
+            <RelTime at={agent.last_seen} />
+          </dd>
+        </div>
+      </dl>
     </article>
   );
 }

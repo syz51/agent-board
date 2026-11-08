@@ -119,7 +119,7 @@ function TaskView({
   return (
     <article>
       <header className="mb-6">
-        <h1 className="max-w-[40ch] text-[22px] leading-tight font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
+        <h1 className="max-w-[40ch] text-headline font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
@@ -212,7 +212,7 @@ function TaskView({
 
           {summary && (
             <Section id="task-summary" title="Summary" first>
-              <div className="max-w-[72ch] leading-relaxed">
+              <div className="leading-relaxed">
                 <Markdown text={summary} />
               </div>
             </Section>
@@ -220,7 +220,7 @@ function TaskView({
 
           <Section id="task-description" title="Description" first={!summary && !task.feedback}>
             {task.body.trim() ? (
-              <div className="max-w-[72ch] leading-relaxed">
+              <div className="leading-relaxed">
                 <Markdown text={task.body} />
               </div>
             ) : (
@@ -283,7 +283,7 @@ function TaskView({
                         <RelTime at={note.at} />
                       </span>
                     </div>
-                    <p className="max-w-[72ch]">
+                    <p>
                       <PlainText text={note.text} />
                     </p>
                   </li>

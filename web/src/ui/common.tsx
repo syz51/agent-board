@@ -84,7 +84,7 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1 rounded-lg border border-dashed border-input px-6 py-9 text-center text-meta text-muted-foreground">
+    <div className="grid justify-items-center gap-1 rounded-lg border px-6 py-9 text-center text-meta text-muted-foreground">
       <span className="mb-1.5 grid size-8 place-items-center rounded-md border bg-card text-subtle-foreground">
         <Icon name={icon} className="size-4" />
       </span>
@@ -243,12 +243,7 @@ export function Owner({
 }) {
   if (!task.owner) {
     return (
-      <span className="inline-flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground">
-        <span
-          data-slot="avatar-empty"
-          className="size-5 flex-none rounded-full border border-dashed border-input"
-          aria-hidden="true"
-        />
+      <span className="inline-flex min-h-5 min-w-0 items-center text-meta text-muted-foreground">
         Unowned
       </span>
     );

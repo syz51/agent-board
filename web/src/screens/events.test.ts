@@ -78,7 +78,16 @@ describe("event marks", () => {
     expect(eventMark(event("evidence_added", { kind: "check", exit_code: 0 })).icon).toBe("shield");
     expect(eventMark(event("handoff_updated", {}, null))).toEqual({
       icon: "handoff",
-      tone: "text-muted-foreground",
+      tone: "text-subtle-foreground",
     });
+  });
+
+  test("give each agent state its own shape", () => {
+    const state = (to: string) =>
+      eventMark(event("agent_state_changed", { from: "running", to }, null)).icon;
+    expect(state("paused")).toBe("pause");
+    expect(state("idle")).toBe("idle");
+    expect(state("running")).toBe("agent");
+    expect(new Set([state("paused"), state("idle"), state("running")]).size).toBe(3);
   });
 });

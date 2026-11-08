@@ -272,6 +272,7 @@ export function AskScreen() {
       <Crumbs current={`Ask #${id}`}>
         <Link to="/asks">Needs you</Link>
       </Crumbs>
+      <PageHeader title={`Ask #${id}`} />
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => <AskCard ask={data} agents={agents} standalone />}
@@ -292,7 +293,6 @@ function AskCard({
   agents: Map<string, Agent>;
   standalone?: boolean;
 }) {
-  const Heading = standalone ? "h1" : "h2";
   return (
     <article
       className={cn(
@@ -308,15 +308,14 @@ function AskCard({
     >
       <header className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-meta">
         <AskKind kind={ask.kind} />
-        <Heading className="text-meta font-semibold">
-          {standalone ? (
-            <>Ask #{ask.id}</>
-          ) : (
+        {/* On its own page the ask's number is the page title. */}
+        {!standalone && (
+          <h2 className="text-meta font-semibold">
             <Link className="text-foreground" to="/asks/$id" params={{ id: String(ask.id) }}>
               Ask #{ask.id}
             </Link>
-          )}
-        </Heading>
+          </h2>
+        )}
         <span className="inline-flex items-center gap-2">
           <Who id={ask.agent} agents={agents} />
           <span className="text-muted-foreground">
@@ -420,7 +419,7 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     {ask.options.map((option, index) => (
                       <Label
                         key={index}
-                        className="flex min-h-9 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-primary has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
+                        className="flex min-h-9 cursor-pointer items-center gap-2.5 rounded-md border border-input bg-card px-3 py-2 text-sm leading-normal font-normal hover:bg-muted has-checked:border-signal has-checked:bg-primary-soft has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring [&_input]:outline-none"
                       >
                         <input
                           type="radio"
@@ -456,8 +455,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     </Label>
                     <Textarea
                       id={`${id}-text`}
-                      rows={1}
-                      className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                      rows={2}
+                      className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}

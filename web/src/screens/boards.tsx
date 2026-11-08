@@ -51,7 +51,7 @@ export function BoardsScreen() {
         }
       />
       {openAsks.length > 0 && (
-        <section className="mb-8" aria-labelledby="waiting-title">
+        <section className="mb-7" aria-labelledby="waiting-title">
           <div className="flex items-baseline justify-between gap-3">
             <SectionTitle id="waiting-title">Waiting on you</SectionTitle>
             <Link
@@ -94,7 +94,12 @@ export function BoardsScreen() {
               Create one with <code>board create</code>; it appears here.
             </Empty>
           ) : (
-            <BoardTable boards={list} agents={agents} />
+            <section aria-labelledby="boards-title">
+              <SectionTitle id="boards-title" count={list.length}>
+                All boards
+              </SectionTitle>
+              <BoardTable boards={list} agents={agents} />
+            </section>
           )
         }
       </QueryFrame>
@@ -185,13 +190,14 @@ const AREA: Record<string, string> = {
 const CELL_CLASS: Record<string, string> = {
   name: "grid min-w-0 gap-0.5",
   tasks: "grid min-w-0 gap-2 @min-[760px]:gap-1.75",
-  coordinator: "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1",
+  coordinator:
+    "text-meta flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 @min-[760px]:grid @min-[760px]:justify-items-start",
   asks: "",
   autopilot: "flex flex-col items-end @min-[760px]:items-start",
 };
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_256px_200px_40px_68px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-5";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto] [grid-template-areas:'name_name_name'_'tasks_tasks_tasks'_'coord_asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,432px)_152px_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -257,7 +263,6 @@ function BoardName({ board }: { board: Board }) {
             {board.title}
           </Link>
         </h2>
-        <span className="ident text-meta text-muted-foreground">{board.slug}</span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
             {board.status[0]?.toUpperCase()}
@@ -270,11 +275,15 @@ function BoardName({ board }: { board: Board }) {
           </Badge>
         )}
       </div>
-      {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
-      ) : (
-        <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
-      )}
+      {/* The slug leads the goal's line, so the title line keeps its width for the name. */}
+      <div className="flex min-w-0 items-baseline gap-2 text-meta text-muted-foreground">
+        <span className="ident flex-none">{board.slug}</span>
+        {board.goal ? (
+          <ExpandableLine className="min-w-0 flex-1" text={board.goal} />
+        ) : (
+          <p className="leading-6">No goal written.</p>
+        )}
+      </div>
     </>
   );
 }
@@ -303,7 +312,7 @@ function TaskTally({ board }: { board: Board }) {
         <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
       ) : (
         <ul
-          className="flex flex-wrap gap-x-2.5 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
+          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -311,7 +320,7 @@ function TaskTally({ board }: { board: Board }) {
               counts[segment.key] > 0 && (
                 <li
                   key={segment.key}
-                  className="inline-flex items-center gap-1"
+                  className="inline-flex items-center gap-0.75"
                   title={`${counts[segment.key]} ${segment.label}`}
                 >
                   <StatusIcon

@@ -106,7 +106,7 @@ export function Nav() {
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
             <span
-              className="ml-auto h-4.5 min-w-5 rounded-full px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:bg-primary max-md:text-2xs max-md:text-primary-foreground"
+              className="ml-auto h-4.5 min-w-5 rounded-full bg-signal px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-signal-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
               aria-label={`${open} waiting on you`}
             >
               {open}
@@ -117,7 +117,7 @@ export function Nav() {
               {/* One mark at a time: the count when something waits, else a dot for news. */}
               {open === 0 && (
                 <span
-                  className="ml-auto size-2 flex-none rounded-full bg-primary max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                  className="ml-auto size-2 flex-none rounded-full bg-signal max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
                   aria-hidden="true"
                   title={`${unseen} unseen updates`}
                 />

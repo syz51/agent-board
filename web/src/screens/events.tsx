@@ -170,11 +170,20 @@ export function eventMark(event: BoardEvent): {
     case "evidence_added":
       return typeof payload.exit_code === "number" && payload.exit_code !== 0
         ? { icon: "cross", tone: "text-status-blocked" }
-        : { icon: "shield", tone: "text-muted-foreground" };
+        : { icon: "shield", tone: "text-subtle-foreground" };
+    case "agent_state_changed":
+      // The agent's new state, with the shape its state pill uses.
+      return payload.to === "paused"
+        ? { icon: "pause", tone: "text-amber" }
+        : payload.to === "idle"
+          ? { icon: "idle", tone: "text-subtle-foreground" }
+          : payload.to === "running"
+            ? { icon: "agent", tone: "text-status-ready" }
+            : { icon: "agent", tone: "text-subtle-foreground" };
     default:
       return {
         icon: KIND_ICON[event.type.split("_")[0] ?? ""] ?? "events",
-        tone: "text-muted-foreground",
+        tone: "text-subtle-foreground",
       };
   }
 }

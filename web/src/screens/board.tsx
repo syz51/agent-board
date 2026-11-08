@@ -316,7 +316,7 @@ const CELL_CLASS: Record<string, string> = {
   id: "ident text-subtle-foreground text-xs max-md:[grid-area:id] max-md:self-center",
   main: "flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 max-md:[grid-area:main]",
   owner:
-    "min-w-0 overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
+    "flex min-w-0 items-center overflow-hidden max-md:[grid-area:owner] max-md:text-meta max-md:flex max-md:flex-wrap max-md:items-center max-md:[&_[data-slot=avatar]]:hidden",
   updated:
     "text-meta text-muted-foreground text-right whitespace-nowrap tabular-nums max-md:[grid-area:updated]",
 };
@@ -338,7 +338,9 @@ export function TaskList({
   );
   const table = useTable({ features, columns, data, getRowId: (row) => row.task.id });
   return (
-    <ul className="grid grid-cols-[54px_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_88px] gap-x-3 divide-y max-md:block">
+    // A row's gutter padding sits inside the subgrid's first and last tracks, so those tracks
+    // add the gutter to their own width; otherwise priority would run into the status mark.
+    <ul className="grid grid-cols-[calc(var(--gutter)+40px)_14px_minmax(84px,max-content)_minmax(0,1fr)_132px_calc(var(--gutter)+80px)] gap-x-3.5 divide-y max-md:block">
       {table.getRowModel().rows.map((row) => (
         <li
           key={row.id}
