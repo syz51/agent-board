@@ -17,7 +17,7 @@ const CLAUDE_AGENT: &str = "claude:00893aaf-19fa-41d2-8238-13269b9b3ca0";
 const SNAPSHOT: &str =
     "<board agent=\"claude:0089\" board=\"factory\" seq=\"812\">\nyou: claude:0089\n</board>";
 /// What Claude's `SessionStart` adds after the snapshot: Claude Code defers MCP tool schemas.
-const TOOL_SEARCH: &str = "Before the first board call, load the board tools in one call: ToolSearch select:mcp__board__task_claim,mcp__board__task_add,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_update,mcp__board__task_done,mcp__board__task_show,mcp__board__lease_paths";
+const TOOL_SEARCH: &str = "If the board tools show by name only, load them in one call before the first board call: ToolSearch query \"select:mcp__board__board_snapshot,mcp__board__task_claim,mcp__board__task_add,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_update,mcp__board__task_done,mcp__board__task_show,mcp__board__lease_paths,mcp__board__feedback,mcp__board__ask_user\" max_results 11";
 
 /// Claude's `SessionStart` context for [`SNAPSHOT`].
 fn started() -> String {
@@ -200,10 +200,17 @@ fn session_start_without_a_board_hints_only_when_the_repo_has_one() {
     );
     let (reply, _) = e.hook("session-start", "claude", payload);
     let hint = context(&reply, "SessionStart");
-    assert_eq!(hint.lines().count(), 1);
+    let (hint, load) = hint.split_once('\n').unwrap();
     assert!(
         hint.contains("board factory (active)") && hint.contains("board_join factory"),
         "{hint}"
+    );
+    assert_eq!(
+        load,
+        TOOL_SEARCH
+            .replace("select:", "select:mcp__board__board_join,")
+            .replace("max_results 11", "max_results 12"),
+        "board_join is loaded first"
     );
 }
 

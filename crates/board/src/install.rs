@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::cli::expand_tilde;
 use crate::config::{Home, write_atomic};
 use crate::hook::HookEvent;
+use crate::mcp::SERVER_NAME;
 
 const LAUNCHD_LABEL: &str = "dev.agent-board.watch";
 const SYSTEMD_UNIT: &str = "agent-board-watch.service";
@@ -156,13 +157,13 @@ pub fn run(cmd: InstallCommand) -> Result<()> {
         } => {
             let bin = binary(bin);
             let hooks = hooks_json(&bin, "claude", CLAUDE_HOOKS);
-            let mcp = json!({"mcpServers": {"board": claude_mcp_server(&bin)}});
+            let mcp = json!({"mcpServers": {SERVER_NAME: claude_mcp_server(&bin)}});
             match write {
                 None => {
                     println!("# Merge into ~/.claude/settings.json:");
                     println!("{}", serde_json::to_string_pretty(&hooks)?);
                     println!(
-                        "# Merge into ~/.claude.json (user-scoped MCP servers), or run: claude mcp add --scope user board -- {} mcp",
+                        "# Merge into ~/.claude.json (user-scoped MCP servers), or run: claude mcp add --scope user {SERVER_NAME} -- {} mcp",
                         shell_word(&bin)
                     );
                     println!("{}", serde_json::to_string_pretty(&mcp)?);
@@ -332,7 +333,7 @@ fn claude_mcp_server(bin: &Path) -> Value {
 fn codex_mcp_toml(bin: &Path) -> String {
     let command = toml::Value::String(bin.display().to_string());
     format!(
-        "[mcp_servers.board]\ncommand = {command}\nargs = [\"mcp\"]\nenv_vars = [\"T3CODE_THREAD_ID\"]\n"
+        "[mcp_servers.{SERVER_NAME}]\ncommand = {command}\nargs = [\"mcp\"]\nenv_vars = [\"T3CODE_THREAD_ID\"]\n"
     )
 }
 
@@ -546,7 +547,7 @@ pub fn merge_mcp_file(path: &Path, server: Value) -> Result<()> {
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .context("\"mcpServers\" is not an object")?
-            .insert("board".into(), server.clone());
+            .insert(SERVER_NAME.into(), server.clone());
         Ok(())
     })
 }

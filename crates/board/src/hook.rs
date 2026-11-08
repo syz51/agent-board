@@ -1083,7 +1083,7 @@ impl Hook<'_> {
     fn offline(&mut self, failure: Failure) -> Reply {
         match self.event {
             HookEvent::SessionStart => match self.cached_snapshot(failure) {
-                Reply::Context(text) => Reply::Context(self.with_tool_search(text)),
+                Reply::Context(text) => Reply::Context(self.with_tool_search(text, &[])),
                 reply => reply,
             },
             HookEvent::UserPromptSubmit if !self.local.offline_notified => {
@@ -1138,23 +1138,25 @@ impl Hook<'_> {
         ))
     }
 
-    /// Ends a `SessionStart` snapshot with the `ToolSearch` call that loads the board tools
-    /// most calls need. Claude Code shows deferred MCP tools by name only, so an agent that
-    /// calls one before loading it guesses its arguments and fails once. Codex has no
-    /// `ToolSearch`; the MCP server's instructions name the tools for it.
-    fn with_tool_search(&self, snapshot: String) -> String {
+    /// Ends `SessionStart` board context with the `ToolSearch` call that loads `first` and
+    /// the board tools most calls need. Claude Code may show MCP tools by name only, so an
+    /// agent that calls one before loading it guesses its arguments and fails once. Codex
+    /// has no `ToolSearch`; the MCP server's instructions name the tools for it.
+    fn with_tool_search(&self, context: String, first: &[&str]) -> String {
         match self.runtime {
             Runtime::Claude => {
-                let tools: Vec<String> = mcp::CORE_TOOLS
+                let tools: Vec<String> = first
                     .iter()
-                    .map(|tool| format!("mcp__board__{tool}"))
+                    .chain(mcp::CORE_TOOLS)
+                    .map(|tool| format!("mcp__{}__{tool}", mcp::SERVER_NAME))
                     .collect();
                 format!(
-                    "{snapshot}\nBefore the first board call, load the board tools in one call: ToolSearch select:{}",
-                    tools.join(",")
+                    "{context}\nIf the board tools show by name only, load them in one call before the first board call: ToolSearch query \"select:{}\" max_results {}",
+                    tools.join(","),
+                    tools.len()
                 )
             }
-            Runtime::Codex => snapshot,
+            Runtime::Codex => context,
         }
     }
 
@@ -1323,7 +1325,7 @@ impl Hook<'_> {
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
-            return Ok(Reply::Context(self.with_tool_search(text)));
+            return Ok(Reply::Context(self.with_tool_search(text, &[])));
         }
         // No board for this agent: hint at a board covering the repo, if any.
         let Some(key) = repo.key else {
@@ -1337,13 +1339,16 @@ impl Hook<'_> {
             .collect();
         covering.sort_by_key(|b| b.status != board_proto::BoardStatus::Active);
         Ok(match covering.first() {
-            Some(board) => Reply::Context(format!(
-                "board: this repo has board {} ({}); board_join {} to see and claim its tasks.",
-                board.slug,
-                serde_json::to_value(board.status)?
-                    .as_str()
-                    .unwrap_or_default(),
-                board.slug
+            Some(board) => Reply::Context(self.with_tool_search(
+                format!(
+                    "board: this repo has board {} ({}); board_join {} to see and claim its tasks.",
+                    board.slug,
+                    serde_json::to_value(board.status)?
+                        .as_str()
+                        .unwrap_or_default(),
+                    board.slug
+                ),
+                &["board_join"],
             )),
             None => Reply::Nothing,
         })
