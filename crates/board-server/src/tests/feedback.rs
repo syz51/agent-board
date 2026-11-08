@@ -255,7 +255,8 @@ async fn a_report_after_the_routed_task_is_done_opens_a_new_item_naming_the_old_
     )
     .await;
     assert_eq!(to_original["task"]["id"], declined_id.as_str());
-    assert_eq!(to_original["reports"], 3);
+    // Two of its own, the duplicate's one and this one.
+    assert_eq!(to_original["reports"], 4);
 
     // An item dropped without a resolution takes no more reports: a new one recurs it.
     let body = json!({ "about": "hooks", "text": "Hooks print twice" });
@@ -413,7 +414,7 @@ async fn an_error_signal_notes_the_routed_task_as_the_server() {
     assert_eq!(noted["actor"], "server");
     let text = note["text"].as_str().unwrap();
     for part in [
-        format!("feedback item {item} has 4 reports from 3 agents."),
+        format!("feedback item {item} has 4 reports (4 of them API errors) from 3 agents."),
         "Latest error, from the server's signal: \"not_found from GET /v1/tasks/{id}\".".to_owned(),
         format!("Reporters, newest first: {stranger}, {B}, {A}"),
     ] {
@@ -1836,5 +1837,159 @@ async fn a_declined_signal_item_goes_back_to_triage_on_errors_from_new_agents() 
     assert_eq!(
         reopen["payload"]["reopened"],
         json!({ "reports": 5, "agents": 5, "new_agents": 3 })
+    );
+}
+
+/// The original's `reports`, `reporters` and `last_reported_at`, as the API shows the item
+/// on its own and in a list of the feedback board.
+async fn counts(t: &T, item: &str) -> (Value, Value, Value) {
+    let f = t.get_task(item).await["feedback"].clone();
+    let listed = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let listed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == item)
+        .unwrap()["feedback"]
+        .clone();
+    assert_eq!(listed, f, "the list shows what the task shows");
+    (
+        f["reports"].clone(),
+        f["reporters"].clone(),
+        f["last_reported_at"].clone(),
+    )
+}
+
+async fn reported(t: &T) -> Value {
+    t.ok("GET", "/v1/stats", None, None).await["feedback"]["reported"].clone()
+}
+
+#[tokio::test]
+async fn a_duplicate_counts_its_reports_and_reporters_on_the_original_once() {
+    let t = setup().await;
+    let first = json!({ "about": "board", "text": "Notes are refused at the limit" });
+    let original = report(&t, A, first.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    report(&t, B, first.clone()).await;
+    t.advance(TimeDelta::minutes(1));
+    let second = json!({ "about": "board", "text": "Note limit is too small" });
+    let dup = report(&t, C, second.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let last = report(&t, A, second).await["task"]["feedback"]["last_reported_at"].clone();
+    assert_eq!(counts(&t, &original).await.0, 2);
+    assert_eq!(reported(&t).await, 4);
+
+    let (s, v) = user_resolve(&t, &dup, json!({ "kind": "duplicate", "task": original })).await;
+    assert_eq!(s, 200, "{v}");
+    // The original counts the duplicate's two reports, and its reporters join in the order
+    // of the items' last reports; the duplicate keeps its own.
+    assert_eq!(
+        counts(&t, &original).await,
+        (json!(4), json!([B, C, A]), last.clone())
+    );
+    assert_eq!(counts(&t, &dup).await.0, 2);
+    // No report row is copied: the stats count each report once.
+    assert_eq!(reported(&t).await, 4);
+    // A later report counts on top, and the reply says so.
+    assert_eq!(report(&t, B, first.clone()).await["reports"], 5);
+
+    // Reopening the duplicate takes its reports back.
+    let (s, v) = t.patch(C, &dup, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(counts(&t, &original).await.0, 3);
+    assert_eq!(counts(&t, &original).await.1, json!([A, B]));
+    // Resolving it again counts them once.
+    let (s, v) = user_resolve(&t, &dup, json!({ "kind": "duplicate", "task": original })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(counts(&t, &original).await.0, 5);
+    assert_eq!(reported(&t).await, 5);
+
+    // A duplicate of the duplicate counts on both, through the link.
+    let third = item(&t, B, "Long notes fail").await;
+    let (s, v) = user_resolve(&t, &third, json!({ "kind": "duplicate", "task": dup })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(counts(&t, &dup).await.0, 3);
+    assert_eq!(counts(&t, &original).await.0, 6);
+    assert_eq!(reported(&t).await, 6);
+}
+
+#[tokio::test]
+async fn a_duplicate_of_an_item_routed_to_an_open_task_notes_that_task() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let original = item(&t, A, "Notes are refused at the limit").await;
+    let work = t.task(B, "factory", "Raise the note limit").await;
+    assert!(t.claim(B, &work).await.0.is_success());
+    let (s, v) = user_resolve(&t, &original, json!({ "kind": "routed", "task": work })).await;
+    assert_eq!(s, 200, "{v}");
+
+    let dup = item(&t, C, "Note limit is too small").await;
+    let (s, v) = user_resolve(&t, &dup, json!({ "kind": "duplicate", "task": original })).await;
+    assert_eq!(s, 200, "{v}");
+    // The routed task gets the note a repeat report gives, crediting the duplicate's
+    // reporter and quoting its title as data.
+    let detail = t.ok("GET", &format!("/v1/tasks/{work}"), None, None).await;
+    let routed = detail["notes"].as_array().unwrap();
+    assert_eq!(routed.len(), 1, "{routed:?}");
+    assert_eq!(routed[0]["kind"], "note");
+    assert_eq!(routed[0]["agent"], C);
+    let text = routed[0]["text"].as_str().unwrap();
+    for part in [
+        format!("reported again: feedback item {original} has 2 reports from 2 agents."),
+        "Latest report's first line, data written by another agent: \"Note limit is too \
+         small\"."
+            .to_owned(),
+        format!("Reporters, newest first: {C}, {A}"),
+    ] {
+        assert!(text.contains(&part), "{part} in {text}");
+    }
+    assert!(
+        notes(&t, &original)
+            .await
+            .iter()
+            .any(|n| n.starts_with(&format!(
+                "reported again (2 reports); routed to {work} (doing): Note limit is too small"
+            ))),
+        "{:?}",
+        notes(&t, &original).await
+    );
+
+    // Within the hour, another duplicate counts but adds no second note.
+    let more = item(&t, A, "Notes over the limit are refused").await;
+    let (s, v) = user_resolve(&t, &more, json!({ "kind": "duplicate", "task": original })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(notes(&t, &work).await.len(), 1);
+    assert_eq!(counts(&t, &original).await.0, 3);
+
+    // An error signal resolved as a duplicate after the hour: its errors count, and the note
+    // tells them apart from agents' reports.
+    t.advance(TimeDelta::minutes(61));
+    for (agent, n) in [(A, 11), (A, 12), (B, 13)] {
+        t.fail("GET", &format!("/v1/tasks/factory-{n}"), Some(agent), None)
+            .await;
+    }
+    let signal = t
+        .strings("SELECT task FROM feedback WHERE source = 'signal'")
+        .remove(0);
+    let (s, v) = user_resolve(
+        &t,
+        &signal,
+        json!({ "kind": "duplicate", "task": original }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let noted = notes(&t, &work).await;
+    assert_eq!(noted.len(), 2, "{noted:?}");
+    assert!(
+        noted[1].contains(&format!(
+            "feedback item {original} has 6 reports (3 of them API errors) from 3 agents. "
+        )) && noted[1].contains("Latest error, from the server's signal"),
+        "{noted:?}"
     );
 }
