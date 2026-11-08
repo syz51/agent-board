@@ -131,6 +131,36 @@ pub fn take_skew_warning() -> Option<String> {
         .take()
 }
 
+/// An answer the device daemon's hook relay made itself (`relay::RELAY_HEADER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFailure {
+    /// The relay could not connect to the server.
+    Unreachable,
+    /// The server did not answer the relay in time.
+    Slow,
+    /// The relay did not forward the request.
+    Refused,
+}
+
+impl fmt::Display for RelayFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unreachable => "board server unreachable (from the device daemon's hook relay)",
+            Self::Slow => "board server slow (from the device daemon's hook relay)",
+            Self::Refused => "the device daemon's hook relay refused the request",
+        })
+    }
+}
+
+impl std::error::Error for RelayFailure {}
+
+/// The relay's own answer in `err`, if any.
+pub fn relay_failure(err: &anyhow::Error) -> Option<RelayFailure> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<RelayFailure>())
+        .copied()
+}
+
 /// Whether `err` is the server not answering at all (no connection, or no answer in
 /// time), rather than an answer that was an error.
 pub fn is_unreachable(err: &anyhow::Error) -> bool {
@@ -192,7 +222,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    token: String,
+    /// `None` through the device daemon's relay, which adds the device token itself.
+    token: Option<String>,
     agent: Option<AgentId>,
     /// Bounds each request and its answer; for the event stream, only until it opens.
     timeout: Option<Duration>,
@@ -225,7 +256,7 @@ impl Client {
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
-            token,
+            token: Some(token),
             agent,
             timeout,
         })
@@ -233,6 +264,11 @@ impl Client {
 
     pub fn agent(&self) -> Option<&AgentId> {
         self.agent.as_ref()
+    }
+
+    /// The token it sends; `None` for a relayed client.
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     /// The calling agent, or an error saying how to name one.
@@ -270,11 +306,43 @@ impl Client {
         Ok(client)
     }
 
+    /// A client that reaches the server through the device daemon's relay on the Unix
+    /// socket `socket` (see `relay`), with `timeout` for each whole request. It sends no
+    /// token: the relay adds the device's.
+    pub fn relayed(socket: &std::path::Path, timeout: Duration) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .unix_socket(socket)
+            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(Self {
+            http,
+            // Not used to connect: the relay forwards to its own server.
+            base: "http://board-relay.invalid".to_owned(),
+            token: None,
+            agent: None,
+            timeout: Some(timeout),
+        })
+    }
+
+    /// The same client with `timeout` for each whole request; it keeps its connections.
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..self
+        }
+    }
+
+    /// The relay's own status (a relayed client only).
+    pub async fn relay_status(&self) -> Result<crate::relay::Status> {
+        self.get(crate::relay::STATUS_PATH).await
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        let mut req = self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token);
+        let mut req = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
         if let Some(agent) = &self.agent {
             req = req.header(AGENT_HEADER, agent.as_str());
         }
@@ -286,6 +354,17 @@ impl Client {
             req = req.timeout(timeout);
         }
         let resp = req.send().await.context("board server unreachable")?;
+        // Only the relay sets the header, and only a relayed client (no token) believes it.
+        if self.token.is_none()
+            && let Some(kind) = resp.headers().get(crate::relay::RELAY_HEADER)
+        {
+            return Err(match kind.as_bytes() {
+                b"slow" => RelayFailure::Slow,
+                b"unreachable" => RelayFailure::Unreachable,
+                _ => RelayFailure::Refused,
+            }
+            .into());
+        }
         note_server_build(resp.headers());
         let status = resp.status();
         let bytes = resp.bytes().await.context("reading the server's answer")?;
@@ -586,7 +665,7 @@ fn not_found_as_none<T>(result: Result<T>) -> Result<Option<T>> {
 }
 
 /// Percent-encodes a path segment (agent ids contain `:` and `%`).
-fn enc(segment: &str) -> String {
+pub(crate) fn enc(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for b in segment.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
