@@ -674,7 +674,11 @@ settings in use, warned once per edit.
   reorders (kept per browser); a board's open asks above its tasks, then its tasks by
   status, in groups that collapse; task detail with notes, evidence and history; agents
   with their state, current task and handoff, named by their T3 thread title with a link
-  to the thread (native id `t3_link`) when they have one; a **Needs you** queue of only
+  to the thread (native id `t3_link`) when they have one, where an agent not ended but
+  unseen for 30 minutes (the default `doing_idle_secs`) is away: a session that dies never
+  sends `ended`, so the list shows away agents only under its Away filter, unless they wait
+  for a usage-limit reset still ahead or for the user, or a board names them coordinator;
+  a **Needs you** queue of only
   what waits on the user's decision or action: the open asks, to answer there (its
   navigation badge counts them). Blocked and non-auto tasks are not listed there: a task
   that needs the user carries an ask. Every agent handle links to its T3 thread, or else
