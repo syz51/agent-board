@@ -748,9 +748,24 @@ impl<T: T3> Daemon<T> {
                 };
                 let live = match live {
                     Ok(live) => live,
-                    // A failed check says nothing of the thread: the named coordinator keeps
-                    // its lease, and only a check that answers replaces it.
+                    // A failed check says nothing of the thread. A named coordinator at work
+                    // keeps its lease, and only a check that answers replaces it. One whose
+                    // session ended keeps it only while this device can run its thread: the
+                    // lease goes, so another home device can take over, and the record stays,
+                    // so this device adopts the thread again once T3 answers.
                     Err(err) if named => {
+                        let ended = matches!(
+                            self.client().agent_info(&local.agent).await,
+                            Ok(info) if info.state == AgentState::Ended
+                        );
+                        if ended {
+                            tracing::warn!(
+                                "coordinator of {slug}: checking thread {}: {err:#}; its session ended, so releasing the lease",
+                                local.thread
+                            );
+                            self.release(slug).await;
+                            return Err(err);
+                        }
                         tracing::warn!(
                             "coordinator of {slug}: checking thread {}: {err:#}; renewing it as live",
                             local.thread
@@ -778,7 +793,27 @@ impl<T: T3> Daemon<T> {
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
                 Ok(info) if info.state != AgentState::Ended => return Ok(()),
-                Ok(_) => {}
+                // T3 ends a session left idle while its thread lives on, and the server keeps
+                // the lease: the daemon of its device renews or releases it. Taken over once
+                // it expires.
+                Ok(info) if info.device != self.ctx.device => return Ok(()),
+                // Ours, and unknown to this daemon's state: run its thread again if T3 has it.
+                Ok(_) => {
+                    let thread = agent.native().to_owned();
+                    if self.thread_live(&thread).await? {
+                        let local = Coordinator {
+                            thread,
+                            agent: agent.clone(),
+                            started_at: now,
+                            renewed_at: now,
+                            resumed_after: None,
+                            registered: true,
+                            briefed: None,
+                            rebrief_backoff: None,
+                        };
+                        return self.adopt(board, local, now).await;
+                    }
+                }
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {}
                 Err(err) => return Err(err),
             }

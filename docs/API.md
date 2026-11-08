@@ -130,7 +130,11 @@ server's minute sweep.
   than 7 days ago are left out unless `state=ended`; they stay members of the board.
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
-  `ended` releases the agent's leases and coordinator lease; owned tasks stay owned.
+  `ended` releases the agent's file leases; owned tasks stay owned. Its coordinator lease
+  runs on until it expires: T3 ends a session left idle for 30 minutes while the thread
+  lives on, and the daemon of the lease's device renews the lease while the thread is live,
+  or releases it when the thread is gone or T3 cannot say. (Servers before this change
+  released the coordinator lease too.)
   `paused_until` is accepted only with `paused`. An agent paused until a time still ahead
   keeps that `paused_until` when it is marked `ended` (T3 closes an idle session, but the
   usage limit holds until its reset), and the `agent_state_changed` event carries it; any

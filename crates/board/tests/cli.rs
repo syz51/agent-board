@@ -1179,6 +1179,72 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
 
 #[cfg(unix)]
 #[test]
+fn board_adopt_and_a_coordinator_whose_session_ended() {
+    let adopt = |e: &Env, thread: &str| {
+        board(
+            &e.home,
+            &e.cwd,
+            &[],
+            &["board", "adopt", "infra", thread],
+            "",
+        )
+    };
+    let ended = |e: &Env, agent: &str, device: &str| {
+        e.stub.on(
+            &format!("GET /v1/agents/{}", enc(agent)),
+            agent_fixture(agent, device, board_proto::AgentState::Ended),
+        );
+    };
+
+    // On its own device: T3 closed the idle session, the thread lives on, and the lease
+    // still names it. Adopting that thread is accepted, with nothing left to do.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:live")));
+    ended(&e, "t3:live", DEVICE);
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("t3:live already coordinates infra"),
+        "{}",
+        stdout(&out)
+    );
+    // Adopting another thread there replaces it.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", DEVICE);
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+
+    // On another device: refused while that device's lease runs, with nothing changed.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", "mac-air");
+    let out = adopt(&e, "live");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("t3:old coordinates board infra from device mac-air: its session ended"),
+        "{err}"
+    );
+    assert_eq!(adoption_file(&e), None);
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty()
+    );
+    // Once the lease has expired the board names no coordinator, and the adoption goes on.
+    e.stub.on("GET /v1/boards/infra", adopt_board(true, None));
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+}
+
+#[cfg(unix)]
+#[test]
 fn board_adopt_undoes_the_adoption_when_another_device_wins_the_lease() {
     let e = adopt_env();
     e.stub.on("GET /v1/boards/infra", adopt_board(false, None));
