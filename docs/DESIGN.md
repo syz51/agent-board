@@ -225,7 +225,11 @@ descriptions under 300 characters):
 Every string parameter declares a `maxLength` equal to the server's default limit (title
 72, note 500, handoff field 300, question 1,000, body 4,000 characters, and so on), so a
 runtime can refuse an oversized argument before the call; a server configured with other
-limits still checks its own. The CLI states the same default limits in `--help` and
+limits still checks its own. Every input schema sets `additionalProperties: false`, and
+`board mcp` refuses a call with an argument its tool does not declare, before anything is
+sent: the error names the unknown arguments, lists the accepted ones and says to call
+again with them. An argument dropped in silence would let a guessed name, such as
+`blocked_by`, look like a change. The CLI states the same default limits in `--help` and
 refuses over-long text before sending, with the server's message and hint, so it cannot
 use limits a server raised above the defaults; its enum flags list their values in
 `--help` and in the error for an unknown one. The server's instructions ask agents to
@@ -323,14 +327,19 @@ settings in use, warned once per edit.
   owner waiting for a usage-limit reset still to come (paused, or ended meanwhile) is not
   away. It skips the task while a thread the owner delegated, at any depth, is at work
   (running and seen within that time, or waiting for a reset still to come, paused or
-  ended). It records one `task_updated` event with `idle_doing` and `away` per spell
-  away, so the check runs once, on the server, not on every device: a spell is told once
-  there is a notice for the task and owner after the owner last ran and after the task
-  last came to it. While the task is still in doing and still that owner's, the snapshot
-  alerts the owner, and the board's coordinator when the owner is no T3 thread (no daemon
-  can wake it) or has been away twice `doing_idle_secs`: T3 closes an idle session after
-  30 minutes while the daemon still wakes its thread, so the owner gets the first turn.
-  The owner's device daemon wakes a T3 owner.
+  ended). It records a `task_updated` event with `idle_doing` and `away` at most twice per
+  spell away, so the check runs once, on the server, not on every device: a spell's
+  notices are those for the task and owner after the owner last ran and after the task
+  last came to it. The first comes once the owner has been away `doing_idle_secs`; one
+  more comes once it has been away twice that, unless the first came that late; never a
+  third. While the task is still in doing and still that owner's, the snapshot alerts the
+  owner, and the board's coordinator when the owner is no T3 thread (no daemon can wake
+  it) or has been away twice `doing_idle_secs`: T3 closes an idle session after 30
+  minutes while the daemon still wakes its thread, so the owner gets the first turn. The
+  repeat is what the coordinator hears: alerts are read once, so a coordinator snapshot
+  between the two passes the first notice without it. It also reaches a coordinator on
+  another device, which the daemon's forwarding cannot. The owner's device daemon wakes a
+  T3 owner at each notice, so at most once more at the repeat.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another
@@ -809,7 +818,8 @@ back on purpose: did the fix hold, and do the chosen values still fit.
 - **Client refusals.** The CLI refuses over-long text before sending, so the server never
   sees it. The CLI reports each refusal, best effort, to the server, which records it with
   its own errors (source `client`), so signals and revisits both count it. MCP calls reach
-  the server already. A client that checks a schema itself and never sends is not counted;
+  the server already, except an unknown tool or argument, which `board mcp` refuses itself
+  and does not count. A client that checks a schema itself and never sends is not counted;
   friction capture covers it.
 - **Friction reports.** Their free text gives each a different signature, so the server
   cannot link them. Triage does: a report that repeats a problem whose fix has an open
