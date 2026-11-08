@@ -402,8 +402,18 @@ pub enum Command {
     Install(crate::install::InstallCommand),
     /// Print the standing prompt this device briefs the board's coordinator with: the
     /// coordinator prompt, plus triage on the feedback board. A coordinator reads it at the
-    /// start of a fresh session.
-    Brief { board: BoardSlug },
+    /// start of a fresh session. With `--kind`, print the brief a daemon-dispatch worker or
+    /// judge starts with instead.
+    Brief {
+        board: BoardSlug,
+        /// Which brief: the coordinator's (default), a worker's, or a judge's.
+        #[arg(long, value_enum, default_value_t = BriefKind::Coordinator)]
+        kind: BriefKind,
+        /// The task the brief is for: exactly one for a worker, at least one for a review,
+        /// verdict or triage judge, none otherwise. Repeat it for more.
+        #[arg(long = "task")]
+        tasks: Vec<TaskId>,
+    },
     /// Run the device daemon: coordinators and wake-ups.
     Watch {
         /// Run one reconcile pass and exit.
@@ -454,6 +464,54 @@ where
         .map(|value| clap::builder::PossibleValue::new(*value).hide(hidden.contains(value)));
     clap::builder::PossibleValuesParser::new(values)
         .map(|value| parse_enum::<T>(&value).expect("a listed value parses"))
+}
+
+/// The briefs `board brief` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BriefKind {
+    Coordinator,
+    Worker,
+    Review,
+    Verdict,
+    Goal,
+    Triage,
+}
+
+/// The brief `board brief` prints for `kind` on `board`, or what to pass instead.
+fn brief(home: &Home, board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String> {
+    use crate::brief::{JudgeKind, judge_brief, worker_brief};
+    let judge = match kind {
+        BriefKind::Coordinator => {
+            if !tasks.is_empty() {
+                bail!("the coordinator brief names no task: leave out --task");
+            }
+            let triage = *board == Config::load(home)?.feedback_board();
+            return Ok(crate::daemon::brief(board, triage));
+        }
+        BriefKind::Worker => {
+            let [task] = tasks else {
+                bail!("a worker brief is for one task: pass --task <id> once");
+            };
+            return Ok(worker_brief(board, task, crate::brief::WORKER_CLOSER));
+        }
+        BriefKind::Review => JudgeKind::Review,
+        BriefKind::Verdict => JudgeKind::Verdict,
+        BriefKind::Goal => JudgeKind::Goal,
+        BriefKind::Triage => JudgeKind::Triage,
+    };
+    if judge.takes_tasks() && tasks.is_empty() {
+        bail!(
+            "a {} judge brief names its tasks: pass --task <id>, once per task",
+            judge.as_str()
+        );
+    }
+    if !judge.takes_tasks() && !tasks.is_empty() {
+        bail!(
+            "a {} judge brief names no task: leave out --task",
+            judge.as_str()
+        );
+    }
+    Ok(judge_brief(judge, board, tasks))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -995,9 +1053,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Install(cmd) => return crate::install::run(cmd),
         Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
-        Command::Brief { board } => {
-            let triage = board == Config::load(&home)?.feedback_board();
-            println!("{}", crate::daemon::brief(&board, triage));
+        Command::Brief { board, kind, tasks } => {
+            println!("{}", brief(&home, &board, kind, &tasks)?);
             return Ok(());
         }
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
