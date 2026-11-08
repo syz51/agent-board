@@ -20,6 +20,7 @@ import {
   ExpandableLine,
   PageHeader,
   QueryFrame,
+  listClass,
   RelTime,
   StatePill,
   useAgents,
@@ -78,14 +79,14 @@ export function HomeScreen() {
             case "asks":
               return (
                 <Section
-                  title="Waiting on you"
+                  title="Needs you"
                   count={openAsks.length}
                   aside={
                     <Link
                       className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
                       to="/asks"
                     >
-                      All asks <Icon name="arrow" className="size-3.5" />
+                      See all <Icon name="arrow" className="size-3.5" />
                     </Link>
                   }
                   {...state}
@@ -191,7 +192,7 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
     return <p className="text-meta text-muted-foreground">Nothing waits on you.</p>;
   }
   return (
-    <ul className="divide-y overflow-hidden rounded-lg border bg-card">
+    <ul className={listClass}>
       {newestFirst(asks)
         .slice(0, HOME_ROWS)
         .map((ask) => (
@@ -200,8 +201,8 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
                 wait on the user, unlike every other row on Home. */}
             <Link
               className={cn(
-                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-4 py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
-                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
+                "before:absolute before:inset-y-2 before:left-[calc(var(--gutter)-12px)] before:w-[3px] before:rounded-full",
                 ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
               )}
               to="/asks/$id"
@@ -458,7 +459,7 @@ function TaskTally({ board }: { board: Board }) {
       ) : (
         <ul
           // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex-nowrap @min-[760px]:gap-x-1.5"
+          className="grid grid-cols-3 gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground @min-[760px]:flex @min-[760px]:flex-nowrap @min-[760px]:gap-x-1.5"
           aria-label="Tasks by status"
         >
           {SEGMENTS.map(
@@ -487,10 +488,8 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   if (board.coordinator === null) {
     return (
       <span className="text-muted-foreground">
-        <span className="@min-[760px]:sr-only">No coordinator</span>
-        <span className="hidden @min-[760px]:inline" aria-hidden="true">
-          –
-        </span>
+        <span className="@min-[760px]:hidden">No coordinator</span>
+        <span className="hidden @min-[760px]:inline">None</span>
       </span>
     );
   }

@@ -388,8 +388,13 @@ export function AnswerForm({ ask }: { ask: Ask }) {
               {/* Send closes the whole answer group, so it plainly sends a choice or the text.
                   It sits at the left, under the field, where the eye ends after typing. */}
               <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                {/* The page's main action; a press with nothing chosen says what is missing. */}
-                <Button type="submit" disabled={mutation.isPending}>
+                {/* The main action, quiet until there is an answer to send; a press with nothing
+                    chosen says what is missing. */}
+                <Button
+                  type="submit"
+                  variant={answer ? "default" : "outline"}
+                  disabled={mutation.isPending}
+                >
                   {mutation.isPending ? "Sending…" : "Send answer"}
                 </Button>
                 {answer && !mutation.isPending ? (

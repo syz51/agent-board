@@ -46,7 +46,7 @@ describe("home", () => {
     const titles = screen
       .getAllByRole("heading", { level: 2 })
       .map((heading) => heading.textContent?.replace(/\d.*$/, ""));
-    expect(titles).toEqual(["Waiting on you", "Boards", "In progress", "Since you last looked"]);
+    expect(titles).toEqual(["Needs you", "Boards", "In progress", "Since you last looked"]);
   });
 
   test("lists every task in progress, so its counts match its rows", async () => {
@@ -63,7 +63,7 @@ describe("home", () => {
 
   test("marks each waiting ask's row with its kind's colour and lists at most four", async () => {
     await renderInApp(<HomeScreen />, { seed });
-    const asks = screen.getByRole("region", { name: /Waiting on you/ });
+    const asks = screen.getByRole("region", { name: /Needs you/ });
     const rows = within(asks)
       .getAllByRole("link")
       .filter((link) => link.closest("li"));

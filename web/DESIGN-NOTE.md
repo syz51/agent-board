@@ -14,9 +14,9 @@ inset panel, and lists that run edge to edge across it.
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
   name, slug, states and open asks (a tinted pill, only when there are some) share one
-  line, none of them cut, the goal keeps to two lines, the task tally to one (it wraps on
-  phones rather than shrink) and the coordinator to two; cells start level with the name,
-  and an empty cell is a dash.
+  line, none of them cut, the goal keeps to two lines, the task tally to one (on phones it
+  wraps into three even columns, never one count alone) and the coordinator to two; cells
+  start level with the name, and a board with no coordinator says "None".
   Agents are a two-column table: who (in a 300px column), with its state, when last seen
   and where it runs in two quiet lines, its machine, then its repository and branch in the
   id face a step smaller; then what it is working on, with its handoff. Priority labels share one weight; the
@@ -34,8 +34,9 @@ inset panel, and lists that run edge to edge across it.
   Since you last looked says what is new. A count that cannot load does not show (the
   banner and footer say why), and boards that cannot load are placeholder rows. On a board or a task the sidebar marks the
   board, not Home.
-- **Home**: what the user follows, in sections they collapse and reorder: waiting asks (a
-  card inset to the gutter, a left edge in each kind's colour, as on Needs you, and an
+- **Home**: what the user follows, in sections they collapse and reorder: Needs you (the
+  asks, one name for them in the nav, the section and its "See all" link; edge to edge like
+  every list on Home, with a short bar in each kind's colour just left of the text, and an
   Answer cue on hover), the boards,
   tasks in progress across boards (Doing and Review under their own headings), and what
   changed since they last looked. Finished tasks there are one-line rows whose summary
@@ -44,8 +45,8 @@ inset panel, and lists that run edge to edge across it.
   collapsed. What a task waits for (blockers, a start date) is muted text with an icon;
   outlined chips are tags only. A board with nothing to filter has no filter bar. On phones
   a task row's time sits on its title line.
-- **Asks**: an ask card's left border takes its kind's colour. A filled Send closes the
-  answer group at its left, under the options and a
+- **Asks**: an ask card's left border takes its kind's colour. Send closes the answer
+  group at its left, outlined until there is an answer and filled once there is one, under the options and a
   two-line field that grows, so it plainly sends either; Cmd or Ctrl with Enter sends from
   the field. A single ask is titled with its kind ("Decision · Ask #9"), across the content
   width with its prose at a reading measure, and its task and the asking agent's handoff in
@@ -57,6 +58,8 @@ inset panel, and lists that run edge to edge across it.
   a neutral placeholder that says it loads again once the connection is back; its icon
   tile stays error-tinted, so it never reads as an empty state. "Try again" is a filled
   button.
+- **Empty states**: a dashed outline with room around the message, so they read as a place
+  for content rather than a card.
 
 ## What it trades away
 

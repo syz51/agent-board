@@ -107,7 +107,7 @@ export function Empty({
   icon?: IconName;
 }) {
   return (
-    <div className="grid justify-items-center gap-1 rounded-lg border px-6 py-9 text-center text-meta text-muted-foreground">
+    <div className="grid justify-items-center gap-1 rounded-lg border border-dashed px-6 py-14 text-center text-meta text-muted-foreground">
       <span className="mb-1.5 grid size-8 place-items-center rounded-md border bg-card text-subtle-foreground">
         <Icon name={icon} className="size-4" />
       </span>
