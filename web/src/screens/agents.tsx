@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { getRouteApi, Link } from "@tanstack/react-router";
+import { getRouteApi, Link, useLocation } from "@tanstack/react-router";
 import type { Agent, Task } from "@/api/schema.ts";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
@@ -47,6 +47,8 @@ export function sortAgents(agents: Agent[], state: string): Agent[] {
 export function AgentsScreen() {
   useTitle("Agents");
   const state = route.useSearch().state ?? "";
+  // The card another page linked to. CSS `:target` misses the router's in-app navigation.
+  const target = useLocation({ select: (location) => location.hash });
   const agents = useAgents();
   const doing = useQuery(queries.doingTasks());
   const current = new Map<string, Task>();
@@ -107,7 +109,12 @@ export function AgentsScreen() {
                 <span>Working on</span>
               </div>
               {shown.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
+                <AgentCard
+                  key={agent.id}
+                  agent={agent}
+                  task={current.get(agent.id)}
+                  targeted={target === agentAnchor(agent.handle)}
+                />
               ))}
             </div>
           );
@@ -127,7 +134,15 @@ const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
  * coordinator, its turn endings. Narrow lists stack the two.
  */
-function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
+function AgentCard({
+  agent,
+  task,
+  targeted,
+}: {
+  agent: Agent;
+  task: Task | undefined;
+  targeted: boolean;
+}) {
   const where = [
     agent.role === "coordinator" ? "Coordinator" : null,
     agent.device,
@@ -141,7 +156,10 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
     <article
       id={agentAnchor(agent.handle)}
-      className={`${ROW} scroll-mt-4 gap-y-2.5 py-3 target:bg-accent hover:bg-muted/60`}
+      className={cn(
+        `${ROW} scroll-mt-4 gap-y-2.5 py-3 hover:bg-muted/60`,
+        targeted && "bg-accent hover:bg-accent",
+      )}
     >
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
         <Avatar handle={agent.handle} large className="row-span-3 size-7 self-start text-2xs" />

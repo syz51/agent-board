@@ -109,7 +109,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   thread's `title` is its T3 title, and native id `t3_link` its `https://` link in the T3
   app, both read by the hooks (see Runtime integration), so the web view names the thread
   and links to it. A board's coordinator keeps the title its daemon registered
-  (`<slug> coordinator`): the server ignores a title in a worker's registration of it.
+  (`<slug> coordinator`): the server ignores a title in a worker's registration of it,
+  also before the daemon claims the lease (the agent's stored role is then coordinator).
+  The server takes a `t3_link` only as an `https://` link.
 - **Nested sessions**: a `claude -p` or `codex exec` started from a thread's shell inherits
   `T3CODE_THREAD_ID` (and Claude Code's session variables), so the environment cannot tell
   it from the thread. Process ancestry can: walking up from the client's parent, the first
@@ -247,7 +249,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts. A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user). In a T3 thread, the session's first `Stop`, then one at most an hour after the last check, asks T3 for the thread's title and link (the same `t3 thread show`; the check counts whether or not T3 answers within 0.4 seconds), since T3 renames a thread after its first turn. Only a title or link other than the registered one is sent: the hook registers the agent again (where it runs now, so a `git` read of the work tree too) before the idle update, as registering marks it running |
+| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user). In a T3 thread, the session's first `Stop`, then one at most an hour after the last check, asks T3 for the thread's title and link (the same `t3 thread show`, at most 0.4 seconds), since T3 renames a thread after its first turn; not while the server is skipped. Only a title or link other than the registered one is sent: after the idle update and the reminders, the hook registers the agent again (where it runs now, so a `git` read of the work tree too, and a delegated thread's parent if T3 now gives it) and, since registering marks it running, marks it idle again, in what is left of the hook's budget. A check that finds no change or gets no answer counts as done; a change counts once the server takes it, so a failed registration is tried again at the next `Stop`. One cut off between the two requests leaves the agent marked running until its next hook |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release file leases. A coordinator lease runs on: T3 ends idle sessions while the thread lives on, and the daemon of the lease's device renews it while the thread is live, or releases it |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -592,8 +594,7 @@ settings in use, warned once per edit.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
     after local midnight, one message lists the Needs you items by board,
-    by the web view's rule: the open asks. It adds how many tasks were done since the
-    user last marked updates seen. Nothing is sent when every list is empty.
+    by the web view's rule: the open asks. Nothing is sent when no ask is open.
   - The sent state is stored (`telegram_stuck`, `telegram_stalled`, `telegram_digest`)
     after each send, so a restart repeats none, and an alert that cannot be sent, or is
     cut off by shutdown, is tried again at the next check; a crash between a send and its
@@ -602,18 +603,18 @@ settings in use, warned once per edit.
     new chat forgets what was sent to the old one. With all three alerts off, nothing is
     checked.
 - **Web view** (served at `/` on the tailnet, phone-friendly): a home page with the open
-  asks, the tasks in progress (doing and review) on every board, **Since you last looked**
-  and the boards with counts, autopilot switches and coordinator state, in sections the
-  user collapses and reorders (kept per browser); a board's tasks by status, in groups
-  that collapse; task detail with notes, evidence and history; agents with their state,
-  current task and handoff; a **Needs you** queue of only what waits on the user's
-  decision or action: the open asks, to answer there (its navigation badge counts them).
-  Blocked and non-auto tasks are not listed there: a task that needs the user carries an
-  ask. Since you last looked lists the tasks finished, with their summaries, and the
-  coordinators' turn endings since the user's seen cursor, newest first. One cursor covers
-  every board; "Mark all seen" moves it to the newest update shown, so anything that
-  arrived later stays unseen, and a dot on Home shows that something is unseen. A done
-  task's page shows its summary, and the agents page a coordinator's last turn endings.
+  asks, the boards with counts, autopilot switches and coordinator state, and the tasks
+  in progress (doing and review) on every board, in sections the user collapses and
+  reorders (kept per browser); a board's open asks above its tasks, then its tasks by
+  status, in groups that collapse; task detail with notes, evidence and history; agents
+  with their state, current task and handoff, named by their T3 thread title with a link
+  to the thread (native id `t3_link`) when they have one; a **Needs you** queue of only
+  what waits on the user's decision or action: the open asks, to answer there (its
+  navigation badge counts them). Blocked and non-auto tasks are not listed there: a task
+  that needs the user carries an ask. Every agent handle links to its T3 thread, or else
+  to its card on the agents page. A done task's page shows its summary, and the agents
+  page a coordinator's last turn endings. No page uses `GET /v1/updates` or the seen
+  cursor; they stay in the API for other clients.
 
 ## Text format
 

@@ -321,7 +321,7 @@ pub struct Agent {
     pub cwd: Option<String>,
     /// Provider and host ids, for example `{"claude_session": "...", "t3_thread": "...",
     /// "t3_parent": "...", "t3_link": "https://..."}`; `t3_link` is the T3 thread's link in
-    /// the T3 app, always `https://`.
+    /// the T3 app, always `https://` (the server refuses any other).
     pub native_ids: BTreeMap<String, String>,
     pub forked_from: Option<AgentId>,
     pub state: AgentState,

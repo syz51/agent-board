@@ -1675,7 +1675,7 @@ async fn a_digest_due_just_before_midnight_still_goes_out_after_it() {
 }
 
 #[tokio::test]
-async fn the_digest_counts_tasks_done_since_last_seen() {
+async fn the_digest_lists_only_open_asks_not_done_tasks() {
     let (fake, api_base) = fake_api().await;
     let t = T::new();
     t.register(A, None, None).await;
@@ -1702,11 +1702,6 @@ async fn the_digest_counts_tasks_done_since_last_seen() {
         c.digest_at = chrono::NaiveTime::from_hms_opt(9, 0, 0);
     });
     t.advance(TimeDelta::days(1));
-    let sent = notifier.sent_after_check(&fake).await;
-    assert_eq!(sent.len(), 1, "{sent:?}");
-    assert!(
-        sent[0].ends_with("\nDone since you last looked: 2 tasks."),
-        "{}",
-        sent[0]
-    );
+    // No client moves the seen cursor any more, so done tasks alone send nothing.
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
 }

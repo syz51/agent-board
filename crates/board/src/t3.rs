@@ -20,7 +20,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{Runtime, Timestamp};
+use board_proto::{
+    AGENT_TITLE_CHARS_MAX as TITLE_CHARS_MAX, NATIVE_ID_CHARS_MAX, Runtime, T3_LINK_PREFIX,
+    Timestamp,
+};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
@@ -41,11 +44,6 @@ pub struct ThreadFacts {
     /// Its `https://` link in the T3 app, exactly as T3 printed it.
     pub link: Option<String>,
 }
-
-/// The longest title the server takes for an agent.
-pub const TITLE_CHARS_MAX: usize = 200;
-/// The longest native id value the server takes.
-const NATIVE_ID_CHARS_MAX: usize = 300;
 
 /// A thread from a project's listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +122,18 @@ impl T3Cli {
     /// What T3 says of `thread`: its parent, title and link; `None` when T3 does not know
     /// the thread.
     pub async fn thread_facts(&self, thread: &str) -> Result<Option<ThreadFacts>> {
+        Ok(self
+            .thread_show(thread, "0")
+            .await?
+            .map(|value| parse_thread_facts(&value)))
+    }
+
+    /// `t3 thread show --json --messages <messages> <thread>`, parsed; `None` when T3 does
+    /// not know the thread.
+    async fn thread_show(&self, thread: &str, messages: &str) -> Result<Option<Value>> {
         let (ok, stdout, stderr) = self
             .run(
-                &["thread", "show", "--json", "--messages", "0", thread],
+                &["thread", "show", "--json", "--messages", messages, thread],
                 None,
             )
             .await?;
@@ -136,8 +143,9 @@ impl T3Cli {
             }
             bail!("t3 thread show failed: {}", stderr.trim());
         }
-        let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
-        Ok(Some(parse_thread_facts(&value)))
+        Ok(Some(
+            serde_json::from_str(&stdout).context("t3 thread show --json")?,
+        ))
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
@@ -204,20 +212,10 @@ impl T3 for T3Cli {
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
-        let (ok, stdout, stderr) = self
-            .run(
-                &["thread", "show", "--json", "--messages", "1", thread],
-                None,
-            )
-            .await?;
-        if !ok {
-            if is_unknown_thread(&stderr, thread) {
-                return Ok(None);
-            }
-            bail!("t3 thread show failed: {}", stderr.trim());
-        }
-        let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
-        Ok(Some(parse_thread_info(&value)))
+        Ok(self
+            .thread_show(thread, "1")
+            .await?
+            .map(|value| parse_thread_info(&value)))
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
@@ -337,8 +335,8 @@ pub fn parse_thread_facts(value: &Value) -> ThreadFacts {
     let link = thread["link"]
         .as_str()
         .filter(|l| {
-            l.starts_with("https://")
-                && l.len() > "https://".len()
+            l.starts_with(T3_LINK_PREFIX)
+                && l.len() > T3_LINK_PREFIX.len()
                 && l.chars().count() <= NATIVE_ID_CHARS_MAX
                 && !l.chars().any(|c| c.is_whitespace() || c.is_control())
         })

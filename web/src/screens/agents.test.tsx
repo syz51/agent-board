@@ -67,6 +67,13 @@ describe("the agents list", () => {
     expect(within(other).queryByRole("link", { name: /Open in T3 Code/ })).toBeNull();
   });
 
+  test("highlights the card another page linked to", async () => {
+    const [linked, other] = agents.filter((agent) => agent.state !== "ended");
+    await renderRoute(`/agents#${agentAnchor(linked!.handle)}`, { seed });
+    expect((await card(linked!.handle)).className).toContain("bg-accent");
+    expect((await card(other!.handle)).className).not.toContain("bg-accent");
+  });
+
   test("says where each agent runs in one line under its name, with no details column", async () => {
     await renderRoute("/agents", { seed });
     const coordinator = agents.find((agent) => agent.role === "coordinator" && agent.repo)!;

@@ -52,6 +52,9 @@ const MARGIN: Duration = Duration::from_millis(200);
 /// tailnet). Past it the server counts as unreachable, not slow: a connect that hangs (a
 /// peer asleep or dropping packets) never answers however long the hook waits.
 const CONNECT_BUDGET: Duration = Duration::from_millis(500);
+/// What a `Stop` leaves of the server share after registering a renamed thread, so the
+/// hook answers before its own deadline.
+const RENAME_MARGIN: Duration = Duration::from_millis(50);
 /// A failure to get an answer within a deadline shorter than this, because the hook's local
 /// steps took the rest of the budget, leaves the breaker as it was.
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
@@ -208,6 +211,9 @@ struct Hook<'a> {
     /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
     done_reminder: Option<String>,
     now: Timestamp,
+    /// Shortly before the hook's server share runs out: what a `Stop` may still spend
+    /// registering a renamed thread.
+    deadline: tokio::time::Instant,
 }
 
 async fn handle(
@@ -318,11 +324,10 @@ async fn handle(
     // or T3 never looks like a slow server. T3 is asked while the Keychain lookup runs.
     let t3 = match event {
         _ if nested || !t3_identity_applies(explicit_agent, env) => None,
+        // A hook that skips the server registers nothing, so T3's answer would go unused.
+        _ if breaker.open_at(now).is_some() => None,
         HookEvent::SessionStart => thread_at_start(&home, runtime, session).await,
-        // A Stop that could not reach the server could not register a new title either.
-        HookEvent::Stop if breaker.open_at(now).is_none() => {
-            thread_renamed(&home, runtime, session, now).await
-        }
+        HookEvent::Stop => thread_renamed(&home, runtime, session, now).await,
         _ => None,
     };
     steps.mark("t3");
@@ -368,6 +373,7 @@ async fn handle(
         }
     };
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
+    let deadline = tokio::time::Instant::now() + remaining.saturating_sub(RENAME_MARGIN);
     let relayed = matches!(route, Route::Relay(_));
     let client = match route {
         Route::Relay(client) => client
@@ -393,6 +399,7 @@ async fn handle(
         t3,
         done_reminder: None,
         now,
+        deadline,
     };
     // Turn boundaries for the done reminder hold whether or not the server answers.
     match event {
@@ -694,9 +701,11 @@ async fn thread_at_start(
 
 /// At `Stop`, when a title check is due ([`title_check_due`]): what T3 says of this
 /// session's thread, when its title or link differs from what the hooks registered
-/// ([`thread_changed`]). The check counts as done whatever T3 answers, so a slow T3 costs
-/// one `Stop` an hour. `None` without a session cache, which `SessionStart` (or the
-/// session's first hook) writes.
+/// ([`thread_changed`]). A check that finds no change, or no answer, counts as done, so a
+/// slow T3 costs one `Stop` an hour; a change counts once the server took it
+/// ([`Hook::register`]), so a failed registration is tried again at the next `Stop`.
+/// `None` without a session cache, which `SessionStart` (or the session's first hook)
+/// writes.
 async fn thread_renamed(
     home: &Home,
     runtime: Runtime,
@@ -709,23 +718,34 @@ async fn thread_renamed(
     if !title_check_due(cached.title_checked_at, now) {
         return None;
     }
-    cached.title_checked_at = Some(now);
-    if let Err(err) = state::save_session(home, runtime, session, &cached) {
-        tracing::debug!("recording the title check: {err:#}");
-    }
     // What was registered for another thread, or never, says nothing of this one.
     let same = cached.t3_thread.as_deref() == Some(id.as_str());
     let (parent, title, link) = if same {
-        (cached.t3_parent, cached.t3_title, cached.t3_link)
+        (
+            cached.t3_parent.clone(),
+            cached.t3_title.clone(),
+            cached.t3_link.clone(),
+        )
     } else {
         (None, None, None)
     };
-    let mut facts = ask_t3(home, &id).await?;
-    if !thread_changed(title.as_deref(), link.as_deref(), &facts) {
-        return None;
+    let read = ask_t3(home, &id).await;
+    let mut facts = match read {
+        Some(facts) if thread_changed(title.as_deref(), link.as_deref(), &facts) => facts,
+        _ => {
+            cached.title_checked_at = Some(now);
+            if let Err(err) = state::save_session(home, runtime, session, &cached) {
+                tracing::debug!("recording the title check: {err:#}");
+            }
+            return None;
+        }
+    };
+    // As at `SessionStart`: a parent only for a delegated thread, else the one registered
+    // (T3's answer may now have one the session's first registration missed).
+    if !id.starts_with(DELEGATED_THREAD) {
+        facts.parent = None;
     }
-    // Registered with a new title, the thread keeps the parent it registered.
-    facts.parent = parent;
+    facts.parent = facts.parent.or(parent);
     Some(SeenThread { id, facts })
 }
 
@@ -978,6 +998,9 @@ impl Hook<'_> {
             if seen.facts.link.is_some() {
                 local.t3_link = seen.facts.link.clone();
             }
+            if self.event == HookEvent::Stop {
+                local.title_checked_at = Some(self.now);
+            }
             if let Err(err) = state::save_session(&self.home, self.runtime, session, &local) {
                 tracing::debug!("caching the thread's title and link: {err:#}");
             }
@@ -1070,14 +1093,6 @@ impl Hook<'_> {
     async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
         // Before any server call, so it survives a server that fails (`local_stop`).
         self.prepare_done_reminder();
-        // T3 renamed the thread: registered again before the idle update, since registering
-        // marks the agent running. Rare (about once a thread), so it rarely delays the state.
-        if self.t3.is_some()
-            && let Some(repo) = &repo
-            && let Err(err) = self.register(repo).await
-        {
-            tracing::debug!("registering the thread's new title: {err:#}");
-        }
         // A Stop that follows our own block ends the turn that answered a reminder; the
         // message worth keeping was the one the reminder interrupted.
         let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
@@ -1099,21 +1114,45 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        if continued {
-            return Ok(Reply::Nothing);
-        }
-        let handoff = self.handoff_reminder().await?;
-        let text: Vec<String> = self
-            .done_reminder
-            .take()
-            .into_iter()
-            .chain(handoff)
-            .collect();
-        Ok(if text.is_empty() {
+        let reply = if continued {
             Reply::Nothing
         } else {
-            Reply::Block(text.join("\n"))
-        })
+            let handoff = self.handoff_reminder().await?;
+            let text: Vec<String> = self
+                .done_reminder
+                .take()
+                .into_iter()
+                .chain(handoff)
+                .collect();
+            if text.is_empty() {
+                Reply::Nothing
+            } else {
+                Reply::Block(text.join("\n"))
+            }
+        };
+        if let Some(repo) = &repo {
+            self.register_renamed(repo).await;
+        }
+        Ok(reply)
+    }
+
+    /// T3 renamed the thread: registers it again, last and in the time left, then marks it
+    /// idle again, since registering marks it running. Rare (about once a thread). A failure
+    /// is logged and the next `Stop` tries again; one that cuts off between the two requests
+    /// leaves the agent marked running until its next hook.
+    async fn register_renamed(&self, repo: &RepoInfo) {
+        if self.t3.is_none() {
+            return;
+        }
+        let again = async {
+            self.register(repo).await?;
+            self.set_state(AgentState::Idle, None).await
+        };
+        match tokio::time::timeout_at(self.deadline, again).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::debug!("registering the thread's new title: {err:#}"),
+            Err(_) => tracing::debug!("registering the thread's new title: out of time"),
+        }
     }
 
     /// The handoff reminder: when a task is in `doing` and the handoff is missing or stale.

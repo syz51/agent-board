@@ -115,8 +115,13 @@ server's minute sweep deletes older ones.
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
   as a board's coordinator keeps the `coordinator` role whatever role it registers with,
   and its stored `title` unless it registers as `coordinator` (the hooks register a T3
-  thread's own title as a worker; the daemon names its coordinator after the board). The
-  hooks send a T3 thread's link as native id `t3_link`.
+  thread's own title as a worker; the daemon names its coordinator after the board). An
+  agent stored with the `coordinator` role keeps its title against a worker registration
+  too, since the daemon registers its coordinator before it claims the lease. The hooks
+  send a T3 thread's link as native id `t3_link`: it must start with `https://`, have more
+  after it and hold no white space (400 `invalid` otherwise). Native id values are at most
+  300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
+  `AGENT_TITLE_CHARS_MAX`).
   Clients register on session start (hooks) and before acting when the agent is unknown.
   Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
   `agent_state_changed` event (`from` its old state, `to` `running`).
@@ -477,8 +482,9 @@ turn, so the thread is not where the user reads it. One seen cursor is kept for 
   updates starts the cursor at its newest done task, so earlier history counts as seen.
 - `PUT /v1/updates/seen` `[MarkSeen]` `{at}` → `[SeenCursor]`. Moves the cursor forward to
   `at` (a later `at` than the server's clock counts as now; an earlier one than the cursor
-  leaves it). Clients send the time of the newest update they showed, so updates that
-  arrived after the page loaded stay unseen.
+  leaves it). A client should send the time of the newest update it showed, so updates
+  that arrived after it loaded stay unseen. The web view no longer shows updates, so
+  nothing it does moves the cursor.
 
 Neither records an event; agent tokens get 403 `forbidden`. A new turn ending arrives with
 its coordinator's `agent_state_changed` event, and a new or reopened done task with
