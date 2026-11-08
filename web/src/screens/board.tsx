@@ -24,8 +24,9 @@ import {
   useTitle,
 } from "@/ui/common.tsx";
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusKey } from "@/ui/icons.tsx";
 import { useCollapsed } from "@/ui/sections.tsx";
+import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import { AskRows, useOpenAsks } from "./asks.tsx";
 
 const route = getRouteApi("/boards/$slug");
@@ -38,23 +39,33 @@ export interface TaskFilters {
   /** An agent id, `none` for unowned, or empty for anyone. */
   owner: string;
   readyOnly: boolean;
+  /** A task id: only its direct children, done ones whenever they were done. */
+  parent: string;
 }
 
 export interface TaskGroup {
-  key: "ready" | "open" | "doing" | "blocked" | "review" | "done";
+  key: "ready" | "open" | "doing" | "blocked" | "review" | "done" | "dropped";
   title: string;
   tasks: Task[];
 }
 
 /**
  * Group a board's tasks for display: doing, review, blocked, ready, open tasks still
- * waiting, and done in the last 30 days. Dropped tasks are not shown. Exported for tests.
+ * waiting, and done in the last 30 days. Dropped tasks are not shown. The children of the
+ * `parent` filter's task show whole: every done one, then the dropped ones, so the list
+ * holds as many as the parent's subtask count. Exported for tests.
  */
 export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): TaskGroup[] {
   const q = filters.q.trim().toLowerCase();
   const visible = tasks.filter((task) => {
-    if (task.status === "dropped") return false;
-    if (task.status === "done" && now - Date.parse(task.updated_at) > DONE_WINDOW_MS) return false;
+    if (filters.parent ? task.parent !== filters.parent : task.status === "dropped") return false;
+    if (
+      !filters.parent &&
+      task.status === "done" &&
+      now - Date.parse(task.updated_at) > DONE_WINDOW_MS
+    ) {
+      return false;
+    }
     if (filters.priority && task.priority !== filters.priority) return false;
     if (
       filters.owner === "none" ? task.owner !== null : filters.owner && task.owner !== filters.owner
@@ -73,11 +84,12 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     { key: "blocked", title: "Blocked", tasks: of("blocked") },
     { key: "ready", title: "Ready", tasks: open.filter((task) => task.ready) },
     { key: "open", title: "Waiting", tasks: open.filter((task) => !task.ready) },
-    { key: "done", title: "Done in the last 30 days", tasks: done },
+    { key: "done", title: filters.parent ? "Done" : "Done in the last 30 days", tasks: done },
+    { key: "dropped", title: "Dropped", tasks: of("dropped") },
   ];
 }
 
-const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
+const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false, parent: "" };
 
 /**
  * Whether a board shows any task before filtering, by the rule the list uses: dropped tasks
@@ -94,6 +106,7 @@ export function filtersOf(search: BoardSearch): TaskFilters {
     priority: search.priority ?? "",
     owner: search.owner ?? "",
     readyOnly: search.ready === "1",
+    parent: search.parent ?? "",
   };
 }
 
@@ -127,19 +140,30 @@ function rememberTitle(slug: string, title: string) {
 export function BoardScreen() {
   const { slug } = route.useParams();
   const search = route.useSearch();
+  const filters = filtersOf(search);
   const navigate = route.useNavigate();
   const now = useNow(60_000);
   // The board comes from the list the sidebar already holds: one request for both.
   const boards = useQuery(queries.boards());
   const board = boards.data?.find((item) => item.slug === slug);
-  const tasks = useQuery(queries.boardTasks(slug));
+  const boardTasks = useQuery(queries.boardTasks(slug));
+  // Narrowed to a parent, the list asks the server for its children: the board list is
+  // capped, so it may miss some.
+  const childList = useQuery({
+    ...queries.childTasks(slug, filters.parent),
+    enabled: filters.parent !== "",
+  });
+  const tasks = filters.parent ? childList : boardTasks;
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
   // One set per task list, so the memoized rows keep their identity between renders.
+  // Blockers come from anywhere on the board, so this set does too.
   const done = useMemo(
     () =>
-      new Set((tasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id)),
-    [tasks.data],
+      new Set(
+        (boardTasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id),
+      ),
+    [boardTasks.data],
   );
   // Without the board list, as in an outage, the name last seen in this browser stands in,
   // or else the slug.
@@ -149,15 +173,15 @@ export function BoardScreen() {
   const name = board?.title ?? rememberedTitle(slug) ?? slug;
   useTitle(name);
   // One choice for every board: done work starts folded away.
-  const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
+  const [collapsed, toggle] = useCollapsed("board-groups", ["done", "dropped"]);
 
-  const filters = filtersOf(search);
   const setFilter = (key: keyof BoardSearch, value: string) =>
     void navigate({
       search: { ...search, [key]: value || undefined },
       replace: true,
     });
-  const filtered = filters.q || filters.priority || filters.owner || filters.readyOnly;
+  const filtered =
+    filters.q || filters.priority || filters.owner || filters.readyOnly || filters.parent;
 
   return (
     <>
@@ -188,6 +212,16 @@ export function BoardScreen() {
       )}
 
       <BoardAsks slug={slug} />
+
+      {filters.parent && (
+        <ParentFilter
+          id={filters.parent}
+          slug={slug}
+          search={search}
+          parent={boardTasks.data?.find((task) => task.id === filters.parent)}
+          subtasks={childList.data}
+        />
+      )}
 
       {/* While tasks load the bar shows disabled, so the header holds still. A board with
           nothing to filter, or whose tasks failed to load, has no bar: it would only look
@@ -454,9 +488,7 @@ const columns = column.columns([
     id: "status",
     cell: ({ row }) => {
       const { task } = row.original;
-      return (
-        <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
-      );
+      return <StatusIcon status={statusKey(task)} label />;
     },
   }),
   column.display({
@@ -566,6 +598,19 @@ function TaskMain({ task, done, now }: TaskRowData) {
           </span>
         </span>
       )}
+      {/* An umbrella task: its children, narrowed to on this list. */}
+      {task.child_count > 0 && (
+        <Link
+          className={cn(DEPENDENCY, "hover:text-foreground")}
+          to="/boards/$slug"
+          params={{ slug: task.board }}
+          search={{ parent: task.id }}
+          data-dependency="children"
+        >
+          <Icon name="subtasks" className="size-3.5 flex-none" />
+          {task.child_count} {task.child_count === 1 ? "subtask" : "subtasks"}
+        </Link>
+      )}
       {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
       {!task.auto && (
         <Badge
@@ -592,5 +637,60 @@ function TaskMain({ task, done, now }: TaskRowData) {
         </p>
       )}
     </>
+  );
+}
+
+/**
+ * The parent the list is narrowed to: its id and title, how its children stand, and a link
+ * back to every task.
+ */
+function ParentFilter({
+  id,
+  slug,
+  search,
+  parent,
+  subtasks,
+}: {
+  id: string;
+  slug: string;
+  search: BoardSearch;
+  /** The parent as the board list has it, for its title; absent until that list loads. */
+  parent: Task | undefined;
+  /** Its children; absent while they load. */
+  subtasks: Task[] | undefined;
+}) {
+  return (
+    <section
+      className="mb-5 grid gap-2.5 rounded-lg border bg-card px-4 py-3 shadow-raise"
+      aria-labelledby="parent-filter"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 id="parent-filter" className="min-w-0 text-sm font-semibold">
+          <span className="font-normal text-muted-foreground">Subtasks of </span>
+          <Link to="/tasks/$id" params={{ id }}>
+            <span className="ident">{id}</span>
+            {parent && (
+              <>
+                {" "}
+                <PlainText text={parent.title} className="whitespace-normal" />
+              </>
+            )}
+          </Link>
+        </h2>
+        <Link
+          className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
+          to="/boards/$slug"
+          params={{ slug }}
+          search={{ ...search, parent: undefined }}
+          replace
+        >
+          <Icon name="cross" className="size-3.5" />
+          Show all tasks
+        </Link>
+      </div>
+      {subtasks !== undefined && (
+        <StatusTally counts={taskTally(subtasks)} label="Subtasks by status" empty="No subtasks" />
+      )}
+    </section>
   );
 }

@@ -74,6 +74,7 @@ export class DevState {
     const status = params.get("status");
     const owner = params.get("owner");
     const ready = params.get("ready");
+    const parent = params.get("parent");
     const limit = Number(params.get("limit") ?? Infinity);
     if (board) this.findBoard(board);
     return this.data.tasks
@@ -83,6 +84,7 @@ export class DevState {
           (!board || task.board === board) &&
           (!status || task.status === status) &&
           (!owner || task.owner === owner) &&
+          (!parent || task.parent === parent) &&
           (ready === null || String(task.ready) === ready),
       )
       .sort((a, b) => a.priority.localeCompare(b.priority) || taskNumber(a.id) - taskNumber(b.id))
@@ -92,6 +94,10 @@ export class DevState {
   task(id: string): TaskDetail {
     const stored = this.data.tasks.find((task) => task.id === id);
     if (!stored) throw notFound(`task ${id}`, "check the id; task ids look like factory-12");
+    const children = this.data.tasks
+      .filter((task) => task.parent === id)
+      .map((task) => this.toTask(task))
+      .sort((a, b) => taskNumber(a.id) - taskNumber(b.id));
     return {
       task: this.toTask(stored),
       notes: this.data.notes.filter((note) => note.task === id),
@@ -99,7 +105,15 @@ export class DevState {
         .filter((item) => item.task === id)
         .map(({ task: _, ...item }) => item),
       blocks: this.data.tasks.filter((task) => task.blockers.includes(id)).map((task) => task.id),
-      children: this.data.tasks.filter((task) => task.parent === id).map((task) => task.id),
+      children: children.map((task) => task.id),
+      child_tasks: children.map(({ id, title, status, ready, owner, owner_stale }) => ({
+        id,
+        title,
+        status,
+        ready,
+        owner,
+        owner_stale,
+      })),
       history: this.data.events.filter((event) => event.task === id),
     };
   }
@@ -505,6 +519,7 @@ export class DevState {
       ...task,
       owner_stale: owner !== undefined && this.stale(owner),
       proposal,
+      child_count: this.data.tasks.filter((item) => item.parent === task.id).length,
       ready:
         task.status === "open" &&
         !proposal &&

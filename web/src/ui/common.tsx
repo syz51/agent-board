@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import { safeHref } from "@/text/markdown.tsx";
-import { Avatar, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
+import { Avatar, Icon, type IconName, PriorityMark, StatusPill, statusKey } from "./icons.tsx";
 
 export function useTitle(title: string): void {
   useEffect(() => {
@@ -213,7 +213,7 @@ export function RelTime({ at }: { at: string }) {
 }
 
 export function StatusBadge({ status, ready }: { status: TaskStatus; ready?: boolean }) {
-  return <StatusPill status={status === "open" && ready ? "ready" : status} />;
+  return <StatusPill status={statusKey({ status, ready: ready ?? false })} />;
 }
 
 export function PriorityBadge({ priority, compact }: { priority: Priority; compact?: boolean }) {

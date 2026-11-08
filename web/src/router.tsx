@@ -25,6 +25,8 @@ export interface BoardSearch {
   /** An agent id, `none` for unowned, or nothing for anyone. */
   owner?: string | undefined;
   ready?: "1" | undefined;
+  /** A task id: only its direct children. */
+  parent?: string | undefined;
 }
 
 export function validateBoardSearch(search: Record<string, unknown>): BoardSearch {
@@ -33,6 +35,7 @@ export function validateBoardSearch(search: Record<string, unknown>): BoardSearc
     priority: text(search.priority),
     owner: text(search.owner),
     ready: search.ready === "1" ? "1" : undefined,
+    parent: text(search.parent),
   };
 }
 

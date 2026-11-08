@@ -1,7 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { type ReactNode, useMemo } from "react";
-import type { Agent, BoardEvent, Evidence, Feedback, Task, TaskDetail } from "@/api/schema.ts";
+import type {
+  Agent,
+  BoardEvent,
+  ChildTask,
+  Evidence,
+  Feedback,
+  Task,
+  TaskDetail,
+} from "@/api/schema.ts";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
 import { boardOfTask } from "@/lib/ids.ts";
@@ -23,7 +31,8 @@ import {
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusKey } from "@/ui/icons.tsx";
+import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import { EventLine, Timeline } from "./events.tsx";
 
 const route = getRouteApi("/tasks/$id");
@@ -122,6 +131,7 @@ function TaskView({
   return (
     <article>
       <header className="mb-6">
+        {task.parent && <ParentLine id={task.parent} related={related} />}
         <h1 className="max-w-[40ch] text-headline font-semibold tracking-[-0.015em] text-balance max-md:text-display-phone">
           <PlainText text={task.title} />
         </h1>
@@ -132,7 +142,7 @@ function TaskView({
           <Owner task={task} agents={agents} />
         </p>
         {/* The links to other tasks are far down there too; this says they exist. */}
-        {(task.blockers.length > 0 || detail.children.length > 0) && (
+        {(task.blockers.length > 0 || detail.child_tasks.length > 0) && (
           <p className="mt-1.5 flex flex-wrap items-center gap-x-3 text-meta text-muted-foreground lg:hidden">
             {task.blockers.length > 0 && (
               <a
@@ -143,12 +153,13 @@ function TaskView({
                 Blocked by <span className="ident">{task.blockers.join(", ")}</span>
               </a>
             )}
-            {detail.children.length > 0 && (
+            {detail.child_tasks.length > 0 && (
               <a
                 className="inline-flex min-h-6 items-center text-muted-foreground"
-                href={`#${linksId("Subtasks")}`}
+                href="#task-subtasks"
               >
-                {detail.children.length} {detail.children.length === 1 ? "subtask" : "subtasks"}
+                {detail.child_tasks.length}{" "}
+                {detail.child_tasks.length === 1 ? "subtask" : "subtasks"}
               </a>
             )}
           </p>
@@ -215,8 +226,6 @@ function TaskView({
           </Facts>
           <TaskLinks title="Blocked by" ids={task.blockers} related={related} />
           <TaskLinks title="Blocks" ids={detail.blocks} related={related} />
-          {task.parent && <TaskLinks title="Parent" ids={[task.parent]} related={related} />}
-          <TaskLinks title="Subtasks" ids={detail.children} related={related} />
         </aside>
 
         <div className="min-w-0">
@@ -252,6 +261,8 @@ function TaskView({
               <Muted>No description.</Muted>
             )}
           </Section>
+
+          {detail.child_tasks.length > 0 && <Subtasks detail={detail} agents={agents} />}
 
           <Section id="task-acceptance" title="Acceptance" count={acceptance.length}>
             {acceptance.length > 0 ? (
@@ -456,12 +467,7 @@ function TaskLinks({
                 to="/tasks/$id"
                 params={{ id }}
               >
-                {task && (
-                  <StatusIcon
-                    status={task.status === "open" && task.ready ? "ready" : task.status}
-                    label
-                  />
-                )}
+                {task && <StatusIcon status={statusKey(task)} label />}
                 <span className="ident col-start-2 text-xs text-muted-foreground">{id}</span>
                 {task && <PlainText text={task.title} className="col-start-2 whitespace-normal" />}
               </Link>
@@ -493,6 +499,84 @@ function EvidenceItem({ item, agents }: { item: Evidence; agents: Map<string, Ag
       )}
       <span className="inline-flex items-center gap-1.5 text-meta text-muted-foreground">
         <Who id={item.agent} agents={agents} /> · <RelTime at={item.at} />
+      </span>
+    </li>
+  );
+}
+
+/** Above the title: the umbrella task this one belongs to. */
+function ParentLine({ id, related }: { id: string; related: Map<string, Task> }) {
+  const parent = related.get(id);
+  return (
+    <p className="mb-2 flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
+      <Icon name="subtasks" className="size-3.5" />
+      <span>Subtask of</span>
+      <Link
+        className="inline-flex min-h-6 min-w-0 items-center gap-1.5"
+        to="/tasks/$id"
+        params={{ id }}
+      >
+        {parent && <StatusIcon status={statusKey(parent)} label />}
+        <span className="ident">{id}</span>
+        {parent && <PlainText text={parent.title} className="whitespace-normal" />}
+      </Link>
+    </p>
+  );
+}
+
+/**
+ * A parent's children in one place: how they stand, then each with its status, title and
+ * owner, by id number as the server lists them.
+ */
+function Subtasks({ detail, agents }: { detail: TaskDetail; agents: Map<string, Agent> }) {
+  const { task, child_tasks: children } = detail;
+  return (
+    <Section id="task-subtasks" title="Subtasks" count={children.length}>
+      <div className="grid gap-3 rounded-lg border bg-card px-3.5 pt-3 pb-1 shadow-raise">
+        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+          <StatusTally
+            counts={taskTally(children)}
+            label="Subtasks by status"
+            className="min-w-0 flex-[1_1_240px]"
+          />
+          <Link
+            className="inline-flex min-h-6 items-center gap-1 text-meta font-medium max-md:min-h-11"
+            to="/boards/$slug"
+            params={{ slug: task.board }}
+            search={{ parent: task.id }}
+          >
+            Open as a list <Icon name="arrow" className="size-3.5" />
+          </Link>
+        </div>
+        <ul className="-mx-3.5 divide-y border-t">
+          {children.map((child) => (
+            <ChildRow key={child.id} child={child} agents={agents} />
+          ))}
+        </ul>
+      </div>
+    </Section>
+  );
+}
+
+function ChildRow({ child, agents }: { child: ChildTask; agents: Map<string, Agent> }) {
+  return (
+    <li
+      className="grid grid-cols-[14px_auto_minmax(0,1fr)_auto] items-center gap-x-2.5 px-3.5 py-2 max-md:grid-cols-[14px_minmax(0,1fr)_auto] max-md:items-start max-md:gap-y-1"
+      data-child={child.id}
+    >
+      <StatusIcon status={statusKey(child)} label className="max-md:mt-0.75" />
+      <span className="ident text-xs text-subtle-foreground max-md:col-start-2 max-md:row-start-2">
+        {child.id}
+      </span>
+      <Link
+        className="min-w-0 font-medium text-foreground max-md:col-start-2 max-md:row-start-1"
+        to="/tasks/$id"
+        params={{ id: child.id }}
+      >
+        <PlainText text={child.title} className="whitespace-normal" />
+      </Link>
+      <span className="flex min-w-0 justify-end text-meta max-md:col-start-3 max-md:row-span-2 max-md:row-start-1 max-md:[&_[data-slot=avatar]]:hidden">
+        <Owner task={child} agents={agents} />
       </span>
     </li>
   );
