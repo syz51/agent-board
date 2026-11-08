@@ -32,7 +32,7 @@
 //! is gone. A board whose coordinator cannot be started here is retried with a growing delay
 //! until its repos, home devices, autopilot switch or status change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ use crate::client::{Client, ServerError, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
-use crate::t3::{T3, T3Cli, TimedOut};
+use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
 
 /// The coordinator's standing instructions.
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
@@ -297,7 +297,8 @@ struct Seen {
     since: Timestamp,
     /// The agent stopped running since it was first read: its held wake-ups are due.
     idled: bool,
-    /// For an ended agent: what T3 said of its thread, asked once per state change.
+    /// For an ended agent: what T3 said of its thread, asked once per state change. Also
+    /// gone for a coordinator whose thread a reconcile found gone, until its state changes.
     thread: ThreadCheck,
 }
 
@@ -306,9 +307,9 @@ struct Seen {
 enum ThreadCheck {
     /// Not asked since the agent's state last changed.
     NotAsked,
-    /// T3 has the thread and has not archived it.
+    /// T3 can run the thread: it has it, has not archived it, and its folder is there.
     Live,
-    /// T3 no longer has the thread, or archived it.
+    /// T3 no longer has the thread, archived it, or its folder is gone, so every run fails.
     Gone,
     /// T3 did not answer: the send is tried, and a failed send asks again.
     NoAnswer,
@@ -344,7 +345,7 @@ enum Unreachable {
     Elsewhere,
     /// Not a T3 thread.
     NotT3,
-    /// Ended, and T3 no longer has its thread or has archived it.
+    /// T3 no longer has its thread, archived it, or its folder is gone.
     ThreadGone,
     /// Paused with no reset time: resuming is left to the user.
     NoReset,
@@ -362,7 +363,9 @@ impl std::fmt::Display for Unreachable {
         f.write_str(match self {
             Self::Elsewhere => "it runs on another device",
             Self::NotT3 => "it is not a T3 thread",
-            Self::ThreadGone => "it ended and T3 no longer has its thread, or archived it",
+            Self::ThreadGone => {
+                "T3 no longer has its thread, archived it, or the thread's folder is gone"
+            }
             Self::NoReset => "it is paused with no reset time",
         })
     }
@@ -376,6 +379,9 @@ impl Reach {
         }
         if agent.id.source() != AgentSource::T3 {
             return Self::Never(Unreachable::NotT3);
+        }
+        if seen.thread == ThreadCheck::Gone {
+            return Self::Never(Unreachable::ThreadGone);
         }
         match agent.state {
             // T3 closes idle sessions, which marks their agents ended; a message resumes
@@ -424,7 +430,7 @@ enum Sent {
     Delivered,
     /// It ran out of time: T3 may have delivered it, so it is not sent again.
     MaybeDelivered(anyhow::Error),
-    /// T3 no longer has the thread, or it is archived.
+    /// T3 no longer has the thread, it is archived, or its worktree is gone.
     Gone(anyhow::Error),
     Failed(anyhow::Error),
 }
@@ -663,11 +669,16 @@ struct StartFailure {
     retry_at: Timestamp,
 }
 
+/// What T3 said of a thread: `None` when it cannot run it; else the folder it runs it in,
+/// when known.
+type RunsIn = Option<Option<PathBuf>>;
+
 /// How a coordinator thread's last check went, when it spares the next ones for
 /// [`THREAD_RECHECK`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LastCheck {
-    Live,
+    /// Live, run in this folder when known: a folder gone since ends the spare.
+    Live(Option<PathBuf>),
     TimedOut,
 }
 
@@ -685,6 +696,9 @@ pub struct Daemon<T: T3> {
     checks_failing: BTreeMap<BoardSlug, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
+    /// Coordinators with queued wake-ups whose thread a reconcile found gone, until their
+    /// state changes: not woken, as for an ended agent whose thread T3 says is gone.
+    gone: BTreeSet<AgentId>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
     /// them here: their lines count as maybe delivered, never sent twice.
     sending: Vec<AgentId>,
@@ -708,6 +722,7 @@ impl<T: T3> Daemon<T> {
             last_checks: BTreeMap::new(),
             checks_failing: BTreeMap::new(),
             agents: BTreeMap::new(),
+            gone: BTreeSet::new(),
             sending: Vec::new(),
             config_text,
             timing: Timing::default(),
@@ -848,7 +863,7 @@ impl<T: T3> Daemon<T> {
         until: tokio::time::Instant,
     ) -> BTreeMap<BoardSlug, Option<Result<bool>>> {
         let mut checks = BTreeMap::new();
-        let mut ask: Vec<(BoardSlug, String)> = Vec::new();
+        let mut ask: Vec<(BoardSlug, String, Option<PathBuf>)> = Vec::new();
         for board in boards.iter().filter(|board| self.is_home(board)) {
             let Some(local) = self.state.coordinators.get(&board.slug) else {
                 continue;
@@ -858,9 +873,13 @@ impl<T: T3> Daemon<T> {
                 .last_checks
                 .get(&local.thread)
                 .filter(|(_, at)| (TimeDelta::zero()..THREAD_RECHECK).contains(&(now - *at)));
+            let project = self.project_for(board).map(|(_, project)| project);
             match (&board.coordinator, last) {
                 (Some(named), _) if *named != local.agent => continue,
-                (Some(_), Some((LastCheck::Live, _))) if local.registered => {
+                // A folder found gone since is not left for the recheck.
+                (Some(_), Some((LastCheck::Live(folder), _)))
+                    if local.registered && !folder.as_deref().is_some_and(folder_gone) =>
+                {
                     checks.insert(board.slug.clone(), Some(Ok(true)));
                 }
                 (Some(_), Some((LastCheck::TimedOut, at))) if local.registered => {
@@ -871,35 +890,47 @@ impl<T: T3> Daemon<T> {
                     );
                     checks.insert(board.slug.clone(), Some(Err(err)));
                 }
-                _ => ask.push((board.slug.clone(), local.thread.clone())),
+                _ => ask.push((board.slug.clone(), local.thread.clone(), project)),
             }
         }
         let this = &*self;
         // Unordered, so a hung check holds only its own slot.
-        let mut answers: Vec<(usize, Option<Result<bool>>)> =
-            futures_util::stream::iter(ask.iter().enumerate().map(|(i, (_, thread))| async move {
-                if tokio::time::Instant::now() >= until {
-                    return (i, None);
-                }
-                (i, Some(this.thread_live(thread).await))
-            }))
+        let mut answers: Vec<(usize, Option<Result<RunsIn>>)> =
+            futures_util::stream::iter(ask.iter().enumerate().map(
+                |(i, (_, thread, project))| async move {
+                    if tokio::time::Instant::now() >= until {
+                        return (i, None);
+                    }
+                    (
+                        i,
+                        Some(this.thread_runs_in(thread, project.as_deref()).await),
+                    )
+                },
+            ))
             .buffer_unordered(THREAD_CHECKS_AT_ONCE)
             .collect()
             .await;
         answers.sort_by_key(|(i, _)| *i);
-        for ((slug, thread), (_, answer)) in ask.into_iter().zip(answers) {
-            match &answer {
-                Some(Ok(true)) => {
-                    self.last_checks.insert(thread, (LastCheck::Live, now));
+        for ((slug, thread, _), (_, answer)) in ask.into_iter().zip(answers) {
+            let answer = answer.map(|answer| match answer {
+                Ok(Some(folder)) => {
+                    self.last_checks
+                        .insert(thread, (LastCheck::Live(folder), now));
+                    Ok(true)
                 }
-                Some(Err(err)) if err.downcast_ref::<TimedOut>().is_some() => {
-                    self.last_checks.insert(thread, (LastCheck::TimedOut, now));
-                }
-                Some(_) => {
+                Ok(None) => {
                     self.last_checks.remove(&thread);
+                    Ok(false)
                 }
-                None => {}
-            }
+                Err(err) => {
+                    if err.downcast_ref::<TimedOut>().is_some() {
+                        self.last_checks.insert(thread, (LastCheck::TimedOut, now));
+                    } else {
+                        self.last_checks.remove(&thread);
+                    }
+                    Err(err)
+                }
+            });
             checks.insert(slug, answer);
         }
         let ours: Vec<&str> = self
@@ -913,12 +944,30 @@ impl<T: T3> Daemon<T> {
         checks
     }
 
-    /// Whether T3 has `thread` and has not archived it.
-    async fn thread_live(&self, thread: &str) -> Result<bool> {
+    /// Whether T3 has `thread` and can run it: not archived, and its folder (its worktree,
+    /// else `project` when given) still exists, since T3 fails every run of a thread whose
+    /// folder is gone.
+    async fn thread_live(&self, thread: &str, project: Option<&Path>) -> Result<bool> {
+        Ok(self.thread_runs_in(thread, project).await?.is_some())
+    }
+
+    /// [`Self::thread_live`], with the folder T3 runs a live thread in.
+    async fn thread_runs_in(&self, thread: &str, project: Option<&Path>) -> Result<RunsIn> {
         let limit = self.timing.thread_check;
         match tokio::time::timeout(limit, self.t3.thread_info(thread)).await {
-            Ok(info) => Ok(info?.is_some_and(|t| !t.archived)),
+            Ok(info) => Ok(info?
+                .filter(|t| t.runnable(project))
+                .map(|t| t.folder(project).map(Path::to_path_buf))),
             Err(_) => Err(TimedOut(format!("t3 thread show {thread}")).into()),
+        }
+    }
+
+    /// Wake-ups queued for `agent`, whose thread a reconcile found gone, are not sent to it:
+    /// a flush passes its answers and idle notices to the board's coordinator, as for any
+    /// gone thread.
+    fn thread_gone(&mut self, agent: &AgentId) {
+        if self.state.wakes.contains_key(agent) {
+            self.gone.insert(agent.clone());
         }
     }
 
@@ -930,6 +979,7 @@ impl<T: T3> Daemon<T> {
         check: Option<Result<bool>>,
     ) -> Result<()> {
         let slug = &board.slug;
+        let project = self.project_for(board).map(|(_, project)| project);
         // Our own coordinator whose thread is gone: replace it whatever its agent record says.
         let mut ours_gone = false;
         if let Some(local) = self.state.coordinators.get(slug).cloned() {
@@ -939,7 +989,7 @@ impl<T: T3> Daemon<T> {
                 let named = board.coordinator.is_some() && local.registered;
                 let live = match check {
                     Some(check) => check,
-                    None => self.thread_live(&local.thread).await,
+                    None => self.thread_live(&local.thread, project.as_deref()).await,
                 };
                 let mut info = None;
                 let live = match live {
@@ -987,6 +1037,11 @@ impl<T: T3> Daemon<T> {
                         self.adopt(board, local, now).await
                     };
                 }
+                tracing::warn!(
+                    "coordinator of {slug}: thread {} is gone, archived or its folder is missing; replacing it",
+                    local.thread
+                );
+                self.thread_gone(&local.agent);
                 ours_gone = board.coordinator.is_some();
             }
             // The board names someone else, or the thread is gone.
@@ -1011,13 +1066,14 @@ impl<T: T3> Daemon<T> {
                         && load_adoption(&self.ctx.home, slug).is_none() =>
                 {
                     let thread = agent.native().to_owned();
-                    if self.thread_live(&thread).await? {
+                    if let Some(folder) = self.thread_runs_in(&thread, project.as_deref()).await? {
                         self.last_checks
-                            .insert(thread.clone(), (LastCheck::Live, now));
+                            .insert(thread.clone(), (LastCheck::Live(folder), now));
                         // What it was briefed with is unknown: briefed again, once.
                         let local = Coordinator::new(thread, agent.clone(), now, true, None);
                         return self.adopt(board, local, now).await;
                     }
+                    self.thread_gone(agent);
                     // A renewal keeps it named: released first, as for a gone thread above.
                     self.release(slug).await;
                 }
@@ -1281,25 +1337,14 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// The local T3 project folder for one of the board's repos, with that repo; else the
-    /// folder `[board_projects]` names for the board, without a repo.
+    /// [`project_for`] on this device.
     fn project_for(&self, board: &Board) -> Option<(Option<String>, PathBuf)> {
-        let config = &self.ctx.config;
-        board
-            .repos
-            .iter()
-            .find_map(|repo| {
-                config
-                    .projects
-                    .get(repo)
-                    .map(|path| (Some(repo.clone()), path.clone()))
-            })
-            .or_else(|| {
-                config
-                    .board_projects
-                    .get(&board.slug)
-                    .map(|path| (None, path.clone()))
-            })
+        project_for(&self.ctx.config, board)
+    }
+
+    /// [`host_folder`] on this device.
+    fn host_folder(&self, board: &Board) -> Result<PathBuf> {
+        host_folder(&self.ctx.config, board)
     }
 
     /// Whether `slug` is this device's feedback board, whose coordinator also triages.
@@ -1309,10 +1354,7 @@ impl<T: T3> Daemon<T> {
 
     async fn start_coordinator(&mut self, board: &Board, now: Timestamp) -> Result<()> {
         let slug = &board.slug;
-        // Checked before claiming: a device that cannot host the thread leaves the lease alone.
-        let Some((_, project)) = self.project_for(board) else {
-            anyhow::bail!(no_project(board));
-        };
+        let project = self.host_folder(board)?;
         match self.claim(slug, None).await {
             Ok(updated) => {
                 self.boards.insert(slug.clone(), updated);
@@ -1421,9 +1463,6 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<()> {
         let slug = &board.slug;
-        if self.project_for(board).is_none() {
-            anyhow::bail!(no_project(board));
-        }
         let agent = match thread_agent(&adoption.thread) {
             Ok(agent) => agent,
             Err(err) => {
@@ -1431,6 +1470,7 @@ impl<T: T3> Daemon<T> {
                 return Err(err.context(format!("dropped the adoption for {slug}")));
             }
         };
+        let project = self.host_folder(board)?;
         // Claimed before asking T3, which is slow: meanwhile no other device starts a thread.
         match self.claim(slug, None).await {
             Ok(updated) => {
@@ -1445,7 +1485,7 @@ impl<T: T3> Daemon<T> {
                 .t3
                 .thread_info(&adoption.thread)
                 .await?
-                .is_some_and(|t| !t.archived);
+                .is_some_and(|t| t.runnable(Some(&project)));
             if !live {
                 return Ok(None);
             }
@@ -1460,7 +1500,7 @@ impl<T: T3> Daemon<T> {
             Ok(Some(registered)) => registered,
             Ok(None) => {
                 tracing::warn!(
-                    "coordinator of {slug}: thread {} to adopt is gone or archived; starting a new thread",
+                    "coordinator of {slug}: thread {} to adopt is gone, archived or its folder is missing; starting a new thread",
                     adoption.thread
                 );
                 drop_adoption(&self.ctx.home, slug, &adoption)?;
@@ -1500,11 +1540,13 @@ impl<T: T3> Daemon<T> {
     /// boards should be reconciled. On an error nothing is queued and `last_seq` stays.
     pub async fn on_event(&mut self, event: &Event, now: Timestamp) -> Result<bool> {
         if event.event_type == EventType::AgentStateChanged {
-            // An ended agent's thread may be gone: the next reconcile asks T3 about it.
-            if event.payload["to"] == "ended"
-                && let Ok(agent) = event.actor.parse::<AgentId>()
-            {
-                self.last_checks.remove(agent.native());
+            if let Ok(agent) = event.actor.parse::<AgentId>() {
+                // An ended agent's thread may be gone: the next reconcile asks T3 about it.
+                if event.payload["to"] == "ended" {
+                    self.last_checks.remove(agent.native());
+                }
+                // Its thread ran again, or is asked about again once ended.
+                self.gone.remove(&agent);
             }
             self.note_state(event, now);
             // Back at work: a notice that it was away no longer holds, for it or for the
@@ -1847,6 +1889,7 @@ impl<T: T3> Daemon<T> {
         }
         let wakes = &self.state.wakes;
         self.agents.retain(|agent, _| wakes.contains_key(agent));
+        self.gone.retain(|agent| wakes.contains_key(agent));
     }
 
     /// Reads what a flush needs to decide on `agent`'s `queue`: the agent, and each line
@@ -1875,8 +1918,14 @@ impl<T: T3> Daemon<T> {
         };
         // Asked once per state change, also while a failed send backs off. A thread that goes
         // later is found by the next send that fails, which asks T3 again.
+        if self.gone.contains(agent) && seen.thread != ThreadCheck::Gone {
+            seen.thread = ThreadCheck::Gone;
+            read = true;
+        }
         if seen.needs_thread_check(&self.ctx.device) {
-            seen.thread = match self.thread_live(agent.native()).await {
+            // Its folder: the worktree T3 names, else the one its session registered from.
+            let registered = seen.agent.cwd.as_deref().map(Path::new);
+            seen.thread = match self.thread_live(agent.native(), registered).await {
                 Ok(true) => ThreadCheck::Live,
                 Ok(false) => ThreadCheck::Gone,
                 Err(err) => {
@@ -2136,7 +2185,7 @@ impl<T: T3> Daemon<T> {
         };
         match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.t3.thread_info(thread)).await {
             Ok(Ok(None)) => Sent::Gone(err),
-            Ok(Ok(Some(info))) if info.archived => Sent::Gone(err),
+            Ok(Ok(Some(info))) if !info.runnable(None) => Sent::Gone(err),
             _ => Sent::Failed(err),
         }
     }
@@ -2148,7 +2197,7 @@ impl<T: T3> Daemon<T> {
             Sent::Delivered => false,
             Sent::Gone(_) => true,
             Sent::MaybeDelivered(_) | Sent::Failed(_) => {
-                matches!(self.last_checks.get(thread), Some((LastCheck::Live, _)))
+                matches!(self.last_checks.get(thread), Some((LastCheck::Live(_), _)))
             }
         };
         if forget {
@@ -2460,6 +2509,44 @@ fn is_transient(err: &anyhow::Error) -> bool {
         Some(server) => !server.status.is_client_error(),
         None => true,
     }
+}
+
+/// The local T3 project folder for one of the board's repos, with that repo; else the folder
+/// `[board_projects]` names for the board, without a repo.
+fn project_for(config: &Config, board: &Board) -> Option<(Option<String>, PathBuf)> {
+    board
+        .repos
+        .iter()
+        .find_map(|repo| {
+            config
+                .projects
+                .get(repo)
+                .map(|path| (Some(repo.clone()), path.clone()))
+        })
+        .or_else(|| {
+            config
+                .board_projects
+                .get(&board.slug)
+                .map(|path| (None, path.clone()))
+        })
+}
+
+/// The folder a device runs the board's coordinator in: [`project_for`], which must not be
+/// gone, since T3 fails every run of a thread whose folder is gone. Checked before claiming:
+/// a device that cannot host the thread leaves the lease alone.
+pub fn host_folder(config: &Config, board: &Board) -> Result<PathBuf> {
+    let (_, project) = project_for(config, board).with_context(|| no_project(board))?;
+    if folder_gone(&project) {
+        anyhow::bail!(
+            "the project folder {} of board {} is missing on this device: restore it, point \
+             config.toml at where it is now, or switch the board's autopilot off (board board \
+             update {} --autopilot false)",
+            project.display(),
+            board.slug,
+            board.slug
+        );
+    }
+    Ok(project)
 }
 
 fn no_project(board: &Board) -> String {
