@@ -13,10 +13,10 @@ use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
     AskStatus, Board, BoardSlug, ClaimCoordinator, CreateAsk, CreateBoard, CreateDevice,
     CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName, DeviceToken,
-    DoneTask, ErrorCode, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note, PutHandoff,
-    RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
-    Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateTask, Updates,
+    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, LeaseResult, MarkSeen, Note,
+    PutHandoff, RegisterAgent, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskStatus, Timestamp, TouchResult, Touches,
+    UpdateBoard, UpdateTask, Updates,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -79,6 +79,7 @@ pub(crate) fn router(state: AppState) -> Router {
             post(claim_coordinator).delete(release_coordinator),
         )
         .route("/stats", get(show_stats))
+        .route("/errors", get(show_errors))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
         .route("/tasks/{id}/claim", post(claim_task))
@@ -469,6 +470,18 @@ async fn show_stats(
 ) -> Result<Json<Stats>> {
     let days = stats::validate_days(q.days)?;
     Ok(Json(state.read(move |cx| stats::stats(cx, days)).await?))
+}
+
+async fn show_errors(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<feedback::ErrorsQuery>,
+) -> Result<Json<ErrorLog>> {
+    Ok(Json(
+        state
+            .read(move |cx| feedback::errors(cx, &feedback::ErrorsFilter::new(cx, q)?))
+            .await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------

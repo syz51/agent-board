@@ -4,6 +4,7 @@ use chrono::TimeDelta;
 use serde_json::{Value, json};
 
 use super::{T, check};
+use crate::clock::Clock;
 
 const A: &str = "t3:alpha";
 const B: &str = "t3:beta";
@@ -671,13 +672,133 @@ async fn three_identical_agent_errors_from_two_agents_file_one_signal_item() {
     assert_eq!(items[0]["feedback"]["recurs"], id.as_str());
     assert_eq!(items[0]["feedback"]["reports"], 3);
 
-    // Old records are pruned by the sweeper.
-    t.advance(TimeDelta::days(8));
-    t.state
-        .write(|cx| crate::ops::feedback::prune_signals(cx))
-        .await
-        .unwrap();
+    // Records outlive the signal window, for revisits; the sweeper prunes them once they
+    // are older than error_retention_days (35).
+    let prune = async || {
+        t.state
+            .write(|cx| crate::ops::feedback::prune_signals(cx))
+            .await
+            .unwrap()
+    };
+    let kept = t.count("SELECT COUNT(*) FROM api_errors");
+    assert!(kept > 0);
+    t.advance(TimeDelta::days(20));
+    prune().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), kept);
+    t.advance(TimeDelta::days(16));
+    prune().await;
     assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 0);
+}
+
+#[tokio::test]
+async fn errors_lists_recorded_errors_per_signature_since_a_time() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let task = t.task(A, "factory", "Noted").await;
+    let long = "x".repeat(501);
+    let note = |n: usize| json!({ "agent": A, "kind": "note", "text": long[..n].to_owned() });
+    let notes_path = format!("/v1/tasks/{task}/notes");
+    let missing = |n: u32| format!("/v1/tasks/factory-{}", 100 + n);
+    // Two over-long notes from one agent: under the signal threshold, so no item.
+    t.fail("POST", &notes_path, Some(A), Some(note(501))).await;
+    t.advance(TimeDelta::hours(1));
+    t.fail("POST", &notes_path, Some(A), Some(note(501))).await;
+    // Three lookups of missing tasks from two agents: a signal item.
+    for (n, agent) in [A, B, A].into_iter().enumerate() {
+        t.fail("GET", &missing(n as u32), Some(agent), None).await;
+    }
+    let item = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let log = t.ok("GET", "/v1/errors", None, None).await;
+    assert_eq!(log["retention_days"], 35);
+    let rows = log["signatures"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{log}");
+    assert_eq!(rows[0]["code"], "not_found");
+    assert_eq!(rows[0]["route"], "GET /v1/tasks/{id}");
+    assert_eq!(
+        (&rows[0]["count"], &rows[0]["agents"]),
+        (&json!(3), &json!(2))
+    );
+    assert_eq!(rows[0]["item"], item.as_str());
+    let signature = rows[0]["signature"].as_str().unwrap();
+    assert_eq!(
+        t.get_task(&item).await["feedback"]["signature"],
+        signature,
+        "the row names the signature of its item"
+    );
+    let under = &rows[1];
+    assert_eq!(under["code"], "invalid");
+    assert_eq!(under["route"], "POST /v1/tasks/{id}/notes");
+    assert_eq!(under["template"], "text is N characters; the limit is N");
+    assert_eq!((&under["count"], &under["agents"]), (&json!(2), &json!(1)));
+    assert_eq!(under["item"], Value::Null, "no signal under the threshold");
+    assert!(under["first_at"].as_str().unwrap() < under["last_at"].as_str().unwrap());
+
+    // Filters: code, route, text; `since` drops earlier errors.
+    let only = |query: &str| {
+        let query = query.to_owned();
+        let t = &t;
+        async move {
+            let log = t
+                .ok("GET", &format!("/v1/errors?{query}"), None, None)
+                .await;
+            log["signatures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["code"].as_str().unwrap().to_owned(),
+                        r["count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let invalid = vec![("invalid".to_owned(), 2)];
+    assert_eq!(only("code=invalid").await, invalid);
+    assert_eq!(
+        only("route=POST%20%2Fv1%2Ftasks%2F%7Bid%7D%2Fnotes").await,
+        invalid
+    );
+    assert_eq!(only("q=THE%20LIMIT").await, invalid);
+    assert_eq!(only("limit=1").await, vec![("not_found".to_owned(), 3)]);
+    assert_eq!(
+        only("q=&route=").await.len(),
+        2,
+        "blank filters are left out"
+    );
+    t.advance(TimeDelta::days(10));
+    assert!(
+        only("").await.is_empty(),
+        "the default since is the signal window"
+    );
+    let since =
+        (t.clock.now() - TimeDelta::days(11)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert_eq!(only(&format!("since={since}")).await.len(), 2);
+
+    // A since before the records kept reads from the oldest kept, and says so.
+    let long_ago =
+        (t.clock.now() - TimeDelta::days(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let log = t
+        .ok("GET", &format!("/v1/errors?since={long_ago}"), None, None)
+        .await;
+    let kept =
+        (t.clock.now() - TimeDelta::days(35)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert_eq!(log["since"], kept.as_str());
+
+    for query in ["limit=0", "limit=1001", "since=yesterday", "code=NotFound"] {
+        let (s, v) = t
+            .call("GET", &format!("/v1/errors?{query}"), None, None)
+            .await;
+        assert_eq!(s.as_u16(), 400, "{query}: {v}");
+        assert!(v["next"].is_string(), "{v}");
+    }
 }
 
 #[tokio::test]
@@ -793,4 +914,28 @@ async fn a_report_worded_as_a_proposal_is_still_triaged() {
         "{task}"
     );
     assert!(t.claim(B, &id).await.0.is_success());
+}
+
+#[tokio::test]
+async fn kept_errors_older_than_the_signal_window_do_not_count_toward_a_signal() {
+    let t = setup().await;
+    let missing = |n: u32| format!("/v1/tasks/factory-{n}");
+    t.fail("GET", &missing(1), Some(A), None).await;
+    t.fail("GET", &missing(2), Some(B), None).await;
+    t.advance(TimeDelta::days(8));
+    t.fail("GET", &missing(3), Some(A), None).await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 3, "all kept");
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM feedback"),
+        0,
+        "two are too old"
+    );
+    t.fail("GET", &missing(4), Some(B), None).await;
+    t.fail("GET", &missing(5), Some(A), None).await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM feedback"), 1);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM feedback_reports"),
+        3,
+        "only the errors within the window are its reports"
+    );
 }

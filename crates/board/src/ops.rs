@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, SnapshotQuery, TaskQuery, error_code};
+use crate::client::{Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code};
 use crate::config::{Config, Home, load_token};
 use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
@@ -969,6 +969,37 @@ pub async fn log(
     Ok(Output::new(render::event_list(&page.events), &page))
 }
 
+/// A `--since` argument: an RFC 3339 time, a date (`YYYY-MM-DD`, midnight UTC), or a
+/// duration back from `now` (`30m`, `12h`, `14d`).
+pub fn parse_since(value: &str, now: Timestamp) -> Result<Timestamp> {
+    let value = value.trim();
+    let back = value
+        .strip_suffix(['m', 'h', 'd'])
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(|n| match value.as_bytes()[value.len() - 1] {
+            b'm' => chrono::TimeDelta::minutes(n.into()),
+            b'h' => chrono::TimeDelta::hours(n.into()),
+            _ => chrono::TimeDelta::days(n.into()),
+        });
+    if let Some(back) = back {
+        return now.checked_sub_signed(back).with_context(|| {
+            format!("since {value:?} reaches back too far; send a shorter duration")
+        });
+    }
+    match parse_not_before(Some(value)) {
+        Ok(Some(Some(at))) => Ok(at),
+        _ => bail!(
+            "since {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now (30m, 12h, 14d)"
+        ),
+    }
+}
+
+/// API errors the server recorded since a time, one line per signature (`GET /v1/errors`).
+pub async fn errors(ctx: &Ctx, q: &ErrorsQuery) -> Result<Output> {
+    let log = ctx.client.errors(q).await?;
+    Ok(Output::new(render::errors(&log), &log))
+}
+
 pub async fn stats(ctx: &Ctx, days: u32) -> Result<Output> {
     let stats = ctx.client.stats(days).await?;
     Ok(Output::new(render::stats(&stats), &stats))
@@ -1007,6 +1038,24 @@ pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Out
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_takes_a_time_a_date_or_a_duration_back() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        for (since, want) in [
+            ("30m", "2026-11-08T11:30:00Z"),
+            ("12h", "2026-11-08T00:00:00Z"),
+            ("14d", "2026-10-25T12:00:00Z"),
+            ("2026-11-07", "2026-11-07T00:00:00Z"),
+            ("2026-11-07T07:45:00Z", "2026-11-07T07:45:00Z"),
+        ] {
+            assert_eq!(parse_since(since, now).unwrap(), at(want), "{since}");
+        }
+        for bad in ["", "d", "14w", "-3d", "none", "yesterday", "100000000d"] {
+            assert!(parse_since(bad, now).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn enum_values_are_the_wire_spellings() {
