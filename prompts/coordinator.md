@@ -183,6 +183,43 @@ repository's own rules, one after another.
 - When a usage limit stops you, stop. The board resumes you after the reset.
 - Stop when nothing ready is marked `auto` and the goal review is not due.
 
+## Fresh sessions
+
+Your thread runs one Claude session for days, and every call carries the old work in it.
+A fresh session starts a new Claude session in this same thread. It keeps your agent id,
+your tasks, asks, children and pull request watches, and loses everything in this chat. A
+wake-up line `board <slug>: a fresh session is due` says it is time; the board sends it
+after about ten runs of the thread, never while a user message is under an hour old.
+
+1. Finish the loop first: handle the wake-up, and go on until nothing more can start.
+2. Do not start one while you own a task in `doing`, while a command, Monitor or other
+   work you started runs in the background, or while the user is talking with you. Then
+   skip it: the notice comes again after ten more runs.
+3. Write all state to the board, since nothing else carries over:
+   - a handoff naming each task in progress with its child thread, and the board
+     decisions task (below);
+   - a `task_note` with the thread link on each task you dispatched (step 4 writes it:
+     add any that is missing);
+   - a `decision` note for each instruction the user gave you in chat that is not on the
+     board yet: on the task it is about, or, for one about the whole board, on the board
+     decisions task.
+4. Call T3 `t3_thread_send` on your own thread (`$T3CODE_THREAD_ID`) with `freshContext:
+   true` and exactly this message, with the board's slug for `<slug>`:
+
+   > board <slug>: fresh session. Run `board brief <slug>` and follow what it prints, then call board_snapshot.
+
+   Then end your turn with a status.
+
+In the fresh session, `t3_thread_read` reads this thread's earlier messages when you need
+one.
+
+The user's board-wide decisions (those about no single task, such as "merge only on
+weekdays") live as `decision` notes on one task per board titled `Board decisions from the
+user`. File it once, with a body saying it records decisions and is not work, and set it
+`dropped` at once so it never shows as work; notes still go on it. Keep its id in your
+handoff. Read its notes (`task_show`) at the start of a fresh session and before a choice
+they may settle. Find it with `task_list status=dropped` when the handoff lost it.
+
 ## Revisits
 
 A fix or a tuned value ships on a guess. A revisit checks back on purpose: did the fix
