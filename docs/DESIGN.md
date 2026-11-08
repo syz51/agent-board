@@ -337,11 +337,17 @@ settings in use, warned once per edit.
   delegate's brief.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
   board-generated message (`t3 thread send`) when a task becomes ready (including when its
-  `not_before` passes), a blocker clears, or another agent files a proposal on the board (a
+  `not_before` passes), a blocker clears, a task moves to `review` (to check it against its
+  acceptance checks), or another agent files a proposal on the board (a
   new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
   board, so a blocker on another board wakes the coordinator of the waiting task's board;
   and the owner of a `blocked` task is woken when its last blocker is done (told to check
-  its blocked reason first when it has one). An answered ask wakes the agent
+  its blocked reason first when it has one). Every 5 minutes the daemon lists `doing`
+  tasks and wakes an owner that is a T3 thread on this device, has been idle or ended for
+  30 minutes or more, and has no running delegated child (an agent whose `t3_parent` is
+  the owner's thread): it is told to continue the task or park it by what it waits on.
+  An owner is woken once per idle spell; it is woken again only after it ran and went
+  idle again. An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
@@ -357,7 +363,8 @@ settings in use, warned once per edit.
     T3 once per state change; when T3 does not answer, the send is tried. A thread archived later, which no event announces, is found when a send
     to it fails, and its answers then go to the coordinator. Lines dropped for an agent
     the daemon cannot wake from its own device, and answers with no other coordinator to
-    go to, are logged as warnings.
+    go to, are logged as warnings. Each delivered send logs one INFO line naming the
+    agent and the kinds of its lines.
   - **Lapsed lease**: while the board names no coordinator (its lease lapsed, and naming
     it again has not happened yet), the coordinator thread this device runs for the board
     still gets the board's wake-ups.

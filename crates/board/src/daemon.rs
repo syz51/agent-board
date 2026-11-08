@@ -44,7 +44,7 @@ use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, ServerError, error_code, is_unreachable};
+use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
@@ -78,6 +78,11 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// each minute costs a home device more than the check is worth. A failed send to the
 /// thread, or its agent ending, asks again on the next reconcile.
 pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
+/// The owner of a task in `doing` that has been away this long (idle, paused or ended)
+/// with no running child thread is woken, once per spell away.
+pub const IDLE_WAKE_AFTER: TimeDelta = TimeDelta::minutes(30);
+/// How often a reconcile looks for such owners: each look reads every task in `doing`.
+pub const IDLE_SCAN_EVERY: TimeDelta = TimeDelta::minutes(5);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -152,6 +157,10 @@ pub struct WatchState {
     /// cannot read is skipped rather than resetting the rest of the state.
     #[serde(default, deserialize_with = "lenient_queues")]
     pub wakes: BTreeMap<AgentId, WakeQueue>,
+    /// Tasks in `doing` whose away owner was woken, with the `last_seen` that began the
+    /// spell: the owner is not woken again for the task until it has run since.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub idle_woken: BTreeMap<TaskId, Timestamp>,
 }
 
 /// One agent's wake-ups not sent yet.
@@ -201,6 +210,25 @@ pub enum WakeAbout {
     /// The user answered `asker`'s ask: for the asker, or for the coordinator when the
     /// asker cannot be woken.
     Answered { ask: i64, asker: AgentId },
+    /// For the coordinator: another agent moved `task` to `review`.
+    Review { task: TaskId },
+    /// For the owner of `task`, in `doing`: it has been away since `since`.
+    Idle { task: TaskId, since: Timestamp },
+}
+
+impl WakeAbout {
+    /// Its kind, as `watch.log` names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::Cleared { .. } => "cleared",
+            Self::Proposal { .. } => "proposal",
+            Self::Unblocked { .. } => "unblocked",
+            Self::Answered { .. } => "answered",
+            Self::Review { .. } => "review",
+            Self::Idle { .. } => "idle",
+        }
+    }
 }
 
 /// Each agent's queue read on its own, so one this version cannot read (a newer kind, a
@@ -531,6 +559,8 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
     threads_live: BTreeMap<String, Timestamp>,
+    /// When a reconcile last looked for away owners of tasks in `doing`.
+    idle_scanned_at: Option<Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
@@ -554,6 +584,7 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             threads_live: BTreeMap::new(),
+            idle_scanned_at: None,
             agents: BTreeMap::new(),
             sending: Vec::new(),
             config_text,
@@ -664,7 +695,87 @@ impl<T: T3> Daemon<T> {
         self.state
             .pending_starts
             .retain(|slug, _| boards.contains_key(slug));
+        if self
+            .idle_scanned_at
+            .is_none_or(|at| now - at >= IDLE_SCAN_EVERY)
+        {
+            self.idle_scanned_at = Some(now);
+            if let Err(err) = self.wake_idle_owners(now).await {
+                tracing::warn!("waking idle owners: {err:#}");
+            }
+        }
         self.save()
+    }
+
+    /// Queues a wake-up for each owner on this device of a task in `doing` that has been
+    /// away (idle, paused or ended) for [`IDLE_WAKE_AFTER`] and has no running child
+    /// thread, which may be doing the work: once per spell away. A paused owner's line
+    /// waits for its reset, like any other.
+    async fn wake_idle_owners(&mut self, now: Timestamp) -> Result<()> {
+        let doing = self
+            .client()
+            .tasks(&TaskQuery {
+                status: Some(TaskStatus::Doing),
+                limit: Some(1_000),
+                ..TaskQuery::default()
+            })
+            .await?;
+        self.state
+            .idle_woken
+            .retain(|task, _| doing.iter().any(|t| t.id == *task));
+        let mut owners: BTreeMap<AgentId, Agent> = BTreeMap::new();
+        let mut running: Option<Vec<Agent>> = None;
+        for task in doing {
+            let Some(owner) = task.owner.clone() else {
+                continue;
+            };
+            if owner.source() != AgentSource::T3 {
+                continue;
+            }
+            let info = match owners.get(&owner) {
+                Some(info) => info.clone(),
+                None => {
+                    let info = match self.client().agent_info(&owner).await {
+                        Ok(info) => info,
+                        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    owners.insert(owner.clone(), info.clone());
+                    info
+                }
+            };
+            let since = info.last_seen;
+            if info.device != self.ctx.device
+                || info.state == AgentState::Running
+                || now - since < IDLE_WAKE_AFTER
+                || self.state.idle_woken.get(&task.id) == Some(&since)
+            {
+                continue;
+            }
+            let running = match &running {
+                Some(running) => running,
+                None => running.insert(self.client().agents_in_state(AgentState::Running).await?),
+            };
+            let parent = owner.native();
+            if running
+                .iter()
+                .any(|a| a.native_ids.get("t3_parent").map(String::as_str) == Some(parent))
+            {
+                continue;
+            }
+            self.state.idle_woken.insert(task.id.clone(), since);
+            let wake = Wake {
+                board: task.board.clone(),
+                about: WakeAbout::Idle {
+                    task: task.id.clone(),
+                    since,
+                },
+                queued_at: now,
+                forwarded: false,
+            };
+            self.queue(owner, wake);
+        }
+        Ok(())
     }
 
     /// Whether each coordinator thread of ours that a home board still leaves to us is live,
@@ -1336,7 +1447,11 @@ impl<T: T3> Daemon<T> {
                     && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
                     let detail = self.client().task(task).await?;
-                    let about = if detail.task.ready && detail.task.auto {
+                    let about = if event.event_type == EventType::TaskUpdated
+                        && event.payload["to"] == "review"
+                    {
+                        Some(WakeAbout::Review { task: task.clone() })
+                    } else if detail.task.ready && detail.task.auto {
                         Some(WakeAbout::Ready { task: task.clone() })
                     } else if event.event_type == EventType::TaskCreated
                         && is_proposal(&detail.task)
@@ -1799,14 +1914,21 @@ impl<T: T3> Daemon<T> {
             // A send that failed may mean the thread is gone: the next reconcile asks T3.
             self.threads_live.remove(agent.native());
         }
+        let kinds = || {
+            let mut kinds: Vec<&str> = out.wakes.iter().map(|w| w.about.kind()).collect();
+            kinds.dedup();
+            kinds.join(", ")
+        };
         match sent {
             Sent::Delivered => {
+                tracing::info!("woke {agent}: {}", kinds());
                 if let Some(queue) = self.state.wakes.get_mut(&agent) {
                     queue.backoff = None;
                 }
             }
             Sent::MaybeDelivered(err) => tracing::warn!(
-                "waking {agent}: {err:#}; not sent again, since T3 may have delivered it"
+                "waking {agent} ({}): {err:#}; not sent again, since T3 may have delivered it",
+                kinds()
             ),
             Sent::Gone(err) => {
                 tracing::warn!(
@@ -1916,10 +2038,36 @@ impl<T: T3> Daemon<T> {
                     ask.id
                 ))
             }
+            WakeAbout::Review { task } if coordinator => {
+                let task = self.client().task(task).await?.task;
+                (task.status == TaskStatus::Review).then(|| {
+                    format!(
+                        "board {slug}: {} moved to review; check it against its acceptance \
+                         checks, or note what it still waits on",
+                        task.id
+                    )
+                })
+            }
+            // Still the agent's and still in doing.
+            WakeAbout::Idle { task, since } => {
+                let task = self.client().task(task).await?.task;
+                (task.owner.as_ref() == Some(agent) && task.status == TaskStatus::Doing).then(
+                    || {
+                        format!(
+                            "board {slug}: your {} is in doing, and you have been away from it \
+                             since {}. Continue it, or park it by what it waits on: review with a \
+                             note naming the PR, blocked with the reason, or open with your handoff",
+                            task.id,
+                            since.format("%Y-%m-%d %H:%MZ")
+                        )
+                    },
+                )
+            }
             // The agent is no longer this board's coordinator.
             WakeAbout::Ready { .. }
             | WakeAbout::Cleared { .. }
             | WakeAbout::Proposal { .. }
+            | WakeAbout::Review { .. }
             | WakeAbout::Answered { .. } => None,
         };
         Ok(line)

@@ -16,7 +16,8 @@ use board::identity::RepoInfo;
 use board::ops::Ctx;
 use board::t3::{ListedThread, T3, ThreadInfo, TimedOut};
 use board_proto::{
-    AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, Timestamp,
+    AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, TaskStatus,
+    Timestamp,
 };
 use common::*;
 use serde_json::json;
@@ -572,6 +573,132 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
 }
 
 #[tokio::test]
+async fn a_task_moved_to_review_wakes_the_coordinator_and_each_send_is_logged() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut review = detail("factory-6", false, &[]);
+    review.task.status = TaskStatus::Review;
+    e.stub.on("GET /v1/tasks/factory-6", &review);
+    let mut moved = event(20, EventType::TaskUpdated, Some("factory-6"), "t3:worker");
+    moved.payload = json!({ "fields": ["status"], "from": "doing", "to": "review" });
+    e.daemon.on_event(&moved, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "coord".to_owned(),
+            "board factory: factory-6 moved to review; check it against its acceptance checks, \
+             or note what it still waits on\nRun board_snapshot and continue."
+                .to_owned()
+        )]
+    );
+    assert!(
+        logs.text().contains("woke t3:coord: review"),
+        "{}",
+        logs.text()
+    );
+
+    // Moved on before the flush: nothing to check.
+    let mut again = moved.clone();
+    again.seq = 21;
+    e.daemon.on_event(&again, at()).await.unwrap();
+    review.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/factory-6", &review);
+    e.daemon.flush(at()).await;
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+/// An env with `factory-7` in doing, owned by the T3 thread `worker` on this device, which
+/// has been `state` since `away` minutes before [`at`]; the board is hosted elsewhere.
+fn idle_owner_env(state: AgentState, away: i64) -> (Env, String) {
+    let e = env();
+    let owner = "t3:worker".to_owned();
+    e.t3.live("worker");
+    e.stub.on("GET /v1/boards", [autopilot(None, &["mac-air"])]);
+    let mut doing = detail("factory-7", false, &[]);
+    doing.task.status = TaskStatus::Doing;
+    doing.task.owner = Some(owner.parse().unwrap());
+    e.stub.on("GET /v1/tasks", [&doing.task]);
+    e.stub.on("GET /v1/tasks/factory-7", &doing);
+    e.stub
+        .on("GET /v1/agents", Vec::<board_proto::Agent>::new());
+    let mut info = agent_fixture(&owner, DEVICE, state);
+    info.last_seen = at() - chrono::Duration::minutes(away);
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &info);
+    (e, owner)
+}
+
+#[tokio::test]
+async fn an_owner_away_from_its_doing_task_is_woken_once_per_spell() {
+    let (mut e, owner) = idle_owner_env(AgentState::Idle, 40);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    let since = (at() - chrono::Duration::minutes(40)).format("%Y-%m-%d %H:%MZ");
+    assert_eq!(
+        e.t3.sends(),
+        [(
+            "worker".to_owned(),
+            format!(
+                "board factory: your factory-7 is in doing, and you have been away from it since \
+                 {since}. Continue it, or park it by what it waits on: review with a note naming \
+                 the PR, blocked with the reason, or open with your handoff\n\
+                 Run board_snapshot and continue."
+            )
+        )]
+    );
+    let tasks = e.stub.requests_to("GET /v1/tasks");
+    assert_eq!(tasks[0].query, "status=doing&limit=1000");
+    assert_eq!(
+        e.stub.requests_to("GET /v1/agents")[0].query,
+        "state=running"
+    );
+
+    // Still away in the same spell: not woken again, and not looked for before 5 minutes.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 1);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 2);
+    e.daemon.flush(at() + chrono::Duration::minutes(6)).await;
+    assert_eq!(e.t3.sends().len(), 1);
+
+    // It ran since and is away again: a new spell, woken again.
+    let mut info = agent_fixture(&owner, DEVICE, AgentState::Ended);
+    info.last_seen = at() - chrono::Duration::minutes(10);
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &info);
+    let later = at() + chrono::Duration::minutes(30);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.flush(later).await;
+    assert_eq!(e.t3.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn an_owner_running_away_briefly_or_with_a_running_child_is_not_woken() {
+    for (state, away) in [(AgentState::Running, 40), (AgentState::Idle, 20)] {
+        let (mut e, _) = idle_owner_env(state, away);
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.flush(at()).await;
+        assert!(e.t3.sends().is_empty(), "{state:?} for {away} minutes");
+    }
+    // A delegated child of the owner still runs: the parent waits on it.
+    let (mut e, _) = idle_owner_env(AgentState::Idle, 40);
+    let mut child = agent_fixture("t3:child", DEVICE, AgentState::Running);
+    child.native_ids.insert("t3_parent".into(), "worker".into());
+    e.stub.on("GET /v1/agents", [&child]);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    assert!(e.daemon.state.idle_woken.is_empty());
+}
+
+#[tokio::test]
 async fn a_filed_proposal_wakes_the_coordinator_to_review_it() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     e.daemon.reconcile(at()).await.unwrap();
@@ -1059,11 +1186,15 @@ struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl Logs {
     fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        self.capture_at(tracing::Level::WARN)
+    }
+
+    fn capture_at(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
         let logs = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || logs.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(level)
             .finish();
         tracing::subscriber::set_default(subscriber)
     }
@@ -1623,8 +1754,8 @@ async fn a_device_without_the_project_never_claims_the_lease() {
         e.stub
             .requests()
             .iter()
-            .all(|r| r.method == "GET" && r.path == "/v1/boards"),
-        "only board reads: {:?}",
+            .all(|r| r.method == "GET" && ["/v1/boards", "/v1/tasks"].contains(&r.path.as_str())),
+        "only board and task reads: {:?}",
         e.stub.requests()
     );
     assert!(e.t3.calls().is_empty());
