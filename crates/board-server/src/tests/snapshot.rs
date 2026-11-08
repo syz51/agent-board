@@ -913,7 +913,7 @@ fn sweep_idle_doing(t: &T) -> usize {
 }
 
 #[tokio::test]
-async fn an_owner_away_from_its_doing_task_is_announced_once_per_spell() {
+async fn an_owner_away_from_its_doing_task_is_announced_twice_per_spell() {
     let t = T::new();
     let owner = "t3:alpha";
     t.register(owner, Some(REPO), None).await;
@@ -929,7 +929,7 @@ async fn an_owner_away_from_its_doing_task_is_announced_once_per_spell() {
     assert_eq!(sweep_idle_doing(&t), 0, "20 minutes away");
     t.advance(TimeDelta::minutes(11));
     assert_eq!(sweep_idle_doing(&t), 1);
-    assert_eq!(sweep_idle_doing(&t), 0, "once per spell");
+    assert_eq!(sweep_idle_doing(&t), 0, "once at the period");
     let delta = snapshot(&t, owner, "kind=delta").await;
     // The alert names the owner by its short handle.
     let handle = handle(&t, owner);
@@ -941,18 +941,30 @@ async fn an_owner_away_from_its_doing_task_is_announced_once_per_spell() {
         text(&delta)
     );
 
-    // The session closing later is the same spell.
+    // The session closing later is the same spell: one more notice at twice the period,
+    // then no third.
     set_state(&t, owner, "ended").await;
-    t.advance(TimeDelta::minutes(40));
-    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::minutes(28));
+    assert_eq!(sweep_idle_doing(&t), 0, "59 minutes away");
+    t.advance(TimeDelta::minutes(1));
+    assert_eq!(sweep_idle_doing(&t), 1, "twice the period");
+    t.advance(TimeDelta::hours(3));
+    assert_eq!(sweep_idle_doing(&t), 0, "no third");
 
-    // Back at work, then stopped again: a new spell.
+    // Back at work, then stopped again: a new spell, counted again.
     t.register(owner, Some(REPO), None).await;
     set_state(&t, owner, "idle").await;
     t.advance(TimeDelta::minutes(29));
     assert_eq!(sweep_idle_doing(&t), 0);
     t.advance(TimeDelta::minutes(2));
     assert_eq!(sweep_idle_doing(&t), 1);
+    t.advance(TimeDelta::minutes(28));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::minutes(1));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    t.advance(TimeDelta::hours(1));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    assert_eq!(idle_notices(&t).len(), 4);
 
     // Out of doing: never announced.
     let review = json!({ "status": "review" });
@@ -1106,7 +1118,7 @@ async fn the_idle_notice_reads_as_one_in_recent_activity() {
 }
 
 #[tokio::test]
-async fn an_owner_left_running_then_ended_is_announced_once() {
+async fn an_owner_left_running_then_ended_is_one_spell() {
     let t = T::new();
     let owner = "t3:alpha";
     t.register(owner, Some(REPO), None).await;
@@ -1115,13 +1127,16 @@ async fn an_owner_left_running_then_ended_is_announced_once() {
     assert!(t.claim(owner, &id).await.0.is_success());
     t.advance(TimeDelta::minutes(31));
     assert_eq!(sweep_idle_doing(&t), 1);
-    // T3 closes the session later: its end is no new spell.
+    // T3 closes the session later: its end is no new spell, so it brings no new first
+    // notice, only the one repeat, at twice the period after the end, and no third.
     set_state(&t, owner, "ended").await;
     t.advance(TimeDelta::minutes(31));
     assert_eq!(sweep_idle_doing(&t), 0);
     t.advance(TimeDelta::hours(3));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    t.advance(TimeDelta::hours(3));
     assert_eq!(sweep_idle_doing(&t), 0);
-    assert_eq!(idle_notices(&t).len(), 1);
+    assert_eq!(idle_notices(&t).len(), 2);
 
     // Running again and stopping is a new spell.
     t.register(owner, Some(REPO), None).await;
@@ -1303,6 +1318,118 @@ async fn an_idle_notice_is_dropped_once_the_task_is_parked_or_handed_over() {
             text(&delta)
         );
     }
+}
+
+#[tokio::test]
+async fn a_coordinator_between_once_and_twice_the_period_hears_the_repeat() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    let id = t.task(owner, "auto", "T3 owner").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    snapshot(&t, coordinator, "kind=delta").await;
+    let sat = |s: &Value| text(s).contains(&format!("{id} sat in doing"));
+
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    renew_lease(&t, coordinator).await;
+    // Between once and twice the period: the owner's to wake. This snapshot passes the
+    // first notice.
+    t.advance(TimeDelta::minutes(20));
+    let early = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(!sat(&early), "{}", text(&early));
+    renew_lease(&t, coordinator).await;
+
+    // Twice the period: the repeat reaches the coordinator.
+    t.advance(TimeDelta::minutes(9));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    let late = snapshot(&t, coordinator, "kind=delta").await;
+    assert!(sat(&late), "{}", text(&late));
+    let handle = handle(&t, owner);
+    assert!(
+        text(&late).contains(&format!("while {handle} was away for 1h")),
+        "{}",
+        text(&late)
+    );
+    assert_eq!(sweep_idle_doing(&t), 0, "no third");
+    assert_eq!(
+        idle_notices(&t),
+        [format!("{id} {owner}"), format!("{id} {owner}")]
+    );
+}
+
+#[tokio::test]
+async fn no_repeat_reaches_the_coordinator_once_the_task_is_parked_or_handed_over() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let (owner, giver, other) = ("t3:alpha", "t3:giver", "t3:other");
+    for agent in [owner, giver, other] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    let parked = t.task(owner, "auto", "Parked").await;
+    let handed = t.task(giver, "auto", "Handed over").await;
+    assert!(t.claim(owner, &parked).await.0.is_success());
+    assert!(t.claim(giver, &handed).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    set_state(&t, giver, "idle").await;
+    for agent in [coordinator, owner, giver, other] {
+        snapshot(&t, agent, "kind=delta").await;
+    }
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 2);
+    let blocked = json!({ "status": "blocked", "blocked_reason": "waits on CI" });
+    assert!(t.patch(owner, &parked, blocked).await.0.is_success());
+    let (s, v) = t.patch(giver, &handed, json!({ "owner": other })).await;
+    assert!(s.is_success(), "{v}");
+
+    // Past twice the period: no repeat, and the first notices reach no one.
+    t.advance(TimeDelta::minutes(30));
+    renew_lease(&t, coordinator).await;
+    snapshot(&t, other, "kind=delta").await;
+    assert_eq!(sweep_idle_doing(&t), 0);
+    for agent in [coordinator, owner, giver, other] {
+        let delta = snapshot(&t, agent, "kind=delta").await;
+        assert!(
+            !text(&delta).contains("sat in doing"),
+            "{agent}: {}",
+            text(&delta)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_task_that_comes_to_its_owner_again_is_counted_again() {
+    let t = T::new();
+    let coordinator = "t3:coord";
+    autopilot_board(&t, coordinator).await;
+    let (owner, other) = ("t3:alpha", "t3:other");
+    t.register(owner, Some(REPO), None).await;
+    t.register(other, Some(REPO), None).await;
+    let id = t.task(owner, "auto", "Comes back").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // Handed away and back: the task came to it again, so the count starts over. The owner
+    // has been away past the period already, so the first notice comes at once.
+    t.advance(TimeDelta::minutes(9));
+    renew_lease(&t, coordinator).await;
+    for to in [other, owner] {
+        let (s, v) = t.patch(coordinator, &id, json!({ "owner": to })).await;
+        assert!(s.is_success(), "{v}");
+    }
+    assert_eq!(sweep_idle_doing(&t), 1);
+    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::minutes(20));
+    assert_eq!(sweep_idle_doing(&t), 1, "twice the period");
+    t.advance(TimeDelta::hours(1));
+    assert_eq!(sweep_idle_doing(&t), 0, "no third");
+    assert_eq!(idle_notices(&t).len(), 3);
 }
 
 #[tokio::test]
