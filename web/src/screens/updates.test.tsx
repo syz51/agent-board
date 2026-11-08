@@ -20,9 +20,8 @@ const none: Updates = {
   more: false,
 };
 
-const view = async (data: Updates, board = "") =>
-  (await renderInApp(<UpdatesView updates={data} agents={agents} board={board} />)).container
-    .innerHTML;
+const view = async (data: Updates) =>
+  (await renderInApp(<UpdatesView updates={data} agents={agents} />)).container.innerHTML;
 
 describe("updates section", () => {
   test("with nothing new it says so and offers no mark-seen", async () => {
@@ -73,12 +72,6 @@ describe("updates section", () => {
   test("says when older items were cut", async () => {
     expect(await view({ ...updates, more: true })).toContain("older ones were cut");
     expect(await view(updates)).not.toContain("older ones were cut");
-  });
-
-  test("with a board filter it cannot mark seen, since the cursor covers every board", async () => {
-    const html = await view(state.updates(new URLSearchParams({ board: "docs" })), "docs");
-    expect(html).not.toContain("Mark all seen");
-    expect(html).toContain('href="/asks"');
   });
 
   test("counts what is unseen and finds the newest shown time", async () => {

@@ -1,115 +1,14 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
-import { api } from "@/api/client.ts";
-import type { Agent, BoardEvent, EventsPage } from "@/api/schema.ts";
-import { Button } from "@/components/ui/button.tsx";
+// A task's history on its page: one line per event, joined by a rule through their marks.
+
+import type { Agent, BoardEvent } from "@/api/schema.ts";
 import { cn } from "@/lib/utils.ts";
-import { EVENTS_PAGE, fetching, mergeEvents, queries } from "@/live/query.ts";
-import {
-  agentIndex,
-  Empty,
-  ErrorNotice,
-  PageHeader,
-  QueryFrame,
-  RelTime,
-  useAgents,
-  useTitle,
-  Who,
-} from "@/ui/common.tsx";
+import { RelTime, Who } from "@/ui/common.tsx";
 import { Icon, type IconName, STATUS_COLOR, StatusIcon, type StatusKey } from "@/ui/icons.tsx";
-import { FilterSelect, FilterToggle } from "@/ui/filters.tsx";
-import { NativeSelectOption } from "@/components/ui/native-select.tsx";
-
-const NOISY = new Set(["lease_created", "lease_released", "lease_expired", "files_touched"]);
-
-export function EventsScreen() {
-  useTitle("Events");
-  const client = useQueryClient();
-  const agentList = useAgents().data;
-  const agents = useMemo(() => agentIndex(agentList), [agentList]);
-  const boards = useQuery(queries.boards());
-  const events = useQuery(queries.events());
-  const [board, setBoard] = useState("");
-  const [showNoisy, setShowNoisy] = useState(false);
-
-  const oldest = events.data?.at(-1)?.seq ?? 0;
-  const older = useMutation({
-    mutationFn: fetching(() =>
-      api.events({ since: Math.max(0, oldest - 1 - EVENTS_PAGE), limit: EVENTS_PAGE }),
-    ),
-    onSuccess: (page: EventsPage) =>
-      client.setQueryData(queries.events().queryKey, (current) =>
-        mergeEvents(current ?? [], page.events),
-      ),
-  });
-
-  return (
-    <>
-      <PageHeader title="Events" sub="Everything agents and you did, live as it happens." />
-      <form
-        className="mb-5 flex flex-wrap items-center gap-2"
-        onSubmit={(event) => event.preventDefault()}
-      >
-        <FilterSelect label="Board" value={board} onChange={setBoard}>
-          <NativeSelectOption value="">All boards</NativeSelectOption>
-          {(boards.data ?? []).map((item) => (
-            <NativeSelectOption key={item.slug} value={item.slug}>
-              {item.title}
-            </NativeSelectOption>
-          ))}
-        </FilterSelect>
-        <FilterToggle checked={showNoisy} onChange={setShowNoisy}>
-          Show leases and file edits
-        </FilterToggle>
-      </form>
-
-      {older.error && <ErrorNotice error={older.error} retry={() => older.mutate()} compact />}
-      <QueryFrame query={events} label="Loading events">
-        {(list) => {
-          const shown = list.filter(
-            (event) => (!board || event.board === board) && (showNoisy || !NOISY.has(event.type)),
-          );
-          return (
-            <>
-              {shown.length === 0 ? (
-                <Empty title="No events yet" icon="events">
-                  New events appear here as they happen.
-                </Empty>
-              ) : (
-                <Timeline live>
-                  {shown.map((event) => (
-                    <EventLine key={event.seq} event={event} agents={agents} showTask />
-                  ))}
-                </Timeline>
-              )}
-              {oldest > 1 && (
-                <div className="mt-4 flex justify-center">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={older.isPending}
-                    onClick={() => older.mutate()}
-                  >
-                    {older.isPending ? "Loading…" : "Load older events"}
-                  </Button>
-                </div>
-              )}
-            </>
-          );
-        }}
-      </QueryFrame>
-    </>
-  );
-}
 
 /** A vertical timeline of events, joined by a rule through their icons. */
-export function Timeline({ live, children }: { live?: boolean; children: React.ReactNode }) {
+export function Timeline({ children }: { children: React.ReactNode }) {
   return (
-    <ol
-      className="relative before:absolute before:top-3.5 before:bottom-3.5 before:left-[13px] before:w-px before:bg-input"
-      {...(live ? { "aria-live": "polite" as const, "aria-relevant": "additions" as const } : {})}
-    >
+    <ol className="relative before:absolute before:top-3.5 before:bottom-3.5 before:left-[13px] before:w-px before:bg-input">
       {children}
     </ol>
   );
@@ -126,9 +25,6 @@ const KIND_ICON: Record<string, IconName> = {
   lease: "lock",
   files: "file",
 };
-
-/** Events about the agent itself, where the board adds nothing. */
-const PERSONAL = new Set(["handoff_updated", "agent_state_changed"]);
 
 const TASK_STATUS: Record<string, StatusKey> = {
   open: "open",
@@ -217,15 +113,7 @@ function EventMark({ event, className }: { event: BoardEvent; className?: string
   );
 }
 
-export function EventLine({
-  event,
-  agents,
-  showTask,
-}: {
-  event: BoardEvent;
-  agents: Map<string, Agent>;
-  showTask: boolean;
-}) {
+export function EventLine({ event, agents }: { event: BoardEvent; agents: Map<string, Agent> }) {
   const summary = detail(event);
   const [verb, suffix] = describe(event);
   const kind = event.type.split("_")[0] ?? "";
@@ -239,16 +127,6 @@ export function EventLine({
         <p className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-foreground">
           <Who id={event.actor} agents={agents} />
           <span title={event.type}>{verb}</span>
-          {showTask && event.task && (
-            <Link to="/tasks/$id" params={{ id: event.task }}>
-              <span className="ident text-meta">{event.task}</span>
-            </Link>
-          )}
-          {showTask && !event.task && event.board && !PERSONAL.has(event.type) && (
-            <Link to="/boards/$slug" params={{ slug: event.board }}>
-              <span className="ident text-meta">{event.board}</span>
-            </Link>
-          )}
           {suffix && <span>{suffix}</span>}
         </p>
         {summary && (

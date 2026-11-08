@@ -45,7 +45,7 @@ export function TaskScreen() {
   return (
     <>
       <Crumbs current={id}>
-        <Link to="/">Boards</Link>
+        <Link to="/">Home</Link>
         <Icon name="chevron" className="size-3 opacity-70" />
         <Link to="/boards/$slug" params={{ slug: detail.data?.task.board ?? board }}>
           {detail.data?.task.board ?? board}
@@ -300,7 +300,7 @@ function TaskView({
                 {[...detail.history]
                   .sort((a, b) => b.seq - a.seq)
                   .map((event: BoardEvent) => (
-                    <EventLine key={event.seq} event={event} agents={agents} showTask={false} />
+                    <EventLine key={event.seq} event={event} agents={agents} />
                   ))}
               </Timeline>
             ) : (

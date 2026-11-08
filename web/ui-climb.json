@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "agent-board-web",
-  "product": "The web view of agent-board, a shared work board for AI coding agents and the person who runs them (boards, tasks by status, task details and history, agents, asks, live events). Developers check progress, unblock agents and answer asks, mostly on desktop, sometimes on a phone.",
+  "product": "The web view of agent-board, a shared work board for AI coding agents and the person who runs them (a home page with what waits on the user, the work in progress and every board; tasks by status; task details and history; agents; asks). Developers check progress, unblock agents and answer asks, mostly on desktop, sometimes on a phone.",
   "taste": [
     "Quiet, dense tool interface in the spirit of Linear and GitHub.",
     "Status reads at a glance without relying on color alone."
@@ -12,13 +12,12 @@
   "serve": { "command": ["bun", "dev/server.ts", "--port", "{port}", "--events", "0"], "ready": "/healthz" },
   "settleMs": 500,
   "screens": [
-    { "id": "boards", "title": "Boards", "path": "/", "views": ["desktop-light", "desktop-dark", "phone-light"] },
+    { "id": "home", "title": "Home", "path": "/", "views": ["desktop-light", "desktop-dark", "phone-light"] },
     { "id": "board", "title": "Board", "path": "/boards/factory", "views": ["desktop-light", "desktop-dark", "phone-light"] },
     { "id": "task", "title": "Task", "path": "/tasks/factory-12", "views": ["desktop-light", "desktop-dark", "phone-light"] },
     { "id": "agents", "title": "Agents", "path": "/agents", "views": ["desktop-light", "phone-light"] },
-    { "id": "asks", "title": "Asks", "path": "/asks", "views": ["desktop-light"] },
+    { "id": "asks", "title": "Needs you", "path": "/asks", "views": ["desktop-light"] },
     { "id": "ask", "title": "Ask", "path": "/asks/9", "views": ["desktop-light"] },
-    { "id": "events", "title": "Events", "path": "/events", "views": ["desktop-light"] },
     { "id": "empty", "title": "Empty board", "path": "/boards/sandbox", "views": ["desktop-light"] },
     { "id": "outage", "title": "Server down", "path": "/boards/factory", "views": ["desktop-light"], "before": ["/__dev/outage?on=1"], "after": ["/__dev/outage?on=0"] }
   ],

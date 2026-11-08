@@ -1,10 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
-import { Fragment, type ReactNode, useMemo } from "react";
+import { Fragment, type ReactNode, useId, useMemo } from "react";
 import type { Agent, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
+import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useNow } from "@/live/runtime.ts";
 import type { BoardSearch } from "@/router.tsx";
@@ -24,6 +25,7 @@ import {
 } from "@/ui/common.tsx";
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
 import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { useCollapsed } from "@/ui/sections.tsx";
 
 const route = getRouteApi("/boards/$slug");
 
@@ -112,6 +114,8 @@ export function BoardScreen() {
     [tasks.data],
   );
   useTitle(board?.title ?? slug);
+  // One choice for every board: done work starts folded away.
+  const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
 
   const filters = filtersOf(search);
   const setFilter = (key: keyof BoardSearch, value: string) =>
@@ -124,7 +128,7 @@ export function BoardScreen() {
   return (
     <>
       <Crumbs current={board?.title ?? slug}>
-        <Link to="/">Boards</Link>
+        <Link to="/">Home</Link>
       </Crumbs>
       <PageHeader title={board?.title ?? slug} sub={board?.goal && <PlainText text={board.goal} />}>
         {board && board.title !== slug && (
@@ -226,6 +230,8 @@ export function BoardScreen() {
                     </>
                   }
                   count={group.tasks.length}
+                  collapsed={collapsed.has(group.key)}
+                  onToggle={() => toggle(group.key)}
                 >
                   <TaskList tasks={group.tasks} agents={agents} done={done} now={now} />
                 </TaskGroupSection>
@@ -250,31 +256,66 @@ export function TaskBoard({ children }: { children: ReactNode }) {
   return <div className="edge divide-y overflow-hidden border-y bg-card">{children}</div>;
 }
 
-/** A group of tasks under a shaded heading with its count. */
+/**
+ * A group of tasks under a shaded heading with its count. With `onToggle`, the heading is a
+ * button that folds the group away.
+ */
 export function TaskGroupSection({
   id,
   heading,
   count,
-  level = 2,
+  collapsed = false,
+  onToggle,
   children,
 }: {
   id: string;
   heading: ReactNode;
   count: number;
-  level?: 2 | 3;
+  collapsed?: boolean;
+  onToggle?: () => void;
   children: ReactNode;
 }) {
-  const Heading = level === 2 ? "h2" : "h3";
+  const bodyId = useId();
+  const row = "flex h-9.5 w-full items-center gap-2 px-(--gutter)";
+  const label = (
+    <>
+      {heading}
+      <span className="text-meta font-medium text-subtle-foreground tabular-nums">{count}</span>
+    </>
+  );
   return (
     <section aria-labelledby={id}>
-      <Heading
+      <h2
         id={id}
-        className="flex h-9.5 items-center gap-2 border-b bg-muted px-(--gutter) text-sm font-semibold"
+        className={cn("bg-muted text-sm font-semibold", !collapsed && "border-b", !onToggle && row)}
       >
-        {heading}
-        <span className="text-meta font-medium text-subtle-foreground tabular-nums">{count}</span>
-      </Heading>
-      {children}
+        {onToggle ? (
+          <button
+            type="button"
+            className={cn(
+              row,
+              "text-left hover:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+            )}
+            aria-expanded={!collapsed}
+            aria-controls={bodyId}
+            onClick={onToggle}
+          >
+            {label}
+            <Icon
+              name="chevronDown"
+              className={cn(
+                "ml-auto size-3.5 text-muted-foreground transition-transform motion-reduce:transition-none",
+                collapsed && "-rotate-90",
+              )}
+            />
+          </button>
+        ) : (
+          label
+        )}
+      </h2>
+      <div id={bodyId} hidden={collapsed}>
+        {children}
+      </div>
     </section>
   );
 }

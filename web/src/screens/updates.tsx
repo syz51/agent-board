@@ -1,4 +1,4 @@
-// "Since you last looked" on the Needs you screen: tasks done and coordinators' turn endings
+// "Since you last looked" on the home page: tasks done and coordinators' turn endings
 // since the user's seen cursor (`GET /v1/updates`). A coordinator's closing message can be
 // followed at once by a wake-up that starts its next turn, so this is where the user reads it.
 
@@ -20,7 +20,6 @@ import {
   ErrorNotice,
   QueryFrame,
   RelTime,
-  SectionTitle,
   useAgents,
   Who,
 } from "@/ui/common.tsx";
@@ -58,18 +57,15 @@ export async function markShownSeen(
   if (at !== null) await client.markSeen(at);
 }
 
-export function UpdatesSection({ board }: { board: string }) {
-  const updates = useUpdates(board);
+/** The updates on every board, for the home page's section. */
+export function Updates() {
+  const updates = useUpdates();
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
-  const titleId = useId();
   return (
-    <section className="mt-9" aria-labelledby={titleId}>
-      <SectionTitle id={titleId}>Since you last looked</SectionTitle>
-      <QueryFrame query={updates} label="Loading updates">
-        {(data) => <UpdatesView updates={data} agents={agents} board={board} />}
-      </QueryFrame>
-    </section>
+    <QueryFrame query={updates} label="Loading updates">
+      {(data) => <UpdatesView updates={data} agents={agents} />}
+    </QueryFrame>
   );
 }
 
@@ -77,13 +73,10 @@ export function UpdatesSection({ board }: { board: string }) {
 export function UpdatesView({
   updates,
   agents,
-  board,
   client = api,
 }: {
   updates: Updates;
   agents: Map<string, Agent>;
-  /** A board filter: the cursor is shared, so marking seen needs every board shown. */
-  board: string;
   client?: Pick<Api, "markSeen">;
 }) {
   const total = unseenCount(updates);
@@ -98,21 +91,14 @@ export function UpdatesView({
           ) : (
             "Everything kept so far"
           )}
-          {board && <> · {board} only</>}
         </p>
-        {total > 0 && !board && <MarkSeen updates={updates} client={client} />}
+        {total > 0 && <MarkSeen updates={updates} client={client} />}
       </div>
-      {total > 0 && board && (
-        <p className="mb-2 text-muted-foreground">
-          Seen is kept for all boards at once. <Link to="/asks">Show every board</Link> to mark
-          updates seen.
-        </p>
-      )}
       {updates.more && (
         <Alert variant="warn" className="my-3 px-3.5 py-2.5">
           <AlertDescription className="text-warn">
             Only the newest {UPDATES_MAX} of each kind are listed; older ones were cut. Marking all
-            seen covers them too. Each task's page and the event feed keep the full history.
+            seen covers them too. Each task's page keeps its full history.
           </AlertDescription>
         </Alert>
       )}

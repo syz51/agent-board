@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { useId, useMemo } from "react";
 import { api } from "@/api/client.ts";
-import type { Agent, Ask, Task } from "@/api/schema.ts";
+import type { Agent, Ask } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Label } from "@/components/ui/label.tsx";
@@ -11,7 +11,6 @@ import { Textarea } from "@/components/ui/textarea.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
-import { useNow } from "@/live/runtime.ts";
 import { Markdown } from "@/text/markdown.tsx";
 import {
   agentIndex,
@@ -23,7 +22,6 @@ import {
   PageHeader,
   QueryFrame,
   RelTime,
-  SectionTitle,
   StatusBadge,
   useAgents,
   useTitle,
@@ -31,8 +29,6 @@ import {
 } from "@/ui/common.tsx";
 import { Icon } from "@/ui/icons.tsx";
 import { HandoffView } from "./agents.tsx";
-import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
-import { UpdatesSection } from "./updates.tsx";
 
 const asksRoute = getRouteApi("/asks");
 const askRoute = getRouteApi("/asks/$id");
@@ -50,92 +46,10 @@ export function newestFirst(asks: Ask[]): Ask[] {
   );
 }
 
-export interface BoardTasks {
-  board: string;
-  tasks: Task[];
-}
-
-/**
- * Tasks that wait on the user with no open ask, by board: blocked tasks, and open tasks
- * not marked `auto`. Left out: pending proposals and feedback items (agents review and
- * triage those), open tasks held by a `not_before` still ahead, and tasks on closed
- * boards. Exported for tests.
- */
-export function waitingTasks(
-  tasks: Task[],
-  openAsks: Ask[],
-  now: number,
-  closedBoards: ReadonlySet<string> = new Set(),
-): BoardTasks[] {
-  const asked = new Set(openAsks.flatMap((ask) => (ask.task ? [ask.task] : [])));
-  const byBoard = new Map<string, Task[]>();
-  for (const task of tasks) {
-    if (asked.has(task.id) || closedBoards.has(task.board)) continue;
-    const waits =
-      task.status === "blocked" ||
-      (task.status === "open" &&
-        !task.auto &&
-        !task.proposal &&
-        task.feedback === null &&
-        (task.not_before === null || Date.parse(task.not_before) <= now));
-    if (!waits) continue;
-    const list = byBoard.get(task.board) ?? [];
-    list.push(task);
-    byBoard.set(task.board, list);
-  }
-  const number = (id: string) => Number(id.slice(id.lastIndexOf("-") + 1));
-  return [...byBoard]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([board, list]) => ({
-      board,
-      tasks: list.sort(
-        (a, b) => a.priority.localeCompare(b.priority) || number(a.id) - number(b.id),
-      ),
-    }));
-}
-
-/** What the Needs you page lists across boards: the open asks and the waiting tasks. */
-export function needsYouCount(
-  openAsks: Ask[],
-  tasks: Task[],
-  now: number,
-  closedBoards: ReadonlySet<string> = new Set(),
-): number {
-  return waitingTasks(tasks, openAsks, now, closedBoards).reduce(
-    (sum, group) => sum + group.tasks.length,
-    openAsks.length,
-  );
-}
-
-/**
- * The navigation badge's count, from the page's own cached queries. Until the tasks load
- * it counts the open asks only.
- */
-export function useNeedsYouCount(): number {
-  const asks = useOpenAsks();
-  const tasks = useQuery(queries.candidateTasks());
-  const closed = useClosedBoards();
-  const now = useNow(60_000);
-  return needsYouCount(asks.data ?? [], tasks.data ?? [], now, closed);
-}
-
-/** Slugs of closed boards, from the boards query; none until it loads. */
-function useClosedBoards(): ReadonlySet<string> {
-  const boards = useQuery(queries.boards()).data;
-  return useMemo(
-    () =>
-      new Set((boards ?? []).filter((item) => item.status === "closed").map((item) => item.slug)),
-    [boards],
-  );
-}
-
 export function AsksScreen() {
   useTitle("Needs you");
   const board = asksRoute.useSearch().board ?? "";
   const asks = useOpenAsks();
-  const tasks = useQuery(queries.candidateTasks());
-  const closed = useClosedBoards();
-  const now = useNow(60_000);
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
 
@@ -143,7 +57,7 @@ export function AsksScreen() {
     <>
       <PageHeader
         title="Needs you"
-        sub="Questions and requests from agents, newest first, then tasks waiting on you."
+        sub="Questions and requests from agents that wait on your answer, newest first."
         aside={
           board && (
             <Badge variant="outline" shape="tag" className="h-7 text-meta" asChild>
@@ -157,98 +71,25 @@ export function AsksScreen() {
       <QueryFrame query={asks} label="Loading asks">
         {(list) => {
           const shown = newestFirst(list.filter((ask) => !board || ask.board === board));
+          if (shown.length === 0) {
+            return (
+              <Empty title="Nothing needs you" icon="inbox">
+                {board
+                  ? `No open asks on ${board}.`
+                  : "When an agent needs your decision or action, its ask appears here, and on Telegram if it is set up."}
+              </Empty>
+            );
+          }
           return (
-            <>
-              {shown.length > 0 && (
-                <div className="grid gap-3">
-                  {shown.map((ask) => (
-                    <AskCard key={ask.id} ask={ask} agents={agents} />
-                  ))}
-                </div>
-              )}
-              {/* Its own frame: asks stay answerable while tasks load or fail. */}
-              <QueryFrame query={tasks} label="Loading tasks">
-                {(taskList) => {
-                  const waiting = waitingTasks(taskList, list, now, closed).filter(
-                    (group) => !board || group.board === board,
-                  );
-                  if (waiting.length > 0) {
-                    return (
-                      <WaitingTasks
-                        groups={waiting}
-                        agents={agents}
-                        now={now}
-                        first={shown.length === 0}
-                      />
-                    );
-                  }
-                  if (shown.length > 0) return null;
-                  return (
-                    <Empty title="Nothing needs you" icon="inbox">
-                      Agents' questions and requests appear here, and on Telegram if it is set up,
-                      with tasks that wait on you.
-                    </Empty>
-                  );
-                }}
-              </QueryFrame>
-            </>
+            <div className="grid gap-3">
+              {shown.map((ask) => (
+                <AskCard key={ask.id} ask={ask} agents={agents} />
+              ))}
+            </div>
           );
         }}
       </QueryFrame>
-      <UpdatesSection board={board} />
     </>
-  );
-}
-
-/** Tasks that wait on the user without an open ask, one group per board. */
-function WaitingTasks({
-  groups,
-  agents,
-  now,
-  first,
-}: {
-  groups: BoardTasks[];
-  agents: Map<string, Agent>;
-  now: number;
-  first: boolean;
-}) {
-  const count = groups.reduce((sum, group) => sum + group.tasks.length, 0);
-  return (
-    <section className={first ? undefined : "mt-9"} aria-labelledby="needs-you-tasks">
-      <SectionTitle
-        id="needs-you-tasks"
-        count={count}
-        icon={<Icon name="inbox" className="self-center text-amber" />}
-      >
-        Tasks waiting on you
-      </SectionTitle>
-      <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
-        Blocked tasks and tasks only you can start, with no open ask.
-      </p>
-      {/* Manual tags in amber, the colour of asks that wait on an action from you. */}
-      <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
-        <TaskBoard>
-          {groups.map(({ board, tasks }) => (
-            <TaskGroupSection
-              key={board}
-              id={`needs-you-board-${board}`}
-              level={3}
-              heading={
-                <>
-                  <Icon name="board" className="size-3.5 text-muted-foreground" />
-                  <Link className="text-foreground" to="/boards/$slug" params={{ slug: board }}>
-                    {board}
-                  </Link>
-                </>
-              }
-              count={tasks.length}
-            >
-              <TaskList tasks={tasks} agents={agents} now={now} />
-            </TaskGroupSection>
-          ))}
-        </TaskBoard>
-      </div>
-    </section>
   );
 }
 

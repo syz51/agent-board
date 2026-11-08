@@ -20,8 +20,12 @@ inset panel, and lists that run edge to edge across it.
 - **Color and surfaces**: cool greys, a graphite primary action and one violet signal for
   links, selection and unseen marks. The panel's outline is the only elevation. Status
   colours stay, always with a shape and a word: board tallies spell out "3 done 1 review".
-- **Navigation**: the sidebar on wide screens; a top bar and bottom tabs on phones. Needs
-  you shows one mark: its count, or a dot for unseen updates when nothing waits.
+- **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
+  bottom tabs on phones. Needs you counts the open asks; a dot on Home marks unseen updates.
+- **Home**: what the user follows, in sections they collapse and reorder: waiting asks,
+  tasks in progress across boards, what changed since they last looked, and the boards.
+  Needs you holds only asks, the things that wait on the user. Board status groups
+  collapse, and done starts collapsed.
 - **Asks**: a filled Send beside the answer field; a single ask shows its task and the
   asking agent's handoff beside it.
 - **Failures**: while the connection banner shows, a failed page uses its plug and tone.

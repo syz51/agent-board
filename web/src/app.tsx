@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
-import { useNeedsYouCount } from "@/screens/asks.tsx";
+import { useOpenAsks } from "@/screens/asks.tsx";
 import { unseenCount, useUpdates } from "@/screens/updates.tsx";
 import { Empty, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
@@ -67,26 +67,24 @@ function usePathname(): string {
 }
 
 const NAV: {
-  to: "/" | "/asks" | "/agents" | "/events";
+  to: "/" | "/asks" | "/agents";
   label: string;
   icon: IconName;
   match: (path: string) => boolean;
 }[] = [
   {
     to: "/",
-    label: "Boards",
+    label: "Home",
     icon: "boards",
     match: (path) => path === "/" || /^\/(boards|tasks)\//.test(path),
   },
   { to: "/asks", label: "Needs you", icon: "inbox", match: (path) => path.startsWith("/asks") },
   { to: "/agents", label: "Agents", icon: "agents", match: (path) => path.startsWith("/agents") },
-  { to: "/events", label: "Events", icon: "events", match: (path) => path.startsWith("/events") },
 ];
 
 export function Nav() {
   const path = usePathname();
-  // Open asks plus the tasks waiting on the user without one, as the page lists them.
-  const open = useNeedsYouCount();
+  const open = useOpenAsks().data?.length ?? 0;
   const updates = useUpdates();
   const unseen = updates.data ? unseenCount(updates.data) : 0;
   return (
@@ -112,16 +110,14 @@ export function Nav() {
               {open}
             </span>
           )}
-          {item.to === "/asks" && unseen > 0 && (
+          {/* Since you last looked is on the home page; a dot there says something is new. */}
+          {item.to === "/" && unseen > 0 && (
             <>
-              {/* One mark at a time: the count when something waits, else a dot for news. */}
-              {open === 0 && (
-                <span
-                  className="ml-auto size-2 flex-none rounded-full bg-signal max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
-                  aria-hidden="true"
-                  title={`${unseen} unseen updates`}
-                />
-              )}
+              <span
+                className="ml-auto size-2 flex-none rounded-full bg-signal max-md:absolute max-md:top-1.5 max-md:left-[calc(50%+8px)] max-md:m-0"
+                aria-hidden="true"
+                title={`${unseen} unseen updates`}
+              />
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}
               </span>
@@ -253,7 +249,7 @@ export function NotFound() {
   useTitle("Not found");
   return (
     <Empty title="This page doesn't exist">
-      <Link to="/">Go to boards</Link>
+      <Link to="/">Go home</Link>
     </Empty>
   );
 }

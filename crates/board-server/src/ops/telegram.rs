@@ -1,15 +1,14 @@
 //! Telegram state: pairing (one-time codes created on the host, redeemed by `/start <code>`
 //! from a private chat, which then becomes the notifier's chat) and the scheduled alerts.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use board_proto::{Ask, AskStatus, Task, TaskId, TaskStatus, Timestamp};
+use board_proto::{Ask, AskStatus, TaskId, Timestamp};
 use rusqlite::{OptionalExtension, params};
 
 use crate::auth::hash_token;
 use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, invalid};
-use crate::store::load_tasks;
 
 /// How long a pairing code stays valid.
 pub(crate) const CODE_TTL_MS: i64 = 15 * 60 * 1000;
@@ -224,8 +223,8 @@ pub(crate) fn record_digest(cx: &mut Ctx<'_>, day: &str) -> Result<()> {
 /// What the daily digest lists: the web view's Needs you page, per board.
 #[derive(Debug, Default)]
 pub(crate) struct Digest {
-    /// Boards in slug order, each with its open asks and the tasks that wait on the user.
-    pub boards: BTreeMap<String, (Vec<Ask>, Vec<Task>)>,
+    /// Boards in slug order, each with its open asks.
+    pub boards: BTreeMap<String, Vec<Ask>>,
     /// Tasks done since the user last marked updates seen, as the Updates page counts them.
     pub done_since_seen: usize,
 }
@@ -236,43 +235,16 @@ impl Digest {
     }
 }
 
-/// The Needs you items, by the web view's rule (`web/src/screens/asks.tsx`): open asks, and
-/// tasks without an open ask on a board that is not closed that are blocked, or open,
-/// not auto, not a proposal, not a feedback item and past any `not_before`.
+/// The Needs you items, by the web view's rule (`web/src/screens/asks.tsx`): the open asks,
+/// which are what waits on the user's decision or action.
 pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
     let mut digest = Digest::default();
-    let asks = crate::ops::asks::list(cx, Some(AskStatus::Open), None)?;
-    let asked: HashSet<String> = asks
-        .iter()
-        .filter_map(|a| a.task.as_ref().map(ToString::to_string))
-        .collect();
-    for ask in asks {
+    for ask in crate::ops::asks::list(cx, Some(AskStatus::Open), None)? {
         digest
             .boards
             .entry(ask.board.to_string())
             .or_default()
-            .0
             .push(ask);
-    }
-    let tasks = load_tasks(
-        cx,
-        "(t.status = 'blocked' OR (t.status = 'open' AND t.auto = 0)) \
-         AND t.board IN (SELECT slug FROM boards WHERE status != 'closed')",
-        &Vec::new(),
-    )?;
-    for task in tasks {
-        let waits = task.status == TaskStatus::Blocked
-            || (!task.proposal
-                && task.feedback.is_none()
-                && task.not_before.is_none_or(|at| at <= cx.now));
-        if waits && !asked.contains(task.id.as_str()) {
-            digest
-                .boards
-                .entry(task.board.to_string())
-                .or_default()
-                .1
-                .push(task);
-        }
     }
     // Before the user first marks updates seen there is no cursor, and every done task
     // would count.

@@ -413,26 +413,26 @@ registers without a repo).
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
     after local midnight, one message lists the Needs you items by board,
-    by the web view's rule: open asks, and tasks without an open ask, on boards that are
-    not closed, that are blocked or that are open, not auto, not a proposal, not a
-    feedback item and past any `not_before`. It adds how many tasks were done since the
+    by the web view's rule: the open asks. It adds how many tasks were done since the
     user last marked updates seen. Nothing is sent when every list is empty.
   - The sent state is stored (`telegram_stuck`, `telegram_digest`) after each send, so a
     restart repeats neither, and an alert that cannot be sent, or is cut off by shutdown,
     is tried again at the next check; a crash between a send and its record repeats that
     alert once. Nothing is recorded while no chat is paired, and pairing a new chat
     forgets what was sent to the old one. With both alerts off, nothing is checked.
-- **Web view** (served at `/` on the tailnet, phone-friendly): boards with counts, autopilot
-  switches and coordinator state; a board's tasks by status; task detail with notes,
-  evidence and history; agents with their state, current task and handoff; a **Needs you**
-  queue to answer asks, followed by the tasks that wait on the user without an open ask,
-  by board: blocked ones, and open ones not `auto` other than pending proposals, feedback
-  items and those held by a `not_before` (its navigation badge counts both), then **Since
-  you last looked**: the tasks finished, with their summaries, and the coordinators' turn
-  endings since the user's seen cursor, newest first. One cursor covers every board; "Mark
-  all seen" moves it to the newest update shown, so anything that arrived later stays
-  unseen, and a dot on Needs you shows that something is unseen. A done task's page shows
-  its summary, and the agents page a coordinator's last turn endings. A live event feed.
+- **Web view** (served at `/` on the tailnet, phone-friendly): a home page with the open
+  asks, the tasks in progress (doing and review) on every board, **Since you last looked**
+  and the boards with counts, autopilot switches and coordinator state, in sections the
+  user collapses and reorders (kept per browser); a board's tasks by status, in groups
+  that collapse; task detail with notes, evidence and history; agents with their state,
+  current task and handoff; a **Needs you** queue of only what waits on the user's
+  decision or action: the open asks, to answer there (its navigation badge counts them).
+  Blocked and non-auto tasks are not listed there: a task that needs the user carries an
+  ask. Since you last looked lists the tasks finished, with their summaries, and the
+  coordinators' turn endings since the user's seen cursor, newest first. One cursor covers
+  every board; "Mark all seen" moves it to the newest update shown, so anything that
+  arrived later stays unseen, and a dot on Home shows that something is unseen. A done
+  task's page shows its summary, and the agents page a coordinator's last turn endings.
 
 ## Text format
 

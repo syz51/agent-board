@@ -3,12 +3,13 @@ import { Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
 import { useMemo, useState } from "react";
 import { api } from "@/api/client.ts";
-import type { Agent, Board } from "@/api/schema.ts";
+import type { Agent, Ask, Board, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Switch } from "@/components/ui/switch.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
+import { useNow } from "@/live/runtime.ts";
 import {
   AgentStateBadge,
   agentIndex,
@@ -20,7 +21,6 @@ import {
   PageHeader,
   QueryFrame,
   RelTime,
-  SectionTitle,
   StatePill,
   useAgents,
   useTitle,
@@ -28,19 +28,38 @@ import {
 } from "@/ui/common.tsx";
 import { ConfirmDialog } from "@/ui/confirm.tsx";
 import { Icon } from "@/ui/icons.tsx";
+import { ArrangedSections, Section } from "@/ui/sections.tsx";
 import { newestFirst, useOpenAsks } from "./asks.tsx";
+import { TaskBoard, TaskList } from "./board.tsx";
+import { unseenCount, Updates, useUpdates } from "./updates.tsx";
 
-export function BoardsScreen() {
-  useTitle("Boards");
+const HOME_SECTIONS = ["asks", "progress", "updates", "boards"] as const;
+
+/**
+ * Home: what waits on the user, what is in progress, what changed since they last looked,
+ * and every board. Each section collapses and moves; the arrangement is kept per browser.
+ */
+export function HomeScreen() {
+  useTitle("Home");
   const boards = useQuery(queries.boards());
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
   const openAsks = useOpenAsks().data ?? [];
+  const updates = useUpdates().data;
+  const active = useQuery(queries.activeTasks());
+  const closed = useMemo(
+    () =>
+      new Set(
+        (boards.data ?? []).filter((board) => board.status === "closed").map((board) => board.slug),
+      ),
+    [boards.data],
+  );
+  const now = useNow(60_000);
 
   return (
     <>
       <PageHeader
-        title="Boards"
+        title="Home"
         sub={
           boards.data && (
             <>
@@ -50,61 +69,128 @@ export function BoardsScreen() {
           )
         }
       />
-      {openAsks.length > 0 && (
-        <section className="mb-7" aria-labelledby="waiting-title">
-          <div className="flex items-baseline justify-between gap-3">
-            <SectionTitle id="waiting-title">Waiting on you</SectionTitle>
-            <Link
-              className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
-              to="/asks"
-            >
-              All asks <Icon name="arrow" className="size-3.5" />
-            </Link>
-          </div>
-          <ul className={listClass}>
-            {newestFirst(openAsks)
-              .slice(0, 4)
-              .map((ask) => (
-                <li key={ask.id}>
-                  <Link
-                    className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5"
-                    to="/asks/$id"
-                    params={{ id: String(ask.id) }}
-                  >
-                    <AskKind kind={ask.kind} />
-                    <span
-                      className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-2 max-md:whitespace-normal"
-                      title={plainLine(ask.question)}
+      <ArrangedSections
+        storageKey="home"
+        ids={HOME_SECTIONS}
+        render={(id, state) => {
+          switch (id) {
+            case "asks":
+              return (
+                <Section
+                  title="Waiting on you"
+                  count={openAsks.length}
+                  aside={
+                    <Link
+                      className="inline-flex min-h-7 items-center gap-1 text-meta font-medium"
+                      to="/asks"
                     >
-                      {plainLine(ask.question)}
-                    </span>
-                    <span className="text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
-                      {ask.board} · <RelTime at={ask.created_at} />
-                    </span>
-                  </Link>
-                </li>
-              ))}
-          </ul>
-        </section>
-      )}
-      <QueryFrame query={boards} label="Loading boards">
-        {(list) =>
-          list.length === 0 ? (
-            <Empty title="No boards yet">
-              Create one with <code>board create</code>; it appears here.
-            </Empty>
-          ) : (
-            <section aria-labelledby="boards-title">
-              <SectionTitle id="boards-title" count={list.length}>
-                All boards
-              </SectionTitle>
-              <BoardTable boards={list} agents={agents} />
-            </section>
-          )
-        }
-      </QueryFrame>
+                      All asks <Icon name="arrow" className="size-3.5" />
+                    </Link>
+                  }
+                  {...state}
+                >
+                  <WaitingAsks asks={openAsks} />
+                </Section>
+              );
+            case "progress":
+              return (
+                <Section
+                  title="In progress"
+                  count={active.data && inProgress(active.data, closed).length}
+                  {...state}
+                >
+                  <QueryFrame query={active} label="Loading tasks">
+                    {(list) => {
+                      const shown = inProgress(list, closed);
+                      return shown.length === 0 ? (
+                        <p className="text-meta text-muted-foreground">No task is in progress.</p>
+                      ) : (
+                        <TaskBoard>
+                          <TaskList tasks={shown} agents={agents} now={now} />
+                        </TaskBoard>
+                      );
+                    }}
+                  </QueryFrame>
+                </Section>
+              );
+            case "updates":
+              return (
+                <Section
+                  title="Since you last looked"
+                  count={updates ? unseenCount(updates) : undefined}
+                  {...state}
+                >
+                  <Updates />
+                </Section>
+              );
+            case "boards":
+              return (
+                <Section title="Boards" count={boards.data?.length} {...state}>
+                  <QueryFrame query={boards} label="Loading boards">
+                    {(list) =>
+                      list.length === 0 ? (
+                        <Empty title="No boards yet">
+                          Create one with <code>board create</code>; it appears here.
+                        </Empty>
+                      ) : (
+                        <BoardTable boards={list} agents={agents} />
+                      )
+                    }
+                  </QueryFrame>
+                </Section>
+              );
+          }
+        }}
+      />
     </>
   );
+}
+
+/** The newest open asks, one line each; the Needs you page lists them all. */
+function WaitingAsks({ asks }: { asks: Ask[] }) {
+  if (asks.length === 0) {
+    return <p className="text-meta text-muted-foreground">Nothing waits on you.</p>;
+  }
+  return (
+    <ul className={listClass}>
+      {newestFirst(asks)
+        .slice(0, 4)
+        .map((ask) => (
+          <li key={ask.id}>
+            <Link
+              className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5"
+              to="/asks/$id"
+              params={{ id: String(ask.id) }}
+            >
+              <AskKind kind={ask.kind} />
+              <span
+                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-2 max-md:whitespace-normal"
+                title={plainLine(ask.question)}
+              >
+                {plainLine(ask.question)}
+              </span>
+              <span className="text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
+                {ask.board} · <RelTime at={ask.created_at} />
+              </span>
+            </Link>
+          </li>
+        ))}
+    </ul>
+  );
+}
+
+/**
+ * Tasks being worked on or waiting for review, on boards that are not closed: doing first,
+ * then review, each most recently updated first. Exported for tests.
+ */
+export function inProgress(tasks: Task[], closedBoards: ReadonlySet<string>): Task[] {
+  const rank = (task: Task) => (task.status === "doing" ? 0 : 1);
+  return tasks
+    .filter(
+      (task) =>
+        (task.status === "doing" || task.status === "review") && !closedBoards.has(task.board),
+    )
+    .sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
 /** The first line of agent markdown without its markup, for a one-line preview. */

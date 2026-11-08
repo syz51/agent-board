@@ -15,7 +15,6 @@ function seed(client: QueryClient) {
     queries.openAsks().queryKey,
     state.asks(new URLSearchParams({ status: "open" })),
   );
-  client.setQueryData(queries.candidateTasks().queryKey, []);
   client.setQueryData(queries.boards().queryKey, state.boards());
   client.setQueryData(queries.updates("").queryKey, state.updates(none));
 }
@@ -28,12 +27,11 @@ const current = () =>
 
 describe("navigation", () => {
   test.each([
-    ["/", "Boards"],
-    ["/boards/factory?ready=1", "Boards"],
-    ["/tasks/factory-9", "Boards"],
+    ["/", "Home"],
+    ["/boards/factory?ready=1", "Home"],
+    ["/tasks/factory-9", "Home"],
     ["/asks/3", "Needs you"],
     ["/agents?state=running", "Agents"],
-    ["/events", "Events"],
   ])("on %s only %s is current", async (path, label) => {
     await renderInApp(<Nav />, { path, seed });
     const links = current();
@@ -41,10 +39,16 @@ describe("navigation", () => {
     expect(links[0]).toStartWith(label);
   });
 
-  test("Needs you names its count and unseen updates for screen readers", async () => {
+  test("Needs you counts the open asks; Home names its unseen updates", async () => {
     await renderInApp(<Nav />, { seed });
     const open = state.asks(new URLSearchParams({ status: "open" })).length;
     expect(screen.getByLabelText(`${open} waiting on you`).textContent).toBe(String(open));
-    expect(screen.getByRole("link", { name: /Needs you/ }).textContent).toMatch(/unseen updates?$/);
+    expect(screen.getByRole("link", { name: /Home/ }).textContent).toMatch(/unseen updates?$/);
+    expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
+  });
+
+  test("there is no Events item", async () => {
+    await renderInApp(<Nav />, { seed });
+    expect(screen.queryByRole("link", { name: /Events/ })).toBeNull();
   });
 });
