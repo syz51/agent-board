@@ -4,7 +4,7 @@ import { screen } from "@testing-library/react";
 import { renderInApp } from "../test/render.tsx";
 import { DevState } from "../dev/state.ts";
 import { queries } from "./live/query.ts";
-import { Nav } from "./app.tsx";
+import { BoardLinks, Nav } from "./app.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const state = new DevState(() => now);
@@ -61,5 +61,26 @@ describe("navigation", () => {
   test("there is no Events item", async () => {
     await renderInApp(<Nav />, { seed });
     expect(screen.queryByRole("link", { name: /Events/ })).toBeNull();
+  });
+});
+
+describe("board links", () => {
+  // A board named `web` is a prefix of `web-view`: a task of web-view must not mark it.
+  function seedWithPrefix(client: QueryClient) {
+    const web = { ...state.board("web-view"), slug: "web", title: "Web" };
+    client.setQueryData(queries.boards().queryKey, [web, ...state.boards()]);
+  }
+
+  test.each([
+    ["/tasks/web-view-3", "web-view"],
+    ["/tasks/web-3", "web"],
+    ["/boards/web", "web"],
+  ])("on %s only the %s board is current", async (path, slug) => {
+    await renderInApp(<BoardLinks />, { path, seed: seedWithPrefix });
+    const current = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page")
+      .map((link) => link.getAttribute("href"));
+    expect(current).toEqual([`/boards/${slug}`]);
   });
 });

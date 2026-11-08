@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useRouter, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
+import { boardOfTask } from "@/lib/ids.ts";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
@@ -152,10 +153,13 @@ export function Nav() {
 }
 
 /** Each board, with its open asks, so a board is one click from anywhere on a wide screen. */
-function BoardLinks() {
+export function BoardLinks() {
   const path = usePathname();
   const boards = useQuery(queries.boards());
   const list = (boards.data ?? []).filter((board) => board.status !== "closed");
+  // On a task page, the task's own board is current, not every board whose slug starts it.
+  const taskId = /^\/tasks\/([^/]+)/.exec(path)?.[1];
+  const taskBoard = taskId === undefined ? undefined : boardOfTask(taskId);
   return (
     <nav className="hidden min-h-0 flex-1 overflow-y-auto lg:block" aria-label="Boards">
       <p className="px-2 pb-1 text-xs font-medium text-muted-foreground" aria-hidden="true">
@@ -183,7 +187,7 @@ function BoardLinks() {
       <ul className="grid gap-px">
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
-          const here = path === href || path.startsWith(`/tasks/${board.slug}-`);
+          const here = path === href || board.slug === taskBoard;
           return (
             <li key={board.slug}>
               <Link

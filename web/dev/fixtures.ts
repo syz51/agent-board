@@ -575,6 +575,7 @@ export function createFixtures(now: number): Fixtures {
         title: "The install guide skips the token step",
         body: "The install guide skips the token step\n\nI had to read the CLI source to find `board login`.",
         status: "done",
+        summary: "The install guide now covers `board login` before the first board call.",
         owner: id("t3:61aa"),
         feedback: {
           about: "instructions",
