@@ -3376,6 +3376,30 @@ fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
 }
 
 #[test]
+fn coordinators_ask_the_user_only_for_a_named_reason() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(board::daemon::COORDINATOR_PROMPT);
+    for rule in [
+        "Ask the user (`ask_user`) only for one of these reasons, named in the ask as `Reason: <name>`",
+        "`design`",
+        "`cost` (new spending of money)",
+        "`only-me` (a step that needs the user in person",
+        "An `action` ask must be `only-me`",
+        "Never ask because a hook or rule blocked a step",
+        "to approve a step the user asked for or that follows from it (merging, pushing, deploying, cleaning up)",
+        "for a choice with a sensible default (take it, record a `decision` note",
+        "when reviewers disagree, a third reviewer decides",
+        "Changes to this process and to security posture take the two accepts below, not the user",
+        "a split goes to a third reviewer",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    let triage = words(board::daemon::TRIAGE_PROMPT);
+    assert!(triage.contains("route the item to the most likely board"));
+    assert!(triage.contains("Do not ask the user."));
+}
+
+#[test]
 fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let triage = words(board::daemon::TRIAGE_PROMPT);
@@ -3550,16 +3574,36 @@ fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
-        "open its PR, turn on auto-merge where the repository's merge rules allow it, park the task in `review` with a `task_note` naming the PR, and end",
+        "open its PR, turn on auto-merge only where the base branch requires status checks or reviews",
+        "`gh api repos/<owner>/<repo>/branches/<base>/protection`",
+        "`gh api repos/<owner>/<repo>/rules/branches/<base>`",
+        "and otherwise leave the PR open, park the task in `review` with a `task_note` naming the PR",
         "Never tell a child to wait for CI or merge after it",
         "The merge is yours, not the child's",
-        "call T3 `watch_pull_request` on the PR, and once its checks pass merge it by the repository's rules or brief a new child to",
+        "elsewhere the PR is still open, so call T3 `watch_pull_request` on the PR, and once its checks pass and your review holds, merge it by the repository's rules or brief a new child to",
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+    // In a repository with no required checks, auto-merge would merge before the review.
+    assert!(!prompt.contains("turn on auto-merge where the repository's merge rules allow it"));
     // Children cannot wait for CI, so the brief no longer asks them to.
     assert!(!prompt.contains("while CI runs"));
     assert!(!prompt.contains("a live child finishes its own"));
+}
+
+#[test]
+fn the_coordinator_prompt_names_the_closer_and_parks_a_task_without_a_pr() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "Write each brief as yourself, never in the user's voice",
+        "name who closes the task by role and agent id, such as \"the coordinator (t3:1a2b) reviews and closes it\"",
+        "or for a task with no PR naming its result (a file, a note id, a report)",
+        "A child says a task waits on the user only when the brief says the user must decide or act.",
+        "each task in `review` whose PR has merged (or that has no PR) and whose child has ended",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
