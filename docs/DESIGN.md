@@ -366,7 +366,10 @@ settings in use, warned once per edit.
     also while the stream is down. The boards' `t3 thread show` checks run side by side,
     10 seconds each; one that fails or runs out of time still renews a named coordinator,
     and only a check that
-    answers replaces it. The reconnect delay (1 second, doubled up to a minute) resets
+    answers replaces it. Each check starts a `t3` process of about 180 MB, so a named
+    coordinator's thread that T3 found live is not asked about again for 5 minutes. A
+    failed send to it, or its agent ending, makes the next reconcile ask; an archived
+    thread is replaced within that interval. The reconnect delay (1 second, doubled up to a minute) resets
     only after a connection that lasted a minute. An unreadable `watch.json` is copied to
     `watch.json.unreadable-<time>` with a warning before the daemon starts fresh. The
     daemon logs its starts, adoptions, reconnects and stops at INFO in `watch.log`; the
