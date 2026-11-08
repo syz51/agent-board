@@ -574,7 +574,7 @@ async fn update_task(
 ) -> Result<Json<Task>> {
     let id = parse_task_id(&id)?;
     caller.act_as(&req.agent)?;
-    tasks::validate_update(&req, state.settings())?;
+    let req = tasks::validate_update(req, state.settings())?;
     let by_user = caller.is_user();
     Ok(Json(
         state
