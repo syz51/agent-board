@@ -201,6 +201,21 @@ impl FromRequestParts<AppState> for Caller {
                     "log in again with `board login` and a new token from the user",
                 ));
             };
+            // A dispatch agent holds a board's coordinator rights, so only its own
+            // device's daemon (or the user) speaks for it.
+            if let Some(owner) = agent.as_ref().and_then(AgentId::dispatch_device)
+                && owner != name
+                && !user
+            {
+                return Err(forbidden(
+                    format!(
+                        "X-Board-Agent is device {owner}'s dispatch agent, but this token is device {name}'s"
+                    ),
+                    format!(
+                        "act as your own agent; only device {owner}'s daemon acts as dispatch:{owner}"
+                    ),
+                ));
+            }
             return Ok(Caller {
                 role: Role::Device { name, user },
                 agent,

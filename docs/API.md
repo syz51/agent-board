@@ -26,6 +26,11 @@ Every other enum is closed: a new value would fail every read that carries it in
 that predates it. Add one only after making the enum open as above and waiting until running
 clients have been restarted on a version that reads it.
 
+Agent id sources are closed too. The `dispatch` source (see "Daemon dispatch") is new:
+clients before it fail to read an answer that carries a `dispatch:` id, such as a board
+whose coordinator it is or a task it owns. Upgrade and restart every client (`board mcp`,
+daemons) before a board's dispatch agent takes its coordinator lease.
+
 ## Authentication
 
 | Caller | How | May call |
@@ -43,7 +48,8 @@ Agent requests also send `X-Board-Agent: <agent id>`. The device token authentic
 device; the agent id is asserted by that device's local client, which reads it from the
 runtime's environment. Every request body field named `agent`, `RegisterAgent.id` and
 every agent id in a path must equal the header. Agent ids in paths are percent-encoded
-(`:` as `%3A`, `%` as `%25`).
+(`:` as `%3A`, `%` as `%25`). A device token may send `X-Board-Agent: dispatch:<device>`
+only for its own device (403 `forbidden` otherwise); a `--user` token may name any.
 
 Every `repo` field (boards' `repos`, agents, leases, touches) takes an origin URL in any
 common form (`https://host/owner/repo.git`, `git@host:owner/repo`, `ssh://git@host:22/owner/repo`)
@@ -132,6 +138,11 @@ server's minute sweep deletes older ones.
   after it and hold no white space (400 `invalid` otherwise). Native id values are at most
   300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
   `AGENT_TITLE_CHARS_MAX`).
+  A dispatch agent (`dispatch:<device>`, see "Daemon dispatch") registers with its own
+  device as `device` and the runtime of the threads it starts. Another device's token is
+  refused with 403 `forbidden` (see "Authentication"); a `--user` token that names another
+  `device` gets 400 `invalid`.
+  Its handle is its id.
   Clients register on session start (hooks) and before acting when the agent is unknown.
   The client registers before acting only the agent its environment names: an id named by
   hand, by `--agent` (CLI, also `board mcp --agent`) or `agent=` (MCP), that the server does
@@ -182,8 +193,8 @@ server's minute sweep deletes older ones.
   terminal escape sequences and control characters other than line breaks and tabs, trims
   it, cuts it to 4,000 characters (`SAID_CHARS_MAX`, ending with `…`) and drops it when
   nothing is left (`turn_ending` in board-proto, which the hooks apply first). While the
-  agent holds a live coordinator lease it is kept, once per such board, as a `[Said]` for
-  the user (see "Updates"), and the update records an `agent_state_changed` event even when
+  agent holds a live coordinator lease, or is a live judge of a board, it is kept, once
+  per such board, as a `[Said]` for the user (see "Updates"), and the update records an `agent_state_changed` event even when
   the state did not change; otherwise it is dropped. The newest 50 per agent and board are
   kept.
 - `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
@@ -210,13 +221,26 @@ server's minute sweep deletes older ones.
   `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
   restate or lower it. A `Board` from a server that predates it reads as 1, and a client
   leaves the field out of `UpdateBoard` unless it sets it.
+  `dispatch` (`[Dispatch]`) is who runs the board's autopilot: `thread` (a coordinator
+  thread, the default) or `daemon` (the dispatch agent of the device holding the
+  coordinator lease; see "Daemon dispatch"). Anyone may change it; the change is recorded
+  as `board_updated` with `dispatch` in `fields`. `board board set <slug> --dispatch
+  daemon|thread` (`set` is another name for `update`) sets it. `board boards` and
+  `board_status` show ` · dispatch daemon` on the board's line, and `board_status` shows
+  `dispatch thread` otherwise; a full snapshot of a daemon board has the line
+  `dispatch: daemon` (in `json` and `yaml`, `dispatch` at the top). A `Board` from a server
+  that predates it reads as `thread`; a client leaves the field out of `UpdateBoard` unless
+  it sets it, and reports a server that ignored it.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
   the daemon and by the coordinator's heartbeats). The device claims first, starts the
   thread, then claims again with the thread's `agent` id, which makes that agent's role
-  `coordinator`. `DELETE` releases it; only the holding device or the user may. Both emit
+  `coordinator`. A device names only its own dispatch agent as `agent` (403 `forbidden`
+  for `dispatch:<another device>`). `DELETE` releases it; only the holding device or the user may. Both emit
   `board_updated` with `coordinator` and the lease's `device` in the payload.
+- `POST /v1/boards/{slug}/judges` `[RegisterJudge]` → `[Judge]` and
+  `GET /v1/boards/{slug}/judges` → `[Judge]` list: see "Daemon dispatch".
 - `DELETE /v1/boards/{slug}` → 204. User only. Refused with 400 `invalid_transition` unless
   the board is `closed` and has no open asks. Deletes the board with its tasks, blockers,
   notes, evidence, asks, members, refused-claim records and events (including lease events
@@ -330,7 +354,8 @@ Reopening a closed board, or any change on it, starts the period again.
   its `task_done` succeeds and the previous owner's is refused. The owner is worked out
   after the request's status change (`open` clears it, `doing` sets the caller), and
   `owner` then replaces it; naming the owner that leaves changes nothing. Only the task's
-  owner, the board's coordinator or the user may hand a task over (403 `forbidden`; another
+  owner, the board's coordinator (or a live judge of the board, see "Daemon dispatch") or
+  the user may hand a task over (403 `forbidden`; another
   agent takes a stale owner's task first with `/take`). The status change is checked
   first, then: a task left without an owner (`open`, or unowned and not moving to `doing`)
   is refused with 400 `invalid` (claim it first, or resume it with `status: doing` and
@@ -435,8 +460,8 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 moves between `review` and `blocked` directly as what it waits on changes.
 
 Who may change the status: anyone while the task has no owner or is `done` or `dropped`;
-otherwise only its owner, the board's coordinator or the user (a `--user` token or the
-browser), else 403 `forbidden`. Another agent takes a stale owner's task first
+otherwise only its owner, the board's coordinator (or a live judge of the board) or the
+user (a `--user` token or the browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 (`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
@@ -484,6 +509,44 @@ so an open task left with nothing to wait on is announced as ready (a done or dr
 loses the link without an event). A blocked task's owner is not woken by this and sees the
 change in its next snapshot. The temporary-board sweep never does this to a blocker that
 is not done (see "Temporary boards").
+
+### Daemon dispatch
+
+A board set to `dispatch: daemon` (see "Boards") runs its autopilot from a device daemon
+instead of a long-lived coordinator thread (`DESIGN.md`, "Daemon dispatch"). The server
+knows two things for it:
+
+- **The dispatch agent** `dispatch:<device>`: an agent id source of its own, whose native id
+  is a device name. Only that device's daemon (or the user) acts as it (see
+  "Authentication"), registers it (see "Agents") and names it in the coordinator lease
+  (see "Boards"). Holding the lease, it has the coordinator's rights on the board: it hands
+  tasks over, moves them, and finishes a task it handed to itself with `/done`. Without the
+  lease it is an agent like any other.
+- **Judges**: short-lived threads the lease holder starts for one judgment.
+  - `POST /v1/boards/{slug}/judges` `[RegisterJudge]` `{agent, kind, tasks?}` → `[Judge]`
+    `{board, agent, kind, tasks, registered_by, created_at, expires_at, running}`. Only the
+    agent holding the board's coordinator lease may call it, acting as itself in
+    `X-Board-Agent` (400 `invalid` without the header; 403 `forbidden` for any other agent,
+    a judge included). `kind` is `review`, `verdict`, `goal` or `triage`. `tasks` names
+    tasks of this board: repeats are dropped, then at most 20 may remain
+    (`JUDGE_TASKS_MAX`; 400 `invalid` for more), and a `review` names at least one (400
+    `invalid`). An unknown task is 404, a task of another board 400 `invalid`. `agent` is
+    an id or a handle, stored as the id. The agent may not be registered yet, since its
+    session may still be starting; 400 `invalid` when it is the caller or has ended.
+    Registrations that ended or expired are deleted then. Records `board_updated` with
+    `fields: ["judges"]`, `judge`, `kind`, `tasks` and `expires_at`.
+  - A judge has the coordinator's rights on that board, and only there, while all of these
+    hold: its agent has not ended since it was registered (a resumed agent does not get them
+    back), at most 2 hours have passed since it was registered (`JUDGE_HOURS_MAX`;
+    `expires_at`), and the agent that registered it still holds the board's coordinator
+    lease. Registering the same agent again before its registration ended or expired
+    replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
+    registration starts afresh.
+  - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first.
+    `running` is true while the judge's agent is `running` or not registered yet: the
+    daemon counts those as the judges at work. A judge whose turn ended (`idle` or
+    `paused`) keeps its rights until its agent ends, but is not running.
+  - A judge's turn endings are kept as a coordinator's (see "Agents", `said`).
 
 ### Leases and touches
 

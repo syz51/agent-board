@@ -7,6 +7,7 @@ mod auth;
 mod boards;
 mod events;
 mod feedback;
+mod judges;
 mod leases;
 mod query_cost;
 mod reads;

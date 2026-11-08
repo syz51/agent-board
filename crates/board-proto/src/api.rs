@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Event,
-    Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, NoteKind, Priority, ResolutionKind,
-    Runtime, Said, Task, TaskId, TaskStatus, Timestamp,
+    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Dispatch,
+    Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority,
+    ResolutionKind, Runtime, Said, Task, TaskId, TaskStatus, Timestamp,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -78,6 +78,22 @@ pub struct UpdateBoard {
     /// tasks at once spend the shared usage limit faster; anyone may lower it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tasks: Option<u32>,
+    /// Who runs the board's autopilot (see [`crate::Board::dispatch`]). A server that
+    /// predates it ignores it, so a client checks the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<Dispatch>,
+}
+
+/// `POST /v1/boards/{slug}/judges`: the holder of the board's coordinator lease registers a
+/// judge, which then has the coordinator's rights on the board until its agent ends or
+/// for at most [`crate::JUDGE_HOURS_MAX`] hours. Registering the same agent again while
+/// its registration is live replaces `kind` and `tasks` and keeps its expiry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterJudge {
+    pub agent: AgentId,
+    pub kind: JudgeKind,
+    #[serde(default)]
+    pub tasks: Vec<TaskId>,
 }
 
 /// `POST /v1/boards/{slug}/join`: the calling agent joins the board.
@@ -954,10 +970,34 @@ mod tests {
             "older servers run one task at a time"
         );
         assert_eq!(update.parallel_tasks, None);
-        // Older servers reject no field they do not know, and an unset one is not sent.
         assert_eq!(
-            serde_json::to_value(UpdateBoard::default()).unwrap()["parallel_tasks"],
-            serde_json::Value::Null
+            board.dispatch,
+            Dispatch::Thread,
+            "older servers run a coordinator thread"
+        );
+        assert_eq!(update.dispatch, None);
+        // Older servers reject no field they do not know, and an unset one is not sent.
+        let unset = serde_json::to_value(UpdateBoard::default()).unwrap();
+        assert_eq!(unset["parallel_tasks"], serde_json::Value::Null);
+        assert_eq!(unset["dispatch"], serde_json::Value::Null);
+        let set: UpdateBoard =
+            serde_json::from_value(serde_json::json!({ "dispatch": "daemon" })).unwrap();
+        assert_eq!(set.dispatch, Some(Dispatch::Daemon));
+    }
+
+    #[test]
+    fn judge_registration_tasks_default_to_none() {
+        let req: RegisterJudge = serde_json::from_value(serde_json::json!({
+            "agent": "t3:judge", "kind": "goal",
+        }))
+        .unwrap();
+        assert_eq!(req.kind, JudgeKind::Goal);
+        assert!(req.tasks.is_empty());
+        assert!(
+            serde_json::from_value::<RegisterJudge>(serde_json::json!({
+                "agent": "t3:judge", "kind": "merge",
+            }))
+            .is_err()
         );
     }
 }

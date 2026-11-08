@@ -134,7 +134,11 @@ impl Ctx {
                 }
                 let runtime = match agent.source() {
                     AgentSource::Codex => Runtime::Codex,
-                    AgentSource::T3 | AgentSource::Claude => Runtime::Claude,
+                    // A dispatch agent runs no model: it names the runtime of the threads
+                    // it starts, Claude.
+                    AgentSource::T3 | AgentSource::Claude | AgentSource::Dispatch => {
+                        Runtime::Claude
+                    }
                 };
                 self.register(runtime, Vec::new()).await
             }
@@ -864,6 +868,16 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
             "updated board {slug}, but the server ignored parallel_tasks={wanted}: it predates \
              parallel tasks. Upgrade the server, then run board board update {slug} \
              --parallel-tasks {wanted}"
+        );
+    }
+    if let Some(wanted) = body.dispatch
+        && board.dispatch != wanted
+    {
+        let wanted = crate::render::enum_str(&wanted);
+        bail!(
+            "updated board {slug}, but the server ignored dispatch={wanted}: it predates \
+             daemon dispatch. Upgrade the server, then run board board set {slug} \
+             --dispatch {wanted}"
         );
     }
     Ok(Output::new(

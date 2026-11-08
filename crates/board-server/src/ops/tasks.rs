@@ -1009,7 +1009,8 @@ fn require_owner(task: &Task, agent: &AgentId, action: &str) -> Result<()> {
 }
 
 /// Who may change the status of `task` (`docs/API.md`, "Tasks"): anyone while it has no
-/// owner or is closed; otherwise its owner, the board's coordinator or the user. Others
+/// owner or is closed; otherwise its owner, the board's coordinator (or a live judge of the
+/// board) or the user. Others
 /// take a stale owner's task first, which is logged.
 fn require_status_rights(
     cx: &Ctx<'_>,
@@ -1021,14 +1022,14 @@ fn require_status_rights(
     if task.owner.is_none() || task.status.is_closed() || by_user {
         return Ok(());
     }
-    if get_board(cx, &task.board)?.coordinator.as_ref() == Some(agent) {
+    if crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)? {
         return Ok(());
     }
     require_owner(task, agent, action)
 }
 
 /// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, the board's
-/// coordinator or the user. `owned` is whether the task has an owner once the request's
+/// coordinator (or a live judge of the board) or the user. `owned` is whether the task has an owner once the request's
 /// status change applies, and `to` that status. The target must be a live agent.
 fn check_handover(
     cx: &Ctx<'_>,
@@ -1042,7 +1043,7 @@ fn check_handover(
     let id = &task.id;
     let allowed = by_user
         || task.owner.as_ref() == Some(agent)
-        || get_board(cx, &task.board)?.coordinator.as_ref() == Some(agent);
+        || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?;
     if !allowed {
         return Err(match &task.owner {
             Some(owner) => forbidden(
