@@ -4,18 +4,27 @@ import { parseSearch, stringifySearch, validateBoardSearch } from "./router.tsx"
 describe("search params", () => {
   test("board filters keep known non-empty values and drop the rest", () => {
     expect(
-      validateBoardSearch({ q: "lease", priority: "p1", owner: "none", ready: "1", x: "y" }),
+      validateBoardSearch({
+        q: "lease",
+        priority: "p1",
+        owner: "none",
+        ready: "1",
+        parent: "factory-12",
+        x: "y",
+      }),
     ).toEqual({
       q: "lease",
       priority: "p1",
       owner: "none",
       ready: "1",
+      parent: "factory-12",
     });
     expect(validateBoardSearch({ q: "", ready: "true", priority: 3 })).toEqual({
       q: undefined,
       priority: undefined,
       owner: undefined,
       ready: undefined,
+      parent: undefined,
     });
   });
 

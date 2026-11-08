@@ -46,6 +46,7 @@ const PATHS = {
   /** A crescent: an agent that went idle. */
   idle: "M12.75 9.75A5 5 0 1 1 6.25 3.25a4 4 0 0 0 6.5 6.5z",
   cross: "m5 5 6 6M11 5l-6 6",
+  subtasks: "M2.75 3.25h10.5M4.75 3.25v9h2.5M4.75 8h2.5M9.25 8h4M9.25 12.25h4",
 } as const;
 
 export type IconName = keyof typeof PATHS;
@@ -79,6 +80,11 @@ export function BrandMark() {
 }
 
 export type StatusKey = TaskStatus | "ready";
+
+/** How a task's status shows: an open task that may start shows as ready. */
+export function statusKey(task: { status: TaskStatus; ready: boolean }): StatusKey {
+  return task.status === "open" && task.ready ? "ready" : task.status;
+}
 
 const STATUS_TEXT: Record<StatusKey, string> = {
   ready: "Ready",

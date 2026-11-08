@@ -26,6 +26,7 @@ import {
 import { ConfirmDialog } from "@/ui/confirm.tsx";
 import { Icon, StatusIcon, statusLabel } from "@/ui/icons.tsx";
 import { ArrangedSections, Section } from "@/ui/sections.tsx";
+import { boardTally, StatusTally } from "@/ui/tally.tsx";
 import { AskRows, useOpenAsks } from "./asks.tsx";
 import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
 
@@ -188,26 +189,6 @@ export function inProgress(tasks: Task[], closedBoards: ReadonlySet<string>): Ta
     .sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
-const SEGMENTS = [
-  { key: "done", label: "done", bar: "bg-status-done" },
-  { key: "review", label: "review", bar: "bg-status-review" },
-  { key: "doing", label: "doing", bar: "bg-status-doing" },
-  { key: "blocked", label: "blocked", bar: "bg-status-blocked" },
-  { key: "ready", label: "ready", bar: "bg-status-ready" },
-  { key: "waiting", label: "waiting", bar: "bg-input" },
-] as const;
-
-function segmentCounts(counts: Board["counts"]): Record<(typeof SEGMENTS)[number]["key"], number> {
-  return {
-    done: counts.done,
-    review: counts.review,
-    doing: counts.doing,
-    blocked: counts.blocked,
-    ready: counts.ready,
-    waiting: Math.max(0, counts.open - counts.ready),
-  };
-}
-
 interface BoardRowData {
   board: Board;
   coordinator: Agent | undefined;
@@ -231,7 +212,14 @@ const columns = column.columns([
   column.display({
     id: "tasks",
     header: "Tasks",
-    cell: ({ row }) => <TaskTally board={row.original.board} />,
+    cell: ({ row }) => (
+      <StatusTally
+        counts={boardTally(row.original.board.counts)}
+        label="Tasks by status"
+        readyAuto={row.original.board.counts.ready_auto}
+        className="contents"
+      />
+    ),
   }),
   column.display({
     id: "coordinator",
@@ -360,66 +348,6 @@ function BoardName({ board }: { board: Board }) {
         <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
-      )}
-    </>
-  );
-}
-
-function TaskTally({ board }: { board: Board }) {
-  const counts = segmentCounts(board.counts);
-  const total = SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
-  return (
-    <>
-      <div
-        className="flex h-1.5 gap-0.5 overflow-hidden rounded-[3px] bg-secondary"
-        aria-hidden="true"
-      >
-        {SEGMENTS.map(
-          (segment) =>
-            counts[segment.key] > 0 && (
-              <span
-                key={segment.key}
-                className={cn("min-w-1 basis-0", segment.bar)}
-                style={{ flexGrow: counts[segment.key] }}
-              />
-            ),
-        )}
-      </div>
-      {total === 0 ? (
-        <p className="text-meta leading-[18px] text-muted-foreground">No tasks yet</p>
-      ) : (
-        <ul
-          // Phones set it a step smaller and tighter, so six counts still fit on one line.
-          className="flex flex-wrap gap-x-2 gap-y-0.5 text-meta leading-[18px] text-muted-foreground max-md:gap-x-1 max-md:text-xs"
-          aria-label="Tasks by status"
-        >
-          {SEGMENTS.map(
-            (segment) =>
-              counts[segment.key] > 0 && (
-                // A count and its word, in the bar's order, after a dot of its bar colour.
-                <li
-                  key={segment.key}
-                  className="inline-flex items-center gap-1 whitespace-nowrap max-md:gap-0.75"
-                >
-                  <span
-                    className={cn("size-1.5 flex-none rounded-full", segment.bar)}
-                    aria-hidden="true"
-                  />
-                  <strong className="font-semibold text-foreground tabular-nums">
-                    {counts[segment.key]}
-                  </strong>{" "}
-                  <span>{segment.label}</span>
-                  {/* How much of ready the coordinator may start; an older server omits it. */}
-                  {segment.key === "ready" && board.counts.ready_auto !== null && (
-                    <>
-                      {" "}
-                      <span>(auto {board.counts.ready_auto})</span>
-                    </>
-                  )}
-                </li>
-              ),
-          )}
-        </ul>
       )}
     </>
   );

@@ -44,6 +44,7 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
             evidence: vec![],
             blocks: vec![],
             children: vec![],
+            child_tasks: vec![],
             history: vec![],
             handles: Default::default(),
         },

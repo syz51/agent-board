@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use board_proto::{
-    Agent, AgentId, Ask, Board, BoardSlug, Event, EventType, Evidence, Handoff, Lease, Note,
-    StatusCounts, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
+    Agent, AgentId, Ask, Board, BoardSlug, ChildTask, Event, EventType, Evidence, Handoff, Lease,
+    Note, StatusCounts, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
 };
 use rusqlite::types::ToSql;
 use rusqlite::{OptionalExtension, Row, named_params, params};
@@ -101,6 +101,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         updated_at: ts(r.get(14)?),
         feedback: None,
         summary: r.get(16)?,
+        child_count: 0,
     })
 }
 
@@ -148,8 +149,12 @@ pub(crate) const BATCH_BLOCKERS: &str = "SELECT b.task, b.blocker, bt.status \
      FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
      WHERE b.task IN (SELECT value FROM json_each(?1)) ORDER BY bt.number, bt.board";
 
-/// Fills in blockers, `owner_stale`, `ready` and feedback, with one query for each across
-/// all of `tasks`.
+/// How many children each of a batch of tasks has, along the `tasks_parent` index.
+pub(crate) const BATCH_CHILD_COUNTS: &str = "SELECT parent, COUNT(*) FROM tasks \
+     WHERE parent IN (SELECT value FROM json_each(?1)) GROUP BY parent";
+
+/// Fills in blockers, child counts, `owner_stale`, `ready` and feedback, with one query for
+/// each across all of `tasks`.
 fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
     if tasks.is_empty() {
         return Ok(tasks);
@@ -191,6 +196,12 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
     drop(rows);
     drop(stmt);
 
+    let child_counts: HashMap<String, u32> = cx
+        .db
+        .prepare_cached(BATCH_CHILD_COUNTS)?
+        .query_map([&ids], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
     let with_feedback: HashSet<String> = cx
         .db
         .prepare_cached(
@@ -200,6 +211,7 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
         .collect::<rusqlite::Result<_>>()?;
 
     for task in &mut tasks {
+        task.child_count = child_counts.get(task.id.as_str()).copied().unwrap_or(0);
         let all_done = match blockers.remove(task.id.as_str()) {
             Some((ids, all_done)) => {
                 task.blockers = ids;
@@ -296,11 +308,21 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
          WHERE b.blocker = ?1 ORDER BY t.number, t.board",
         id,
     )?;
-    let children = task_ids(
-        cx,
-        "SELECT id FROM tasks WHERE parent = ?1 ORDER BY number",
-        id,
-    )?;
+    // Children with their statuses, loaded and completed as one batch; by id number.
+    let mut child_tasks = load_tasks(cx, "t.parent = :parent", &vec![(":parent", &id.as_str())])?;
+    child_tasks.sort_by_key(|t| t.id.number());
+    let children = child_tasks.iter().map(|t| t.id.clone()).collect();
+    let child_tasks = child_tasks
+        .into_iter()
+        .map(|t| ChildTask {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            ready: t.ready,
+            owner: t.owner,
+            owner_stale: t.owner_stale,
+        })
+        .collect();
     // The newest events, oldest first; a cut history no longer starts with task_created.
     let mut history = latest_events(
         cx,
@@ -341,6 +363,7 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
         evidence,
         blocks,
         children,
+        child_tasks,
         history,
         handles,
     })
