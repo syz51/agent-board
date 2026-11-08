@@ -11,8 +11,7 @@ use crate::db::{live_sql, ready_sql};
 use crate::ops::leases::DELEGATION_FAMILY;
 use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
 use crate::snapshot::{
-    RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, alert_events_sql, alerts_left_sql,
-    recent_candidates,
+    ALERT_EVENTS, ALERTS_LEFT, RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates,
 };
 use crate::store::{BATCH_BLOCKERS, latest_events_sql};
 
@@ -112,7 +111,7 @@ async fn snapshot_stays_fast_on_a_big_board() {
 }
 
 /// A year of history: a full snapshot over 1M events stays under 20 ms, as the alert scan
-/// reads only the events of its types after the cursor (`events_type_seq`).
+/// reads only the seq range of its window, not each watched type's whole history.
 #[tokio::test]
 #[ignore = "timing; run in a release build"]
 async fn snapshot_stays_fast_over_a_million_events() {
@@ -181,8 +180,8 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
 
     // Alerts: the seq range between the cursor (or the window's start) and `seq`, not each
     // watched type's whole history along `events_type`.
-    for sql in [alert_events_sql(), alerts_left_sql()] {
-        let p = plan(&t, &sql);
+    for sql in [&*ALERT_EVENTS, &*ALERTS_LEFT] {
+        let p = plan(&t, sql);
         assert!(
             p.starts_with("SEARCH events USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
             "{p}"

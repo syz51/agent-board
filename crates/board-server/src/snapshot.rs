@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 use board_proto::{
     Agent, AgentId, AgentSource, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot,
@@ -23,8 +24,8 @@ use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    NamedParams, agent_boards, counts, event_row, find_handoff, get_agent, get_board, handle_of,
-    is_live, json_ids, latest_events, load_agents, load_tasks,
+    EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
+    get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -69,18 +70,18 @@ pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
 /// `NOT INDEXED` keeps both alert queries on the seq range of the events table, which the
 /// window bounds to `ALERT_WINDOW` rows. Left to choose, the planner reads each watched
 /// type's whole history from `events_type (type, at)`, which grows with retention.
-pub(crate) fn alert_events_sql() -> String {
+pub(crate) static ALERT_EVENTS: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT seq, at, board, actor, type, task, payload FROM events NOT INDEXED \
+        "SELECT {EVENT_COLUMNS} FROM events NOT INDEXED \
          WHERE seq > :since AND {ALERT_FILTER} ORDER BY seq LIMIT :limit"
     )
-}
+});
 
 /// How many events after `:since` pass [`ALERT_FILTER`], on the same range as
-/// [`alert_events_sql`].
-pub(crate) fn alerts_left_sql() -> String {
+/// [`ALERT_EVENTS`].
+pub(crate) static ALERTS_LEFT: LazyLock<String> = LazyLock::new(|| {
     format!("SELECT COUNT(*) FROM events NOT INDEXED WHERE seq > :since AND {ALERT_FILTER}")
-}
+});
 
 #[derive(Debug, Clone, Serialize)]
 struct Model {
@@ -260,7 +261,7 @@ pub(crate) struct Rendered {
     pub snapshot: Snapshot,
     agent: AgentId,
     /// The board counts shown, to compare the next delta with; `None` keeps the stored ones.
-    shown: Option<String>,
+    shown: Option<ShownCounts>,
 }
 
 /// Renders a snapshot and changes nothing, so a read transaction can run it.
@@ -335,7 +336,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     };
     let shown = match req.kind {
         SnapshotKind::Alerts => None,
-        _ => shown_now.map(|s| serde_json::to_string(&s).expect("serializes")),
+        _ => shown_now,
     };
     Ok(Rendered {
         snapshot: Snapshot {
@@ -353,14 +354,13 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
 /// shown counts move past it. Runs in the write transaction that rendered it.
 pub(crate) fn advance(cx: &mut Ctx<'_>, rendered: Rendered) -> Result<Snapshot> {
     crate::ops::touch_agent(cx, &rendered.agent)?;
+    let shown = rendered
+        .shown
+        .map(|s| serde_json::to_string(&s).expect("serializes"));
     cx.db.execute(
         "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
          WHERE id = ?1",
-        params![
-            rendered.agent.as_str(),
-            rendered.snapshot.seq,
-            rendered.shown
-        ],
+        params![rendered.agent.as_str(), rendered.snapshot.seq, shown],
     )?;
     Ok(rendered.snapshot)
 }
@@ -892,7 +892,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
     params.extend([(":since", &skipped_to as _), (":limit", &ALERT_SCAN as _)]);
     let events: Vec<Event> = cx
         .db
-        .prepare_cached(&alert_events_sql())?
+        .prepare_cached(&ALERT_EVENTS)?
         .query_map(params.as_slice(), event_row)?
         .collect::<rusqlite::Result<_>>()?;
     let scanned_to = match events.last() {
@@ -904,7 +904,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         let mut params = filter.clone();
         params.push((":since", &scanned_to));
         cx.db
-            .prepare_cached(&alerts_left_sql())?
+            .prepare_cached(&ALERTS_LEFT)?
             .query_row(params.as_slice(), |r| r.get(0))?
     } else {
         0

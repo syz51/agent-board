@@ -672,6 +672,9 @@ pub(crate) fn get_ask(cx: &Ctx<'_>, id: i64) -> Result<Ask> {
         })
 }
 
+/// The columns [`event_row`] reads, in its order.
+pub(crate) const EVENT_COLUMNS: &str = "seq, at, board, actor, type, task, payload";
+
 pub(crate) fn event_row(r: &Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         seq: r.get(0)?,
@@ -703,7 +706,7 @@ pub(crate) fn load_events(
     Ok(cx
         .db
         .prepare_cached(&format!(
-            "SELECT seq, at, board, actor, type, task, payload FROM events \
+            "SELECT {EVENT_COLUMNS} FROM events \
              WHERE seq > :since AND {filter} ORDER BY seq LIMIT :limit"
         ))?
         .query_map(params.as_slice(), event_row)?
@@ -730,7 +733,7 @@ pub(crate) fn latest_events(
 /// The query of [`latest_events`].
 pub(crate) fn latest_events_sql(filter: &str) -> String {
     format!(
-        "SELECT seq, at, board, actor, type, task, payload FROM events \
+        "SELECT {EVENT_COLUMNS} FROM events \
          WHERE seq > :since AND {filter} ORDER BY seq DESC LIMIT :limit"
     )
 }

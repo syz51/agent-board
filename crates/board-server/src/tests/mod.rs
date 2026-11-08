@@ -1,4 +1,5 @@
-//! In-process tests through the HTTP layer, over an in-memory database and a manual clock.
+//! In-process tests through the HTTP layer, over a database file in WAL mode and a manual
+//! clock.
 
 mod agents;
 mod asks;
@@ -88,7 +89,7 @@ impl T {
     }
 
     pub fn with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
-        // On disk, so reads take the read-only pool as in production.
+        // A fresh database file, kept until the server is dropped.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("board.db")).unwrap();
         Self {
