@@ -4,10 +4,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use board_proto::{Ask, AskStatus, Task, TaskId, TaskStatus, Timestamp};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, named_params, params};
 
 use crate::auth::hash_token;
-use crate::db::{Ctx, parse_id, ts};
+use crate::db::{Ctx, parse_id, ready_sql, ts};
 use crate::error::{Result, invalid};
 use crate::store::load_tasks;
 
@@ -75,8 +75,8 @@ fn new_code() -> String {
 /// Pairs `chat_id` when `code` is a live pairing code, and either no chat is paired or the
 /// code replaces the paired chat; every code is used up by a successful pairing. Message
 /// ids from earlier chats are forgotten, since Telegram numbers messages per chat, and so
-/// are the stuck alerts and the digest sent there, so the new chat gets them too. Returns
-/// whether the chat was paired.
+/// are the stuck and stalled alerts and the digest sent there, so the new chat gets them
+/// too. Returns whether the chat was paired.
 pub(crate) fn redeem(cx: &mut Ctx<'_>, code: &str, chat_id: i64) -> Result<bool> {
     let code = code.trim().to_ascii_lowercase();
     let replaces: Option<bool> = cx
@@ -106,6 +106,8 @@ pub(crate) fn redeem(cx: &mut Ctx<'_>, code: &str, chat_id: i64) -> Result<bool>
     )?;
     cx.db.execute("DELETE FROM telegram_stuck", [])?;
     cx.db.execute("DELETE FROM telegram_digest", [])?;
+    cx.db
+        .execute("UPDATE telegram_stalled SET sent_at = NULL", [])?;
     Ok(true)
 }
 
@@ -196,6 +198,124 @@ pub(crate) fn record_stuck(cx: &mut Ctx<'_>, sent: &[(TaskId, i64)]) -> Result<(
             "INSERT INTO telegram_stuck (task, seq, sent_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT (task) DO UPDATE SET seq = excluded.seq, sent_at = excluded.sent_at",
             params![task.as_str(), seq, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// An active autopilot board whose ready work sits unclaimed, as the stalled alert reports
+/// it.
+#[derive(Debug)]
+pub(crate) struct Stalled {
+    pub board: String,
+    /// Ready auto tasks on the board.
+    pub ready: usize,
+    /// When a check first saw the board stalled; an alert is recorded against it.
+    pub since: Timestamp,
+    /// The coordinator that holds the board's lease: its handle, state and when it was
+    /// last seen.
+    pub coordinator: Option<(String, String, Timestamp)>,
+}
+
+/// Events that move a task into or out of doing, over events alias `x`.
+const DOING_MOVES: &str = "(x.type IN ('task_claimed', 'task_taken', 'task_released', \
+    'task_done') OR (x.type = 'task_updated' AND 'doing' IN \
+    (json_extract(x.payload, '$.from'), json_extract(x.payload, '$.to'))))";
+
+/// Tracks which boards are stalled and returns those due an alert. A board is stalled while
+/// it is active, has autopilot on, has no task in doing and has a ready auto task, unless the
+/// coordinator that holds its lease is paused on a usage limit (that pause has its own
+/// message). Each check records when it first saw a board stalled; a board that stops being
+/// stalled, or where a task moved into or out of doing since then, starts over. A board is
+/// due once it has stayed stalled for `quiet_ms` and was not yet reported since then. So
+/// work that became claimable by any route (autopilot switched on, a board resumed, a
+/// blocker done, a pause over) gives the coordinator the whole threshold to claim it.
+pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
+    let now = cx.now_ms();
+    let max_seq = cx.max_seq()?;
+    let rows = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT b.slug, a.handle, a.state, a.last_seen, \
+               (SELECT COUNT(*) FROM tasks t WHERE t.board = b.slug AND t.auto = 1 \
+                 AND {ready}), \
+               s.since, s.sent_at, \
+               EXISTS (SELECT 1 FROM events x WHERE x.board = b.slug AND x.seq > s.seq \
+                 AND {DOING_MOVES}) \
+             FROM boards b \
+             LEFT JOIN agents a ON a.id = b.coordinator AND b.coordinator_expires_at > :now \
+             LEFT JOIN telegram_stalled s ON s.board = b.slug \
+             WHERE b.autopilot = 1 AND b.status = 'active' \
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
+                 AND t.status = 'doing') \
+               AND NOT (COALESCE(a.state, '') = 'paused' \
+                 AND (a.paused_until IS NULL OR a.paused_until > :now)) \
+             ORDER BY b.slug",
+            ready = ready_sql("t"),
+        ))?
+        .query_map(
+            named_params! { ":now": now, ":cutoff": cx.stale_cutoff() },
+            |r| {
+                let handle: Option<String> = r.get(1)?;
+                let state: Option<String> = r.get(2)?;
+                let seen: Option<i64> = r.get(3)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    handle
+                        .zip(state)
+                        .zip(seen)
+                        .map(|((h, s), at)| (h, s, ts(at))),
+                    usize::try_from(r.get::<_, i64>(4)?).unwrap_or_default(),
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<bool>>(7)?.unwrap_or(false),
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut kept = Vec::new();
+    let mut due = Vec::new();
+    for (board, coordinator, ready, since, sent_at, moved) in rows {
+        if ready == 0 {
+            continue;
+        }
+        match since {
+            Some(since) if !moved => {
+                if sent_at.is_none() && since <= now - quiet_ms {
+                    due.push(Stalled {
+                        board: board.clone(),
+                        ready,
+                        since: ts(since),
+                        coordinator,
+                    });
+                }
+            }
+            _ => {
+                cx.db.execute(
+                    "INSERT INTO telegram_stalled (board, seq, since, sent_at) \
+                     VALUES (?1, ?2, ?3, NULL) ON CONFLICT (board) DO UPDATE \
+                     SET seq = excluded.seq, since = excluded.since, sent_at = NULL",
+                    params![board, max_seq, now],
+                )?;
+            }
+        }
+        kept.push(board);
+    }
+    cx.db.execute(
+        "DELETE FROM telegram_stalled WHERE board NOT IN (SELECT value FROM json_each(?1))",
+        [serde_json::to_string(&kept).expect("strings serialize")],
+    )?;
+    Ok(due)
+}
+
+/// Records the stalled alerts sent, each against when its board was first seen stalled, so
+/// a board is reported again only once it stalls anew.
+pub(crate) fn record_stalled(cx: &mut Ctx<'_>, sent: &[(String, Timestamp)]) -> Result<()> {
+    let now = cx.now_ms();
+    for (board, since) in sent {
+        cx.db.execute(
+            "UPDATE telegram_stalled SET sent_at = ?1 WHERE board = ?2 AND since = ?3",
+            params![now, board, since.timestamp_millis()],
         )?;
     }
     Ok(())
