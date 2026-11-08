@@ -19,15 +19,16 @@ use crate::store::{
 };
 use crate::text::{ago, check_line, check_text};
 
-/// Status changes allowed through `PATCH` (`docs/API.md`).
+/// Status changes allowed through `PATCH` (`docs/API.md`). A parked task moves between
+/// `review` and `blocked` directly as what it waits on changes.
 pub(crate) fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
     matches!(
         (from, to),
         (Open, Blocked | Dropped)
             | (Doing, Blocked | Review | Open | Dropped)
-            | (Blocked, Open | Doing | Dropped)
-            | (Review, Doing | Dropped)
+            | (Blocked, Open | Doing | Review | Dropped)
+            | (Review, Doing | Blocked | Dropped)
             | (Done | Dropped, Open)
     )
 }
@@ -840,6 +841,26 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
     get_task(cx, id)
 }
 
+/// The oldest open ask on `task`, if any.
+fn open_ask(cx: &Ctx<'_>, task: &TaskId) -> Result<Option<i64>> {
+    Ok(cx
+        .db
+        .query_row(
+            "SELECT id FROM asks WHERE task = ?1 AND status = 'open' ORDER BY id LIMIT 1",
+            [task.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// How the agent that asked `ask` withdraws it, through MCP or the CLI.
+fn withdraw_hint(ask: i64) -> String {
+    format!(
+        "withdraw it if you asked it and it no longer applies (ask_withdraw {ask}; CLI: board \
+         withdraw {ask})"
+    )
+}
+
 /// Resumes a parked task (review or blocked) that is the caller's or nobody's, for
 /// `claim`: a claim's checks, then `update` with `status: doing`, so the change and its
 /// event are the same as `task_update status=doing` and stats do not count it as a claim
@@ -851,26 +872,26 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
     if let Some(reason) = &task.blocked_reason {
         return Err(bad_transition(
             format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
-            format!(
-                "it is blocked for \"{reason}\": resume it ({}) only once that no longer holds",
-                resume_hint(id)
-            ),
+            if task.owner.as_ref() == Some(agent) {
+                format!(
+                    "once \"{reason}\" no longer holds, resume it ({}), which clears the \
+                     reason, or close it with task_done {id} if its work is finished",
+                    resume_hint(id)
+                )
+            } else {
+                format!(
+                    "once \"{reason}\" no longer holds, clear the reason with task_update {id} \
+                     status=open, then task_claim {id}"
+                )
+            },
         ));
     }
-    let ask: Option<i64> = cx
-        .db
-        .query_row(
-            "SELECT id FROM asks WHERE task = ?1 AND status = 'open' ORDER BY id LIMIT 1",
-            [id.as_str()],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(ask) = ask {
+    if let Some(ask) = open_ask(cx, id)? {
         return Err(bad_transition(
             format!("{id} waits on ask #{ask}, so claiming does not resume it"),
             format!(
-                "wait for the user's answer to ask #{ask}, then resume it ({})",
-                resume_hint(id)
+                "wait for the user's answer to ask #{ask}, or {}; then claim it again",
+                withdraw_hint(ask)
             ),
         ));
     }
@@ -1254,6 +1275,17 @@ pub(crate) fn update(
             TaskStatus::Open => owner = None,
             // Whoever moves a task to doing works on it, as with claim and take.
             TaskStatus::Doing => owner = Some(agent.clone()),
+            // A task in review has an owner to finish it, who came through doing and so
+            // past the proposal gate.
+            TaskStatus::Review if owner.is_none() => {
+                return Err(bad_transition(
+                    format!("nobody owns {id}, so it cannot wait in review"),
+                    format!(
+                        "to work on it yourself, resume it ({}), then move it to review",
+                        resume_hint(id)
+                    ),
+                ));
+            }
             _ => {}
         }
         fields.push("status");
@@ -1437,17 +1469,52 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
         return Err(version_conflict(&task, req.version));
     }
     require_owner(&task, &req.agent, "complete")?;
-    if !matches!(task.status, TaskStatus::Doing | TaskStatus::Review) {
+    // The owner closes its blocked task directly: the wait often ends off the board, and
+    // resuming it first would hit the doing limit. Done clears `blocked_reason`.
+    if !matches!(
+        task.status,
+        TaskStatus::Doing | TaskStatus::Review | TaskStatus::Blocked
+    ) {
         return Err(bad_transition(
             format!(
-                "{id} is {}; only doing or review tasks can be done",
+                "{id} is {}; only doing, review or blocked tasks can be done",
                 status_str(task.status)
             ),
-            match task.status {
-                TaskStatus::Blocked => format!("resume it first ({})", resume_hint(id)),
-                _ => format!("claim it first with task_claim {id}"),
+            if task.status.is_closed() {
+                format!(
+                    "it is closed already; reopen it (task_update {id} status=open) if it needs more work"
+                )
+            } else {
+                format!("claim it first with task_claim {id}")
             },
         ));
+    }
+    // What a blocked task still names as its wait is settled before it closes, so no ask
+    // stays open for the user and no waiting task becomes ready early.
+    if task.status == TaskStatus::Blocked {
+        if let Some(ask) = open_ask(cx, id)? {
+            return Err(bad_transition(
+                format!("{id} waits on ask #{ask}, so it cannot be done yet"),
+                format!(
+                    "wait for the user's answer to ask #{ask}, or {}; then mark it done",
+                    withdraw_hint(ask)
+                ),
+            ));
+        }
+        let waiting = open_blockers(cx, id)?;
+        if !waiting.is_empty() {
+            let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
+            return Err(bad_transition(
+                format!(
+                    "{id} waits on {}, so it cannot be done yet",
+                    list.join(", ")
+                ),
+                format!(
+                    "help finish them, or remove the ones it no longer waits on (task_update {id} \
+                     with blockers), then mark it done"
+                ),
+            ));
+        }
     }
     let now = cx.now_ms();
     for item in &req.evidence {

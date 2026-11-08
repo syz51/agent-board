@@ -258,7 +258,7 @@ fn board_stats(
                  WHERE type IN ('task_released', 'task_updated') AND at >= ?2 AND board = ?1 \
                  AND json_extract(payload, '$.from') = 'review' \
                  AND (type = 'task_released' \
-                      OR json_extract(payload, '$.to') IN ('open', 'doing', 'blocked'))",
+                      OR json_extract(payload, '$.to') IN ('open', 'doing'))",
                 params![slug, from],
                 |r| r.get(0),
             )?,
