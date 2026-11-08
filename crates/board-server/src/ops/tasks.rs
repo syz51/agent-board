@@ -761,7 +761,8 @@ fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
     ))
 }
 
-/// Claims an open task: one conditional update, so concurrent claims have one winner.
+/// Claims an open task: one conditional update, so concurrent claims have one winner. A
+/// parked task (review or blocked) that is the caller's or nobody's resumes instead.
 pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
     touch_agent(cx, agent)?;
     let task = get_task(cx, id)?;
@@ -778,14 +779,16 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
             "pick another task from ready (task_list ready=true)",
         ));
     }
+    if matches!(task.status, TaskStatus::Review | TaskStatus::Blocked)
+        && (owned_by_me || task.owner.is_none())
+    {
+        return resume(cx, &task, agent);
+    }
     if task.status != TaskStatus::Open {
         let next = if task.owner_stale && !task.status.is_closed() {
             format!("its owner is stale: take it with {}", take_hint(id))
         } else if task.status.is_closed() {
             format!("reopen it first (task_update {id} status=open) if it needs more work")
-        } else if owned_by_me {
-            // Review and blocked: the owner resumes its own task rather than claiming it.
-            format!("you own it: resume it with task_update {id} status=doing")
         } else {
             "pick another task from ready (task_list ready=true)".to_owned()
         };
@@ -823,6 +826,61 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         EventType::TaskClaimed,
         Some(id),
         serde_json::json!({ "previous_owner": previous }),
+    )?;
+    get_task(cx, id)
+}
+
+/// Resumes a parked task (review or blocked) that is the caller's or nobody's, for
+/// `claim`: the checks of a claim, then the change and event of `task_update status=doing`,
+/// so stats do not count it as a claim from ready. A blocked reason may name a wait the
+/// server cannot see, such as an ask, so it is refused until the caller resumes it itself.
+fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
+    let id = &task.id;
+    if board_proto::is_unaccepted_proposal(task.auto, &task.body, task.feedback.is_some()) {
+        return Err(unaccepted_proposal(id));
+    }
+    // Stored only on blocked tasks and only when not blank.
+    if let Some(reason) = &task.blocked_reason {
+        return Err(bad_transition(
+            format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
+            format!(
+                "it is blocked for \"{reason}\": resume it ({}) only once that no longer holds",
+                resume_hint(id)
+            ),
+        ));
+    }
+    check_blockers_done(cx, id)?;
+    check_not_before(cx, task)?;
+    check_doing_limit(cx, agent, id)?;
+    let now = cx.now_ms();
+    let updated = cx.db.execute(
+        "UPDATE tasks SET status = 'doing', owner = ?2, doing_since = COALESCE(doing_since, ?3), \
+         version = version + 1, updated_at = ?3 WHERE id = ?1 AND version = ?4",
+        params![id.as_str(), agent.as_str(), now, task.version],
+    )?;
+    if updated != 1 {
+        return Err(refused(
+            format!("claim refused: {id} changed while claiming"),
+            "re-read it and pick another task from ready",
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "fields": ["status"],
+        "from": task.status,
+        "to": TaskStatus::Doing,
+    });
+    if task.owner.is_none() {
+        join_board(cx, &task.board, agent)?;
+        payload["fields"] = serde_json::json!(["status", "owner"]);
+        payload["owner"] = serde_json::json!(agent);
+        payload["previous_owner"] = serde_json::Value::Null;
+    }
+    cx.emit(
+        Some(&task.board),
+        agent.as_str(),
+        EventType::TaskUpdated,
+        Some(id),
+        payload,
     )?;
     get_task(cx, id)
 }
@@ -972,7 +1030,8 @@ fn check_handover(
                     format!("to work on it yourself, claim it (task_claim {id})")
                 } else {
                     format!(
-                        "to work on it yourself, resume it (task_update {id} status=doing) without owner"
+                        "to work on it yourself, resume it ({}) without owner",
+                        resume_hint(id)
                     )
                 },
             ),
@@ -1010,7 +1069,10 @@ fn check_handover(
     if !owned {
         return Err(invalid(
             format!("nobody owns {id}, so it cannot be handed over"),
-            format!("resume it for that agent: task_update {id} status=doing owner={target}"),
+            format!(
+                "resume it for that agent: {} owner={target}",
+                resume_hint(id)
+            ),
         ));
     }
     let Some(found) = find_agent(cx, target)? else {
@@ -1030,7 +1092,6 @@ fn check_handover(
     Ok(())
 }
 
-/// How to take a stale owner's task, through MCP or the CLI.
 /// The refusal of an unaccepted proposal moving to doing. The hint keeps the claimant,
 /// who may be the proposer, from accepting it itself.
 fn unaccepted_proposal(id: &TaskId) -> Error {
@@ -1043,8 +1104,14 @@ fn unaccepted_proposal(id: &TaskId) -> Error {
     )
 }
 
+/// How to take a stale owner's task, through MCP or the CLI.
 fn take_hint(id: &TaskId) -> String {
     format!("task_claim {id} take=true, or board take {id}")
+}
+
+/// How to move a parked task back to doing.
+fn resume_hint(id: &TaskId) -> String {
+    format!("task_update {id} status=doing")
 }
 
 /// `check_doing_limit` for `owner`, worded for the caller when someone else is the owner.
@@ -1355,7 +1422,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
                 status_str(task.status)
             ),
             match task.status {
-                TaskStatus::Blocked => format!("resume it first (task_update {id} status=doing)"),
+                TaskStatus::Blocked => format!("resume it first ({})", resume_hint(id)),
                 _ => format!("claim it first with task_claim {id}"),
             },
         ));

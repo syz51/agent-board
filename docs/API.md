@@ -355,11 +355,18 @@ Reopening a closed board, or any change on it, starts the period again.
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
   `not_before` has not passed. A pending proposal is refused the same way, with 400
-  `invalid_transition`, until a verdict sets it `auto`. A task in `review` or `blocked` is
-  400 `invalid_transition` too; when the caller owns it, `next` says to resume it with
-  `task_update <id> status=doing`, and another agent's claim is 409 `claim_refused`
-  naming the owner. A claim
+  `invalid_transition`, until a verdict sets it `auto`. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
+  A task in `review` or `blocked`:
+  - owned by the caller or by nobody: the claim resumes it, as `PATCH` with
+    `status: doing` would (the same `task_updated` event, not `task_claimed`), after the
+    checks above (blockers done, `not_before` passed, the `doing` limit, no pending
+    proposal). A `blocked` task with a `blocked_reason` is refused with 400
+    `invalid_transition`, since the reason may name a wait the server cannot see; `next`
+    quotes the reason and says to resume it with `task_update <id> status=doing` only once
+    it no longer holds.
+  - owned by another live agent: 409 `claim_refused` naming the owner.
+  - owned by a stale agent: 400 `invalid_transition`, with `next` naming `take=true`.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
   board coordinator or user only (as status changes below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`; records a
