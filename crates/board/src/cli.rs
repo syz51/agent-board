@@ -797,7 +797,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let named: board_proto::AgentId = named.parse().context("--agent")?;
             crate::identity::refuse_borrowed(proven_identity().as_ref(), &named, "--agent")?;
         }
-        let ctx = Ctx::load(home.clone(), agent()?, None)?;
+        let mut ctx = Ctx::load(home.clone(), agent()?, None)?;
+        // A read the proxy fails while the server restarts is sent again, not left to the agent.
+        ctx.client = ctx
+            .client
+            .with_read_retries(crate::client::READ_RETRY_DELAYS);
         Ok(loaded.get_or_init(|| ctx).clone())
     };
     if let Err(err) = cli.command.check_text_limits() {
