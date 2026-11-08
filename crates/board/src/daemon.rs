@@ -45,7 +45,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, error_code, is_unreachable};
-use crate::config::{Config, Home};
+use crate::config::{Config, Home, load_token};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut};
@@ -2235,6 +2235,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         ctx.device,
         t3.bin.display()
     );
+    // Hooks of this home reach the server through the relay while the daemon runs; without
+    // it they call the server directly, so a relay that cannot start costs only speed.
+    let _relay = if once { None } else { start_relay(&ctx) };
     let mut daemon = Daemon::new(ctx, t3);
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
@@ -2252,6 +2255,26 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         return daemon.save();
     }
     daemon.follow(&mut shutdown).await
+}
+
+/// Starts the hook relay for `ctx`'s home, or says why not and carries on without it.
+fn start_relay(ctx: &Ctx) -> Option<crate::relay::Relay> {
+    let started = load_token(&ctx.home)
+        .and_then(|token| token.context("no device token"))
+        .and_then(|token| {
+            let (server, _) = ctx.config.require_login()?;
+            crate::relay::start(&ctx.home, server, token)
+        });
+    match started {
+        Ok(relay) => {
+            tracing::info!("serving hooks on {}", relay.path().display());
+            Some(relay)
+        }
+        Err(err) => {
+            tracing::warn!("hooks will call the server directly: {err:#}");
+            None
+        }
+    }
 }
 
 /// A request to stop: Ctrl-C, SIGTERM from launchd or systemd stopping the service, or a

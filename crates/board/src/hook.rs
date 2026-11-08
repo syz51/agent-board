@@ -26,7 +26,7 @@ use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::client::{Client, SnapshotQuery, TaskQuery};
+use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::render;
@@ -186,6 +186,8 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
 
 struct Hook<'a> {
     event: HookEvent,
+    /// The hook reaches the server through the device daemon's relay.
+    relayed: bool,
     runtime: Runtime,
     /// The session runs inside another agent session (`identity::is_nested`).
     nested: bool,
@@ -279,10 +281,13 @@ async fn handle(
     } else {
         Vec::new()
     };
+    // The device daemon's relay, when its socket is there and safe to use: it holds the
+    // token, so the hook needs none.
+    let relay = crate::relay::safe_socket(&home);
     // The Keychain lookup runs a process, while the process table and the work tree are
     // read below. A PostToolUse hook other than an edit tool's often has nothing to send,
     // so it looks the token up only once it knows it has.
-    let mut token = (!post || !edited.is_empty()).then(|| spawn_token(&home));
+    let mut token = (relay.is_none() && (!post || !edited.is_empty())).then(|| spawn_token(&home));
     let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
     let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
@@ -313,14 +318,28 @@ async fn handle(
         // Nothing to send: no server call and no Keychain lookup.
         return Ok(Reply::Nothing);
     }
-    let token = match token.take() {
-        Some(token) => token,
-        None => spawn_token(&home),
+    // A socket left by a daemon that stopped refuses at once: then call the server directly.
+    let relay = match relay {
+        Some(socket) if crate::relay::answers(&socket).await => Some(socket),
+        _ => None,
     };
-    let Some(token) = token.await?? else {
-        return Ok(Reply::Nothing);
+    let route = match relay {
+        Some(socket) => {
+            steps.mark("relay");
+            Route::Relay(socket)
+        }
+        None => {
+            let token = match token.take() {
+                Some(token) => token,
+                None => spawn_token(&home),
+            };
+            let Some(token) = token.await?? else {
+                return Ok(Reply::Nothing);
+            };
+            steps.mark("token");
+            Route::Direct(token)
+        }
     };
-    steps.mark("token");
     let t3_parent = match event {
         HookEvent::SessionStart if !nested && t3_identity_applies(explicit_agent, env) => {
             delegated_parent(&home, runtime, session).await
@@ -329,10 +348,16 @@ async fn handle(
     };
     steps.mark("t3");
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
-    let connect = CONNECT_BUDGET.min(remaining);
-    let client =
-        Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?;
+    let relayed = matches!(route, Route::Relay(_));
+    let client = match route {
+        Route::Relay(socket) => Client::relayed(&socket, agent.clone(), remaining)?,
+        Route::Direct(token) => {
+            let connect = CONNECT_BUDGET.min(remaining);
+            Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
+        }
+    };
     let mut hook = Hook {
+        relayed,
         event,
         runtime,
         nested,
@@ -365,30 +390,36 @@ async fn handle(
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
-    let (reply, failure) = match tokio::time::timeout(remaining, hook.online(repo)).await {
+    // `judged`: whether a failure says anything about the server.
+    let (reply, failure, judged) = match tokio::time::timeout(remaining, hook.online(repo)).await {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
-            (reply, None)
+            (reply, None, true)
         }
         // The server answered with an error: it is reachable, so the cache is no better.
         Ok(Err(err)) if crate::client::error_code(&err).is_some() => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            (hook.local_stop(), None)
+            (hook.local_stop(), None, true)
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
             let failure = Failure::of(&err);
-            (hook.offline(failure), Some(failure))
+            // The relay's connection failing (a daemon stopped mid-hook) says nothing about
+            // the server; the relay reports the server's own failures, and a timeout counts.
+            let judged = !hook.relayed
+                || failure == Failure::Slow
+                || err.chain().any(|c| c.is::<RelayFailure>());
+            (hook.offline(failure), Some(failure), judged)
         }
         Err(_) => {
             tracing::debug!("hook {}: no answer within {remaining:?}", event.name());
-            (hook.offline(Failure::Slow), Some(Failure::Slow))
+            (hook.offline(Failure::Slow), Some(Failure::Slow), true)
         }
     };
     steps.mark("server");
     let next = match failure {
-        // This device left the server too little time to judge it.
-        Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
+        // This device left the server too little time to judge it, or the relay failed.
+        Some(_) if remaining < SERVER_SHARE_FAIR || !judged => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
@@ -436,6 +467,14 @@ impl Drop for Steps {
     }
 }
 
+/// How a hook reaches the server.
+enum Route {
+    /// Through the device daemon's relay on this socket.
+    Relay(PathBuf),
+    /// Directly, with this token.
+    Direct(String),
+}
+
 /// Why the hook got no answer from the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Failure {
@@ -451,6 +490,13 @@ impl Failure {
     /// A request that timed out after it connected is slow; any other failure to get an
     /// answer is unreachable, a connection not opened within [`CONNECT_BUDGET`] included.
     fn of(err: &anyhow::Error) -> Self {
+        if let Some(relayed) = err.chain().find_map(|e| e.downcast_ref::<RelayFailure>()) {
+            return if relayed.slow {
+                Self::Slow
+            } else {
+                Self::Unreachable
+            };
+        }
         let timed_out = err
             .chain()
             .filter_map(|e| e.downcast_ref::<reqwest::Error>())
@@ -752,6 +798,22 @@ impl Hook<'_> {
             .await
     }
 
+    /// Marks the agent running and fetches a snapshot of `kind`. Directly, one request after
+    /// the other, so both use one connection: two at once would open two, each with its own
+    /// TLS handshake (the client speaks HTTP/1.1). Through the relay, at once: its
+    /// connections to the server are already open.
+    async fn beat_and_fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
+        let beat = self.set_state(AgentState::Running, None);
+        if self.relayed {
+            let (beat, snap) = tokio::join!(beat, self.fetch(kind));
+            beat?;
+            snap
+        } else {
+            beat.await?;
+            self.fetch(kind).await
+        }
+    }
+
     /// Records the snapshot's sequence (and caches a full one) and returns its text.
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
         self.local.seq = Some(snap.seq);
@@ -838,17 +900,8 @@ impl Hook<'_> {
         } else {
             SnapshotKind::Delta
         };
-        let heartbeat = self.client.set_state(
-            &self.agent,
-            &AgentStateUpdate {
-                state: AgentState::Running,
-                paused_until: None,
-                said: None,
-            },
-        );
-        let (beat, snap) = tokio::join!(heartbeat, self.fetch(kind));
-        beat?;
-        let text = self.keep(snap?)?;
+        let snap = self.beat_and_fetch(kind).await?;
+        let text = self.keep(snap)?;
         Ok(if text.is_empty() {
             Reply::Nothing
         } else {
@@ -868,8 +921,8 @@ impl Hook<'_> {
         }
         if heartbeat_due(self.local.last_heartbeat, self.now) {
             self.local.last_heartbeat = Some(self.now);
-            self.set_state(AgentState::Running, None).await?;
-            let alerts = self.snapshot(SnapshotKind::Alerts).await?;
+            let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
+            let alerts = self.keep(snap)?;
             if !alerts.is_empty() {
                 lines.push(alerts);
             }

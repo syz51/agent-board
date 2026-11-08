@@ -131,13 +131,33 @@ pub fn take_skew_warning() -> Option<String> {
         .take()
 }
 
+/// The device daemon's hook relay got no answer from the server (`relay::RELAY_HEADER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayFailure {
+    /// The server took too long, rather than refusing or failing the connection.
+    pub slow: bool,
+}
+
+impl fmt::Display for RelayFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = if self.slow { "slow" } else { "unreachable" };
+        write!(
+            f,
+            "board server {what} (from the device daemon's hook relay)"
+        )
+    }
+}
+
+impl std::error::Error for RelayFailure {}
+
 /// Whether `err` is the server not answering at all (no connection, or no answer in
 /// time), rather than an answer that was an error.
 pub fn is_unreachable(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_request())
+        cause.is::<RelayFailure>()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|e| e.is_connect() || e.is_timeout() || e.is_request())
     })
 }
 
@@ -192,7 +212,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    token: String,
+    /// `None` through the device daemon's relay, which adds the device token itself.
+    token: Option<String>,
     agent: Option<AgentId>,
     /// Bounds each request and its answer; for the event stream, only until it opens.
     timeout: Option<Duration>,
@@ -225,7 +246,7 @@ impl Client {
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
-            token,
+            token: Some(token),
             agent,
             timeout,
         })
@@ -270,11 +291,31 @@ impl Client {
         Ok(client)
     }
 
+    /// A client for `agent` that reaches the server through the device daemon's relay on
+    /// the Unix socket `socket` (see `relay`), with `timeout` for each whole request. It
+    /// sends no token: the relay adds the device's.
+    pub fn relayed(socket: &std::path::Path, agent: AgentId, timeout: Duration) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .unix_socket(socket)
+            .timeout(timeout)
+            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(Self {
+            http,
+            // Not used to connect: the relay forwards to its own server.
+            base: "http://board-relay.invalid".to_owned(),
+            token: None,
+            agent: Some(agent),
+            timeout: Some(timeout),
+        })
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        let mut req = self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token);
+        let mut req = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
         if let Some(agent) = &self.agent {
             req = req.header(AGENT_HEADER, agent.as_str());
         }
@@ -286,6 +327,15 @@ impl Client {
             req = req.timeout(timeout);
         }
         let resp = req.send().await.context("board server unreachable")?;
+        // Only the relay sets the header, and only a relayed client (no token) believes it.
+        if self.token.is_none()
+            && let Some(kind) = resp.headers().get(crate::relay::RELAY_HEADER)
+        {
+            return Err(RelayFailure {
+                slow: kind == "slow",
+            }
+            .into());
+        }
         note_server_build(resp.headers());
         let status = resp.status();
         let bytes = resp.bytes().await.context("reading the server's answer")?;
@@ -586,7 +636,7 @@ fn not_found_as_none<T>(result: Result<T>) -> Result<Option<T>> {
 }
 
 /// Percent-encodes a path segment (agent ids contain `:` and `%`).
-fn enc(segment: &str) -> String {
+pub(crate) fn enc(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for b in segment.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

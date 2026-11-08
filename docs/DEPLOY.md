@@ -101,6 +101,11 @@ a desktop session (a login over SSH, or a locked Keychain), `board login` stores
 Each `$BOARD_HOME` keeps its own token, so a second login with another `BOARD_HOME` (for
 the `--user` token you answer asks with) does not replace the device's token.
 
+While `board watch` runs, hooks reach the server through it, on the socket
+`$BOARD_HOME/run/hook.sock`, and skip the TLS handshake and the token lookup. It reads the
+token and server when it starts, so restart it after `board login`. Without it, hooks call
+the server directly.
+
 ### Coordinators and the feedback board
 
 A board with autopilot on gets a coordinator thread on one of its home devices, in a T3
