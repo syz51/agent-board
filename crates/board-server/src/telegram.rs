@@ -5,8 +5,8 @@
 //!
 //! Every minute it also reports tasks in doing or review that went quiet past
 //! `stuck_after_secs`, in one message per check and once until they change; reports active
-//! autopilot boards whose ready work sat unclaimed past `stalled_after_secs`, once until a
-//! task on the board moves into or out of doing; and sends a daily Needs you digest at
+//! autopilot boards whose ready work sat unclaimed past `stalled_after_secs`, once until
+//! the board stalls anew; and sends a daily Needs you digest at
 //! `digest_at` (skipped when there is nothing to list). Each is recorded only once sent, so
 //! an alert is never lost; a crash between the send and the record repeats it once.
 //!
@@ -38,9 +38,9 @@ use crate::store::{find_task, get_agent, get_ask, get_board};
 /// Long-poll timeout passed to `getUpdates`.
 const POLL_SECS: u64 = 25;
 const RETRY: Duration = Duration::from_secs(5);
-/// How often the stuck alert and the digest are checked.
+/// How often the scheduled alerts are checked.
 const CHECK_EVERY: Duration = Duration::from_secs(60);
-/// Room for the digest and stuck texts: Telegram takes at most 4,096 characters per message.
+/// Room for the digest, stuck and stalled texts: Telegram takes at most 4,096 characters per message.
 const DIGEST_CHARS: usize = 3_500;
 /// How long after its time a day's digest still goes out once the local date has turned.
 const DIGEST_GRACE_MINS: i64 = 60;
@@ -565,31 +565,36 @@ fn stuck_text(
 }
 
 /// Reports the autopilot boards whose ready work sits unclaimed, in one message, each once
-/// until a task on it moves into or out of doing. Recorded only once sent.
+/// until it stalls anew. Only what was sent is recorded, so a failed send, or boards past
+/// the message's length, go in the next check's message.
 async fn send_stalled(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule) -> Result<()> {
     let quiet_ms =
         i64::try_from(schedule.stalled_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
     let stalled = state
-        .read(move |cx| telegram_ops::stalled(cx, quiet_ms))
+        .write(move |cx| telegram_ops::stalled(cx, quiet_ms))
         .await?;
     if stalled.is_empty() {
         return Ok(());
     }
-    let text = stalled_text(state, &stalled, schedule);
+    let (text, shown) = stalled_text(state, &stalled, schedule);
     bot.send(json!({ "chat_id": chat, "text": text })).await?;
-    let sent: Vec<_> = stalled.into_iter().map(|b| (b.board, b.seq)).collect();
+    let sent: Vec<_> = stalled
+        .into_iter()
+        .take(shown)
+        .map(|b| (b.board, b.since))
+        .collect();
     state
         .write(move |cx| telegram_ops::record_stalled(cx, &sent))
         .await
 }
 
-/// The stalled message: per board, its ready count, how long nothing moved, and its
-/// coordinator. Boards are few, so it needs no cap.
+/// The stalled message, and how many of `stalled` it lists: per board, its ready count,
+/// since when it stalled, and the coordinator that holds its lease.
 fn stalled_text(
     state: &AppState,
     stalled: &[telegram_ops::Stalled],
     schedule: &Schedule,
-) -> String {
+) -> (String, usize) {
     let threshold =
         TimeDelta::seconds(i64::try_from(schedule.stalled_after_secs).unwrap_or(i64::MAX));
     let mut text = format!(
@@ -598,27 +603,38 @@ fn stalled_text(
         plural(stalled.len(), "board", "boards"),
         span(threshold),
     );
+    let mut shown = 0;
     for board in stalled {
         let coordinator = match &board.coordinator {
             Some((handle, agent_state, seen)) => format!(
                 "Coordinator {handle}: {agent_state}, last seen {}.",
                 local(*seen, schedule.utc_offset)
             ),
-            None => "No coordinator named.".to_owned(),
+            None => "No coordinator holds the board.".to_owned(),
         };
-        text.push_str(&format!(
-            "\n{}: {} ready auto {}, no task in doing, quiet for {} (since {}).\n{coordinator}\n",
+        let mut item = format!(
+            "\n{}: {} ready auto {}, no task in doing, stalled for {} (since {}).\n{coordinator}\n",
             board.board,
             board.ready,
             plural(board.ready, "task", "tasks"),
-            span(state.now() - board.quiet_since),
-            local(board.quiet_since, schedule.utc_offset),
-        ));
+            span(state.now() - board.since),
+            local(board.since, schedule.utc_offset),
+        );
         if let Some(url) = state.public_url() {
-            text.push_str(&format!("{url}/boards/{}\n", board.board));
+            item.push_str(&format!("{url}/boards/{}\n", board.board));
         }
+        // The first board always fits: slugs and handles are short, and the cap leaves room.
+        if shown > 0 && text.chars().count() + item.chars().count() > DIGEST_CHARS {
+            text.push_str(&format!(
+                "\n… and {} more in the next message.",
+                stalled.len() - shown
+            ));
+            break;
+        }
+        text.push_str(&item);
+        shown += 1;
     }
-    text.trim_end().to_owned()
+    (text.trim_end().to_owned(), shown)
 }
 
 /// Sends the digest of the local day once its time has passed, unless it was sent; nothing

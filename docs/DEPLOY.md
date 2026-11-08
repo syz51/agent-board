@@ -67,8 +67,9 @@ utc_offset = "+08:00"      # the local time's offset from UTC (fixed: no dayligh
 The first digest goes out at the first check past `digest_at` after the upgrade, which can
 be right away; days with nothing to list send nothing. Set `utc_offset`: without it,
 `digest_at` is read as UTC. The first check after the upgrade also reports every task
-already quiet past `stuck_after_secs`, in one message, and every autopilot board already
-stalled past `stalled_after_secs`, in another.
+already quiet past `stuck_after_secs`, in one message. A board's stalled clock starts at the
+first check that sees it stalled, so an autopilot board already stalled at the upgrade is
+reported `stalled_after_secs` later.
 
 To upgrade, use `deploy/upgrade.sh` (section 5). Migrations run on start. Since pairing
 came in, `BOARD_TELEGRAM_TOKEN` alone starts the notifier, without a `[telegram]` table; it
