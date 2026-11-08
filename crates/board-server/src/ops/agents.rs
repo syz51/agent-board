@@ -213,12 +213,16 @@ pub(crate) fn boards_for_repo(cx: &Ctx<'_>, repo: &str) -> Result<Vec<board_prot
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// How long an ended agent stays in a board's listing: its membership and record stay, so
-/// it comes back when it resumes, and `state=ended` lists it.
-const ENDED_LISTED_MS: i64 = 7 * 86_400_000;
+/// How long an unseen agent stays in a board's listing: its membership and record stay, so
+/// it comes back when it is seen again, and `state=ended` lists the ended ones.
+const UNSEEN_LISTED_MS: i64 = 7 * 86_400_000;
 
-/// Agents, by board and state. A board's listing leaves out agents that ended more than a
-/// week ago unless `state=ended`, so it does not grow with every session the board ever
+/// Agents, by board and state. A board's listing leaves out agents not seen for more than a
+/// week, whatever their state (a session that crashed never sends `ended`), unless the
+/// request asks for `state=ended`. Kept are agents that wait: for a usage-limit reset still
+/// ahead (paused, or ended meanwhile), or paused with no reset, for the user. So is the
+/// board's coordinator while its lease is live, since the daemon renews the lease without
+/// marking the agent seen. So the listing does not grow with every session the board ever
 /// had; the unfiltered listing stays complete, as clients use it to name agents.
 pub(crate) fn list(
     cx: &Ctx<'_>,
@@ -226,12 +230,20 @@ pub(crate) fn list(
     state: Option<AgentState>,
 ) -> Result<Vec<Agent>> {
     let board = board.map(|b| b.as_str().to_owned());
-    let ended_before = cx.now_ms() - ENDED_LISTED_MS;
+    let now = cx.now_ms();
+    let unseen_before = now - UNSEEN_LISTED_MS;
     let mut filter = vec!["1 = 1"];
     let mut params: crate::store::NamedParams<'_> = Vec::new();
     if board.is_some() && state != Some(AgentState::Ended) {
-        filter.push("NOT (state = 'ended' AND last_seen < :ended_before)");
-        params.push((":ended_before", &ended_before));
+        filter.push(
+            "(last_seen >= :unseen_before \
+             OR paused_until > :now \
+             OR (state = 'paused' AND paused_until IS NULL) \
+             OR id IN (SELECT coordinator FROM boards \
+                       WHERE slug = :board AND coordinator_expires_at > :now))",
+        );
+        params.push((":unseen_before", &unseen_before));
+        params.push((":now", &now));
     }
     let state = state.map(|s| enum_str(&s));
     if let Some(board) = &board {
