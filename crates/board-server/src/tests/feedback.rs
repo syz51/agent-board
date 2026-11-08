@@ -1120,6 +1120,43 @@ async fn refused_claims_are_counted_but_are_not_signals() {
 }
 
 #[tokio::test]
+async fn expected_errors_take_no_write_to_record_and_others_still_do() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let task = t.task(A, "factory", "Race").await;
+    assert!(t.claim(A, &task).await.0.is_success());
+
+    // A refused claim takes two transactions of its own: the claim and the count of
+    // refusals for the stats. A lost race is expected, so none runs to record it.
+    let before = t.state.db().writes();
+    let (s, v) = t.claim(B, &task).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused"))
+    );
+    assert!(
+        v["message"].as_str().unwrap().starts_with("claim refused:"),
+        "{v}"
+    );
+    assert_eq!(t.state.db().writes() - before, 2, "no write to record it");
+
+    // A claim past the doing limit is not expected: a third transaction records it.
+    let other = t.task(A, "factory", "One too many").await;
+    let before = t.state.db().writes();
+    let (s, v) = t.claim(A, &other).await;
+    assert_eq!(s.as_u16(), 409, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("you already have"),
+        "{v}"
+    );
+    assert_eq!(t.state.db().writes() - before, 3, "one write to record it");
+    assert_eq!(t.count("SELECT COUNT(*) FROM api_errors"), 1);
+}
+
+#[tokio::test]
 async fn stats_count_feedback() {
     let t = setup().await;
     let item = report(&t, A, json!({ "about": "board", "text": "One" })).await["task"]["id"]

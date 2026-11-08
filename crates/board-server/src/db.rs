@@ -52,6 +52,9 @@ pub struct Db {
     readers: Arc<Readers>,
     writer: Arc<Mutex<Connection>>,
     events: broadcast::Sender<Event>,
+    /// Write transactions begun, so tests can tell that a request took no writer turn.
+    #[cfg(test)]
+    writes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Db {
@@ -65,7 +68,15 @@ impl Db {
             readers: Arc::new(readers),
             writer: Arc::new(Mutex::new(writer)),
             events,
+            #[cfg(test)]
+            writes: Arc::default(),
         })
+    }
+
+    /// Write transactions begun since the database opened.
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Creates a device (a user device when `user`) and returns its token, shown once.
@@ -107,6 +118,9 @@ impl Db {
         f: impl FnOnce(&mut Ctx<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.lock();
+        #[cfg(test)]
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cx = Ctx {
             db: &tx,
