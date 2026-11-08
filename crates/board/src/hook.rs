@@ -62,16 +62,21 @@ const CONNECT_BUDGET: Duration = Duration::from_millis(500);
 /// What a `Stop` leaves of the server share after registering a renamed thread, so the
 /// hook answers before its own deadline.
 const RENAME_MARGIN: Duration = Duration::from_millis(50);
-/// How long before the request's deadline a direct connect's deadline falls when the server
-/// share leaves less than this beyond [`CONNECT_BUDGET`]: a connect that hangs then fails on
-/// its own deadline, as unreachable, instead of racing the request's.
+/// How long before the request's deadline a direct connect's deadline falls when the time
+/// left as it starts is less than this beyond [`CONNECT_BUDGET`]: a connect that hangs then
+/// fails on its own deadline, as unreachable, instead of racing the request's.
 const CONNECT_LEAD: Duration = Duration::from_millis(100);
 /// A server share shorter than this, because the hook's local steps took the rest of the
 /// budget, is too little to judge the server: a slow answer leaves the breaker as it was, and
-/// a direct connect gets no deadline of its own, so one that hangs ends with the request, as
-/// slow. A connection that fails at once is unreachable whatever the share. At least
-/// [`CONNECT_LEAD`] plus a fair connect (well over the 0.1 s a tailnet takes).
+/// a direct connect starting with less than this left gets no deadline of its own, so one
+/// that hangs ends with the request, as slow. A connection that fails at once is unreachable
+/// whatever the share. At least [`CONNECT_LEAD`] plus a fair connect (well over the 0.1 s a
+/// tailnet takes).
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
+/// Debug builds only: gives the server this many milliseconds from when the hook sets its
+/// share, whatever the local steps took, and lets those steps take up to [`BUDGET`] more.
+/// Tests set the share with it instead of slowing the machine; a release build ignores it.
+pub const SHARE_ENV: &str = "BOARD_HOOK_SERVER_SHARE_MS";
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
@@ -161,7 +166,10 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     // A guard around the whole hook; `handle` keeps its own, earlier deadline for the
     // network so it can still fall back to the cache.
-    let guard = BUDGET.saturating_sub(started.elapsed() + MARGIN / 2);
+    let guard = match share_override() {
+        Some(share) => share + BUDGET,
+        None => BUDGET.saturating_sub(started.elapsed() + MARGIN / 2),
+    };
     let reply = match tokio::time::timeout(
         guard,
         handle(event, runtime, explicit_agent, &input, started),
@@ -396,31 +404,13 @@ async fn handle(
             Route::Direct(token)
         }
     };
-    let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
-    let fair = remaining >= SERVER_SHARE_FAIR;
-    tracing::debug!(
-        "hook {}: server share {}ms{}",
-        event.name(),
-        remaining.as_millis(),
-        if fair { "" } else { ", too little to judge" }
-    );
-    let deadline = tokio::time::Instant::now() + remaining.saturating_sub(RENAME_MARGIN);
     let relayed = matches!(route, Route::Relay(_));
+    let connects = std::sync::Arc::new(ConnectClock::default());
     let client = match route {
-        Route::Relay(client) => client
-            .with_agent(Some(agent.clone()))
-            .with_timeout(remaining),
-        Route::Direct(token) => {
-            // The connect's deadline never races the request's: it falls well before it, or,
-            // with too little time to judge, past it, so a connect that hangs reads as slow.
-            let connect = if fair {
-                CONNECT_BUDGET.min(remaining - CONNECT_LEAD)
-            } else {
-                BUDGET
-            };
-            Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
-        }
+        Route::Relay(client) => client.with_agent(Some(agent.clone())),
+        Route::Direct(token) => direct_client(server, token, Some(agent.clone()), &connects)?,
     };
+    steps.mark("client");
     let mut hook = Hook {
         relayed,
         event,
@@ -436,7 +426,8 @@ async fn handle(
         t3,
         done_reminder: None,
         now,
-        deadline,
+        // Set with the server's share, below.
+        deadline: tokio::time::Instant::now(),
     };
     // Turn boundaries for the done reminder hold whether or not the server answers.
     match event {
@@ -456,8 +447,28 @@ async fn handle(
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
+    if event == HookEvent::Stop {
+        // Before any server call, so it survives a server that fails (`local_stop`), and
+        // before the share is measured, so its file reads count against the share.
+        hook.prepare_done_reminder();
+    }
+    // What the server gets: what the local steps, the client build and a `Stop`'s local work
+    // left of the budget.
+    let server_deadline = server_deadline(tokio::time::Instant::from_std(started));
+    connects.set_deadline(server_deadline);
+    let share = server_deadline.saturating_duration_since(tokio::time::Instant::now());
+    hook.deadline = server_deadline - RENAME_MARGIN;
+    hook.client = hook.client.clone().with_timeout(share);
+    let fair = share >= SERVER_SHARE_FAIR;
+    tracing::debug!(
+        "hook {}: server share {}ms{}",
+        event.name(),
+        share.as_millis(),
+        if fair { "" } else { ", too little to judge" }
+    );
     // `judged`: whether a failure says anything about the server.
-    let (reply, failure, judged) = match tokio::time::timeout(remaining, hook.online(repo)).await {
+    let online = tokio::time::timeout_at(server_deadline, hook.online(repo)).await;
+    let (reply, failure, judged) = match online {
         Ok(Ok(reply)) => {
             hook.local.offline_notified = false;
             (reply, None, true)
@@ -486,7 +497,7 @@ async fn handle(
             (hook.offline(failure), Some(failure), !relay_broke)
         }
         Err(_) => {
-            tracing::debug!("hook {}: no answer within {remaining:?}", event.name());
+            tracing::debug!("hook {}: no answer within {share:?}", event.name());
             (hook.offline(Failure::Slow), Some(Failure::Slow), true)
         }
     };
@@ -494,8 +505,9 @@ async fn handle(
     let next = match failure {
         // The relay failed, not the server.
         _ if !judged => breaker.clone(),
-        // This device left the server too little time to judge it slow.
-        Some(Failure::Slow) if !fair => breaker.clone(),
+        // This device left the server too little time to judge it slow, or a connect
+        // started with too little time left to get a deadline of its own.
+        Some(Failure::Slow) if !fair || connects.unjudged() => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
@@ -503,6 +515,87 @@ async fn handle(
     }
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// When the hook stops waiting for the server: [`BUDGET`] - [`MARGIN`] after it `started`,
+/// however long the local steps, the client build and the local work before the first
+/// request took. With [`SHARE_ENV`] (debug builds), that share from now instead; the hook
+/// asks just before its first request.
+fn server_deadline(started: tokio::time::Instant) -> tokio::time::Instant {
+    match share_override() {
+        Some(share) => tokio::time::Instant::now() + share,
+        None => started + (BUDGET - MARGIN),
+    }
+}
+
+/// The server share a test set with [`SHARE_ENV`], at most [`BUDGET`]; always `None` in a
+/// release build. A value that is not a whole number of milliseconds panics, so a test never
+/// runs on the real share by mistake.
+fn share_override() -> Option<Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let ms = std::env::var(SHARE_ENV).ok()?;
+    let ms: u64 = ms
+        .parse()
+        .unwrap_or_else(|_| panic!("{SHARE_ENV}={ms:?}: give whole milliseconds"));
+    Some(Duration::from_millis(ms).min(BUDGET))
+}
+
+/// What a direct client's connects share with the hook: the server's deadline, set when
+/// the hook measures the server's share, and whether a connect started with too little time
+/// left to judge the server.
+#[derive(Default)]
+struct ConnectClock {
+    deadline: std::sync::OnceLock<tokio::time::Instant>,
+    unjudged: std::sync::atomic::AtomicBool,
+}
+
+impl ConnectClock {
+    fn set_deadline(&self, deadline: tokio::time::Instant) {
+        // Set once per hook; a second value would be the same deadline.
+        let _ = self.deadline.set(deadline);
+    }
+
+    /// The deadline of a connect starting now ([`connect_limit`]); none before the server's
+    /// deadline is set.
+    fn limit(&self) -> Option<Duration> {
+        let deadline = *self.deadline.get()?;
+        let limit = connect_limit(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if limit.is_none() {
+            self.unjudged
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        limit
+    }
+
+    /// A connect started with too little time left to get a deadline of its own, so a slow
+    /// answer says nothing about the server.
+    fn unjudged(&self) -> bool {
+        self.unjudged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A client that calls the server directly. The connect's deadline never races the
+/// request's: set as each connect starts ([`ConnectClock::limit`]), it falls well before
+/// it, or, with too little time to judge, there is none, so one that hangs reads as slow.
+/// Work between building the client and the first request so shortens no lead. Each
+/// request gets [`BUDGET`] until the hook sets the share with [`Client::with_timeout`].
+fn direct_client(
+    server: &str,
+    token: String,
+    agent: Option<AgentId>,
+    connects: &std::sync::Arc<ConnectClock>,
+) -> Result<Client> {
+    let connects = connects.clone();
+    Client::with_connect_limit(server, token, agent, BUDGET, move || connects.limit())
+}
+
+/// The deadline of a direct connection that starts `left` before the server's deadline: at
+/// most [`CONNECT_BUDGET`], and [`CONNECT_LEAD`] before the request's. None with less than
+/// [`SERVER_SHARE_FAIR`] left, too little to judge, so one that hangs ends with the request.
+fn connect_limit(left: Duration) -> Option<Duration> {
+    (left >= SERVER_SHARE_FAIR).then(|| CONNECT_BUDGET.min(left - CONNECT_LEAD))
 }
 
 /// How long each step of a hook took, logged at debug level when the hook returns
@@ -1148,7 +1241,7 @@ impl Hook<'_> {
     /// than the turn (`UserPromptSubmit`) are from a turn whose `Stop` never ran.
     fn take_done_reminder(&mut self) -> Result<Option<String>> {
         let marks = state::take_done(&self.home, &self.agent)?;
-        if self.input["stop_hook_active"].as_bool().unwrap_or(false) {
+        if self.stop_continued() {
             return Ok(None);
         }
         Ok(done_reminder(
@@ -1415,18 +1508,21 @@ impl Hook<'_> {
         })
     }
 
+    /// A `Stop` that follows our own block, ending the turn that answered a reminder.
+    fn stop_continued(&self) -> bool {
+        self.input["stop_hook_active"].as_bool().unwrap_or(false)
+    }
+
     /// Marks the agent idle with the turn's last message, which the server keeps for the
     /// user while the agent coordinates a board. A turn the reminders continue has not
     /// ended, so its message is not sent; the next `Stop` sends the final one.
     ///
     /// Both reminders go in one block: the turn continues once, and the `Stop` that follows
     /// has `stop_hook_active` and stays quiet, so a second block would never be seen.
+    /// `handle` has prepared the done reminder ([`Hook::prepare_done_reminder`]).
     async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
-        // Before any server call, so it survives a server that fails (`local_stop`).
-        self.prepare_done_reminder();
-        // A Stop that follows our own block ends the turn that answered a reminder; the
-        // message worth keeping was the one the reminder interrupted.
-        let continued = self.input["stop_hook_active"].as_bool().unwrap_or(false);
+        // The message worth keeping after our own block was the one the reminder interrupted.
+        let continued = self.stop_continued();
         let said = if continued {
             None
         } else {
@@ -2074,6 +2170,71 @@ pub fn current_exe() -> PathBuf {
 mod tests {
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_server_deadline_counts_all_time_since_the_hook_started() {
+        let started = tokio::time::Instant::now();
+        // Local steps, then the client build and a `Stop`'s local work.
+        tokio::time::advance(Duration::from_millis(400)).await;
+        let deadline = server_deadline(started);
+        tokio::time::advance(Duration::from_millis(300)).await;
+        assert_eq!(deadline, started + BUDGET - MARGIN);
+        assert_eq!(server_deadline(started), deadline);
+    }
+
+    #[test]
+    fn a_connect_gets_its_budget_and_falls_before_the_request() {
+        let ms = Duration::from_millis;
+        assert_eq!(connect_limit(ms(1300)), Some(CONNECT_BUDGET));
+        assert_eq!(connect_limit(ms(550)), Some(ms(450)));
+        assert_eq!(connect_limit(SERVER_SHARE_FAIR), Some(ms(400)));
+        assert_eq!(connect_limit(ms(499)), None, "too little time to judge");
+        assert_eq!(connect_limit(Duration::ZERO), None);
+    }
+
+    /// A port that takes connections but never answers TLS: a connect to it hangs.
+    fn silent_tls() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    /// Work between building the client and the first request (a slow build, a `Stop`'s
+    /// local work) leaves the connect's deadline its lead over the request's.
+    #[tokio::test(start_paused = true)]
+    async fn local_work_before_the_first_request_keeps_the_connects_lead() {
+        let (_listener, url) = silent_tls();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+        let connects = std::sync::Arc::new(ConnectClock::default());
+        connects.set_deadline(deadline);
+        let client = direct_client(&url, "token".into(), None, &connects).unwrap();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let err = tokio::time::timeout_at(deadline, client.health())
+            .await
+            .expect("the connect fails before the request's deadline")
+            .unwrap_err();
+        assert_eq!(Failure::of(&err), Failure::Unreachable, "{err:#}");
+        let lead = deadline - tokio::time::Instant::now();
+        assert!(lead >= CONNECT_LEAD, "lead {lead:?}");
+        assert!(!connects.unjudged());
+    }
+
+    /// With too little left as it starts, a connect that hangs ends with the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_with_too_little_time_left_ends_with_the_request() {
+        let (_listener, url) = silent_tls();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+        let connects = std::sync::Arc::new(ConnectClock::default());
+        connects.set_deadline(deadline);
+        let client = direct_client(&url, "token".into(), None, &connects).unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let answer = tokio::time::timeout_at(deadline, client.health()).await;
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(
+            connects.unjudged(),
+            "a slow answer then says nothing about the server"
+        );
+    }
 
     #[test]
     fn the_relays_reports_count_as_the_servers_own_failures() {

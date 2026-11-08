@@ -470,15 +470,27 @@ impl Client {
         agent: Option<AgentId>,
         timeout: Option<Duration>,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(timeout.unwrap_or(Duration::from_secs(10)))
+        let http =
+            reqwest::Client::builder().connect_timeout(timeout.unwrap_or(Duration::from_secs(10)));
+        Self::build(http, base, Some(token), agent, timeout)
+    }
+
+    /// A client from `http`, which gets the user agent; each request gets `timeout`.
+    fn build(
+        http: reqwest::ClientBuilder,
+        base: &str,
+        token: Option<String>,
+        agent: Option<AgentId>,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let http = http
             .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the HTTP client")?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
-            token: Some(token),
+            token,
             agent,
             timeout,
             read_retries: &[],
@@ -510,43 +522,36 @@ impl Client {
     }
 
     /// A client like [`Client::new`] with `timeout`, whose connections must open (TLS
-    /// included) within `connect`: a server that cannot be reached then fails as a connect
-    /// error well before `timeout`, which a hook tells apart from a slow answer.
-    pub fn with_connect_timeout(
+    /// included) within what `limit` returns as each starts: a server that cannot be
+    /// reached then fails as a connect error, which a hook tells apart from a slow answer.
+    /// `None` gives a connection no deadline of its own.
+    pub fn with_connect_limit<F>(
         base: &str,
         token: String,
         agent: Option<AgentId>,
         timeout: Duration,
-        connect: Duration,
-    ) -> Result<Self> {
-        let mut client = Self::new(base, token, agent, Some(timeout))?;
-        client.http = reqwest::Client::builder()
-            .connect_timeout(connect)
-            .timeout(timeout)
-            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("building the HTTP client")?;
-        Ok(client)
+        limit: F,
+    ) -> Result<Self>
+    where
+        F: Fn() -> Option<Duration> + Clone + Send + Sync + 'static,
+    {
+        let http = reqwest::Client::builder().connector_layer(ConnectLimit(limit));
+        Self::build(http, base, Some(token), agent, Some(timeout))
     }
 
     /// A client that reaches the server through the device daemon's relay on the Unix
     /// socket `socket` (see `relay`), with `timeout` for each whole request. It sends no
     /// token: the relay adds the device's.
     pub fn relayed(socket: &std::path::Path, timeout: Duration) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .unix_socket(socket)
-            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("building the HTTP client")?;
-        Ok(Self {
+        let http = reqwest::Client::builder().unix_socket(socket);
+        // Not used to connect: the relay forwards to its own server.
+        Self::build(
             http,
-            // Not used to connect: the relay forwards to its own server.
-            base: "http://board-relay.invalid".to_owned(),
-            token: None,
-            agent: None,
-            timeout: Some(timeout),
-            read_retries: &[],
-        })
+            "http://board-relay.invalid",
+            None,
+            None,
+            Some(timeout),
+        )
     }
 
     /// The same client with `timeout` for each whole request; it keeps its connections.
@@ -988,6 +993,68 @@ pub(crate) fn enc(segment: &str) -> String {
         }
     }
     out
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A connector layer that gives each connection the deadline its function returns as the
+/// connection starts ([`Client::with_connect_limit`]), not one fixed when the client was built.
+#[derive(Clone)]
+struct ConnectLimit<F>(F);
+
+impl<S, F: Clone> tower_layer::Layer<S> for ConnectLimit<F> {
+    type Service = ConnectLimited<S, F>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConnectLimited {
+            inner,
+            limit: self.0.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectLimited<S, F> {
+    inner: S,
+    limit: F,
+}
+
+impl<S, F, R> tower_service::Service<R> for ConnectLimited<S, F>
+where
+    S: tower_service::Service<R, Error = BoxError>,
+    S::Response: Send + 'static,
+    S::Future: Send + 'static,
+    F: Fn() -> Option<Duration>,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        let limit = (self.limit)();
+        let connect = self.inner.call(req);
+        Box::pin(async move {
+            match limit {
+                // A timed-out connector reads as a connect error that timed out, as with
+                // reqwest's own `connect_timeout`.
+                Some(limit) => tokio::time::timeout(limit, connect).await.map_err(|_| {
+                    BoxError::from(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("connection not open within {limit:?}"),
+                    ))
+                })?,
+                None => connect.await,
+            }
+        })
+    }
 }
 
 #[cfg(test)]

@@ -448,6 +448,20 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                       aria-describedby={missing ? `${id}-missing` : undefined}
                       aria-keyshortcuts="Meta+Enter Control+Enter"
                       onChange={(event) => field.handleChange(event.currentTarget.value)}
+                      onPaste={(event) => {
+                        // Insert the text the paste event carries. Left to itself, Chrome
+                        // reads the clipboard again after the event; dictation apps such as
+                        // Wispr Flow paste with a synthetic ⌘V and then restore the clipboard,
+                        // so that second read can drop the dictated text or insert old text.
+                        const text = event.clipboardData.getData("text/plain");
+                        if (!text) return;
+                        event.preventDefault();
+                        // insertText keeps native undo and fires the input event onChange reads.
+                        if (document.execCommand("insertText", false, text)) return;
+                        const area = event.currentTarget;
+                        area.setRangeText(text, area.selectionStart, area.selectionEnd, "end");
+                        field.handleChange(area.value);
+                      }}
                       onKeyDown={(event) => {
                         // Enter adds a line; with Cmd or Ctrl it sends, as in chat and mail.
                         if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
