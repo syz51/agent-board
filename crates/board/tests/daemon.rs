@@ -2454,15 +2454,22 @@ async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
 
 #[test]
 fn the_coordinator_prompt_says_how_to_run_a_climb() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = board::daemon::coordinator_message(&factory(), false);
     for rule in [
         "A climb is a task whose acceptance is a score command",
         "note starting `score:`",
-        "rounds in a row gain no more than the score's noise",
+        "use its verdict, do not judge a plateau yourself",
+        "report friction in the climb process",
+        "applies from the next run: start one and note why",
+        "Never change the bar, judges or references within a run",
+        "which judges scored it, the gap to the bar and the budget spent",
         "merges only on the user's decision",
     ] {
-        assert!(prompt.contains(rule), "missing {rule:?}");
+        assert!(words(&prompt).contains(rule), "missing {rule:?}");
     }
+    // The stop test is the score command's own, not restated here.
+    assert!(!prompt.contains("rounds in a row gain no more than"));
     // Generic: no tool paths of one setup.
     assert!(!prompt.contains("factory/cli.js"));
 }
