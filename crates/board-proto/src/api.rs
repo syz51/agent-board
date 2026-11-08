@@ -904,6 +904,23 @@ mod tests {
         );
     }
 
+    /// `ready_auto` is part of the counts on the wire, next to the `ready` it splits.
+    #[test]
+    fn counts_carry_ready_auto() {
+        let counts = crate::StatusCounts {
+            ready: 5,
+            ready_auto: 3,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(counts).unwrap();
+        assert_eq!(
+            (&value["ready"], &value["ready_auto"]),
+            (&5.into(), &3.into())
+        );
+        let back: crate::StatusCounts = serde_json::from_value(value).unwrap();
+        assert_eq!(back, counts);
+    }
+
     /// Peers that predate `temporary` neither send nor expect it.
     #[test]
     fn temporary_is_optional_on_the_wire() {
@@ -923,6 +940,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!board.temporary);
+        assert_eq!(
+            board.counts.ready_auto, 0,
+            "older servers do not split ready work"
+        );
         assert_eq!(
             board.parallel_tasks, 1,
             "older servers run one task at a time"

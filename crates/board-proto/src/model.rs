@@ -66,6 +66,11 @@ pub struct StatusCounts {
     /// Open, every blocker done, no live owner, and `not_before` (if any) passed. Computed,
     /// never stored.
     pub ready: u32,
+    /// The ready tasks with `auto` on: work a coordinator may start without the user. The
+    /// rest of `ready` waits on the user. Absent from servers that predate it, so it reads
+    /// as 0.
+    #[serde(default)]
+    pub ready_auto: u32,
 }
 
 /// Task statuses. `ready` is not a status: it is computed (see [`Task::ready`]).

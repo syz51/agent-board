@@ -84,7 +84,10 @@ async fn design_scenario(t: &T) {
     ];
     for (i, (title, priority)) in titles.iter().enumerate() {
         let n = i + 1;
-        let mut body = json!({ "board": "factory", "title": title, "priority": priority });
+        // Every task but one is work a coordinator may start; that one waits on the user.
+        let auto = n != 17;
+        let mut body =
+            json!({ "board": "factory", "title": title, "priority": priority, "auto": auto });
         if [3, 4, 5, 6, 7, 8, 10, 11, 13, 19].contains(&n) {
             body["blockers"] = json!(["factory-2"]);
         }
@@ -187,7 +190,7 @@ async fn delta_and_alerts_render_the_same_alerts() {
     let delta = snapshot(&t, ME, "kind=delta&since=806").await;
     let expected = "\
 <board agent=\"t3:7f3a\" board=\"factory\" src=\"board server\" seq=\"812\">
-counts: open 14 · doing 3 · blocked 1 · ready 4
+counts: open 14 · doing 3 · blocked 1 · ready 4 (auto 3)
 alerts:
   ! factory-9 done: your blocker is cleared -> task_update factory-12 blockers=[]
   ! t3:a91c edited claude/tests/lib/stream.js 3m ago; you edited it 25m ago -> re-read before editing
@@ -487,6 +490,7 @@ async fn json_and_yaml_carry_the_same_model() {
     let model: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}:\n{json_text}"));
     assert_eq!(model["you"]["handle"], "t3:7f3a");
     assert_eq!(model["counts"]["ready"], 4);
+    assert_eq!(model["counts"]["auto"], 3);
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
     // Compact JSON fits the same cap as lines, so no section is cut and the formats

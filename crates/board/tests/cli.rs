@@ -600,6 +600,25 @@ fn parallel_tasks_are_set_shown_and_checked() {
     );
 }
 
+/// `board boards` shows how much of the ready work a coordinator may start, apart from the
+/// ready tasks that wait on the user.
+#[test]
+fn boards_show_ready_auto_apart_from_ready() {
+    let e = env();
+    let mut factory = board_fixture("factory", &[]);
+    factory.counts.open = 7;
+    factory.counts.ready = 5;
+    factory.counts.ready_auto = 3;
+    e.stub.on("GET /v1/boards", [&factory]);
+    let out = e.run(&["boards"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(" · open 7 doing 0 blocked 0 review 0 done 0 ready 5 (auto 3)"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn temporary_boards_are_created_marked_and_deleted() {
     let e = env();

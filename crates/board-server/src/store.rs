@@ -379,9 +379,10 @@ pub(crate) fn counts(cx: &Ctx<'_>, board: &BoardSlug) -> Result<StatusCounts> {
             TaskStatus::Dropped => counts.dropped = n,
         }
     }
-    counts.ready = cx.db.query_row(
+    (counts.ready, counts.ready_auto) = cx.db.query_row(
         &format!(
-            "SELECT COUNT(*) FROM tasks t WHERE t.board = :board AND {}",
+            "SELECT COUNT(*), COALESCE(SUM(t.auto != 0), 0) FROM tasks t \
+             WHERE t.board = :board AND {}",
             ready_sql("t")
         ),
         named_params! {
@@ -389,7 +390,7 @@ pub(crate) fn counts(cx: &Ctx<'_>, board: &BoardSlug) -> Result<StatusCounts> {
             ":now": cx.now_ms(),
             ":cutoff": cx.stale_cutoff(),
         },
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok(counts)
 }
