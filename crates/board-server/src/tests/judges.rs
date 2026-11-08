@@ -294,7 +294,12 @@ async fn only_the_lease_holder_registers_judges_of_its_board_s_tasks() {
 async fn a_judge_loses_the_rights_when_its_agent_ends_even_if_it_resumes() {
     let t = dispatched().await;
     let id = parked(&t, "factory").await;
-    register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
     assert!(may_hand_over(&t, JUDGE, &id).await);
     t.ok(
         "POST",
@@ -314,10 +319,20 @@ async fn a_judge_loses_the_rights_when_its_agent_ends_even_if_it_resumes() {
         Some(json!({ "state": "ended", "paused_until": null })),
     )
     .await;
-    let (s, v) = register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    let (s, v) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
     assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
     t.register(JUDGE, None, None).await;
-    let (s, v) = register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    let (s, v) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
     assert_eq!(s, 200, "{v}");
     assert!(may_hand_over(&t, JUDGE, &id).await);
 }
@@ -326,8 +341,12 @@ async fn a_judge_loses_the_rights_when_its_agent_ends_even_if_it_resumes() {
 async fn a_judge_loses_the_rights_after_two_hours_and_registering_again_does_not_extend_them() {
     let t = dispatched().await;
     let id = parked(&t, "factory").await;
-    let (_, first) =
-        register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    let (_, first) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
     let step = coordinator_ttl() / 2;
     let mut passed = TimeDelta::zero();
     while passed + step < TimeDelta::hours(2) {
@@ -355,7 +374,12 @@ async fn a_judge_loses_the_rights_after_two_hours_and_registering_again_does_not
 async fn a_judge_loses_the_rights_when_its_registrant_loses_the_lease() {
     let t = dispatched().await;
     let id = parked(&t, "factory").await;
-    register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
     let (s, _) = t
         .as_user("DELETE", "/v1/boards/factory/coordinator", None)
         .await;
@@ -394,5 +418,96 @@ async fn a_judges_turn_endings_are_kept_as_a_coordinators() {
     assert_eq!(
         (said[0]["board"].as_str(), said[0]["text"].as_str()),
         (Some("factory"), Some("review: pass"))
+    );
+}
+
+#[tokio::test]
+async fn a_judge_named_by_its_handle_is_registered_by_its_id() {
+    let t = dispatched().await;
+    let id = parked(&t, "factory").await;
+    let handle = t.register(JUDGE, None, None).await["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": handle, "kind": "review", "tasks": [id] }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["agent"], JUDGE);
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    // The lease holder's own handle is still itself.
+    let (s, v) = register_judge(&t, DISPATCH, json!({ "agent": DISPATCH, "kind": "goal" })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+}
+
+#[tokio::test]
+async fn repeats_are_dropped_before_the_task_limit_and_a_review_names_its_task() {
+    let t = dispatched().await;
+    let mut tasks = Vec::new();
+    for n in 0..20 {
+        tasks.push(t.task(WORKER, "factory", &format!("Task {n}")).await);
+    }
+    let mut repeated = tasks.clone();
+    repeated.push(tasks[0].clone());
+    let (s, v) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "verdict", "tasks": repeated }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 20);
+    let (s, v) = register_judge(&t, DISPATCH, json!({ "agent": JUDGE, "kind": "review" })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+}
+
+#[tokio::test]
+async fn the_list_says_which_judges_still_run_and_drops_ended_ones() {
+    let t = dispatched().await;
+    let id = parked(&t, "factory").await;
+    register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
+    // Not registered yet: its session is starting.
+    register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": "t3:starting", "kind": "goal" }),
+    )
+    .await;
+    let list = t.ok("GET", "/v1/boards/factory/judges", None, None).await;
+    assert_eq!(list[0]["running"], true, "{list}");
+    assert_eq!(list[1]["running"], true, "{list}");
+    // A turn that ended leaves the rights but not the count.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{JUDGE}/state"),
+        Some(JUDGE),
+        Some(json!({ "state": "idle", "paused_until": null })),
+    )
+    .await;
+    let list = t.ok("GET", "/v1/boards/factory/judges", None, None).await;
+    assert_eq!(list[0]["running"], false, "{list}");
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    // An ended registration is dropped at the next registration.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{JUDGE}/state"),
+        Some(JUDGE),
+        Some(json!({ "state": "ended", "paused_until": null })),
+    )
+    .await;
+    register_judge(&t, DISPATCH, json!({ "agent": "t3:next", "kind": "goal" })).await;
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM judges WHERE agent = '{JUDGE}'"
+        )),
+        0
     );
 }

@@ -92,6 +92,10 @@ pub struct Judge {
     pub created_at: Timestamp,
     /// At most [`JUDGE_HOURS_MAX`] hours after `created_at`.
     pub expires_at: Timestamp,
+    /// Its agent is running, or has not registered yet: the judge is still at work. One
+    /// whose turn ended (idle or paused) keeps its rights, but is no longer counted as a
+    /// running judge.
+    pub running: bool,
 }
 
 /// How long a judge keeps the coordinator's rights at most.

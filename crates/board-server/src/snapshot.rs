@@ -463,15 +463,12 @@ fn fill_full(
     board_counts: Option<Counts>,
 ) -> Result<()> {
     // Only the board's coordinator, with its lease live, is told the limit.
-    let parallel_tasks: Option<u32> = cx
-        .db
-        .query_row(
-            "SELECT parallel_tasks FROM boards WHERE slug = ?1 AND coordinator = ?2 \
-             AND coordinator_expires_at > ?3",
-            params![board.as_str(), agent.id.as_str(), cx.now_ms()],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let (parallel_tasks, dispatch): (Option<u32>, Dispatch) = cx.db.query_row(
+        "SELECT CASE WHEN coordinator = ?2 AND coordinator_expires_at > ?3 \
+                THEN parallel_tasks END, dispatch FROM boards WHERE slug = ?1",
+        params![board.as_str(), agent.id.as_str(), cx.now_ms()],
+        |r| Ok((r.get(0)?, parse_enum(&r.get::<_, String>(1)?)?)),
+    )?;
     model.you = Some(You {
         handle: agent.handle.clone(),
         runtime: runtime_str(agent.runtime),
@@ -482,11 +479,6 @@ fn fill_full(
         parallel_tasks,
     });
     model.counts = board_counts;
-    let dispatch: Dispatch = cx.db.query_row(
-        "SELECT dispatch FROM boards WHERE slug = ?1",
-        [board.as_str()],
-        |r| parse_enum(&r.get::<_, String>(0)?),
-    )?;
     model.dispatch = (dispatch == Dispatch::Daemon).then_some("daemon");
 
     // mine: owned tasks that are not closed, on any board.

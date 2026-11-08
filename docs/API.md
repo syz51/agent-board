@@ -139,7 +139,9 @@ server's minute sweep deletes older ones.
   300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
   `AGENT_TITLE_CHARS_MAX`).
   A dispatch agent (`dispatch:<device>`, see "Daemon dispatch") registers with its own
-  device as `device` (400 `invalid` otherwise) and the runtime of the threads it starts.
+  device as `device` and the runtime of the threads it starts. Another device's token is
+  refused with 403 `forbidden` (see "Authentication"); a `--user` token that names another
+  `device` gets 400 `invalid`.
   Its handle is its id.
   Clients register on session start (hooks) and before acting when the agent is unknown.
   The client registers before acting only the agent its environment names: an id named by
@@ -522,23 +524,28 @@ knows two things for it:
   lease it is an agent like any other.
 - **Judges**: short-lived threads the lease holder starts for one judgment.
   - `POST /v1/boards/{slug}/judges` `[RegisterJudge]` `{agent, kind, tasks?}` → `[Judge]`
-    `{board, agent, kind, tasks, registered_by, created_at, expires_at}`. Only the agent
-    holding the board's coordinator lease may call it (`X-Board-Agent`; 403 `forbidden`
-    otherwise, also for a judge and the user). `kind` is `review`, `verdict`, `goal` or
-    `triage`. `tasks` names at most 20 tasks of this board (`JUDGE_TASKS_MAX`; repeats are
-    dropped; 400 `invalid` for more, 404 for an unknown task, 400 for a task of another
-    board). The agent may not be registered yet, since its session may still be starting;
-    400 `invalid` when it is the caller or has ended. Records `board_updated` with
+    `{board, agent, kind, tasks, registered_by, created_at, expires_at, running}`. Only the
+    agent holding the board's coordinator lease may call it, acting as itself in
+    `X-Board-Agent` (400 `invalid` without the header; 403 `forbidden` for any other agent,
+    a judge included). `kind` is `review`, `verdict`, `goal` or `triage`. `tasks` names
+    tasks of this board: repeats are dropped, then at most 20 may remain
+    (`JUDGE_TASKS_MAX`; 400 `invalid` for more), and a `review` names at least one (400
+    `invalid`). An unknown task is 404, a task of another board 400 `invalid`. `agent` is
+    an id or a handle, stored as the id. The agent may not be registered yet, since its
+    session may still be starting; 400 `invalid` when it is the caller or has ended.
+    Registrations that ended or expired are deleted then. Records `board_updated` with
     `fields: ["judges"]`, `judge`, `kind`, `tasks` and `expires_at`.
   - A judge has the coordinator's rights on that board, and only there, while all of these
     hold: its agent has not ended since it was registered (a resumed agent does not get them
     back), at most 2 hours have passed since it was registered (`JUDGE_HOURS_MAX`;
     `expires_at`), and the agent that registered it still holds the board's coordinator
-    lease. Registering the same agent again while its registration is live replaces `kind`,
-    `tasks` and `registered_by` and keeps `expires_at`; once it is over, a registration
-    starts afresh.
-  - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first,
-    so the daemon can count the judges running.
+    lease. Registering the same agent again before its registration ended or expired
+    replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
+    registration starts afresh.
+  - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first.
+    `running` is true while the judge's agent is `running` or not registered yet: the
+    daemon counts those as the judges at work. A judge whose turn ended (`idle` or
+    `paused`) keeps its rights until its agent ends, but is not running.
   - A judge's turn endings are kept as a coordinator's (see "Agents", `said`).
 
 ### Leases and touches

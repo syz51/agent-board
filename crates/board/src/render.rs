@@ -478,8 +478,9 @@ pub fn board_line(board: &Board) -> String {
 
 pub fn board_detail(board: &Board, agents: &[Agent], detailed: bool) -> String {
     let mut out = board_line(board);
-    // The line names daemon dispatch; the default is named here, so the setting always shows.
-    if board.dispatch == Dispatch::Thread {
+    // The line names daemon dispatch; on autopilot the default is named here, so the setting
+    // always shows where it applies.
+    if board.autopilot && board.dispatch == Dispatch::Thread {
         out.push_str("\ndispatch thread");
     }
     if !board.repos.is_empty() {

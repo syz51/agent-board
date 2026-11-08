@@ -18,19 +18,7 @@ pub(crate) const SAID_LIST_DEFAULT: usize = 20;
 /// Stores `text` once per board whose live coordinator or live judge `agent` is, keeping
 /// the newest `SAID_KEPT` per agent and board. Whether anything was stored.
 pub(crate) fn record_said(cx: &mut Ctx<'_>, agent: &AgentId, text: &str) -> Result<bool> {
-    let mut boards: Vec<String> = cx
-        .db
-        .prepare_cached(
-            "SELECT slug FROM boards WHERE coordinator = ?1 AND coordinator_expires_at > ?2 \
-             ORDER BY slug",
-        )?
-        .query_map(params![agent.as_str(), cx.now_ms()], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for board in crate::ops::judges::boards_judged_by(cx, agent)? {
-        if !boards.contains(&board) {
-            boards.push(board);
-        }
-    }
+    let boards = crate::ops::judges::boards_with_rights(cx, agent)?;
     for board in &boards {
         cx.db.execute(
             "INSERT INTO said (agent, board, text, at) VALUES (?1, ?2, ?3, ?4)",

@@ -633,8 +633,11 @@ fn dispatch_is_set_shown_and_checked() {
         "{}",
         stdout(&out)
     );
-    e.stub
-        .on("GET /v1/boards/factory", board_fixture("factory", &[]));
+    e.stub.on("GET /v1/boards/factory", {
+        let mut thread = board_fixture("factory", &[]);
+        thread.autopilot = true;
+        thread
+    });
     let out = e.run(&["status", "--board", "factory"]);
     assert!(
         stdout(&out).contains("\ndispatch thread"),
