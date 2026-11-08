@@ -1828,16 +1828,20 @@ fn a_delegated_t3_thread_registers_its_parent() {
 }
 
 /// A `t3` that answers `thread show` with the JSON in `answer` and logs each call to `log`.
+/// A `slow` one answers after 0.7 seconds, as T3 does on a busy Mac: always past the hooks'
+/// own budget for T3 (0.4 seconds), so only a background read gets its answer. It logs a
+/// call once it answers, so a call the hook gave up on is not logged.
 #[cfg(unix)]
-fn fake_t3(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
+fn fake_t3(dir: &std::path::Path, slow: bool) -> (String, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
     let log = dir.join("t3.log");
     let answer = dir.join("t3-answer.json");
     let t3 = dir.join("t3");
+    let wait = if slow { "sleep 0.7\n" } else { "" };
     std::fs::write(
         &t3,
         format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncat '{}'\n",
+            "#!/bin/sh\n{wait}echo \"$@\" >> '{}'\ncat '{}'\n",
             log.display(),
             answer.display()
         ),
@@ -1847,17 +1851,61 @@ fn fake_t3(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
     (t3.to_str().unwrap().to_owned(), log, answer)
 }
 
+/// The session's cached decisions and its background read of the T3 thread, as files.
+struct SessionFiles {
+    cache: PathBuf,
+    read: PathBuf,
+}
+
+impl SessionFiles {
+    fn of(e: &Env) -> Self {
+        let state = e.home.join("state");
+        let name = format!("claude-{SESSION}.json");
+        Self {
+            cache: state.join("sessions").join(&name),
+            read: state.join("thread-reads").join(name),
+        }
+    }
+
+    fn cached(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(&self.cache).unwrap()).unwrap()
+    }
+
+    fn set(&self, field: &str, at: chrono::DateTime<chrono::Utc>) {
+        let mut cached = self.cached();
+        cached[field] = json!(at);
+        std::fs::write(&self.cache, cached.to_string()).unwrap();
+    }
+
+    /// Dates `field` an hour back.
+    fn backdate(&self, field: &str) {
+        self.set(field, chrono::Utc::now() - chrono::Duration::minutes(61));
+    }
+
+    /// Waits, bounded, for the background read a hook started to leave its answer.
+    fn read_done(&self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.read.exists() {
+            assert!(Instant::now() < deadline, "no background read answered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Every step takes T3's answer from a background read, which a slow `t3` makes the only
+/// path, so no step depends on how fast the machine runs.
 #[cfg(unix)]
 #[test]
 fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     const LINK: &str = "https://app.example.test/threads/env-1/thread-7";
     let e = env();
-    let (t3, log, answer) = fake_t3(&e.home);
+    let (t3, log, answer) = fake_t3(&e.home, true);
+    let files = SessionFiles::of(&e);
     let titled = |title: &str| {
         let body = json!({"thread": {"threadId": "thread-7", "title": title, "link": LINK}});
         std::fs::write(&answer, body.to_string()).unwrap();
     };
-    let calls = || {
+    let answered = || {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
@@ -1882,6 +1930,10 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
         let payload = e.with("SessionStart", json!({"source": source}));
         e.hook_env("session-start", "claude", payload, &t3_env);
     };
+    let prompt = || {
+        let payload = e.with("UserPromptSubmit", json!({"prompt": "Go on."}));
+        e.hook_env("user-prompt-submit", "claude", payload, &t3_env);
+    };
     let stop = || {
         let payload = e.with(
             "Stop",
@@ -1897,24 +1949,52 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
             .collect::<Vec<_>>()
     };
 
-    // SessionStart registers the title T3 has then, and the link.
+    // SessionStart does not wait for a slow T3: it registers the thread without its title
+    // or link and leaves them to a background read.
     titled("New thread");
     start("startup");
     let first = registered().pop().unwrap();
-    assert_eq!(first["title"], "New thread");
-    assert_eq!(first["native_ids"]["t3_link"], LINK);
     assert_eq!(first["native_ids"]["t3_thread"], "thread-7");
-    assert_eq!(calls(), 1);
+    assert!(first["title"].is_null(), "{first}");
+    assert!(first["native_ids"].get("t3_link").is_none(), "{first}");
 
-    // T3 renames the thread after its first turn. The first Stop marks the agent idle with
-    // its message first, then registers the new title, and marks it idle again, since
-    // registering marks it running. The server refuses the registration this time.
+    // The next hook registers what the read found, and drops it.
+    files.read_done();
+    assert_eq!(answered(), 1);
+    e.stub.clear();
+    prompt();
+    let read = registered().pop().unwrap();
+    assert_eq!(read["title"], "New thread");
+    assert_eq!(read["native_ids"]["t3_link"], LINK);
+    assert_eq!(read["repo"], first["repo"]);
+    assert!(!files.read.exists());
+
+    // T3 renames the thread after its first turn. The session's first Stop asks, but T3 is
+    // too slow and the read SessionStart started may still run: the check stays due.
     titled("Fix the parser");
+    files.set("thread_read_at", chrono::Utc::now());
+    let started = files.cached()["thread_read_at"].clone();
+    e.stub.clear();
+    stop();
+    assert!(registered().is_empty());
+    assert!(files.cached()["title_checked_at"].is_null());
+    assert_eq!(files.cached()["thread_read_at"], started);
+
+    // Once that read is done with, the next Stop starts a new one and counts the check.
+    files.backdate("thread_read_at");
+    stop();
+    assert!(registered().is_empty());
+    assert!(!files.cached()["title_checked_at"].is_null());
+    files.read_done();
+    assert_eq!(answered(), 2);
+
+    // The next Stop marks the agent idle with its message first, then registers the new
+    // title, and marks it idle again, since registering marks it running. The server
+    // refuses the registration this time, so the read is kept.
     e.stub.clear();
     e.stub
         .once_error("POST /v1/agents", 500, "internal", "try again");
     stop();
-    assert_eq!(calls(), 2);
     let routes = || {
         e.stub
             .requests()
@@ -1926,11 +2006,11 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     let state = format!("POST /v1/agents/{}/state", enc(agent));
     assert_eq!(routes(), [state.clone(), "POST /v1/agents".to_owned()]);
     assert_eq!(e.stub.requests_to(&state)[0].body["said"], "Done.");
+    assert!(files.read.exists());
 
-    // A refused registration counts no check: the next Stop asks T3 and registers again.
+    // The next Stop registers it again.
     e.stub.clear();
     stop();
-    assert_eq!(calls(), 3);
     assert_eq!(
         routes(),
         [state.clone(), "POST /v1/agents".to_owned(), state.clone()]
@@ -1943,37 +2023,116 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     let states = e.stub.requests_to(&state);
     assert_eq!(states[1].body["state"], "idle");
     assert_eq!(states[1].body["said"], Value::Null);
+    assert!(!files.read.exists());
+    assert_eq!(answered(), 2);
 
-    // Within the hour, no Stop asks T3 again.
+    // Within the hour, no Stop asks T3 again: one that asked would start a read.
     titled("Renamed again");
+    files.backdate("thread_read_at");
+    let started = files.cached()["thread_read_at"].clone();
     e.stub.clear();
     stop();
-    assert_eq!(calls(), 3);
     assert!(registered().is_empty());
+    assert_eq!(files.cached()["thread_read_at"], started);
 
     // An hour later a Stop asks again; an unchanged title sends nothing.
-    let backdate = || {
-        let path = e
-            .home
-            .join("state/sessions")
-            .join(format!("claude-{SESSION}.json"));
-        let mut cached: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let hour_ago = chrono::Utc::now() - chrono::Duration::minutes(61);
-        cached["title_checked_at"] = json!(hour_ago);
-        std::fs::write(&path, cached.to_string()).unwrap();
-    };
     titled("Fix the parser");
-    backdate();
+    files.backdate("title_checked_at");
     stop();
-    assert_eq!(calls(), 4);
+    assert_ne!(files.cached()["thread_read_at"], started, "no read started");
+    files.read_done();
+    assert_eq!(answered(), 3);
+    stop();
     assert!(registered().is_empty(), "the title did not change");
+    assert!(!files.read.exists());
 
     // Compaction starts the session again: the cached title, without asking T3.
     titled("Something else");
+    files.backdate("thread_read_at");
+    let started = files.cached()["thread_read_at"].clone();
     start("compact");
-    assert_eq!(calls(), 4);
     assert_eq!(registered().pop().unwrap()["title"], "Fix the parser");
+    assert_eq!(files.cached()["thread_read_at"], started);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slow_t3_brings_a_delegated_threads_title_link_and_parent_to_a_tool_call() {
+    const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    const LINK: &str = "https://app.example.test/threads/env-1/child";
+    let e = env();
+    let (t3, log, answer) = fake_t3(&e.home, true);
+    let files = SessionFiles::of(&e);
+    let body = json!({"thread": {
+        "threadId": CHILD, "title": "Child work", "link": LINK,
+        "parentThreadId": "parent-1", "relationshipToParent": "subagent",
+    }});
+    std::fs::write(&answer, body.to_string()).unwrap();
+    let agent = format!("t3:{CHILD}");
+    let t3_env = [
+        ("T3CODE_THREAD_ID", CHILD),
+        ("T3CODE_CLI_PATH", t3.as_str()),
+    ];
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    let registered = || {
+        e.stub
+            .requests_to("POST /v1/agents")
+            .into_iter()
+            .map(|r| r.body)
+            .collect::<Vec<_>>()
+    };
+    let read_tool = || {
+        let payload = e.with(
+            "PostToolUse",
+            json!({
+                "tool_name": "Read",
+                "tool_input": {"file_path": e.repo.join("src/lib.rs")},
+                "tool_response": {"type": "text"},
+                "tool_use_id": "toolu_01READ",
+            }),
+        );
+        e.hook_env("post-tool-use", "claude", payload, &t3_env);
+    };
+
+    let payload = e.with("SessionStart", json!({"source": "startup"}));
+    e.hook_env("session-start", "claude", payload, &t3_env);
+    let first = registered().pop().unwrap();
+    assert!(first["title"].is_null(), "{first}");
+    assert!(first["native_ids"].get("t3_parent").is_none(), "{first}");
+
+    // The first tool call after the read registers all three, the agent still running.
+    files.read_done();
+    e.stub.clear();
+    read_tool();
+    let read = registered().pop().unwrap();
+    assert_eq!(read["title"], "Child work");
+    assert_eq!(read["native_ids"]["t3_link"], LINK);
+    assert_eq!(read["native_ids"]["t3_parent"], "parent-1");
+    assert_eq!(read["native_ids"]["t3_thread"], CHILD);
+    assert!(
+        e.stub
+            .requests_to(&format!("POST /v1/agents/{}/state", enc(&agent)))
+            .iter()
+            .all(|r| r.body["state"] != "idle")
+    );
+    assert!(!files.read.exists());
+
+    // Later tool calls register nothing more, and T3 was asked once to the end.
+    e.stub.clear();
+    read_tool();
+    assert!(registered().is_empty());
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 }
 
 #[cfg(unix)]
@@ -1981,7 +2140,7 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
 fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
     const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
     let e = env();
-    let (t3, log, answer) = fake_t3(&e.home);
+    let (t3, log, answer) = fake_t3(&e.home, false);
     let agent = format!("t3:{CHILD}");
     let t3_env = [
         ("T3CODE_THREAD_ID", CHILD),
@@ -2098,7 +2257,12 @@ fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
         "GET /v1/snapshot",
         snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
     );
-    let t3_env = [("T3CODE_THREAD_ID", "thread-7")];
+    // No `t3` there: the device's own T3 never hears of this thread.
+    let no_t3 = e.home.join("no-t3");
+    let t3_env = [
+        ("T3CODE_THREAD_ID", "thread-7"),
+        ("T3CODE_CLI_PATH", no_t3.to_str().unwrap()),
+    ];
     let cache = e
         .home
         .join(format!("state/sessions/claude-{}.json", SESSION));
@@ -2130,5 +2294,5 @@ fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
     assert_eq!(register.body["id"], t3);
     assert_eq!(register.body["native_ids"]["t3_thread"], "thread-7");
     let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-    assert_eq!(cached, json!({"nested": false}));
+    assert_eq!(cached["nested"], false, "{cached}");
 }

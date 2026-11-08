@@ -156,6 +156,23 @@ pub struct SessionLocal {
     /// first `Stop`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_checked_at: Option<Timestamp>,
+    /// When a hook last started a background read of the thread ([`ThreadRead`]), because
+    /// T3 answered too slowly for the hook itself; `None` before the session's first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_read_at: Option<Timestamp>,
+}
+
+/// What a background read found of a session's T3 thread, kept until a hook registered it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRead {
+    /// The thread read; the facts hold only for it.
+    pub thread: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 fn runtime_name(runtime: Runtime) -> &'static str {
@@ -173,6 +190,33 @@ fn session_path(home: &Home, runtime: Runtime, session: &str) -> PathBuf {
     ))
 }
 
+fn thread_read_path(home: &Home, runtime: Runtime, session: &str) -> PathBuf {
+    home.state_dir().join("thread-reads").join(format!(
+        "{}-{}.json",
+        runtime_name(runtime),
+        safe_stem(session)
+    ))
+}
+
+/// The session's finished background read, until a hook registered it.
+pub fn load_thread_read(home: &Home, runtime: Runtime, session: &str) -> Option<ThreadRead> {
+    read_json(&thread_read_path(home, runtime, session))
+}
+
+pub fn save_thread_read(
+    home: &Home,
+    runtime: Runtime,
+    session: &str,
+    read: &ThreadRead,
+) -> Result<()> {
+    write_json(&thread_read_path(home, runtime, session), read)
+}
+
+/// Forgets the session's background read; a missing file is fine.
+pub fn remove_thread_read(home: &Home, runtime: Runtime, session: &str) -> Result<()> {
+    remove_if_exists(&thread_read_path(home, runtime, session))
+}
+
 /// The session's cached decisions; `None` when none were saved.
 pub fn load_session(home: &Home, runtime: Runtime, session: &str) -> Option<SessionLocal> {
     read_json(&session_path(home, runtime, session))
@@ -187,8 +231,9 @@ pub fn save_session(
     write_json(&session_path(home, runtime, session), state)
 }
 
-/// Forgets an ended session; a missing file is fine.
+/// Forgets an ended session, its background read included; a missing file is fine.
 pub fn remove_session(home: &Home, runtime: Runtime, session: &str) -> Result<()> {
+    remove_thread_read(home, runtime, session)?;
     remove_if_exists(&session_path(home, runtime, session))
 }
 
@@ -200,10 +245,11 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-/// Removes the cached decisions of sessions not written for `age`: sessions that ended
-/// without a SessionEnd hook. A session that comes back decides again.
+/// Removes the cached decisions and background reads of sessions not written for `age`:
+/// sessions that ended without a SessionEnd hook. A session that comes back decides again.
 pub fn prune_sessions(home: &Home, age: std::time::Duration) -> Result<()> {
-    prune_dir(&home.state_dir().join("sessions"), age)
+    prune_dir(&home.state_dir().join("sessions"), age)?;
+    prune_dir(&home.state_dir().join("thread-reads"), age)
 }
 
 fn tool_start_path(home: &Home, runtime: Runtime, tool_use: &str) -> PathBuf {
@@ -523,8 +569,20 @@ mod tests {
             t3_title: Some("Fix the parser".into()),
             t3_link: Some("https://app.example.test/threads/env-1/thread-1".into()),
             title_checked_at: Some(chrono::Utc::now()),
+            thread_read_at: Some(chrono::Utc::now()),
         };
         save_session(&home, Runtime::Claude, "s/1", &nested).unwrap();
+        let read = ThreadRead {
+            thread: "thread-1".into(),
+            title: Some("Fix the parser".into()),
+            ..ThreadRead::default()
+        };
+        save_thread_read(&home, Runtime::Claude, "s/1", &read).unwrap();
+        assert_eq!(
+            load_thread_read(&home, Runtime::Claude, "s/1"),
+            Some(read.clone())
+        );
+        assert_eq!(load_thread_read(&home, Runtime::Codex, "s/1"), None);
         assert_eq!(
             load_session(&home, Runtime::Claude, "s/1"),
             Some(nested.clone())
@@ -533,6 +591,7 @@ mod tests {
         remove_session(&home, Runtime::Claude, "s/1").unwrap();
         remove_session(&home, Runtime::Claude, "s/1").unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "s/1"), None);
+        assert_eq!(load_thread_read(&home, Runtime::Claude, "s/1"), None);
 
         // Pruning keeps recent sessions and removes those older than the age.
         prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
@@ -542,9 +601,20 @@ mod tests {
         let file = std::fs::File::options().write(true).open(&old).unwrap();
         file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
             .unwrap();
+        save_thread_read(&home, Runtime::Claude, "old", &read).unwrap();
+        let old_read = thread_read_path(&home, Runtime::Claude, "old");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&old_read)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        save_thread_read(&home, Runtime::Codex, "new", &read).unwrap();
         prune_sessions(&home, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(load_session(&home, Runtime::Claude, "old"), None);
         assert_eq!(load_session(&home, Runtime::Codex, "new"), Some(nested));
+        assert_eq!(load_thread_read(&home, Runtime::Claude, "old"), None);
+        assert_eq!(load_thread_read(&home, Runtime::Codex, "new"), Some(read));
     }
 
     #[test]
