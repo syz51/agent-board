@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { BoardEvent } from "../api/schema.ts";
+import type { Agent, BoardEvent } from "../api/schema.ts";
 import { plainLine } from "./asks.tsx";
 import { describe as describeEvent, detail, eventMark } from "./events.tsx";
 import { monogram } from "../ui/icons.tsx";
@@ -32,6 +32,30 @@ describe("event sentences", () => {
       describeEvent(event("agent_state_changed", { from: "running", to: "idle" }, null)),
     ).toEqual(["went idle", ""]);
     expect(describeEvent(event("something_new", {}))).toEqual(["something new", ""]);
+  });
+
+  test("say a handover hands the task to the new owner's handle", () => {
+    const handover = event("task_updated", {
+      fields: ["owner"],
+      owner: "t3:019a2b3c-new",
+      previous_owner: "t3:a91c",
+    });
+    const agents = new Map([["t3:019a2b3c-new", { handle: "t3:e4b7" } as Agent]]);
+    expect(describeEvent(handover, agents)).toEqual(["handed", "to t3:e4b7"]);
+    // An unknown agent keeps its id.
+    expect(describeEvent(handover)).toEqual(["handed", "to t3:019a2b3c-new"]);
+    // The previous owner handed it over itself, so the sentence says it all.
+    expect(detail(handover)).toBe("");
+    // Someone else handed it over: the previous owner stays in the details.
+    expect(detail({ ...handover, actor: "t3:c2d0" })).toBe("previous_owner: t3:a91c");
+    // A status change with a new owner still reads as a move; other edits stay updates.
+    expect(
+      describeEvent(event("task_updated", { from: "open", to: "doing", owner: "t3:e4b7" })),
+    ).toEqual(["moved", "to doing"]);
+    expect(describeEvent(event("task_updated", { fields: ["title"], title: "New" }))).toEqual([
+      "updated",
+      "",
+    ]);
   });
 
   test("details leave out what the sentence already says", () => {

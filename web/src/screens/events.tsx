@@ -115,7 +115,7 @@ function EventMark({ event, className }: { event: BoardEvent; className?: string
 
 export function EventLine({ event, agents }: { event: BoardEvent; agents: Map<string, Agent> }) {
   const summary = detail(event);
-  const [verb, suffix] = describe(event);
+  const [verb, suffix] = describe(event, agents);
   const kind = event.type.split("_")[0] ?? "";
   return (
     <li
@@ -143,15 +143,31 @@ export function EventLine({ event, agents }: { event: BoardEvent; agents: Map<st
   );
 }
 
+/**
+ * The new owner when a `task_updated` event hands the task over without moving it, as the
+ * server's recent activity reads it: an `owner` and no `to`.
+ */
+function handedTo(event: BoardEvent): string | undefined {
+  if (event.type !== "task_updated") return undefined;
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  return payload.to === undefined && typeof payload.owner === "string" ? payload.owner : undefined;
+}
+
 /** What happened, as a verb before the task or board and an optional ending after it. */
-export function describe(event: BoardEvent): [string, string] {
+export function describe(
+  event: BoardEvent,
+  agents: Map<string, Agent> = new Map(),
+): [string, string] {
   const payload = (event.payload ?? {}) as Record<string, unknown>;
   const to = typeof payload.to === "string" ? payload.to : "";
+  const owner = handedTo(event);
   switch (event.type) {
     case "task_created":
       return ["created", ""];
     case "task_updated":
-      return to ? ["moved", `to ${to}`] : ["updated", ""];
+      if (to) return ["moved", `to ${to}`];
+      if (owner) return ["handed", `to ${agents.get(owner)?.handle ?? owner}`];
+      return ["updated", ""];
     case "task_done":
       return ["finished", ""];
     case "task_claimed":
@@ -193,6 +209,13 @@ export function detail(event: BoardEvent): string {
     return parts.join(" · ");
   }
   if (event.type === "note_added") delete record.kind;
+  if (handedTo(event)) {
+    // The sentence names the new owner; the previous one matters only when someone else
+    // handed the task over.
+    delete record.fields;
+    delete record.owner;
+    if (record.previous_owner === event.actor) delete record.previous_owner;
+  }
   if (["task_updated", "task_done", "agent_state_changed", "task_claimed"].includes(event.type)) {
     delete record.from;
     delete record.to;
