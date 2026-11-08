@@ -562,6 +562,45 @@ fn board_create_and_update_carry_autopilot_and_home_devices() {
 }
 
 #[test]
+fn parallel_tasks_are_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.parallel_tasks = 2;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["parallel_tasks"], 2);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · 2 tasks at once"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Out of range never reaches the server.
+    for value in ["0", "5"] {
+        let out = e.run(&["board", "update", "factory", "--parallel-tasks", value]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    }
+    assert_eq!(e.stub.requests_to("PATCH /v1/boards/factory").len(), 1);
+
+    // A server that predates the setting answers without it: the user is told.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("parallel_tasks");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--parallel-tasks", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored parallel_tasks=2")
+            && err.contains("board board update factory --parallel-tasks 2"),
+        "{err}"
+    );
+}
+
+#[test]
 fn temporary_boards_are_created_marked_and_deleted() {
     let e = env();
     let mut scratch = board_fixture("scratch", &[]);
@@ -1294,6 +1333,79 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
         "live",
         "the daemon on this device still keeps thread other-live as the coordinator",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn board_adopt_and_a_coordinator_whose_session_ended() {
+    let adopt = |e: &Env, thread: &str| {
+        board(
+            &e.home,
+            &e.cwd,
+            &[],
+            &["board", "adopt", "infra", thread],
+            "",
+        )
+    };
+    let ended = |e: &Env, agent: &str, device: &str| {
+        e.stub.on(
+            &format!("GET /v1/agents/{}", enc(agent)),
+            agent_fixture(agent, device, board_proto::AgentState::Ended),
+        );
+    };
+
+    // On its own device: T3 closed the idle session, the thread lives on, and the lease
+    // still names it. Adopting that thread is accepted, with nothing left to do and no need
+    // to look its agent up.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:live")));
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("t3:live already coordinates infra"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        e.stub
+            .requests_to(&format!("GET /v1/agents/{}", enc("t3:live")))
+            .is_empty()
+    );
+    // Adopting another thread there is saved for the daemon, which releases the ended
+    // coordinator's lease and adopts it (daemon test
+    // an_ended_coordinator_of_ours_gives_way_to_an_adoption_and_a_gone_thread_is_released).
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", DEVICE);
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+
+    // On another device: refused while that device's lease runs, with nothing changed.
+    let e = adopt_env();
+    e.stub
+        .on("GET /v1/boards/infra", adopt_board(true, Some("t3:old")));
+    ended(&e, "t3:old", "mac-air");
+    let out = adopt(&e, "live");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("t3:old coordinates board infra from device mac-air: its session ended"),
+        "{err}"
+    );
+    assert_eq!(adoption_file(&e), None);
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/infra/coordinator")
+            .is_empty()
+    );
+    // Once the lease has expired the board names no coordinator, and the adoption goes on.
+    e.stub.on("GET /v1/boards/infra", adopt_board(true, None));
+    let out = adopt(&e, "live");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
 }
 
 #[cfg(unix)]

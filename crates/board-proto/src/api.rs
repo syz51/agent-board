@@ -74,6 +74,10 @@ pub struct UpdateBoard {
     /// Turning it on for a board that is not temporary is for the user only, since the
     /// board is then deleted once idle.
     pub temporary: Option<bool>,
+    /// 1 to [`crate::PARALLEL_TASKS_MAX`]. Raising it is for the user only, since more
+    /// tasks at once spend the shared usage limit faster; anyone may lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks: Option<u32>,
 }
 
 /// `POST /v1/boards/{slug}/join`: the calling agent joins the board.
@@ -851,5 +855,15 @@ mod tests {
         }))
         .unwrap();
         assert!(!board.temporary);
+        assert_eq!(
+            board.parallel_tasks, 1,
+            "older servers run one task at a time"
+        );
+        assert_eq!(update.parallel_tasks, None);
+        // Older servers reject no field they do not know, and an unset one is not sent.
+        assert_eq!(
+            serde_json::to_value(UpdateBoard::default()).unwrap()["parallel_tasks"],
+            serde_json::Value::Null
+        );
     }
 }

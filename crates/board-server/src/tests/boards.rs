@@ -652,3 +652,70 @@ async fn mixed_case_board_repos_match_agents_from_any_url_form() {
         2
     );
 }
+
+#[tokio::test]
+async fn only_the_user_raises_parallel_tasks_and_anyone_lowers_it() {
+    let t = T::new();
+    let board = t.board("factory", &[]).await;
+    assert_eq!(board["parallel_tasks"], 1, "one task at a time by default");
+
+    // Out of range: the error says what to send.
+    for n in [0, 5] {
+        let (code, err, v) = t
+            .fail(
+                "PATCH",
+                "/v1/boards/factory",
+                None,
+                Some(json!({ "parallel_tasks": n })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+        assert!(
+            v["next"].as_str().unwrap().contains("between 1 and 4"),
+            "{v}"
+        );
+    }
+
+    // An agent may not raise it: more tasks at once spend the shared usage limit.
+    let (code, err, v) = t
+        .fail(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+
+    // The user may; the event names the field.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 3 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["parallel_tasks"], 3);
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let last = page["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (&last["type"], &last["payload"]["fields"]),
+        (&json!("board_updated"), &json!(["parallel_tasks"]))
+    );
+
+    // Restating or lowering it is open to anyone.
+    for n in [3, 2] {
+        let v = t
+            .ok(
+                "PATCH",
+                "/v1/boards/factory",
+                None,
+                Some(json!({ "parallel_tasks": n })),
+            )
+            .await;
+        assert_eq!(v["parallel_tasks"], n);
+    }
+}

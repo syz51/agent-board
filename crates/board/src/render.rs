@@ -408,6 +408,9 @@ pub fn board_line(board: &Board) -> String {
             None => line.push_str(" (no coordinator)"),
         }
     }
+    if board.parallel_tasks > 1 {
+        let _ = write!(line, " · {} tasks at once", board.parallel_tasks);
+    }
     line
 }
 
