@@ -1080,6 +1080,7 @@ pub(crate) fn release(
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), cx.now_ms()],
     )?;
+    crate::ops::leases::release_for_task(cx, id, &task.board, agent.as_str())?;
     cx.emit(
         Some(&task.board),
         agent.as_str(),
@@ -1290,8 +1291,9 @@ pub(crate) fn update(
     if fields.contains(&"blockers") {
         set_blockers(cx, id, &blockers)?;
     }
-    if to.is_closed() && !from.is_closed() {
-        crate::ops::leases::release_for_task(cx, id, agent.as_str())?;
+    // Work on the task has stopped: done or dropped, or open (unowned, for the next owner).
+    if to != from && (to.is_closed() || to == TaskStatus::Open) {
+        crate::ops::leases::release_for_task(cx, id, &task.board, agent.as_str())?;
     }
     if from.is_closed() && to == TaskStatus::Open {
         // A reopened feedback item is live again.
@@ -1364,7 +1366,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now, req.summary],
     )?;
-    crate::ops::leases::release_for_task(cx, id, req.agent.as_str())?;
+    crate::ops::leases::release_for_task(cx, id, &task.board, req.agent.as_str())?;
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",
         [id.as_str()],

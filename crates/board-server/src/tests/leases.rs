@@ -587,6 +587,8 @@ async fn a_task_lease_outside_its_boards_repos_warns_and_stays_put() {
         lease(OTHER, Some(&free)),
         lease(OTHER, None),
     ] {
+        // Each starts from no lease, so re-leasing src/** for another task does not warn.
+        t.exec("DELETE FROM leases");
         let v = t.ok("POST", "/v1/leases", Some(A), Some(body)).await;
         assert!(v.get("warning").is_none(), "{v}");
     }
@@ -657,7 +659,7 @@ async fn leases_end_with_their_task() {
     assert_eq!(events[0]["payload"]["agent"], C);
     assert_eq!(events[0]["payload"]["repo"], REPO);
 
-    // Moved to review, or back to open: the task is not closed, so its leases stay.
+    // Moved to review and back, or to blocked: its owner's work may resume, so its leases stay.
     assert!(
         t.patch(D, &working, json!({ "status": "review" }))
             .await
@@ -671,16 +673,20 @@ async fn leases_end_with_their_task() {
             .is_success()
     );
     assert!(
-        t.patch(E, &parked, json!({ "status": "open" }))
-            .await
-            .0
-            .is_success()
+        t.patch(
+            E,
+            &parked,
+            json!({ "status": "blocked", "blocked_reason": "waiting" })
+        )
+        .await
+        .0
+        .is_success()
     );
     assert!(released(&t, &working).await.is_empty());
     assert!(released(&t, &parked).await.is_empty());
 
     // Another agent leasing every path is warned only by leases of work still going: the
-    // doing task's, the reopened task's and the lease that names no task.
+    // doing task's, the blocked task's and the lease that names no task.
     let answer = lease(
         &t,
         B,
@@ -755,4 +761,143 @@ async fn resolving_a_feedback_item_ends_its_leases() {
     assert!(s.is_success());
     assert_eq!(released(&t, &item).await.len(), 1);
     assert!(holders(&lease(&t, B, &["src/fix.rs"]).await).is_empty());
+}
+
+#[tokio::test]
+async fn leases_end_on_release_review_done_and_unowned_drop_but_not_for_another_task() {
+    const C: &str = "t3:gamma";
+    const D: &str = "t3:delta";
+    let t = T::new();
+    t.board("app", &[REPO]).await;
+    for agent in [A, B, C, D] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    let lease_ids = |answer: &Value| -> Vec<Value> {
+        answer["leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["task"].clone())
+            .collect()
+    };
+
+    // Done from review.
+    let reviewed = t.task(A, "app", "Reviewed").await;
+    assert!(t.claim(A, &reviewed).await.0.is_success());
+    lease_for(&t, A, &reviewed, &["src/reviewed.rs"]).await;
+    assert!(
+        t.patch(A, &reviewed, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    assert!(released(&t, &reviewed).await.is_empty());
+    assert!(t.done(A, &reviewed, check(0)).await.0.is_success());
+    let events = released(&t, &reviewed).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["board"], "app");
+
+    // Released to open: the next owner is not warned about its own task's files.
+    let handed = t.task(B, "app", "Handed back").await;
+    assert!(t.claim(B, &handed).await.0.is_success());
+    lease_for(&t, B, &handed, &["src/handed.rs"]).await;
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{handed}/release"),
+            Some(B),
+            Some(json!({ "agent": B })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(released(&t, &handed).await.len(), 1);
+    assert!(t.claim(C, &handed).await.0.is_success());
+    assert!(holders(&lease_for(&t, C, &handed, &["src/handed.rs"]).await).is_empty());
+
+    // An unowned open task leased by one agent and dropped by another.
+    let idea = t.task(D, "app", "Idea").await;
+    lease_for(&t, D, &idea, &["src/idea.rs"]).await;
+    assert!(
+        t.patch(A, &idea, json!({ "status": "dropped" }))
+            .await
+            .0
+            .is_success()
+    );
+    let events = released(&t, &idea).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            events[0]["actor"].as_str(),
+            events[0]["payload"]["agent"].as_str()
+        ),
+        (Some(A), Some(D))
+    );
+
+    // A lease for a task already closed names no task, and says so.
+    let late = lease_for(&t, D, &idea, &["src/late.rs"]).await;
+    assert_eq!(lease_ids(&late), [Value::Null]);
+    assert!(
+        late["warning"].as_str().unwrap().contains("is dropped"),
+        "{late}"
+    );
+
+    // One glob leased for two pieces of work names neither, so closing one keeps it.
+    let first = t.task(A, "app", "First").await;
+    assert!(t.claim(A, &first).await.0.is_success());
+    let plain = lease(&t, A, &["src/shared.rs"]).await;
+    assert_eq!(lease_ids(&plain), [Value::Null]);
+    let again = lease_for(&t, A, &first, &["src/shared.rs", "src/first.rs"]).await;
+    assert_eq!(lease_ids(&again), [Value::Null, json!(first)]);
+    assert!(
+        again["warning"].as_str().unwrap().contains("src/shared.rs"),
+        "{again}"
+    );
+    // Leasing it for the same task again is a plain renewal, without a warning.
+    let renewed = lease_for(&t, A, &first, &["src/first.rs"]).await;
+    assert_eq!(lease_ids(&renewed), [json!(first)]);
+    assert!(renewed.get("warning").is_none(), "{renewed}");
+    assert!(t.done(A, &first, check(0)).await.0.is_success());
+    let globs: Vec<String> = released(&t, &first)
+        .await
+        .iter()
+        .map(|e| e["payload"]["glob"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(globs, ["src/first.rs"]);
+    assert_eq!(holders(&lease(&t, B, &["src/shared.rs"]).await), [A]);
+}
+
+#[tokio::test]
+async fn a_feedback_item_resolved_by_the_user_ends_its_leases() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    let item = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "leases outlive tasks" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(A, &item).await.0.is_success());
+    lease_for(&t, A, &item, &["src/fix.rs"]).await;
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{item}/resolve"),
+            Some(json!({ "kind": "declined", "reason": "works as designed" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let events = released(&t, &item).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            events[0]["actor"].as_str(),
+            events[0]["payload"]["agent"].as_str()
+        ),
+        (Some("user"), Some(A))
+    );
 }

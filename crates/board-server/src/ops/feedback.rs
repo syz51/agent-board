@@ -675,7 +675,7 @@ pub(crate) fn resolve(
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now],
     )?;
-    crate::ops::leases::release_for_task(cx, id, &by)?;
+    crate::ops::leases::release_for_task(cx, id, &task.board, &by)?;
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",
         [id.as_str()],
