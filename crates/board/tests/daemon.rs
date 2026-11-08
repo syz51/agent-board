@@ -3754,7 +3754,17 @@ fn the_watch_lock_is_held_once_per_home_and_released_on_drop() {
         "{err}"
     );
     drop(lock);
-    board::daemon::lock_watch(&home).expect("free again once released");
+    // A process that another test spawns gets a copy of every descriptor at fork and
+    // closes the close-on-exec ones only at exec. The lock lives on the shared open file,
+    // so it can outlast the drop for that window (milliseconds under load); wait it out.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match board::daemon::lock_watch(&home) {
+            Ok(_) => break,
+            Err(err) if Instant::now() >= deadline => panic!("free again once released: {err}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
 
 #[cfg(unix)]
