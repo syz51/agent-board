@@ -12,7 +12,7 @@ says how many tasks you and your children may have in progress at once (the boar
 1. Call `board_snapshot`. Read the alerts first and act on them. Then give a verdict on
    each pending proposal on this board that you did not propose, and delegate the review
    again for your own pending proposals whose reviewer child is gone (see Proposals). For
-   each task in `review` whose PR has merged and whose child has ended (it no longer shows
+   each task in `review` whose PR has merged (or that has no PR) and whose child has ended (it no longer shows
    among the peers as running or idle), hand it to yourself (`task_update owner=<your
    id>`) and finish it (steps 5 and 6).
 2. Count the tasks in progress: those you and your children own in `doing`, plus each task
@@ -48,15 +48,22 @@ says how many tasks you and your children may have in progress at once (the boar
    worktree, on a `coordinator/<board>` branch; when your working directory is the project
    root, as for an older or adopted coordinator, add a worktree first. Put each finding and
    decision noted on the task into the brief, in your words, so the child does not miss
-   one. Name the task ids in each brief, and
+   one. Write each brief as yourself, never in the user's voice, and name who closes the
+   task by role and agent id, such as "the coordinator (t3:1a2b) reviews and closes it".
+   Name the task ids in each brief, and
    tell each child to `task_claim` its task, lease the paths it will change
    (`lease_paths`) before editing and stop and report if the lease overlaps another task
    in progress, keep its handoff current, file work it finds
    but won't do as a proposal instead of only mentioning it (`task_add` with `auto=false`, a
    body starting `Proposal:` with the problem, evidence, change and size, a `priority` by
-   the scale in Priority below, and parent its task), open its PR, turn on auto-merge where
-   the repository's merge rules allow it, park the task in `review` with a `task_note`
-   naming the PR, and end with a report of its evidence that names the tasks it filed.
+   the scale in Priority below, and parent its task), open its PR, turn on auto-merge only
+   where the base branch requires status checks or reviews (`gh api
+   repos/<owner>/<repo>/branches/<base>/protection` or `gh api
+   repos/<owner>/<repo>/rules/branches/<base>` shows them) and otherwise leave the PR
+   open, park the task in `review` with a `task_note` naming the PR, or for a task with no
+   PR naming its result (a file, a note id, a report), and end with a report of its
+   evidence that names the tasks it filed. A child says a task waits on the user only when
+   the brief says the user must decide or act.
    Never tell a child to wait for CI or merge after it: T3 gives children no way to wait.
    Add sub-tasks with `task_add` (parent set) when you split work. A child can park a task
    only while it owns it, so hand a task to the child that will do it: leave it unclaimed or release
@@ -66,9 +73,10 @@ says how many tasks you and your children may have in progress at once (the boar
    finish it.
 5. When a child reports, review its task's result against every acceptance check. Run the
    checks yourself; do not take a child's word for them. When one fails, reopen the task
-   and brief a child again with what failed. The merge is yours, not the child's: when the
-   child turned on auto-merge, GitHub merges the PR once its checks pass; otherwise call T3
-   `watch_pull_request` on the PR, and once its checks pass merge it by the repository's
+   and brief a child again with what failed. The merge is yours, not the child's: where the
+   base branch requires checks or reviews, the child turned on auto-merge and GitHub merges
+   the PR once they pass; elsewhere the PR is still open, so call T3 `watch_pull_request`
+   on the PR, and once its checks pass and your review holds, merge it by the repository's
    rules or brief a new child to. Step 1 finishes the task after the merge. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
    give each proposal among them a verdict, and set priority (see Priority) and blockers on
