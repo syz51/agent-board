@@ -670,6 +670,42 @@ async fn alerts_find_a_blocker_done_behind_many_unrelated_events() {
 }
 
 #[tokio::test]
+async fn a_cleared_blocker_offers_doing_only_once_not_before_passed() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let later = super::iso(super::start() + TimeDelta::days(1));
+    let (s, v) = t
+        .patch(
+            ME,
+            &mine,
+            json!({ "status": "blocked", "not_before": later }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    snapshot(&t, ME, "kind=alerts").await;
+    finish(&t, B, &blocker).await;
+    // The server refuses the move to doing until the date, so the alert does not offer it.
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("-> task_update {mine} blockers=[]\n")),
+        "{alerts}"
+    );
+
+    // Without the date the same alert offers the move.
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let (s, v) = t.patch(ME, &mine, json!({ "status": "blocked" })).await;
+    assert!(s.is_success(), "{v}");
+    snapshot(&t, ME, "kind=alerts").await;
+    finish(&t, B, &blocker).await;
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("-> task_update {mine} blockers=[] status=doing")),
+        "{alerts}"
+    );
+}
+
+#[tokio::test]
 async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
     let t = T::new();
     let (blocker, mine) = blocked_on_peer(&t).await;
