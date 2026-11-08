@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn items_resolved_before_resolved_report_take_the_reports_up_to_their_resolution() {
+    fn items_resolved_before_resolved_report_take_the_reports_recorded_by_then() {
         let conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
         for (index, migration) in MIGRATIONS[..15].iter().enumerate() {
@@ -522,12 +522,12 @@ mod tests {
              INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
              auto, created_by, version, created_at, updated_at) VALUES \
              ('f-1', 'f', 1, 't', '', '', 'done', 'p2', 0, 't3:a', 2, 0, 20), \
-             ('f-2', 'f', 2, 't', '', '', 'done', 'p2', 0, 't3:a', 2, 0, 15), \
+             ('f-2', 'f', 2, 't', '', '', 'done', 'p2', 0, 't3:a', 2, 0, 5), \
              ('f-3', 'f', 3, 't', '', '', 'open', 'p2', 0, 't3:a', 1, 0, 0); \
              INSERT INTO feedback (task, about, source, signature, reports, reporters, \
              last_reported_at, resolution, resolution_reason, resolved_at, resolved_by) VALUES \
              ('f-1', 'board', 'agent', 's1', 3, '[]', 30, 'declined', 'by design', 20, 'user'), \
-             ('f-2', 'board', 'agent', 's2', 1, '[]', 10, 'declined', 'by design', 15, 'user'), \
+             ('f-2', 'board', 'agent', 's2', 1, '[]', 25, 'declined', 'by design', 5, 'user'), \
              ('f-3', 'board', 'agent', 's3', 1, '[]', 10, NULL, NULL, NULL, NULL); \
              INSERT INTO feedback_reports (id, task, agent, at) VALUES \
              (1, 'f-1', 't3:a', 10), (2, 'f-2', 't3:a', 25), (3, 'f-1', 't3:b', 20), \
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(
             resolved,
             [
-                ("f-1".to_owned(), Some(3)),
+                ("f-1".to_owned(), Some(5)),
                 ("f-2".to_owned(), Some(0)),
                 ("f-3".to_owned(), None)
             ]
