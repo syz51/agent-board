@@ -44,8 +44,8 @@ const ALERT_SCAN: u32 = 1000;
 const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
 /// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
-/// reminders (at most one per task a day) all pass, as a coordinator gets those of its
-/// board's tasks whose owner is gone.
+/// reminders (at most one per task a day) and idle-owner notices (one per spell away) all
+/// pass, as a coordinator gets those of its board's tasks whose owner is gone.
 const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
@@ -56,6 +56,7 @@ const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \
       AND board IN (SELECT slug FROM boards WHERE coordinator = :me)) \
      OR (type = 'task_updated' AND json_extract(payload, '$.quiet_review') IS NOT NULL) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.idle_doing') IS NOT NULL) \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
      OR (type = 'task_created' AND :any_mine))";
@@ -724,8 +725,10 @@ const OVERLAP: u8 = 4;
 const NEW_AGENT: u8 = 5;
 /// A task left quiet in review: a reminder, so after the alerts about change.
 const QUIET_REVIEW: u8 = 6;
+/// A task left in doing while its owner was away: a reminder, like a quiet review.
+const IDLE_DOING: u8 = 7;
 /// Last: found work waits for the owner's review, so it never crowds out the rest.
-const FILED: u8 = 7;
+const FILED: u8 = 8;
 
 /// Has `peer` touched (within the window) or leased a path the agent touched or leased?
 fn shares_paths(
@@ -985,6 +988,39 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                             "check what it waits on (its PR, CI or reviewer), then move it on or task_note {task} with what it still waits on"
                         ),
                         rank: rank(QUIET_REVIEW),
+                    },
+                );
+            }
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let Some(task) = &event.task else { continue };
+                // The owner, when it comes back; the board's coordinator when the owner is
+                // gone, so the stalled task is not lost.
+                let to_me =
+                    mine_ids.contains(task) || stands_in_for_owner(cx, task, me, &["doing"])?;
+                if !to_me {
+                    continue;
+                }
+                let since = event
+                    .payload
+                    .get("idle_doing")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                    .map_or_else(|| "a while".to_owned(), |at| ago(cx.now - at));
+                let owner = event
+                    .payload
+                    .get("owner")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("its owner");
+                out.insert(
+                    (IDLE_DOING, task.to_string()),
+                    Alert {
+                        alert: format!(
+                            "{task} sat in doing while {owner} was away for {since}"
+                        ),
+                        action: format!(
+                            "continue {task}, or park it by what it waits on: review with a note naming the PR, blocked with the reason, or open with a handoff"
+                        ),
+                        rank: rank(IDLE_DOING),
                     },
                 );
             }

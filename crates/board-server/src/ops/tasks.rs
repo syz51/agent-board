@@ -473,6 +473,104 @@ pub(crate) fn announce_quiet_reviews(cx: &mut Ctx<'_>) -> Result<usize> {
     Ok(quiet.len())
 }
 
+/// When `agent` stopped running: its first state change to anything but `running` after
+/// its last change to `running`. A turn ending, a usage-limit pause and the session's end
+/// all follow the same stop, so the spell away starts at the first of them.
+const AWAY_SINCE: &str = "SELECT MIN(at) FROM events \
+     WHERE actor = ?1 AND type = 'agent_state_changed' \
+       AND json_extract(payload, '$.to') <> 'running' \
+       AND seq > COALESCE((SELECT MAX(seq) FROM events \
+         WHERE actor = ?1 AND type = 'agent_state_changed' \
+           AND json_extract(payload, '$.to') = 'running'), 0)";
+
+/// Whether a T3 thread `agent` delegated, at any depth, is at work: running and seen
+/// after `?3`, or paused until a reset still to come (`?4`, now).
+const DELEGATE_AT_WORK: &str = "WITH RECURSIVE down(id, depth) AS ( \
+       SELECT ?1, 0 \
+       UNION \
+       SELECT a.id, down.depth + 1 FROM down JOIN agents a \
+         ON json_extract(a.native_ids, '$.t3_parent') = substr(down.id, 4) \
+       WHERE substr(down.id, 1, 3) = 't3:' AND down.depth < ?2) \
+     SELECT EXISTS (SELECT 1 FROM down JOIN agents a ON a.id = down.id \
+       WHERE down.depth > 0 \
+         AND ((a.state = 'running' AND a.last_seen > ?3) \
+           OR (a.state = 'paused' AND a.paused_until > ?4)))";
+
+/// Announces each task in `doing` on an active board whose owner has been away for
+/// `doing_idle_secs` while no thread it delegated (at any depth) is at work: a
+/// `task_updated` event by `server` (no field changes; `idle_doing` names when the spell
+/// away began, `owner` the owner). Away means not running since then (idle, paused or
+/// ended), or marked running but not seen for that long, as a turn cut short by an error
+/// leaves a thread. Once per spell: an owner that runs again and stops starts a new one.
+/// The snapshot shows it as an alert to the owner, or to the board's coordinator when the
+/// owner is gone, and the owner's device daemon wakes a T3 owner. Run by the sweeper.
+pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let cutoff = now - cx.s.doing_idle_ms();
+    let doing: Vec<(TaskId, BoardSlug, String, String, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.id, t.board, t.owner, a.state, a.last_seen FROM tasks t \
+             JOIN agents a ON a.id = t.owner JOIN boards b ON b.slug = t.board \
+             WHERE t.status = 'doing' AND b.status = 'active'",
+        )?
+        .query_map([], |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut announced = 0;
+    for (id, board, owner, state, last_seen) in &doing {
+        let since = if state == "running" {
+            *last_seen
+        } else {
+            cx.db
+                .prepare_cached(AWAY_SINCE)?
+                .query_row([owner], |r| r.get::<_, Option<i64>>(0))?
+                .unwrap_or(*last_seen)
+        };
+        if since > cutoff {
+            continue;
+        }
+        let told: bool = cx
+            .db
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM events WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.idle_doing') IS NOT NULL \
+               AND json_extract(payload, '$.owner') = ?2 AND at >= ?3)",
+            )?
+            .query_row(params![id.as_str(), owner, since], |r| r.get(0))?;
+        if told {
+            continue;
+        }
+        let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
+            params![owner, crate::ops::leases::DELEGATION_DEPTH, cutoff, now],
+            |r| r.get(0),
+        )?;
+        if at_work {
+            continue;
+        }
+        cx.emit(
+            Some(board),
+            "server",
+            EventType::TaskUpdated,
+            Some(id),
+            serde_json::json!({
+                "fields": [],
+                "idle_doing": ts(since),
+                "owner": owner,
+            }),
+        )?;
+        announced += 1;
+    }
+    Ok(announced)
+}
+
 /// Refuses to start a task whose `not_before` has not passed.
 fn check_not_before(cx: &Ctx<'_>, task: &Task) -> Result<()> {
     match task.not_before {

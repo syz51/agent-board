@@ -26,7 +26,7 @@ fn matcher(glob: &str) -> Option<GlobMatcher> {
 
 /// How many delegations deep [`delegation_family`] follows, so a cycle of `t3_parent`
 /// ids ends.
-const DELEGATION_DEPTH: i64 = 8;
+pub(crate) const DELEGATION_DEPTH: i64 = 8;
 
 /// The query of [`delegation_family`]: `?1` the agent, `?2` the depth. The `down` join
 /// compares the indexed expression `agents_t3_parent` with the parent's id without `t3:`, so

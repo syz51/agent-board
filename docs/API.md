@@ -276,6 +276,17 @@ Reopening a closed board, or any change on it, starts the period again.
   `review_quiet_secs`; a note from the owner or a new move to `review` restarts the clock.
   The snapshot shows it as an alert to the owner, or to the board's coordinator when the
   owner has ended or is not live.
+- Within a minute of a task in `doing`, on an active board, passing `doing_idle_secs` with
+  its owner away, the server records one `task_updated` event by actor `server` with
+  payload `{"fields": [], "idle_doing": <time>, "owner": <agent id>}`: `idle_doing` is when
+  the spell away began. Away means the owner has not run since its first state change
+  after its last change to `running`, or is marked `running` but was last seen
+  `doing_idle_secs` ago. No event is recorded while an agent the owner delegated (a T3
+  thread whose `t3_parent` chain leads to the owner) is running and was seen within
+  `doing_idle_secs`, or is paused until a reset still to come. The task is unchanged. The
+  event is recorded once per spell: the owner running again and stopping starts a new one.
+  The snapshot shows it as an alert to the owner, or to the board's coordinator when the
+  owner has ended or is not live; `board watch` on the owner's device wakes a T3 owner.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
@@ -564,5 +575,6 @@ no nonce.
 | API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
+| Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

@@ -861,6 +861,149 @@ fn sweep_quiet_reviews(t: &T) -> usize {
         .unwrap()
 }
 
+async fn set_state(t: &T, agent: &str, state: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": state })),
+    )
+    .await;
+}
+
+fn sweep_idle_doing(t: &T) -> usize {
+    t.state
+        .db()
+        .write(
+            || t.state.now(),
+            t.state.settings(),
+            crate::ops::tasks::announce_idle_doing,
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_owner_away_from_its_doing_task_is_announced_once_per_spell() {
+    let t = T::new();
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Long job").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    snapshot(&t, owner, "kind=delta").await;
+    set_state(&t, owner, "idle").await;
+
+    // Seen since (a snapshot, a lease renewal) is not being back: the spell runs from the stop.
+    t.advance(TimeDelta::minutes(20));
+    snapshot(&t, owner, "kind=delta").await;
+    assert_eq!(sweep_idle_doing(&t), 0, "20 minutes away");
+    t.advance(TimeDelta::minutes(11));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    assert_eq!(sweep_idle_doing(&t), 0, "once per spell");
+    let delta = snapshot(&t, owner, "kind=delta").await;
+    assert!(
+        text(&delta).contains(&format!(
+            "{id} sat in doing while t3:alpha was away for 31m"
+        )) && text(&delta).contains(&format!("continue {id}, or park it")),
+        "{}",
+        text(&delta)
+    );
+
+    // The session closing later is the same spell.
+    set_state(&t, owner, "ended").await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0);
+
+    // Back at work, then stopped again: a new spell.
+    t.register(owner, Some(REPO), None).await;
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::minutes(29));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    t.advance(TimeDelta::minutes(2));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // Out of doing: never announced.
+    let review = json!({ "status": "review" });
+    assert!(t.patch(owner, &id, review).await.0.is_success());
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_idle_doing(&t), 0);
+}
+
+#[tokio::test]
+async fn an_owner_left_marked_running_is_away_once_unseen_for_the_period() {
+    let t = T::new();
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Cut short").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    t.advance(TimeDelta::minutes(29));
+    assert_eq!(sweep_idle_doing(&t), 0, "running and seen recently");
+    t.advance(TimeDelta::minutes(2));
+    assert_eq!(sweep_idle_doing(&t), 1);
+}
+
+#[tokio::test]
+async fn a_delegate_at_work_or_a_paused_board_holds_the_announcement() {
+    let t = T::new();
+    let (parent, child, grandchild) = ("t3:parent", "t3:child", "t3:grandchild");
+    t.register(parent, Some(REPO), None).await;
+    for (agent, up) in [(child, parent), (grandchild, child)] {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(agent),
+            Some(json!({
+                "id": agent, "runtime": "claude", "device": "mac", "repo": REPO,
+                "native_ids": {"t3_thread": &agent[3..], "t3_parent": &up[3..]},
+            })),
+        )
+        .await;
+    }
+    t.board("factory", &[REPO]).await;
+    let id = t.task(parent, "factory", "Delegated").await;
+    assert!(t.claim(parent, &id).await.0.is_success());
+    set_state(&t, parent, "idle").await;
+    set_state(&t, child, "idle").await;
+
+    // The child waits on the grandchild, which works: the parent is not away from the task.
+    t.advance(TimeDelta::minutes(25));
+    t.register(grandchild, Some(REPO), None).await;
+    t.advance(TimeDelta::minutes(10));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    // A grandchild paused until a reset still to come is at work too.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{grandchild}/state"),
+        Some(grandchild),
+        Some(json!({ "state": "paused", "paused_until": t.state.now() + TimeDelta::hours(1) })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(40));
+    assert_eq!(sweep_idle_doing(&t), 0);
+    // Past the reset and unseen: nobody is at work.
+    t.advance(TimeDelta::minutes(30));
+    assert_eq!(sweep_idle_doing(&t), 1);
+
+    // A paused board: its work is meant to stand still.
+    let owner = "t3:gamma";
+    t.register(owner, Some(REPO), None).await;
+    t.board("quiet", &[REPO]).await;
+    let other = t.task(owner, "quiet", "Paused board").await;
+    assert!(t.claim(owner, &other).await.0.is_success());
+    t.ok(
+        "PATCH",
+        "/v1/boards/quiet",
+        None,
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+    set_state(&t, owner, "idle").await;
+    t.advance(TimeDelta::hours(1));
+    assert_eq!(sweep_idle_doing(&t), 0);
+}
+
 #[tokio::test]
 async fn snapshots_list_pending_proposals_apart_from_ready_work() {
     let t = T::new();

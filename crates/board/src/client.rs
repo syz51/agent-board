@@ -339,12 +339,6 @@ impl Client {
         self.get_query("/v1/agents", &q).await
     }
 
-    pub async fn agents_in_state(&self, state: board_proto::AgentState) -> Result<Vec<Agent>> {
-        let state = serde_json::to_value(state)?;
-        let state = state.as_str().unwrap_or_default();
-        self.get_query("/v1/agents", &[("state", state)]).await
-    }
-
     pub async fn agent_info(&self, id: &AgentId) -> Result<Agent> {
         self.get(&format!("/v1/agents/{}", enc(id.as_str()))).await
     }

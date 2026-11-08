@@ -610,9 +610,10 @@ async fn a_task_moved_to_review_wakes_the_coordinator_and_each_send_is_logged() 
     assert_eq!(e.t3.sends().len(), 1);
 }
 
-/// An env with `factory-7` in doing, owned by the T3 thread `worker` on this device, which
-/// has been `state` since `away` minutes before [`at`]; the board is hosted elsewhere.
-fn idle_owner_env(state: AgentState, away: i64) -> (Env, String) {
+/// An env whose board is hosted elsewhere, with `factory-7` in doing, owned by the idle T3
+/// thread `worker` on this device, and the server's notice that it has been away since
+/// 40 minutes before [`at`].
+fn idle_owner_env() -> (Env, Event, String) {
     let e = env();
     let owner = "t3:worker".to_owned();
     e.t3.live("worker");
@@ -620,20 +621,24 @@ fn idle_owner_env(state: AgentState, away: i64) -> (Env, String) {
     let mut doing = detail("factory-7", false, &[]);
     doing.task.status = TaskStatus::Doing;
     doing.task.owner = Some(owner.parse().unwrap());
-    e.stub.on("GET /v1/tasks", [&doing.task]);
     e.stub.on("GET /v1/tasks/factory-7", &doing);
-    e.stub
-        .on("GET /v1/agents", Vec::<board_proto::Agent>::new());
-    let mut info = agent_fixture(&owner, DEVICE, state);
-    info.last_seen = at() - chrono::Duration::minutes(away);
-    e.stub.on(&format!("GET {}", agent_path(&owner)), &info);
-    (e, owner)
+    e.stub.on(
+        &format!("GET {}", agent_path(&owner)),
+        agent_fixture(&owner, DEVICE, AgentState::Idle),
+    );
+    let since = at() - chrono::Duration::minutes(40);
+    let mut notice = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
+    notice.payload = json!({ "fields": [], "idle_doing": since, "owner": owner });
+    (e, notice, owner)
 }
 
 #[tokio::test]
-async fn an_owner_away_from_its_doing_task_is_woken_once_per_spell() {
-    let (mut e, owner) = idle_owner_env(AgentState::Idle, 40);
+async fn the_servers_idle_notice_wakes_the_owner_away_from_its_doing_task() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let (mut e, notice, _) = idle_owner_env();
     e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
     e.daemon.flush(at()).await;
     let since = (at() - chrono::Duration::minutes(40)).format("%Y-%m-%d %H:%MZ");
     assert_eq!(
@@ -648,54 +653,88 @@ async fn an_owner_away_from_its_doing_task_is_woken_once_per_spell() {
             )
         )]
     );
-    let tasks = e.stub.requests_to("GET /v1/tasks");
-    assert_eq!(tasks[0].query, "status=doing&limit=1000");
-    assert_eq!(
-        e.stub.requests_to("GET /v1/agents")[0].query,
-        "state=running"
+    assert!(
+        logs.text().contains("woke t3:worker: idle"),
+        "{}",
+        logs.text()
     );
-
-    // Still away in the same spell: not woken again, and not looked for before 5 minutes.
-    e.daemon
-        .reconcile(at() + chrono::Duration::minutes(2))
-        .await
-        .unwrap();
-    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 1);
-    e.daemon
-        .reconcile(at() + chrono::Duration::minutes(6))
-        .await
-        .unwrap();
-    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 2);
-    e.daemon.flush(at() + chrono::Duration::minutes(6)).await;
-    assert_eq!(e.t3.sends().len(), 1);
-
-    // It ran since and is away again: a new spell, woken again.
-    let mut info = agent_fixture(&owner, DEVICE, AgentState::Ended);
-    info.last_seen = at() - chrono::Duration::minutes(10);
-    e.stub.on(&format!("GET {}", agent_path(&owner)), &info);
-    let later = at() + chrono::Duration::minutes(30);
-    e.daemon.reconcile(later).await.unwrap();
-    e.daemon.flush(later).await;
-    assert_eq!(e.t3.sends().len(), 2);
+    // The daemon reads no task list of its own: the server finds idle owners.
+    assert!(e.stub.requests_to("GET /v1/tasks").is_empty());
 }
 
 #[tokio::test]
-async fn an_owner_running_away_briefly_or_with_a_running_child_is_not_woken() {
-    for (state, away) in [(AgentState::Running, 40), (AgentState::Idle, 20)] {
-        let (mut e, _) = idle_owner_env(state, away);
-        e.daemon.reconcile(at()).await.unwrap();
-        e.daemon.flush(at()).await;
-        assert!(e.t3.sends().is_empty(), "{state:?} for {away} minutes");
-    }
-    // A delegated child of the owner still runs: the parent waits on it.
-    let (mut e, _) = idle_owner_env(AgentState::Idle, 40);
-    let mut child = agent_fixture("t3:child", DEVICE, AgentState::Running);
-    child.native_ids.insert("t3_parent".into(), "worker".into());
-    e.stub.on("GET /v1/agents", [&child]);
+async fn an_owner_back_at_work_or_off_its_task_gets_no_idle_line() {
+    // Back at work before the line went out: it no longer holds.
+    let (mut e, notice, owner) = idle_owner_env();
     e.daemon.reconcile(at()).await.unwrap();
+    let mut running = agent_fixture(&owner, DEVICE, AgentState::Running);
+    running.last_seen = at();
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &running);
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "held while it runs");
+    let mut back = event(31, EventType::AgentStateChanged, None, &owner);
+    back.payload = json!({ "from": "idle", "to": "running", "paused_until": null });
+    e.daemon.on_event(&back, at()).await.unwrap();
+    let mut stopped = event(32, EventType::AgentStateChanged, None, &owner);
+    stopped.payload = json!({ "from": "running", "to": "idle", "paused_until": null });
+    e.daemon.on_event(&stopped, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // The task left doing, or another agent owns it, before the send.
+    for change in ["review", "handed"] {
+        let (mut e, notice, _) = idle_owner_env();
+        e.daemon.reconcile(at()).await.unwrap();
+        let mut moved = detail("factory-7", false, &[]);
+        if change == "review" {
+            moved.task.status = TaskStatus::Review;
+            moved.task.owner = Some("t3:worker".parse().unwrap());
+        } else {
+            moved.task.status = TaskStatus::Doing;
+            moved.task.owner = Some("t3:other".parse().unwrap());
+        }
+        e.stub.on("GET /v1/tasks/factory-7", &moved);
+        e.daemon.on_event(&notice, at()).await.unwrap();
+        e.daemon.flush(at()).await;
+        assert!(e.t3.sends().is_empty(), "{change}");
+    }
+}
+
+#[tokio::test]
+async fn an_idle_notice_for_another_devices_or_a_non_t3_owner_is_not_sent_here() {
+    // Another device's owner: its own daemon wakes it.
+    let (mut e, notice, owner) = idle_owner_env();
+    e.stub.on(
+        &format!("GET {}", agent_path(&owner)),
+        agent_fixture(&owner, "mac-air", AgentState::Idle),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
     e.daemon.flush(at()).await;
     assert!(e.t3.sends().is_empty());
-    assert!(e.daemon.state.idle_woken.is_empty());
+
+    // A Claude Code owner has no thread to send to: nothing is queued.
+    let (mut e, mut notice, _) = idle_owner_env();
+    notice.payload["owner"] = json!("claude:abc");
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_paused_owners_idle_line_waits_for_its_reset() {
+    let (mut e, notice, owner) = idle_owner_env();
+    let reset = at() + chrono::Duration::hours(1);
+    let mut paused = agent_fixture(&owner, DEVICE, AgentState::Paused);
+    paused.paused_until = Some(reset);
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &paused);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    e.daemon.flush(reset + chrono::Duration::minutes(1)).await;
+    assert_eq!(e.t3.sends().len(), 1);
 }
 
 #[tokio::test]
@@ -1754,8 +1793,8 @@ async fn a_device_without_the_project_never_claims_the_lease() {
         e.stub
             .requests()
             .iter()
-            .all(|r| r.method == "GET" && ["/v1/boards", "/v1/tasks"].contains(&r.path.as_str())),
-        "only board and task reads: {:?}",
+            .all(|r| r.method == "GET" && r.path == "/v1/boards"),
+        "only board reads: {:?}",
         e.stub.requests()
     );
     assert!(e.t3.calls().is_empty());

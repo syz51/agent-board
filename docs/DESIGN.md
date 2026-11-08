@@ -254,6 +254,16 @@ settings in use, warned once per edit.
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken.
+- **An owner away from its task**: the server's sweeper finds each task in `doing`, on an
+  active board, whose owner has been away for `doing_idle_secs` (30 minutes): not running
+  since it last stopped (idle, paused or ended; the spell starts at the stop, so a session
+  T3 closes later is the same spell), or marked running but not seen for that long, as a
+  turn cut short by an error leaves a thread. It skips the task while a thread the owner
+  delegated, at any depth, is at work (running and seen within that time, or paused until
+  a reset still to come). It records one `task_updated` event with `idle_doing` per spell
+  away, so the check runs once, on the server, not on every device. The snapshot alerts
+  the owner, or the board's coordinator when the owner is gone, and the owner's device
+  daemon wakes a T3 owner.
 - **Re-briefing it**: the daemon records with each coordinator it hosts a SHA-256 digest
   of the standing prompt it briefed the thread with. When that prompt changes (`board` is
   upgraded with a new prompt, or the device's `feedback_board` moves, which adds or drops
@@ -342,12 +352,10 @@ settings in use, warned once per edit.
   new open, non-`auto` task whose body starts `Proposal:`). The stream carries every
   board, so a blocker on another board wakes the coordinator of the waiting task's board;
   and the owner of a `blocked` task is woken when its last blocker is done (told to check
-  its blocked reason first when it has one). Every 5 minutes the daemon lists `doing`
-  tasks and wakes an owner that is a T3 thread on this device, has been idle or ended for
-  30 minutes or more, and has no running delegated child (an agent whose `t3_parent` is
-  the owner's thread): it is told to continue the task or park it by what it waits on.
-  An owner is woken once per idle spell; it is woken again only after it ran and went
-  idle again. An answered ask wakes the agent
+  its blocked reason first when it has one). The owner of a task in `doing` is woken when
+  the server announces it has been away from the task (`idle_doing`, below), and told to
+  continue it or park it by what it waits on; a line still queued when the owner runs
+  again is dropped. An answered ask wakes the agent
   that asked, worker or coordinator; the coordinator gets it instead when the asker cannot
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are

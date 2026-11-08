@@ -11,8 +11,9 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    again for your own pending proposals whose reviewer child is gone (see Proposals).
 2. Pick the highest-priority ready task marked `auto`. If none is ready, run the goal review
    (below) when it is due. If it filed nothing ready, set your handoff, keeping the last task
-   you finished in it, and stop: the board wakes you when work becomes ready, one of your
-   asks is answered, or an ask is answered whose asker it cannot wake.
+   you finished in it, and stop: the board wakes you when work becomes ready, a task moves
+   to review, one of your asks is answered, or an ask is answered whose asker it cannot
+   wake.
 3. `task_claim` it, then `task_show` it and read its body, its acceptance checks and every
    note on it. The claim says how many notes it has; `task_show` shows every finding and
    decision, and the latest plain notes (pass `detailed` for the rest). A finding is part

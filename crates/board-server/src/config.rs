@@ -313,6 +313,9 @@ pub struct Settings {
     pub duplicate_ask_window_secs: u64,
     /// A task in review this long with no note from its owner raises one alert.
     pub review_quiet_secs: u64,
+    /// A task in doing whose owner has been away this long, with no thread it delegated
+    /// still at work, is announced once per spell away.
+    pub doing_idle_secs: u64,
 }
 
 impl Default for Settings {
@@ -344,6 +347,7 @@ impl Default for Settings {
             error_retention_days: 35,
             duplicate_ask_window_secs: 30 * 60,
             review_quiet_secs: 24 * 3600,
+            doing_idle_secs: 30 * 60,
         }
     }
 }
@@ -375,6 +379,7 @@ impl Settings {
             ("error_retention_days", u64::from(self.error_retention_days)),
             ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
             ("review_quiet_secs", self.review_quiet_secs),
+            ("doing_idle_secs", self.doing_idle_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -419,6 +424,10 @@ impl Settings {
 
     pub(crate) fn review_quiet_ms(&self) -> i64 {
         secs_ms(self.review_quiet_secs)
+    }
+
+    pub(crate) fn doing_idle_ms(&self) -> i64 {
+        secs_ms(self.doing_idle_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

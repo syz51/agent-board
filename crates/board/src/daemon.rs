@@ -8,8 +8,10 @@
 //! - renews the coordinator lease while the thread is live;
 //! - wakes the coordinator when a task becomes ready or a blocker clears (the coordinator
 //!   of the waiting task's board, which may differ from the blocker's), the owner of a
-//!   blocked task when its last blocker is done, and the asker (worker or coordinator) when
-//!   its ask is answered, or the coordinator when the asker cannot be woken;
+//!   blocked task when its last blocker is done, the coordinator when a task moves to
+//!   `review`, the owner of a task in `doing` when the server announces it has been away
+//!   from it (`idle_doing`), and the asker (worker or coordinator) when its ask is answered,
+//!   or the coordinator when the asker cannot be woken;
 //! - never wakes a paused agent before its `paused_until`;
 //! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
 //!   session left idle, which marks its agent ended, and a message resumes the thread. One
@@ -44,7 +46,7 @@ use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
+use crate::client::{Client, ServerError, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
@@ -78,11 +80,6 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// each minute costs a home device more than the check is worth. A failed send to the
 /// thread, or its agent ending, asks again on the next reconcile.
 pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
-/// The owner of a task in `doing` that has been away this long (idle, paused or ended)
-/// with no running child thread is woken, once per spell away.
-pub const IDLE_WAKE_AFTER: TimeDelta = TimeDelta::minutes(30);
-/// How often a reconcile looks for such owners: each look reads every task in `doing`.
-pub const IDLE_SCAN_EVERY: TimeDelta = TimeDelta::minutes(5);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -157,10 +154,6 @@ pub struct WatchState {
     /// cannot read is skipped rather than resetting the rest of the state.
     #[serde(default, deserialize_with = "lenient_queues")]
     pub wakes: BTreeMap<AgentId, WakeQueue>,
-    /// Tasks in `doing` whose away owner was woken, with the `last_seen` that began the
-    /// spell: the owner is not woken again for the task until it has run since.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub idle_woken: BTreeMap<TaskId, Timestamp>,
 }
 
 /// One agent's wake-ups not sent yet.
@@ -560,7 +553,6 @@ pub struct Daemon<T: T3> {
     /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
     threads_live: BTreeMap<String, Timestamp>,
     /// When a reconcile last looked for away owners of tasks in `doing`.
-    idle_scanned_at: Option<Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
@@ -584,7 +576,6 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             threads_live: BTreeMap::new(),
-            idle_scanned_at: None,
             agents: BTreeMap::new(),
             sending: Vec::new(),
             config_text,
@@ -695,87 +686,7 @@ impl<T: T3> Daemon<T> {
         self.state
             .pending_starts
             .retain(|slug, _| boards.contains_key(slug));
-        if self
-            .idle_scanned_at
-            .is_none_or(|at| now - at >= IDLE_SCAN_EVERY)
-        {
-            self.idle_scanned_at = Some(now);
-            if let Err(err) = self.wake_idle_owners(now).await {
-                tracing::warn!("waking idle owners: {err:#}");
-            }
-        }
         self.save()
-    }
-
-    /// Queues a wake-up for each owner on this device of a task in `doing` that has been
-    /// away (idle, paused or ended) for [`IDLE_WAKE_AFTER`] and has no running child
-    /// thread, which may be doing the work: once per spell away. A paused owner's line
-    /// waits for its reset, like any other.
-    async fn wake_idle_owners(&mut self, now: Timestamp) -> Result<()> {
-        let doing = self
-            .client()
-            .tasks(&TaskQuery {
-                status: Some(TaskStatus::Doing),
-                limit: Some(1_000),
-                ..TaskQuery::default()
-            })
-            .await?;
-        self.state
-            .idle_woken
-            .retain(|task, _| doing.iter().any(|t| t.id == *task));
-        let mut owners: BTreeMap<AgentId, Agent> = BTreeMap::new();
-        let mut running: Option<Vec<Agent>> = None;
-        for task in doing {
-            let Some(owner) = task.owner.clone() else {
-                continue;
-            };
-            if owner.source() != AgentSource::T3 {
-                continue;
-            }
-            let info = match owners.get(&owner) {
-                Some(info) => info.clone(),
-                None => {
-                    let info = match self.client().agent_info(&owner).await {
-                        Ok(info) => info,
-                        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
-                        Err(err) => return Err(err),
-                    };
-                    owners.insert(owner.clone(), info.clone());
-                    info
-                }
-            };
-            let since = info.last_seen;
-            if info.device != self.ctx.device
-                || info.state == AgentState::Running
-                || now - since < IDLE_WAKE_AFTER
-                || self.state.idle_woken.get(&task.id) == Some(&since)
-            {
-                continue;
-            }
-            let running = match &running {
-                Some(running) => running,
-                None => running.insert(self.client().agents_in_state(AgentState::Running).await?),
-            };
-            let parent = owner.native();
-            if running
-                .iter()
-                .any(|a| a.native_ids.get("t3_parent").map(String::as_str) == Some(parent))
-            {
-                continue;
-            }
-            self.state.idle_woken.insert(task.id.clone(), since);
-            let wake = Wake {
-                board: task.board.clone(),
-                about: WakeAbout::Idle {
-                    task: task.id.clone(),
-                    since,
-                },
-                queued_at: now,
-                forwarded: false,
-            };
-            self.queue(owner, wake);
-        }
-        Ok(())
     }
 
     /// Whether each coordinator thread of ours that a home board still leaves to us is live,
@@ -1381,6 +1292,15 @@ impl<T: T3> Daemon<T> {
                 self.threads_live.remove(agent.native());
             }
             self.note_state(event, now);
+            // Back at work: a notice that it was away no longer holds.
+            if event.payload["to"] == "running"
+                && let Ok(agent) = event.actor.parse::<AgentId>()
+                && let Some(queue) = self.state.wakes.get_mut(&agent)
+            {
+                queue
+                    .wakes
+                    .retain(|w| !matches!(w.about, WakeAbout::Idle { .. }));
+            }
         }
         let (reconcile, wakes) = self.examine(event).await?;
         for (board, agent, about) in wakes {
@@ -1442,16 +1362,37 @@ impl<T: T3> Daemon<T> {
             EventType::BoardCreated => return Ok((true, wakes)),
             // This device's own lease claims and releases change nothing a reconcile would act on.
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
+            // The server's notice that a task's owner has been away from it: the owner. Whether
+            // it is on this device and still away is checked when the wake-up is sent.
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let owner = event.payload["owner"]
+                    .as_str()
+                    .and_then(|a| a.parse::<AgentId>().ok());
+                let since =
+                    serde_json::from_value::<Timestamp>(event.payload["idle_doing"].clone());
+                if let (Some(task), Some(owner), Ok(since)) = (&event.task, &owner, since)
+                    && let Some(owner) = self.wakeable(Some(owner), event)
+                {
+                    let about = WakeAbout::Idle {
+                        task: task.clone(),
+                        since,
+                    };
+                    wakes.push((slug.clone(), owner.clone(), about));
+                }
+            }
             EventType::TaskCreated | EventType::TaskReleased | EventType::TaskUpdated => {
                 if let Some(task) = &event.task
                     && let Some(coordinator) = self.wakeable(self.coordinator_here(slug), event)
                 {
-                    let detail = self.client().task(task).await?;
-                    let about = if event.event_type == EventType::TaskUpdated
-                        && event.payload["to"] == "review"
+                    // A move to review needs no read: the line is checked when it is sent.
+                    if event.event_type == EventType::TaskUpdated && event.payload["to"] == "review"
                     {
-                        Some(WakeAbout::Review { task: task.clone() })
-                    } else if detail.task.ready && detail.task.auto {
+                        let about = WakeAbout::Review { task: task.clone() };
+                        wakes.push((slug.clone(), coordinator.clone(), about));
+                        return Ok((false, wakes));
+                    }
+                    let detail = self.client().task(task).await?;
+                    let about = if detail.task.ready && detail.task.auto {
                         Some(WakeAbout::Ready { task: task.clone() })
                     } else if event.event_type == EventType::TaskCreated
                         && is_proposal(&detail.task)
@@ -1916,6 +1857,7 @@ impl<T: T3> Daemon<T> {
         }
         let kinds = || {
             let mut kinds: Vec<&str> = out.wakes.iter().map(|w| w.about.kind()).collect();
+            kinds.sort_unstable();
             kinds.dedup();
             kinds.join(", ")
         };
@@ -2252,7 +2194,7 @@ pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
 pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
     format!(
-        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
+        "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, a task moves to review, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
     )
 }
 
