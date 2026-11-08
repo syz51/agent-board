@@ -322,6 +322,144 @@ async fn re_registration_keeps_the_title_and_native_ids_it_leaves_out() {
 }
 
 #[tokio::test]
+async fn a_boards_coordinator_keeps_its_title_against_a_workers_registration() {
+    let t = T::new();
+    let a = "t3:lead";
+    let register = async |role: &str, title: &str| {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(a),
+            Some(json!({
+                "id": a, "runtime": "claude", "device": "mac", "role": role, "title": title,
+                "repo": REPO, "native_ids": { "t3_link": format!("https://t3.example.test/{}", title.replace(' ', "-")) },
+            })),
+        )
+        .await
+    };
+    // Before it coordinates, the thread's own title (the hooks') wins.
+    assert_eq!(
+        register("worker", "Fix the parser").await["title"],
+        "Fix the parser"
+    );
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true })),
+    )
+    .await;
+    // The daemon registers its coordinator with the board's name, then claims the lease.
+    assert_eq!(
+        register("coordinator", "auto coordinator").await["title"],
+        "auto coordinator"
+    );
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(a),
+        Some(json!({ "device": "mac", "agent": a })),
+    )
+    .await;
+    // The hooks register it as a worker with the thread's title: role and title stay, the
+    // rest is taken.
+    let hooked = register("worker", "Renamed by T3").await;
+    assert_eq!(
+        (&hooked["role"], &hooked["title"]),
+        (&json!("coordinator"), &json!("auto coordinator"))
+    );
+    assert_eq!(
+        hooked["native_ids"]["t3_link"],
+        "https://t3.example.test/Renamed-by-T3"
+    );
+}
+
+#[tokio::test]
+async fn a_workers_registration_between_the_daemons_and_its_claim_keeps_the_coordinator_title() {
+    let t = T::new();
+    let a = "t3:lead";
+    let register = async |role: &str, title: &str| {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(a),
+            Some(json!({
+                "id": a, "runtime": "claude", "device": "mac", "role": role, "title": title,
+                "repo": REPO,
+            })),
+        )
+        .await
+    };
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true })),
+    )
+    .await;
+    register("coordinator", "auto coordinator").await;
+    // The thread's session-start hook lands before the daemon claims the lease.
+    assert_eq!(
+        register("worker", "Thread title").await["title"],
+        "auto coordinator"
+    );
+    let claimed = t
+        .ok(
+            "POST",
+            "/v1/boards/auto/coordinator",
+            Some(a),
+            Some(json!({ "device": "mac", "agent": a })),
+        )
+        .await;
+    assert_eq!(claimed["coordinator"], a);
+    let agent = register("worker", "Thread title").await;
+    assert_eq!(
+        (&agent["role"], &agent["title"]),
+        (&json!("coordinator"), &json!("auto coordinator"))
+    );
+}
+
+#[tokio::test]
+async fn a_t3_link_must_be_an_https_link() {
+    let t = T::new();
+    for link in [
+        "javascript:alert(1)",
+        "http://t3.example.test/x",
+        "https://",
+        "https://a b",
+    ] {
+        let (s, v) = t
+            .call(
+                "POST",
+                "/v1/agents",
+                Some("t3:alpha"),
+                Some(json!({
+                    "id": "t3:alpha", "runtime": "claude", "device": "mac",
+                    "native_ids": { "t3_link": link },
+                })),
+            )
+            .await;
+        assert_eq!(s, 400, "{link}: {v}");
+        assert!(v["message"].as_str().unwrap().contains("t3_link"), "{v}");
+    }
+    let ok = t
+        .ok(
+            "POST",
+            "/v1/agents",
+            Some("t3:alpha"),
+            Some(json!({
+                "id": "t3:alpha", "runtime": "claude", "device": "mac",
+                "native_ids": { "t3_link": "https://t3.example.test/thread-1" },
+            })),
+        )
+        .await;
+    assert_eq!(
+        ok["native_ids"]["t3_link"],
+        "https://t3.example.test/thread-1"
+    );
+}
+
+#[tokio::test]
 async fn devices_register_agents_only_as_themselves() {
     let t = T::new();
     let body = json!({ "id": "t3:alpha", "runtime": "claude", "device": "laptop" });

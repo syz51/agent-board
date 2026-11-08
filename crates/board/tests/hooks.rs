@@ -1817,9 +1817,224 @@ fn a_delegated_t3_thread_registers_its_parent() {
             "{thread}"
         );
     }
-    // Only the delegated thread asked T3, and only once.
+    // Each thread asked T3 once; only the delegated one keeps a parent.
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(calls, format!("thread show --json --messages 0 {CHILD}\n"));
+    assert_eq!(
+        calls,
+        format!(
+            "thread show --json --messages 0 {CHILD}\nthread show --json --messages 0 thread-7\n"
+        )
+    );
+}
+
+/// A `t3` that answers `thread show` with the JSON in `answer` and logs each call to `log`.
+#[cfg(unix)]
+fn fake_t3(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let log = dir.join("t3.log");
+    let answer = dir.join("t3-answer.json");
+    let t3 = dir.join("t3");
+    std::fs::write(
+        &t3,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncat '{}'\n",
+            log.display(),
+            answer.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (t3.to_str().unwrap().to_owned(), log, answer)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
+    const LINK: &str = "https://app.example.test/threads/env-1/thread-7";
+    let e = env();
+    let (t3, log, answer) = fake_t3(&e.home);
+    let titled = |title: &str| {
+        let body = json!({"thread": {"threadId": "thread-7", "title": title, "link": LINK}});
+        std::fs::write(&answer, body.to_string()).unwrap();
+    };
+    let calls = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let agent = "t3:thread-7";
+    let t3_env = [("T3CODE_THREAD_ID", "thread-7"), ("T3CODE_CLI_PATH", &t3)];
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(agent)),
+        agent_fixture(agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    let start = |source: &str| {
+        let payload = e.with("SessionStart", json!({"source": source}));
+        e.hook_env("session-start", "claude", payload, &t3_env);
+    };
+    let stop = || {
+        let payload = e.with(
+            "Stop",
+            json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
+        );
+        e.hook_env("stop", "claude", payload, &t3_env);
+    };
+    let registered = || {
+        e.stub
+            .requests_to("POST /v1/agents")
+            .into_iter()
+            .map(|r| r.body)
+            .collect::<Vec<_>>()
+    };
+
+    // SessionStart registers the title T3 has then, and the link.
+    titled("New thread");
+    start("startup");
+    let first = registered().pop().unwrap();
+    assert_eq!(first["title"], "New thread");
+    assert_eq!(first["native_ids"]["t3_link"], LINK);
+    assert_eq!(first["native_ids"]["t3_thread"], "thread-7");
+    assert_eq!(calls(), 1);
+
+    // T3 renames the thread after its first turn. The first Stop marks the agent idle with
+    // its message first, then registers the new title, and marks it idle again, since
+    // registering marks it running. The server refuses the registration this time.
+    titled("Fix the parser");
+    e.stub.clear();
+    e.stub
+        .once_error("POST /v1/agents", 500, "internal", "try again");
+    stop();
+    assert_eq!(calls(), 2);
+    let routes = || {
+        e.stub
+            .requests()
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect::<Vec<_>>()
+    };
+    let state = format!("POST /v1/agents/{}/state", enc(agent));
+    assert_eq!(routes(), [state.clone(), "POST /v1/agents".to_owned()]);
+    assert_eq!(e.stub.requests_to(&state)[0].body["said"], "Done.");
+
+    // A refused registration counts no check: the next Stop asks T3 and registers again.
+    e.stub.clear();
+    stop();
+    assert_eq!(calls(), 3);
+    assert_eq!(
+        routes(),
+        [state.clone(), "POST /v1/agents".to_owned(), state.clone()]
+    );
+    let again = registered().pop().unwrap();
+    assert_eq!(again["title"], "Fix the parser");
+    assert_eq!(again["native_ids"]["t3_link"], LINK);
+    assert_eq!(again["repo"], first["repo"]);
+    assert_eq!(again["branch"], first["branch"]);
+    let states = e.stub.requests_to(&state);
+    assert_eq!(states[1].body["state"], "idle");
+    assert_eq!(states[1].body["said"], Value::Null);
+
+    // Within the hour, no Stop asks T3 again.
+    titled("Renamed again");
+    e.stub.clear();
+    stop();
+    assert_eq!(calls(), 3);
+    assert!(registered().is_empty());
+
+    // An hour later a Stop asks again; an unchanged title sends nothing.
+    let backdate = || {
+        let path = e
+            .home
+            .join("state/sessions")
+            .join(format!("claude-{SESSION}.json"));
+        let mut cached: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hour_ago = chrono::Utc::now() - chrono::Duration::minutes(61);
+        cached["title_checked_at"] = json!(hour_ago);
+        std::fs::write(&path, cached.to_string()).unwrap();
+    };
+    titled("Fix the parser");
+    backdate();
+    stop();
+    assert_eq!(calls(), 4);
+    assert!(registered().is_empty(), "the title did not change");
+
+    // Compaction starts the session again: the cached title, without asking T3.
+    titled("Something else");
+    start("compact");
+    assert_eq!(calls(), 4);
+    assert_eq!(registered().pop().unwrap()["title"], "Fix the parser");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
+    const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    let e = env();
+    let (t3, log, answer) = fake_t3(&e.home);
+    let agent = format!("t3:{CHILD}");
+    let t3_env = [
+        ("T3CODE_THREAD_ID", CHILD),
+        ("T3CODE_CLI_PATH", t3.as_str()),
+    ];
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(&agent)),
+        agent_fixture(&agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    let start = |source: &str| {
+        let payload = e.with("SessionStart", json!({"source": source}));
+        e.hook_env("session-start", "claude", payload, &t3_env);
+    };
+    let last_registered = || e.stub.requests_to("POST /v1/agents").pop().unwrap().body;
+
+    // T3 does not answer at SessionStart (no answer yet: `t3` fails).
+    start("startup");
+    assert!(last_registered()["native_ids"].get("t3_parent").is_none());
+
+    // The first Stop finds the title, and the parent with it.
+    let body = json!({"thread": {
+        "threadId": CHILD, "title": "Child work",
+        "parentThreadId": "parent-1", "relationshipToParent": "subagent",
+    }});
+    std::fs::write(&answer, body.to_string()).unwrap();
+    e.stub.clear();
+    let payload = e.with(
+        "Stop",
+        json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
+    );
+    e.hook_env("stop", "claude", payload, &t3_env);
+    let renamed = last_registered();
+    assert_eq!(renamed["title"], "Child work");
+    assert_eq!(renamed["native_ids"]["t3_parent"], "parent-1");
+
+    // Compaction registers from the cache, parent included, without asking T3.
+    let asked = std::fs::read_to_string(&log).unwrap().lines().count();
+    e.stub.clear();
+    start("compact");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        asked
+    );
+    assert_eq!(last_registered()["native_ids"]["t3_parent"], "parent-1");
 }
 
 /// Runs a hook two `claude` processes deep, as a `claude -p` started from a T3 thread's

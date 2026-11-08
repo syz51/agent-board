@@ -7,7 +7,8 @@ use board_proto::{
     CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX, ERRORS_Q_CHARS_MAX, ErrorCode,
     ErrorLog, ErrorSignature, EventType, EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
     Feedback, FeedbackActivity, FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats,
-    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
+    NewEvidence, ResolutionKind, ResolveFeedback, ResolvedCounts, Task, TaskId, TaskStatus,
+    Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -235,19 +236,9 @@ fn prior(cx: &Ctx<'_>, signature: &str) -> Result<Prior> {
 /// done or dropped, declined, a duplicate of a live item, or routed to a task that is not
 /// done or dropped. Forwarded and fixed items are not live.
 fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> {
-    let row: Option<(Option<String>, Option<String>)> = cx
-        .db
-        .query_row(
-            "SELECT resolution, resolution_task FROM feedback WHERE task = ?1",
-            [id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((kind, target)) = row else {
+    let Some((kind, target)) = resolution(cx, id)? else {
         return Ok(None);
     };
-    let kind: Option<ResolutionKind> = kind.map(|k| parse_enum(&k)).transpose()?;
-    let target: Option<TaskId> = target.map(|t| parse_id(&t)).transpose()?;
     Ok(match (kind, target) {
         (None, _) => task_open(cx, id)?.then(|| id.clone()),
         (Some(ResolutionKind::Declined), _) => Some(id.clone()),
@@ -262,6 +253,119 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
         }
         _ => None,
     })
+}
+
+/// The resolution kind and task of feedback item `id`, or `None` when it is not one.
+fn resolution(
+    cx: &Ctx<'_>,
+    id: &TaskId,
+) -> Result<Option<(Option<ResolutionKind>, Option<TaskId>)>> {
+    let row: Option<(Option<String>, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT resolution, resolution_task FROM feedback WHERE task = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(kind, target)| {
+        Ok((
+            kind.map(|k| parse_enum(&k)).transpose()?,
+            target.map(|t| parse_id(&t)).transpose()?,
+        ))
+    })
+    .transpose()
+}
+
+/// Refuses resolving item `id` as a duplicate of `original` unless `original` takes reports
+/// (`live_item`; a plain task while it is open). A duplicate of an item that is no longer
+/// live is not live either, so the next report would open yet another item that nobody
+/// routes: the hint says where to route `id` instead. `resolve` checks `id` again once the
+/// resolution is written, for chains that lead back to `id`.
+fn check_original(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<()> {
+    let live = if is_feedback(cx, original)? {
+        live_item(cx, original, 0)?.is_some()
+    } else {
+        task_open(cx, original)?
+    };
+    if live {
+        return Ok(());
+    }
+    Err(invalid(
+        format!("{original} no longer takes reports, so {id} cannot be its duplicate"),
+        route_instead(cx, id, original)?,
+    ))
+}
+
+/// Where to route item `id`, whose original is no longer live: the open revisit of the
+/// original's routed task, else that task's owner (who declined it, when it was dropped),
+/// else the setup's owner.
+fn route_instead(cx: &Ctx<'_>, id: &TaskId, original: &TaskId) -> Result<String> {
+    let routed = format!("then feedback_resolve {id} kind=routed task=<its id>");
+    let task = match routed_task(cx, original)? {
+        Some(task) => find_task(cx, &task)?,
+        None => None,
+    };
+    let Some(task) = task else {
+        return Ok(format!(
+            "file a Proposal: task for the setup's owner that cites {original}, {routed}"
+        ));
+    };
+    let revisit: Option<String> = cx
+        .db
+        .query_row(
+            "SELECT id FROM tasks WHERE parent = ?1 AND status NOT IN ('done', 'dropped') \
+             AND title GLOB 'Revisit:*' ORDER BY number LIMIT 1",
+            [task.id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(revisit) = revisit {
+        return Ok(format!(
+            "route it to the open revisit of {}: feedback_resolve {id} kind=routed \
+             task={revisit}",
+            task.id
+        ));
+    }
+    let owner = task
+        .owner
+        .as_ref()
+        .map_or_else(String::new, |o| format!(", owned by {o}"));
+    let names = if &task.id == original {
+        task.id.to_string()
+    } else {
+        format!("{} and {original}", task.id)
+    };
+    if task.status == TaskStatus::Dropped {
+        return Ok(format!(
+            "{} was dropped{owner}: its verdict note answers these reports. Decline {id} \
+             citing it (kind=declined), or, with evidence the verdict did not weigh, file a \
+             Proposal: task on board {} that names {names} and cites the verdict, {routed}",
+            task.id, task.board
+        ));
+    }
+    Ok(format!(
+        "{} is {}{owner}: file a Proposal: task on board {} that names {names}, {routed}",
+        task.id,
+        status_str(task.status),
+        task.board
+    ))
+}
+
+/// The task an item's resolution routed it to, following duplicate links: a plain task off
+/// the feedback board that `id` is, or that the chain names.
+fn routed_task(cx: &Ctx<'_>, id: &TaskId) -> Result<Option<TaskId>> {
+    let mut at = id.clone();
+    for _ in 0..DUPLICATE_DEPTH_MAX {
+        match resolution(cx, &at)? {
+            None if at.board() == cx.s.feedback_board => return Ok(None),
+            None => return Ok(Some(at)),
+            Some((Some(ResolutionKind::Duplicate), Some(next))) => at = next,
+            Some((Some(ResolutionKind::Routed), Some(task))) => return Ok(Some(task)),
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn is_feedback(cx: &Ctx<'_>, id: &TaskId) -> Result<bool> {
@@ -628,6 +732,9 @@ pub(crate) fn resolve(
                 ),
             ));
         }
+        if req.kind == ResolutionKind::Duplicate {
+            check_original(cx, id, target)?;
+        }
     }
     let by = agent
         .as_ref()
@@ -675,6 +782,21 @@ pub(crate) fn resolve(
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now],
     )?;
+    // The checks above see `id` still open. Once it is resolved, a chain of duplicates that
+    // leads back to it (or runs past the depth limit) leaves it taking no reports; the
+    // error rolls the resolution back.
+    if req.kind == ResolutionKind::Duplicate
+        && let Some(original) = &req.task
+        && live_item(cx, id, 0)?.is_none()
+    {
+        return Err(invalid(
+            format!("{original} passes its reports back to {id}, so {id} cannot be its duplicate"),
+            format!(
+                "name the item that takes the reports, at the end of the duplicate links, not \
+                 one that leads back to {id}"
+            ),
+        ));
+    }
     crate::ops::leases::release_for_task(cx, id, &task.board, &by)?;
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",
@@ -794,13 +916,21 @@ const EXPECTED_ERRORS: &[(ErrorCode, &str, &str)] = &[
     ),
 ];
 
-/// Records an error answered to an agent. Once its signature reaches the signal threshold
-/// it files feedback (source `signal`); later ones add to that item while it is live.
+/// Whether an error answered to `route` (method and route template) is an expected answer,
+/// not friction: a version conflict or one of [`EXPECTED_ERRORS`]. Such errors are never
+/// recorded, so callers may skip them before doing any work to record them.
+pub(crate) fn is_expected(code: ErrorCode, route: &str, message: &str) -> bool {
+    code == ErrorCode::VersionConflict
+        || EXPECTED_ERRORS
+            .iter()
+            .any(|(c, r, start)| *c == code && *r == route && message.starts_with(start))
+}
+
+/// Records an error answered to an agent, unless it [`is_expected`]. Once its signature
+/// reaches the signal threshold it files feedback (source `signal`); later ones add to that
+/// item while it is live.
 pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<TaskId>> {
-    let expected = EXPECTED_ERRORS.iter().any(|(code, route, start)| {
-        *code == e.code && *route == e.route && e.message.starts_with(start)
-    });
-    if e.code == ErrorCode::VersionConflict || expected {
+    if is_expected(e.code, &e.route, &e.message) {
         return Ok(None);
     }
     let code = enum_str(&e.code);
@@ -1061,6 +1191,48 @@ pub(crate) fn stats(cx: &Ctx<'_>, from: i64) -> Result<FeedbackStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_errors_match_by_code_route_and_message_start() {
+        let claim = "POST /v1/tasks/{id}/claim";
+        let cases = [
+            (ErrorCode::VersionConflict, "POST /v1/tasks/{id}", "", true),
+            (ErrorCode::NotFound, "GET /v1/agents/{id}", "no agent", true),
+            (
+                ErrorCode::NotFound,
+                "GET /v1/agents/{id}/handoff",
+                "x",
+                true,
+            ),
+            (ErrorCode::NotFound, "GET /v1/tasks/{id}", "no task", false),
+            (
+                ErrorCode::ClaimRefused,
+                claim,
+                "claim refused: t3:a owns it",
+                true,
+            ),
+            (
+                ErrorCode::ClaimRefused,
+                claim,
+                "you already have x-1 in doing",
+                false,
+            ),
+            (ErrorCode::Invalid, claim, "claim refused: x", false),
+            (
+                ErrorCode::ClaimRefused,
+                "POST /v1/boards/{slug}/coordinator",
+                "held by another device",
+                true,
+            ),
+        ];
+        for (code, route, message, expected) in cases {
+            assert_eq!(
+                is_expected(code, route, message),
+                expected,
+                "{code:?} {route} {message:?}"
+            );
+        }
+    }
 
     #[test]
     fn normalizing_hides_ids_numbers_and_quotes() {

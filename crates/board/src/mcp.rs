@@ -500,7 +500,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "feedback_resolve",
-        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item, forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
+        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item that still takes reports (never a closed one), forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
         params: || {
             vec![
                 ("id", task_arg("The feedback item."), true),
@@ -515,7 +515,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "task",
                     task_arg(
-                        "For routed and duplicate: the task doing the work, or the original item; any board.",
+                        "For routed and duplicate: the task doing the work, or the original item (still live); any board.",
                     ),
                     false,
                 ),
@@ -978,7 +978,7 @@ impl ServerHandler for BoardMcp {
         };
         // Once per session: a server on another build may answer in shapes this one
         // misreads.
-        if let Some(warning) = crate::client::take_skew_warning() {
+        if let Some(warning) = crate::client::take_skew_warning(crate::client::Reporter::Session) {
             result
                 .content
                 .push(ContentBlock::text(format!("warning: {warning}")));

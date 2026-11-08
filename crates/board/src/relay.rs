@@ -27,7 +27,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
-use board_proto::{AGENT_HEADER, AgentId, COMMIT_HEADER, VERSION_HEADER};
+use board_proto::{AGENT_HEADER, AgentId, BUILT_HEADER, COMMIT_HEADER, VERSION_HEADER};
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -405,7 +405,12 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
         Ok((status, headers, bytes)) => {
             let mut resp = Response::new(Body::from(bytes));
             *resp.status_mut() = status;
-            for name in [header::CONTENT_TYPE.as_str(), VERSION_HEADER, COMMIT_HEADER] {
+            for name in [
+                header::CONTENT_TYPE.as_str(),
+                VERSION_HEADER,
+                COMMIT_HEADER,
+                BUILT_HEADER,
+            ] {
                 if let Some(value) = headers.get(name) {
                     resp.headers_mut().insert(name, value.clone());
                 }

@@ -105,6 +105,15 @@ server's minute sweep deletes older ones.
   result, the daemon in its log. Hooks stay silent, and header values that are not plain
   tokens are ignored. `board --version` prints `board <version> (<commit>)`; the commit is
   `BOARD_COMMIT` when set at build time, else the checkout's `HEAD`.
+- Every answer also carries `X-Board-Built`, the build's order stamp: its commit's committer
+  time in seconds since the Unix epoch (`BOARD_BUILT` when set at build time, else from
+  git), or `unknown`. A newer build has a higher stamp, so the warning names the older side.
+  A server that sends no stamp predates it and counts as older. When the server is older,
+  the warning says to upgrade it (docs/DEPLOY.md). When the client is older, it says that
+  calls still work and what picks up the new build. An MCP server or daemon reads the commit
+  of the board installed at its own path: the same as the server's means a restart of the
+  session (or `board watch`) does; its own means the device upgrade does. A stamp of
+  `unknown` on either side, or equal stamps, give the warning without an order.
 
 ### Agents
 
@@ -113,7 +122,15 @@ server's minute sweep deletes older ones.
   `title` or `forked_from` left out keeps the stored one, and `native_ids` are merged into
   the stored ones. A new id with `forked_from` starts with no tasks. A device token
   registers agents only for its own `device` (403 otherwise); the user may name any device. An agent named
-  as a board's coordinator keeps the `coordinator` role whatever role it registers with.
+  as a board's coordinator keeps the `coordinator` role whatever role it registers with,
+  and its stored `title` unless it registers as `coordinator` (the hooks register a T3
+  thread's own title as a worker; the daemon names its coordinator after the board). An
+  agent stored with the `coordinator` role keeps its title against a worker registration
+  too, since the daemon registers its coordinator before it claims the lease. The hooks
+  send a T3 thread's link as native id `t3_link`: it must start with `https://`, have more
+  after it and hold no white space (400 `invalid` otherwise). Native id values are at most
+  300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
+  `AGENT_TITLE_CHARS_MAX`).
   Clients register on session start (hooks) and before acting when the agent is unknown.
   Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
   `agent_state_changed` event (`from` its old state, `to` `running`).
@@ -165,6 +182,11 @@ server's minute sweep deletes older ones.
 ### Boards
 
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
+  A `Board`'s `counts` hold the tasks per status, `ready` (see Tasks) and `ready_auto`: the
+  ready tasks with `auto` on, which the coordinator may start. The rest of `ready` waits on
+  the user. `board boards` and the snapshot counts line show both as `ready N (auto M)`;
+  `json` and `yaml` snapshots name it `auto` under `counts`. A server that predates
+  `ready_auto` leaves it out, and `board boards` then shows `ready N` alone.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
   `parallel_tasks` (1 to 4; 400 `invalid` otherwise) is how many tasks the board's
   coordinator and its child threads may have in progress at once. The coordinator keeps to
@@ -476,8 +498,9 @@ turn, so the thread is not where the user reads it. One seen cursor is kept for 
   updates starts the cursor at its newest done task, so earlier history counts as seen.
 - `PUT /v1/updates/seen` `[MarkSeen]` `{at}` → `[SeenCursor]`. Moves the cursor forward to
   `at` (a later `at` than the server's clock counts as now; an earlier one than the cursor
-  leaves it). Clients send the time of the newest update they showed, so updates that
-  arrived after the page loaded stay unseen.
+  leaves it). A client should send the time of the newest update it showed, so updates
+  that arrived after it loaded stay unseen. The web view no longer shows updates, so
+  nothing it does moves the cursor.
 
 Neither records an event; agent tokens get 403 `forbidden`. A new turn ending arrives with
 its coordinator's `agent_state_changed` event, and a new or reopened done task with
@@ -520,7 +543,17 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   next step. `kind` is one of:
   - `routed`: `task` (any board) does the work. Reports go to this item until that task is
     done or dropped; then a report opens a new item that `recurs` this one.
-  - `duplicate`: `task` is the original item, which takes later reports.
+  - `duplicate`: `task` is the original item, which takes later reports. The original must
+    still take reports: live as above (a plain task: not done or dropped). Otherwise 400
+    `invalid`, since a duplicate of an item that is no longer live is not live either and
+    the next report would open yet another item. The hint says where to route this item
+    instead (kind `routed`): the open revisit of the original's routed task (a child task
+    whose title starts `Revisit:`) by id; else, when that task is dropped, its verdict
+    (decline citing it, or file a new proposal with evidence it did not weigh); else a
+    `Proposal:` task on that task's board, naming the task and its owner; else, when the
+    original has no routed task (fixed, forwarded, closed unresolved, or its task is
+    gone), a proposal for the setup's owner. Also 400 `invalid` when the resolved item
+    would take no reports because the duplicate links lead back to it.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
   - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the

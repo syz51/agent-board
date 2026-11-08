@@ -64,6 +64,9 @@ struct FakeT3 {
     fail_info: Arc<AtomicBool>,
     /// How many times `t3 thread show` ran.
     infos: Arc<AtomicUsize>,
+    /// How many `t3 thread show` run now, and the most that ever ran at once.
+    infos_running: Arc<AtomicUsize>,
+    infos_at_once: Arc<AtomicUsize>,
     /// Threads whose `t3 thread send` never answers.
     hang_send: Arc<Mutex<Vec<String>>>,
     /// Threads whose `t3 thread send` fails, as for an archived thread.
@@ -178,6 +181,16 @@ impl T3 for FakeT3 {
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
         self.infos.fetch_add(1, Ordering::SeqCst);
+        let running = self.infos_running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.infos_at_once.fetch_max(running, Ordering::SeqCst);
+        // Counted down when the check ends or is dropped on its timeout.
+        struct Ended(Arc<AtomicUsize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _ended = Ended(self.infos_running.clone());
         if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
             std::future::pending::<()>().await;
         }
@@ -3006,12 +3019,69 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
 }
 
 #[test]
+fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        // When to declare one, at the finish of the fixed task.
+        "File its revisit too when Revisits below calls for one",
+        "**Declare** one when you finish a task that changed a tuned value",
+        "fixed a feedback item that recurs or that two or more agents reported, or when the user asks",
+        "Routine tasks get none",
+        // Its fields.
+        "File it as a sub-task of the fixed task: it is scope the fix declared, not a proposal",
+        "Title it `Revisit: …`, keep it `auto` with the fix's priority",
+        "set `not_before` about 14 days after the deploy",
+        "Start its body with `Revisit:` and name the deploy time",
+        "the feedback items and error signatures it watches, the values under review, and the bar for \"held\"",
+        // Its cap.
+        "One revisit per fix, and at most three open revisits per board (`task_list` its open tasks titled `Revisit:`)",
+        "add the new watch, with its own fixed task and deploy time, to the open revisit due soonest",
+        "`task_note` that revisit's id on the fixed task",
+        // How to run it.
+        "Count the errors with `board errors --since <deploy time>` per watch",
+        "say so when the window is cut",
+        "read the feedback items routed to it and their reports",
+        "`held` when under the bar; `adjust` when over the bar or the values no longer fit",
+        "Adjust files a proposal, a child of the revisit, with the counts and the change",
+        "for a value the user chose, `ask_user` instead",
+        // How to record the outcome.
+        "a `decision` note starting `revisit: held` or `revisit: adjust`, with the counts, the window and the bar, on each fixed task it watches and on each watched feedback item",
+        "`task_done` the revisit with the counts as evidence",
+        "A shipped adjustment gets its own revisit, which names the revisit before it",
+        "a second adjustment of one value in a row goes to the user",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
+fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let triage = words(board::daemon::TRIAGE_PROMPT);
+    for rule in [
+        // From PR #83: a recurring item goes to the open revisit, never as a duplicate.
+        "A recurring item is never a duplicate of a closed item",
+        "When the earlier task has an open revisit (a child task titled `Revisit: …`, or one a note on that task names), route the item to the revisit as the rule above says",
+        // The dropped-proposal rule still follows the recurring rule it is named from.
+        "when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's owner (see \"Finding the owner\") and cite the earlier item and its reason: a fix that did not hold goes to the owner, not back to you. - When the owner declines or merges a routed proposal",
+        // Repeats without `recurs` go there too, and a signal brings the revisit forward.
+        "Any item that repeats a problem whose fix has an open revisit goes to that revisit, with or without `recurs`",
+        "Find open revisits with `task_list` on the owner's board",
+        "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
+        "When the item is a `signal`, also clear the revisit's `not_before`",
+    ] {
+        assert!(triage.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
 fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
         "with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
-        "finish with `task_done`, evidence and a `summary`",
+        "end with a report of its evidence that names the tasks it filed",
         "The user does not read this chat as it happens",
         "end every turn with a short status",
         "put a question or an offer to the user in `ask_user`, never only in chat",
@@ -3134,6 +3204,38 @@ fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+}
+
+#[test]
+fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_there() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "for a task whose work is in another repository start a T3 thread in that repository's project instead",
+        "(`t3_thread_launch` with its `projectId` and `workspaceStrategy: \"worktree\"`)",
+        // T3 launches a thread only when the user asks for one.
+        "this brief is the user's standing request for such a thread",
+        "Brief it the same way, and `task_note` its link on the task.",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
+#[test]
+fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "open its PR, turn on auto-merge where the repository's merge rules allow it, park the task in `review` with a `task_note` naming the PR, and end",
+        "Never tell a child to wait for CI or merge after it",
+        "The merge is yours, not the child's",
+        "call T3 `watch_pull_request` on the PR, and once its checks pass merge it by the repository's rules or brief a new child to",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    // Children cannot wait for CI, so the brief no longer asks them to.
+    assert!(!prompt.contains("while CI runs"));
+    assert!(!prompt.contains("a live child finishes its own"));
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
@@ -3668,18 +3770,17 @@ fn a_second_watch_on_the_same_home_exits_naming_the_first() {
     stop(third);
 }
 
-#[tokio::test]
-async fn a_hanging_thread_check_holds_up_no_other_board() {
-    let mut e = env();
-    e.daemon.timing.thread_check = Duration::from_millis(300);
+/// Named, registered coordinators of boards `slugs`, whose threads `t3:<slug>` are live and
+/// whose agents are idle.
+fn named_coordinators(e: &mut Env, slugs: &[&str]) {
     let mut boards = Vec::new();
-    for (slug, thread) in [("factory", "coord"), ("other", "hung"), ("third", "slow")] {
-        let agent = format!("t3:{thread}");
-        e.t3.live(thread);
+    for slug in slugs {
+        let agent = format!("t3:{slug}");
+        e.t3.live(slug);
         e.daemon.state.coordinators.insert(
             slug.parse().unwrap(),
             Coordinator {
-                thread: thread.into(),
+                thread: (*slug).into(),
                 agent: agent.parse().unwrap(),
                 started_at: at(),
                 renewed_at: at(),
@@ -3700,32 +3801,255 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
         boards.push(board);
     }
     e.stub.on("GET /v1/boards", &boards);
-    // T3 answers for no thread: one after another, the checks would take 900 ms.
+}
+
+#[tokio::test]
+async fn hung_thread_checks_run_two_at_a_time_and_wait_before_asking_again() {
+    let mut e = env();
+    e.daemon.timing.thread_check = Duration::from_millis(300);
+    // Checks start only in the first half of the budget: until 450 ms.
+    e.daemon.timing.reconcile_budget = Duration::from_millis(900);
+    let slugs = ["factory", "other", "third", "fourth", "fifth"];
+    named_coordinators(&mut e, &slugs);
+    // T3 answers for no thread.
     e.t3.hang_info
         .lock()
         .unwrap()
-        .extend(["coord".into(), "hung".into(), "slow".into()]);
+        .extend(slugs.map(String::from));
+    let infos = |e: &Env| e.t3.infos.load(Ordering::SeqCst);
+    let renewed = |e: &Env, slug: &str| {
+        e.stub
+            .requests_to(&format!("POST /v1/boards/{slug}/coordinator"))
+            .len()
+    };
 
-    let started = Instant::now();
+    // Two checks start at 0 and two at 300 ms, each timing out after 300 ms; the fifth's
+    // turn comes at 600 ms, past the deadline, so it never starts.
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(11))
         .await
         .unwrap();
-    let took = started.elapsed();
-    assert!(
-        took < Duration::from_millis(700),
-        "the checks ran side by side, each cut at 300 ms: {took:?}"
+    assert_eq!(
+        e.t3.infos_at_once.load(Ordering::SeqCst),
+        2,
+        "two at a time"
     );
-    for slug in ["factory", "other", "third"] {
+    assert_eq!(infos(&e), 4, "none started after the deadline");
+    for slug in &slugs[..4] {
+        assert_eq!(
+            renewed(&e, slug),
+            1,
+            "{slug}: renewed, a check that never answers being no sign the thread is gone"
+        );
+    }
+    assert_eq!(
+        renewed(&e, "fifth"),
+        0,
+        "not checked, so left for the next reconcile"
+    );
+    assert_eq!(e.daemon.state.coordinators.len(), 5, "none replaced");
+
+    // A minute later only the board not checked is asked: the timed-out ones wait.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(12))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), 5);
+    assert_eq!(e.daemon.state.coordinators.len(), 5);
+
+    // THREAD_RECHECK after their timeout, the first four are asked again; the fifth waits.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(16))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), 9);
+    assert_eq!(e.daemon.state.coordinators.len(), 5);
+}
+
+#[tokio::test]
+async fn a_hung_thread_check_holds_only_its_own_slot() {
+    let mut e = env();
+    e.daemon.timing.thread_check = Duration::from_millis(300);
+    // Checks start only in the first 100 ms, before the hung one times out.
+    e.daemon.timing.reconcile_budget = Duration::from_millis(200);
+    let slugs = ["factory", "other", "third", "fourth", "fifth"];
+    named_coordinators(&mut e, &slugs);
+    e.t3.hang_info.lock().unwrap().push("factory".into());
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(11))
+        .await
+        .unwrap();
+    assert_eq!(
+        e.t3.infos.load(Ordering::SeqCst),
+        5,
+        "the answered checks freed their slot at once"
+    );
+    for slug in slugs {
         assert_eq!(
             e.stub
                 .requests_to(&format!("POST /v1/boards/{slug}/coordinator"))
                 .len(),
             1,
-            "{slug}: renewed, a check that never answers being no sign the thread is gone"
+            "{slug}: renewed"
         );
     }
-    assert_eq!(e.daemon.state.coordinators.len(), 3, "none replaced");
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_checks_time_out_is_still_replaced_once_t3_answers() {
+    let archive = |e: &Env| {
+        e.t3.hang_info.lock().unwrap().clear();
+        e.t3.threads.lock().unwrap().insert(
+            "coord".into(),
+            ThreadInfo {
+                archived: true,
+                runtime: Runtime::Claude,
+            },
+        );
+    };
+    let lease = |e: &Env, method: &str| {
+        e.stub
+            .requests_to(&format!("{method} /v1/boards/factory/coordinator"))
+            .len()
+    };
+    let infos = |e: &Env| e.t3.infos.load(Ordering::SeqCst);
+    let reconcile = async |e: &mut Env, minutes: i64| {
+        e.stub.clear();
+        e.daemon
+            .reconcile(at() + chrono::Duration::minutes(minutes))
+            .await
+            .unwrap();
+    };
+
+    // At work: the timed-out check renews it. Its thread is archived meanwhile, and the
+    // next check, THREAD_RECHECK later, replaces it.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    reconcile(&mut e, 11).await;
+    assert_eq!(
+        (infos(&e), lease(&e, "POST"), lease(&e, "DELETE")),
+        (1, 1, 0)
+    );
+    archive(&e);
+    reconcile(&mut e, 12).await;
+    assert_eq!(infos(&e), 1, "not asked again yet");
+    assert_eq!(starts(&e.t3), 0);
+    reconcile(&mut e, 16).await;
+    assert_eq!(infos(&e), 3, "asked, then the new thread's runtime read");
+    assert_eq!(lease(&e, "DELETE"), 1, "the archived thread is released");
+    assert_eq!(starts(&e.t3), 1, "and replaced");
+
+    // Its session ended: timed-out checks, and the waits between them, still count toward
+    // CHECK_FAIL_RELEASE, so the lease goes 10 minutes after the first timeout.
+    let (mut e, _) = coordinator_env(AgentState::Ended, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    for (minutes, asked) in [(11, 1), (12, 1), (16, 2)] {
+        reconcile(&mut e, minutes).await;
+        assert_eq!(infos(&e), asked, "at +{minutes}");
+        assert_eq!(
+            (lease(&e, "POST"), lease(&e, "DELETE")),
+            (0, 0),
+            "at +{minutes}"
+        );
+    }
+    reconcile(&mut e, 21).await;
+    assert_eq!(infos(&e), 3);
+    assert_eq!(lease(&e, "DELETE"), 1, "released after CHECK_FAIL_RELEASE");
+    // No one takes the board, and a thread the board does not name is asked each minute,
+    // so it is adopted or replaced as soon as T3 answers: here it is archived.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    archive(&e);
+    reconcile(&mut e, 22).await;
+    assert_eq!((infos(&e), starts(&e.t3)), (5, 1), "asked, then replaced");
+
+    // Its agent ending means its thread may be gone: the next reconcile asks at once.
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    reconcile(&mut e, 11).await;
+    archive(&e);
+    let mut ended = event(10, EventType::AgentStateChanged, None, &agent);
+    ended.payload = json!({"from": "idle", "to": "ended"});
+    e.daemon
+        .on_event(&ended, at() + chrono::Duration::minutes(12))
+        .await
+        .unwrap();
+    reconcile(&mut e, 12).await;
+    assert_eq!(starts(&e.t3), 1, "replaced without waiting");
+
+    // A wake-up that T3 refuses because the thread is archived means T3 answers again: the
+    // next reconcile asks at once instead of waiting out THREAD_RECHECK.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    reconcile(&mut e, 11).await;
+    archive(&e);
+    e.t3.refuse_send.lock().unwrap().push("coord".into());
+    let now = at() + chrono::Duration::minutes(12);
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            now,
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(now).await;
+    assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(infos(&e), 2, "the failed send asked T3 about the thread");
+    reconcile(&mut e, 13).await;
+    assert_eq!(starts(&e.t3), 1, "replaced without waiting");
 }
 
 #[tokio::test]

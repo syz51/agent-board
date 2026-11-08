@@ -84,7 +84,10 @@ async fn design_scenario(t: &T) {
     ];
     for (i, (title, priority)) in titles.iter().enumerate() {
         let n = i + 1;
-        let mut body = json!({ "board": "factory", "title": title, "priority": priority });
+        // Every task but one is work a coordinator may start; that one waits on the user.
+        let auto = n != 17;
+        let mut body =
+            json!({ "board": "factory", "title": title, "priority": priority, "auto": auto });
         if [3, 4, 5, 6, 7, 8, 10, 11, 13, 19].contains(&n) {
             body["blockers"] = json!(["factory-2"]);
         }
@@ -187,7 +190,7 @@ async fn delta_and_alerts_render_the_same_alerts() {
     let delta = snapshot(&t, ME, "kind=delta&since=806").await;
     let expected = "\
 <board agent=\"t3:7f3a\" board=\"factory\" src=\"board server\" seq=\"812\">
-counts: open 14 · doing 3 · blocked 1 · ready 4
+counts: open 14 · doing 3 · blocked 1 · ready 4 (auto 3)
 alerts:
   ! factory-9 done: your blocker is cleared -> task_update factory-12 blockers=[]
   ! t3:a91c edited claude/tests/lib/stream.js 3m ago; you edited it 25m ago -> re-read before editing
@@ -215,7 +218,7 @@ async fn delta_reports_changed_counts_once_and_new_alerts() {
     t.board("factory", &[REPO]).await;
     let full = snapshot(&t, "t3:alpha", "").await;
     assert!(
-        text(&full).contains("counts: open 0 · doing 0 · ready 0"),
+        text(&full).contains("counts: open 0 · doing 0 · ready 0 (auto 0)"),
         "{}",
         text(&full)
     );
@@ -224,11 +227,37 @@ async fn delta_reports_changed_counts_once_and_new_alerts() {
     t.task("t3:beta", "factory", "Something new").await;
     let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
     assert!(
-        text(&delta).contains("counts: open 1 · doing 0 · ready 1"),
+        text(&delta).contains("counts: open 1 · doing 0 · ready 1 (auto 0)"),
         "{}",
         text(&delta)
     );
     assert!(!text(&delta).contains("alerts:"));
+    assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
+
+    // Ready work a coordinator may start changes the counts too, with `ready` unchanged.
+    let (s, v) = t
+        .patch("t3:beta", "factory-1", json!({ "auto": true }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("counts: open 1 · doing 0 · ready 1 (auto 1)"),
+        "{}",
+        text(&delta)
+    );
+    assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
+
+    // Counts stored before the split read it as 0: the next delta shows the split once.
+    t.exec(
+        "UPDATE agents SET last_counts = '{\"board\":\"factory\",\"counts\":{\"open\":1,\
+         \"doing\":0,\"blocked\":0,\"review\":0,\"ready\":1}}' WHERE id = 't3:alpha'",
+    );
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("ready 1 (auto 1)"),
+        "{}",
+        text(&delta)
+    );
     assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
 
     // A lease covering a file the agent touched is an alert.
@@ -487,6 +516,7 @@ async fn json_and_yaml_carry_the_same_model() {
     let model: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}:\n{json_text}"));
     assert_eq!(model["you"]["handle"], "t3:7f3a");
     assert_eq!(model["counts"]["ready"], 4);
+    assert_eq!(model["counts"]["auto"], 3);
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
     // Compact JSON fits the same cap as lines, so no section is cut and the formats

@@ -152,6 +152,11 @@ struct Counts {
     blocked: u32,
     review: u32,
     ready: u32,
+    /// The ready tasks with `auto` on. Named `auto` as in the lines text, `ready N (auto M)`,
+    /// which keeps the compact JSON within the same cap. Counts stored before it existed
+    /// read as 0.
+    #[serde(default, rename = "auto")]
+    ready_auto: u32,
 }
 
 impl From<StatusCounts> for Counts {
@@ -162,6 +167,8 @@ impl From<StatusCounts> for Counts {
             blocked: c.blocked,
             review: c.review,
             ready: c.ready,
+            // The server's own counts always carry it.
+            ready_auto: c.ready_auto.unwrap_or_default(),
         }
     }
 }
@@ -1513,7 +1520,7 @@ fn counts_line(c: &Counts) -> String {
     if c.review > 0 {
         parts.push(format!("review {}", c.review));
     }
-    parts.push(format!("ready {}", c.ready));
+    parts.push(format!("ready {} (auto {})", c.ready, c.ready_auto));
     parts.join(" · ")
 }
 
@@ -1694,8 +1701,8 @@ fn render_yaml(m: &Model) -> String {
     if let Some(c) = &m.counts {
         let _ = writeln!(
             o,
-            "counts: {{open: {}, doing: {}, blocked: {}, review: {}, ready: {}}}",
-            c.open, c.doing, c.blocked, c.review, c.ready
+            "counts: {{open: {}, doing: {}, blocked: {}, review: {}, ready: {}, auto: {}}}",
+            c.open, c.doing, c.blocked, c.review, c.ready, c.ready_auto
         );
     }
     if !m.mine.is_empty() {

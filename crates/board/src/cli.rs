@@ -551,6 +551,7 @@ fn report(result: anyhow::Result<()>) -> i32 {
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let mut config = board_server::ServerConfig::load(path)?;
     config.commit = crate::COMMIT.to_owned();
+    config.built = crate::BUILT.to_owned();
     board_server::serve(config).await?;
     Ok(())
 }
@@ -754,7 +755,7 @@ pub async fn run(cli: Cli) -> i32 {
             1
         }
     };
-    if let Some(warning) = crate::client::take_skew_warning() {
+    if let Some(warning) = crate::client::take_skew_warning(crate::client::Reporter::Cli) {
         eprintln!("board: warning: {warning}");
     }
     code

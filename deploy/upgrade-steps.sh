@@ -88,7 +88,7 @@ server-upgrade)
     # Get the image before the backup, so the copy misses only the seconds of the restart.
     # The running container keeps its image when agent-board:local moves.
     if [ "$image" = build ]; then
-        if ! BOARD_COMMIT=$short compose build board; then
+        if ! BOARD_COMMIT=$short BOARD_BUILT=$(git log -1 --format=%ct HEAD) compose build board; then
             undo
             fail "the image build failed at $short: the server still runs the old image and the clone is back at $prev. Read the output above, fix it, and run again"
         fi

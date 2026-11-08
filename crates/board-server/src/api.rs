@@ -130,8 +130,10 @@ async fn unknown_api() -> Error {
 }
 
 /// Records every error answered to an agent's request (one that sends `X-Board-Agent`),
-/// except version conflicts, for the feedback signals (`ops::feedback::record_error`).
-/// Recording never changes the answer; a failure to record is logged.
+/// except expected ones (`ops::feedback::is_expected`), for the feedback signals
+/// (`ops::feedback::record_error`). Expected errors are skipped before the credentials are
+/// checked, so they cost no read or write. Recording never changes the answer; a failure
+/// to record is logged.
 async fn record_errors(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let named_agent = req.headers().contains_key(AGENT_HEADER);
     let headers = named_agent.then(|| req.headers().clone());
@@ -145,6 +147,7 @@ async fn record_errors(State(state): State<AppState>, req: Request, next: Next) 
     let response = next.run(req).await;
     if let Some(headers) = headers
         && let Some(error) = response.extensions().get::<ApiError>()
+        && !feedback::is_expected(error.code, &route, &error.message)
         // Only authenticated callers: a request without a valid token never writes.
         && let Some(agent) = authenticated_agent(&state, headers).await
     {

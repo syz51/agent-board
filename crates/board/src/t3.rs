@@ -9,7 +9,8 @@
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state; with `--messages 0`
-//!   the hooks read a delegated thread's parent (`parentThreadId`).
+//!   the hooks read a thread's title, link and, for a delegated thread, its parent
+//!   (`parentThreadId`).
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
@@ -19,7 +20,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{Runtime, Timestamp};
+use board_proto::{
+    AGENT_TITLE_CHARS_MAX as TITLE_CHARS_MAX, NATIVE_ID_CHARS_MAX, Runtime, T3_LINK_PREFIX,
+    Timestamp,
+};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
@@ -28,6 +32,17 @@ use tokio::io::AsyncWriteExt as _;
 pub struct ThreadInfo {
     pub archived: bool,
     pub runtime: Runtime,
+}
+
+/// What the hooks read about their own thread from `t3 thread show`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadFacts {
+    /// The thread that delegated it, for a thread with a relationship to a parent.
+    pub parent: Option<String>,
+    /// Its title, as one line of at most [`TITLE_CHARS_MAX`] characters.
+    pub title: Option<String>,
+    /// Its `https://` link in the T3 app, exactly as T3 printed it.
+    pub link: Option<String>,
 }
 
 /// A thread from a project's listing.
@@ -104,12 +119,21 @@ impl T3Cli {
         Self { bin }
     }
 
-    /// The thread that delegated `thread` (`parentThreadId` of a thread T3 started for a
-    /// parent's `delegate_task`); `None` for a top-level thread or one T3 does not know.
-    pub async fn thread_parent(&self, thread: &str) -> Result<Option<String>> {
+    /// What T3 says of `thread`: its parent, title and link; `None` when T3 does not know
+    /// the thread.
+    pub async fn thread_facts(&self, thread: &str) -> Result<Option<ThreadFacts>> {
+        Ok(self
+            .thread_show(thread, "0")
+            .await?
+            .map(|value| parse_thread_facts(&value)))
+    }
+
+    /// `t3 thread show --json --messages <messages> <thread>`, parsed; `None` when T3 does
+    /// not know the thread.
+    async fn thread_show(&self, thread: &str, messages: &str) -> Result<Option<Value>> {
         let (ok, stdout, stderr) = self
             .run(
-                &["thread", "show", "--json", "--messages", "0", thread],
+                &["thread", "show", "--json", "--messages", messages, thread],
                 None,
             )
             .await?;
@@ -119,8 +143,9 @@ impl T3Cli {
             }
             bail!("t3 thread show failed: {}", stderr.trim());
         }
-        let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
-        Ok(parse_thread_parent(&value))
+        Ok(Some(
+            serde_json::from_str(&stdout).context("t3 thread show --json")?,
+        ))
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
@@ -187,20 +212,10 @@ impl T3 for T3Cli {
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
-        let (ok, stdout, stderr) = self
-            .run(
-                &["thread", "show", "--json", "--messages", "1", thread],
-                None,
-            )
-            .await?;
-        if !ok {
-            if is_unknown_thread(&stderr, thread) {
-                return Ok(None);
-            }
-            bail!("t3 thread show failed: {}", stderr.trim());
-        }
-        let value: Value = serde_json::from_str(&stdout).context("t3 thread show --json")?;
-        Ok(Some(parse_thread_info(&value)))
+        Ok(self
+            .thread_show(thread, "1")
+            .await?
+            .map(|value| parse_thread_info(&value)))
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
@@ -290,6 +305,47 @@ pub fn parse_thread_parent(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_owned)
+}
+
+/// Reads the parent, title and link from `t3 thread show --json`
+/// (`{"thread": {"parentThreadId", "relationshipToParent", "title", "link", …}}`). A title
+/// becomes one line: control characters and runs of white space turn into one space, and
+/// one longer than [`TITLE_CHARS_MAX`] is cut, ending with `…`; an empty one is left out. A
+/// link is kept only when it is one `https://` URL the server takes as a native id.
+pub fn parse_thread_facts(value: &Value) -> ThreadFacts {
+    let thread = &value["thread"];
+    let title = thread["title"]
+        .as_str()
+        .map(|t| {
+            t.split(|c: char| c.is_whitespace() || c.is_control())
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            if t.chars().count() <= TITLE_CHARS_MAX {
+                t
+            } else {
+                let mut cut: String = t.chars().take(TITLE_CHARS_MAX - 1).collect();
+                cut.push('…');
+                cut
+            }
+        });
+    let link = thread["link"]
+        .as_str()
+        .filter(|l| {
+            l.starts_with(T3_LINK_PREFIX)
+                && l.len() > T3_LINK_PREFIX.len()
+                && l.chars().count() <= NATIVE_ID_CHARS_MAX
+                && !l.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+        .map(str::to_owned);
+    ThreadFacts {
+        parent: parse_thread_parent(value),
+        title,
+        link,
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +487,51 @@ mod tests {
         assert_eq!(parse_thread_parent(&top), None);
         let unrelated = json!({"thread": {"parentThreadId": "p", "relationshipToParent": null}});
         assert_eq!(parse_thread_parent(&unrelated), None);
+    }
+
+    #[test]
+    fn thread_facts_read_the_title_and_https_link() {
+        let link = "https://app.example.test/threads/env-1/thread-1";
+        let facts = parse_thread_facts(&json!({"thread": {
+            "threadId": "thread-1", "title": "  Fix the\tparser\n ", "link": link,
+            "parentThreadId": null,
+        }}));
+        assert_eq!(
+            facts,
+            ThreadFacts {
+                parent: None,
+                title: Some("Fix the parser".into()),
+                link: Some(link.into()),
+            }
+        );
+        // Missing fields and a missing thread read as nothing.
+        assert_eq!(
+            parse_thread_facts(&json!({"thread": {"threadId": "t"}})),
+            ThreadFacts::default()
+        );
+        assert_eq!(parse_thread_facts(&json!({})), ThreadFacts::default());
+        // Empty titles and links that are not one https URL are left out.
+        for link in [
+            json!("http://app.example.test/threads/e/t"),
+            json!("javascript:alert(1)"),
+            json!("https://"),
+            json!("https://app.example.test/a b"),
+            json!(format!("https://app.example.test/{}", "x".repeat(300))),
+            json!(7),
+        ] {
+            let facts = parse_thread_facts(&json!({"thread": {"title": " \n ", "link": link}}));
+            assert_eq!(facts, ThreadFacts::default(), "{link}");
+        }
+        // A title the server would refuse as too long is cut.
+        let long = parse_thread_facts(&json!({"thread": {"title": "y".repeat(500)}}));
+        let title = long.title.unwrap();
+        assert_eq!(title.chars().count(), TITLE_CHARS_MAX);
+        assert!(title.ends_with('…'));
+        // A delegated thread's parent comes along.
+        let child = parse_thread_facts(&json!({"thread": {
+            "title": "Child", "parentThreadId": "parent-1", "relationshipToParent": "subagent",
+        }}));
+        assert_eq!(child.parent.as_deref(), Some("parent-1"));
     }
 
     #[test]
