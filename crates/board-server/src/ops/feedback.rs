@@ -916,13 +916,21 @@ const EXPECTED_ERRORS: &[(ErrorCode, &str, &str)] = &[
     ),
 ];
 
-/// Records an error answered to an agent. Once its signature reaches the signal threshold
-/// it files feedback (source `signal`); later ones add to that item while it is live.
+/// Whether an error answered to `route` (method and route template) is an expected answer,
+/// not friction: a version conflict or one of [`EXPECTED_ERRORS`]. Such errors are never
+/// recorded, so callers may skip them before doing any work to record them.
+pub(crate) fn is_expected(code: ErrorCode, route: &str, message: &str) -> bool {
+    code == ErrorCode::VersionConflict
+        || EXPECTED_ERRORS
+            .iter()
+            .any(|(c, r, start)| *c == code && *r == route && message.starts_with(start))
+}
+
+/// Records an error answered to an agent, unless it [`is_expected`]. Once its signature
+/// reaches the signal threshold it files feedback (source `signal`); later ones add to that
+/// item while it is live.
 pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<TaskId>> {
-    let expected = EXPECTED_ERRORS.iter().any(|(code, route, start)| {
-        *code == e.code && *route == e.route && e.message.starts_with(start)
-    });
-    if e.code == ErrorCode::VersionConflict || expected {
+    if is_expected(e.code, &e.route, &e.message) {
         return Ok(None);
     }
     let code = enum_str(&e.code);
@@ -1183,6 +1191,48 @@ pub(crate) fn stats(cx: &Ctx<'_>, from: i64) -> Result<FeedbackStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_errors_match_by_code_route_and_message_start() {
+        let claim = "POST /v1/tasks/{id}/claim";
+        let cases = [
+            (ErrorCode::VersionConflict, "POST /v1/tasks/{id}", "", true),
+            (ErrorCode::NotFound, "GET /v1/agents/{id}", "no agent", true),
+            (
+                ErrorCode::NotFound,
+                "GET /v1/agents/{id}/handoff",
+                "x",
+                true,
+            ),
+            (ErrorCode::NotFound, "GET /v1/tasks/{id}", "no task", false),
+            (
+                ErrorCode::ClaimRefused,
+                claim,
+                "claim refused: t3:a owns it",
+                true,
+            ),
+            (
+                ErrorCode::ClaimRefused,
+                claim,
+                "you already have x-1 in doing",
+                false,
+            ),
+            (ErrorCode::Invalid, claim, "claim refused: x", false),
+            (
+                ErrorCode::ClaimRefused,
+                "POST /v1/boards/{slug}/coordinator",
+                "held by another device",
+                true,
+            ),
+        ];
+        for (code, route, message, expected) in cases {
+            assert_eq!(
+                is_expected(code, route, message),
+                expected,
+                "{code:?} {route} {message:?}"
+            );
+        }
+    }
 
     #[test]
     fn normalizing_hides_ids_numbers_and_quotes() {
