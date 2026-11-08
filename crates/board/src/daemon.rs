@@ -71,6 +71,11 @@ const FLUSH_CHECKS_AT_ONCE: usize = 8;
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+/// A named coordinator's thread that T3 found live is not asked about again for this long.
+/// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
+/// each minute costs a home device more than the check is worth. A failed send to the
+/// thread, or its agent ending, asks again on the next reconcile.
+pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -510,6 +515,8 @@ pub struct Daemon<T: T3> {
     boards: BTreeMap<BoardSlug, Board>,
     /// Boards whose coordinator failed to start here, by board.
     failures: BTreeMap<BoardSlug, StartFailure>,
+    /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
+    threads_live: BTreeMap<String, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
     agents: BTreeMap<AgentId, Seen>,
     /// Agents whose wake-up message is being sent. A flush cut short while sending leaves
@@ -529,6 +536,7 @@ impl<T: T3> Daemon<T> {
             state,
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
+            threads_live: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
             timing: Timing::default(),
@@ -553,7 +561,7 @@ impl<T: T3> Daemon<T> {
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
-        let mut checks = self.check_threads(&boards).await;
+        let mut checks = self.check_threads(&boards, now).await;
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -580,27 +588,54 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Whether each coordinator thread of ours that a home board still leaves to us is live,
-    /// by board: asked side by side, each within [`Timing::thread_check`].
-    async fn check_threads(&self, boards: &[Board]) -> BTreeMap<BoardSlug, Result<bool>> {
-        let ours: Vec<(BoardSlug, String)> = boards
-            .iter()
-            .filter(|board| self.is_home(board))
-            .filter_map(|board| {
-                let local = self.state.coordinators.get(&board.slug)?;
-                board
-                    .coordinator
-                    .as_ref()
-                    .is_none_or(|c| *c == local.agent)
-                    .then(|| (board.slug.clone(), local.thread.clone()))
-            })
-            .collect();
-        let checked =
-            futures_util::future::join_all(ours.iter().map(|(_, thread)| self.thread_live(thread)))
+    /// by board: asked side by side, each within [`Timing::thread_check`]. A thread the
+    /// board names as coordinator and T3 found live less than [`THREAD_RECHECK`] ago counts
+    /// as live without asking.
+    async fn check_threads(
+        &mut self,
+        boards: &[Board],
+        now: Timestamp,
+    ) -> BTreeMap<BoardSlug, Result<bool>> {
+        let mut checks = BTreeMap::new();
+        let mut ask: Vec<(BoardSlug, String)> = Vec::new();
+        for board in boards.iter().filter(|board| self.is_home(board)) {
+            let Some(local) = self.state.coordinators.get(&board.slug) else {
+                continue;
+            };
+            match &board.coordinator {
+                Some(named) if *named != local.agent => continue,
+                Some(_)
+                    if local.registered
+                        && self
+                            .threads_live
+                            .get(&local.thread)
+                            .is_some_and(|at| now - *at < THREAD_RECHECK) =>
+                {
+                    checks.insert(board.slug.clone(), Ok(true));
+                }
+                _ => ask.push((board.slug.clone(), local.thread.clone())),
+            }
+        }
+        let answers =
+            futures_util::future::join_all(ask.iter().map(|(_, thread)| self.thread_live(thread)))
                 .await;
-        ours.into_iter()
-            .map(|(slug, _)| slug)
-            .zip(checked)
-            .collect()
+        for ((slug, thread), answer) in ask.into_iter().zip(answers) {
+            if matches!(answer, Ok(true)) {
+                self.threads_live.insert(thread, now);
+            } else {
+                self.threads_live.remove(&thread);
+            }
+            checks.insert(slug, answer);
+        }
+        let ours: Vec<&str> = self
+            .state
+            .coordinators
+            .values()
+            .map(|c| c.thread.as_str())
+            .collect();
+        self.threads_live
+            .retain(|thread, _| ours.contains(&thread.as_str()));
+        checks
     }
 
     /// Whether T3 has `thread` and has not archived it.
@@ -1067,6 +1102,12 @@ impl<T: T3> Daemon<T> {
     /// boards should be reconciled. On an error nothing is queued and `last_seq` stays.
     pub async fn on_event(&mut self, event: &Event, now: Timestamp) -> Result<bool> {
         if event.event_type == EventType::AgentStateChanged {
+            // An ended agent's thread may be gone: the next reconcile asks T3 about it.
+            if event.payload["to"] == "ended"
+                && let Ok(agent) = event.actor.parse::<AgentId>()
+            {
+                self.threads_live.remove(agent.native());
+            }
             self.note_state(event, now);
         }
         let (reconcile, wakes) = self.examine(event).await?;
@@ -1593,6 +1634,10 @@ impl<T: T3> Daemon<T> {
     /// Records how sending `out` went.
     fn settle(&mut self, out: Outgoing, sent: Sent, now: Timestamp) {
         let agent = out.agent;
+        if !matches!(sent, Sent::Delivered) {
+            // A send that failed may mean the thread is gone: the next reconcile asks T3.
+            self.threads_live.remove(agent.native());
+        }
         match sent {
             Sent::Delivered => {
                 if let Some(queue) = self.state.wakes.get_mut(&agent) {
@@ -1840,12 +1885,10 @@ fn no_project(board: &Board) -> String {
     )
 }
 
-/// A pending proposal: open, not `auto`, with a body starting `Proposal:`
-/// (prompts/coordinator.md "Proposals"). Its filing wakes the coordinator to review it.
+/// A pending proposal (prompts/coordinator.md "Proposals"). Its filing wakes the
+/// coordinator to review it.
 fn is_proposal(task: &board_proto::Task) -> bool {
-    task.status == board_proto::TaskStatus::Open
-        && !task.auto
-        && task.body.trim_start().starts_with("Proposal:")
+    task.is_pending_proposal()
 }
 
 fn priority(p: &Priority) -> String {

@@ -202,7 +202,8 @@ pub struct CreateTask {
     pub blockers: Vec<TaskId>,
     #[serde(default = "default_priority")]
     pub priority: Priority,
-    /// Defaults to the board's autopilot setting.
+    /// Defaults to the board's autopilot setting. A body starting `Proposal:` is stored with
+    /// false whatever is sent ([`crate::is_unaccepted_proposal`]).
     pub auto: Option<bool>,
     /// Not ready before this time; a time already passed is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]

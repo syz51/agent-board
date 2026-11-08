@@ -162,7 +162,7 @@ function TaskView({
               <dd>
                 {task.auto
                   ? "May start without you"
-                  : task.body.trimStart().startsWith("Proposal:")
+                  : task.proposal
                     ? "Proposal: waits for an agent's review"
                     : "Needs you to start"}
               </dd>

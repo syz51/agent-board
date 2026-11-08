@@ -262,7 +262,7 @@ pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
     )?;
     for task in tasks {
         let waits = task.status == TaskStatus::Blocked
-            || (!task.body.trim_start().starts_with("Proposal:")
+            || (!task.proposal
                 && task.feedback.is_none()
                 && task.not_before.is_none_or(|at| at <= cx.now));
         if waits && !asked.contains(task.id.as_str()) {

@@ -50,14 +50,6 @@ export function newestFirst(asks: Ask[]): Ask[] {
   );
 }
 
-/**
- * A pending proposal: open, not `auto`, with a body starting `Proposal:` after whitespace.
- * Agents review it, not the user (`is_proposal` in crates/board/src/daemon.rs).
- */
-export function isProposal(task: Task): boolean {
-  return task.status === "open" && !task.auto && task.body.trimStart().startsWith("Proposal:");
-}
-
 export interface BoardTasks {
   board: string;
   tasks: Task[];
@@ -83,7 +75,7 @@ export function waitingTasks(
       task.status === "blocked" ||
       (task.status === "open" &&
         !task.auto &&
-        !isProposal(task) &&
+        !task.proposal &&
         task.feedback === null &&
         (task.not_before === null || Date.parse(task.not_before) <= now));
     if (!waits) continue;
