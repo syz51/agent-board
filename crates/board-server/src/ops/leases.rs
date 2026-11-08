@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use board_proto::{
-    AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX, TouchResult,
-    Touches,
+    AgentId, CreateLeases, EventType, Lease, LeaseResult, Overlap, TOUCH_PATHS_MAX, TaskId,
+    TouchResult, Touches,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::{OptionalExtension, params};
@@ -293,6 +293,36 @@ pub(crate) fn release(cx: &mut Ctx<'_>, id: i64, agent: &AgentId) -> Result<()> 
         lease.task.as_ref(),
         serde_json::json!({ "id": id, "repo": lease.repo, "glob": lease.glob }),
     )?;
+    Ok(())
+}
+
+/// Deletes the leases that name `task`, which just closed (done or dropped), recording
+/// `lease_released` by `actor` for each with the holder as `agent`. A closed task's work
+/// has stopped, so its leases would only warn peers about edits no one is making.
+pub(crate) fn release_for_task(cx: &mut Ctx<'_>, task: &TaskId, actor: &str) -> Result<()> {
+    let leases: Vec<Lease> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {LEASE_COLUMNS} FROM leases WHERE task = ?1 ORDER BY id"
+        ))?
+        .query_map([task.as_str()], lease_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    cx.db
+        .execute("DELETE FROM leases WHERE task = ?1", [task.as_str()])?;
+    for lease in leases {
+        cx.emit(
+            None,
+            actor,
+            EventType::LeaseReleased,
+            Some(task),
+            serde_json::json!({
+                "id": lease.id,
+                "agent": lease.agent,
+                "repo": lease.repo,
+                "glob": lease.glob,
+            }),
+        )?;
+    }
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use chrono::TimeDelta;
 use serde_json::{Value, json};
 
-use super::{REPO, T, iso, lease_ttl, stale_after, start, touch_window};
+use super::{REPO, T, check, iso, lease_ttl, stale_after, start, touch_window};
 use crate::ops::leases::sweep_expired;
 
 const A: &str = "t3:alpha";
@@ -17,6 +17,44 @@ async fn lease(t: &T, agent: &str, globs: &[&str]) -> Value {
         })),
     )
     .await
+}
+
+async fn lease_for(t: &T, agent: &str, task: &str, globs: &[&str]) -> Value {
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(agent),
+        Some(json!({
+            "agent": agent, "repo": REPO, "globs": globs, "task": task,
+        })),
+    )
+    .await
+}
+
+/// The `lease_released` events that name `task`.
+async fn released(t: &T, task: &str) -> Vec<Value> {
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "lease_released" && e["task"] == task)
+        .cloned()
+        .collect()
+}
+
+/// The holders of the `conflicts` in a lease answer, sorted.
+fn holders(answer: &Value) -> Vec<String> {
+    let mut out: Vec<String> = answer["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["agent"].as_str().unwrap().to_owned())
+        .collect();
+    out.sort();
+    out
 }
 
 fn sweep(t: &T) -> usize {
@@ -552,4 +590,169 @@ async fn a_task_lease_outside_its_boards_repos_warns_and_stays_put() {
         let v = t.ok("POST", "/v1/leases", Some(A), Some(body)).await;
         assert!(v.get("warning").is_none(), "{v}");
     }
+}
+
+#[tokio::test]
+async fn leases_end_with_their_task() {
+    const C: &str = "t3:gamma";
+    const D: &str = "t3:delta";
+    const E: &str = "t3:epsilon";
+    let t = T::new();
+    t.board("app", &[REPO]).await;
+    for agent in [A, B, C, D, E] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    let finished = t.task(A, "app", "Finished").await;
+    let dropped = t.task(C, "app", "Dropped").await;
+    let working = t.task(D, "app", "Working").await;
+    let parked = t.task(E, "app", "Parked").await;
+    for (agent, task) in [(A, &finished), (C, &dropped), (D, &working), (E, &parked)] {
+        assert!(t.claim(agent, task).await.0.is_success());
+    }
+    lease_for(&t, A, &finished, &["src/done.rs"]).await;
+    // A lease naming the task by another agent, such as its child, ends with it too.
+    lease_for(&t, B, &finished, &["src/child.rs"]).await;
+    lease(&t, A, &["src/untasked.rs"]).await;
+    lease_for(&t, C, &dropped, &["src/dropped.rs"]).await;
+    lease_for(&t, D, &working, &["src/working.rs"]).await;
+    lease_for(&t, E, &parked, &["src/parked.rs"]).await;
+
+    // Done by its owner: both leases naming it are released, each with an event.
+    assert!(t.done(A, &finished, check(0)).await.0.is_success());
+    let events = released(&t, &finished).await;
+    let mut seen: Vec<(&str, &str, &str)> = events
+        .iter()
+        .map(|e| {
+            (
+                e["actor"].as_str().unwrap(),
+                e["payload"]["agent"].as_str().unwrap(),
+                e["payload"]["glob"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, [(A, A, "src/done.rs"), (A, B, "src/child.rs")]);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE task = '{finished}'"
+        )),
+        0
+    );
+
+    // Dropped by the user (acting as B), not its owner: its lease ends too.
+    let version = t.get_task(&dropped).await["version"].clone();
+    let bearer = format!("Bearer {}", t.user_token);
+    let (s, v) = t
+        .send(
+            "PATCH",
+            &format!("/v1/tasks/{dropped}"),
+            &[("authorization", bearer.as_str()), ("x-board-agent", B)],
+            Some(json!({ "agent": B, "version": version, "status": "dropped" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let events = released(&t, &dropped).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["actor"], B);
+    assert_eq!(events[0]["payload"]["agent"], C);
+    assert_eq!(events[0]["payload"]["repo"], REPO);
+
+    // Moved to review, or back to open: the task is not closed, so its leases stay.
+    assert!(
+        t.patch(D, &working, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    assert!(
+        t.patch(D, &working, json!({ "status": "doing" }))
+            .await
+            .0
+            .is_success()
+    );
+    assert!(
+        t.patch(E, &parked, json!({ "status": "open" }))
+            .await
+            .0
+            .is_success()
+    );
+    assert!(released(&t, &working).await.is_empty());
+    assert!(released(&t, &parked).await.is_empty());
+
+    // Another agent leasing every path is warned only by leases of work still going: the
+    // doing task's, the reopened task's and the lease that names no task.
+    let answer = lease(
+        &t,
+        B,
+        &[
+            "src/done.rs",
+            "src/dropped.rs",
+            "src/working.rs",
+            "src/parked.rs",
+            "src/untasked.rs",
+        ],
+    )
+    .await;
+    assert_eq!(holders(&answer), [A, D, E]);
+    let globs: Vec<&str> = answer["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["glob"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        globs,
+        ["src/untasked.rs", "src/working.rs", "src/parked.rs"]
+    );
+
+    // A touch of the closed tasks' paths reports only B's new leases, none of the ended ones.
+    let touched = t
+        .ok(
+            "POST",
+            "/v1/touches",
+            Some(C),
+            Some(json!({
+                "agent": C, "repo": REPO, "paths": ["src/done.rs", "src/dropped.rs"],
+            })),
+        )
+        .await;
+    let leased: Vec<&str> = touched["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["via"] == "lease")
+        .map(|o| o["agent"].as_str().unwrap())
+        .collect();
+    assert_eq!(leased, [B, B]);
+}
+
+#[tokio::test]
+async fn resolving_a_feedback_item_ends_its_leases() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    let item = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "leases outlive tasks" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(A, &item).await.0.is_success());
+    lease_for(&t, A, &item, &["src/fix.rs"]).await;
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/v1/feedback/{item}/resolve"),
+            Some(A),
+            Some(json!({ "kind": "declined", "reason": "works as designed" })),
+        )
+        .await;
+    assert!(s.is_success());
+    assert_eq!(released(&t, &item).await.len(), 1);
+    assert!(holders(&lease(&t, B, &["src/fix.rs"]).await).is_empty());
 }

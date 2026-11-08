@@ -389,6 +389,15 @@ is not done (see "Temporary boards").
   warning from this lease. `lease_paths` (MCP) and `board lease` print it as a `warning:` line
   above the leases.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
+- Leases end with their task. When a task goes to `done` (`/done`, or a feedback item's
+  `/resolve`) or `dropped` (`PATCH`, by whoever may move it), every lease whose `task` names
+  it is deleted, whoever holds it, in the same transaction. Each records `lease_released`
+  with the task, by the agent that closed it, with payload `{id, agent, repo, glob}` (`agent`
+  is the holder; an explicit `DELETE` records `{id, repo, glob}` by the holder). A task
+  moved to `open` or `review` keeps its leases: its work may resume, and the holder's
+  session end or the lease's expiry still ends them. A lease taken for a task already
+  closed is not released by this. (Servers before this change kept such leases until their
+  holder ended or they expired.)
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
