@@ -348,9 +348,11 @@ settings in use, warned once per edit.
   `WAKE_HOLD_MAX`; a send that timed out may have got through, so it counts as sent; a
   failed send backs off from 30 seconds up to 10 minutes, and makes the next reconcile ask
   T3 whether the thread is gone. It is held too while the board is idle (nothing in
-  doing, no ready auto task and no open ask; a server without `ready_auto` counts as not
-  idle), so a deploy costs an idle coordinator no turn: the next wake-up the daemon sends
-  it carries the new prompt in front of its lines, and settles the re-brief the same way.
+  doing or review, no ready auto task and no open ask; a server without `ready_auto`
+  counts as not idle), or while wake-ups wait for the coordinator, so a deploy costs an
+  idle coordinator no turn: the next wake-up the daemon sends it, or the message that
+  resumes it after a usage limit, carries the new prompt in front. A send that may have
+  got through records the new digest; a failed one leaves the prompt owed for its retry.
   A record without a digest (from before this rule), or a thread an earlier unfinished
   start launched, counts as changed, so it is briefed once.
 - **Adopting a thread instead**: when a thread already does a board's work,

@@ -4547,30 +4547,25 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     e.t3.fail_send.store(false, Ordering::SeqCst);
     assert_eq!(e.t3.sends(), [("coord".to_owned(), expected.clone())]);
     assert_eq!(briefed(&e), old);
-    // It backs off like a failed re-brief; the wake-up's retry carries it again.
+    // The wake-up's back-off times the retry, which carries it again. Meanwhile the
+    // board got work, but a reconcile leaves the prompt to the queued wake-up.
+    e.stub
+        .on("GET /v1/boards", [counted(&agent, 0, Some(1), 0)]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(e.daemon.state.coordinators[&slug].rebrief_backoff, None);
     let next = at() + WAKE_RETRY_FIRST;
-    assert_eq!(
-        e.daemon.state.coordinators[&slug]
-            .rebrief_backoff
-            .as_ref()
-            .map(|b| b.retry_at),
-        Some(next)
-    );
     e.daemon.flush(next).await;
     assert_eq!(e.t3.sends().len(), 2);
     assert_eq!(e.t3.sends()[1], ("coord".to_owned(), expected));
     assert_eq!(briefed(&e), current);
-    assert_eq!(
-        e.daemon.state.coordinators[&slug].rebrief_backoff, None,
-        "a delivered re-brief clears its back-off"
-    );
 
-    // Briefed now: later wake-ups and reconciles carry no prompt.
+    // Briefed now: a reconcile of the board with work, and later wake-ups, send no prompt.
+    e.daemon.reconcile(next).await.unwrap();
     queue_ready(&mut e, 11, &["factory-5"], next).await;
     e.daemon.flush(next).await;
-    e.daemon.reconcile(next).await.unwrap();
     let sends = e.t3.sends();
-    assert_eq!(sends.len(), 3);
+    assert_eq!(sends.len(), 3, "{sends:?}");
     assert_eq!(
         sends[2].1,
         "board factory: factory-5 is ready (p1)\nRun board_snapshot and continue."
@@ -4589,6 +4584,27 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
             .contains(board::daemon::COORDINATOR_PROMPT)
     );
     assert_eq!(briefed(&e), current);
+
+    // A thread that coordinates two boards gets each prompt it is owed.
+    let other: board_proto::BoardSlug = "other".parse().unwrap();
+    let mut second = e.daemon.state.coordinators[&slug].clone();
+    second.briefed = None;
+    e.daemon.state.coordinators.insert(other.clone(), second);
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    queue_ready(&mut e, 13, &["factory-7"], next).await;
+    e.daemon.flush(next).await;
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 5);
+    assert_eq!(
+        sends[4].1,
+        format!(
+            "{}\n\n{}\n\nboard factory: factory-7 is ready (p1)\nRun board_snapshot and continue.",
+            board::daemon::rebrief_message(&slug, false),
+            board::daemon::rebrief_message(&other, false)
+        )
+    );
+    assert_eq!(e.daemon.state.coordinators[&other].briefed, current);
+    assert_eq!(briefed(&e), current);
 }
 
 #[tokio::test]
@@ -4596,9 +4612,12 @@ async fn a_board_with_work_or_unknown_ready_work_re_briefs_its_coordinator_at_on
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
     let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let mut in_review = counted(&agent, 0, Some(0), 0);
+    in_review.counts.review = 1;
     for (n, board) in [
         counted(&agent, 0, Some(2), 0),
         counted(&agent, 1, Some(0), 0),
+        in_review,
         counted(&agent, 0, Some(0), 1),
         // A server from before `ready_auto`: the ready work is unknown.
         counted(&agent, 0, None, 0),
@@ -4624,7 +4643,33 @@ async fn a_board_with_work_or_unknown_ready_work_re_briefs_its_coordinator_at_on
     queue_ready(&mut e, 10, &["factory-4"], at()).await;
     e.daemon.flush(at()).await;
     assert_eq!(
-        e.t3.sends()[4].1,
+        e.t3.sends()[5].1,
         "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue."
+    );
+}
+
+#[tokio::test]
+async fn an_idle_coordinator_resumed_at_a_usage_reset_gets_the_new_prompt_with_it() {
+    let reset = at() + chrono::Duration::hours(1);
+    let (mut e, agent) = coordinator_env(AgentState::Ended, Some(reset));
+    let slug = factory();
+    e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
+    e.stub
+        .on("GET /v1/boards", [counted(&agent, 0, Some(0), 0)]);
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon.reconcile(later).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert_eq!(
+        sends[0].1,
+        format!(
+            "{}\n\nboard factory: the usage limit has reset. Run board_snapshot and continue your loop.",
+            board::daemon::rebrief_message(&slug, false)
+        )
+    );
+    assert_eq!(
+        e.daemon.state.coordinators[&slug].briefed,
+        Some(board::daemon::prompt_digest(false).to_owned())
     );
 }
