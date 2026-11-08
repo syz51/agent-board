@@ -19,6 +19,7 @@ import {
   Crumbs,
   Empty,
   ErrorNotice,
+  Owner,
   PageHeader,
   QueryFrame,
   RelTime,
@@ -27,7 +28,8 @@ import {
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon } from "@/ui/icons.tsx";
+import { Icon, StatusPill } from "@/ui/icons.tsx";
+import { HandoffView } from "./agents.tsx";
 import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
 import { UpdatesSection } from "./updates.tsx";
 
@@ -276,8 +278,10 @@ export function AskScreen() {
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
-            <div className="max-w-[760px]">
+            // The answer comes first; what the ask is about sits beside it on wide screens.
+            <div className="grid items-start gap-x-8 gap-y-6 lg:grid-cols-[minmax(0,1fr)_minmax(260px,320px)]">
               <AskCard ask={data} agents={agents} standalone />
+              <AskContext ask={data} agents={agents} />
             </div>
           )}
         </QueryFrame>
@@ -285,6 +289,49 @@ export function AskScreen() {
         <Empty title={`“${id}” is not an ask number`}>Ask links look like /asks/12.</Empty>
       )}
     </>
+  );
+}
+
+/** Beside a single ask: the task it is about and the asking agent's handoff. */
+function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
+  const heading = "text-xs font-semibold text-subtle-foreground";
+  return (
+    <aside className="grid content-start gap-5" aria-label="About this ask">
+      {ask.task && (
+        <section className="grid gap-2">
+          <h2 className={heading}>Task</h2>
+          <AskTask id={ask.task} agents={agents} />
+        </section>
+      )}
+      <section className="grid gap-2">
+        <h2 className={heading}>Asked by</h2>
+        <Who id={ask.agent} agents={agents} />
+        <HandoffView agentId={ask.agent} />
+      </section>
+    </aside>
+  );
+}
+
+function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
+  const detail = useQuery(queries.task(id));
+  if (detail.error && detail.data === undefined) {
+    return <ErrorNotice error={detail.error} retry={() => void detail.refetch()} compact />;
+  }
+  if (detail.data === undefined) {
+    return <p className="text-meta text-muted-foreground">Loading task…</p>;
+  }
+  const { task } = detail.data;
+  return (
+    <div className="grid gap-2 rounded-lg border bg-card px-3.5 py-3">
+      <Link className="text-sm font-medium text-foreground" to="/tasks/$id" params={{ id }}>
+        {task.title}
+      </Link>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-meta">
+        <StatusPill status={task.status} />
+        <span className="ident text-muted-foreground">{id}</span>
+        <Owner task={task} agents={agents} />
+      </div>
+    </div>
   );
 }
 
@@ -461,8 +508,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                       </Label>
                       <Textarea
                         id={`${id}-text`}
-                        rows={1}
-                        className="field-sizing-content max-h-60 min-h-9 resize-none bg-card py-1.75 text-sm dark:bg-card"
+                        rows={2}
+                        className="field-sizing-content max-h-60 min-h-15 resize-none bg-card py-1.75 text-sm dark:bg-card"
                         value={field.state.value}
                         aria-invalid={missing ? true : undefined}
                         aria-describedby={missing ? `${id}-missing` : undefined}
@@ -471,13 +518,8 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                     </div>
                   )}
                 </form.Field>
-                {/* Quiet until there is something to send, so a list of asks is not a column
-                    of heavy buttons; a press with nothing chosen says what is missing. */}
-                <Button
-                  type="submit"
-                  variant={answer ? "default" : "outline"}
-                  disabled={mutation.isPending}
-                >
+                {/* The page's main action; a press with nothing chosen says what is missing. */}
+                <Button type="submit" disabled={mutation.isPending}>
                   {mutation.isPending ? "Sending…" : "Send answer"}
                 </Button>
               </div>

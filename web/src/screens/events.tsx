@@ -17,7 +17,7 @@ import {
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon, type IconName, StatusIcon, type StatusKey } from "@/ui/icons.tsx";
+import { Icon, type IconName, STATUS_COLOR, StatusIcon, type StatusKey } from "@/ui/icons.tsx";
 import { FilterSelect, FilterToggle } from "@/ui/filters.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
 
@@ -107,7 +107,7 @@ export function EventsScreen() {
 export function Timeline({ live, children }: { live?: boolean; children: React.ReactNode }) {
   return (
     <ol
-      className="relative before:absolute before:top-3.5 before:bottom-3.5 before:left-[13px] before:w-px before:bg-border"
+      className="relative before:absolute before:top-3.5 before:bottom-3.5 before:left-[13px] before:w-px before:bg-input"
       {...(live ? { "aria-live": "polite" as const, "aria-relevant": "additions" as const } : {})}
     >
       {children}
@@ -188,14 +188,15 @@ export function eventMark(event: BoardEvent): {
   }
 }
 
-/** The mark itself: a status symbol or an icon, on the same neutral node for every event. */
+/** The mark itself: a status symbol or an icon on a node tinted with the mark's own color. */
 export function EventMark({ event, className }: { event: BoardEvent; className?: string }) {
   const mark = eventMark(event);
   return (
     <span
       className={cn(
-        "grid size-6 flex-none place-items-center rounded-full border bg-card",
-        mark.tone,
+        // Opaque, so the rail stops at the node; the tint and ring come from the text color.
+        "grid size-6 flex-none place-items-center rounded-full border border-current/25 bg-[color-mix(in_oklab,currentColor_11%,var(--color-card))]",
+        mark.status ? STATUS_COLOR[mark.status] : mark.tone,
         className,
       )}
       aria-hidden="true"

@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
-import { useNow } from "@/live/runtime.ts";
+import { useConnection, useNow } from "@/live/runtime.ts";
 import { Avatar, Icon, type IconName, PriorityMark, StatusPill } from "./icons.tsx";
 
 export function useTitle(title: string): void {
@@ -40,24 +40,38 @@ export function ErrorNotice({
   retry?: (() => void) | undefined;
   compact?: boolean;
 }) {
+  // While the connection banner shows, a failed page is most likely the same outage: the card
+  // then speaks the banner's language (a plug, the banner's tone) instead of raising a second alarm.
+  const { kind } = useConnection();
+  const linkDown = kind === "offline" || kind === "reconnecting";
+  const warn = kind === "reconnecting";
   return (
-    // A page that failed to load gets a neutral card with a red mark: the connection banner,
-    // when there is one, already carries the alarm. Inline failures stay red.
     <Alert
       variant={compact ? "error" : "default"}
       className={cn(
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
+        !compact && (warn ? "border-warn-border" : "border-error-border"),
       )}
     >
       {!compact && (
-        <span className="grid size-9 flex-none place-items-center rounded-[9px] border border-error-border bg-error-soft text-error">
-          <Icon name="alert" className="size-4.5" />
+        <span
+          className={cn(
+            "grid size-9 flex-none place-items-center rounded-[9px] border",
+            warn
+              ? "border-warn-border bg-warn-soft text-warn"
+              : "border-error-border bg-error-soft text-error",
+          )}
+        >
+          <Icon name={linkDown ? "plug" : "alert"} className="size-4.5" />
         </span>
       )}
       <div className="grid flex-[1_1_280px] gap-1">
         <AlertTitle
-          className={cn("col-start-1 line-clamp-none font-semibold", !compact && "text-foreground")}
+          className={cn(
+            "col-start-1 line-clamp-none font-semibold",
+            !compact && "text-base text-foreground",
+          )}
         >
           {error.message}
         </AlertTitle>
@@ -247,10 +261,9 @@ export function Owner({
 }) {
   if (!task.owner) {
     return (
-      // A dash, as other empty cells show; the word is for screen readers.
+      // A word, not a dash: nobody has claimed it, which is not the same as missing data.
       <span className="inline-flex min-h-5 min-w-0 items-center text-meta text-muted-foreground">
-        <span aria-hidden="true">–</span>
-        <span className="sr-only">Unowned</span>
+        Unowned
       </span>
     );
   }
@@ -388,9 +401,12 @@ export function AskKind({ kind }: { kind: "action" | "decision" }) {
 export function ExpandableLine({
   text,
   className,
+  lines = 1,
 }: {
   text: string;
   className?: string | undefined;
+  /** How many lines show while closed. */
+  lines?: 1 | 2;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -398,7 +414,7 @@ export function ExpandableLine({
       type="button"
       className={cn(
         "block min-h-6 w-full min-w-0 cursor-pointer rounded-xs text-left text-inherit",
-        open ? "whitespace-pre-wrap" : "truncate",
+        open ? "whitespace-pre-wrap" : lines === 2 ? "line-clamp-2" : "truncate",
         className,
       )}
       aria-expanded={open}

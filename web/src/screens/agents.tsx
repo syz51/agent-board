@@ -133,7 +133,13 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         >
           {agent.handle}
         </h2>
-        <AgentStateBadge agent={agent} />
+        {/* When it was last seen sits with its state: the two answer "is it alive?". */}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <AgentStateBadge agent={agent} />
+          <span className="text-meta text-muted-foreground">
+            seen <RelTime at={agent.last_seen} />
+          </span>
+        </div>
       </header>
       <div className="grid min-w-0 content-start gap-2">
         <p className="font-medium">
@@ -185,12 +191,6 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
             </dd>
           </div>
         )}
-        <div>
-          <dt>Last seen</dt>
-          <dd>
-            <RelTime at={agent.last_seen} />
-          </dd>
-        </div>
       </dl>
     </article>
   );
@@ -198,7 +198,7 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
 
 const handoffBox = "grid gap-1 border-l-2 pl-3 text-meta";
 
-function HandoffView({ agentId }: { agentId: string }) {
+export function HandoffView({ agentId }: { agentId: string }) {
   const handoff = useQuery(queries.handoff(agentId));
   if (handoff.error && handoff.data === undefined) {
     return <ErrorNotice error={handoff.error} retry={() => void handoff.refetch()} compact />;
