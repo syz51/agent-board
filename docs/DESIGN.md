@@ -407,6 +407,16 @@ registers without a repo).
     limit wait until the reset (or, without an end time, until it resumes), since that
     pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
+  - *Stalled board*: an active autopilot board with no task in `doing`, whose last move of
+    a task into or out of `doing` (claim, take, release, done, or a status change from or
+    to `doing`) is older than `[telegram] stalled_after_secs` (default 2 hours), and
+    that has a ready auto task unchanged for as long, is reported once. The message names
+    the board, its ready auto count, how long it has been quiet, and its coordinator's
+    state and last-seen time, with a link. Boards found at one check share one message. A
+    board is reported again only after another move into or out of `doing`. Work that
+    became ready lately does not count, so a coordinator gets the threshold to claim it.
+    Boards whose coordinator is paused on a usage limit wait, as for stuck tasks. This
+    catches a stopped coordinator or device daemon without depending on either.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls
     after local midnight, one message lists the Needs you items by board,

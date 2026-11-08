@@ -4,10 +4,11 @@
 //! buttons. No public endpoint is needed.
 //!
 //! Every minute it also reports tasks in doing or review that went quiet past
-//! `stuck_after_secs`, in one message per check and once until they change, and sends a
-//! daily Needs you digest at `digest_at` (skipped when there is nothing to list). Both are
-//! recorded only once sent, so an alert is never lost; a crash between the send and the
-//! record repeats it once.
+//! `stuck_after_secs`, in one message per check and once until they change; reports active
+//! autopilot boards whose ready work sat unclaimed past `stalled_after_secs`, once until a
+//! task on the board moves into or out of doing; and sends a daily Needs you digest at
+//! `digest_at` (skipped when there is nothing to list). Each is recorded only once sent, so
+//! an alert is never lost; a crash between the send and the record repeats it once.
 //!
 //! The chat is `[telegram] chat_id` when configured, else the one paired in the database:
 //! the first private chat that sends `/start <code>` with a live code from `board admin
@@ -51,6 +52,8 @@ const DIGEST_LINE_CHARS: usize = 140;
 struct Schedule {
     /// 0 turns the stuck alert off.
     stuck_after_secs: u64,
+    /// 0 turns the stalled-board alert off.
+    stalled_after_secs: u64,
     digest_at: Option<NaiveTime>,
     utc_offset: FixedOffset,
 }
@@ -188,12 +191,16 @@ pub(crate) fn spawn_with(
     }
     let schedule = Schedule {
         stuck_after_secs: config.stuck_after_secs,
+        stalled_after_secs: config.stalled_after_secs,
         digest_at: config.digest_at,
         utc_offset: config.utc_offset,
     };
     let notify = tokio::spawn(notify_loop(state.clone(), bot.clone(), events, since));
-    // With both alerts off there is nothing to check.
-    let alerts = (schedule.stuck_after_secs > 0 || schedule.digest_at.is_some()).then(|| {
+    // With every alert off there is nothing to check.
+    let alerts = (schedule.stuck_after_secs > 0
+        || schedule.stalled_after_secs > 0
+        || schedule.digest_at.is_some())
+    .then(|| {
         tokio::spawn(alert_loop(
             state.clone(),
             bot.clone(),
@@ -428,7 +435,7 @@ async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()>
         .map(|_| ())
 }
 
-/// Checks the stuck alert and the digest every `every` until the state shuts down, and
+/// Checks the scheduled alerts every `every` until the state shuts down, and
 /// counts each finished check in `checked` (tests wait on it).
 async fn alert_loop(
     state: AppState,
@@ -471,6 +478,11 @@ async fn check(state: &AppState, bot: &Bot, schedule: &Schedule) {
         && let Err(error) = send_stuck(state, bot, chat, schedule).await
     {
         tracing::error!(%error, "telegram: the stuck-task alert failed; retrying at the next check");
+    }
+    if schedule.stalled_after_secs > 0
+        && let Err(error) = send_stalled(state, bot, chat, schedule).await
+    {
+        tracing::error!(%error, "telegram: the stalled-board alert failed; retrying at the next check");
     }
     if let Some(at) = schedule.digest_at
         && let Err(error) = send_digest(state, bot, chat, at, schedule.utc_offset).await
@@ -550,6 +562,63 @@ fn stuck_text(
         shown += 1;
     }
     (text.trim_end().to_owned(), shown)
+}
+
+/// Reports the autopilot boards whose ready work sits unclaimed, in one message, each once
+/// until a task on it moves into or out of doing. Recorded only once sent.
+async fn send_stalled(state: &AppState, bot: &Bot, chat: i64, schedule: &Schedule) -> Result<()> {
+    let quiet_ms =
+        i64::try_from(schedule.stalled_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let stalled = state
+        .read(move |cx| telegram_ops::stalled(cx, quiet_ms))
+        .await?;
+    if stalled.is_empty() {
+        return Ok(());
+    }
+    let text = stalled_text(state, &stalled, schedule);
+    bot.send(json!({ "chat_id": chat, "text": text })).await?;
+    let sent: Vec<_> = stalled.into_iter().map(|b| (b.board, b.seq)).collect();
+    state
+        .write(move |cx| telegram_ops::record_stalled(cx, &sent))
+        .await
+}
+
+/// The stalled message: per board, its ready count, how long nothing moved, and its
+/// coordinator. Boards are few, so it needs no cap.
+fn stalled_text(
+    state: &AppState,
+    stalled: &[telegram_ops::Stalled],
+    schedule: &Schedule,
+) -> String {
+    let threshold =
+        TimeDelta::seconds(i64::try_from(schedule.stalled_after_secs).unwrap_or(i64::MAX));
+    let mut text = format!(
+        "Stalled: {} autopilot {} with ready work and nothing claimed for {} or more.\n",
+        stalled.len(),
+        plural(stalled.len(), "board", "boards"),
+        span(threshold),
+    );
+    for board in stalled {
+        let coordinator = match &board.coordinator {
+            Some((handle, agent_state, seen)) => format!(
+                "Coordinator {handle}: {agent_state}, last seen {}.",
+                local(*seen, schedule.utc_offset)
+            ),
+            None => "No coordinator named.".to_owned(),
+        };
+        text.push_str(&format!(
+            "\n{}: {} ready auto {}, no task in doing, quiet for {} (since {}).\n{coordinator}\n",
+            board.board,
+            board.ready,
+            plural(board.ready, "task", "tasks"),
+            span(state.now() - board.quiet_since),
+            local(board.quiet_since, schedule.utc_offset),
+        ));
+        if let Some(url) = state.public_url() {
+            text.push_str(&format!("{url}/boards/{}\n", board.board));
+        }
+    }
+    text.trim_end().to_owned()
 }
 
 /// Sends the digest of the local day once its time has passed, unless it was sent; nothing

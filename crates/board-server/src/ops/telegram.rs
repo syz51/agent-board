@@ -201,6 +201,106 @@ pub(crate) fn record_stuck(cx: &mut Ctx<'_>, sent: &[(TaskId, i64)]) -> Result<(
     Ok(())
 }
 
+/// An active autopilot board whose ready work sits unclaimed, as the stalled alert reports
+/// it.
+#[derive(Debug)]
+pub(crate) struct Stalled {
+    pub board: String,
+    /// Ready auto tasks on the board.
+    pub ready: usize,
+    /// The board's newest event that moved a task into or out of doing, or 0 when none is
+    /// left; an alert is recorded against it.
+    pub seq: i64,
+    /// That event's time, else the board's creation.
+    pub quiet_since: Timestamp,
+    /// The board's coordinator: its handle, state and when it was last seen.
+    pub coordinator: Option<(String, String, Timestamp)>,
+}
+
+/// Events that move a task into or out of doing, over events alias `x`.
+const DOING_MOVES: &str = "(x.type IN ('task_claimed', 'task_taken', 'task_released', \
+    'task_done') OR (x.type = 'task_updated' AND 'doing' IN \
+    (json_extract(x.payload, '$.from'), json_extract(x.payload, '$.to'))))";
+
+/// Every active autopilot board with no task in doing, no task moved into or out of doing
+/// for `quiet_ms`, and a ready auto task unchanged for as long, not yet reported since that
+/// move. Left out, as for the stuck alert: boards whose coordinator is paused on a usage
+/// limit, since that pause has its own message.
+pub(crate) fn stalled(cx: &Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
+    let now = cx.now_ms();
+    let cutoff = now - quiet_ms;
+    let boards = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT b.slug, COALESCE(e.seq, 0), COALESCE(e.at, b.created_at), a.handle, \
+               a.state, a.last_seen \
+             FROM boards b \
+             LEFT JOIN events e ON e.seq = (SELECT x.seq FROM events x \
+               WHERE x.board = b.slug AND {DOING_MOVES} ORDER BY x.seq DESC LIMIT 1) \
+             LEFT JOIN agents a ON a.id = b.coordinator \
+             WHERE b.autopilot = 1 AND b.status = 'active' \
+               AND COALESCE(e.at, b.created_at) <= ?1 \
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
+                 AND t.status = 'doing') \
+               AND NOT (COALESCE(a.state, '') = 'paused' \
+                 AND (a.paused_until IS NULL OR a.paused_until > ?2)) \
+               AND NOT EXISTS (SELECT 1 FROM telegram_stalled s \
+                 WHERE s.board = b.slug AND s.seq = COALESCE(e.seq, 0)) \
+             ORDER BY b.slug"
+        ))?
+        .query_map(params![cutoff, now], |r| {
+            let handle: Option<String> = r.get(3)?;
+            let state: Option<String> = r.get(4)?;
+            let seen: Option<i64> = r.get(5)?;
+            Ok(Stalled {
+                board: r.get(0)?,
+                ready: 0,
+                seq: r.get(1)?,
+                quiet_since: ts(r.get(2)?),
+                coordinator: handle
+                    .zip(state)
+                    .zip(seen)
+                    .map(|((h, s), at)| (h, s, ts(at))),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stalled = Vec::new();
+    for mut board in boards {
+        let ready: Vec<Task> = load_tasks(
+            cx,
+            "t.board = :board AND t.status = 'open' AND t.auto = 1",
+            &vec![(":board", &board.board)],
+        )?
+        .into_iter()
+        .filter(|t| t.ready)
+        .collect();
+        // Work that became ready only lately is the coordinator's to claim first.
+        let cutoff = ts(cutoff);
+        if ready
+            .iter()
+            .any(|t| t.updated_at <= cutoff && t.not_before.is_none_or(|at| at <= cutoff))
+        {
+            board.ready = ready.len();
+            stalled.push(board);
+        }
+    }
+    Ok(stalled)
+}
+
+/// Records the stalled alerts sent, each against its board's newest move into or out of
+/// doing, so a board is reported again only after such a move.
+pub(crate) fn record_stalled(cx: &mut Ctx<'_>, sent: &[(String, i64)]) -> Result<()> {
+    let now = cx.now_ms();
+    for (board, seq) in sent {
+        cx.db.execute(
+            "INSERT INTO telegram_stalled (board, seq, sent_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (board) DO UPDATE SET seq = excluded.seq, sent_at = excluded.sent_at",
+            params![board, seq, now],
+        )?;
+    }
+    Ok(())
+}
+
 /// The local date (`YYYY-MM-DD`) of the last digest sent, if any.
 pub(crate) fn digest_sent(cx: &Ctx<'_>) -> Result<Option<String>> {
     Ok(cx

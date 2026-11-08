@@ -1015,6 +1015,130 @@ async fn only_a_paused_coordinator_holds_back_its_stuck_tasks() {
     assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
 }
 
+fn stalled_after() -> TimeDelta {
+    TimeDelta::seconds(i64::try_from(TelegramConfig::default().stalled_after_secs).unwrap())
+}
+
+/// Switches autopilot on for `board`, with `A` as its coordinator.
+fn autopilot(t: &T, board: &str) {
+    t.exec(&format!(
+        "UPDATE boards SET autopilot = 1, coordinator = '{A}' WHERE slug = '{board}'"
+    ));
+}
+
+#[tokio::test]
+async fn a_stalled_autopilot_board_is_reported_once_until_a_claim() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::with(|c| c.public_url = Some("https://board.example".to_owned()));
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    let first = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Ready work", "auto": true }),
+        )
+        .await;
+    let mut notifier = Scheduled::start(&t, api_base, |c| c.stuck_after_secs = 0);
+
+    // Just under the threshold: nothing.
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 1).await;
+    assert_eq!(sent[0]["chat_id"], CHAT);
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "Stalled: 1 autopilot board with ready work and nothing claimed for 2 h 0 min or \
+             more.\n\nfactory: 1 ready auto task, no task in doing, quiet for 2 h 1 min (since "
+        ),
+        "{text}"
+    );
+    assert!(text.contains(").\nCoordinator t3:"), "{text}");
+    assert!(text.contains(", last seen "), "{text}");
+    assert!(
+        text.ends_with("https://board.example/boards/factory"),
+        "{text}"
+    );
+    // Still stalled: no repeat.
+    t.advance(stalled_after() * 2);
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+
+    // A claim ends it; work in doing never stalls, however long it takes.
+    assert!(t.claim(A, &first).await.0.is_success());
+    let second = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "More work", "auto": true }),
+        )
+        .await;
+    t.advance(stalled_after() * 3);
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+
+    // Once the work is done and the rest sits unclaimed again, it is reported again.
+    assert!(t.done(A, &first, super::check(0)).await.0.is_success());
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 2).await;
+    let text = sent[1]["text"].as_str().unwrap();
+    assert!(text.contains("\nfactory: 1 ready auto task,"), "{text}");
+    assert!(
+        !text.contains(&second),
+        "tasks are counted, not listed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn only_old_ready_auto_work_on_an_active_autopilot_board_stalls() {
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    // Ready auto work, but no autopilot.
+    t.board("manual", &[]).await;
+    t.task_with(
+        A,
+        json!({ "board": "manual", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // Autopilot, but only work that waits on the user.
+    t.board("waits", &[]).await;
+    autopilot(&t, "waits");
+    t.task_with(
+        A,
+        json!({ "board": "waits", "title": "Decide", "auto": false }),
+    )
+    .await;
+    // Autopilot and ready auto work, but a task in doing.
+    t.board("busy", &[]).await;
+    autopilot(&t, "busy");
+    let doing = t.task(A, "busy", "In progress").await;
+    assert!(t.claim(A, &doing).await.0.is_success());
+    t.task_with(A, json!({ "board": "busy", "title": "Next", "auto": true }))
+        .await;
+    // Autopilot and an empty, long-quiet board.
+    t.board("fresh", &[]).await;
+    autopilot(&t, "fresh");
+    let mut notifier = Scheduled::start(&t, api_base, |c| c.stuck_after_secs = 0);
+
+    t.advance(stalled_after() * 3);
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+
+    // Work that just became ready is the coordinator's to claim first, however long the
+    // board was quiet.
+    t.task_with(A, json!({ "board": "fresh", "title": "New", "auto": true }))
+        .await;
+    t.advance(stalled_after() - TimeDelta::minutes(1));
+    assert!(notifier.sent_after_check(&fake).await.is_empty());
+    t.advance(TimeDelta::minutes(2));
+    let sent = fake.wait("sendMessage", 1).await;
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Stalled: 1 autopilot board "), "{text}");
+    assert!(text.contains("\nfresh: 1 ready auto task,"), "{text}");
+}
+
 #[tokio::test]
 async fn the_digest_goes_out_once_a_day_at_the_set_time() {
     let (fake, api_base) = fake_api().await;
