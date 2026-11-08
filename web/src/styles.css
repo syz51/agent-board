@@ -197,7 +197,7 @@
   /* The type scale: 11 badge, 12 meta, 13 body, 14 lead, 16 heading, 24 page title, 28 task title. */
   --text-2xs: 11px;
   --text-2xs--line-height: 1.4;
-  --text-meta: 12px;
+  --text-meta: 12.5px;
   --text-meta--line-height: 1.45;
   --text-title: 16px;
   --text-title--line-height: 1.3;

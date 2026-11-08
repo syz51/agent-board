@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { QueryClient } from "@tanstack/react-query";
-import { screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
 import { renderInApp } from "../../test/render.tsx";
 import { queries } from "../live/query.ts";
-import { HomeScreen, inProgress } from "./boards.tsx";
+import { HOME_ROWS, HomeScreen, inProgress } from "./boards.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const state = new DevState(() => now);
@@ -47,15 +47,27 @@ describe("home", () => {
       .getAllByRole("heading", { level: 2 })
       .map((heading) => heading.textContent?.replace(/\d+$/, ""));
     expect(titles).toEqual(["Waiting on you", "In progress", "Boards", "Since you last looked"]);
+  });
+
+  test("shows the first tasks in progress, and all of them on Show all", async () => {
+    await renderInApp(<HomeScreen />, { seed });
     const progress = screen.getByRole("region", { name: /In progress/ });
-    for (const task of active()) {
-      expect(within(progress).getByText(task.title)).toBeTruthy();
-    }
+    const listed = inProgress(active(), new Set());
+    expect(listed.length).toBeGreaterThan(HOME_ROWS);
+    const visible = () => listed.filter((task) => within(progress).queryByText(task.title));
+    expect(visible()).toEqual(listed.slice(0, HOME_ROWS));
+    const more = within(progress).getByRole("button", { name: `Show all ${listed.length}` });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    await act(() => fireEvent.click(more));
+    expect(visible()).toEqual(listed);
+    expect(more.getAttribute("aria-expanded")).toBe("true");
+    expect(more.textContent).toBe("Show fewer");
   });
 
   test("splits tasks in progress into Doing and Review, each under its own heading", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const progress = screen.getByRole("region", { name: /In progress/ });
+    await act(() => fireEvent.click(within(progress).getByRole("button", { name: /^Show all/ })));
     const groups = within(progress)
       .getAllByRole("heading", { level: 3 })
       .map((heading) => heading.textContent);

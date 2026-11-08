@@ -56,6 +56,8 @@ export function HomeScreen() {
     [boards.data],
   );
   const now = useNow(60_000);
+  const progress = active.data && inProgress(active.data, closed);
+  const [allProgress, setAllProgress] = useState(false);
 
   return (
     <>
@@ -97,46 +99,33 @@ export function HomeScreen() {
               return (
                 <Section
                   title="In progress"
-                  count={active.data && inProgress(active.data, closed).length}
+                  count={progress?.length}
+                  aside={
+                    // In the header, where All asks sits above, so it costs no row of its own.
+                    progress &&
+                    progress.length > HOME_ROWS && (
+                      <button
+                        type="button"
+                        className="inline-flex min-h-7 cursor-pointer items-center gap-1 text-meta font-medium text-link hover:underline max-md:min-h-11"
+                        aria-expanded={allProgress}
+                        aria-controls={PROGRESS_LIST}
+                        onClick={() => setAllProgress(!allProgress)}
+                      >
+                        {allProgress ? "Show fewer" : `Show all ${progress.length}`}
+                      </button>
+                    )
+                  }
                   {...state}
                 >
                   <QueryFrame query={active} label="Loading tasks">
-                    {(list) => {
-                      const shown = inProgress(list, closed);
-                      if (shown.length === 0) {
-                        return (
-                          <p className="text-meta text-muted-foreground">No task is in progress.</p>
-                        );
-                      }
-                      // Doing and Review under their own headings, as on a board, so the
-                      // two read apart at a glance.
-                      const groups = (["doing", "review"] as const)
-                        .map((status) => ({
-                          status,
-                          tasks: shown.filter((task) => task.status === status),
-                        }))
-                        .filter((group) => group.tasks.length > 0);
-                      return (
-                        <TaskBoard>
-                          {groups.map((group) => (
-                            <TaskGroupSection
-                              key={group.status}
-                              id={`progress-${group.status}`}
-                              level={3}
-                              heading={
-                                <>
-                                  <StatusIcon status={group.status} />
-                                  {statusLabel(group.status)}
-                                </>
-                              }
-                              count={group.tasks.length}
-                            >
-                              <TaskList tasks={group.tasks} agents={agents} now={now} />
-                            </TaskGroupSection>
-                          ))}
-                        </TaskBoard>
-                      );
-                    }}
+                    {(list) => (
+                      <InProgress
+                        tasks={inProgress(list, closed)}
+                        all={allProgress}
+                        agents={agents}
+                        now={now}
+                      />
+                    )}
                   </QueryFrame>
                 </Section>
               );
@@ -174,6 +163,60 @@ export function HomeScreen() {
   );
 }
 
+/** How many rows Home's short lists show before "Show all", so Boards stays in reach. */
+export const HOME_ROWS = 4;
+const PROGRESS_LIST = "home-progress-list";
+
+/**
+ * Tasks in progress, under Doing and Review headings as on a board, so the two read apart at
+ * a glance. Home shows the first few; the headings count them all.
+ */
+function InProgress({
+  tasks,
+  all,
+  agents,
+  now,
+}: {
+  tasks: Task[];
+  all: boolean;
+  agents: Map<string, Agent>;
+  now: number;
+}) {
+  if (tasks.length === 0) {
+    return <p className="text-meta text-muted-foreground">No task is in progress.</p>;
+  }
+  const shown = all ? tasks : tasks.slice(0, HOME_ROWS);
+  const groups = (["doing", "review"] as const)
+    .map((status) => ({
+      status,
+      count: tasks.filter((task) => task.status === status).length,
+      tasks: shown.filter((task) => task.status === status),
+    }))
+    .filter((group) => group.count > 0);
+  return (
+    <div id={PROGRESS_LIST}>
+      <TaskBoard>
+        {groups.map((group) => (
+          <TaskGroupSection
+            key={group.status}
+            id={`progress-${group.status}`}
+            level={3}
+            heading={
+              <>
+                <StatusIcon status={group.status} />
+                {statusLabel(group.status)}
+              </>
+            }
+            count={group.count}
+          >
+            <TaskList tasks={group.tasks} agents={agents} now={now} />
+          </TaskGroupSection>
+        ))}
+      </TaskBoard>
+    </div>
+  );
+}
+
 /** The newest open asks, one line each; the Needs you page lists them all. */
 function WaitingAsks({ asks }: { asks: Ask[] }) {
   if (asks.length === 0) {
@@ -182,7 +225,7 @@ function WaitingAsks({ asks }: { asks: Ask[] }) {
   return (
     <ul className={listClass}>
       {newestFirst(asks)
-        .slice(0, 4)
+        .slice(0, HOME_ROWS)
         .map((ask) => (
           <li key={ask.id}>
             <Link

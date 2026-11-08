@@ -33,6 +33,9 @@ import { HandoffView } from "./agents.tsx";
 const asksRoute = getRouteApi("/asks");
 const askRoute = getRouteApi("/asks/$id");
 
+/** Whether the send shortcut is named ⌘ Enter, as on Apple keyboards, or Ctrl Enter. */
+const MAC = typeof navigator !== "undefined" && /Mac|iP(hone|ad)/.test(navigator.platform);
+
 const VIA: Record<string, string> = { web: "the web view", telegram: "Telegram", cli: "the CLI" };
 
 /** The open asks, shared by the queue and the navigation badge. */
@@ -362,7 +365,14 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                       value={field.state.value}
                       aria-invalid={missing ? true : undefined}
                       aria-describedby={missing ? `${id}-missing` : undefined}
+                      aria-keyshortcuts="Meta+Enter Control+Enter"
                       onChange={(event) => field.handleChange(event.currentTarget.value)}
+                      onKeyDown={(event) => {
+                        // Enter adds a line; with Cmd or Ctrl it sends, as in chat and mail.
+                        if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+                        event.preventDefault();
+                        event.currentTarget.form?.requestSubmit();
+                      }}
                     />
                   </div>
                 )}
@@ -373,17 +383,25 @@ export function AnswerForm({ ask }: { ask: Ask }) {
                 </p>
               )}
               {mutation.error && <ErrorNotice error={mutation.error} compact />}
-              {/* Send closes the whole answer group, so it plainly sends a choice or the text. */}
-              <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
-                {answer && !mutation.isPending && (
-                  <span className="mr-auto line-clamp-2 min-w-0 flex-1 text-meta [overflow-wrap:anywhere] text-muted-foreground">
-                    Sends “{answer}”
-                  </span>
-                )}
+              {/* Send closes the whole answer group, so it plainly sends a choice or the text.
+                  It sits at the left, under the field, where the eye ends after typing. */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
                 {/* The page's main action; a press with nothing chosen says what is missing. */}
                 <Button type="submit" disabled={mutation.isPending}>
                   {mutation.isPending ? "Sending…" : "Send answer"}
                 </Button>
+                {answer && !mutation.isPending ? (
+                  <span className="line-clamp-2 min-w-0 flex-1 text-meta [overflow-wrap:anywhere] text-muted-foreground">
+                    Sends “{answer}”
+                  </span>
+                ) : (
+                  <span
+                    className="text-meta text-muted-foreground max-md:hidden"
+                    aria-hidden="true"
+                  >
+                    or <kbd className="font-sans">{MAC ? "⌘" : "Ctrl"}&nbsp;Enter</kbd> in the field
+                  </span>
+                )}
               </div>
             </>
           );

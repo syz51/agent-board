@@ -49,21 +49,24 @@ describe("navigation", () => {
     },
   );
 
-  test("Needs you counts the open asks; Home names its unseen updates", async () => {
+  test("Needs you counts the open asks in amber; Home its unseen updates in neutral", async () => {
     await renderInApp(<Nav />, { seed });
     const open = state.asks(new URLSearchParams({ status: "open" })).length;
-    expect(screen.getByLabelText(`${open} waiting on you`).textContent).toBe(String(open));
+    const asks = screen.getByLabelText(`${open} waiting on you`);
+    expect(asks.textContent).toBe(String(open));
+    expect(asks.className).toMatch(/(^| )bg-amber( |$)/);
     const home = screen.getByRole("link", { name: /Home/ });
     expect(home.textContent).toMatch(/unseen updates?$/);
-    // The same count as the home page's "Since you last looked", saying what it counts.
+    // The same count as the home page's "Since you last looked".
     const unseen = state.updates(none);
     const total = unseen.done.length + unseen.said.length;
     expect(total).toBeGreaterThan(0);
     const count = home.querySelector("[title]");
     expect(count?.getAttribute("title")).toBe(`${total} new since you last looked`);
-    expect(count?.textContent).toBe(`${total} updates`);
-    // Plain text, unlike the asks' badge: nothing here waits on the user.
-    expect(count?.className).not.toMatch(/(^| )bg-/);
+    expect(count?.textContent).toBe(String(total));
+    // The same pill as the asks' count, but neutral: nothing here waits on the user.
+    expect(count?.className).toMatch(/(^| )bg-secondary( |$)/);
+    expect(count?.className).not.toMatch(/bg-amber/);
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
   });
 

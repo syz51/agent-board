@@ -1,5 +1,5 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useState } from "react";
 import type { ApiFailure } from "@/api/client.ts";
 import type { Agent, Priority, Task, TaskStatus } from "@/api/schema.ts";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
@@ -398,6 +398,32 @@ export function SectionTitle({
         </span>
       )}
     </h2>
+  );
+}
+
+/**
+ * A count in a pill, the one way the sidebar and the phone tab bar show a count: amber
+ * where the count waits on the user, neutral where it only informs.
+ */
+export function Count({
+  value,
+  act,
+  className,
+  ...props
+}: { value: number; act?: boolean } & Omit<ComponentProps<"span">, "children">) {
+  return (
+    <span
+      className={cn(
+        "inline-grid h-4.5 min-w-5 flex-none place-items-center rounded-full px-1.5 text-xs leading-none font-semibold tracking-normal tabular-nums",
+        act
+          ? "bg-amber text-card"
+          : "bg-secondary text-subtle-foreground ring-1 ring-input ring-inset",
+        className,
+      )}
+      {...props}
+    >
+      {value}
+    </span>
   );
 }
 

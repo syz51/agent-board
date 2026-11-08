@@ -13,10 +13,10 @@ inset panel, and lists that run edge to edge across it.
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows keep the name, slug and
-  badges on one line and the goal to one line. Agents are a three-column table: who, with
-  state and, on its own line, when last seen; what it is working on, with its handoff (at most 560px);
-  and where it runs, as label and value pairs.
-- **Type**: Inter at 13px body, 12px meta, 24px page titles and 28px task titles; prose
+  badges on one line and the goal to two lines. Agents are a two-column table: who, with
+  its state, when last seen and one quiet line of where it runs; then what it is working
+  on, with its handoff.
+- **Type**: Inter at 13px body, 12.5px meta, 24px page titles and 28px task titles; prose
   stops at a 100-character measure.
 - **Color and surfaces**: cool greys, a graphite primary action and one violet signal for
   links, selection and unseen marks. The panel's outline is the only elevation. Status
@@ -24,17 +24,19 @@ inset panel, and lists that run edge to edge across it.
   after a dot of each bar colour. Agent and board states are one style everywhere: a dot and
   a word, no pill.
 - **Navigation**: Home, Needs you and Agents; the sidebar on wide screens, a top bar and
-  bottom tabs on phones. Needs you counts the open asks; a quieter count on Home says how
-  many updates are unseen. On a board or a task the sidebar marks the board, not Home.
+  bottom tabs on phones. Every count there is one pill: amber where it waits on the user
+  (Needs you, a board's open asks), neutral where it only informs (Home's unseen updates).
+  On a board or a task the sidebar marks the board, not Home.
 - **Home**: what the user follows, in sections they collapse and reorder: waiting asks,
-  tasks in progress across boards (Doing and Review under their own headings), the boards,
+  tasks in progress across boards (Doing and Review under their own headings; the first four,
+  with Show all in the header), the boards,
   and what changed since they last looked. Finished tasks there are one-line rows whose
   summary opens on demand. Needs you holds only asks, the things that wait on the user.
   Board status groups collapse, with the chevron left of the label as on Home, and done
   starts collapsed. What a task waits for (blockers, a start date) is muted text with an
   icon; outlined chips are tags only. A board with nothing to filter has no filter bar.
-- **Asks**: a filled Send closes the answer group, under the options and the text field,
-  so it plainly sends either. A single ask is titled with its kind ("Decision · Ask #9"),
+- **Asks**: a filled Send closes the answer group at its left, under the options and the
+  text field, so it plainly sends either; Cmd or Ctrl with Enter sends from the field. A single ask is titled with its kind ("Decision · Ask #9"),
   across the content width with its prose at a reading measure, and its task and the asking
   agent's handoff in a column beside it, or below it on narrow screens.
 - **Failures**: while the connection banner shows, only the banner warns; a failed page is

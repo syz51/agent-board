@@ -7,7 +7,7 @@ import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
 import { useOpenAsks } from "@/screens/asks.tsx";
 import { unseenCount, useUpdates } from "@/screens/updates.tsx";
-import { Empty, useTitle } from "@/ui/common.tsx";
+import { Count, Empty, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 
 /**
@@ -99,6 +99,10 @@ const NAV: {
   },
 ];
 
+/** A count's place on a nav item: at the end on wide screens, over the icon on phones. */
+const NAV_COUNT =
+  "ml-auto max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:h-4 max-md:min-w-4 max-md:px-1 max-md:text-2xs";
+
 export function Nav() {
   const path = usePathname();
   const open = useOpenAsks().data?.length ?? 0;
@@ -121,27 +125,18 @@ export function Nav() {
           <Icon name={item.icon} />
           <span>{item.label}</span>
           {item.to === "/asks" && open > 0 && (
-            <span
-              className="ml-auto h-4.5 min-w-5 rounded-full bg-amber px-1.5 text-center text-xs leading-4.5 font-semibold tracking-normal text-card tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:text-2xs"
-              aria-label={`${open} waiting on you`}
-            >
-              {open}
-            </span>
+            <Count value={open} act className={NAV_COUNT} aria-label={`${open} waiting on you`} />
           )}
-          {/* Since you last looked is on the home page: its count says how much is new. Quieter
-              than the asks' count, as nothing here waits on the user. */}
+          {/* Since you last looked is on the home page: its count says how much is new, in
+              the neutral pill, as nothing here waits on the user. */}
           {item.to === "/" && unseen > 0 && (
             <>
-              <span
-                className="ml-auto text-xs font-medium tracking-normal text-muted-foreground tabular-nums max-md:absolute max-md:top-1 max-md:left-[calc(50%+6px)] max-md:m-0 max-md:h-4 max-md:min-w-4 max-md:rounded-full max-md:bg-secondary max-md:px-1 max-md:text-center max-md:text-2xs max-md:leading-4"
+              <Count
+                value={unseen}
+                className={NAV_COUNT}
                 aria-hidden="true"
                 title={`${unseen} new since you last looked`}
-              >
-                {unseen}
-                {/* Plain text, not a badge: badges are for what waits on the user. It says
-                    what it counts where there is room; phones keep a small grey count. */}
-                <span className="max-md:hidden"> {unseen === 1 ? "update" : "updates"}</span>
-              </span>
+              />
               <span className="sr-only">
                 , {unseen} unseen {unseen === 1 ? "update" : "updates"}
               </span>
@@ -188,14 +183,12 @@ function BoardLinks() {
                 </span>
                 <span className="min-w-0 flex-1 truncate">{board.title}</span>
                 {board.open_asks > 0 && (
-                  // The inbox icon marks the count as open asks, as the boards table does.
-                  <span className="inline-flex h-4.5 items-center gap-1 px-1 text-xs font-medium tracking-normal text-sidebar-foreground tabular-nums">
-                    <Icon name="inbox" className="size-3.5 text-muted-foreground" />
-                    {board.open_asks}
+                  <>
+                    <Count value={board.open_asks} act aria-hidden="true" />
                     <span className="sr-only">
-                      {board.open_asks === 1 ? " open ask" : " open asks"}
+                      , {board.open_asks} {board.open_asks === 1 ? "open ask" : "open asks"}
                     </span>
-                  </span>
+                  </>
                 )}
               </Link>
             </li>

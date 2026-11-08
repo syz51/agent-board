@@ -102,7 +102,6 @@ export function AgentsScreen() {
               >
                 <span>Agent</span>
                 <span>Working on</span>
-                <span>Details</span>
               </div>
               {shown.map((agent) => (
                 <AgentCard key={agent.id} agent={agent} task={current.get(agent.id)} />
@@ -116,35 +115,48 @@ export function AgentsScreen() {
 }
 
 /**
- * The agents list's columns from 820px of width: who, what it is working on, which takes the
- * spare width, and where it runs, at a fixed width so its pairs sit together.
+ * The agents list's columns from 820px of width: who and where it runs, then what it is
+ * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[200px_minmax(0,1fr)_260px]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[260px_minmax(0,1fr)]";
 
 /**
- * One agent per row: who and its state, then its task, handoff and, for a coordinator, its
- * turn endings, then where it runs as label and value pairs. Narrow lists stack the three.
+ * One agent per row: who, its state and where it runs, then its task, handoff and, for a
+ * coordinator, its turn endings. Narrow lists stack the two.
  */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
   return (
     <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
-        <Avatar handle={agent.handle} large className="row-span-2 size-7 self-start text-2xs" />
+        <Avatar handle={agent.handle} large className="row-span-3 size-7 self-start text-2xs" />
         <h2
           className="text-sm font-semibold [font-variant-numeric:tabular-nums_slashed-zero]"
           title={agent.id}
         >
           {agent.handle}
         </h2>
-        {/* When it was last seen sits under its state, on its own line in every row: the
-            two answer "is it alive?". */}
-        {/* On narrow lists the two share a line, so more agents fit on a screen. */}
-        <div className="grid justify-items-start gap-0.5 @max-[819px]:flex @max-[819px]:flex-wrap @max-[819px]:items-center @max-[819px]:gap-x-2.5">
+        {/* Its state and when it was last seen share a line: together they answer "is it
+            alive?". */}
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
           <AgentStateBadge agent={agent} />
           <span className="text-meta text-muted-foreground">
             seen <RelTime at={agent.last_seen} />
           </span>
         </div>
+        {/* Where it runs, as one quiet line under who it is. */}
+        <p
+          className="col-start-2 text-meta [overflow-wrap:anywhere] text-muted-foreground"
+          data-slot="where"
+        >
+          {[
+            agent.role === "coordinator" ? "Coordinator" : null,
+            `${agent.device} · ${agent.runtime}`,
+            agent.repo?.replace(/^github\.com\//, ""),
+            agent.branch,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </p>
       </header>
       <div className="grid min-w-0 content-start gap-2">
         <p className="font-medium">
@@ -167,50 +179,6 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
         {agent.state !== "ended" && <HandoffView agentId={agent.id} />}
         {agent.role === "coordinator" && <SaidView agentId={agent.id} />}
       </div>
-      {/* Narrow lists say where it runs in one line; wide ones as label and value pairs. */}
-      <p
-        className="text-meta [overflow-wrap:anywhere] text-muted-foreground @min-[820px]:hidden"
-        data-slot="where"
-      >
-        {[
-          agent.role === "coordinator" ? "Coordinator" : null,
-          `${agent.device} · ${agent.runtime}`,
-          agent.repo?.replace(/^github\.com\//, ""),
-          agent.branch,
-        ]
-          .filter(Boolean)
-          .join(" · ")}
-      </p>
-      <dl className="m-0 grid content-start gap-0.5 text-meta leading-5 @max-[819px]:hidden [&_code]:text-xs [&_dd]:m-0 [&_dd]:min-w-0 [&_dd]:text-subtle-foreground [&_dt]:text-muted-foreground [&>div]:grid [&>div]:grid-cols-[72px_minmax(0,1fr)] [&>div]:gap-2">
-        {agent.role === "coordinator" && (
-          <div>
-            <dt>Role</dt>
-            <dd>Coordinator</dd>
-          </div>
-        )}
-        <div>
-          <dt>Device</dt>
-          <dd>
-            {agent.device} · {agent.runtime}
-          </dd>
-        </div>
-        {agent.repo && (
-          <div>
-            <dt>Repo</dt>
-            <dd className="[overflow-wrap:anywhere]">
-              <code>{agent.repo.replace(/^github\.com\//, "")}</code>
-            </dd>
-          </div>
-        )}
-        {agent.branch && (
-          <div>
-            <dt>Branch</dt>
-            <dd className="[overflow-wrap:anywhere]">
-              <code>{agent.branch}</code>
-            </dd>
-          </div>
-        )}
-      </dl>
     </article>
   );
 }

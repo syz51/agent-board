@@ -43,13 +43,13 @@ function seed(client: QueryClient) {
 }
 
 describe("the agents list", () => {
-  test("says where each agent runs twice: one line for narrow lists, pairs for wide ones", async () => {
+  test("says where each agent runs in one line under its name, with no details column", async () => {
     await renderRoute("/agents", { seed });
     const coordinator = agents.find((agent) => agent.role === "coordinator" && agent.repo)!;
     const row = await waitFor(() =>
       screen.getByRole("heading", { level: 2, name: coordinator.handle }).closest("article")!,
     );
-    const line = row.querySelector("[data-slot=where]");
+    const line = row.querySelector("header [data-slot=where]");
     expect(line?.textContent).toBe(
       [
         "Coordinator",
@@ -58,11 +58,8 @@ describe("the agents list", () => {
         ...(coordinator.branch ? [coordinator.branch] : []),
       ].join(" · "),
     );
-    // Each form shows at one width only.
-    expect(line?.className).toContain("@min-[820px]:hidden");
-    // The handoff is a list of pairs too; the details are the one that names the role.
-    const pairs = within(row).getByText("Role").closest("dl");
-    expect(pairs?.className).toContain("@max-[819px]:hidden");
+    expect(within(row).queryByText("Role")).toBeNull();
+    expect(screen.queryByText("Details")).toBeNull();
   });
 
   test("tags in a handoff show as inert code", async () => {

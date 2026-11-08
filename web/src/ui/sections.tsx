@@ -134,7 +134,7 @@ export function Section({
     <section
       aria-labelledby={titleId}
       className={cn(
-        "group/section rounded-lg not-last:mb-7",
+        "group/section rounded-lg not-last:mb-6",
         place?.dropTarget && "outline-2 outline-offset-4 outline-ring/60",
       )}
       {...drop}
