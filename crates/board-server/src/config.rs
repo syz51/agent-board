@@ -59,6 +59,10 @@ pub struct ServerConfig {
     /// by the binary that runs the server, never read from the file.
     #[serde(skip, default = "unknown_commit")]
     pub commit: String,
+    /// The build's order stamp (seconds since the Unix epoch, or `unknown`), which every
+    /// answer reports. Set by the binary that runs the server, never read from the file.
+    #[serde(skip, default = "unknown_commit")]
+    pub built: String,
 }
 
 fn default_listen() -> SocketAddr {
@@ -85,6 +89,7 @@ impl ServerConfig {
             telegram: None,
             defaults: Settings::default(),
             commit: unknown_commit(),
+            built: unknown_commit(),
         }
     }
 

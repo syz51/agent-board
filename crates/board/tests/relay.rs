@@ -256,7 +256,9 @@ async fn the_relay_forwards_only_hook_requests_for_the_named_agent() {
     }
     assert!(e.stub.requests().is_empty(), "nothing reached the server");
 
-    // What the caller sends besides its agent and body stays behind.
+    // What the caller sends besides its agent and body stays behind; the server's build
+    // headers come back.
+    e.stub.build_stamped("0.0.1", "0123456789ab", Some("123"));
     let resp = http
         .get(url("/v1/snapshot?kind=alerts"))
         .header("x-board-agent", AGENT)
@@ -266,6 +268,16 @@ async fn the_relay_forwards_only_hook_requests_for_the_named_agent() {
         .await
         .unwrap();
     assert!(resp.status().is_success());
+    let headers = resp.headers();
+    assert_eq!(
+        [
+            board_proto::VERSION_HEADER,
+            board_proto::COMMIT_HEADER,
+            board_proto::BUILT_HEADER,
+        ]
+        .map(|name| headers[name].to_str().unwrap()),
+        ["0.0.1", "0123456789ab", "123"]
+    );
     let sent = &e.stub.requests()[0];
     assert_eq!(sent.agent.as_deref(), Some(AGENT));
     assert_eq!(

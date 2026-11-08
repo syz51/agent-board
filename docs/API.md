@@ -105,6 +105,15 @@ server's minute sweep deletes older ones.
   result, the daemon in its log. Hooks stay silent, and header values that are not plain
   tokens are ignored. `board --version` prints `board <version> (<commit>)`; the commit is
   `BOARD_COMMIT` when set at build time, else the checkout's `HEAD`.
+- Every answer also carries `X-Board-Built`, the build's order stamp: its commit's committer
+  time in seconds since the Unix epoch (`BOARD_BUILT` when set at build time, else from
+  git), or `unknown`. A newer build has a higher stamp, so the warning names the older side.
+  A server that sends no stamp predates it and counts as older. When the server is older,
+  the warning says to upgrade it (docs/DEPLOY.md). When the client is older, it says that
+  calls still work and what picks up the new build. An MCP server or daemon reads the commit
+  of the board installed at its own path: the same as the server's means a restart of the
+  session (or `board watch`) does; its own means the device upgrade does. A stamp of
+  `unknown` on either side, or equal stamps, give the warning without an order.
 
 ### Agents
 
