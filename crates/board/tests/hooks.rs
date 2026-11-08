@@ -1577,17 +1577,38 @@ fn breaker(e: &Env) -> Value {
 
 /// Runs a hook and returns its reply and how long it took.
 fn timed(e: &Env, event: &str, payload: &Value) -> (Option<Value>, Duration) {
+    timed_env(e, event, payload, &[])
+}
+
+fn timed_env(
+    e: &Env,
+    event: &str,
+    payload: &Value,
+    env: &[(&str, &str)],
+) -> (Option<Value>, Duration) {
     let began = Instant::now();
-    let (reply, _) = e.hook(event, "claude", payload.clone());
+    let (reply, _) = e.hook_env(event, "claude", payload.clone(), env);
     (reply, began.elapsed())
 }
 
+/// Debug builds of the hook give the server exactly this share of the budget, however long
+/// the local steps take, so a test of the breaker does not depend on the runner's speed.
+const SHARE_ENV: &str = "BOARD_HOOK_SERVER_SHARE_MS";
+/// A fair share: enough to judge the server.
+const FAIR_SHARE: [(&str, &str); 1] = [(SHARE_ENV, "1000")];
+/// What a hook whose local steps took most of the budget leaves the server: too little to
+/// judge it.
+const SHORT_SHARE: [(&str, &str); 1] = [(SHARE_ENV, "300")];
+
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore the server share override"
+)]
 fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     let (e, start) = cached_env();
     e.stub.hang(Duration::from_secs(10));
-    let (reply, elapsed) = timed(&e, "session-start", &start);
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let (reply, _) = timed_env(&e, "session-start", &start, &FAIR_SHARE);
     let text = context(&reply, "SessionStart");
     assert!(
         text.starts_with(
@@ -1607,16 +1628,16 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     );
 
     // The next hook tries the server again at once.
-    let (reply, elapsed) = timed(&e, "session-start", &start);
+    let (reply, elapsed) = timed_env(&e, "session-start", &start, &FAIR_SHARE);
     assert!(
-        elapsed >= Duration::from_millis(900),
+        elapsed >= Duration::from_millis(1000),
         "skipped the server: {elapsed:?}"
     );
     assert!(context(&reply, "SessionStart").starts_with("board server slow"));
     assert_eq!(breaker(&e), json!({"strikes": 2}));
 
     // Three slow replies in a row: hooks skip the server for a few seconds, still "slow".
-    timed(&e, "session-start", &start);
+    timed_env(&e, "session-start", &start, &FAIR_SHARE);
     let open = breaker(&e);
     assert_eq!(open["slow"], true, "{open}");
     let until: chrono::DateTime<chrono::Utc> =
@@ -1626,12 +1647,10 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
         left > chrono::Duration::zero() && left <= chrono::Duration::seconds(10),
         "{open}"
     );
-    let (reply, elapsed) = timed(&e, "session-start", &start);
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "waited again: {elapsed:?}"
-    );
+    e.stub.clear();
+    let (reply, _) = timed_env(&e, "session-start", &start, &FAIR_SHARE);
     assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
 
     // Once it has passed and the server answers in time, the breaker closes.
     std::fs::write(
@@ -1640,55 +1659,34 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     )
     .unwrap();
     e.stub.hang(Duration::ZERO);
-    let (reply, _) = timed(&e, "session-start", &start);
+    let (reply, _) = timed_env(&e, "session-start", &start, &FAIR_SHARE);
     assert_eq!(context(&reply, "SessionStart"), started());
     assert_eq!(breaker(&e), json!({}));
 }
 
-/// A `PATH` whose `git` takes most of the hook's budget to name the remote, as on a busy
-/// Mac, so the server's share of the budget is too little to judge it.
-#[cfg(unix)]
-fn slow_git_path(e: &Env) -> String {
-    use std::os::unix::fs::PermissionsExt as _;
-    let real = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .map(|dir| std::path::Path::new(dir).join("git"))
-        .find(|git| git.is_file())
-        .expect("git on PATH");
-    let bin = e.home.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let git = bin.join("git");
-    std::fs::write(
-        &git,
-        format!(
-            "#!/bin/sh\ncase \"$3\" in remote) sleep 0.9;; esac\nexec '{}' \"$@\"\n",
-            real.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-    format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
-#[cfg(unix)]
+/// A hook that answers within its budget when it gives the server all of it.
 #[test]
-fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
+fn a_slow_server_costs_a_hook_no_more_than_its_budget() {
     let (e, start) = cached_env();
-    let path = slow_git_path(&e);
     e.stub.hang(Duration::from_secs(10));
-    let began = Instant::now();
-    let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
-    let elapsed = began.elapsed();
+    let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     // On a very slow runner the hook's own guard may answer first, with nothing.
     if reply.is_some() {
         assert!(context(&reply, "SessionStart").starts_with("board server slow"));
     }
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore the server share override"
+)]
+fn a_slow_reply_with_too_little_server_share_counts_no_strike() {
+    let (e, start) = cached_env();
+    e.stub.hang(Duration::from_secs(10));
+    let (reply, _) = timed_env(&e, "session-start", &start, &SHORT_SHARE);
+    assert!(context(&reply, "SessionStart").starts_with("board server slow"));
     assert_eq!(
         breaker(&e),
         Value::Null,
@@ -1709,17 +1707,15 @@ fn refuse_connects(e: &Env) {
 }
 
 /// A refused connection is unreachable however little time the local steps left.
-#[cfg(unix)]
 #[test]
-fn a_refused_connect_after_slow_local_steps_still_backs_off() {
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore the server share override"
+)]
+fn a_refused_connect_with_too_little_server_share_still_backs_off() {
     let (e, start) = cached_env();
     refuse_connects(&e);
-    let path = slow_git_path(&e);
-    let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
-    // On a very slow runner the hook's own guard may answer first, with nothing.
-    if reply.is_none() {
-        return;
-    }
+    let (reply, _) = timed_env(&e, "session-start", &start, &SHORT_SHARE);
     let text = context(&reply, "SessionStart");
     assert!(text.starts_with("board server unreachable"), "{text}");
     let open = breaker(&e);
@@ -1780,57 +1776,31 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
     assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
 }
 
-/// Points the hook at TEST-NET-1 (RFC 5737): packets to it are dropped, so the connect
-/// hangs, as to a tailnet peer that is asleep; where a network refuses it at once, it is
-/// unreachable all the same.
-fn hang_connects(e: &Env) {
+/// Points the hook at a local port that takes connections but never answers TLS, so its
+/// connection (TLS included) never opens, as to a tailnet peer that is asleep. The listener
+/// must live for the test.
+fn hang_connects(e: &Env) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     std::fs::write(
         e.home.join("config.toml"),
-        format!("server = \"http://192.0.2.1:9\"\ndevice = \"{DEVICE}\"\n"),
+        format!(
+            "server = \"https://{}\"\ndevice = \"{DEVICE}\"\n",
+            listener.local_addr().unwrap()
+        ),
     )
     .unwrap();
-}
-
-/// Whether connects to TEST-NET-1 hang here, as [`hang_connects`] needs; some networks
-/// (offline, no default route) refuse them at once.
-fn connects_hang() -> bool {
-    let addr = "192.0.2.1:9".parse().unwrap();
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
-        .is_err_and(|err| err.kind() == std::io::ErrorKind::TimedOut)
-}
-
-/// Runs a `SessionStart` hook with its debug log and returns its reply, its time, and
-/// whether it gave the server a fair share of its budget. A hook stopped by its own guard
-/// before setting the share gave none.
-fn session_start_judged(
-    e: &Env,
-    start: &Value,
-    env: &[(&str, &str)],
-) -> (Option<Value>, Duration, bool) {
-    let env = [env, &[("BOARD_LOG", "board::hook=debug")]].concat();
-    let began = Instant::now();
-    let out = e.hook_output("session-start", "claude", start.clone(), &env);
-    let elapsed = began.elapsed();
-    let log = stderr(&out);
-    let fair = log.contains(": server share ") && !log.contains(", too little to judge");
-    (serde_json::from_str(&stdout(&out)).ok(), elapsed, fair)
+    listener
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore the server share override"
+)]
 fn a_connect_that_hangs_counts_as_unreachable() {
     let (e, start) = cached_env();
-    hang_connects(&e);
-    // On a loaded machine the hook's local steps may leave the server too little time to
-    // judge a connect that hangs (the next test); then the hook is tried again. A connect
-    // refused at once is unreachable whatever the share.
-    let hang = connects_hang();
-    let (reply, elapsed) = (0..5)
-        .find_map(|_| {
-            let (reply, elapsed, fair) = session_start_judged(&e, &start, &[]);
-            (fair || !hang).then_some((reply, elapsed))
-        })
-        .expect("every try had too little time to judge the server");
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let _listener = hang_connects(&e);
+    let (reply, _) = timed_env(&e, "session-start", &start, &FAIR_SHARE);
     let text = context(&reply, "SessionStart");
     assert!(text.starts_with("board server unreachable"), "{text}");
     let open = breaker(&e);
@@ -1846,24 +1816,17 @@ fn a_connect_that_hangs_counts_as_unreachable() {
 /// A connect that hangs while the hook's local steps took most of the budget had too little
 /// time to fail on its own deadline: it ends with the request, as slow, and the breaker stays
 /// as it was. The connect's deadline never races the request's, so the outcome is fixed.
-#[cfg(unix)]
 #[test]
-fn a_connect_that_hangs_after_slow_local_steps_reads_as_slow() {
-    if !connects_hang() {
-        eprintln!("skipped: this network refuses connects to TEST-NET-1 at once");
-        return;
-    }
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore the server share override"
+)]
+fn a_connect_that_hangs_with_too_little_server_share_reads_as_slow() {
     let (e, start) = cached_env();
-    hang_connects(&e);
-    let path = slow_git_path(&e);
-    let (reply, elapsed, fair) = session_start_judged(&e, &start, &[("PATH", &path)]);
-    assert!(!fair, "the slow git leaves the server too little time");
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
-    // On a very slow runner the hook's own guard may answer first, with nothing.
-    if reply.is_some() {
-        let text = context(&reply, "SessionStart");
-        assert!(text.starts_with("board server slow"), "{text}");
-    }
+    let _listener = hang_connects(&e);
+    let (reply, _) = timed_env(&e, "session-start", &start, &SHORT_SHARE);
+    let text = context(&reply, "SessionStart");
+    assert!(text.starts_with("board server slow"), "{text}");
     assert_eq!(
         breaker(&e),
         Value::Null,
