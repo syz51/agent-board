@@ -14,7 +14,7 @@ says how many tasks you and your children may have in progress at once (the boar
    again for your own pending proposals whose reviewer child is gone (see Proposals). For
    each task in `review` whose PR has merged and whose child has ended (it no longer shows
    among the peers as running or idle), hand it to yourself (`task_update owner=<your
-   id>`) and finish it (steps 5 and 6); a live child finishes its own.
+   id>`) and finish it (steps 5 and 6).
 2. Count the tasks in progress: those you and your children own in `doing`, plus each task
    you dispatched whose child has not claimed it yet. The limit is the one your snapshot's
    `you:` line shows; when it shows none, the limit is 1. While the count is under the
@@ -49,21 +49,25 @@ says how many tasks you and your children may have in progress at once (the boar
    one. Name the task ids in each brief, and
    tell each child to `task_claim` its task, lease the paths it will change
    (`lease_paths`) before editing and stop and report if the lease overlaps another task
-   in progress, follow the repository's merge rules, park the task in `review` while CI
-   runs, keep its handoff current, file work it finds
+   in progress, keep its handoff current, file work it finds
    but won't do as a proposal instead of only mentioning it (`task_add` with `auto=false`, a
    body starting `Proposal:` with the problem, evidence, change and size, a `priority` by
-   the scale in Priority below, and parent its task), and finish with `task_done`, evidence and a `summary`, naming in its report the
-   tasks it filed. Add
-   sub-tasks with `task_add` (parent set) when you split work. Only a task's owner can call
-   `task_done`, so hand a task to the child that will do it: leave it unclaimed or release
+   the scale in Priority below, and parent its task), open its PR, turn on auto-merge where
+   the repository's merge rules allow it, park the task in `review` with a `task_note`
+   naming the PR, and end with a report of its evidence that names the tasks it filed.
+   Never tell a child to wait for CI or merge after it: T3 gives children no way to wait.
+   Add sub-tasks with `task_add` (parent set) when you split work. A child can park a task
+   only while it owns it, so hand a task to the child that will do it: leave it unclaimed or release
    it before dispatching so the child claims it, or, if you must hold it meanwhile, hand it
    over with `task_update owner=<child id>` as soon as the child shows among the peers.
    When a child ends with a task still its own, hand it back to yourself the same way and
    finish it.
 5. When a child reports, review its task's result against every acceptance check. Run the
    checks yourself; do not take a child's word for them. When one fails, reopen the task
-   and brief a child again with what failed. Read the tasks filed under this one (named in the children's
+   and brief a child again with what failed. The merge is yours, not the child's: when the
+   child turned on auto-merge, GitHub merges the PR once its checks pass; otherwise call T3
+   `watch_pull_request` on the PR, and once its checks pass merge it by the repository's
+   rules or brief a new child to. Step 1 finishes the task after the merge. Read the tasks filed under this one (named in the children's
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
    give each proposal among them a verdict, and set priority (see Priority) and blockers on
    the rest.

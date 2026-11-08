@@ -3011,7 +3011,7 @@ fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
     let prompt = words(&board::daemon::coordinator_message(&factory(), false));
     for rule in [
         "with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
-        "finish with `task_done`, evidence and a `summary`",
+        "end with a report of its evidence that names the tasks it filed",
         "The user does not read this chat as it happens",
         "end every turn with a short status",
         "put a question or an offer to the user in `ask_user`, never only in chat",
@@ -3149,6 +3149,23 @@ fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_the
     ] {
         assert!(prompt.contains(rule), "missing {rule:?}");
     }
+}
+
+#[test]
+fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "open its PR, turn on auto-merge where the repository's merge rules allow it, park the task in `review` with a `task_note` naming the PR, and end",
+        "Never tell a child to wait for CI or merge after it",
+        "The merge is yours, not the child's",
+        "call T3 `watch_pull_request` on the PR, and once its checks pass merge it by the repository's rules or brief a new child to",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+    // Children cannot wait for CI, so the brief no longer asks them to.
+    assert!(!prompt.contains("while CI runs"));
+    assert!(!prompt.contains("a live child finishes its own"));
 }
 
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose

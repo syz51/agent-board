@@ -361,8 +361,11 @@ settings in use, warned once per edit.
   delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
   work is in another repository, a T3 thread launched in that repository's project, since
   `delegate_task` runs only in the coordinator's own project), naming the task
-  id in the brief so the child claims it and owns it through PR, merge and `task_done`;
-  review the result against the acceptance checks when the child reports; repeat. The
+  id in the brief so the child claims it, opens its PR, turns on auto-merge where the
+  repository allows it, parks the task in `review` and ends, since a child cannot wait for
+  CI; review the result against the acceptance checks when the child reports; merge the PR
+  once its checks pass when auto-merge is off (T3 `watch_pull_request`), and finish the
+  task after the merge; repeat. The
   coordinator does a task itself only when it changes no repository files (a verdict, an
   investigation, an ask) or a child failed it twice, so its context stays small and it
   keeps answering alerts and proposals while children work. When it needs the user it
