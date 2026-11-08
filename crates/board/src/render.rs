@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use board_proto::{
     Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Handoff, Lease, LeaseResult, Note,
-    NoteKind, Stats, Task, TaskDetail, TaskStatus, Timestamp, TouchResult,
+    NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -566,12 +566,42 @@ pub fn lease_line(lease: &Lease) -> String {
     )
 }
 
-pub fn lease_result(result: &LeaseResult) -> String {
+/// What a lease warning says about the overlapping leases' holders, looked up best effort:
+/// a task or agent missing here prints without its status, or by its full id.
+#[derive(Debug, Default)]
+pub struct LeaseHolders {
+    /// The current status of each overlapping lease's task, by task id.
+    pub statuses: BTreeMap<TaskId, TaskStatus>,
+    /// The short handle of each overlapping lease's agent, by agent id.
+    pub handles: BTreeMap<String, String>,
+}
+
+/// An overlapping lease, with its task and that task's status, so a peer can tell a lease
+/// of work in review (which keeps its leases) from a stale one.
+fn overlap_line(lease: &Lease, holders: &LeaseHolders) -> String {
+    let task = match &lease.task {
+        Some(task) => match holders.statuses.get(task) {
+            Some(status) => format!("{task} ({})", enum_str(status)),
+            None => task.to_string(),
+        },
+        None => "no task".into(),
+    };
+    format!(
+        "lease #{} {} {} for {task} by {} expires {}",
+        lease.id,
+        lease.repo,
+        title(&lease.glob),
+        short(&holders.handles, lease.agent.as_str()),
+        ago(lease.expires_at)
+    )
+}
+
+pub fn lease_result(result: &LeaseResult, holders: &LeaseHolders) -> String {
     let mut lines: Vec<String> = result.leases.iter().map(lease_line).collect();
     for conflict in &result.conflicts {
         lines.push(format!(
             "! overlaps {} -> coordinate before editing",
-            lease_line(conflict)
+            overlap_line(conflict, holders)
         ));
     }
     if lines.is_empty() {
