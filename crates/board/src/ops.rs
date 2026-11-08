@@ -414,10 +414,20 @@ pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output>
         "release" => "released",
         _ => "took",
     };
-    Ok(Output::new(
-        format!("{verb} {}", render::task_line(&task)),
-        &task,
-    ))
+    let mut text = format!("{verb} {}", render::task_line(&task));
+    if action != "release" {
+        // The task is the agent's now either way, so a failed read only loses the count.
+        let notes = match ctx.client.task(id).await {
+            Ok(detail) => render::claim_notes(&detail),
+            Err(err) => {
+                tracing::warn!("reading {id}'s notes after the {action}: {err:#}");
+                format!("task_show {id} and read every note before starting")
+            }
+        };
+        text.push('\n');
+        text.push_str(&notes);
+    }
+    Ok(Output::new(text, &task))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -519,14 +529,14 @@ pub async fn task_done(
             "done needs evidence: a check with its exit code (--check <cmd> --exit <code>), a commit, a PR or an artifact"
         );
     }
-    let version = ctx.client.task(id).await?.task.version;
+    let detail = ctx.client.task(id).await?;
     let task = ctx
         .client
         .done(
             id,
             &DoneTask {
                 agent: ctx.agent()?.clone(),
-                version,
+                version: detail.task.version,
                 evidence,
                 summary,
             },
@@ -539,10 +549,13 @@ pub async fn task_done(
     {
         tracing::warn!("recording {} done for the Stop hook: {err:#}", task.id);
     }
-    Ok(Output::new(
-        format!("done {}", render::task_line(&task)),
-        &task,
-    ))
+    let mut text = format!("done {}", render::task_line(&task));
+    let findings = render::done_findings(&detail, ctx.agent()?.as_str());
+    if !findings.is_empty() {
+        text.push('\n');
+        text.push_str(&findings);
+    }
+    Ok(Output::new(text, &task))
 }
 
 pub async fn task_note(ctx: &Ctx, id: &TaskId, kind: NoteKind, text: String) -> Result<Output> {

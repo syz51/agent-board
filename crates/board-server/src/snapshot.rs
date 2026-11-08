@@ -1039,7 +1039,15 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     continue;
                 }
                 let what = match event.event_type {
-                    EventType::NoteAdded => vec!["note".to_owned()],
+                    // The note's kind (note, finding or decision), set by the server.
+                    EventType::NoteAdded => vec![
+                        event
+                            .payload
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("note")
+                            .to_owned(),
+                    ],
                     EventType::TaskReleased => vec!["owner".to_owned()],
                     _ => str_list(&event.payload, "fields"),
                 };
@@ -1182,12 +1190,21 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         }
     }
     for ((task, actor), (seq, what)) in changed {
+        let noted = what
+            .iter()
+            .any(|w| matches!(w.as_str(), "note" | "finding" | "decision"));
         let what: Vec<String> = what.into_iter().collect();
         out.insert(
             (CHANGED, format!("{task}|{actor}")),
             Alert {
                 alert: format!("{actor} changed your task {task} ({})", what.join(", ")),
-                action: format!("task_show {task}"),
+                action: if noted {
+                    format!(
+                        "task_show {task} and read the new notes; address each finding before task_done"
+                    )
+                } else {
+                    format!("task_show {task}")
+                },
                 rank: (CHANGED, seq),
             },
         );

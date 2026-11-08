@@ -909,3 +909,55 @@ async fn snapshots_list_pending_proposals_apart_from_ready_work() {
         "{yaml}"
     );
 }
+
+#[tokio::test]
+async fn a_note_by_another_agent_on_my_doing_or_review_task_reaches_my_alerts() {
+    let t = T::new();
+    t.register(ME, None, None).await;
+    t.register(B, None, None).await;
+    t.board("factory", &[]).await;
+    let id = t.task(ME, "factory", "Ship it").await;
+    assert!(t.claim(ME, &id).await.0.is_success());
+    // Read up to now, so only what follows alerts.
+    snapshot(&t, ME, "kind=alerts").await;
+
+    let note = |kind: &'static str| json!({ "agent": B, "kind": kind, "text": format!("{kind}: the parser drops tabs") });
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(B),
+        Some(note("finding")),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("changed your task {id} (finding)")),
+        "{alerts}"
+    );
+    assert!(
+        alerts.contains(&format!(
+            "task_show {id} and read the new notes; address each finding before task_done"
+        )),
+        "{alerts}"
+    );
+    // The author is not alerted about its own note.
+    let own = text(&snapshot(&t, B, "kind=alerts").await).to_owned();
+    assert!(!own.contains("changed your task"), "{own}");
+
+    // In review, too.
+    let (s, v) = t.patch(ME, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    snapshot(&t, ME, "kind=alerts").await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{id}/notes"),
+        Some(B),
+        Some(note("decision")),
+    )
+    .await;
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!("changed your task {id} (decision)")),
+        "{alerts}"
+    );
+}

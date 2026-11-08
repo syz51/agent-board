@@ -13,8 +13,13 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    (below) when it is due. If it filed nothing ready, set your handoff, keeping the last task
    you finished in it, and stop: the board wakes you when work becomes ready, one of your
    asks is answered, or an ask is answered whose asker it cannot wake.
-3. `task_claim` it, then `task_show` it and read its body and acceptance checks.
-4. Do it yourself, or delegate parts to child threads. Name the task ids in each brief, and
+3. `task_claim` it, then `task_show` it and read its body, its acceptance checks and every
+   note on it. The claim says how many notes it has; `task_show` shows every finding and
+   decision, and the latest plain notes (pass `detailed` for the rest). A finding is part
+   of the work: address each one.
+4. Do it yourself, or delegate parts to child threads. Put each finding and decision noted on
+   the task into the brief, in your words, so the child does not miss one. Name the task ids
+   in each brief, and
    tell each child to `task_claim` its task, keep its handoff current, file work it finds
    but won't do as a proposal instead of only mentioning it (`task_add` with `auto=false`, a
    body starting `Proposal:` with the problem, evidence, change and size, a `priority` by
@@ -31,8 +36,11 @@ one task at a time, as a person would. The board tools are your MCP `board_*`, `
    reports and in `filed` alerts; `children` in `task_show` of this task and its sub-tasks):
    give each proposal among them a verdict, and set priority (see Priority) and blockers on
    the rest.
-6. File what the task still needs as sub-tasks first (`task_add`, parent set). Call
-   `task_done` only when every acceptance check passes, with evidence (each check with its
+6. File what the task still needs as sub-tasks first (`task_add`, parent set). Address each
+   finding noted on the task: say in the evidence or a `task_note` that it is covered, done,
+   or declined and why. A note another agent adds while you work raises an alert; read it
+   then. `task_done` lists the findings noted since your claim, so you can confirm each.
+   Call `task_done` only when every acceptance check passes, with evidence (each check with its
    exit code, the commit, the PR) and a `summary` for the user: what changed and what they
    should know or decide, with links, in plain words.
 7. Set your handoff (`now`, `next`, `blockers`) and go back to step 1.

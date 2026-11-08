@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, Ask, Board, Event, Handoff, Lease, LeaseResult, Note, Stats, Task, TaskDetail,
-    TaskStatus, Timestamp, TouchResult,
+    Agent, Ask, Board, Event, EventType, Handoff, Lease, LeaseResult, Note, NoteKind, Stats, Task,
+    TaskDetail, TaskStatus, Timestamp, TouchResult,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -212,12 +212,28 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
             ago(ev.at)
         );
     }
-    let notes: &[Note] = if detailed {
-        &detail.notes
+    // Every finding and decision, so the agent doing the task misses none; plain notes
+    // only the latest few unless detailed.
+    let plain = detail
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Note)
+        .count();
+    let cut = if detailed {
+        0
     } else {
-        let n = detail.notes.len();
-        &detail.notes[n.saturating_sub(5)..]
+        plain.saturating_sub(PLAIN_NOTES)
     };
+    let mut skipped = 0;
+    let notes: Vec<&Note> = detail
+        .notes
+        .iter()
+        .filter(|n| {
+            let skip = n.kind == NoteKind::Note && skipped < cut;
+            skipped += usize::from(skip);
+            !skip
+        })
+        .collect();
     if detailed {
         for event in &detail.history {
             let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
@@ -260,14 +276,88 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
         out.push('\n');
         out.push_str(&block);
     }
-    if !detailed && detail.notes.len() > notes.len() {
+    if cut > 0 {
         let _ = write!(
             out,
-            "\n({} older notes; pass detailed for all and the history)",
-            detail.notes.len() - notes.len()
+            "\n({cut} older plain {}; every finding and decision is shown; pass detailed for \
+             all and the history)",
+            if cut == 1 { "note" } else { "notes" },
         );
     }
     out
+}
+
+/// Plain notes `task_show` shows without detailed: the latest few.
+const PLAIN_NOTES: usize = 5;
+
+/// What a claim adds below the task line: how many notes the task has, and to read them.
+pub fn claim_notes(detail: &TaskDetail) -> String {
+    let id = &detail.task.id;
+    if detail.notes.is_empty() {
+        return format!("no notes on {id}; task_show {id} for its body and acceptance checks");
+    }
+    let count = |kind| detail.notes.iter().filter(|n| n.kind == kind).count();
+    let (findings, decisions) = (count(NoteKind::Finding), count(NoteKind::Decision));
+    let n = detail.notes.len();
+    format!(
+        "{n} {} on {id} ({findings} {}, {decisions} {}): task_show {id} and read every one \
+         before starting; pass each finding and decision into a delegate's brief",
+        if n == 1 { "note" } else { "notes" },
+        if findings == 1 { "finding" } else { "findings" },
+        if decisions == 1 {
+            "decision"
+        } else {
+            "decisions"
+        },
+    )
+}
+
+/// What `task_done` adds below the task line: the finding notes added since `agent`'s
+/// latest claim of the task (every finding when the claim is not in the history), so the
+/// agent can confirm each is addressed. Empty when there are none.
+pub fn done_findings(detail: &TaskDetail, agent: &str) -> String {
+    let handles = &detail.handles;
+    let claimed = detail
+        .history
+        .iter()
+        .rev()
+        .find(|e| match e.event_type {
+            EventType::TaskClaimed | EventType::TaskTaken => e.actor.as_str() == agent,
+            // Handed over by an update.
+            EventType::TaskUpdated => e.payload.get("owner").and_then(Value::as_str) == Some(agent),
+            _ => false,
+        })
+        .map(|e| e.at);
+    let findings: Vec<Value> = detail
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Finding && claimed.is_none_or(|at| n.at >= at))
+        .map(|n| {
+            json!({
+                "task": n.task, "field": "note", "kind": n.kind,
+                "by": short(handles, n.agent.as_str()), "at": n.at, "text": n.text,
+            })
+        })
+        .collect();
+    if findings.is_empty() {
+        return String::new();
+    }
+    let since = if claimed.is_some() {
+        "since your claim"
+    } else {
+        "on the task"
+    };
+    format!(
+        "{} {} {since}: confirm each is addressed (covered, done, or declined with a reason) \
+         in the evidence or a task_note\n{}",
+        findings.len(),
+        if findings.len() == 1 {
+            "finding"
+        } else {
+            "findings"
+        },
+        peer_block(&findings)
+    )
 }
 
 /// `id`'s short handle when `handles` has one, else `id`.
@@ -547,6 +637,129 @@ mod tests {
         assert!(cut.ends_with("…\""));
         assert_eq!(title("<b>"), "\"\\u003cb\\u003e\"");
     }
+    /// A doing task owned by `t3:me`, with `notes` as (kind, text, minute) and `history`
+    /// as (type, actor, minute, payload), at minutes past 10:00.
+    fn noted(notes: &[(&str, &str, u32)], history: &[(&str, &str, u32, Value)]) -> TaskDetail {
+        let at = |m: u32| format!("2026-11-07T10:{m:02}:00Z");
+        serde_json::from_value(json!({
+            "task": {
+                "id": "factory-12", "board": "factory", "parent": null, "title": "Fix it",
+                "body": "Body", "acceptance": "", "status": "doing", "priority": "p2",
+                "blocked_reason": null, "owner": "t3:me", "owner_stale": false,
+                "blockers": [], "ready": false, "not_before": null, "auto": true,
+                "created_by": "t3:me", "version": 3, "summary": null,
+                "created_at": at(0), "updated_at": at(0),
+            },
+            "notes": notes.iter().enumerate().map(|(i, (kind, text, m))| json!({
+                "id": i + 1, "task": "factory-12", "agent": "t3:peer", "kind": kind,
+                "text": text, "at": at(*m),
+            })).collect::<Vec<_>>(),
+            "evidence": [], "blocks": [], "children": [],
+            "history": history.iter().enumerate().map(|(i, (kind, actor, m, payload))| json!({
+                "seq": i + 1, "at": at(*m), "board": "factory", "actor": actor,
+                "type": kind, "task": "factory-12", "payload": payload,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn task_show_keeps_every_finding_and_decision_and_cuts_only_plain_notes() {
+        let mut notes = vec![
+            ("finding", "early finding", 1),
+            ("decision", "verdict: accept", 2),
+        ];
+        let plain: Vec<String> = (0..8).map(|i| format!("plain {i}")).collect();
+        notes.extend(plain.iter().map(|t| ("note", t.as_str(), 3)));
+        notes.push(("finding", "late finding", 4));
+        let detail = noted(&notes, &[]);
+
+        let text = task_detail(&detail, false);
+        for kept in ["early finding", "verdict: accept", "late finding"] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
+        for i in 0..3 {
+            assert!(!text.contains(&format!("\"plain {i}\"")), "{text}");
+        }
+        for i in 3..8 {
+            assert!(text.contains(&format!("\"plain {i}\"")), "{text}");
+        }
+        assert!(
+            text.ends_with(
+                "(3 older plain notes; every finding and decision is shown; pass detailed \
+                 for all and the history)"
+            ),
+            "{text}"
+        );
+        // Detailed shows all, with no count.
+        let all = task_detail(&detail, true);
+        assert!(
+            all.contains("\"plain 0\"") && !all.contains("older plain"),
+            "{all}"
+        );
+        // Five plain notes or fewer: nothing cut.
+        let few = noted(&[("note", "a", 1), ("finding", "b", 2)], &[]);
+        assert!(!task_detail(&few, false).contains("older"));
+    }
+
+    #[test]
+    fn claims_count_the_notes_and_done_lists_findings_since_the_claim() {
+        let claimed = (
+            "task_claimed",
+            "t3:me",
+            5,
+            json!({ "previous_owner": null }),
+        );
+        let detail = noted(
+            &[
+                ("finding", "before the claim", 1),
+                ("decision", "verdict: accept", 2),
+                ("note", "plain", 6),
+                ("finding", "after the claim", 7),
+            ],
+            std::slice::from_ref(&claimed),
+        );
+        assert_eq!(
+            claim_notes(&detail),
+            "4 notes on factory-12 (2 findings, 1 decision): task_show factory-12 and read \
+             every one before starting; pass each finding and decision into a delegate's brief"
+        );
+        let empty = noted(&[], &[]);
+        assert_eq!(
+            claim_notes(&empty),
+            "no notes on factory-12; task_show factory-12 for its body and acceptance checks"
+        );
+
+        let done = done_findings(&detail, "t3:me");
+        assert!(
+            done.starts_with(
+                "1 finding since your claim: confirm each is addressed (covered, done, or \
+                 declined with a reason) in the evidence or a task_note\n"
+            ),
+            "{done}"
+        );
+        assert!(done.contains(PEER_HEADER), "{done}");
+        assert!(done.contains("after the claim"), "{done}");
+        assert!(!done.contains("before the claim"), "{done}");
+        // Another agent's claim is not ours; a handover to us is.
+        let taken = noted(
+            &[("finding", "before", 1), ("finding", "after", 7)],
+            &[
+                ("task_claimed", "t3:other", 2, json!({})),
+                ("task_updated", "t3:other", 5, json!({ "owner": "t3:me" })),
+            ],
+        );
+        let done = done_findings(&taken, "t3:me");
+        assert!(
+            done.contains("\"after\"") && !done.contains("\"before\""),
+            "{done}"
+        );
+        // No claim in the history: every finding.
+        let unknown = noted(&[("finding", "a", 1), ("finding", "b", 7)], &[]);
+        assert!(done_findings(&unknown, "t3:me").starts_with("2 findings on the task:"));
+        assert_eq!(done_findings(&empty, "t3:me"), "");
+    }
+
     #[test]
     fn task_detail_names_agents_by_their_handles() {
         const LONG: &str = "t3:thread:delegated-task:command%3Amcp%3A8f8e";
