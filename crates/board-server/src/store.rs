@@ -672,7 +672,7 @@ pub(crate) fn get_ask(cx: &Ctx<'_>, id: i64) -> Result<Ask> {
         })
 }
 
-fn event_row(r: &Row<'_>) -> rusqlite::Result<Event> {
+pub(crate) fn event_row(r: &Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         seq: r.get(0)?,
         at: ts(r.get(1)?),

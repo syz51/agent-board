@@ -835,11 +835,20 @@ async fn show_snapshot(
         kind: q.kind.unwrap_or(SnapshotKind::Full),
         since: q.since,
         format: q.format.unwrap_or_default(),
-        advance,
     };
-    Ok(Json(
-        state.write(move |cx| snapshot::snapshot(cx, req)).await?,
-    ))
+    let snapshot = if advance {
+        state
+            .write(move |cx| {
+                let rendered = snapshot::snapshot(cx, req)?;
+                snapshot::advance(cx, rendered)
+            })
+            .await?
+    } else {
+        state
+            .read(move |cx| Ok(snapshot::snapshot(cx, req)?.snapshot))
+            .await?
+    };
+    Ok(Json(snapshot))
 }
 
 #[derive(Deserialize)]

@@ -8,6 +8,7 @@ mod events;
 mod feedback;
 mod leases;
 mod query_cost;
+mod reads;
 mod snapshot;
 mod tasks;
 mod telegram;
@@ -69,14 +70,16 @@ pub(crate) fn iso(at: Timestamp) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// A server over an in-memory database, with a device token (`mac`) and a user token
-/// (`phone`).
+/// A server over a database file in WAL mode, as in production, with a device token
+/// (`mac`) and a user token (`phone`).
 pub(crate) struct T {
     pub app: Router,
     pub state: AppState,
     pub clock: ManualClock,
     pub token: String,
     pub user_token: String,
+    /// Holds the database file of [`T::with`] until the server is dropped.
+    _dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl T {
@@ -85,7 +88,13 @@ impl T {
     }
 
     pub fn with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
-        Self::over(Db::open_in_memory().unwrap(), configure)
+        // On disk, so reads take the read-only pool as in production.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("board.db")).unwrap();
+        Self {
+            _dir: Some(Arc::new(dir)),
+            ..Self::over(db, configure)
+        }
     }
 
     fn config(configure: impl FnOnce(&mut ServerConfig)) -> ServerConfig {
@@ -110,6 +119,7 @@ impl T {
             clock,
             token,
             user_token,
+            _dir: None,
         }
     }
 
@@ -123,6 +133,7 @@ impl T {
             clock: self.clock.clone(),
             token: self.token.clone(),
             user_token: self.user_token.clone(),
+            _dir: self._dir.clone(),
         }
     }
 
