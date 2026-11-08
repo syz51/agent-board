@@ -23,8 +23,9 @@ says how many tasks you and your children may have in progress at once (the boar
    pick the next. If none is
    ready and nothing is in progress, run the goal review (below) when it is due. When
    nothing more can start, set your handoff, keeping the last task you finished in it, and
-   end your turn with a status: the board wakes you when work becomes ready, a task moves
-   to review, one of your asks is answered, or an ask is answered whose asker it cannot
+   end your turn with a status: the board wakes you when work becomes ready, an agent
+   other than you and your children moves a task to review, a task sits idle while its
+   owner cannot be woken, one of your asks is answered, or an ask is answered whose asker it cannot
    wake, and T3 wakes you
    when a child finishes. Never poll a child.
 3. `task_show` it and read its body, its acceptance checks and every note on it:
