@@ -1,11 +1,13 @@
 // Agent-written text is untrusted. Markdown is parsed into tokens with `marked`'s lexer and
 // rendered as React elements here; no HTML string is ever produced or injected, so raw
-// HTML in the source shows as literal text. Links work only for http, https and mailto
-// and always show their target; images are never loaded.
+// HTML in the source shows as literal text. Links work only for http, https and mailto,
+// and for T3 thread links that map to T3's https page; they always show their target.
+// Images are never loaded.
 
 import { Lexer, type Token, type Tokens } from "marked";
-import type { ReactElement, ReactNode } from "react";
+import { type ReactElement, type ReactNode, useContext } from "react";
 import { cn } from "@/lib/utils.ts";
+import { ThreadBasesContext, threadUrl } from "./thread-links.ts";
 
 const SAFE_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
@@ -254,7 +256,10 @@ function inlineToken(token: Token, key: number): ReactNode {
  * link text cannot hide another site. Unsafe targets are shown, not linked.
  */
 export function SafeLink({ href, children }: { href: string; children: ReactNode }): ReactElement {
-  const url = safeHref(href);
+  const bases = useContext(ThreadBasesContext);
+  const direct = safeHref(href);
+  // A T3 thread link opens as T3's https page; its text names another target, so show it.
+  const url = direct ?? threadUrl(href, bases);
   const childText = typeof children === "string" ? children : flatText(children);
   if (url === null) {
     // An autolink such as <t3-thread://...> already shows its target as its text.
@@ -268,7 +273,8 @@ export function SafeLink({ href, children }: { href: string; children: ReactNode
     );
   }
   const shown = url.startsWith("mailto:") ? url.slice(7) : url;
-  const showTarget = childText !== href && childText !== url && childText !== shown;
+  const showTarget =
+    direct === null || (childText !== href && childText !== url && childText !== shown);
   const target = url.startsWith("mailto:") ? shown : new URL(url).host;
   return (
     <span className="md-link">
