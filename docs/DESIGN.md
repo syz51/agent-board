@@ -307,6 +307,40 @@ the coordinator to check those, and to message each halted owner thread to conti
 task, restarting a task only when its thread is gone. An owner not messaged gets the
 server's idle notice once it has been away `doing_idle_secs`, as usual.
 
+## Usage
+
+Every agent shares the account's usage limits: a 5-hour window and a weekly one. The
+boards know the current usage, so each one stops starting new work when the usage is too
+high for it. There is no total cap.
+
+- **Source**: each daemon reads the endpoint behind Claude Code's `/usage`
+  (`GET https://api.anthropic.com/api/oauth/usage`) at most every 5 minutes, at a
+  reconcile. It signs in with Claude Code's own token: the macOS login keychain item
+  `Claude Code-credentials` (read with `security`), or `~/.claude/.credentials.json`
+  elsewhere. It never refreshes the token, which could sign Claude Code out: with an
+  expired token or no sign-in it skips the reading. The token never leaves the device and
+  is never logged. The daemon reports each window's percent and reset time
+  (`PUT /v1/usage`). The server keeps one reading for the account, the newest by read
+  time, with the device that sent it. Between its own readings, each reconcile takes the
+  server's newest (`GET /v1/usage`).
+- **Setting**: each board has `usage_stop_at`, a percent from 1 to 100, default 90. Only
+  the user may raise it; anyone may lower it. A lower stop makes a board give way first,
+  so the user ranks boards by it.
+- **Over**: a reading is fresh for 30 minutes. A board is over when a window of a fresh
+  reading is at or above its stop and has not reset yet. A stale reading, or none, holds
+  nothing: a device that cannot read the usage never stops work.
+- **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
+  it when there is a reading: `5h 12% · week 74% · read 3m ago · this board starts no new
+  task at 90%`. While the board is over, every kind shows it, also when nothing else
+  changed: `week 92% >= this board's stop at 90% -> usage is high: start no new task or
+  child thread; finish or park the tasks in doing. The week window resets …`. The
+  coordinator starts no task while it shows; tasks in progress finish.
+- **Daemon**: while a board is over, the daemon drops its ready and cleared wake-ups at
+  their send. Other wake-ups still go: answers, unblocked tasks, reviews and idle owners
+  concern work already started. When a board leaves the over state, the daemon wakes its
+  coordinator once to read its snapshot and start ready tasks.
+- `board usage` prints the reading and the boards it holds.
+
 ## Runtime integration
 
 All hooks call `board hook <event> --runtime claude|codex`, which reads the hook's JSON from
@@ -735,7 +769,8 @@ settings in use, warned once per edit.
   review its children's work.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
-  before the reset time.
+  before the reset time. Before a limit is hit, the board's `usage_stop_at` stops new work
+  (see "Usage").
 
 ## Daemon dispatch (partly built)
 

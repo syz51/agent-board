@@ -78,6 +78,10 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     ("boards", "a JSON array of boards"),
     ("pause", "a JSON array of the boards it paused"),
     ("resume", "a JSON array of the boards it resumed"),
+    (
+        "usage",
+        "the reading {five_hour?, seven_day?, read_at, device}, or null when none",
+    ),
     ("board", "see each subcommand's --help"),
     (
         "board create",
@@ -293,6 +297,9 @@ pub enum Command {
         /// Boards to resume. Default: every paused board.
         boards: Vec<BoardSlug>,
     },
+    /// Show the account's latest usage reading, which daemons report, and the boards it
+    /// stops from starting new work (`board board update --usage-stop-at`).
+    Usage,
     /// Create or change a board.
     #[command(subcommand)]
     Board(BoardCommand),
@@ -717,6 +724,10 @@ pub enum BoardCommand {
         /// the device holding the coordinator lease (daemon).
         #[arg(long, value_parser = enum_arg::<Dispatch>())]
         dispatch: Option<Dispatch>,
+        /// The usage percent (1 to 100) of the 5-hour or weekly window at which the board
+        /// starts no new task. Only the user may raise it.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
+        usage_stop_at: Option<u32>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1188,6 +1199,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::set_boards_status(&ctx()?, boards, BoardStatus::Paused, BoardStatus::Active)
                 .await?
         }
+        Command::Usage => ops::usage(&ctx()?, chrono::Utc::now()).await?,
         Command::Board(BoardCommand::Create {
             slug,
             title,
@@ -1219,6 +1231,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             temporary,
             parallel_tasks,
             dispatch,
+            usage_stop_at,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1230,6 +1243,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 temporary,
                 parallel_tasks,
                 dispatch,
+                usage_stop_at,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }

@@ -2658,3 +2658,85 @@ fn brief_says_which_tasks_each_kind_takes() {
         assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
     }
 }
+
+#[test]
+fn usage_stop_at_is_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.usage_stop_at = 60;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "update", "factory", "--usage-stop-at", "60"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["usage_stop_at"], 60);
+    assert!(
+        stdout(&out)
+            .trim_end()
+            .ends_with(" · new work stops at 60% usage"),
+        "{}",
+        stdout(&out)
+    );
+
+    for value in ["0", "101"] {
+        let out = e.run(&["board", "update", "factory", "--usage-stop-at", value]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    }
+    assert_eq!(e.stub.requests_to("PATCH /v1/boards/factory").len(), 1);
+
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("usage_stop_at");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--usage-stop-at", "60"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored usage_stop_at=60")
+            && err.contains("board board update factory --usage-stop-at 60"),
+        "{err}"
+    );
+}
+
+#[test]
+fn usage_shows_the_reading_and_the_boards_it_holds() {
+    let e = env();
+    e.stub.on("GET /v1/usage", serde_json::Value::Null);
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("no usage reading yet"),
+        "{}",
+        stdout(&out)
+    );
+
+    let read = chrono::Utc::now() - chrono::Duration::minutes(2);
+    let resets = read + chrono::Duration::hours(30);
+    e.stub.on(
+        "GET /v1/usage",
+        json!({
+            "five_hour": { "percent": 12.7 },
+            "seven_day": { "percent": 92.0, "resets_at": resets },
+            "read_at": read,
+            "device": "mac",
+        }),
+    );
+    let mut loose = board_fixture("loose", &[]);
+    loose.usage_stop_at = 95;
+    e.stub
+        .on("GET /v1/boards", [board_fixture("factory", &[]), loose]);
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim_end(),
+        format!(
+            "5h 12%\nweek 92% · resets {}\nread 2m ago by mac\nstarting no new task: factory \
+             (week >= 90%)",
+            resets.format("%Y-%m-%d %H:%MZ")
+        )
+    );
+
+    let out = e.run(&["--json", "usage"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["seven_day"]["percent"], 92.0);
+}

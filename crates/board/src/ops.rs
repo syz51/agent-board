@@ -847,6 +847,19 @@ pub async fn boards(ctx: &Ctx) -> Result<Output> {
     Ok(Output::new(render::board_list(&boards), &boards))
 }
 
+/// `board usage`: the latest reading, and which boards it holds from new work.
+pub async fn usage(ctx: &Ctx, now: Timestamp) -> Result<Output> {
+    let usage = ctx.client.usage().await?;
+    let boards = match &usage {
+        Some(_) => ctx.client.boards().await?,
+        None => Vec::new(),
+    };
+    Ok(Output::new(
+        render::usage(usage.as_ref(), &boards, now),
+        &usage,
+    ))
+}
+
 /// `board pause` and `board resume`: sets the boards `named`, or by default every board in
 /// status `from`, to status `to`, and lists the boards it changed. Named boards are checked
 /// before any changes, so a wrong name changes nothing.
@@ -941,6 +954,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
             "updated board {slug}, but the server ignored parallel_tasks={wanted}: it predates \
              parallel tasks. Upgrade the server, then run board board update {slug} \
              --parallel-tasks {wanted}"
+        );
+    }
+    if let Some(wanted) = body.usage_stop_at
+        && board.usage_stop_at != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored usage_stop_at={wanted}: it predates \
+             usage awareness. Upgrade the server, then run board board update {slug} \
+             --usage-stop-at {wanted}"
         );
     }
     if let Some(wanted) = body.dispatch

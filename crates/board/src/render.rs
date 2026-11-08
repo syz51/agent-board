@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use board_proto::{
     Agent, AgentState, Ask, Board, Dispatch, ErrorLog, Event, EventType, Handoff, Lease,
     LeaseResult, Note, NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
-    TouchResult,
+    TouchResult, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -470,6 +470,9 @@ pub fn board_line(board: &Board) -> String {
     if board.parallel_tasks > 1 {
         let _ = write!(line, " · {} tasks at once", board.parallel_tasks);
     }
+    if board.usage_stop_at != board_proto::USAGE_STOP_AT_DEFAULT {
+        let _ = write!(line, " · new work stops at {}% usage", board.usage_stop_at);
+    }
     if board.dispatch == Dispatch::Daemon {
         line.push_str(" · dispatch daemon");
     }
@@ -510,6 +513,40 @@ pub fn board_list(boards: &[Board]) -> String {
         return "no boards".into();
     }
     boards.iter().map(board_line).collect::<Vec<_>>().join("\n")
+}
+
+/// `board usage`: the reading, one line per window, then the active boards it stops from
+/// starting new work.
+pub fn usage(usage: Option<&Usage>, boards: &[Board], now: Timestamp) -> String {
+    let Some(usage) = usage else {
+        return "no usage reading yet: a daemon (board watch) reports one every 5 minutes".into();
+    };
+    let mut lines = Vec::new();
+    for (kind, window) in usage.windows() {
+        let mut line = format!("{} {:.0}%", kind.label(), window.percent.floor());
+        if let Some(at) = window.resets_at {
+            let _ = write!(line, " · resets {}", at.format("%Y-%m-%d %H:%MZ"));
+        }
+        lines.push(line);
+    }
+    let mut read = format!("read {} by {}", ago(usage.read_at), usage.device);
+    if !usage.fresh(now) {
+        read.push_str(" (stale: it holds no board)");
+    }
+    lines.push(read);
+    let held: Vec<String> = boards
+        .iter()
+        .filter(|b| b.status == board_proto::BoardStatus::Active)
+        .filter_map(|b| {
+            usage
+                .over(b.usage_stop_at, now)
+                .map(|(kind, _)| format!("{} ({} >= {}%)", b.slug, kind.label(), b.usage_stop_at))
+        })
+        .collect();
+    if !held.is_empty() {
+        lines.push(format!("starting no new task: {}", held.join(", ")));
+    }
+    lines.join("\n")
 }
 
 pub fn agent_line(agent: &Agent) -> String {

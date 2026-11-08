@@ -16,6 +16,7 @@ mod tasks;
 mod telegram;
 mod temporary;
 mod updates;
+mod usage;
 
 use std::sync::Arc;
 

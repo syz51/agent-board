@@ -12,6 +12,7 @@ pub(crate) mod stats;
 pub(crate) mod tasks;
 pub(crate) mod telegram;
 pub(crate) mod updates;
+pub(crate) mod usage;
 
 use board_proto::{AgentId, BoardSlug, EventType};
 use rusqlite::{OptionalExtension, params};

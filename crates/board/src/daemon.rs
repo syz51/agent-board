@@ -45,7 +45,7 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, Priority, RegisterAgent, Runtime,
-    Task, TaskId, TaskStatus, Timestamp,
+    Task, TaskId, TaskStatus, Timestamp, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -57,6 +57,7 @@ use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
+use crate::usage::UsageSource;
 
 /// The coordinator's standing instructions.
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
@@ -92,6 +93,9 @@ pub const USER_QUIET: TimeDelta = TimeDelta::minutes(60);
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+/// The daemon reads the usage endpoint at most this often; between its own readings, each
+/// reconcile takes the newest reading any device reported.
+pub const USAGE_POLL_EVERY: TimeDelta = TimeDelta::minutes(5);
 /// A named coordinator's thread that T3 found live is not asked about again for this long.
 /// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
 /// each minute costs a home device more than the check is worth. A failed send to the
@@ -190,6 +194,10 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub unsure_wakes: BTreeMap<AgentId, UnsureWakes>,
+    /// Boards the usage held from new work at the last reading: when one drops out, its
+    /// coordinator is woken to start work again.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub usage_held: BTreeSet<BoardSlug>,
 }
 
 /// The wake-up messages to one agent whose send timed out: T3 may or may not have
@@ -335,6 +343,8 @@ pub enum WakeAbout {
     },
     /// For the coordinator: the board was paused and is active again (`board resume`).
     Resumed,
+    /// For the coordinator: the usage no longer holds the board from new work.
+    UsageEased,
 }
 
 impl WakeAbout {
@@ -349,6 +359,7 @@ impl WakeAbout {
             Self::Review { .. } => "review",
             Self::Idle { .. } => "idle",
             Self::Resumed => "resumed",
+            Self::UsageEased => "usage_eased",
         }
     }
 }
@@ -1151,6 +1162,13 @@ pub struct Daemon<T: T3> {
     /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
     config_text: Option<String>,
     pub timing: Timing,
+    /// Where the account's usage is read. [`UsageSource::Server`] unless set: `board
+    /// watch` sets Claude Code's endpoint.
+    pub usage_source: UsageSource,
+    /// The newest usage reading, as last read or reported.
+    pub usage: Option<Usage>,
+    /// When this daemon last read the usage endpoint itself.
+    usage_polled: Option<Timestamp>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1172,6 +1190,9 @@ impl<T: T3> Daemon<T> {
             sending: Vec::new(),
             config_text,
             timing: Timing::default(),
+            usage_source: UsageSource::Server,
+            usage: None,
+            usage_polled: None,
         }
     }
 
@@ -1259,6 +1280,7 @@ impl<T: T3> Daemon<T> {
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
+        self.refresh_usage(now).await;
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         for board in &boards {
             if !self.is_home(board) {
@@ -3260,6 +3282,75 @@ impl<T: T3> Daemon<T> {
     }
 
     /// The line for `wake` when what it is about still holds, else `None`.
+    /// Whether the usage holds `slug` from new work at `now`: a window of a fresh reading
+    /// is at or above the board's `usage_stop_at`.
+    fn usage_holds(&self, slug: &BoardSlug, now: Timestamp) -> bool {
+        let (Some(board), Some(usage)) = (self.boards.get(slug), &self.usage) else {
+            return false;
+        };
+        usage.over(board.usage_stop_at, now).is_some()
+    }
+
+    /// Takes a new usage reading: from the endpoint, when [`USAGE_POLL_EVERY`] has passed
+    /// since this daemon last read it, reported to the server; else the newest any device
+    /// reported. Then wakes the coordinators of boards the usage no longer holds. A
+    /// failure keeps the last reading, which goes stale and then holds nothing.
+    async fn refresh_usage(&mut self, now: Timestamp) {
+        let mut reported = None;
+        if let UsageSource::ClaudeCode { url, credentials } = &self.usage_source
+            && self
+                .usage_polled
+                .is_none_or(|at| now - at >= USAGE_POLL_EVERY)
+        {
+            self.usage_polled = Some(now);
+            match crate::usage::read(url, credentials, now).await {
+                Ok(Some(report)) => match self.client().report_usage(&report).await {
+                    Ok(usage) => reported = Some(usage),
+                    Err(err) => tracing::warn!("reporting the usage: {err:#}"),
+                },
+                Ok(None) => tracing::debug!(
+                    "usage: Claude Code is not signed in here or its token has expired"
+                ),
+                Err(err) => tracing::warn!("reading the usage: {err:#}"),
+            }
+        }
+        match reported {
+            Some(usage) => self.usage = Some(usage),
+            None => match self.client().usage().await {
+                Ok(Some(usage)) => self.usage = Some(usage),
+                Ok(None) => {}
+                Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
+            },
+        }
+        let held: BTreeSet<BoardSlug> = self
+            .boards
+            .keys()
+            .filter(|slug| self.usage_holds(slug, now))
+            .cloned()
+            .collect();
+        let eased: Vec<BoardSlug> = self.state.usage_held.difference(&held).cloned().collect();
+        for slug in eased {
+            if let Some(coordinator) = self
+                .coordinator_here(&slug)
+                .filter(|c| c.source() == AgentSource::T3)
+                .cloned()
+            {
+                tracing::info!("usage: {slug} may start new work again; waking {coordinator}");
+                self.queue(
+                    coordinator,
+                    Wake {
+                        board: slug,
+                        about: WakeAbout::UsageEased,
+                        queued_at: now,
+                        forwarded: false,
+                        resent: false,
+                    },
+                );
+            }
+        }
+        self.state.usage_held = held;
+    }
+
     async fn recheck(
         &self,
         agent: &AgentId,
@@ -3276,6 +3367,14 @@ impl<T: T3> Daemon<T> {
             return Ok(None);
         }
         let coordinator = self.coordinator_here(slug) == Some(agent);
+        // High usage starts no new work: the coordinator is woken when it eases.
+        if matches!(
+            wake.about,
+            WakeAbout::Ready { .. } | WakeAbout::Cleared { .. }
+        ) && self.usage_holds(slug, now)
+        {
+            return Ok(None);
+        }
         let line = match &wake.about {
             WakeAbout::Ready { task } if coordinator => {
                 let task = self.client().task(task).await?.task;
@@ -3407,8 +3506,20 @@ impl<T: T3> Daemon<T> {
                  restart a task only when its owner thread is gone. Check blocked tasks and \
                  answered asks too: their wake-ups were dropped while paused"
             )),
-            // The agent is no longer this board's coordinator.
+            WakeAbout::UsageEased if coordinator && !self.usage_holds(slug, now) => {
+                let stop_at = self
+                    .boards
+                    .get(slug)
+                    .map_or(board_proto::USAGE_STOP_AT_DEFAULT, |b| b.usage_stop_at);
+                Some(format!(
+                    "board {slug}: the account usage no longer stops new work on this board \
+                     (stop at {stop_at}%). Read your board snapshot, then start ready tasks \
+                     as usual"
+                ))
+            }
+            // The agent is no longer this board's coordinator, or the usage is high again.
             WakeAbout::Resumed
+            | WakeAbout::UsageEased
             | WakeAbout::Ready { .. }
             | WakeAbout::Cleared { .. }
             | WakeAbout::Proposal { .. }
@@ -3739,6 +3850,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
     let mut daemon = Daemon::new(ctx, t3);
+    daemon.usage_source = UsageSource::claude_code();
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
         let health = daemon.client().health().await?;
