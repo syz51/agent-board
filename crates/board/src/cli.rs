@@ -167,12 +167,12 @@ pub enum Command {
     /// under the signal threshold, such as those since a fix deployed.
     Errors {
         /// From when: an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now
-        /// (30m, 12h, 14d). Default: the server's signal window (7 days).
+        /// (30m, 12h, 14d). Default: the server's signal window (signal_window_days).
         #[arg(long)]
         since: Option<String>,
         /// Only this error code, such as invalid.
-        #[arg(long)]
-        code: Option<String>,
+        #[arg(long, value_parser = enum_arg::<board_proto::ErrorCode>())]
+        code: Option<board_proto::ErrorCode>,
         /// Only this route, such as "POST /v1/tasks/{id}/notes".
         #[arg(long)]
         route: Option<String>,
@@ -180,7 +180,11 @@ pub enum Command {
         #[arg(long)]
         grep: Option<String>,
         /// Most signatures to list, 1 to 1000.
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        #[arg(
+            long,
+            default_value_t = board_proto::ERRORS_LIMIT_DEFAULT,
+            value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::ERRORS_LIMIT_MAX))
+        )]
         limit: u32,
     },
     /// Print your board snapshot.
@@ -629,6 +633,7 @@ impl Command {
                 check_all("option", options, ASK_OPTION_CHARS_MAX)?;
             }
             Self::Answer { answer, .. } => check_chars("answer", answer, l.question_chars)?,
+            Self::Errors { grep, .. } => check_opt("q", grep, board_proto::ERRORS_Q_CHARS_MAX)?,
             Self::Feedback {
                 about,
                 signature,

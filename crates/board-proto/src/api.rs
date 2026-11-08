@@ -144,13 +144,21 @@ pub struct ResolvedCounts {
 /// one row per signature, so errors under the signal threshold can be counted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorLog {
-    /// Errors at or after this time are counted.
+    /// Errors at or after this time are counted: the time asked for, or the oldest record
+    /// kept when that is later.
     pub since: Timestamp,
     /// The server keeps error records this many days; `since` before that reads less.
     pub retention_days: u32,
     /// Most errors first.
     pub signatures: Vec<ErrorSignature>,
 }
+
+/// Most signatures one `GET /v1/errors` answer lists.
+pub const ERRORS_LIMIT_MAX: u32 = 1_000;
+/// Signatures `GET /v1/errors` lists when the request names no `limit`.
+pub const ERRORS_LIMIT_DEFAULT: u32 = 100;
+/// Longest `q` filter of `GET /v1/errors`, in characters.
+pub const ERRORS_Q_CHARS_MAX: usize = 200;
 
 /// One error signature in [`ErrorLog`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

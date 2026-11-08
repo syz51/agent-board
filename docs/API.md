@@ -183,9 +183,11 @@ server's minute sweep deletes older ones.
   message), `count`, `agents` (distinct), `first_at`, `last_at` and `item`: the newest
   feedback item with that signature, or `null` when none was filed, as for errors under
   the signal threshold. `since` is an RFC 3339 time, default `signal_window_days` back from
-  now; the server keeps records `error_retention_days`, so an earlier `since` reads no
-  more. `code` and `route` match exactly; `q` (at most 200 characters) matches the
-  template's text, ignoring case. `limit` is 1 to 1,000, default 100.
+  now; the server keeps records `error_retention_days`, so an earlier `since` reads from the
+  oldest kept, and the answer's `since` says so. `code` is an error code (400 `invalid`
+  otherwise) and `route` a route template, matched exactly; `q` (at most 200 characters)
+  matches the template's text, ignoring ASCII case. Blank `route` and `q` are left out.
+  `limit` is 1 to 1,000, default 100.
 
 #### Temporary boards
 

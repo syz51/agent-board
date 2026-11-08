@@ -3,12 +3,14 @@
 //! server itself when agents keep hitting the same API error.
 
 use board_proto::{
-    AgentId, Board, CreateBoard, CreateFeedback, ErrorCode, ErrorLog, ErrorSignature, EventType,
-    EvidenceKind, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity,
-    FeedbackResolution, FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind,
-    ResolveFeedback, ResolvedCounts, Task, TaskId, Timestamp,
+    AgentId, Board, CreateBoard, CreateFeedback, ERRORS_LIMIT_DEFAULT, ERRORS_LIMIT_MAX,
+    ERRORS_Q_CHARS_MAX, ErrorCode, ErrorLog, ErrorSignature, EventType, EvidenceKind,
+    FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, Feedback, FeedbackActivity, FeedbackResolution,
+    FeedbackResult, FeedbackSource, FeedbackStats, NewEvidence, ResolutionKind, ResolveFeedback,
+    ResolvedCounts, Task, TaskId, Timestamp,
 };
 use rusqlite::{OptionalExtension, params};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::Settings;
@@ -773,7 +775,8 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         Prior::Gone(earlier) => Some(earlier),
         Prior::None => None,
     };
-    // Errors that an earlier item took (before its fix) do not count towards a new one.
+    // Records outlive the signal window (error_retention_days), so only those within it
+    // count. Errors that an earlier item took (before its fix) do not count towards a new one.
     let mut from = now - cx.s.signal_window_ms();
     if let Some(earlier) = &earlier {
         let last: i64 = cx.db.query_row(
@@ -842,50 +845,53 @@ pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
     )?)
 }
 
-/// Most signatures one [`errors`] answer lists.
-pub(crate) const ERRORS_LIMIT_MAX: usize = 1_000;
-/// Longest `q` filter of [`errors`].
-const ERRORS_Q_MAX: usize = 200;
-
-/// Filters of `GET /v1/errors`, validated by [`ErrorsFilter::new`].
-pub(crate) struct ErrorsFilter {
-    since: i64,
-    code: Option<String>,
+/// `GET /v1/errors` query, validated by [`ErrorsFilter::new`].
+#[derive(Deserialize)]
+pub(crate) struct ErrorsQuery {
+    since: Option<Timestamp>,
+    code: Option<ErrorCode>,
     route: Option<String>,
     q: Option<String>,
-    limit: usize,
+    limit: Option<u32>,
+}
+
+/// Filters of `GET /v1/errors`.
+pub(crate) struct ErrorsFilter {
+    since: i64,
+    code: Option<ErrorCode>,
+    route: Option<String>,
+    /// ASCII-lowercased, as SQLite's `lower` folds the template.
+    q: Option<String>,
+    limit: u32,
 }
 
 impl ErrorsFilter {
-    /// `since` defaults to the signal window back from now; `limit` to 100.
-    pub(crate) fn new(
-        cx: &Ctx<'_>,
-        since: Option<Timestamp>,
-        code: Option<String>,
-        route: Option<String>,
-        q: Option<String>,
-        limit: Option<usize>,
-    ) -> Result<Self> {
-        let limit = limit.unwrap_or(100);
+    /// `since` defaults to the signal window back from now, and never reaches back past the
+    /// records kept; `limit` defaults to [`ERRORS_LIMIT_DEFAULT`]. Blank text filters are
+    /// left out.
+    pub(crate) fn new(cx: &Ctx<'_>, q: ErrorsQuery) -> Result<Self> {
+        let limit = q.limit.unwrap_or(ERRORS_LIMIT_DEFAULT);
         if !(1..=ERRORS_LIMIT_MAX).contains(&limit) {
             return Err(invalid(
                 format!("limit={limit} is out of range"),
                 format!("send limit between 1 and {ERRORS_LIMIT_MAX}"),
             ));
         }
-        if let Some(q) = &q {
-            check_line("q", q, ERRORS_Q_MAX)?;
-        }
-        let since = since.map_or_else(
-            || cx.now_ms() - cx.s.signal_window_ms(),
-            |at| at.timestamp_millis(),
-        );
         let blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let text = blank(q.q);
+        if let Some(text) = &text {
+            check_line("q", text, ERRORS_Q_CHARS_MAX)?;
+        }
+        let now = cx.now_ms();
+        let kept = now - cx.s.error_retention_ms();
+        let since = q
+            .since
+            .map_or_else(|| now - cx.s.signal_window_ms(), |at| at.timestamp_millis());
         Ok(Self {
-            since,
-            code: blank(code),
-            route: blank(route),
-            q: blank(q),
+            since: since.max(kept),
+            code: q.code,
+            route: blank(q.route),
+            q: text.map(|t| t.to_ascii_lowercase()),
             limit,
         })
     }
@@ -894,19 +900,21 @@ impl ErrorsFilter {
 /// `GET /v1/errors`: the recorded API errors since a time, one row per signature, most
 /// first, with the newest feedback item each one filed or added to.
 pub(crate) fn errors(cx: &Ctx<'_>, f: &ErrorsFilter) -> Result<ErrorLog> {
-    let q = f.q.as_ref().map(|q| q.to_lowercase());
+    let code = f.code.as_ref().map(enum_str);
+    // The item lookup runs on the rows kept, not on every signature.
     let rows = cx
         .db
         .prepare_cached(
-            "SELECT e.signature, e.code, e.route, e.template, COUNT(*), COUNT(DISTINCT e.agent), \
-             MIN(e.at), MAX(e.at), \
-             (SELECT task FROM feedback WHERE signature = e.signature ORDER BY rowid DESC LIMIT 1) \
-             FROM api_errors e WHERE e.at >= ?1 \
-             AND (?2 IS NULL OR e.code = ?2) AND (?3 IS NULL OR e.route = ?3) \
-             AND (?4 IS NULL OR instr(lower(e.template), ?4) > 0) \
-             GROUP BY e.signature ORDER BY COUNT(*) DESC, MAX(e.at) DESC LIMIT ?5",
+            "SELECT g.*, (SELECT task FROM feedback WHERE signature = g.signature \
+             ORDER BY rowid DESC LIMIT 1) FROM ( \
+             SELECT signature, code, route, template, COUNT(*) AS n, COUNT(DISTINCT agent), \
+             MIN(at), MAX(at) AS last FROM api_errors WHERE at >= ?1 \
+             AND (?2 IS NULL OR code = ?2) AND (?3 IS NULL OR route = ?3) \
+             AND (?4 IS NULL OR instr(lower(template), ?4) > 0) \
+             GROUP BY signature ORDER BY n DESC, last DESC LIMIT ?5) g \
+             ORDER BY g.n DESC, g.last DESC",
         )?
-        .query_map(params![f.since, f.code, f.route, q, f.limit as i64], |r| {
+        .query_map(params![f.since, code, f.route, f.q, f.limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,

@@ -982,7 +982,9 @@ pub fn parse_since(value: &str, now: Timestamp) -> Result<Timestamp> {
             _ => chrono::TimeDelta::days(n.into()),
         });
     if let Some(back) = back {
-        return Ok(now - back);
+        return now.checked_sub_signed(back).with_context(|| {
+            format!("since {value:?} reaches back too far; send a shorter duration")
+        });
     }
     match parse_not_before(Some(value)) {
         Ok(Some(Some(at))) => Ok(at),
@@ -1050,7 +1052,7 @@ mod tests {
         ] {
             assert_eq!(parse_since(since, now).unwrap(), at(want), "{since}");
         }
-        for bad in ["", "d", "14w", "-3d", "none", "yesterday"] {
+        for bad in ["", "d", "14w", "-3d", "none", "yesterday", "100000000d"] {
             assert!(parse_since(bad, now).is_err(), "{bad}");
         }
     }

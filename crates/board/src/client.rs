@@ -176,7 +176,7 @@ pub struct ErrorsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    pub code: Option<ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

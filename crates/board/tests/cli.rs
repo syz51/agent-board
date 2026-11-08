@@ -860,14 +860,22 @@ fn errors_asks_since_a_time_and_prints_one_line_per_signature_or_the_json() {
         "{query}"
     );
 
-    // A since that is no time fails before any request.
-    let out = e.run(&["errors", "--since", "last week"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("duration back from now"),
-        "{}",
-        stderr(&out)
-    );
+    // A since that is no time, an unknown code and an over-long grep fail before any
+    // request.
+    let grep = "x".repeat(201);
+    for (args, says) in [
+        (vec!["--since", "last week"], "duration back from now"),
+        (vec!["--since", "100000000d"], "reaches back too far"),
+        (vec!["--code", "NotFound"], "not_found"),
+        (
+            vec!["--grep", grep.as_str()],
+            "q is 201 characters; the limit is 200",
+        ),
+    ] {
+        let out = e.run(&[&["errors"][..], &args].concat());
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
+    }
     assert_eq!(e.stub.requests_to("GET /v1/errors").len(), 2);
 }
 

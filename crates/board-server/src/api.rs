@@ -407,15 +407,6 @@ struct StatsQuery {
 }
 
 #[derive(Deserialize)]
-struct ErrorsQuery {
-    since: Option<Timestamp>,
-    code: Option<String>,
-    route: Option<String>,
-    q: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
 struct SaidQuery {
     limit: Option<usize>,
 }
@@ -484,15 +475,11 @@ async fn show_stats(
 async fn show_errors(
     State(state): State<AppState>,
     _caller: Caller,
-    Q(q): Q<ErrorsQuery>,
+    Q(q): Q<feedback::ErrorsQuery>,
 ) -> Result<Json<ErrorLog>> {
     Ok(Json(
         state
-            .read(move |cx| {
-                let filter =
-                    feedback::ErrorsFilter::new(cx, q.since, q.code, q.route, q.q, q.limit)?;
-                feedback::errors(cx, &filter)
-            })
+            .read(move |cx| feedback::errors(cx, &feedback::ErrorsFilter::new(cx, q)?))
             .await?,
     ))
 }

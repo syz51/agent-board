@@ -768,6 +768,11 @@ async fn errors_lists_recorded_errors_per_signature_since_a_time() {
     );
     assert_eq!(only("q=THE%20LIMIT").await, invalid);
     assert_eq!(only("limit=1").await, vec![("not_found".to_owned(), 3)]);
+    assert_eq!(
+        only("q=&route=").await.len(),
+        2,
+        "blank filters are left out"
+    );
     t.advance(TimeDelta::days(10));
     assert!(
         only("").await.is_empty(),
@@ -777,7 +782,17 @@ async fn errors_lists_recorded_errors_per_signature_since_a_time() {
         (t.clock.now() - TimeDelta::days(11)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     assert_eq!(only(&format!("since={since}")).await.len(), 2);
 
-    for query in ["limit=0", "limit=1001", "since=yesterday"] {
+    // A since before the records kept reads from the oldest kept, and says so.
+    let long_ago =
+        (t.clock.now() - TimeDelta::days(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let log = t
+        .ok("GET", &format!("/v1/errors?since={long_ago}"), None, None)
+        .await;
+    let kept =
+        (t.clock.now() - TimeDelta::days(35)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert_eq!(log["since"], kept.as_str());
+
+    for query in ["limit=0", "limit=1001", "since=yesterday", "code=NotFound"] {
         let (s, v) = t
             .call("GET", &format!("/v1/errors?{query}"), None, None)
             .await;
