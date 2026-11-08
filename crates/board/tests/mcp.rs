@@ -190,7 +190,13 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         ]
     );
     for tool in tools {
-        assert!(tool["description"].as_str().unwrap().chars().count() < 300);
+        // task_claim also states the doing limit and the resume path (DESIGN.md).
+        let cap = if tool["name"] == "task_claim" {
+            560
+        } else {
+            300
+        };
+        assert!(tool["description"].as_str().unwrap().chars().count() < cap);
         assert!(tool.get("outputSchema").is_none());
         for (name, param) in tool["inputSchema"]["properties"].as_object().unwrap() {
             let param = if param["type"] == "array" {

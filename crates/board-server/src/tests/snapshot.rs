@@ -515,20 +515,27 @@ async fn json_and_yaml_carry_the_same_model() {
         .unwrap();
     let model: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}:\n{json_text}"));
     assert_eq!(model["you"]["handle"], "t3:7f3a");
+    assert_eq!(model["you"]["doing"], json!(["factory-12"]));
+    assert_eq!(model["you"]["doing_limit"], 1);
     assert_eq!(model["counts"]["ready"], 4);
     assert_eq!(model["counts"]["auto"], 3);
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
-    // Compact JSON fits the same cap as lines, so no section is cut and the formats
-    // compare fairly in the benchmark.
+    // Compact JSON fits the same cap as lines, so the formats compare fairly in the
+    // benchmark. Its quoted keys leave it a few characters longer, so the cap cuts the
+    // oldest recent event and nothing else.
     assert!(json_text.chars().count() <= 2000);
     assert!(!body.contains("\n  "), "JSON is compact");
     assert_eq!(model["peers"].as_array().unwrap().len(), 2);
     assert_eq!(model["ready"]["total"], 4);
-    assert_eq!(model["recent"].as_array().unwrap().len(), 3);
+    assert_eq!(model["recent"].as_array().unwrap().len(), 2);
 
     let yaml = text(&snapshot(&t, ME, "since=806&format=yaml").await).to_owned();
     assert!(yaml.contains("you:\n"), "{yaml}");
+    assert!(
+        yaml.contains("  doing: [factory-12]\n  doing_limit: 1\n"),
+        "{yaml}"
+    );
     assert!(yaml.contains("factory-12"), "{yaml}");
     assert!(
         yaml.contains("\"Inject board delta on UserPromptSubmit\""),
@@ -1690,4 +1697,36 @@ async fn the_coordinator_sees_how_many_tasks_it_may_run_at_once() {
     t.advance(super::coordinator_ttl() + TimeDelta::seconds(1));
     let full = snapshot(&t, coordinator, "kind=full").await;
     assert!(!you(&full).contains("coordinator"), "{full}");
+}
+
+#[tokio::test]
+async fn you_names_the_task_held_in_doing_next_to_the_limit() {
+    let t = T::new();
+    let me = "t3:alpha";
+    t.register(me, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(me, "factory", "Ship the loop").await;
+    let you = |s: &Value| {
+        text(s)
+            .lines()
+            .find(|l| l.starts_with("you: "))
+            .unwrap()
+            .to_owned()
+    };
+
+    let full = snapshot(&t, me, "kind=full").await;
+    assert!(you(&full).ends_with(" · doing none (limit 1)"), "{full}");
+
+    assert!(t.claim(me, &id).await.0.is_success());
+    let full = snapshot(&t, me, "kind=full").await;
+    assert!(
+        you(&full).ends_with(&format!(" · doing {id} (limit 1)")),
+        "{full}"
+    );
+
+    // A task parked in review no longer counts.
+    let (s, v) = t.patch(me, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    let full = snapshot(&t, me, "kind=full").await;
+    assert!(you(&full).ends_with(" · doing none (limit 1)"), "{full}");
 }
