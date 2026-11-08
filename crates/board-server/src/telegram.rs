@@ -882,15 +882,19 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
 }
 
 async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()> {
-    let chat = bot.chat(state).await?;
+    let chat = bot.chat(state).await;
     if let Some(query) = update.callback_query {
-        let from_chat = chat.is_some() && query.message.as_ref().map(|m| m.chat.id) == chat;
-        let reply = if !from_chat {
-            "Not accepted from this chat.".to_owned()
-        } else if let Some((id, index)) = query.data.as_deref().and_then(parse_callback) {
-            answer(state, id, Answer::Option(index)).await
-        } else {
-            "Unknown button.".to_owned()
+        let pressed = query.data.as_deref().and_then(parse_callback);
+        let reply = match chat {
+            // Telegram does not resend the update, so the user presses again.
+            Err(error) => not_read(&error, pressed.map(|(id, _)| id)),
+            Ok(chat) if chat.is_none() || query.message.as_ref().map(|m| m.chat.id) != chat => {
+                "Not accepted from this chat.".to_owned()
+            }
+            Ok(_) => match pressed {
+                Some((id, index)) => answer(state, id, Answer::Option(index)).await,
+                None => "Unknown button.".to_owned(),
+            },
         };
         let _: Value = bot
             .call(
@@ -903,6 +907,16 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
     let Some(message) = update.message else {
         return Ok(());
     };
+    let is_reply = message.text.is_some() && message.reply_to_message.is_some();
+    let chat = match chat {
+        Ok(chat) => chat,
+        // Whether this chat is the paired one is unknown; a reply may be an answer, so its
+        // sender is asked to send it again. Anything else waits for the next message.
+        Err(error) if is_reply => {
+            return reply_to(bot, &message, not_read(&error, None)).await;
+        }
+        Err(error) => return Err(error),
+    };
     let Some(chat) = chat.filter(|c| *c == message.chat.id) else {
         // Another chat may pair (or, with a `--replace` code, re-pair) unless the chat is
         // configured.
@@ -911,24 +925,43 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
         }
         return Ok(());
     };
-    let (Some(text), Some(original)) = (message.text, message.reply_to_message) else {
+    let (Some(text), Some(original)) = (&message.text, &message.reply_to_message) else {
         return Ok(());
     };
     let original_id = original.message_id;
-    let Some(id) = state
-        .read(move |cx| asks::by_telegram_message(cx, original_id))
-        .await?
-    else {
-        return Ok(());
+    let found = state
+        .read(move |cx| asks::by_telegram_message(cx, chat, original_id))
+        .await;
+    let reply = match found {
+        Ok(None) => return Ok(()),
+        Ok(Some(id)) => answer(state, id, Answer::Text(text.clone())).await,
+        Err(error) => not_read(&error, None),
     };
-    let reply = answer(state, id, Answer::Text(text)).await;
+    reply_to(bot, &message, reply).await
+}
+
+/// Sends `text` to the chat of `message`, as a reply to it.
+async fn reply_to(bot: &Bot, message: &Message, text: String) -> Result<()> {
     bot.send(json!({
-        "chat_id": chat,
-        "text": reply,
+        "chat_id": message.chat.id,
+        "text": text,
         "reply_parameters": { "message_id": message.message_id },
     }))
     .await
     .map(|_| ())
+}
+
+/// The acknowledgement of an answer the board could not read or record (say the database
+/// is busy): the ask stays open, so the user answers again. Logs `error`.
+fn not_read(error: &Error, ask: Option<i64>) -> String {
+    tracing::error!(%error, ask, "telegram: handling an answer failed");
+    match ask {
+        Some(id) => format!(
+            "Ask {id}: the board could not record this answer; it is still open, so answer again."
+        ),
+        None => "The board could not record this answer; the ask is still open, so answer again."
+            .to_owned(),
+    }
 }
 
 enum Answer {
@@ -969,12 +1002,7 @@ async fn answer(state: &AppState, id: i64, answer: Answer) -> String {
     match result {
         Ok(text) => format!("Answered ask {id}: {text}"),
         Err(Error::Api(e)) => format!("Ask {id}: {}", e.message),
-        Err(error) => {
-            tracing::error!(%error, ask = id, "telegram: recording an answer failed");
-            format!(
-                "Ask {id}: the board could not record this answer; it is still open, so answer again."
-            )
-        }
+        Err(error) => not_read(&error, Some(id)),
     }
 }
 
