@@ -105,6 +105,7 @@ const JSON_IGNORED: &[&str] = &[
     "hook",
     "read-thread",
     "install",
+    "brief",
     "watch",
     "serve",
     "admin",
@@ -399,6 +400,10 @@ pub enum Command {
     /// Print or write runtime and service configuration.
     #[command(subcommand)]
     Install(crate::install::InstallCommand),
+    /// Print the standing prompt this device briefs the board's coordinator with: the
+    /// coordinator prompt, plus triage on the feedback board. A coordinator reads it at the
+    /// start of a fresh session.
+    Brief { board: BoardSlug },
     /// Run the device daemon: coordinators and wake-ups.
     Watch {
         /// Run one reconcile pass and exit.
@@ -995,6 +1000,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Install(cmd) => return crate::install::run(cmd),
         Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
+        Command::Brief { board } => {
+            let triage = board == Config::load(&home)?.feedback_board();
+            println!("{}", crate::daemon::brief(&board, triage));
+            return Ok(());
+        }
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
         Command::Ls(a) => {
             let query = TaskQuery {

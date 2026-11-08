@@ -62,8 +62,14 @@ only for a cause that is already gone.
   watched signature. Find open revisits with `task_list` on the owner's board: their titles
   start `Revisit:` and their bodies name the items and signatures they watch.
   `feedback_resolve` with kind `routed` and `task` the revisit, with no new task. When the
-  item is a `signal`, also clear the revisit's `not_before` (`task_update` with
-  `not_before` none) so it runs now.
+  item is a `signal`, also `task_note` it on the revisit with its count and window. Keep the
+  revisit's `not_before`: a revisit judges a rate over its whole window. Clear it
+  (`task_update` with `not_before` none) so the revisit runs now only in two cases:
+  - the signal shows p1 harm on the Priority scale in the coordinator instructions; counts
+    alone never make p1;
+  - its count, counted as the revisit body says, already exceeds the whole-window bar: the
+    bar's rate times the time from the watched deploy to `not_before`. For example, a bar
+    of 2 a week over 14 days gives 4.
 - An item reopened after a decline goes to the setup's owner or to the user, never back to
   `declined` for the same reason. You know it by its evidence: the server's own
   `feedback declined: <reason>` from the earlier resolution. When enough new agents keep

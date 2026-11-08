@@ -2457,3 +2457,32 @@ fn show_counts_children_by_status_and_keeps_their_ids() {
     let text = stdout(&e.run(&["show", "factory-3"]));
     assert!(!text.contains("children"), "{text}");
 }
+
+#[test]
+fn brief_prints_what_the_daemon_briefs_the_coordinator_with() {
+    let e = env();
+    let factory: board_proto::BoardSlug = "factory".parse().unwrap();
+    let out = e.run(&["brief", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("{}\n", board::daemon::brief(&factory, false))
+    );
+    assert!(
+        board::daemon::coordinator_message(&factory, false)
+            .starts_with(stdout(&out).trim_end_matches('\n'))
+    );
+    assert!(e.stub.requests().is_empty(), "no server needed");
+
+    // On this device's feedback board, triage comes with it.
+    let config = e.home.join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}feedback_board = \"factory\"\n")).unwrap();
+    let out = e.run(&["brief", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("{}\n", board::daemon::brief(&factory, true))
+    );
+    assert!(stdout(&out).contains(board::daemon::TRIAGE_PROMPT));
+}

@@ -14,7 +14,7 @@ use board::config::{Config, Home};
 use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut};
+use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut, UserMessage};
 use board_proto::{
     AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, TaskStatus,
     Timestamp,
@@ -87,6 +87,8 @@ struct FakeT3 {
     clock: Arc<Mutex<Timestamp>>,
     /// Saved by the next `t3 thread send`: a newer `board board adopt` arriving meanwhile.
     adopt_during_send: Arc<Mutex<Option<(Home, Adoption)>>>,
+    /// Each thread's `runCount`, as `t3 thread show` gives it.
+    runs: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl FakeT3 {
@@ -122,6 +124,21 @@ impl FakeT3 {
             .count()
     }
 
+    /// Sets `thread`'s `runCount`.
+    fn set_runs(&self, thread: &str, runs: u64) {
+        self.runs.lock().unwrap().insert(thread.to_owned(), runs);
+    }
+
+    /// A message to `thread` from someone other than the daemon, such as the user.
+    fn message(&self, thread: &str, text: &str) {
+        self.received
+            .lock()
+            .unwrap()
+            .entry(thread.to_owned())
+            .or_default()
+            .push(text.to_owned());
+    }
+
     fn live(&self, thread: &str) {
         self.threads.lock().unwrap().insert(
             thread.to_owned(),
@@ -129,6 +146,7 @@ impl FakeT3 {
                 archived: false,
                 runtime: Runtime::Claude,
                 worktree: None,
+                runs: None,
             },
         );
     }
@@ -216,7 +234,14 @@ impl T3 for FakeT3 {
         if self.fail_info.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread show failed: server not running");
         }
-        Ok(self.threads.lock().unwrap().get(thread).cloned())
+        let runs = self.runs.lock().unwrap().get(thread).copied();
+        Ok(self
+            .threads
+            .lock()
+            .unwrap()
+            .get(thread)
+            .cloned()
+            .map(|info| ThreadInfo { runs, ..info }))
     }
 
     async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
@@ -229,13 +254,21 @@ impl T3 for FakeT3 {
         }
         Ok(Some(RecentMessages {
             busy: self.running.lock().unwrap().iter().any(|t| t == thread),
+            // Each message started its own run.
             user: self
                 .received
                 .lock()
                 .unwrap()
                 .get(thread)
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| UserMessage {
+                    text,
+                    run: Some(format!("run:{i}")),
+                })
+                .collect(),
         }))
     }
 
@@ -591,6 +624,7 @@ async fn an_ended_coordinator_of_another_device_keeps_its_lease_and_ours_is_adop
             archived: false,
             runtime: Runtime::Claude,
             worktree: None,
+            runs: None,
         },
     );
     e.stub
@@ -738,6 +772,7 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
             archived: true,
             runtime: Runtime::Claude,
             worktree: None,
+            runs: None,
         },
     );
     e.stub.on(
@@ -788,6 +823,7 @@ fn coordinator_in(project: &Path) -> Env {
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
             rebrief_unsure: None,
+            fresh: Default::default(),
         },
     );
     e.stub
@@ -880,6 +916,7 @@ async fn a_coordinator_whose_worktree_is_gone_is_replaced() {
             archived: false,
             runtime: Runtime::Claude,
             worktree: Some(dir.path().join("worktree-removed")),
+            runs: None,
         },
     );
     e.daemon.reconcile(at()).await.unwrap();
@@ -905,6 +942,7 @@ async fn a_coordinator_whose_worktree_goes_is_replaced_at_once_and_its_answers_f
             archived: false,
             runtime: Runtime::Claude,
             worktree: Some(worktree.clone()),
+            runs: None,
         },
     );
     e.daemon.reconcile(at()).await.unwrap();
@@ -947,6 +985,7 @@ async fn an_ended_worker_whose_folder_is_gone_has_its_answer_passed_to_the_coord
             archived: false,
             runtime: Runtime::Claude,
             worktree: Some(dir.path().join("worktree-removed")),
+            runs: None,
         },
     );
     e.stub.on(
@@ -1000,6 +1039,7 @@ async fn an_adoption_waits_for_its_project_folder_and_not_for_a_gone_worktree() 
             archived: false,
             runtime: Runtime::Claude,
             worktree: Some(dir.path().join("worktree-removed")),
+            runs: None,
         },
     );
     e.daemon
@@ -1030,6 +1070,7 @@ fn coordinator_env(
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
             rebrief_unsure: None,
+            fresh: Default::default(),
         },
     );
     e.stub
@@ -2049,6 +2090,7 @@ async fn an_ended_coordinator_whose_thread_is_archived_is_not_woken_and_says_so(
             archived: true,
             runtime: Runtime::Claude,
             worktree: None,
+            runs: None,
         },
     );
     e.stub
@@ -3246,6 +3288,7 @@ async fn an_adoption_of_a_gone_or_archived_thread_is_dropped_for_a_new_thread() 
                     archived: true,
                     runtime: Runtime::Claude,
                     worktree: None,
+                    runs: None,
                 },
             );
         } else {
@@ -3463,14 +3506,20 @@ fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
         "When the earlier task has an open revisit (a child task titled `Revisit: …`, or one a note on that task names), route the item to the revisit as the rule above says",
         // The dropped-proposal rule still follows the recurring rule it is named from.
         "when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's owner (see \"Finding the owner\") and cite the earlier item and its reason: a fix that did not hold goes to the owner, not back to you. - When the owner declines or merges a routed proposal",
-        // Repeats without `recurs` go there too, and a signal brings the revisit forward.
+        // Repeats without `recurs` go there too. A signal is noted on the revisit and keeps
+        // its `not_before`, unless it shows p1 harm or already exceeds the whole-window bar.
         "Any item that repeats a problem whose fix has an open revisit goes to that revisit, with or without `recurs`",
         "Find open revisits with `task_list` on the owner's board",
         "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
-        "When the item is a `signal`, also clear the revisit's `not_before`",
+        "When the item is a `signal`, also `task_note` it on the revisit with its count and window",
+        "Keep the revisit's `not_before`: a revisit judges a rate over its whole window",
+        "so the revisit runs now only in two cases",
+        "the signal shows p1 harm on the Priority scale in the coordinator instructions; counts alone never make p1",
+        "already exceeds the whole-window bar: the bar's rate times the time from the watched deploy to `not_before`",
     ] {
         assert!(triage.contains(rule), "missing {rule:?}");
     }
+    assert!(!triage.contains("also clear the revisit's `not_before`"));
 }
 
 #[test]
@@ -4221,6 +4270,7 @@ fn named_coordinators(e: &mut Env, slugs: &[&str]) {
                 briefed: Some(board::daemon::prompt_digest(false).to_owned()),
                 rebrief_backoff: None,
                 rebrief_unsure: None,
+                fresh: Default::default(),
             },
         );
         let mut board = autopilot(Some(&agent), &[DEVICE]);
@@ -4338,6 +4388,7 @@ async fn a_coordinator_whose_checks_time_out_is_still_replaced_once_t3_answers()
                 archived: true,
                 runtime: Runtime::Claude,
                 worktree: None,
+                runs: None,
             },
         );
     };
@@ -4845,6 +4896,7 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             briefed: Some(board::daemon::prompt_digest(false).to_owned()),
             rebrief_backoff: None,
             rebrief_unsure: None,
+            fresh: Default::default(),
         },
     );
     e.stub
@@ -5394,4 +5446,227 @@ async fn a_re_brief_sent_with_a_resume_that_timed_out_is_not_repeated_with_each_
         e.daemon.state.coordinators[&slug].briefed, None,
         "owed again"
     );
+}
+
+/// Reconciles at `now` with the coordinator's thread at `runs`, then queues `task` as ready
+/// and flushes; returns the wake-up message sent.
+async fn wake_at_runs(e: &mut Env, runs: u64, now: Timestamp, seq: i64) -> String {
+    e.t3.set_runs("coord", runs);
+    e.daemon.reconcile(now).await.unwrap();
+    let task = format!("factory-{seq}");
+    queue_ready(e, seq, &[&task], now).await;
+    e.daemon.flush(now).await;
+    let sends = e.t3.sends();
+    let (thread, message) = sends.last().unwrap().clone();
+    assert_eq!(thread, "coord");
+    assert!(message.contains(&task), "{message}");
+    message
+}
+
+fn says_fresh(message: &str) -> bool {
+    message.ends_with(&board::daemon::fresh_session_line(&factory()))
+}
+
+#[tokio::test]
+async fn a_wake_up_says_a_fresh_session_is_due_after_ten_runs_and_again_ten_later() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    // The first count read starts it; each reconcile is past the thread check's spare.
+    let base = 500;
+    assert!(!says_fresh(
+        &wake_at_runs(&mut e, base, minute(0), 10).await
+    ));
+    let almost = base + FRESH_SESSION_RUNS - 1;
+    assert!(!says_fresh(
+        &wake_at_runs(&mut e, almost, minute(6), 11).await
+    ));
+    assert_eq!(reads(&e), 0, "messages read only once the count is reached");
+
+    // Board, child and pull request messages are not the user's: they hold nothing.
+    for text in [
+        "board factory: factory-3 is ready (p1)",
+        "Delegated task finished: factory-3",
+        "Update on pull request #12",
+    ] {
+        e.t3.message("coord", text);
+    }
+    let message = wake_at_runs(&mut e, base + FRESH_SESSION_RUNS, minute(12), 12).await;
+    assert!(says_fresh(&message), "{message}");
+    assert_eq!(reads(&e), 1);
+    assert_eq!(
+        message,
+        format!(
+            "board factory: factory-12 is ready (p1)\nRun board_snapshot and continue.\n{}",
+            board::daemon::fresh_session_line(&factory())
+        )
+    );
+
+    // Said once: not again before ten more runs.
+    let next = base + FRESH_SESSION_RUNS;
+    for (i, runs) in [next + 1, next + FRESH_SESSION_RUNS - 1]
+        .into_iter()
+        .enumerate()
+    {
+        let i = i as i64;
+        let message = wake_at_runs(&mut e, runs, minute(18 + 6 * i), 13 + i).await;
+        assert!(!says_fresh(&message), "{runs}: {message}");
+    }
+    let message = wake_at_runs(&mut e, next + FRESH_SESSION_RUNS, minute(30), 15).await;
+    assert!(says_fresh(&message), "{message}");
+}
+
+#[tokio::test]
+async fn a_user_message_holds_the_fresh_session_for_an_hour() {
+    use board::daemon::{FRESH_SESSION_RUNS, USER_QUIET};
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
+    let base = 40;
+    wake_at_runs(&mut e, base, minute(0), 10).await;
+
+    // The user writes to the coordinator: no fresh session while that is under an hour old.
+    e.t3.message("coord", "Why did factory-3 stop?");
+    let seen = minute(6);
+    let reached = base + FRESH_SESSION_RUNS;
+    assert!(!says_fresh(&wake_at_runs(&mut e, reached, seen, 11).await));
+    assert_eq!(reads(&e), 1);
+    // While it holds, the thread is not read again, however often it runs.
+    let message = wake_at_runs(&mut e, reached + 3, minute(40), 12).await;
+    assert!(!says_fresh(&message), "{message}");
+    assert_eq!(reads(&e), 1);
+
+    // An hour after it was first seen, a read finds nothing newer: due.
+    let after = seen + USER_QUIET;
+    let message = wake_at_runs(&mut e, reached + 4, after, 13).await;
+    assert!(says_fresh(&message), "{message}");
+    assert_eq!(reads(&e), 2);
+
+    // Ten runs on, a newer user message holds it again, from when the daemon saw it.
+    e.t3.message("coord", "Also check factory-5, please.");
+    let again = reached + 4 + FRESH_SESSION_RUNS;
+    let later = after + chrono::Duration::minutes(6);
+    assert!(!says_fresh(&wake_at_runs(&mut e, again, later, 14).await));
+    let message = wake_at_runs(&mut e, again + 1, later + USER_QUIET, 15).await;
+    assert!(says_fresh(&message), "{message}");
+}
+
+#[tokio::test]
+async fn a_fresh_session_notice_whose_send_failed_goes_with_the_retry() {
+    use board::daemon::{FRESH_SESSION_RUNS, WAKE_RETRY_FIRST};
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.set_runs("coord", FRESH_SESSION_RUNS);
+    e.daemon.reconcile(minute(6)).await.unwrap();
+    queue_ready(&mut e, 11, &["factory-11"], minute(6)).await;
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(minute(6)).await;
+    assert!(says_fresh(&e.t3.sends().last().unwrap().1));
+
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    e.daemon.flush(minute(6) + WAKE_RETRY_FIRST).await;
+    let message = e.t3.sends().last().unwrap().1.clone();
+    assert!(message.contains("factory-11"), "{message}");
+    assert!(says_fresh(&message), "{message}");
+    assert_eq!(
+        e.daemon.state.coordinators[&factory()].fresh.since,
+        Some(FRESH_SESSION_RUNS)
+    );
+}
+
+#[test]
+fn only_messages_not_from_the_board_children_or_pull_requests_are_the_users() {
+    use board::daemon::is_user_message;
+    for text in [
+        "board factory: factory-3 is ready (p1)",
+        "board agent-board: your standing instructions changed",
+        &board::daemon::fresh_session_message(&factory()),
+        "Delegated task finished",
+        "Delegated tasks t1, t2 reached terminal states.",
+        "Update on pull request #4",
+        "/compact",
+        "Background task completed.",
+        &board::daemon::coordinator_message(&factory(), false),
+        &board::daemon::adoption_message(&factory(), true),
+    ] {
+        assert!(!is_user_message(text), "{text}");
+    }
+    for text in [
+        "Please look at the deploy",
+        "board the train: it leaves at 6",
+        "the board factory: hi",
+    ] {
+        assert!(is_user_message(text), "{text}");
+    }
+}
+
+#[test]
+fn the_coordinator_prompt_carries_the_fresh_session_message() {
+    let message = board::daemon::fresh_session_message(&factory()).replace("factory", "<slug>");
+    assert!(
+        board::daemon::COORDINATOR_PROMPT.contains(&message),
+        "{message}"
+    );
+}
+
+#[test]
+fn every_brief_starts_with_what_board_brief_prints() {
+    for triage in [false, true] {
+        let brief = board::daemon::brief(&factory(), triage);
+        assert!(brief.contains(board::daemon::COORDINATOR_PROMPT));
+        assert_eq!(brief.contains(board::daemon::TRIAGE_PROMPT), triage);
+        assert!(board::daemon::coordinator_message(&factory(), triage).starts_with(&brief));
+        assert!(
+            board::daemon::rebrief_message(&factory(), triage).contains(&format!("\n\n{brief} "))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_user_message_since_the_last_thread_check_holds_the_notice_it_would_go_with() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.set_runs("coord", FRESH_SESSION_RUNS);
+    e.daemon.reconcile(minute(6)).await.unwrap();
+    // The user writes after the reconcile read the count: the flush reads it first.
+    e.t3.message("coord", "Hold on, I am looking at factory-2.");
+    queue_ready(&mut e, 11, &["factory-11"], minute(7)).await;
+    e.daemon.flush(minute(7)).await;
+    let message = e.t3.sends().last().unwrap().1.clone();
+    assert!(message.contains("factory-11"), "{message}");
+    assert!(!says_fresh(&message), "{message}");
+}
+
+#[tokio::test]
+async fn a_failed_read_sends_the_wake_up_without_the_notice_and_tries_with_the_next() {
+    use board::daemon::FRESH_SESSION_RUNS;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    wake_at_runs(&mut e, 0, minute(0), 10).await;
+    e.t3.fail_messages.store(true, Ordering::SeqCst);
+    let message = wake_at_runs(&mut e, FRESH_SESSION_RUNS, minute(6), 11).await;
+    assert!(!says_fresh(&message), "{message}");
+    e.t3.fail_messages.store(false, Ordering::SeqCst);
+    let message = wake_at_runs(&mut e, FRESH_SESSION_RUNS + 1, minute(12), 12).await;
+    assert!(says_fresh(&message), "{message}");
+}
+
+#[test]
+fn a_message_key_names_the_run_and_text_without_keeping_the_text() {
+    use board::daemon::message_key;
+    let message = |run: Option<&str>, text: &str| UserMessage {
+        text: text.to_owned(),
+        run: run.map(str::to_owned),
+    };
+    let first = message_key(&message(Some("run:7"), "secret token abc"));
+    assert!(!first.contains("secret"));
+    assert_eq!(
+        first,
+        message_key(&message(Some("run:7"), "secret token abc"))
+    );
+    // A message steered into the same run is a new one.
+    assert_ne!(
+        first,
+        message_key(&message(Some("run:7"), "and another thing"))
+    );
+    assert_ne!(first, message_key(&message(None, "secret token abc")));
 }

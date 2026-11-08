@@ -431,6 +431,39 @@ settings in use, warned once per edit.
   or reads an unknown format backs off like a failed send and sends nothing, so a
   re-brief that arrived is not sent twice. One that answers that T3 does not know the
   thread makes the next reconcile ask whether the thread is gone.
+- **Fresh sessions**: a coordinator thread runs one Claude session for days; it
+  auto-compacts about hourly, its calls carry ~170K tokens, and each compaction summary
+  carries old chat-only state forward. T3 can start a new Claude session in the same
+  thread (`t3_thread_send` with `freshContext: true`), which keeps the thread, the agent
+  id, its asks, children and pull request watches. `t3 thread send` cannot pass that flag
+  yet, so the daemon only says when one is due, and the coordinator sends it to itself at
+  a safe point (`prompts/coordinator.md`, Fresh sessions). The daemon keeps, per
+  coordinator, the thread's `runCount` from the reconcile's `t3 thread show`, and the count
+  at the last notice (the first count read starts it). Once the thread has run
+  `FRESH_SESSION_RUNS` (10) more times, the flush that is about to send the coordinator a
+  wake-up first reads the thread's 100 latest messages, within the flush's check, so a
+  read cut short keeps the wake-up queued. A user message is one that does not start with
+  `board <slug>:`, the coordinator prompt's title (the daemon's own brief), `Delegated
+  task`, `Update on pull request` or `Background task completed`, and is not `/compact`
+  (T3's idle compaction). T3's CLI gives messages no time and no sender, so the daemon
+  records the newest user message by a digest of its run id and text (never the text)
+  with the time it first saw it, and holds the notice while that is under `USER_QUIET`
+  (60 minutes) old, without reading again meanwhile. Otherwise that wake-up ends with the
+  line `board <slug>: a fresh session is due …`, and the count starts again from the last
+  one read: a coordinator that cannot rotate then (it owns a task in doing, runs
+  background work, or the user is talking with it) hears again `FRESH_SESSION_RUNS` runs
+  later. A read that fails sends the wake-up without the notice, and a failed send leaves
+  the notice for the retry. A message another agent sent the thread looks like the
+  user's, which only delays the notice. The coordinator writes its
+  state to the board first: its handoff, a thread link on each dispatched task, and a
+  `decision` note for each instruction the user gave in chat. The user's board-wide
+  decisions go on one `dropped` task per board, `Board decisions from the user`, named in
+  the coordinator's handoff. The fresh session's first message runs `board brief <slug>`,
+  which prints the standing prompt the daemon briefs with on that device (the triage
+  prompt added on the feedback board), from the same source. The interval is a tuned
+  value with a revisit. Rejected: a new thread (it changes the agent id, and breaks asks,
+  owned tasks, children and pull request watches), and a lower compaction threshold (it
+  keeps the summary drift).
 - **Adopting a thread instead**: when a thread already does a board's work,
   `board board adopt <board> <thread>`, run on a home device, makes that thread the
   coordinator instead of a new one. The command refuses when the board has a live
@@ -632,6 +665,140 @@ settings in use, warned once per edit.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
   before the reset time.
+
+## Daemon dispatch (planned)
+
+Status: planned, not built (agent-board-308; the user chose it on 2026-11-08). It replaces
+the coordinator thread above one board at a time. Until a board switches, the previous
+section holds for that board.
+
+**Why**: a coordinator is one Claude session that lives for days. On agent-board
+(2026-11-06 to 11-08) it ran 506 turns. It auto-compacted 29 times at about 267K tokens.
+Its median call carried 173K tokens. Each compaction summary carried old, chat-only state
+forward (agent-board-292). Most of that context is not needed. About 39% of its wakes were
+routine: PR updates, answered asks, and ready tasks at a limit of 1. Each other wake needs
+one task and one section of the prompt, not the days before it.
+
+**Parts**:
+
+- **Dispatcher**: the daemon on the device that holds the board's coordinator lease. It
+  holds the lease as a device agent (`dispatch:<device>`) with the coordinator's rights on
+  the board, and writes its notes and updates as that agent. It runs no model. It does
+  the routine steps in code and starts the threads below.
+- **Worker**: a T3 thread started for one task. Its brief (`prompts/worker.md`) holds the
+  rules a coordinator puts in each brief today (Loop step 4). It works as a delegated
+  child does now: it claims the task, leases paths, opens a PR, parks the task in
+  `review` with a note, and ends.
+- **Judge**: a T3 thread started for one judgment event. Its brief is the shared rules
+  plus one section (`prompts/judges/<kind>.md`). It finishes in one run. It never waits
+  or polls. When it needs the user, it asks and ends. Then it settles its thread. While
+  it runs, the server gives it the coordinator's rights on the board, because the
+  dispatcher registered it as a judge of that board. It starts with no history. All it
+  needs is on the board.
+
+**The switch**: a board setting `dispatch`, either `thread` (the coordinator, default) or
+`daemon`, set with `board board set <slug> --dispatch daemon`. When a board switches to
+`daemon`:
+
+1. The daemon stops waking the coordinator thread.
+2. It sends that thread one last message: record each instruction the user gave in chat
+   as a `decision` note, hand each task it owns in `doing` to its child or back to
+   `open`, then end.
+3. The dispatcher takes the lease.
+
+**Routing** (event, then what handles it):
+
+| Event | Handled by |
+|---|---|
+| A ready `auto` task and a free slot | The dispatcher starts a worker |
+| A task moves to `review` | A review judge, unless one already runs for that task |
+| A pass verdict with the PR still open | The dispatcher merges once the checks pass |
+| PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task |
+| A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals |
+| An ask answered, asker can be woken | The asker, as today |
+| An ask answered, asker gone | The dispatcher: a `decision` note with the answer, then the task back to `open` |
+| An owner away from `doing` | Wake it as today. At the repeat, if it is still away, the dispatcher sets the task `open` with a note naming the old thread and branch |
+| Nothing ready or in progress, goal review due | A goal judge |
+| A ready item on the feedback board | A triage judge |
+| A changed standing prompt | Nothing: each new thread starts with the current briefs |
+
+**Slots**: `parallel_tasks` still limits the tasks in progress: tasks in `doing` that
+workers own, plus tasks the dispatcher started a worker for that it has not claimed yet.
+Judges do not count, but at most 2 judges run per board at once. The rest wait, oldest
+first. With one slot, the dispatcher takes the highest-priority ready `auto` task, the
+oldest first on a tie. With more slots, code checks only the mechanical rules:
+
+- Neither task waits on the other.
+- No agent of the board stopped on a usage limit since the tasks in progress started.
+
+The file rules are left to the worker's lease check. A worker whose lease overlaps
+another task in progress stops and leaves its task `open`. The dispatcher skips that task
+until a task in progress ends. The rules a coordinator judged by eye (size L, shared kinds
+of files) are dropped. The revisit measures what dropping them costs.
+
+**Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>
+--title "<id> <title>" -`. The brief goes in on stdin. The folder is the `[projects]`
+folder for the task's repository, and `<base>` is chosen as for a coordinator. The
+dispatcher records the thread in `watch.json` and notes its link on the task. The worker
+reads the task's notes itself. Its brief says that every finding and decision is part of
+the work.
+
+**Judges**:
+
+- **Review**:
+  - It runs in a worktree on the PR's head.
+  - It reads `task_show` and the diff, and runs every acceptance check.
+  - On pass, it adds a `review: pass` decision note with a summary for the user. It turns
+    on auto-merge where the base branch requires checks; elsewhere the merge is left to
+    the dispatcher. It files the task's revisit when Revisits calls for one.
+  - On fail, it adds a finding note per failed check and sets the task `open`, so a new
+    worker starts.
+  - After two failed reviews of the same task, it fixes the task itself in its worktree.
+  - It also gives verdicts on proposals filed under the task. It sets priority and
+    blockers on the other tasks filed there.
+- **Verdict**: it follows "Proposals and triage" and runs in the project folder, reading
+  only. A proposal that needs a second verdict gets it from another judge.
+- **Goal** and **triage**: they follow the goal review and Triage rules above.
+
+**Merging and finishing**:
+
+- For a task in `review` with a pass verdict and an open PR, the dispatcher reads the PR
+  (`gh pr view --json`) at most every 2 minutes.
+- Once every check passes and the branch is up to date, it merges by the repository's
+  rules. When the branch is behind, it runs `gh pr update-branch`. On a conflict, it sets
+  the task `open` with a note, so a worker resolves it.
+- Once the PR is merged (or the task has none) and the worker no longer runs, the
+  dispatcher hands the task to itself and calls `task_done`. The evidence is the PR, the
+  merge commit and the checks the judge recorded. The summary is the judge's.
+
+**Rights and records**:
+
+- The server learns two new things:
+  - a `dispatch` agent kind;
+  - the judges a lease holder registers for its board (agent, kind, tasks).
+- A registered judge has the coordinator's rights on that board until its agent ends,
+  or for at most 2 hours.
+- Turn endings are kept for judges as they are for a coordinator today (Reporting to the
+  user).
+- Workers are ordinary agents.
+
+**What this loses**:
+
+- Memory across events: the board is the only record. An instruction the user gives in
+  a thread must become a `decision` note.
+- A standing chat: the user uses asks, the web view, or any thread.
+- The side-by-side judgment described above.
+
+Each judge starts at about 43-55K tokens, mostly cache reads within the hour. A replay of
+agent-board-292's transcript estimates input tokens at about a quarter of the coordinator's.
+That is an estimate, not a measurement.
+
+**Rollout**:
+
+1. agent-board switches first. A revisit one week later measures tokens per day, the
+   wait for dispatch and review, rework, and overlap stops.
+2. Other boards switch once that revisit holds.
+3. Then the coordinator-thread path is removed.
 
 ## Notifications and the web view
 
