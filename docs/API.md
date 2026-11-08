@@ -148,8 +148,15 @@ server's minute sweep deletes older ones.
   refused before anything is sent, with an error that says to drop the flag. Elsewhere,
   where the environment proves no identity, any agent may be named. The server does not
   check this.
-- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents that ended more
-  than 7 days ago are left out unless `state=ended`; they stay members of the board.
+- `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents not seen for more
+  than 7 days are left out whatever their state, since a session that crashed never sends
+  `ended`. Kept are agents that wait for a usage-limit reset still to come (`paused_until`
+  ahead, also when ended), agents `paused` with no reset (they wait for the user), and the
+  board's coordinator while its lease is live (the daemon renews the lease without marking
+  the agent seen). `state=ended` lists every ended agent. The agents left out stay members
+  of the board, and a call that marks one seen (a registration, a state update or another
+  write as that agent; reads do not) lists it again. (Servers before this change left out
+  only agents that ended more than 7 days ago.)
 - `GET /v1/agents/{id}` → `[Agent]`.
 - `POST /v1/agents/{id}/state` `[AgentStateUpdate]` → `[Agent]`. Heartbeat and lifecycle.
   `ended` releases the agent's file leases; owned tasks stay owned. Its coordinator lease
@@ -357,6 +364,16 @@ Reopening a closed board, or any change on it, starts the period again.
   `not_before` has not passed. A pending proposal is refused the same way, with 400
   `invalid_transition`, until a verdict sets it `auto`. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
+  A task in `review` or `blocked`:
+  - owned by the caller or by nobody: the claim resumes it, as `PATCH` with
+    `status: doing` would (the same `task_updated` event, not `task_claimed`), after the
+    checks above (blockers done, `not_before` passed, the `doing` limit, not an unaccepted
+    proposal). It is refused with 400 `invalid_transition` while the task may wait on the
+    user: a `blocked` task with a `blocked_reason` (`next` quotes the reason and says to
+    resume it with `task_update <id> status=doing` only once it no longer holds), or an
+    open ask on the task (`next` names the ask).
+  - owned by another live agent: 409 `claim_refused` naming the owner.
+  - owned by a stale agent: 400 `invalid_transition`, with `next` naming `take=true`.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
   board coordinator or user only (as status changes below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`; records a
@@ -529,8 +546,14 @@ use, autopilot off). Items get `auto` from that board's autopilot.
 - A report whose signature matches a **live** item adds to it instead of filing a new one
   (`duplicate: true`): `reports` grows by one, the reporter joins `reporters` (the latest
   20), and at most once an hour a `feedback` note says it was reported again, naming the
-  routed task and its status when routed, with a `task_updated` event
-  `{"fields": ["feedback"], "reports": n}`. A report leaves the task's `version` alone, so
+  task doing the work and its status (the routed task, or a plain task the item is a
+  duplicate of), with a `task_updated` event `{"fields": ["feedback"], "reports": n}`.
+  The same hourly report also adds a plain `note` to that task while it is not done or
+  dropped, so its owner sees the new evidence in its alerts. The note gives the item, the
+  report count, the number of distinct reporters, their ids (newest first, cut at the note
+  limit) and the report's first line, quoted as data written by another agent; for a
+  signal, the error's summary. Notes record the reporter as author; the `note_added`
+  event's actor is `server` for a signal. A report leaves the task's `version` alone, so
   it never makes the owner's update conflict, except the one that reopens a declined item
   (below), which changes its status. The newest item with the signature is live
   while it is unresolved and not done or dropped, declined, a duplicate of a live item (the

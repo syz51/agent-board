@@ -127,7 +127,11 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
   it for choosing the identity; in a T3 thread the check still runs once, because
   `--agent` there may name only the thread's own agent.
-- **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
+- **Ownership is durable; leases expire.** A claimed task stays owned across restarts. A
+  claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
+  it, with a claim's checks, so an agent returning to its own work is not sent away; a
+  `blocked_reason` or an open ask on the task still refuses it, since the task may wait on
+  the user. Another live agent's parked task is refused, naming the owner. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). File
@@ -778,9 +782,14 @@ report, not a free-form task (`API.md`, "Feedback"):
   the `activity` it interrupted; hooks may file reports with source `capture`.
 - **Dedupe and recurrence.** Reports with the same signature (given, or derived from
   `about` and the title) land on one item while it is live, so a problem reported by ten
-  agents is one task with ten reports rather than ten tasks. Once the item is routed to a
-  task and that task is done, a new report opens a new item that `recurs` the old one: the
-  fix did not hold, and the history shows it.
+  agents is one task with ten reports rather than ten tasks. A routed item is resolved, so
+  triage no longer watches it: while the routed task (or a plain task the item duplicates)
+  is open, a report also adds a note to that task, at most once an hour per item, with the
+  report count, the reporters and the report's first line quoted as data. Its owner, who
+  sets the priority the evidence meets, sees it as an alert. It is a plain note, not a
+  finding, so hourly repeats do not pile up items to answer at `task_done`. Once the item is
+  routed to a task and that task is done, a new report opens a new item that `recurs` the
+  old one: the fix did not hold, and the history shows it.
 - **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
   does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere,
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
