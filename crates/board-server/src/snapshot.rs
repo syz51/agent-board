@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 use board_proto::{
     Agent, AgentId, AgentSource, AgentState, BoardSlug, Event, EventType, Runtime, Snapshot,
@@ -23,8 +24,8 @@ use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{priority_str, status_str};
 use crate::store::{
-    NamedParams, agent_boards, counts, find_handoff, get_agent, get_board, handle_of, is_live,
-    json_ids, latest_events, load_agents, load_events, load_tasks,
+    EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
+    get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -63,6 +64,24 @@ pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      OR (type = 'task_taken' AND json_extract(payload, '$.from') = :me) \
      OR (type = 'ask_answered' AND json_extract(payload, '$.agent') = :me) \
      OR (type = 'task_created' AND :any_mine))";
+
+/// The alert scan: events after `:since` that pass [`ALERT_FILTER`], in seq order.
+///
+/// `NOT INDEXED` keeps both alert queries on the seq range of the events table, which the
+/// window bounds to `ALERT_WINDOW` rows. Left to choose, the planner reads each watched
+/// type's whole history from `events_type (type, at)`, which grows with retention.
+pub(crate) static ALERT_EVENTS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {EVENT_COLUMNS} FROM events NOT INDEXED \
+         WHERE seq > :since AND {ALERT_FILTER} ORDER BY seq LIMIT :limit"
+    )
+});
+
+/// How many events after `:since` pass [`ALERT_FILTER`], on the same range as
+/// [`ALERT_EVENTS`].
+pub(crate) static ALERTS_LEFT: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT COUNT(*) FROM events NOT INDEXED WHERE seq > :since AND {ALERT_FILTER}")
+});
 
 #[derive(Debug, Clone, Serialize)]
 struct Model {
@@ -229,8 +248,6 @@ pub(crate) struct Request {
     pub kind: SnapshotKind,
     pub since: Option<i64>,
     pub format: SnapshotFormat,
-    /// Advance the agent's cursor (the agent itself is asking).
-    pub advance: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -239,7 +256,16 @@ struct ShownCounts {
     counts: Counts,
 }
 
-pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
+/// A rendered snapshot, with what [`advance`] records when the agent itself asked for it.
+pub(crate) struct Rendered {
+    pub snapshot: Snapshot,
+    agent: AgentId,
+    /// The board counts shown, to compare the next delta with; `None` keeps the stored ones.
+    shown: Option<ShownCounts>,
+}
+
+/// Renders a snapshot and changes nothing, so a read transaction can run it.
+pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     let agent = get_agent(cx, &req.agent)?;
     let (cursor, shown): (i64, Option<String>) = cx.db.query_row(
         "SELECT cursor, last_counts FROM agents WHERE id = ?1",
@@ -308,24 +334,35 @@ pub(crate) fn snapshot(cx: &mut Ctx<'_>, req: Request) -> Result<Snapshot> {
             }
         }
     };
-    if req.advance {
-        crate::ops::touch_agent(cx, &agent.id)?;
-        let counts_json = match req.kind {
-            SnapshotKind::Alerts => None,
-            _ => shown_now.map(|s| serde_json::to_string(&s).expect("serializes")),
-        };
-        cx.db.execute(
-            "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
-             WHERE id = ?1",
-            params![agent.id.as_str(), scanned_to, counts_json],
-        )?;
-    }
-    Ok(Snapshot {
-        kind: req.kind,
-        text,
-        seq: scanned_to,
-        at: cx.now,
+    let shown = match req.kind {
+        SnapshotKind::Alerts => None,
+        _ => shown_now,
+    };
+    Ok(Rendered {
+        snapshot: Snapshot {
+            kind: req.kind,
+            text,
+            seq: scanned_to,
+            at: cx.now,
+        },
+        agent: agent.id,
+        shown,
     })
+}
+
+/// Records that the agent itself saw `rendered`: it counts as seen, and its cursor and
+/// shown counts move past it. Runs in the write transaction that rendered it.
+pub(crate) fn advance(cx: &mut Ctx<'_>, rendered: Rendered) -> Result<Snapshot> {
+    crate::ops::touch_agent(cx, &rendered.agent)?;
+    let shown = rendered
+        .shown
+        .map(|s| serde_json::to_string(&s).expect("serializes"));
+    cx.db.execute(
+        "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
+         WHERE id = ?1",
+        params![rendered.agent.as_str(), rendered.snapshot.seq, shown],
+    )?;
+    Ok(rendered.snapshot)
 }
 
 /// The board a snapshot is about: the board of the agent's task in `doing`, else a board
@@ -851,7 +888,13 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         (":mine", &mine_json),
         (":any_mine", &any_mine),
     ];
-    let events = load_events(cx, ALERT_FILTER, &filter, skipped_to, ALERT_SCAN)?;
+    let mut params = filter.clone();
+    params.extend([(":since", &skipped_to as _), (":limit", &ALERT_SCAN as _)]);
+    let events: Vec<Event> = cx
+        .db
+        .prepare_cached(&ALERT_EVENTS)?
+        .query_map(params.as_slice(), event_row)?
+        .collect::<rusqlite::Result<_>>()?;
     let scanned_to = match events.last() {
         Some(last) if events.len() == ALERT_SCAN as usize => last.seq,
         _ => seq,
@@ -861,9 +904,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         let mut params = filter.clone();
         params.push((":since", &scanned_to));
         cx.db
-            .prepare_cached(&format!(
-                "SELECT COUNT(*) FROM events WHERE seq > :since AND {ALERT_FILTER}"
-            ))?
+            .prepare_cached(&ALERTS_LEFT)?
             .query_row(params.as_slice(), |r| r.get(0))?
     } else {
         0
