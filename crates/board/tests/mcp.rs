@@ -19,13 +19,27 @@ struct Mcp {
 
 impl Mcp {
     fn start(home: &std::path::Path, cwd: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_board"))
-            .arg("mcp")
+        Self::spawn(home, cwd, &[], Some("thread-1"))
+    }
+
+    /// Runs `board <args> mcp`, in the T3 thread `t3_thread` or outside T3.
+    fn spawn(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        args: &[&str],
+        t3_thread: Option<&str>,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_board"));
+        command.args(args).arg("mcp");
+        match t3_thread {
+            Some(thread) => command.env("T3CODE_THREAD_ID", thread),
+            None => command.env_remove("T3CODE_THREAD_ID"),
+        };
+        let mut child = command
             .current_dir(cwd)
             .env("BOARD_HOME", home)
             .env("BOARD_TOKEN", TOKEN)
             .env("BOARD_KEYCHAIN", "0")
-            .env("T3CODE_THREAD_ID", "thread-1")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -593,6 +607,90 @@ fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
         json!({"id": "factory-12", "agent": "t3:thread-1"}),
     );
     assert_ne!(ok["isError"], true, "{ok}");
+    assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
+}
+
+#[test]
+fn agent_naming_an_unknown_id_is_refused_without_a_write() {
+    const STRAY: &str = "claude:e2e-xb";
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let not_found =
+        json!({"code": "not_found", "message": "no such agent", "next": "register first"});
+    stub.on_status(&format!("GET /v1/agents/{}", enc(STRAY)), 404, &not_found);
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(STRAY, DEVICE, board_proto::AgentState::Running),
+    );
+    stub.on(
+        "POST /v1/tasks/factory-12/claim",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let start = |args: &[&str], t3_thread: Option<&str>| {
+        let mut mcp = Mcp::spawn(&home, &cwd, args, t3_thread);
+        mcp.request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+        );
+        mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        mcp
+    };
+    let writes = || -> Vec<_> {
+        stub.requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect()
+    };
+
+    // Outside T3 with no identity, agent= may name any id, but not one the server does
+    // not know.
+    let mut mcp = start(&[], None);
+    let refused = mcp.call(2, "task_claim", json!({"id": "factory-12", "agent": STRAY}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(text(&refused).contains("does not know"), "{refused}");
+    assert!(
+        text(&refused).contains("leave agent out to act as yourself"),
+        "{refused}"
+    );
+    assert!(writes().is_empty(), "{:?}", writes());
+    drop(mcp);
+
+    // An unknown --agent at start-up is refused too, also when agent= repeats it.
+    let mut mcp = start(&["--agent", STRAY], None);
+    for (n, args) in [
+        (2, json!({"id": "factory-12"})),
+        (3, json!({"id": "factory-12", "agent": STRAY})),
+    ] {
+        let refused = mcp.call(n, "task_claim", args);
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(text(&refused).contains("does not know"), "{refused}");
+        assert!(text(&refused).contains("--register"), "{refused}");
+    }
+    assert!(writes().is_empty(), "{:?}", writes());
+    drop(mcp);
+
+    // In a T3 thread, --agent at start-up may name only the thread's own agent, even with
+    // --register.
+    stub.clear();
+    let mut mcp = start(&["--agent", STRAY, "--register"], Some("thread-1"));
+    let refused = mcp.call(2, "task_claim", json!({"id": "factory-12"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        text(&refused).contains("this session is t3:thread-1"),
+        "{refused}"
+    );
+    assert!(stub.requests().is_empty(), "{:?}", stub.requests());
+    drop(mcp);
+
+    // With --register, a script's own fixed id registers, also named again by agent=.
+    let mut mcp = start(&["--agent", STRAY, "--register"], None);
+    let ok = mcp.call(2, "task_claim", json!({"id": "factory-12", "agent": STRAY}));
+    assert_ne!(ok["isError"], true, "{ok}");
+    assert_eq!(stub.requests_to("POST /v1/agents")[0].body["id"], STRAY);
     assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
 }
 
