@@ -34,7 +34,11 @@ says how many tasks you and your children may have in progress at once (the boar
 4. Delegate it: start one child thread per task with T3 `delegate_task`, in its own
    worktree (`isolation: "worktree"`). Do a task yourself only when it changes no files in
    the repository (a verdict, a note, an investigation, an ask) or a child failed it
-   twice; never edit the project's checkout while children work. Put each finding and
+   twice. Never change files, switch branches or merge in the project root, the checkout
+   other threads share. Do any file work yourself in a worktree of your own, on a new
+   branch per task (not under `coordinator/`): the daemon starts a coordinator in its own
+   worktree, on a `coordinator/<board>` branch; when your working directory is the project
+   root, as for an older or adopted coordinator, add a worktree first. Put each finding and
    decision noted on the task into the brief, in your words, so the child does not miss
    one. Name the task ids in each brief, and
    tell each child to `task_claim` its task, lease the paths it will change

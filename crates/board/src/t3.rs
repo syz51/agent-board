@@ -1,8 +1,11 @@
 //! The T3 Code commands the device daemon runs, behind a trait so tests use a fake.
 //!
 //! Commands (checked against `t3` v0.1.8 help):
-//! - `t3 thread start --json --title <title> <project path> -` with the message on stdin;
-//!   prints the new thread.
+//! - `t3 thread start --json --title <title> [--worktree <base> --branch <branch>]
+//!   <project path> -` with the message on stdin; prints the new thread. With `--worktree`,
+//!   T3 creates the branch from the base and checks it out in a new worktree after it
+//!   created the thread, so a branch that already exists fails the thread's first run, not
+//!   the command.
 //! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
 //!   next turn.
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state; with `--messages 0`
@@ -36,13 +39,22 @@ pub struct ListedThread {
     pub ran: bool,
 }
 
+/// A new git worktree for a thread: the `branch` T3 creates from `base` and checks out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWorktree {
+    pub base: String,
+    pub branch: String,
+}
+
 pub trait T3: Send + Sync {
-    /// Starts a thread in the project containing `project` and returns its id.
+    /// Starts a thread in the project containing `project`, in a new `worktree` when one is
+    /// given, else in the project folder, and returns its id.
     fn start_thread(
         &self,
         project: &Path,
         title: &str,
         message: &str,
+        worktree: Option<&NewWorktree>,
     ) -> impl Future<Output = Result<String>> + Send;
 
     /// Sends a message to a thread.
@@ -144,9 +156,19 @@ impl T3Cli {
 }
 
 impl T3 for T3Cli {
-    async fn start_thread(&self, project: &Path, title: &str, message: &str) -> Result<String> {
+    async fn start_thread(
+        &self,
+        project: &Path,
+        title: &str,
+        message: &str,
+        worktree: Option<&NewWorktree>,
+    ) -> Result<String> {
         let project = project.to_string_lossy();
-        let args = ["thread", "start", "--json", "--title", title, &project, "-"];
+        let mut args = vec!["thread", "start", "--json", "--title", title];
+        if let Some(worktree) = worktree {
+            args.extend(["--worktree", &worktree.base, "--branch", &worktree.branch]);
+        }
+        args.extend([&*project, "-"]);
         let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
         if !ok {
             bail!("t3 thread start failed: {}", stderr.trim());
@@ -275,6 +297,60 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A `t3` that records its arguments and prints a started thread.
+    #[cfg(unix)]
+    fn recording_t3(dir: &Path) -> (T3Cli, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let log = dir.join("args");
+        let bin = dir.join("t3");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\necho '{{\"threadId\":\"t-1\"}}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (T3Cli { bin }, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn threads_start_in_a_new_worktree_only_when_given_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t3, log) = recording_t3(dir.path());
+        let args = || std::fs::read_to_string(&log).unwrap();
+
+        let worktree = NewWorktree {
+            base: "origin/main".into(),
+            branch: "coordinator/factory".into(),
+        };
+        let id = t3
+            .start_thread(
+                Path::new("/src/p"),
+                "factory coordinator",
+                "hi",
+                Some(&worktree),
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, "t-1");
+        assert_eq!(
+            args(),
+            "thread\nstart\n--json\n--title\nfactory coordinator\n--worktree\norigin/main\n\
+             --branch\ncoordinator/factory\n/src/p\n-\n"
+        );
+
+        t3.start_thread(Path::new("/src/p"), "factory coordinator", "hi", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            args(),
+            "thread\nstart\n--json\n--title\nfactory coordinator\n/src/p\n-\n"
+        );
+    }
 
     #[test]
     fn thread_ids_parse_from_json_or_text() {

@@ -14,7 +14,7 @@ use board::config::{Config, Home};
 use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{ListedThread, T3, ThreadInfo, TimedOut};
+use board::t3::{ListedThread, NewWorktree, T3, ThreadInfo, TimedOut};
 use board_proto::{
     AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Runtime, TaskDetail, Timestamp,
 };
@@ -31,6 +31,7 @@ enum Call {
         project: PathBuf,
         title: String,
         message: String,
+        worktree: Option<NewWorktree>,
     },
     Send {
         thread: String,
@@ -119,11 +120,18 @@ impl FakeT3 {
 }
 
 impl T3 for FakeT3 {
-    async fn start_thread(&self, project: &Path, title: &str, message: &str) -> Result<String> {
+    async fn start_thread(
+        &self,
+        project: &Path,
+        title: &str,
+        message: &str,
+        worktree: Option<&NewWorktree>,
+    ) -> Result<String> {
         self.calls.lock().unwrap().push(Call::Start {
             project: project.to_path_buf(),
             title: title.to_owned(),
             message: message.to_owned(),
+            worktree: worktree.cloned(),
         });
         if self.fail_start.load(Ordering::SeqCst) {
             anyhow::bail!("t3 thread start failed: no such project");
@@ -297,6 +305,7 @@ async fn a_home_device_starts_a_coordinator_when_none_is_live() {
             project,
             title,
             message,
+            worktree: None,
         },
     ] = calls.as_slice()
     else {
@@ -2823,6 +2832,19 @@ fn the_coordinator_prompt_files_what_remains_before_task_done() {
     }
 }
 
+#[test]
+fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    for rule in [
+        "Never change files, switch branches or merge in the project root",
+        "Do any file work yourself in a worktree of your own, on a new branch per task",
+        "when your working directory is the project root, as for an older or adopted coordinator, add a worktree first",
+    ] {
+        assert!(prompt.contains(rule), "missing {rule:?}");
+    }
+}
+
 /// Reconciles once with `config` on a home device of the autopilot `board`, whose
 /// coordinator lease is free, and returns the fake `t3` and the stub.
 async fn start_with(board: Board, config: Config) -> (FakeT3, Stub) {
@@ -2899,6 +2921,93 @@ async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
     let (t3, stub) = start_with(board_fixture("factory", &[REPO]), config).await;
     assert_eq!(started(&t3).0, Path::new("/src/agent-board"));
     assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
+}
+
+/// Runs git in `dir` with no user or system config, and panics when it fails.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+#[tokio::test]
+async fn a_git_project_starts_the_coordinator_in_its_own_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=trunk"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let config = Config {
+        projects: [(REPO.to_owned(), repo.clone())].into(),
+        ..Config::default()
+    };
+    let (t3, _) = start_with(board_fixture("factory", &[REPO]), config.clone()).await;
+    let calls = t3.calls();
+    let [
+        Call::Start {
+            project, worktree, ..
+        },
+    ] = calls.as_slice()
+    else {
+        panic!("{calls:?}");
+    };
+    assert_eq!(project, &repo, "T3 finds the project by its folder");
+    // The remote's default branch, not `main`, and a stable branch per board.
+    let expected = NewWorktree {
+        base: "origin/trunk".into(),
+        branch: "coordinator/factory".into(),
+    };
+    assert_eq!(worktree.as_ref(), Some(&expected));
+
+    // A re-start leaves the branch and worktree an earlier coordinator left, which a live
+    // thread may still use, and takes a branch of its own.
+    let old = dir.path().join("old");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "coordinator/factory",
+            old.to_str().unwrap(),
+            "origin/trunk",
+        ],
+    );
+    let (t3, _) = start_with(board_fixture("factory", &[REPO]), config).await;
+    let calls = t3.calls();
+    let [Call::Start { worktree, .. }] = calls.as_slice() else {
+        panic!("{calls:?}");
+    };
+    let branch = worktree.as_ref().map(|w| w.branch.as_str()).unwrap_or("");
+    assert!(branch.starts_with("coordinator/factory-"), "{worktree:?}");
+    assert!(old.exists());
+
+    // A folder outside git starts in the folder itself.
+    let config = Config {
+        board_projects: [(factory(), dir.path().join("plain"))].into(),
+        ..Config::default()
+    };
+    std::fs::create_dir(dir.path().join("plain")).unwrap();
+    let (t3, _) = start_with(board_fixture("factory", &[]), config).await;
+    let calls = t3.calls();
+    let [Call::Start { worktree, .. }] = calls.as_slice() else {
+        panic!("{calls:?}");
+    };
+    assert_eq!(worktree, &None);
 }
 
 /// An env whose daemon has no project for the factory board yet, nor a `config.toml`.
