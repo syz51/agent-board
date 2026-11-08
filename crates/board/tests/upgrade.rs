@@ -3,8 +3,9 @@
 //! operator's clone the script runs from, and the server's clone it moves.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -172,11 +173,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn write_exec(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 impl Env {
     fn new() -> Env {
         let dir = tempfile::tempdir().unwrap();
@@ -211,7 +207,7 @@ impl Env {
         }
         git(&root, &["clone", "-q", "origin.git", "server"]);
         for (name, text) in STUBS {
-            write_exec(&root.join("bin").join(name), text);
+            common::script::write_script(&root.join("bin").join(name), text);
         }
         fs::write(
             root.join("hosts.conf"),

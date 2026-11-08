@@ -1145,12 +1145,12 @@ mod tests {
 
     #[test]
     fn over_long_text_is_refused_before_sending() {
-        assert!(check_chars("title", &"x".repeat(72), limits().title_chars).is_ok());
-        let err = check_chars("title", &"x".repeat(80), limits().title_chars).unwrap_err();
+        assert!(check_chars("title", &"x".repeat(80), limits().title_chars).is_ok());
+        let err = check_chars("title", &"x".repeat(81), limits().title_chars).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "title is 80 characters; the limit is 72 (not sent)\n\
-             next: shorten title to at most 72 characters, or put the detail in the body"
+            "title is 81 characters; the limit is 80 (not sent)\n\
+             next: shorten title to at most 80 characters, or put the detail in the body"
         );
     }
 }

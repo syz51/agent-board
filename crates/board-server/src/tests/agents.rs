@@ -131,30 +131,35 @@ async fn handoffs_are_replaced_whole_with_versions() {
         .await;
     assert_eq!(h["version"], 2);
     assert_eq!(t.ok("GET", &path, None, None).await["now"], "testing");
-    assert_eq!(defaults().handoff_field_chars, 300);
-    let long = "x".repeat(280);
+    // now takes 400 characters (ask #98); next and blockers keep 300.
+    assert_eq!(
+        (defaults().handoff_now_chars, defaults().handoff_field_chars),
+        (400, 300)
+    );
     let h = t
         .ok(
             "PUT",
             &path,
             Some(a),
-            Some(json!({ "now": long, "next": "push", "version": 2 })),
-        )
-        .await;
-    assert_eq!(h["version"], 3);
-    let (s, _) = t
-        .call(
-            "PUT",
-            &path,
-            Some(a),
             Some(json!({
-                "now": "x".repeat(defaults().handoff_field_chars + 1),
-                "next": "y",
-                "version": 3,
+                "now": "x".repeat(400),
+                "next": "y".repeat(300),
+                "blockers": "z".repeat(300),
+                "version": 2,
             })),
         )
         .await;
-    assert_eq!(s.as_u16(), 400);
+    assert_eq!(h["version"], 3);
+    for (field, len) in [("now", 401), ("next", 301), ("blockers", 301)] {
+        let mut body = json!({ "now": "x", "next": "y", "version": 3 });
+        body[field] = json!("x".repeat(len));
+        let (s, v) = t.call("PUT", &path, Some(a), Some(body)).await;
+        assert_eq!(s.as_u16(), 400, "{field}");
+        assert_eq!(
+            v["message"],
+            format!("{field} is {len} characters; the limit is {}", len - 1)
+        );
+    }
 }
 
 #[tokio::test]

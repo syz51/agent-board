@@ -440,18 +440,15 @@ mod tests {
     /// A `t3` that records its arguments and prints a started thread.
     #[cfg(unix)]
     fn recording_t3(dir: &Path) -> (T3Cli, PathBuf) {
-        use std::os::unix::fs::PermissionsExt as _;
         let log = dir.join("args");
         let bin = dir.join("t3");
-        std::fs::write(
+        crate::test_script::write_script(
             &bin,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\necho '{{\"threadId\":\"t-1\"}}'\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (T3Cli { bin }, log)
     }
 

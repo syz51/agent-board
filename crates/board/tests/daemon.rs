@@ -4543,8 +4543,6 @@ fn an_unreadable_watch_state_is_kept_aside_with_a_warning() {
 #[cfg(unix)]
 #[test]
 fn a_coordinator_start_is_logged() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
     stub.on("GET /healthz", json!({"ok": true, "seq": 5}));
@@ -4565,18 +4563,16 @@ fn a_coordinator_start_is_logged() {
         },
     );
     let t3 = dir.path().join("t3");
-    std::fs::write(
+    common::script::write_script(
         &t3,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$1 $2\" in\n\
              'thread start') cat >/dev/null; echo '{{\"threadId\":\"{NEW_THREAD}\"}}' ;;\n\
              'thread show') echo '{{\"thread\":{{\"archived\":false}}}}' ;;\n\
              'thread list') echo '{{\"threads\":[]}}' ;;\n\
              *) cat >/dev/null ;;\nesac\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let home = home_for(dir.path(), &stub.url);
     let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     std::fs::write(

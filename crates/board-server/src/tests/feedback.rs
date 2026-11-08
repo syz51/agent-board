@@ -974,9 +974,15 @@ async fn reports_are_validated() {
     )
     .await;
     let title = filed["task"]["title"].as_str().unwrap();
-    assert_eq!(title.chars().count(), 72);
+    assert_eq!(title.chars().count(), 80);
     assert!(title.ends_with('…'));
     assert_eq!(filed["task"]["feedback"]["source"], "capture");
+    // The signature keeps the first 72 characters, as before titles took 80, so reports
+    // after the change join items filed before it.
+    assert_eq!(
+        filed["task"]["feedback"]["signature"],
+        format!("board:{}w…", "word ".repeat(14))
+    );
     // A bare carriage return ends the title.
     let filed = report(
         &t,
@@ -1129,14 +1135,14 @@ async fn errors_lists_recorded_errors_per_signature_since_a_time() {
     let t = setup().await;
     t.board("factory", &[]).await;
     let task = t.task(A, "factory", "Noted").await;
-    let long = "x".repeat(501);
+    let long = "x".repeat(801);
     let note = |n: usize| json!({ "agent": A, "kind": "note", "text": long[..n].to_owned() });
     let notes_path = format!("/v1/tasks/{task}/notes");
     let missing = |n: u32| format!("/v1/tasks/factory-{}", 100 + n);
     // Two over-long notes from one agent: under the signal threshold, so no item.
-    t.fail("POST", &notes_path, Some(A), Some(note(501))).await;
+    t.fail("POST", &notes_path, Some(A), Some(note(801))).await;
     t.advance(TimeDelta::hours(1));
-    t.fail("POST", &notes_path, Some(A), Some(note(501))).await;
+    t.fail("POST", &notes_path, Some(A), Some(note(801))).await;
     // Three lookups of missing tasks from two agents: a signal item.
     for (n, agent) in [A, B, A].into_iter().enumerate() {
         t.fail("GET", &missing(n as u32), Some(agent), None).await;
@@ -1388,7 +1394,7 @@ async fn kept_errors_older_than_the_signal_window_do_not_count_toward_a_signal()
 }
 
 const NOTE_ROUTE: &str = "POST /v1/tasks/{id}/notes";
-const LONG_NOTE: &str = "text is 501 characters; the limit is 500";
+const LONG_NOTE: &str = "text is 801 characters; the limit is 800";
 
 /// Records a refusal `agent`'s client made before sending a note.
 async fn client_refusal(t: &T, agent: &str, body: Value) -> (u16, Value) {
@@ -1424,7 +1430,7 @@ async fn a_client_refusal_is_recorded_under_the_signature_of_the_servers_own() {
             "POST",
             &format!("/v1/tasks/{task}/notes"),
             Some(B),
-            Some(json!({ "agent": B, "kind": "note", "text": "x".repeat(501) })),
+            Some(json!({ "agent": B, "kind": "note", "text": "x".repeat(801) })),
         )
         .await;
     assert_eq!((status, code.as_str()), (400, "invalid"), "{v}");
@@ -1489,7 +1495,7 @@ async fn a_signal_from_both_sources_says_which_answered_and_later_client_reports
             "POST",
             &format!("/v1/tasks/{task}/notes"),
             Some(agent),
-            Some(json!({ "agent": agent, "kind": "note", "text": "x".repeat(501) })),
+            Some(json!({ "agent": agent, "kind": "note", "text": "x".repeat(801) })),
         )
         .await;
     }
@@ -1549,7 +1555,7 @@ async fn client_refusals_are_checked_like_any_request() {
             "is not a refusal of text over a limit",
         ),
         (
-            with("message", json!("text is 500 characters; the limit is 500")),
+            with("message", json!("text is 800 characters; the limit is 800")),
             "is not a refusal of text over a limit",
         ),
         (with("message", json!("x\ny")), "line break"),

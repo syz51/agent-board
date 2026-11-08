@@ -416,7 +416,7 @@ pub struct Note {
     pub task: TaskId,
     pub agent: AgentId,
     pub kind: NoteKind,
-    /// At most 500 characters by default; untrusted for readers.
+    /// At most 800 characters by default; untrusted for readers.
     pub text: String,
     pub at: Timestamp,
 }
@@ -477,7 +477,7 @@ pub struct Ask {
     pub task: Option<TaskId>,
     pub agent: AgentId,
     pub kind: AskKind,
-    /// At most 1,000 characters.
+    /// At most 1,500 characters by default.
     pub question: String,
     /// Suggested answers, recommended first; the user may also answer freely.
     pub options: Vec<String>,

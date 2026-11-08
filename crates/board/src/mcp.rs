@@ -109,8 +109,7 @@ fn one_of(values: &[&str], description: &str) -> Value {
 }
 
 /// A handoff field, its limit stated in words: `maxLength` alone does not stop every client.
-fn handoff_field(what: &str) -> Value {
-    let max = limits().handoff_field_chars;
+fn handoff_field(what: &str, max: usize) -> Value {
     s(&format!("{what}; at most {max} characters."), max)
 }
 
@@ -206,13 +205,16 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_add",
-        description: "Add a task. Title: imperative, at most 72 characters, no status or ids. Body stands alone. Acceptance: one observable check per line.",
+        description: "Add a task. Title: imperative, at most 80 characters, no status or ids. Body stands alone. Acceptance: one observable check per line.",
         params: || {
             vec![
                 (
                     "title",
                     s(
-                        "Imperative title, at most 72 characters.",
+                        &format!(
+                            "Imperative title, at most {} characters.",
+                            limits().title_chars
+                        ),
                         limits().title_chars,
                     ),
                     true,
@@ -285,12 +287,19 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_update",
-        description: "Change a task: status (blocked, review, open, dropped...), title, body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done.",
+        description: "Change a task: status (blocked, review, open, dropped...), title (at most 80 characters), body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
                 ("status", one_of(STATUSES, "New status."), false),
-                ("title", s("New title.", limits().title_chars), false),
+                (
+                    "title",
+                    s(
+                        &format!("New title, at most {} characters.", limits().title_chars),
+                        limits().title_chars,
+                    ),
+                    false,
+                ),
                 ("body", s("New body.", limits().body_chars), false),
                 (
                     "acceptance",
@@ -342,7 +351,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_done",
-        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks run (command and exit code), commits, PRs or artifacts; at least one. Add a summary for the user, who reads it in the web view, apart from this chat.",
+        description: "Mark a task you own done, only when every acceptance check passes; file what remains first (sub-tasks, proposals). Evidence: checks, commits, PRs or artifacts; at least one. Add a summary (at most 800 characters) for the user, who reads it in the web view, apart from this chat.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -381,7 +390,9 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "summary",
                     s(
-                        "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone.",
+                        &format!(
+                            "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone. At most {SUMMARY_CHARS_MAX} characters."
+                        ),
                         SUMMARY_CHARS_MAX,
                     ),
                     false,
@@ -391,7 +402,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_note",
-        description: "Add a note (at most 500 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision. To report something in a setup that cost you a step, use the feedback tool instead.",
+        description: "Add a note (at most 800 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision. To report something in a setup that cost you a step, use the feedback tool instead.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -413,14 +424,22 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "handoff_set",
-        description: "Replace your handoff, read first after a restart: now (state of the work), next (the first concrete action), blockers. Update it before you stop with a task in doing.",
+        description: "Replace your handoff, read first after a restart: now (state of the work, at most 400 characters), next (the first concrete action) and blockers (at most 300 characters each). Update it before you stop with a task in doing.",
         params: || {
             vec![
-                ("now", handoff_field("Where the work stands"), true),
-                ("next", handoff_field("The first concrete action"), true),
+                (
+                    "now",
+                    handoff_field("Where the work stands", limits().handoff_now_max()),
+                    true,
+                ),
+                (
+                    "next",
+                    handoff_field("The first concrete action", limits().handoff_field_chars),
+                    true,
+                ),
                 (
                     "blockers",
-                    handoff_field("What blocks you, if anything"),
+                    handoff_field("What blocks you, if anything", limits().handoff_field_chars),
                     false,
                 ),
             ]
@@ -461,13 +480,16 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "ask_user",
-        description: "Notify the user only for a design, cost, irreversible, outside, only-me, security or intent reason, named as `Reason: <name>`; do every other step yourself, even one a hook blocked. Then continue with other ready work: the answer wakes you.",
+        description: "Notify the user only for a design, cost, irreversible, outside, only-me, security or intent reason, named as `Reason: <name>`; do every other step yourself, even one a hook blocked. Question: at most 1500 characters. Then continue with other ready work: the answer wakes you.",
         params: || {
             vec![
                 (
                     "question",
                     s(
-                        "At most 1,000 characters; stands alone.",
+                        &format!(
+                            "At most {} characters; stands alone.",
+                            limits().question_chars
+                        ),
                         limits().question_chars,
                     ),
                     true,
@@ -1369,10 +1391,10 @@ mod tests {
         }
         let by_name = |name: &str| tools().into_iter().find(|t| t.name == name).unwrap();
         let add = by_name("task_add");
-        assert_eq!(add.input_schema["properties"]["title"]["maxLength"], 72);
+        assert_eq!(add.input_schema["properties"]["title"]["maxLength"], 80);
         assert_eq!(add.input_schema["properties"]["body"]["maxLength"], 4000);
         let note = by_name("task_note");
-        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 500);
+        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 800);
         assert!(
             note.description
                 .as_deref()
@@ -1386,15 +1408,53 @@ mod tests {
             "feedback goes through the feedback tool"
         );
         let handoff = by_name("handoff_set");
+        assert_eq!(handoff.input_schema["properties"]["now"]["maxLength"], 400);
         assert_eq!(handoff.input_schema["properties"]["next"]["maxLength"], 300);
         assert_eq!(
+            handoff.input_schema["properties"]["blockers"]["maxLength"],
+            300
+        );
+        assert_eq!(
             handoff.input_schema["properties"]["now"]["description"],
-            "Where the work stands; at most 300 characters."
+            "Where the work stands; at most 400 characters."
         );
         let ask = by_name("ask_user");
         assert_eq!(
             ask.input_schema["properties"]["question"]["maxLength"],
-            1000
+            1500
         );
+        let update = by_name("task_update");
+        assert_eq!(update.input_schema["properties"]["title"]["maxLength"], 80);
+        let done = by_name("task_done");
+        assert_eq!(done.input_schema["properties"]["summary"]["maxLength"], 800);
+    }
+
+    /// Each tool states its own text limits, in its description and in each limited
+    /// argument's, and they match the schema's `maxLength`: an agent that sees one tool
+    /// take longer text must not guess another's limit from it.
+    #[test]
+    fn descriptions_state_each_tools_own_limits() {
+        let l = limits();
+        let cases = [
+            ("task_add", "title", l.title_chars),
+            ("task_update", "title", l.title_chars),
+            ("task_note", "text", l.note_chars),
+            ("ask_user", "question", l.question_chars),
+            ("handoff_set", "now", l.handoff_now_max()),
+            ("handoff_set", "next", l.handoff_field_chars),
+            ("handoff_set", "blockers", l.handoff_field_chars),
+            ("task_done", "summary", SUMMARY_CHARS_MAX),
+        ];
+        let tools = tools();
+        for (name, param, max) in cases {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            let prop = &tool.input_schema["properties"][param];
+            assert_eq!(prop["maxLength"], max, "{name}.{param}");
+            let said = format!("at most {max} characters");
+            let param_description = prop["description"].as_str().unwrap().to_lowercase();
+            assert!(param_description.contains(&said), "{name}.{param}");
+            let description = tool.description.as_deref().unwrap().to_lowercase();
+            assert!(description.contains(&said), "{name}: {description}");
+        }
     }
 }
