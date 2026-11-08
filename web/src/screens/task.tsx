@@ -319,9 +319,9 @@ function TaskView({
                         <RelTime at={note.at} />
                       </span>
                     </div>
-                    <p className="max-w-[100ch]">
-                      <PlainText text={note.text} />
-                    </p>
+                    <div className="max-w-[100ch]">
+                      <Markdown text={note.text} />
+                    </div>
                   </li>
                 ))}
               </ul>
