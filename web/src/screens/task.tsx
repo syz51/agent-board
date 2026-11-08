@@ -31,7 +31,7 @@ import {
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusKey } from "@/ui/icons.tsx";
 import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import { EventLine, Timeline } from "./events.tsx";
 
@@ -142,7 +142,7 @@ function TaskView({
           <Owner task={task} agents={agents} />
         </p>
         {/* The links to other tasks are far down there too; this says they exist. */}
-        {(task.blockers.length > 0 || detail.children.length > 0) && (
+        {(task.blockers.length > 0 || detail.child_tasks.length > 0) && (
           <p className="mt-1.5 flex flex-wrap items-center gap-x-3 text-meta text-muted-foreground lg:hidden">
             {task.blockers.length > 0 && (
               <a
@@ -153,12 +153,13 @@ function TaskView({
                 Blocked by <span className="ident">{task.blockers.join(", ")}</span>
               </a>
             )}
-            {detail.children.length > 0 && (
+            {detail.child_tasks.length > 0 && (
               <a
                 className="inline-flex min-h-6 items-center text-muted-foreground"
                 href="#task-subtasks"
               >
-                {detail.children.length} {detail.children.length === 1 ? "subtask" : "subtasks"}
+                {detail.child_tasks.length}{" "}
+                {detail.child_tasks.length === 1 ? "subtask" : "subtasks"}
               </a>
             )}
           </p>
@@ -261,9 +262,7 @@ function TaskView({
             )}
           </Section>
 
-          {detail.child_tasks.length > 0 && (
-            <Subtasks detail={detail} agents={agents} related={related} />
-          )}
+          {detail.child_tasks.length > 0 && <Subtasks detail={detail} agents={agents} />}
 
           <Section id="task-acceptance" title="Acceptance" count={acceptance.length}>
             {acceptance.length > 0 ? (
@@ -468,12 +467,7 @@ function TaskLinks({
                 to="/tasks/$id"
                 params={{ id }}
               >
-                {task && (
-                  <StatusIcon
-                    status={task.status === "open" && task.ready ? "ready" : task.status}
-                    label
-                  />
-                )}
+                {task && <StatusIcon status={statusKey(task)} label />}
                 <span className="ident col-start-2 text-xs text-muted-foreground">{id}</span>
                 {task && <PlainText text={task.title} className="col-start-2 whitespace-normal" />}
               </Link>
@@ -522,12 +516,7 @@ function ParentLine({ id, related }: { id: string; related: Map<string, Task> })
         to="/tasks/$id"
         params={{ id }}
       >
-        {parent && (
-          <StatusIcon
-            status={parent.status === "open" && parent.ready ? "ready" : parent.status}
-            label
-          />
-        )}
+        {parent && <StatusIcon status={statusKey(parent)} label />}
         <span className="ident">{id}</span>
         {parent && <PlainText text={parent.title} className="whitespace-normal" />}
       </Link>
@@ -539,15 +528,7 @@ function ParentLine({ id, related }: { id: string; related: Map<string, Task> })
  * A parent's children in one place: how they stand, then each with its status, title and
  * owner, by id number as the server lists them.
  */
-function Subtasks({
-  detail,
-  agents,
-  related,
-}: {
-  detail: TaskDetail;
-  agents: Map<string, Agent>;
-  related: Map<string, Task>;
-}) {
+function Subtasks({ detail, agents }: { detail: TaskDetail; agents: Map<string, Agent> }) {
   const { task, child_tasks: children } = detail;
   return (
     <Section id="task-subtasks" title="Subtasks" count={children.length}>
@@ -569,7 +550,7 @@ function Subtasks({
         </div>
         <ul className="-mx-3.5 divide-y border-t">
           {children.map((child) => (
-            <ChildRow key={child.id} child={child} owner={related.get(child.id)} agents={agents} />
+            <ChildRow key={child.id} child={child} agents={agents} />
           ))}
         </ul>
       </div>
@@ -577,26 +558,13 @@ function Subtasks({
   );
 }
 
-function ChildRow({
-  child,
-  owner,
-  agents,
-}: {
-  child: ChildTask;
-  /** The child as the board list has it, for its owner; absent until that list loads. */
-  owner: Task | undefined;
-  agents: Map<string, Agent>;
-}) {
+function ChildRow({ child, agents }: { child: ChildTask; agents: Map<string, Agent> }) {
   return (
     <li
       className="grid grid-cols-[14px_auto_minmax(0,1fr)_auto] items-center gap-x-2.5 px-3.5 py-2 max-md:grid-cols-[14px_minmax(0,1fr)_auto] max-md:items-start max-md:gap-y-1"
       data-child={child.id}
     >
-      <StatusIcon
-        status={child.status === "open" && child.ready ? "ready" : child.status}
-        label
-        className="max-md:mt-0.75"
-      />
+      <StatusIcon status={statusKey(child)} label className="max-md:mt-0.75" />
       <span className="ident text-xs text-subtle-foreground max-md:col-start-2 max-md:row-start-2">
         {child.id}
       </span>
@@ -608,7 +576,7 @@ function ChildRow({
         <PlainText text={child.title} className="whitespace-normal" />
       </Link>
       <span className="flex min-w-0 justify-end text-meta max-md:col-start-3 max-md:row-span-2 max-md:row-start-1 max-md:[&_[data-slot=avatar]]:hidden">
-        {owner && <Owner task={owner} agents={agents} />}
+        <Owner task={child} agents={agents} />
       </span>
     </li>
   );

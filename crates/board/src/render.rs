@@ -159,15 +159,18 @@ pub fn task_list_detailed(tasks: &[Task]) -> String {
     }
 }
 
-/// Statuses in the order a parent's children line counts them: finished work first.
-const CHILD_STATUS_ORDER: [TaskStatus; 6] = [
-    TaskStatus::Done,
-    TaskStatus::Review,
-    TaskStatus::Doing,
-    TaskStatus::Blocked,
-    TaskStatus::Open,
-    TaskStatus::Dropped,
-];
+/// Where a status falls in a parent's children line: finished work first. The match is
+/// exhaustive, so a new status cannot drop children from the line.
+fn child_status_rank(status: TaskStatus) -> u8 {
+    match status {
+        TaskStatus::Done => 0,
+        TaskStatus::Review => 1,
+        TaskStatus::Doing => 2,
+        TaskStatus::Blocked => 3,
+        TaskStatus::Open => 4,
+        TaskStatus::Dropped => 5,
+    }
+}
 
 /// The children line: how many children, a count per status, then the ids of each status.
 /// A server that predates `child_tasks` sends the ids alone, which print as they are.
@@ -179,19 +182,14 @@ fn children(out: &mut String, detail: &TaskDetail) {
         }
         return;
     }
-    let by_status: Vec<(TaskStatus, Vec<&str>)> = CHILD_STATUS_ORDER
-        .iter()
-        .map(|&status| {
-            let ids = detail
-                .child_tasks
-                .iter()
-                .filter(|c| c.status == status)
-                .map(|c| c.id.as_str())
-                .collect();
-            (status, ids)
-        })
-        .filter(|(_, ids): &(TaskStatus, Vec<&str>)| !ids.is_empty())
-        .collect();
+    let mut by_status: Vec<(TaskStatus, Vec<&str>)> = Vec::new();
+    for child in &detail.child_tasks {
+        match by_status.iter_mut().find(|(s, _)| *s == child.status) {
+            Some((_, ids)) => ids.push(child.id.as_str()),
+            None => by_status.push((child.status, vec![child.id.as_str()])),
+        }
+    }
+    by_status.sort_by_key(|(status, _)| child_status_rank(*status));
     let counts: Vec<String> = by_status
         .iter()
         .map(|(status, ids)| format!("{} {}", enum_str(status), ids.len()))

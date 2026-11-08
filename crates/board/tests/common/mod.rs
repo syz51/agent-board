@@ -595,6 +595,8 @@ pub fn parent_detail() -> board_proto::TaskDetail {
         title: format!("Child {id}"),
         status,
         ready: status == TaskStatus::Open,
+        owner: None,
+        owner_stale: false,
     };
     let child_tasks = vec![
         child("factory-2", TaskStatus::Done),

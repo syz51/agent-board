@@ -22,6 +22,7 @@ describe("groupTasks", () => {
       ready: ["factory-15", "factory-16", "factory-18", "factory-20", "factory-21"],
       open: ["factory-19", "factory-30"],
       done: ["factory-9", "factory-8"],
+      dropped: [],
     });
     expect(tasks.find((task) => task.id === "factory-19")?.ready).toBe(false);
   });
@@ -57,12 +58,24 @@ describe("groupTasks", () => {
       open: ["factory-19"],
       // factory-3 was done over 30 days ago: the board list leaves it out, its parent not.
       done: ["factory-8", "factory-3"],
+      dropped: [],
     });
     expect(ids().done).not.toContain("factory-3");
     // It combines with the other filters; a task without children leaves nothing.
     expect(ids({ parent: "factory-12", priority: "p1" }).blocked).toEqual(["factory-17"]);
     expect(ids({ parent: "factory-12", priority: "p1" }).review).toEqual([]);
     expect(Object.values(ids({ parent: "factory-21" })).flat()).toEqual([]);
+  });
+
+  test("shows a parent's dropped children, which the whole board leaves out", () => {
+    const base = tasks.find((task) => task.id === "factory-15")!;
+    const dropped = { ...base, id: "factory-99", status: "dropped" as const, parent: "factory-12" };
+    const groups = (filters: Partial<TaskFilters>) =>
+      groupTasks([...tasks, dropped], { ...none, ...filters }, now).find(
+        (group) => group.key === "dropped",
+      )?.tasks;
+    expect(groups({ parent: "factory-12" })?.map((task) => task.id)).toEqual(["factory-99"]);
+    expect(groups({})).toEqual([]);
   });
 });
 

@@ -235,7 +235,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "parent",
                     task_arg(
-                        "Parent task id, on the same board only; for a task on another board, name it in the body or use blockers.",
+                        "Parent task id, on the same board only; for a task on another board, name it in the body, or make that task wait for this one by adding this one to its blockers.",
                     ),
                     false,
                 ),

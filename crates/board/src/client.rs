@@ -773,8 +773,14 @@ impl Client {
         if let Some(want) = q.proposal {
             tasks.retain(|t| t.is_pending_proposal() == want);
         }
-        if let Some(parent) = &q.parent {
-            tasks.retain(|t| t.parent.as_ref() == Some(parent));
+        // Servers that predate the `parent` filter ignore it. Trimming their list here would
+        // miss children past its limit, so say so instead.
+        if let Some(parent) = &q.parent
+            && tasks.iter().any(|t| t.parent.as_ref() != Some(parent))
+        {
+            anyhow::bail!(
+                "the server does not filter by parent yet; upgrade it, or run `board show {parent}` (MCP: task_show) for its children"
+            );
         }
         Ok(tasks)
     }

@@ -2090,9 +2090,12 @@ async fn the_task_list_narrows_to_a_parents_children_with_their_statuses() {
     assert_eq!(
         detail["child_tasks"],
         json!([
-            { "id": first, "title": "First child", "status": "open", "ready": true },
-            { "id": second, "title": "Second child", "status": "doing", "ready": false },
-            { "id": third, "title": "Third child", "status": "done", "ready": false },
+            { "id": first, "title": "First child", "status": "open", "ready": true,
+              "owner": null, "owner_stale": false },
+            { "id": second, "title": "Second child", "status": "doing", "ready": false,
+              "owner": A, "owner_stale": false },
+            { "id": third, "title": "Third child", "status": "done", "ready": false,
+              "owner": B, "owner_stale": false },
         ])
     );
     let leaf = t
@@ -2123,5 +2126,5 @@ async fn a_parent_on_another_board_is_refused_with_the_alternatives() {
         "{v}"
     );
     let next = v["next"].as_str().unwrap();
-    assert!(next.contains("name it in the body or use blockers"), "{v}");
+    assert!(next.contains("name it in the body, or make that task wait for this one by adding this one to its blockers"), "{v}");
 }

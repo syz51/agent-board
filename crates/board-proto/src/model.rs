@@ -307,6 +307,10 @@ pub struct ChildTask {
     pub status: TaskStatus,
     /// As [`Task::ready`].
     pub ready: bool,
+    /// As [`Task::owner`] and [`Task::owner_stale`], so a parent's view shows who works on
+    /// each child.
+    pub owner: Option<AgentId>,
+    pub owner_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

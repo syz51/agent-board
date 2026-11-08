@@ -81,6 +81,11 @@ export function BrandMark() {
 
 export type StatusKey = TaskStatus | "ready";
 
+/** How a task's status shows: an open task that may start shows as ready. */
+export function statusKey(task: { status: TaskStatus; ready: boolean }): StatusKey {
+  return task.status === "open" && task.ready ? "ready" : task.status;
+}
+
 const STATUS_TEXT: Record<StatusKey, string> = {
   ready: "Ready",
   open: "Open",

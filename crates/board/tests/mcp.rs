@@ -658,7 +658,7 @@ fn task_list_narrows_to_a_parent_and_task_show_counts_its_children() {
     umbrella.child_count = 1;
     let mut child = task_fixture("factory-2", "Child");
     child.parent = Some("factory-1".parse().unwrap());
-    stub.on("GET /v1/tasks", [umbrella, child]);
+    stub.on("GET /v1/tasks", [umbrella, child.clone()]);
     stub.on("GET /v1/tasks/factory-1", parent_detail());
 
     let mut mcp = Mcp::start(&home, &cwd);
@@ -682,11 +682,14 @@ fn task_list_narrows_to_a_parent_and_task_show_counts_its_children() {
         tool("task_list")["inputSchema"]["properties"]["parent"]["type"],
         "string"
     );
-    // agent-board-244: the schema says where a parent may be.
+    // The schema says where a parent may be, and that blockers make the other task wait.
     let parent = tool("task_add")["inputSchema"]["properties"]["parent"]["description"].clone();
     assert!(
         parent.as_str().unwrap().contains("same board only")
-            && parent.as_str().unwrap().contains("use blockers"),
+            && parent
+                .as_str()
+                .unwrap()
+                .contains("make that task wait for this one"),
         "{parent}"
     );
 
@@ -696,6 +699,7 @@ fn task_list_narrows_to_a_parent_and_task_show_counts_its_children() {
         text(&all).contains("factory-1 open p1 \"Umbrella\" ready auto children 1"),
         "{all}"
     );
+    stub.on("GET /v1/tasks", [child]);
     let children = mcp.call(
         4,
         "task_list",

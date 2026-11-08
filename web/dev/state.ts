@@ -106,7 +106,14 @@ export class DevState {
         .map(({ task: _, ...item }) => item),
       blocks: this.data.tasks.filter((task) => task.blockers.includes(id)).map((task) => task.id),
       children: children.map((task) => task.id),
-      child_tasks: children.map(({ id, title, status, ready }) => ({ id, title, status, ready })),
+      child_tasks: children.map(({ id, title, status, ready, owner, owner_stale }) => ({
+        id,
+        title,
+        status,
+        ready,
+        owner,
+        owner_stale,
+      })),
       history: this.data.events.filter((event) => event.task === id),
     };
   }

@@ -71,6 +71,25 @@ describe("a task's page", () => {
     ).toBe("/boards/factory?parent=factory-12");
   });
 
+  test("shows each subtask's owner from the detail alone", async () => {
+    // No board list: it never arrives, and the detail itself says who works on each child.
+    const original = globalThis.fetch;
+    globalThis.fetch = (() => new Promise(() => {})) as unknown as typeof fetch;
+    await renderRoute("/tasks/factory-12", {
+      seed: (client) => {
+        client.setQueryData(queries.boards().queryKey, state.boards());
+        client.setQueryData(queries.openAsks().queryKey, []);
+        client.setQueryData(queries.agents().queryKey, state.agents(none));
+        client.setQueryData(queries.task("factory-12").queryKey, state.task("factory-12"));
+      },
+    });
+    const section = await waitFor(() => screen.getByRole("region", { name: /^Subtasks/ }));
+    const row = (id: string) => section.querySelector(`[data-child="${id}"]`)?.textContent;
+    expect(row("factory-13")).toContain("t3:a91c");
+    expect(row("factory-21")).toContain("Unowned");
+    globalThis.fetch = original;
+  });
+
   test("a subtask links its parent above its title", async () => {
     await renderRoute("/tasks/factory-21", { seed: seed("factory-21") });
     const link = await waitFor(() =>

@@ -12,8 +12,11 @@ const none = new URLSearchParams();
 const title = state.boards().find((board) => board.slug === "factory")!.title;
 
 const original = globalThis.fetch;
+/** The query of each task list request, in order. */
+let asked: URLSearchParams[] = [];
 afterEach(() => {
   globalThis.fetch = original;
+  asked = [];
   localStorage.clear();
 });
 
@@ -27,7 +30,10 @@ function serve(down = false) {
         { status: 503 },
       );
     }
-    if (url.pathname === "/v1/tasks") return Response.json(state.tasks(url.searchParams));
+    if (url.pathname === "/v1/tasks") {
+      asked.push(url.searchParams);
+      return Response.json(state.tasks(url.searchParams));
+    }
     return Response.json(
       { code: "not_found", message: `No fixture for ${url.pathname}.`, next: null },
       { status: 404 },
@@ -121,6 +127,10 @@ describe("a board narrowed to a parent", () => {
     expect(listed.sort()).toEqual(
       ["factory-13", "factory-17", "factory-19", "factory-21", "factory-3", "factory-8"].sort(),
     );
+    // The children come from the server's parent filter, not the capped board list.
+    expect(
+      asked.some((q) => q.get("parent") === "factory-12" && q.get("board") === "factory"),
+    ).toBe(true);
     const clear = screen.getByRole("link", { name: "Show all tasks" });
     expect(clear.getAttribute("href")).toBe("/boards/factory");
     // The filter bar stays, so the narrowing can be combined and cleared.

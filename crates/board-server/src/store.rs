@@ -319,6 +319,8 @@ pub(crate) fn task_detail(cx: &Ctx<'_>, id: &TaskId) -> Result<TaskDetail> {
             title: t.title,
             status: t.status,
             ready: t.ready,
+            owner: t.owner,
+            owner_stale: t.owner_stale,
         })
         .collect();
     // The newest events, oldest first; a cut history no longer starts with task_created.

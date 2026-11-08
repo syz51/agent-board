@@ -24,7 +24,7 @@ import {
   useTitle,
 } from "@/ui/common.tsx";
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
-import { Icon, StatusIcon } from "@/ui/icons.tsx";
+import { Icon, StatusIcon, statusKey } from "@/ui/icons.tsx";
 import { useCollapsed } from "@/ui/sections.tsx";
 import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import { AskRows, useOpenAsks } from "./asks.tsx";
@@ -44,21 +44,21 @@ export interface TaskFilters {
 }
 
 export interface TaskGroup {
-  key: "ready" | "open" | "doing" | "blocked" | "review" | "done";
+  key: "ready" | "open" | "doing" | "blocked" | "review" | "done" | "dropped";
   title: string;
   tasks: Task[];
 }
 
 /**
  * Group a board's tasks for display: doing, review, blocked, ready, open tasks still
- * waiting, and done in the last 30 days, or all done children of the `parent` filter's task.
- * Dropped tasks are not shown. Exported for tests.
+ * waiting, and done in the last 30 days. Dropped tasks are not shown. The children of the
+ * `parent` filter's task show whole: every done one, then the dropped ones, so the list
+ * holds as many as the parent's subtask count. Exported for tests.
  */
 export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): TaskGroup[] {
   const q = filters.q.trim().toLowerCase();
   const visible = tasks.filter((task) => {
-    if (task.status === "dropped") return false;
-    if (filters.parent && task.parent !== filters.parent) return false;
+    if (filters.parent ? task.parent !== filters.parent : task.status === "dropped") return false;
     if (
       !filters.parent &&
       task.status === "done" &&
@@ -85,6 +85,7 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     { key: "ready", title: "Ready", tasks: open.filter((task) => task.ready) },
     { key: "open", title: "Waiting", tasks: open.filter((task) => !task.ready) },
     { key: "done", title: filters.parent ? "Done" : "Done in the last 30 days", tasks: done },
+    { key: "dropped", title: "Dropped", tasks: of("dropped") },
   ];
 }
 
@@ -139,19 +140,30 @@ function rememberTitle(slug: string, title: string) {
 export function BoardScreen() {
   const { slug } = route.useParams();
   const search = route.useSearch();
+  const filters = filtersOf(search);
   const navigate = route.useNavigate();
   const now = useNow(60_000);
   // The board comes from the list the sidebar already holds: one request for both.
   const boards = useQuery(queries.boards());
   const board = boards.data?.find((item) => item.slug === slug);
-  const tasks = useQuery(queries.boardTasks(slug));
+  const boardTasks = useQuery(queries.boardTasks(slug));
+  // Narrowed to a parent, the list asks the server for its children: the board list is
+  // capped, so it may miss some.
+  const childList = useQuery({
+    ...queries.childTasks(slug, filters.parent),
+    enabled: filters.parent !== "",
+  });
+  const tasks = filters.parent ? childList : boardTasks;
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
   // One set per task list, so the memoized rows keep their identity between renders.
+  // Blockers come from anywhere on the board, so this set does too.
   const done = useMemo(
     () =>
-      new Set((tasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id)),
-    [tasks.data],
+      new Set(
+        (boardTasks.data ?? []).filter((task) => task.status === "done").map((task) => task.id),
+      ),
+    [boardTasks.data],
   );
   // Without the board list, as in an outage, the name last seen in this browser stands in,
   // or else the slug.
@@ -161,9 +173,8 @@ export function BoardScreen() {
   const name = board?.title ?? rememberedTitle(slug) ?? slug;
   useTitle(name);
   // One choice for every board: done work starts folded away.
-  const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
+  const [collapsed, toggle] = useCollapsed("board-groups", ["done", "dropped"]);
 
-  const filters = filtersOf(search);
   const setFilter = (key: keyof BoardSearch, value: string) =>
     void navigate({
       search: { ...search, [key]: value || undefined },
@@ -203,7 +214,13 @@ export function BoardScreen() {
       <BoardAsks slug={slug} />
 
       {filters.parent && (
-        <ParentFilter id={filters.parent} slug={slug} search={search} tasks={tasks.data} />
+        <ParentFilter
+          id={filters.parent}
+          slug={slug}
+          search={search}
+          parent={boardTasks.data?.find((task) => task.id === filters.parent)}
+          subtasks={childList.data}
+        />
       )}
 
       {/* While tasks load the bar shows disabled, so the header holds still. A board with
@@ -471,9 +488,7 @@ const columns = column.columns([
     id: "status",
     cell: ({ row }) => {
       const { task } = row.original;
-      return (
-        <StatusIcon status={task.status === "open" && task.ready ? "ready" : task.status} label />
-      );
+      return <StatusIcon status={statusKey(task)} label />;
     },
   }),
   column.display({
@@ -627,21 +642,23 @@ function TaskMain({ task, done, now }: TaskRowData) {
 
 /**
  * The parent the list is narrowed to: its id and title, how its children stand, and a link
- * back to every task. The counts include done and dropped children the groups leave out.
+ * back to every task.
  */
 function ParentFilter({
   id,
   slug,
   search,
-  tasks,
+  parent,
+  subtasks,
 }: {
   id: string;
   slug: string;
   search: BoardSearch;
-  tasks: Task[] | undefined;
+  /** The parent as the board list has it, for its title; absent until that list loads. */
+  parent: Task | undefined;
+  /** Its children; absent while they load. */
+  subtasks: Task[] | undefined;
 }) {
-  const parent = tasks?.find((task) => task.id === id);
-  const children = useMemo(() => (tasks ?? []).filter((task) => task.parent === id), [tasks, id]);
   return (
     <section
       className="mb-5 grid gap-2.5 rounded-lg border bg-card px-4 py-3 shadow-raise"
@@ -671,8 +688,8 @@ function ParentFilter({
           Show all tasks
         </Link>
       </div>
-      {tasks !== undefined && (
-        <StatusTally counts={taskTally(children)} label="Subtasks by status" empty="No subtasks" />
+      {subtasks !== undefined && (
+        <StatusTally counts={taskTally(subtasks)} label="Subtasks by status" empty="No subtasks" />
       )}
     </section>
   );

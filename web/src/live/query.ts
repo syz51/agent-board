@@ -98,6 +98,13 @@ export const queries = {
       queryFn: fetching(() => api.tasks({ board })),
       meta: { tags: [tags.board(board)] },
     }),
+  /** A parent's direct children, all of them, through the server's `parent` filter. */
+  childTasks: (board: string, parent: string) =>
+    queryOptions({
+      queryKey: ["tasks", "board", board, "parent", parent],
+      queryFn: fetching(() => api.tasks({ board, parent })),
+      meta: { tags: [tags.board(board)] },
+    }),
   doingTasks: () =>
     queryOptions({
       queryKey: ["tasks", "doing"],

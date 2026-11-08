@@ -116,6 +116,8 @@ export const childTask = object({
   title: string,
   status: taskStatus,
   ready: boolean,
+  owner: nullable(string),
+  owner_stale: boolean,
 });
 
 /**

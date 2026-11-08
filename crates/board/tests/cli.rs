@@ -2103,8 +2103,8 @@ fn ls_narrows_to_a_parents_children_and_marks_umbrella_tasks() {
     umbrella.child_count = 2;
     let mut child = task_fixture("factory-2", "Child");
     child.parent = Some("factory-1".parse().unwrap());
-    // A server that predates the filter answers with every task; the CLI keeps the children.
-    e.stub.on("GET /v1/tasks", [umbrella, child]);
+    e.stub
+        .on("GET /v1/tasks", [umbrella.clone(), child.clone()]);
 
     let out = e.run(&["ls", "--board", "factory"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -2117,6 +2117,7 @@ fn ls_narrows_to_a_parents_children_and_marks_umbrella_tasks() {
         ]
     );
 
+    e.stub.on("GET /v1/tasks", [child.clone()]);
     let out = e.run(&[
         "ls",
         "--parent",
@@ -2136,6 +2137,17 @@ fn ls_narrows_to_a_parents_children_and_marks_umbrella_tasks() {
     assert_eq!(
         stdout(&out).trim(),
         "factory-2 open p1 \"Child\" ready auto"
+    );
+
+    // A server that predates the filter answers with every task; trimming that list could
+    // miss children past its limit, so the CLI says what to do instead.
+    e.stub.on("GET /v1/tasks", [umbrella, child]);
+    let out = e.run(&["ls", "--parent", "factory-1"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("board show factory-1"),
+        "{}",
+        stderr(&out)
     );
 
     let out = e.run(&["ls", "--parent", "not an id"]);

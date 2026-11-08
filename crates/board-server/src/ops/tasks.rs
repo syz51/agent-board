@@ -244,7 +244,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         if parent.board() != req.board {
             return Err(invalid(
                 format!("parent {parent} is on another board"),
-                "a parent must be on the same board; for a task on another board, name it in the body or use blockers",
+                "a parent must be on the same board; for a task on another board, name it in the body, or make that task wait for this one by adding this one to its blockers",
             ));
         }
         if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [parent.as_str()])? {

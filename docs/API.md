@@ -276,8 +276,9 @@ Reopening a closed board, or any change on it, starts the period again.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
-  `parent` ignore it and list every task, so the CLI and MCP keep only the children
-  themselves. Every `Task` has `child_count`, how many tasks name it as parent whatever
+  `parent` ignore it and list every task, up to the limit, which may leave children out;
+  the CLI and MCP then refuse and point to `board show <id>`, whose detail lists every
+  child. Every `Task` has `child_count`, how many tasks name it as parent whatever
   their status; it is absent when none does, and from servers that predate it. The counts
   of a list come from one query, along the parent index. `proposal=true` lists only
   pending proposals, `false` leaves them out (see "Pending proposals" below). `limit`
@@ -307,7 +308,8 @@ Reopening a closed board, or any change on it, starts the period again.
     win in between.
 - `GET /v1/tasks/{id}` → `[TaskDetail]`. `children` lists the ids of the tasks that name it
   as parent, by id number, and `child_tasks` the same tasks in the same order as
-  `{id, title, status, ready}`, so a parent's view needs no request per child.
+  `{id, title, status, ready, owner, owner_stale}`, so a parent's view needs no request
+  per child.
   `child_tasks` is absent when there are none, and from servers that predate it. `history`
   is the task's newest 200 events, oldest first; when it was cut, it does not start with the `task_created` event. `handles` maps
   each registered agent the detail names (owner, creator, note and evidence authors,
