@@ -1602,6 +1602,11 @@ impl Logs {
     }
 
     fn capture_at(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+        static UNDECIDED: std::sync::Once = std::sync::Once::new();
+        UNDECIDED.call_once(|| {
+            tracing::subscriber::set_global_default(Undecided)
+                .expect("no other global subscriber in this test binary");
+        });
         let logs = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || logs.clone())
@@ -1616,6 +1621,43 @@ impl Logs {
     }
 }
 
+/// The global subscriber while tests capture logs: it records nothing and leaves every
+/// callsite's interest at "sometimes", so each event asks its own thread's subscriber.
+///
+/// tracing caches each callsite's interest for the whole process. While a single scoped
+/// subscriber is registered, tracing computes that interest from the default of whichever
+/// thread hits the callsite first. A test thread without a capture caches `never` there,
+/// and the capturing test then loses the line. A global subscriber that is always
+/// registered keeps tracing from taking that shortcut.
+struct Undecided;
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 impl std::io::Write for Logs {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
@@ -1625,6 +1667,22 @@ impl std::io::Write for Logs {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn a_capture_keeps_a_line_another_thread_without_one_logged_first() {
+    fn line() {
+        tracing::info!("logged from both threads");
+    }
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    std::thread::spawn(line).join().unwrap();
+    line();
+    assert!(
+        logs.text().contains("logged from both threads"),
+        "{}",
+        logs.text()
+    );
 }
 
 #[tokio::test]
