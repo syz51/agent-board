@@ -24,10 +24,7 @@ export const stream = new EventStream(
     onEvent(event) {
       batcher.add(tagsForEvent(event));
     },
-    onState(state) {
-      connection = state;
-      for (const listener of connectionListeners) listener();
-    },
+    onState: setConnection,
     // Events may have been missed: refetch everything shown, mark the rest stale.
     onResync: () => void queryClient.invalidateQueries(),
   },
@@ -37,6 +34,12 @@ export function startLive(): void {
   addEventListener("online", () => stream.online());
   addEventListener("offline", () => stream.offline());
   stream.start();
+}
+
+/** The connection state the page shows. The stream sets it; tests set it to render a state. */
+export function setConnection(state: ConnectionState): void {
+  connection = state;
+  for (const listener of connectionListeners) listener();
 }
 
 function subscribeConnection(listener: () => void): () => void {

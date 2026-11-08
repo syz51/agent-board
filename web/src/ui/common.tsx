@@ -47,6 +47,8 @@ export function ErrorNotice({
   return (
     <Alert
       variant={compact ? "error" : "default"}
+      // The placeholder is news, not a second alarm: assistive tech hears the banner's alarm once.
+      role={linkDown && !compact ? "status" : "alert"}
       className={cn(
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
