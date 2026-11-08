@@ -302,19 +302,20 @@ async fn a_report_on_a_routed_item_notes_the_open_task_at_most_hourly() {
     assert_eq!(noted.len(), 1, "{noted:?}");
     let note = &noted[0];
     for part in [
-        format!("finding: feedback item {item} was reported again: 2 reports from 2 agents."),
-        "data written by another agent: \"Clippy flags unknown\".".to_owned(),
-        format!("Reporters, newest last: {A}, {C}"),
+        format!("reported again: feedback item {item} has 2 reports from 2 agents."),
+        "Latest report's first line, data written by another agent: \"Clippy flags unknown\"."
+            .to_owned(),
+        format!("Reporters, newest first: {C}, {A}"),
     ] {
         assert!(note.contains(&part), "{part} in {note}");
     }
     let detail = t.ok("GET", &format!("/v1/tasks/{work}"), None, None).await;
-    assert_eq!(detail["notes"][0]["kind"], "finding");
+    assert_eq!(detail["notes"][0]["kind"], "note");
     assert_eq!(detail["notes"][0]["agent"], C);
     // The owner sees it in its snapshot's alerts before it picks its next task.
     let seen = alerts(&t, B).await;
     assert!(
-        seen.contains(&format!("changed your task {work} (finding)")),
+        seen.contains(&format!("changed your task {work} (note)")),
         "{seen}"
     );
 
@@ -329,7 +330,7 @@ async fn a_report_on_a_routed_item_notes_the_open_task_at_most_hourly() {
     let noted = notes(&t, &work).await;
     assert_eq!(noted.len(), 2, "{noted:?}");
     assert!(
-        noted[1].contains("4 reports from 2 agents") && noted[1].ends_with(&format!("{A}, {C}")),
+        noted[1].contains("4 reports from 2 agents") && noted[1].ends_with(&format!("{C}, {A}")),
         "{noted:?}"
     );
 
@@ -356,13 +357,11 @@ async fn a_report_on_a_duplicate_of_a_plain_task_notes_that_task() {
     let (s, v) = user_resolve(&t, &item, json!({ "kind": "duplicate", "task": work })).await;
     assert_eq!(s, 200, "{v}");
 
-    report(&t, C, text).await;
+    report(&t, A, text).await;
     let noted = notes(&t, &work).await;
     assert_eq!(noted.len(), 1, "{noted:?}");
     assert!(
-        noted[0].contains(&format!(
-            "feedback item {item} was reported again: 2 reports"
-        )),
+        noted[0].contains(&format!("feedback item {item} has 2 reports from 1 agent.")),
         "{noted:?}"
     );
     // The item's own note names the task as the one doing the work.
@@ -372,6 +371,54 @@ async fn a_report_on_a_duplicate_of_a_plain_task_notes_that_task() {
             .any(|n| n.contains(&format!("routed to {work} (open)"))),
         "{own:?}"
     );
+}
+
+#[tokio::test]
+async fn an_error_signal_notes_the_routed_task_as_the_server() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let missing = |n: u32| format!("/v1/tasks/factory-{n}");
+    for (agent, n) in [(A, 11), (A, 12), (B, 13)] {
+        t.fail("GET", &missing(n), Some(agent), None).await;
+    }
+    let items = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let item = items[0]["id"].as_str().unwrap().to_owned();
+    let work = t.task(A, "factory", "Fix the lookup").await;
+    let (s, v) = user_resolve(&t, &item, json!({ "kind": "routed", "task": work })).await;
+    assert_eq!(s, 200, "{v}");
+
+    // An agent with a valid token that never registered gets the same error: it counts,
+    // and the server notes the routed task, without registering the agent.
+    let stranger = "t3:delta";
+    t.fail("GET", &missing(14), Some(stranger), None).await;
+    assert_eq!(t.get_task(&item).await["feedback"]["reports"], 4);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM agents WHERE id = 't3:delta'"),
+        0
+    );
+    let detail = t.ok("GET", &format!("/v1/tasks/{work}"), None, None).await;
+    let note = &detail["notes"][0];
+    assert_eq!(note["agent"], stranger);
+    let events = t
+        .ok("GET", "/v1/events?board=factory&since=0", None, None)
+        .await;
+    let noted = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "note_added" && e["task"] == work.as_str())
+        .unwrap();
+    assert_eq!(noted["actor"], "server");
+    let text = note["text"].as_str().unwrap();
+    for part in [
+        format!("feedback item {item} has 4 reports from 3 agents."),
+        "Latest error, from the server's signal: \"not_found from GET /v1/tasks/{id}\".".to_owned(),
+        format!("Reporters, newest first: {stranger}, {B}, {A}"),
+    ] {
+        assert!(text.contains(&part), "{part} in {text}");
+    }
 }
 
 #[tokio::test]

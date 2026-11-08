@@ -529,13 +529,14 @@ use, autopilot off). Items get `auto` from that board's autopilot.
 - A report whose signature matches a **live** item adds to it instead of filing a new one
   (`duplicate: true`): `reports` grows by one, the reporter joins `reporters` (the latest
   20), and at most once an hour a `feedback` note says it was reported again, naming the
-  routed task and its status when routed, with a `task_updated` event
-  `{"fields": ["feedback"], "reports": n}`. The same hourly report also adds a `finding`
-  note, by the reporter, to the task doing the work while it is not done or dropped: the
-  routed task, or a plain task the item is a duplicate of. It gives the item, the report
-  count, the distinct reporters (the latest 20) and the report's first line, quoted as
-  data written by another agent, so the task's owner sees the new evidence in its alerts.
-  A report leaves the task's `version` alone, so
+  task doing the work and its status (the routed task, or a plain task the item is a
+  duplicate of), with a `task_updated` event `{"fields": ["feedback"], "reports": n}`.
+  The same hourly report also adds a plain `note` to that task while it is not done or
+  dropped, so its owner sees the new evidence in its alerts. The note gives the item, the
+  report count, the number of distinct reporters, their ids (newest first, cut at the note
+  limit) and the report's first line, quoted as data written by another agent; for a
+  signal, the error's summary. Notes record the reporter as author; the `note_added`
+  event's actor is `server` for a signal. A report leaves the task's `version` alone, so
   it never makes the owner's update conflict, except the one that reopens a declined item
   (below), which changes its status. The newest item with the signature is live
   while it is unresolved and not done or dropped, declined, a duplicate of a live item (the
