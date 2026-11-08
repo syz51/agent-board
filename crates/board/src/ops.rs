@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
@@ -488,7 +488,9 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
             },
         )
         .await?;
-    check_owner(&task, wanted_owner.as_ref())?;
+    if let Some(wanted) = &wanted_owner {
+        check_owner(ctx, &task, wanted).await?;
+    }
     Ok(Output::new(
         format!("updated {}", render::task_line(&task)),
         &task,
@@ -832,19 +834,32 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
 }
 
 /// A server that predates handovers ignores `owner` and answers with the owner unchanged,
-/// so the new owner's `task_done` would be refused later.
-fn check_owner(task: &Task, wanted: Option<&AgentId>) -> Result<()> {
-    if let Some(wanted) = wanted
-        && task.owner.as_ref() != Some(wanted)
-    {
-        bail!(
-            "updated {id}, but the server ignored owner={wanted}: it predates handovers, so \
-             {owner} still owns it. Upgrade the server, then hand it over again",
-            id = task.id,
-            owner = task.owner.as_ref().map_or("nobody", AgentId::as_str),
-        );
+/// so the new owner's `task_done` would be refused later. The server resolves a short
+/// handle such as `t3:7f3a` to the agent's full id, so a different id in the answer is
+/// checked against the handles the task's detail lists before it counts as ignored.
+async fn check_owner(ctx: &Ctx, task: &Task, wanted: &AgentId) -> Result<()> {
+    let Some(owner) = task.owner.as_ref() else {
+        return Err(ignored_owner(task, wanted));
+    };
+    if owner == wanted {
+        return Ok(());
     }
-    Ok(())
+    let detail = ctx.client.task(&task.id).await?;
+    if detail.task.owner.as_ref() == Some(owner)
+        && detail.handles.get(owner.as_str()).map(String::as_str) == Some(wanted.as_str())
+    {
+        return Ok(());
+    }
+    Err(ignored_owner(task, wanted))
+}
+
+fn ignored_owner(task: &Task, wanted: &AgentId) -> anyhow::Error {
+    anyhow!(
+        "updated {id}, but the server ignored owner={wanted}: it predates handovers, so \
+         {owner} still owns it. Upgrade the server, then hand it over again",
+        id = task.id,
+        owner = task.owner.as_ref().map_or("nobody", AgentId::as_str),
+    )
 }
 
 /// A server that predates temporary boards ignores the flag, so a board meant to be

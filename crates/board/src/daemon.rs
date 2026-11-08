@@ -423,12 +423,27 @@ struct HeldRebrief {
     slug: BoardSlug,
     triage: bool,
     before: Option<String>,
+    /// The coordinator's [`Coordinator::rebrief_unsure`] before, restored with `before`.
+    unsure_before: Option<UnsureRebrief>,
+}
+
+/// What a check found of a re-brief whose send timed out.
+enum Arrival {
+    /// The thread has it.
+    Found,
+    /// Not in the thread, but a run of it is active or queued, which may still take it.
+    Waiting,
+    /// The thread never got it.
+    Missing,
+    /// The check failed; `gone` when T3 answered that it does not know the thread.
+    Unknown { err: anyhow::Error, gone: bool },
 }
 
 /// How a wake-up send went.
 enum Sent {
     Delivered,
-    /// It ran out of time: T3 may have delivered it, so it is not sent again.
+    /// It ran out of time: T3 may have delivered it, so its wake-up lines are not sent
+    /// again, and a re-brief it carried is sent again only when the thread lacks it.
     MaybeDelivered(anyhow::Error),
     /// T3 no longer has the thread, it is archived, or its worktree is gone.
     Gone(anyhow::Error),
@@ -498,7 +513,8 @@ fn is_idle(board: &Board) -> bool {
 }
 
 /// Records how sending `local` of `slug` the standing prompt with `digest` on its own went:
-/// a send that timed out counts as sent, a failed one backs off.
+/// a send that timed out counts as sent until a reconcile finds it missing from the thread
+/// (see [`Daemon::rebrief`]), and is sent again once at most; a failed one backs off.
 fn settle_rebrief(
     local: &mut Coordinator,
     slug: &BoardSlug,
@@ -514,34 +530,89 @@ fn settle_rebrief(
             );
             local.briefed = Some(digest.to_owned());
             local.rebrief_backoff = None;
+            local.rebrief_unsure = None;
         }
         Sent::MaybeDelivered(err) => {
-            tracing::warn!(
-                "re-briefing {} of {slug}: {err:#}; not sent again, since T3 may have delivered it",
-                local.agent
-            );
             local.briefed = Some(digest.to_owned());
             local.rebrief_backoff = None;
+            local.rebrief_unsure = unsure_after(local, digest, now);
+            if local.rebrief_unsure.is_some() {
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; T3 may have delivered it, so a \
+                     reconcile looks for it in the thread",
+                    local.agent
+                );
+            } else {
+                tracing::warn!(
+                    "re-briefing {} of {slug}: {err:#}; sent twice already, so not sent again",
+                    local.agent
+                );
+            }
         }
         Sent::Gone(err) | Sent::Failed(err) => {
-            let last = local
-                .rebrief_backoff
-                .as_ref()
-                .map(|b| TimeDelta::seconds(b.delay_secs));
-            let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
-            tracing::warn!(
-                "re-briefing {} of {slug}: {err:#}; trying again in {}s",
-                local.agent,
-                delay.num_seconds()
-            );
-            local.rebrief_backoff = Some(Backoff {
-                delay_secs: delay.num_seconds(),
-                retry_at: now + delay,
-                lookup: false,
-            });
+            rebrief_back_off(local, slug, now, "re-briefing", err);
         }
     }
 }
+
+/// What `local` records once a re-brief with `digest` may have been delivered at `now`:
+/// unsure, to be looked for in the thread, unless it was found missing and owed again
+/// already, which leaves nothing to look for: a digest is sent at most twice.
+fn unsure_after(local: &Coordinator, digest: &str, now: Timestamp) -> Option<UnsureRebrief> {
+    let resent = local
+        .rebrief_unsure
+        .as_ref()
+        .is_some_and(|u| u.digest == digest && u.resent);
+    (!resent).then(|| UnsureRebrief {
+        digest: digest.to_owned(),
+        resent: false,
+        since: now,
+    })
+}
+
+/// Holds `local`'s next re-brief of `slug`, or check of one, for a back-off doubled per
+/// failure, and logs `doing` and the `err` that failed it.
+fn rebrief_back_off(
+    local: &mut Coordinator,
+    slug: &BoardSlug,
+    now: Timestamp,
+    doing: &str,
+    err: &anyhow::Error,
+) {
+    let last = local
+        .rebrief_backoff
+        .as_ref()
+        .map(|b| TimeDelta::seconds(b.delay_secs));
+    let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
+    tracing::warn!(
+        "{doing} {} of {slug}: {err:#}; trying again in {}s",
+        local.agent,
+        delay.num_seconds()
+    );
+    local.rebrief_backoff = Some(Backoff {
+        delay_secs: delay.num_seconds(),
+        retry_at: now + delay,
+        lookup: false,
+    });
+}
+
+/// A re-brief whose send timed out: T3 may or may not have delivered it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnsureRebrief {
+    /// The [`prompt_digest`] it carried, which its [`rebrief_marker`] names.
+    pub digest: String,
+    /// Whether a reconcile found it missing and it is owed again: a second send that times
+    /// out counts as delivered.
+    #[serde(default)]
+    pub resent: bool,
+    /// When the send that may have delivered it ran: it is looked for
+    /// [`REBRIEF_CHECK_AFTER`] later, once T3 has handled a request still in flight.
+    pub since: Timestamp,
+}
+
+/// A re-brief whose send timed out is looked for in the thread this long after the send,
+/// since T3 may still be handling the request the timed-out `t3 thread send` made.
+pub const REBRIEF_CHECK_AFTER: TimeDelta = TimeDelta::minutes(1);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Coordinator {
@@ -561,6 +632,10 @@ pub struct Coordinator {
     /// Set after a failed re-brief: it is not sent again before `retry_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebrief_backoff: Option<Backoff>,
+    /// Set after a re-brief send timed out, until a reconcile finds it in the thread or
+    /// sends it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebrief_unsure: Option<UnsureRebrief>,
 }
 
 impl Coordinator {
@@ -581,6 +656,7 @@ impl Coordinator {
             registered,
             briefed,
             rebrief_backoff: None,
+            rebrief_unsure: None,
         }
     }
 }
@@ -1187,7 +1263,16 @@ impl<T: T3> Daemon<T> {
             } else {
                 resume
             };
-            self.t3.send(&local.thread, &message).await?;
+            if let Err(err) = self.t3.send(&local.thread, &message).await {
+                // The resume is tried again on the next reconcile; a re-brief that went with
+                // a send that timed out is looked for in the thread instead of resent.
+                if owed && err.downcast_ref::<TimedOut>().is_some() {
+                    let sent = Sent::MaybeDelivered(anyhow::anyhow!("{err:#}"));
+                    settle_rebrief(&mut local, &board.slug, digest, &sent, now);
+                    self.state.coordinators.insert(board.slug.clone(), local);
+                }
+                return Err(err);
+            }
             local.resumed_after = Some(until);
             if owed {
                 settle_rebrief(&mut local, &board.slug, digest, &Sent::Delivered, now);
@@ -1203,8 +1288,10 @@ impl<T: T3> Daemon<T> {
     /// coordinator is paused, or runs and was seen within [`WAKE_HOLD_MAX`], so it lands
     /// between turns. Held too while its board is idle ([`is_idle`]), or wake-ups wait for
     /// it: the next wake-up carries it (see [`Self::flush`]), so a deploy costs an idle
-    /// coordinator no turn. Like a wake-up: a send that timed out counts as sent, a failed
-    /// one backs off, and either makes the next reconcile ask T3 whether the thread is gone.
+    /// coordinator no turn. A failed send backs off. One that timed out counts as sent until
+    /// a reconcile [`REBRIEF_CHECK_AFTER`] later finds it missing ([`Self::rebrief_arrival`]),
+    /// which makes it owed again, once. Either makes the next reconcile ask T3 whether the
+    /// thread is gone.
     async fn rebrief(
         &mut self,
         board: &Board,
@@ -1220,14 +1307,73 @@ impl<T: T3> Daemon<T> {
             AgentState::Running => now - info.last_seen < WAKE_HOLD_MAX,
             _ => false,
         };
+        let backing_off = local
+            .rebrief_backoff
+            .as_ref()
+            .is_some_and(|b| now < b.retry_at);
+        // A re-brief with another prompt is owed in its place.
+        if local
+            .rebrief_unsure
+            .as_ref()
+            .is_some_and(|unsure| unsure.digest != digest)
+        {
+            local.rebrief_unsure = None;
+        }
+        // Looked for while the coordinator works too, so its turns do not push the message
+        // out of the messages read first.
+        let unsure_since = local
+            .rebrief_unsure
+            .as_ref()
+            .filter(|unsure| !unsure.resent && local.briefed.as_deref() == Some(digest))
+            .map(|unsure| unsure.since);
+        if let Some(since) = unsure_since {
+            if backing_off || now - since < REBRIEF_CHECK_AFTER {
+                return;
+            }
+            match self.rebrief_arrival(&local.thread, slug, triage).await {
+                Arrival::Found => {
+                    tracing::info!(
+                        "re-briefed {} of {slug}: the send timed out, but the thread has the message",
+                        local.agent
+                    );
+                    local.rebrief_unsure = None;
+                    local.rebrief_backoff = None;
+                    return;
+                }
+                Arrival::Waiting => {
+                    local.rebrief_backoff = None;
+                    return;
+                }
+                Arrival::Missing => {
+                    tracing::warn!(
+                        "re-briefing {} of {slug}: the send timed out and the thread never got \
+                         the message; it is owed again",
+                        local.agent
+                    );
+                    local.rebrief_backoff = None;
+                    local.briefed = None;
+                    local.rebrief_unsure = Some(UnsureRebrief {
+                        digest: digest.to_owned(),
+                        resent: true,
+                        since,
+                    });
+                }
+                Arrival::Unknown { err, gone } => {
+                    // T3 answered that it has no such thread: the next reconcile asks again.
+                    if gone {
+                        self.last_checks.remove(&local.thread);
+                    }
+                    let doing = "looking for the timed-out re-brief of";
+                    rebrief_back_off(local, slug, now, doing, &err);
+                    return;
+                }
+            }
+        }
         if local.briefed.as_deref() == Some(digest)
             || held
+            || backing_off
             || is_idle(board)
             || self.state.wakes.contains_key(&local.agent)
-            || local
-                .rebrief_backoff
-                .as_ref()
-                .is_some_and(|b| now < b.retry_at)
         {
             return;
         }
@@ -1238,10 +1384,46 @@ impl<T: T3> Daemon<T> {
         settle_rebrief(local, slug, digest, &sent, now);
     }
 
+    /// Whether `thread` got the re-brief of `slug` whose send timed out, from its
+    /// [`RECENT_MESSAGES`] latest messages: the newest user message with a re-brief marker
+    /// of `slug` must carry this prompt's [`rebrief_marker`]. Without one, it counts as
+    /// missing only when T3 has no run of the thread active or queued, which might still
+    /// take the message.
+    async fn rebrief_arrival(&self, thread: &str, slug: &BoardSlug, triage: bool) -> Arrival {
+        let read = tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
+            .await
+            .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()));
+        let recent = match read {
+            Ok(Some(recent)) => recent,
+            Ok(None) => {
+                return Arrival::Unknown {
+                    err: anyhow::anyhow!("T3 does not know thread {thread}"),
+                    gone: true,
+                };
+            }
+            Err(err) => return Arrival::Unknown { err, gone: false },
+        };
+        let marker = rebrief_marker(slug, triage);
+        let any_marker = format!(" of board {slug})");
+        let newest = recent
+            .user
+            .iter()
+            .rev()
+            .find(|text| text.contains("(re-brief ") && text.contains(&any_marker));
+        if newest.is_some_and(|text| text.contains(&marker)) {
+            Arrival::Found
+        } else if recent.busy {
+            Arrival::Waiting
+        } else {
+            Arrival::Missing
+        }
+    }
+
     /// The re-briefs `agent` is owed, for each board this device hosts it as coordinator
-    /// of where it was briefed with another standing prompt; marked briefed at once, so a
-    /// flush cut short while sending counts them as maybe delivered, like its wake-up lines.
-    fn take_owed_rebriefs(&mut self, agent: &AgentId) -> Vec<HeldRebrief> {
+    /// of where it was briefed with another standing prompt; marked briefed, and unsure as
+    /// of `now`, at once, so a flush cut short while sending leaves them to be looked for
+    /// in the thread.
+    fn take_owed_rebriefs(&mut self, agent: &AgentId, now: Timestamp) -> Vec<HeldRebrief> {
         let feedback = self.ctx.config.feedback_board();
         self.state
             .coordinators
@@ -1250,10 +1432,15 @@ impl<T: T3> Daemon<T> {
             .filter_map(|(slug, local)| {
                 let triage = *slug == feedback;
                 let digest = prompt_digest(triage);
-                (local.briefed.as_deref() != Some(digest)).then(|| HeldRebrief {
-                    slug: slug.clone(),
-                    triage,
-                    before: local.briefed.replace(digest.to_owned()),
+                (local.briefed.as_deref() != Some(digest)).then(|| {
+                    let unsure_before = local.rebrief_unsure.clone();
+                    local.rebrief_unsure = unsure_after(local, digest, now);
+                    HeldRebrief {
+                        slug: slug.clone(),
+                        triage,
+                        before: local.briefed.replace(digest.to_owned()),
+                        unsure_before,
+                    }
                 })
             })
             .collect()
@@ -1867,7 +2054,7 @@ impl<T: T3> Daemon<T> {
         let mut outgoing = Vec::new();
         for ((agent, queue), checked) in queues.into_iter().zip(checked) {
             if let Some(mut out) = self.apply(agent, queue, checked, now) {
-                out.rebriefs = self.take_owed_rebriefs(&out.agent);
+                out.rebriefs = self.take_owed_rebriefs(&out.agent, now);
                 for held in out.rebriefs.iter().rev() {
                     out.message = format!(
                         "{}\n\n{}",
@@ -2221,9 +2408,14 @@ impl<T: T3> Daemon<T> {
             };
             match sent {
                 Sent::Delivered | Sent::MaybeDelivered(_) => {
+                    // Settled as from before the send, which marked it unsure for a cut flush.
+                    local.rebrief_unsure = held.unsure_before;
                     settle_rebrief(local, &held.slug, prompt_digest(held.triage), &sent, now);
                 }
-                Sent::Gone(_) | Sent::Failed(_) => local.briefed = held.before,
+                Sent::Gone(_) | Sent::Failed(_) => {
+                    local.briefed = held.before;
+                    local.rebrief_unsure = held.unsure_before;
+                }
             }
         }
         let kinds = || {
@@ -2602,11 +2794,22 @@ pub fn prompt_digest(triage: bool) -> &'static str {
     &DIGESTS[usize::from(triage)]
 }
 
-/// The message that gives a running coordinator its changed standing prompt in full.
+/// The message that gives a running coordinator its changed standing prompt in full,
+/// ending with its [`rebrief_marker`].
 pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
+    let marker = rebrief_marker(slug, triage);
     format!(
-        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot."
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{prompt}\nYou are the coordinator of board {slug}. Continue your loop: call board_snapshot.\n{marker}"
+    )
+}
+
+/// The last line of [`rebrief_message`]: it names the board and the prompt's digest, so a
+/// reconcile finds the message among a thread's messages after its send timed out.
+pub fn rebrief_marker(slug: &BoardSlug, triage: bool) -> String {
+    format!(
+        "(re-brief {} of board {slug})",
+        &prompt_digest(triage)[..16]
     )
 }
 
