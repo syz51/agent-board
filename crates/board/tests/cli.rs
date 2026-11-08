@@ -608,7 +608,7 @@ fn boards_show_ready_auto_apart_from_ready() {
     let mut factory = board_fixture("factory", &[]);
     factory.counts.open = 7;
     factory.counts.ready = 5;
-    factory.counts.ready_auto = 3;
+    factory.counts.ready_auto = Some(3);
     e.stub.on("GET /v1/boards", [&factory]);
     let out = e.run(&["boards"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -617,6 +617,15 @@ fn boards_show_ready_auto_apart_from_ready() {
         "{}",
         stdout(&out)
     );
+
+    // A server that predates the split sends none: the line shows no split, not `(auto 0)`.
+    factory.counts.ready_auto = None;
+    e.stub.on("GET /v1/boards", [&factory]);
+    let out = e.run(&["boards"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains(" done 0 ready 5"), "{text}");
+    assert!(!text.contains("(auto"), "{text}");
 }
 
 #[test]

@@ -67,10 +67,10 @@ pub struct StatusCounts {
     /// never stored.
     pub ready: u32,
     /// The ready tasks with `auto` on: work a coordinator may start without the user. The
-    /// rest of `ready` waits on the user. Absent from servers that predate it, so it reads
-    /// as 0.
-    #[serde(default)]
-    pub ready_auto: u32,
+    /// rest of `ready` waits on the user. `None` from servers that predate it: the split is
+    /// unknown, not 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_auto: Option<u32>,
 }
 
 /// Task statuses. `ready` is not a status: it is computed (see [`Task::ready`]).

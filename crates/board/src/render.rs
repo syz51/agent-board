@@ -382,7 +382,7 @@ fn short<'a>(handles: &'a BTreeMap<String, String>, id: &'a str) -> &'a str {
 pub fn board_line(board: &Board) -> String {
     let c = &board.counts;
     let mut line = format!(
-        "{} {} {} · open {} doing {} blocked {} review {} done {} ready {} (auto {})",
+        "{} {} {} · open {} doing {} blocked {} review {} done {} ready {}",
         board.slug,
         title(&board.title),
         enum_str(&board.status),
@@ -391,9 +391,12 @@ pub fn board_line(board: &Board) -> String {
         c.blocked,
         c.review,
         c.done,
-        c.ready,
-        c.ready_auto
+        c.ready
     );
+    // A server that predates the split sends none; 0 would claim nothing may start.
+    if let Some(auto) = c.ready_auto {
+        let _ = write!(line, " (auto {auto})");
+    }
     if board.open_asks > 0 {
         let _ = write!(line, " · asks {}", board.open_asks);
     }

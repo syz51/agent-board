@@ -167,7 +167,8 @@ impl From<StatusCounts> for Counts {
             blocked: c.blocked,
             review: c.review,
             ready: c.ready,
-            ready_auto: c.ready_auto,
+            // The server's own counts always carry it.
+            ready_auto: c.ready_auto.unwrap_or_default(),
         }
     }
 }

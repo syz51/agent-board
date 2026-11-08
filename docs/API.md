@@ -167,8 +167,9 @@ server's minute sweep deletes older ones.
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
   A `Board`'s `counts` hold the tasks per status, `ready` (see Tasks) and `ready_auto`: the
   ready tasks with `auto` on, which the coordinator may start. The rest of `ready` waits on
-  the user. `board boards` and snapshots show both as `ready N (auto M)`. A `Board` from a
-  server that predates `ready_auto` reads it as 0.
+  the user. `board boards` and the snapshot counts line show both as `ready N (auto M)`;
+  `json` and `yaml` snapshots name it `auto` under `counts`. A server that predates
+  `ready_auto` leaves it out, and `board boards` then shows `ready N` alone.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
   `parallel_tasks` (1 to 4; 400 `invalid` otherwise) is how many tasks the board's
   coordinator and its child threads may have in progress at once. The coordinator keeps to

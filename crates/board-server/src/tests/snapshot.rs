@@ -218,7 +218,7 @@ async fn delta_reports_changed_counts_once_and_new_alerts() {
     t.board("factory", &[REPO]).await;
     let full = snapshot(&t, "t3:alpha", "").await;
     assert!(
-        text(&full).contains("counts: open 0 · doing 0 · ready 0"),
+        text(&full).contains("counts: open 0 · doing 0 · ready 0 (auto 0)"),
         "{}",
         text(&full)
     );
@@ -227,11 +227,37 @@ async fn delta_reports_changed_counts_once_and_new_alerts() {
     t.task("t3:beta", "factory", "Something new").await;
     let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
     assert!(
-        text(&delta).contains("counts: open 1 · doing 0 · ready 1"),
+        text(&delta).contains("counts: open 1 · doing 0 · ready 1 (auto 0)"),
         "{}",
         text(&delta)
     );
     assert!(!text(&delta).contains("alerts:"));
+    assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
+
+    // Ready work a coordinator may start changes the counts too, with `ready` unchanged.
+    let (s, v) = t
+        .patch("t3:beta", "factory-1", json!({ "auto": true }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("counts: open 1 · doing 0 · ready 1 (auto 1)"),
+        "{}",
+        text(&delta)
+    );
+    assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
+
+    // Counts stored before the split read it as 0: the next delta shows the split once.
+    t.exec(
+        "UPDATE agents SET last_counts = '{\"board\":\"factory\",\"counts\":{\"open\":1,\
+         \"doing\":0,\"blocked\":0,\"review\":0,\"ready\":1}}' WHERE id = 't3:alpha'",
+    );
+    let delta = snapshot(&t, "t3:alpha", "kind=delta").await;
+    assert!(
+        text(&delta).contains("ready 1 (auto 1)"),
+        "{}",
+        text(&delta)
+    );
     assert_eq!(text(&snapshot(&t, "t3:alpha", "kind=delta").await), "");
 
     // A lease covering a file the agent touched is an alert.
