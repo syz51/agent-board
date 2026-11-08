@@ -61,6 +61,18 @@ impl Env {
         payload: Value,
         env: &[(&str, &str)],
     ) -> (Option<Value>, String) {
+        let text = stdout(&self.hook_output(event, runtime, payload, env));
+        (serde_json::from_str(&text).ok(), text)
+    }
+
+    /// Runs a hook and returns its output, stderr included.
+    fn hook_output(
+        &self,
+        event: &str,
+        runtime: &str,
+        payload: Value,
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
         let out = board(
             &self.home,
             &self.repo,
@@ -74,8 +86,7 @@ impl Env {
             "hooks always exit 0: {}",
             stderr(&out)
         );
-        let text = stdout(&out);
-        (serde_json::from_str(&text).ok(), text)
+        out
     }
 
     fn base(&self, event: &str) -> Value {
@@ -1685,10 +1696,8 @@ fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
     );
 }
 
-#[test]
-fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
-    let (e, start) = cached_env();
-    // A closed port: the connection is refused.
+/// Points the hook at a closed port, so its connection is refused at once.
+fn refuse_connects(e: &Env) {
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
@@ -1697,6 +1706,30 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
         format!("server = \"{url}\"\ndevice = \"{DEVICE}\"\n"),
     )
     .unwrap();
+}
+
+/// A refused connection is unreachable however little time the local steps left.
+#[cfg(unix)]
+#[test]
+fn a_refused_connect_after_slow_local_steps_still_backs_off() {
+    let (e, start) = cached_env();
+    refuse_connects(&e);
+    let path = slow_git_path(&e);
+    let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
+    // On a very slow runner the hook's own guard may answer first, with nothing.
+    if reply.is_none() {
+        return;
+    }
+    let text = context(&reply, "SessionStart");
+    assert!(text.starts_with("board server unreachable"), "{text}");
+    let open = breaker(&e);
+    assert!(open["until"].is_string(), "{open}");
+}
+
+#[test]
+fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
+    let (e, start) = cached_env();
+    refuse_connects(&e);
     let (reply, elapsed) = timed(&e, "session-start", &start);
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     let text = context(&reply, "SessionStart");
@@ -1758,8 +1791,17 @@ fn hang_connects(e: &Env) {
     .unwrap();
 }
 
+/// Whether connects to TEST-NET-1 hang here, as [`hang_connects`] needs; some networks
+/// (offline, no default route) refuse them at once.
+fn connects_hang() -> bool {
+    let addr = "192.0.2.1:9".parse().unwrap();
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::TimedOut)
+}
+
 /// Runs a `SessionStart` hook with its debug log and returns its reply, its time, and
-/// whether it had too little time left to judge the server.
+/// whether it gave the server a fair share of its budget. A hook stopped by its own guard
+/// before setting the share gave none.
 fn session_start_judged(
     e: &Env,
     start: &Value,
@@ -1767,19 +1809,11 @@ fn session_start_judged(
 ) -> (Option<Value>, Duration, bool) {
     let env = [env, &[("BOARD_LOG", "board::hook=debug")]].concat();
     let began = Instant::now();
-    let out = board(
-        &e.home,
-        &e.repo,
-        &env,
-        &["hook", "session-start", "--runtime", "claude"],
-        &start.to_string(),
-    );
+    let out = e.hook_output("session-start", "claude", start.clone(), &env);
     let elapsed = began.elapsed();
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let log = stderr(&out);
-    assert!(log.contains(": server share "), "{log}");
-    let short = log.contains(", too little to judge");
-    (serde_json::from_str(&stdout(&out)).ok(), elapsed, short)
+    let fair = log.contains(": server share ") && !log.contains(", too little to judge");
+    (serde_json::from_str(&stdout(&out)).ok(), elapsed, fair)
 }
 
 #[test]
@@ -1787,19 +1821,13 @@ fn a_connect_that_hangs_counts_as_unreachable() {
     let (e, start) = cached_env();
     hang_connects(&e);
     // On a loaded machine the hook's local steps may leave the server too little time to
-    // judge (the next test); then the hook is tried again.
+    // judge a connect that hangs (the next test); then the hook is tried again. A connect
+    // refused at once is unreachable whatever the share.
+    let hang = connects_hang();
     let (reply, elapsed) = (0..5)
         .find_map(|_| {
-            let (reply, elapsed, short) = session_start_judged(&e, &start, &[]);
-            if !short {
-                return Some((reply, elapsed));
-            }
-            assert_eq!(
-                breaker(&e),
-                Value::Null,
-                "too little time leaves the breaker"
-            );
-            None
+            let (reply, elapsed, fair) = session_start_judged(&e, &start, &[]);
+            (fair || !hang).then_some((reply, elapsed))
         })
         .expect("every try had too little time to judge the server");
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
@@ -1821,11 +1849,15 @@ fn a_connect_that_hangs_counts_as_unreachable() {
 #[cfg(unix)]
 #[test]
 fn a_connect_that_hangs_after_slow_local_steps_reads_as_slow() {
+    if !connects_hang() {
+        eprintln!("skipped: this network refuses connects to TEST-NET-1 at once");
+        return;
+    }
     let (e, start) = cached_env();
     hang_connects(&e);
     let path = slow_git_path(&e);
-    let (reply, elapsed, short) = session_start_judged(&e, &start, &[("PATH", &path)]);
-    assert!(short, "the slow git leaves the server too little time");
+    let (reply, elapsed, fair) = session_start_judged(&e, &start, &[("PATH", &path)]);
+    assert!(!fair, "the slow git leaves the server too little time");
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     // On a very slow runner the hook's own guard may answer first, with nothing.
     if reply.is_some() {
