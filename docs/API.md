@@ -158,6 +158,11 @@ server's minute sweep deletes older ones.
 
 - `GET /v1/boards` → `[Board]` list. `POST /v1/boards` `[CreateBoard]` → `[Board]`.
 - `GET /v1/boards/{slug}` → `[Board]`. `PATCH /v1/boards/{slug}` `[UpdateBoard]` → `[Board]`.
+  `parallel_tasks` (1 to 4; 400 `invalid` otherwise) caps the tasks the board's
+  coordinator and its child threads have in `doing` at once. Raising it is user only (403
+  `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
+  restate or lower it. A `Board` from a server that predates it reads as 1, and a client
+  leaves the field out of `UpdateBoard` unless it sets it.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by

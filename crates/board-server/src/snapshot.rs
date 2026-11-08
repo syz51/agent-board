@@ -116,6 +116,10 @@ struct You {
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// Set when the agent is the snapshot board's coordinator: how many tasks it and its
+    /// child threads may have in progress at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tasks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,11 +398,14 @@ fn fill_full(
     board: &BoardSlug,
     board_counts: Option<Counts>,
 ) -> Result<()> {
+    let shown_board = get_board(cx, board)?;
     model.you = Some(You {
         handle: agent.handle.clone(),
         runtime: runtime_str(agent.runtime),
         repo: agent.repo.clone(),
         branch: agent.branch.clone(),
+        parallel_tasks: (shown_board.coordinator.as_ref() == Some(&agent.id))
+            .then_some(shown_board.parallel_tasks),
     });
     model.counts = board_counts;
 
@@ -1399,6 +1406,11 @@ fn render_lines(m: &Model) -> String {
         if let Some(branch) = &you.branch {
             parts.push(path(branch));
         }
+        match you.parallel_tasks {
+            Some(1) => parts.push("coordinator, one task at a time".to_owned()),
+            Some(n) => parts.push(format!("coordinator, up to {n} tasks at once")),
+            None => {}
+        }
         let _ = writeln!(o, "you: {}", parts.join(" · "));
     }
     if let Some(c) = &m.counts {
@@ -1547,6 +1559,9 @@ fn render_yaml(m: &Model) -> String {
         }
         if let Some(branch) = &you.branch {
             let _ = writeln!(o, "  branch: {}", q(branch));
+        }
+        if let Some(n) = you.parallel_tasks {
+            let _ = writeln!(o, "  coordinator_parallel_tasks: {n}");
         }
     }
     if let Some(c) = &m.counts {

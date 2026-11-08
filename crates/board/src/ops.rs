@@ -772,6 +772,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
     if let Some(temporary) = body.temporary {
         check_temporary(&board, temporary, "updated")?;
     }
+    if let Some(wanted) = body.parallel_tasks
+        && board.parallel_tasks != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored parallel_tasks={wanted}: it predates \
+             parallel tasks. Upgrade the server, then run board board update {slug} \
+             --parallel-tasks {wanted}"
+        );
+    }
     Ok(Output::new(
         format!("updated {}", render::board_line(&board)),
         &board,
