@@ -437,3 +437,69 @@ async fn a_relay_dying_mid_hook_trips_nothing() {
         "a failing relay says nothing about the server"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_too_busy_to_accept_costs_no_hook_its_answer() {
+    let e = env();
+    // The relay on a runtime of its own, which the test can keep from accepting.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let relay = {
+        let _on = runtime.enter();
+        relay::start(&e.home(), &e.stub.url, DAEMON_TOKEN.to_owned()).unwrap()
+    };
+    let (stall, stalled) = tokio::sync::oneshot::channel::<()>();
+    let (resume, resumed) = std::sync::mpsc::channel::<()>();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let driver = std::thread::spawn(move || {
+        runtime.block_on(async move {
+            stalled.await.unwrap();
+            // Busy: nothing on this runtime runs, so nothing is accepted.
+            resumed.recv().unwrap();
+            stopped.await.unwrap();
+        });
+    });
+    assert!(relay::connect(relay.path(), &e.stub.url).await.is_some());
+    for _ in 0..200 {
+        if e.stub.requests_to("GET /healthz").len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A token the hook calls the server with once it passes the relay by.
+    std::fs::write(e.home.join("token"), format!("{TOKEN}\n")).unwrap();
+    stall.send(()).unwrap();
+    e.stub.clear();
+
+    let text = e.hook("user-prompt-submit", e.prompt(), "").await;
+    assert!(text.contains("alerts: x"), "{text}");
+    assert_eq!(
+        e.tokens(),
+        vec![format!("Bearer {TOKEN}"); 2],
+        "called directly with the hook's own token"
+    );
+    assert_eq!(e.breaker(), None);
+
+    // The relay then meets the probe's closed connection: counted, and still serving.
+    resume.send(()).unwrap();
+    let mut serving = false;
+    for _ in 0..200 {
+        // macOS has no credentials for a closed connection; Linux keeps them and serves it.
+        if (!cfg!(target_os = "macos") || relay.early_closes() == 1)
+            && relay::connect(relay.path(), &e.stub.url).await.is_some()
+        {
+            serving = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        serving,
+        "{} early closes; the relay must count the probe's and serve again",
+        relay.early_closes()
+    );
+    stop.send(()).unwrap();
+    driver.join().unwrap();
+}

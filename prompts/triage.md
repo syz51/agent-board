@@ -64,6 +64,14 @@ only for a cause that is already gone.
   `feedback_resolve` with kind `routed` and `task` the revisit, with no new task. When the
   item is a `signal`, also clear the revisit's `not_before` (`task_update` with
   `not_before` none) so it runs now.
+- An item reopened after a decline goes to the setup's owner or to the user, never back to
+  `declined` for the same reason. You know it by its evidence: the server's own
+  `feedback declined: <reason>` from the earlier resolution. When enough new agents keep
+  reporting a declined item, the server reopens it and adds a `reopened:` note with the
+  counts. Many agents hitting intended behaviour means the interface or the instructions
+  may be wrong. File a `Proposal:` task for the owner that cites the decline, its reason
+  and the counts, then `feedback_resolve` with kind `routed`. When only the user can decide whether the rule should change,
+  `ask_user` with the counts, set the item `blocked`, and continue with the next item.
 - A recurring item (`recurs` set: it came back after an earlier resolution) goes back to
   the same owner, never as a `duplicate` of the closed item. When the earlier task has an
   open revisit (a child task titled `Revisit: …`, or one a note on that task names),

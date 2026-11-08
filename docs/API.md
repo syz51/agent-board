@@ -531,7 +531,8 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   20), and at most once an hour a `feedback` note says it was reported again, naming the
   routed task and its status when routed, with a `task_updated` event
   `{"fields": ["feedback"], "reports": n}`. A report leaves the task's `version` alone, so
-  it never makes the owner's update conflict. The newest item with the signature is live
+  it never makes the owner's update conflict, except the one that reopens a declined item
+  (below), which changes its status. The newest item with the signature is live
   while it is unresolved and not done or dropped, declined, a duplicate of a live item (the
   link is followed), or routed to a task that is not done or dropped.
 - Otherwise a new item is filed (`task_created` with a `feedback` payload). When the newest
@@ -556,6 +557,21 @@ use, autopilot off). Items get `auto` from that board's autopilot.
     would take no reports because the duplicate links lead back to it.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
+    When agents keep reporting it, the server sends it back to triage. The check runs on
+    each report to a declined item. It needs three things: the item was declined at least
+    `declined_reopen_after_days` ago; it has gained at least `declined_reopen_reports`
+    reports since the decline, from any agent; and at least `declined_reopen_agents` of
+    the agents behind them are new. A new agent had not reported it before the decline:
+    not on this item, not on an item resolved as its duplicate, and not as its creator.
+    The report that meets all three moves it to `open`, unowned, with the resolution
+    cleared and `version` raised. Reports that met the bar during the wait take effect
+    with the next report after it. A `finding` note, credited to that
+    reporter, starts `reopened:` and gives the reports and agents since the decline, how
+    many agents are new, the decline time and its reason. It comes with `note_added` and a
+    `task_updated` event `{"fields": ["status", "feedback"], "from": "done", "to": "open",
+    "reopened": {"reports", "agents", "new_agents"}}`; when the item still had an owner,
+    `fields` also lists `owner`, and the event carries `owner` (null) and `previous_owner`. Every report counts,
+    not just the 20 in `reporters`. Declining it again starts a new count.
   - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the
     file and line, or the setting). It is not live: a later report opens a new item that
     `recurs` this one.
@@ -693,6 +709,7 @@ no nonce.
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 | API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |
+| Declined feedback item reopened after, with reports and new agents since the decline (`declined_reopen_after_days`, `declined_reopen_reports`, `declined_reopen_agents`) | 1 day, 5 reports, 3 agents |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |

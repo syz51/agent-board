@@ -574,6 +574,10 @@ fn service_path_env() -> String {
     dirs.join(":")
 }
 
+/// The launchd agent for `board watch`. It is `Interactive`: launchd throttles a job of no
+/// `ProcessType` (`Standard`), and while builds kept the device busy such a relay answered
+/// hooks after up to 0.4 seconds, past their 0.1-second probe, so they called the server
+/// directly.
 pub fn launchd_plist(bin: &Path, home: &Home) -> String {
     let log = home.root().join("watch.log");
     format!(
@@ -601,6 +605,8 @@ pub fn launchd_plist(bin: &Path, home: &Home) -> String {
   <true/>
   <key>ThrottleInterval</key>
   <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>{log}</string>
   <key>StandardErrorPath</key>
@@ -707,6 +713,7 @@ mod tests {
         let plist = launchd_plist(Path::new("/opt/board"), &home);
         assert!(plist.contains("<string>/opt/board</string>\n    <string>watch</string>"));
         assert!(plist.contains("/data/board &amp; co"));
+        assert!(plist.contains("<key>ProcessType</key>\n  <string>Interactive</string>"));
         let unit = systemd_unit(Path::new("/opt/my board"), &home);
         assert!(unit.contains("ExecStart=\"/opt/my board\" watch"));
         assert!(unit.contains("Environment=\"BOARD_HOME=/data/board & co\""));

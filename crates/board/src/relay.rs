@@ -15,10 +15,14 @@
 //! - When the relay gets no answer from the server, or refuses a request itself, it says so
 //!   in [`RELAY_HEADER`], so the hook judges the server as it would have directly and never
 //!   blames it for the relay.
+//! - A hook whose probe gets no answer within [`PROBE`] closes its connection, often before
+//!   the relay accepts it, and calls the server directly. The relay counts these and says
+//!   how many in one line every [`EARLY_REPORT`], not one warning each.
 
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -58,6 +62,8 @@ const UPSTREAM_IDLE: Duration = Duration::from_secs(300);
 const KEEP_WARM: Duration = Duration::from_secs(30);
 /// How long a hook waits for the relay's status; past it, the hook calls the server.
 const PROBE: Duration = Duration::from_millis(100);
+/// How often the relay says how many hooks closed their connection before it accepted it.
+const EARLY_REPORT: Duration = Duration::from_secs(600);
 
 /// The relay's socket for `home`.
 pub fn socket_path(home: &Home) -> PathBuf {
@@ -110,11 +116,17 @@ fn hook_route(method: &Method, path: &str, agent: &AgentId) -> bool {
 pub struct Relay {
     path: PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    early: Arc<AtomicU64>,
 }
 
 impl Relay {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Connections closed before the relay accepted them, not yet reported.
+    pub fn early_closes(&self) -> u64 {
+        self.early.load(Ordering::Relaxed)
     }
 }
 
@@ -183,25 +195,53 @@ pub fn start(home: &Home, server: &str, token: String) -> Result<Relay> {
         .route(STATUS_PATH, axum::routing::get(status))
         .fallback(relay)
         .with_state(upstream);
+    let early = Arc::new(AtomicU64::new(0));
     let listener = SameUser {
         inner: listener,
         uid,
+        early: early.clone(),
     };
     let serve = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::warn!("the hook relay stopped: {err:#}");
         }
     });
+    let count = early.clone();
+    let report = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EARLY_REPORT);
+        // The first tick is at once.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            report_early_closes(&count);
+        }
+    });
     Ok(Relay {
         path,
-        tasks: vec![serve, keep_warm],
+        tasks: vec![serve, keep_warm, report],
+        early,
     })
 }
 
-/// Accepts only connections from processes of `uid`.
+/// Says how many hooks closed their connection before the relay accepted it since the last
+/// report, if any. Each of them called the server directly instead.
+fn report_early_closes(count: &AtomicU64) {
+    let closed = count.swap(0, Ordering::Relaxed);
+    if closed > 0 {
+        tracing::info!(
+            "hook relay: {closed} hooks closed their connection before it was accepted in the last {} minutes and called the server directly: the relay did not answer within their {} ms probe, as when this device is busy",
+            EARLY_REPORT.as_secs() / 60,
+            PROBE.as_millis(),
+        );
+    }
+}
+
+/// Accepts only connections from processes of `uid`, and counts in `early` those closed
+/// before they were accepted.
 struct SameUser {
     inner: UnixListener,
     uid: u32,
+    early: Arc<AtomicU64>,
 }
 
 impl axum::serve::Listener for SameUser {
@@ -217,6 +257,12 @@ impl axum::serve::Listener for SameUser {
                         "hook relay: refused a connection from user id {}",
                         cred.uid()
                     ),
+                    // macOS has no credentials for a connection its client already closed: a
+                    // hook whose probe gave up and called the server directly.
+                    Err(err) if err.kind() == ErrorKind::NotConnected => {
+                        tracing::debug!("hook relay: closed before it was accepted: {err}");
+                        self.early.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(err) => tracing::warn!("hook relay: no peer credentials: {err}"),
                 },
                 Err(err) => {
@@ -497,6 +543,17 @@ pub async fn connect(socket: &Path, server: &str) -> Option<Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_closes_are_reported_once() {
+        let count = AtomicU64::new(3);
+        report_early_closes(&count);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "each report starts a new count"
+        );
+    }
 
     #[test]
     fn only_hook_routes_for_the_calling_agent_pass() {
