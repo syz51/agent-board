@@ -3449,14 +3449,20 @@ fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
         "When the earlier task has an open revisit (a child task titled `Revisit: …`, or one a note on that task names), route the item to the revisit as the rule above says",
         // The dropped-proposal rule still follows the recurring rule it is named from.
         "when that task was dropped, the next rule applies. When the earlier item was `fixed` or `forwarded` (no task), route it to the setup's owner (see \"Finding the owner\") and cite the earlier item and its reason: a fix that did not hold goes to the owner, not back to you. - When the owner declines or merges a routed proposal",
-        // Repeats without `recurs` go there too, and a signal brings the revisit forward.
+        // Repeats without `recurs` go there too. A signal is noted on the revisit and keeps
+        // its `not_before`, unless it shows p1 harm or already exceeds the whole-window bar.
         "Any item that repeats a problem whose fix has an open revisit goes to that revisit, with or without `recurs`",
         "Find open revisits with `task_list` on the owner's board",
         "`feedback_resolve` with kind `routed` and `task` the revisit, with no new task",
-        "When the item is a `signal`, also clear the revisit's `not_before`",
+        "When the item is a `signal`, also `task_note` it on the revisit with its count and window",
+        "Keep the revisit's `not_before`: a revisit judges a rate over its whole window",
+        "so the revisit runs now only in two cases",
+        "the signal shows p1 harm on the Priority scale in the coordinator instructions; counts alone never make p1",
+        "already exceeds the whole-window bar: the bar's rate times the time from the watched deploy to `not_before`",
     ] {
         assert!(triage.contains(rule), "missing {rule:?}");
     }
+    assert!(!triage.contains("also clear the revisit's `not_before`"));
 }
 
 #[test]
