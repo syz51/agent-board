@@ -105,6 +105,13 @@ server's minute sweep deletes older ones.
   result, the daemon in its log. Hooks stay silent, and header values that are not plain
   tokens are ignored. `board --version` prints `board <version> (<commit>)`; the commit is
   `BOARD_COMMIT` when set at build time, else the checkout's `HEAD`.
+- Every answer also carries `X-Board-Built`, the build's order stamp: its commit's committer
+  time in seconds since the Unix epoch (`BOARD_BUILT` when set at build time, else from
+  git), or `unknown`. A newer build has a higher stamp, so the warning names the older side
+  and says that calls still work. When the server is older, it says to upgrade the server.
+  When the client is older, it reads the commit of the board installed at its own path and
+  says what picks up the new build: restarting the session, or the device upgrade. Servers
+  that predate the header, and builds without a stamp, get the warning without an order.
 
 ### Agents
 

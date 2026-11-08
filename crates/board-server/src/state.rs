@@ -25,8 +25,8 @@ struct Inner {
     users: Vec<String>,
     trust_identity_header: bool,
     public_url: Option<String>,
-    /// The build's response headers: version and commit.
-    build: [(HeaderName, HeaderValue); 2],
+    /// The build's response headers: version, commit and order stamp.
+    build: [(HeaderName, HeaderValue); 3],
     shutdown: watch::Sender<bool>,
 }
 
@@ -60,6 +60,12 @@ impl AppState {
                         HeaderValue::from_str(&config.commit)
                             .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
                     ),
+                    (
+                        HeaderName::from_static(board_proto::BUILT_HEADER),
+                        // The binary passes seconds since the epoch or `unknown`.
+                        HeaderValue::from_str(&config.built)
+                            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+                    ),
                 ],
                 shutdown,
             }),
@@ -67,7 +73,7 @@ impl AppState {
     }
 
     /// The response headers naming this build.
-    pub(crate) fn build_headers(&self) -> &[(HeaderName, HeaderValue); 2] {
+    pub(crate) fn build_headers(&self) -> &[(HeaderName, HeaderValue); 3] {
         &self.inner.build
     }
 

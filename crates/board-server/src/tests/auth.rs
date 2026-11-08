@@ -236,7 +236,10 @@ async fn health_and_every_answer_name_the_build() {
     use axum::http::Request;
     use tower::ServiceExt as _;
 
-    let t = T::with(|c| c.commit = "0123456789ab".into());
+    let t = T::with(|c| {
+        c.commit = "0123456789ab".into();
+        c.built = "1762588800".into();
+    });
     let (s, v) = t.send("GET", "/healthz", &[], None).await;
     assert_eq!(s.as_u16(), 200);
     assert_eq!(v["version"], board_proto::VERSION);
@@ -251,17 +254,24 @@ async fn health_and_every_answer_name_the_build() {
         assert_eq!(
             (
                 headers[board_proto::VERSION_HEADER].to_str().unwrap(),
-                headers[board_proto::COMMIT_HEADER].to_str().unwrap()
+                headers[board_proto::COMMIT_HEADER].to_str().unwrap(),
+                headers[board_proto::BUILT_HEADER].to_str().unwrap()
             ),
-            (board_proto::VERSION, "0123456789ab"),
+            (board_proto::VERSION, "0123456789ab", "1762588800"),
             "{path}"
         );
     }
 
-    // A server started without a commit reports `unknown`.
+    // A server started without a commit or stamp reports `unknown`.
     let t = T::new();
     assert_eq!(
         t.ok("GET", "/healthz", None, None).await["commit"],
         "unknown"
     );
+    let req = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = t.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.headers()[board_proto::BUILT_HEADER], "unknown");
 }

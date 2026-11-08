@@ -69,8 +69,9 @@ struct StubState {
     /// Routes answered as a server-sent event stream: the events after the request's
     /// `since`, then nothing more while the connection stays open.
     streams: BTreeMap<String, Stream>,
-    /// Version and commit sent in the build headers, as a server does since it reports them.
-    build: Option<(String, String)>,
+    /// Version, commit and order stamp sent in the build headers, as a server does since it
+    /// reports them; servers before the stamp send none.
+    build: Option<(String, String, Option<String>)>,
 }
 
 struct Stream {
@@ -178,7 +179,16 @@ impl Stub {
 
     /// Names a server build in the headers of every answer.
     pub fn build(&self, version: &str, commit: &str) {
-        self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned()));
+        self.state.lock().unwrap().build = Some((version.to_owned(), commit.to_owned(), None));
+    }
+
+    /// Names a server build with its order stamp in the headers of every answer.
+    pub fn build_stamped(&self, version: &str, commit: &str, built: &str) {
+        self.state.lock().unwrap().build = Some((
+            version.to_owned(),
+            commit.to_owned(),
+            Some(built.to_owned()),
+        ));
     }
 
     /// Delays the answers to `route` by `delay`, as a server stalled on it would.
@@ -329,7 +339,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
     *resp.status_mut() = StatusCode::from_u16(canned.status).unwrap();
     resp.headers_mut()
         .insert("content-type", HeaderValue::from_static("application/json"));
-    if let Some((version, commit)) = build {
+    if let Some((version, commit, built)) = build {
         let headers = resp.headers_mut();
         headers.insert(
             board_proto::VERSION_HEADER,
@@ -339,6 +349,12 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             board_proto::COMMIT_HEADER,
             HeaderValue::from_str(&commit).unwrap(),
         );
+        if let Some(built) = built {
+            headers.insert(
+                board_proto::BUILT_HEADER,
+                HeaderValue::from_str(&built).unwrap(),
+            );
+        }
     }
     resp
 }

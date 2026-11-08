@@ -110,6 +110,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The order stamp every answer reports: the commit's committer time in seconds.
+      - id: stamp
+        name: Read the order stamp
+        run: echo "built=$(git log -1 --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
       # /healthz reports BOARD_COMMIT; the build keeps its first 12 characters, lowercase
       # (crates/board/build_commit.rs), which upgrade.sh waits for.
       - name: Build the image
@@ -119,7 +123,9 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
-          build-args: BOARD_COMMIT=${{ github.sha }}
+          build-args: |
+            BOARD_COMMIT=${{ github.sha }}
+            BOARD_BUILT=${{ steps.stamp.outputs.built }}
       - name: Smoke test the image
         run: docker run --rm "$IMAGE:sha-$GITHUB_SHA" --version
       # The same inputs again: the builder reuses the build above and pushes it.
@@ -131,7 +137,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
-          build-args: BOARD_COMMIT=${{ github.sha }}
+          build-args: |
+            BOARD_COMMIT=${{ github.sha }}
+            BOARD_BUILT=${{ steps.stamp.outputs.built }}
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
