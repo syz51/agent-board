@@ -271,6 +271,183 @@ async fn a_report_after_the_routed_task_is_done_opens_a_new_item_naming_the_old_
 }
 
 #[tokio::test]
+async fn a_duplicate_needs_an_original_that_still_takes_reports() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let text = json!({ "about": "board", "text": "Notes are refused at the limit" });
+    let original = report(&t, A, text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let work = t.task(B, "factory", "Raise the note limit").await;
+    assert!(t.claim(C, &original).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &original,
+        json!({ "kind": "routed", "task": work }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // While the routed task is open, the original is live: a duplicate of it works.
+    let other = report(
+        &t,
+        B,
+        json!({ "about": "board", "text": "Long notes bounce" }),
+    )
+    .await;
+    let other = other["task"]["id"].as_str().unwrap().to_owned();
+    assert!(t.claim(C, &other).await.0.is_success());
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &other,
+        json!({ "kind": "duplicate", "task": original }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // Once the fix is done, the recurring item cannot be a duplicate of the original, or of
+    // a duplicate of it: the hint names the fix, its board and its owner.
+    assert!(t.claim(B, &work).await.0.is_success());
+    assert!(t.done(B, &work, check(0)).await.0.is_success());
+    let recurred = report(&t, A, text).await;
+    let item = recurred["task"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(recurred["task"]["feedback"]["recurs"], original.as_str());
+    assert!(t.claim(C, &item).await.0.is_success());
+    let path = format!("/v1/feedback/{item}/resolve");
+    for gone in [&original, &other] {
+        let (code, err, v) = t
+            .fail(
+                "POST",
+                &path,
+                Some(C),
+                Some(json!({ "kind": "duplicate", "task": gone })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("no longer takes reports"),
+            "{v}"
+        );
+        let next = v["next"].as_str().unwrap();
+        for part in [work.as_str(), "is done", B, "board factory", "kind=routed"] {
+            assert!(next.contains(part), "{part}: {v}");
+        }
+    }
+    // The user is refused too: the rule is about the items, not who resolves them.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &path,
+            Some(json!({ "kind": "duplicate", "task": original })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+
+    // With an open revisit of the fix, the hint routes the item there.
+    let revisit = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Revisit: the note limit",
+                "body": "Revisit: did the raised limit hold?",
+                "parent": work,
+            }),
+        )
+        .await;
+    let (_, _, v) = t
+        .fail(
+            "POST",
+            &path,
+            Some(C),
+            Some(json!({ "kind": "duplicate", "task": original })),
+        )
+        .await;
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("kind=routed task={revisit}")),
+        "{v}"
+    );
+    let (s, v) = resolve(
+        &t,
+        Some(C),
+        &item,
+        json!({ "kind": "routed", "task": revisit }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // A fixed original has no task: the hint routes to the setup's owner.
+    let fixed_text = json!({ "about": "tools", "text": "A tool is missing from PATH" });
+    let fixed = report(&t, A, fixed_text.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{fixed}/resolve"),
+            Some(json!({ "kind": "fixed", "reason": "config.toml:12 adds it" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let again = report(&t, B, fixed_text).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{again}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": fixed })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("setup's owner") && next.contains(&fixed),
+        "{v}"
+    );
+
+    // An item cannot be a duplicate of one that passes its reports back to it.
+    let first = report(&t, A, json!({ "about": "t3", "text": "Threads stall" })).await;
+    let first = first["task"]["id"].as_str().unwrap().to_owned();
+    let second = report(&t, B, json!({ "about": "t3", "text": "Threads hang" })).await;
+    let second = second["task"]["id"].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{second}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": first })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{first}/resolve"),
+            Some(json!({ "kind": "duplicate", "task": second })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("passes its reports"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
 async fn resolve_is_for_the_owner_or_the_user() {
     let t = setup().await;
     let item = report(
