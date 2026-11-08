@@ -24,7 +24,6 @@ function seed(client: QueryClient) {
   );
   client.setQueryData(queries.activeTasks().queryKey, active());
   client.setQueryData(queries.agents().queryKey, state.agents(none));
-  client.setQueryData(queries.updates("").queryKey, state.updates(none));
 }
 
 describe("inProgress", () => {
@@ -41,12 +40,12 @@ describe("inProgress", () => {
 });
 
 describe("home", () => {
-  test("shows waiting asks, boards, tasks in progress and updates, in that order", async () => {
+  test("shows waiting asks, boards and tasks in progress, in that order", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const titles = screen
       .getAllByRole("heading", { level: 2 })
       .map((heading) => heading.textContent?.replace(/\d.*$/, ""));
-    expect(titles).toEqual(["Waiting on you", "Boards", "In progress", "Since you last looked"]);
+    expect(titles).toEqual(["Waiting on you", "Boards", "In progress"]);
   });
 
   test("lists every task in progress, so its counts match its rows", async () => {

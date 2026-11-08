@@ -183,8 +183,6 @@ const server = Bun.serve({
     "/v1/agents": api((_, url) => state.agents(url.searchParams)),
     "/v1/agents/:id/handoff": api((req) => state.handoff(req.params.id ?? "")),
     "/v1/agents/:id/said": api((req, url) => state.said(req.params.id ?? "", url.searchParams)),
-    "/v1/updates": api((_, url) => state.updates(url.searchParams)),
-    "/v1/updates/seen": { PUT: api(async (req) => state.markSeen(await body(req))) },
     "/v1/asks": api((_, url) => state.asks(url.searchParams)),
     "/v1/asks/:id": api((req) => state.ask(Number(req.params.id))),
     "/v1/asks/:id/answer": {

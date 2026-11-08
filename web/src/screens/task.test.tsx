@@ -14,7 +14,6 @@ function seed(id: string) {
     const detail = state.task(id);
     client.setQueryData(queries.boards().queryKey, state.boards());
     client.setQueryData(queries.openAsks().queryKey, []);
-    client.setQueryData(queries.updates("").queryKey, state.updates(none));
     client.setQueryData(queries.agents().queryKey, state.agents(none));
     client.setQueryData(queries.task(id).queryKey, detail);
     client.setQueryData(
