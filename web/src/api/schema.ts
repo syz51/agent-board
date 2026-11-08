@@ -106,6 +106,16 @@ export const task = object({
   feedback: nullable(feedback),
   /** What the agent that finished the task told the user; untrusted. Absent unless done with one. */
   summary: nullable(string),
+  /** How many tasks name this one as parent, whatever their status; 0 from older servers. */
+  child_count: withDefault(integer, 0),
+});
+
+/** A child task as its parent's detail lists it. */
+export const childTask = object({
+  id: string,
+  title: string,
+  status: taskStatus,
+  ready: boolean,
 });
 
 /**
@@ -145,6 +155,8 @@ export const taskDetail = object({
   evidence: array(evidence),
   blocks: array(string),
   children: array(string),
+  /** The children with their titles and statuses; empty from servers that predate it. */
+  child_tasks: withDefault(array(childTask), []),
   history: array(event),
 });
 
@@ -214,6 +226,7 @@ export type Feedback = NonNullable<Task["feedback"]>;
 export type TaskStatus = Task["status"];
 export type Priority = Task["priority"];
 export type TaskDetail = Decoded<typeof taskDetail>;
+export type ChildTask = Decoded<typeof childTask>;
 export type Note = Decoded<typeof note>;
 export type Evidence = Decoded<typeof evidence>;
 export type Agent = Decoded<typeof agent>;

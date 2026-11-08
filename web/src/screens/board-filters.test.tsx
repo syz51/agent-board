@@ -105,3 +105,25 @@ describe("a board's filter bar", () => {
     expect(bar()).not.toBeNull();
   });
 });
+
+describe("a board narrowed to a parent", () => {
+  test("names the parent, counts its children by status and lists only them", async () => {
+    serve();
+    await renderRoute("/boards/factory?parent=factory-12", { seed });
+    const banner = await waitFor(() => screen.getByRole("region", { name: /^Subtasks of/ }));
+    await waitFor(() => expect(banner.textContent).toContain("Inject board delta"));
+    const tally = screen.getByRole("list", { name: "Subtasks by status" });
+    expect(
+      Array.from(tally.querySelectorAll("li"), (li) => li.textContent?.replace(/\s+/g, " ")),
+    ).toEqual(["2 done", "1 review", "1 blocked", "1 ready", "1 waiting"]);
+    // The id cell of each row, not the ids its blockers link to.
+    const listed = Array.from(document.querySelectorAll("li > .ident"), (el) => el.textContent);
+    expect(listed.sort()).toEqual(
+      ["factory-13", "factory-17", "factory-19", "factory-21", "factory-3", "factory-8"].sort(),
+    );
+    const clear = screen.getByRole("link", { name: "Show all tasks" });
+    expect(clear.getAttribute("href")).toBe("/boards/factory");
+    // The filter bar stays, so the narrowing can be combined and cleared.
+    expect(bar()).not.toBeNull();
+  });
+});

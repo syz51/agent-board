@@ -26,6 +26,7 @@ import {
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
 import { Icon, StatusIcon } from "@/ui/icons.tsx";
 import { useCollapsed } from "@/ui/sections.tsx";
+import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import { AskRows, useOpenAsks } from "./asks.tsx";
 
 const route = getRouteApi("/boards/$slug");
@@ -38,6 +39,8 @@ export interface TaskFilters {
   /** An agent id, `none` for unowned, or empty for anyone. */
   owner: string;
   readyOnly: boolean;
+  /** A task id: only its direct children, done ones whenever they were done. */
+  parent: string;
 }
 
 export interface TaskGroup {
@@ -48,13 +51,21 @@ export interface TaskGroup {
 
 /**
  * Group a board's tasks for display: doing, review, blocked, ready, open tasks still
- * waiting, and done in the last 30 days. Dropped tasks are not shown. Exported for tests.
+ * waiting, and done in the last 30 days, or all done children of the `parent` filter's task.
+ * Dropped tasks are not shown. Exported for tests.
  */
 export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): TaskGroup[] {
   const q = filters.q.trim().toLowerCase();
   const visible = tasks.filter((task) => {
     if (task.status === "dropped") return false;
-    if (task.status === "done" && now - Date.parse(task.updated_at) > DONE_WINDOW_MS) return false;
+    if (filters.parent && task.parent !== filters.parent) return false;
+    if (
+      !filters.parent &&
+      task.status === "done" &&
+      now - Date.parse(task.updated_at) > DONE_WINDOW_MS
+    ) {
+      return false;
+    }
     if (filters.priority && task.priority !== filters.priority) return false;
     if (
       filters.owner === "none" ? task.owner !== null : filters.owner && task.owner !== filters.owner
@@ -73,11 +84,11 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     { key: "blocked", title: "Blocked", tasks: of("blocked") },
     { key: "ready", title: "Ready", tasks: open.filter((task) => task.ready) },
     { key: "open", title: "Waiting", tasks: open.filter((task) => !task.ready) },
-    { key: "done", title: "Done in the last 30 days", tasks: done },
+    { key: "done", title: filters.parent ? "Done" : "Done in the last 30 days", tasks: done },
   ];
 }
 
-const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
+const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false, parent: "" };
 
 /**
  * Whether a board shows any task before filtering, by the rule the list uses: dropped tasks
@@ -94,6 +105,7 @@ export function filtersOf(search: BoardSearch): TaskFilters {
     priority: search.priority ?? "",
     owner: search.owner ?? "",
     readyOnly: search.ready === "1",
+    parent: search.parent ?? "",
   };
 }
 
@@ -157,7 +169,8 @@ export function BoardScreen() {
       search: { ...search, [key]: value || undefined },
       replace: true,
     });
-  const filtered = filters.q || filters.priority || filters.owner || filters.readyOnly;
+  const filtered =
+    filters.q || filters.priority || filters.owner || filters.readyOnly || filters.parent;
 
   return (
     <>
@@ -188,6 +201,10 @@ export function BoardScreen() {
       )}
 
       <BoardAsks slug={slug} />
+
+      {filters.parent && (
+        <ParentFilter id={filters.parent} slug={slug} search={search} tasks={tasks.data} />
+      )}
 
       {/* While tasks load the bar shows disabled, so the header holds still. A board with
           nothing to filter, or whose tasks failed to load, has no bar: it would only look
@@ -566,6 +583,19 @@ function TaskMain({ task, done, now }: TaskRowData) {
           </span>
         </span>
       )}
+      {/* An umbrella task: its children, narrowed to on this list. */}
+      {task.child_count > 0 && (
+        <Link
+          className={cn(DEPENDENCY, "hover:text-foreground")}
+          to="/boards/$slug"
+          params={{ slug: task.board }}
+          search={{ parent: task.id }}
+          data-dependency="children"
+        >
+          <Icon name="subtasks" className="size-3.5 flex-none" />
+          {task.child_count} {task.child_count === 1 ? "subtask" : "subtasks"}
+        </Link>
+      )}
       {/* Most tasks may start on autopilot; mark the ones that wait for the user. */}
       {!task.auto && (
         <Badge
@@ -592,5 +622,58 @@ function TaskMain({ task, done, now }: TaskRowData) {
         </p>
       )}
     </>
+  );
+}
+
+/**
+ * The parent the list is narrowed to: its id and title, how its children stand, and a link
+ * back to every task. The counts include done and dropped children the groups leave out.
+ */
+function ParentFilter({
+  id,
+  slug,
+  search,
+  tasks,
+}: {
+  id: string;
+  slug: string;
+  search: BoardSearch;
+  tasks: Task[] | undefined;
+}) {
+  const parent = tasks?.find((task) => task.id === id);
+  const children = useMemo(() => (tasks ?? []).filter((task) => task.parent === id), [tasks, id]);
+  return (
+    <section
+      className="mb-5 grid gap-2.5 rounded-lg border bg-card px-4 py-3 shadow-raise"
+      aria-labelledby="parent-filter"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 id="parent-filter" className="min-w-0 text-sm font-semibold">
+          <span className="font-normal text-muted-foreground">Subtasks of </span>
+          <Link to="/tasks/$id" params={{ id }}>
+            <span className="ident">{id}</span>
+            {parent && (
+              <>
+                {" "}
+                <PlainText text={parent.title} className="whitespace-normal" />
+              </>
+            )}
+          </Link>
+        </h2>
+        <Link
+          className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
+          to="/boards/$slug"
+          params={{ slug }}
+          search={{ ...search, parent: undefined }}
+          replace
+        >
+          <Icon name="cross" className="size-3.5" />
+          Show all tasks
+        </Link>
+      </div>
+      {tasks !== undefined && (
+        <StatusTally counts={taskTally(children)} label="Subtasks by status" empty="No subtasks" />
+      )}
+    </section>
   );
 }

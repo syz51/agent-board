@@ -4,7 +4,7 @@ import { groupTasks, showsTasks, type TaskFilters } from "./board.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const tasks = new DevState(() => now).tasks(new URLSearchParams({ board: "factory" }));
-const none: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
+const none: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false, parent: "" };
 const ids = (filters: Partial<TaskFilters> = {}) =>
   Object.fromEntries(
     groupTasks(tasks, { ...none, ...filters }, now).map((group) => [
@@ -46,6 +46,23 @@ describe("groupTasks", () => {
     expect(ids({ readyOnly: true }).open).toEqual([]);
     expect(ids({ q: "LEASES" }).ready).toEqual(["factory-15"]);
     expect(ids({ q: "factory-13" }).review).toEqual(["factory-13"]);
+  });
+
+  test("narrows to a parent's direct children, with every done one", () => {
+    expect(ids({ parent: "factory-12" })).toEqual({
+      doing: [],
+      review: ["factory-13"],
+      blocked: ["factory-17"],
+      ready: ["factory-21"],
+      open: ["factory-19"],
+      // factory-3 was done over 30 days ago: the board list leaves it out, its parent not.
+      done: ["factory-8", "factory-3"],
+    });
+    expect(ids().done).not.toContain("factory-3");
+    // It combines with the other filters; a task without children leaves nothing.
+    expect(ids({ parent: "factory-12", priority: "p1" }).blocked).toEqual(["factory-17"]);
+    expect(ids({ parent: "factory-12", priority: "p1" }).review).toEqual([]);
+    expect(Object.values(ids({ parent: "factory-21" })).flat()).toEqual([]);
   });
 });
 
