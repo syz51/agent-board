@@ -242,14 +242,17 @@ pub(crate) fn telegram_message(cx: &Ctx<'_>, id: i64) -> Result<Option<(i64, i64
     Ok(chat.zip(message))
 }
 
-pub(crate) fn by_telegram_message(cx: &Ctx<'_>, message: i64) -> Result<Option<i64>> {
+/// Finds an ask by the chat and message it was sent as, along `asks_telegram_message`.
+pub(crate) const BY_TELEGRAM_MESSAGE: &str =
+    "SELECT id FROM asks WHERE telegram_chat_id = ?1 AND telegram_message_id = ?2";
+
+/// The ask sent as `message` in `chat`, which a reply to that message answers. Message ids
+/// are unique only per chat.
+pub(crate) fn by_telegram_message(cx: &Ctx<'_>, chat: i64, message: i64) -> Result<Option<i64>> {
     use rusqlite::OptionalExtension;
     Ok(cx
         .db
-        .query_row(
-            "SELECT id FROM asks WHERE telegram_message_id = ?1",
-            [message],
-            |r| r.get(0),
-        )
+        .prepare_cached(BY_TELEGRAM_MESSAGE)?
+        .query_row(params![chat, message], |r| r.get(0))
         .optional()?)
 }

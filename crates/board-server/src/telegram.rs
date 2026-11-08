@@ -796,6 +796,20 @@ fn span(d: TimeDelta) -> String {
 }
 
 async fn poll_loop(state: AppState, bot: Bot) {
+    // The chat answers are accepted from. Only pairing, in this loop, changes it, so it is
+    // read once, before the first poll: no update is taken while it is unknown.
+    let mut chat = loop {
+        match bot.chat(&state).await {
+            Ok(chat) => break chat,
+            Err(error) => {
+                tracing::warn!(%error, "telegram: reading the paired chat failed; retrying");
+                tokio::select! {
+                    () = state.stopped() => return,
+                    () = tokio::time::sleep(RETRY) => {}
+                }
+            }
+        }
+    };
     let mut offset: i64 = 0;
     loop {
         let body = json!({
@@ -811,7 +825,7 @@ async fn poll_loop(state: AppState, bot: Bot) {
             Ok(updates) => {
                 for update in updates {
                     offset = offset.max(update.update_id + 1);
-                    if let Err(error) = handle_update(&state, &bot, update).await {
+                    if let Err(error) = handle_update(&state, &bot, &mut chat, update).await {
                         tracing::error!(%error, "telegram update failed");
                     }
                 }
@@ -846,9 +860,15 @@ fn start_code(text: &str) -> Option<&str> {
     words.next().is_none().then_some(code)
 }
 
-/// Pairs the chat of a private `/start <code>` message that redeems a live code. Anything
-/// else, a wrong or expired code included, gets no answer.
-async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> {
+/// Pairs the chat of a private `/start <code>` message that redeems a live code, and
+/// records it in `paired`. Anything else, a wrong or expired code included, gets no
+/// answer.
+async fn try_pair(
+    state: &AppState,
+    bot: &Bot,
+    paired: &mut Option<i64>,
+    message: &Message,
+) -> Result<()> {
     if message.chat.kind.as_deref() != Some("private") {
         return Ok(());
     }
@@ -862,6 +882,7 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
     {
         return Ok(());
     }
+    *paired = Some(chat);
     tracing::info!("telegram: paired a chat; asks go there from now on");
     bot.send(json!({
         "chat_id": chat,
@@ -881,10 +902,15 @@ async fn try_pair(state: &AppState, bot: &Bot, message: &Message) -> Result<()> 
     Ok(())
 }
 
-async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()> {
-    let chat = bot.chat(state).await?;
+/// Handles an update from Telegram; `chat` is the chat answers are accepted from.
+async fn handle_update(
+    state: &AppState,
+    bot: &Bot,
+    chat: &mut Option<i64>,
+    update: Update,
+) -> Result<()> {
     if let Some(query) = update.callback_query {
-        let from_chat = chat.is_some() && query.message.as_ref().map(|m| m.chat.id) == chat;
+        let from_chat = chat.is_some() && query.message.as_ref().map(|m| m.chat.id) == *chat;
         let reply = if !from_chat {
             "Not accepted from this chat.".to_owned()
         } else if let Some((id, index)) = query.data.as_deref().and_then(parse_callback) {
@@ -903,11 +929,11 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
     let Some(message) = update.message else {
         return Ok(());
     };
-    let Some(chat) = chat.filter(|c| *c == message.chat.id) else {
+    let Some(current) = chat.filter(|c| *c == message.chat.id) else {
         // Another chat may pair (or, with a `--replace` code, re-pair) unless the chat is
         // configured.
         if bot.configured.is_none() {
-            try_pair(state, bot, &message).await?;
+            try_pair(state, bot, chat, &message).await?;
         }
         return Ok(());
     };
@@ -915,15 +941,20 @@ async fn handle_update(state: &AppState, bot: &Bot, update: Update) -> Result<()
         return Ok(());
     };
     let original_id = original.message_id;
-    let Some(id) = state
-        .read(move |cx| asks::by_telegram_message(cx, original_id))
-        .await?
-    else {
-        return Ok(());
+    let found = state
+        .read(move |cx| asks::by_telegram_message(cx, current, original_id))
+        .await;
+    let reply = match found {
+        Ok(None) => return Ok(()),
+        Ok(Some(id)) => answer(state, id, Answer::Text(text)).await,
+        Err(error) => {
+            // Which ask the reply answers, if any, is unknown.
+            tracing::error!(%error, "telegram: finding the ask a reply answers failed");
+            "The board could not read this reply; if it answers an ask, send it again.".to_owned()
+        }
     };
-    let reply = answer(state, id, Answer::Text(text)).await;
     bot.send(json!({
-        "chat_id": chat,
+        "chat_id": current,
         "text": reply,
         "reply_parameters": { "message_id": message.message_id },
     }))
