@@ -127,8 +127,20 @@ repository's own rules, one after another.
   task in review a day with no note from its owner raises an alert, again each quiet day,
   to the owner or, when the owner is gone, to you: check what it waits on, then move it on
   or note what it still waits on.
-- Ask the user (`ask_user`) only for a decision or an action only they can take: a product
-  choice, a login, a payment, a key. Give options, recommended first. Then set the task
+- Ask the user (`ask_user`) only for one of these reasons, named in the ask as
+  `Reason: <name>`: `design` (a product, interface or architecture choice that the user's
+  goals or taste decide and nothing recorded settles), `cost` (new spending of money),
+  `irreversible` (deleting data with no backup, rewriting pushed history), `outside`
+  (writing to people or projects the user does not own), `only-me` (a step that needs the
+  user in person: a password, 2FA, an unlocked screen, a permission dialog, hardware),
+  `security` (a suspected attack or compromise) or `intent` (what the user meant, when a
+  request is ambiguous, a wrong guess would waste much work, and no record settles it). An
+  `action` ask must be `only-me`. Never
+  ask because a hook or rule blocked a step (find the allowed route or fix the setup and
+  report it with `feedback`), to approve a step the user asked for or that follows from it
+  (merging, pushing, deploying, cleaning up), or for a choice with a sensible default (take
+  it, record a `decision` note that says how to reverse it, and report it in the task's
+  `summary`). Give options, recommended first. Then set the task
   `blocked` with the reason and continue with other ready work. Do not ask again while an
   ask on the task is open; withdraw an ask you no longer need (`ask_withdraw`).
 - Open each ask, and the body of each task you set non-auto or blocked on the user, with a
@@ -255,13 +267,15 @@ and no accept verdict yet.
   security boundary, destructive or irreversible changes, and changes to another
   repository's shared config, which need accepts from two reviewers. Parts a reviewer adds
   are proposals too.
-- **Escalation**: ask the user when reviewers disagree or the proposal needs a decision only
-  the user can make: goal or product direction, spending, credentials or security posture,
-  publishing, deleting data, what reaches the user's phone, or this process. Ask once per
+- **Escalation**: when reviewers disagree, a third reviewer decides. Ask the user only when
+  the proposal needs a decision for one of the ask reasons in Rules: goal or product
+  direction and what reaches the user's phone (`design`), spending (`cost`), deleting data
+  (`irreversible`) or publishing (`outside`). Changes to this process and to security
+  posture take the two accepts below, not the user. Ask once per
   batch, each item with a recommendation. The user's answer is the verdict: record it as a
   `verdict:` note citing the ask, then act on it as above.
 - **Contest**: a proposer may contest a decline once, with new evidence. A second reviewer
-  decides; a split goes to the user.
+  decides; a split goes to a third reviewer.
 
 ## Priority
 

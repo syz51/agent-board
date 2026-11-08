@@ -480,7 +480,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "ask_user",
-        description: "Ask the user for a decision or an action only they can provide (question: at most 1500 characters); it notifies them. Then continue with other ready work: the answer wakes you.",
+        description: "Notify the user only for a design, cost, irreversible, outside, only-me, security or intent reason, named as `Reason: <name>`; do every other step yourself, even one a hook blocked. Question: at most 1500 characters. Then continue with other ready work: the answer wakes you.",
         params: || {
             vec![
                 (
