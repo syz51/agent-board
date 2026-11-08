@@ -1035,13 +1035,26 @@ async fn titles_and_text_are_checked() {
         )
         .await;
     assert_eq!(s.as_u16(), 400);
-    // Notes run past 280 characters with evidence in them; 500 is the default limit.
-    assert_eq!(defaults().note_chars, 500);
+    // Notes run past 500 characters with evidence in them (ask #98); 800 is the default
+    // limit, and a title takes 80.
+    assert_eq!((defaults().note_chars, defaults().title_chars), (800, 80));
+    t.task(A, "factory", &"x".repeat(80)).await;
+    let (s, v) = t
+        .call(
+            "PATCH",
+            &format!("/v1/tasks/{id}"),
+            Some(A),
+            Some(json!({
+                "agent": A, "version": t.get_task(&id).await["version"], "title": "y".repeat(80),
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
     t.ok(
         "POST",
         &format!("/v1/tasks/{id}/notes"),
         Some(A),
-        Some(json!({ "agent": A, "kind": "finding", "text": "x".repeat(450) })),
+        Some(json!({ "agent": A, "kind": "finding", "text": "x".repeat(800) })),
     )
     .await;
     let note = t

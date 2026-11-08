@@ -213,7 +213,7 @@ pub struct ClientError {
     /// `POST /v1/tasks/{id}/notes`.
     pub route: String,
     /// The message the server would have answered for text over a limit, such as `text is
-    /// 501 characters; the limit is 500` ([`crate::TooLong::message`]), for one of
+    /// 801 characters; the limit is 800` ([`crate::TooLong::message`]), for one of
     /// [`crate::CLIENT_CHECKED_FIELDS`].
     pub message: String,
 }
@@ -424,7 +424,7 @@ pub struct DoneTask {
 }
 
 /// Longest `DoneTask.summary`, in characters.
-pub const SUMMARY_CHARS_MAX: usize = 600;
+pub const SUMMARY_CHARS_MAX: usize = 800;
 
 /// Longest `Said.text`, in characters.
 pub const SAID_CHARS_MAX: usize = 4000;
