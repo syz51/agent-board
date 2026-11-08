@@ -1840,6 +1840,163 @@ async fn a_declined_signal_item_goes_back_to_triage_on_errors_from_new_agents() 
     );
 }
 
+#[tokio::test]
+async fn reports_that_reach_a_declined_item_through_duplicates_count_toward_reopening() {
+    let t = setup().await;
+    let (d, e, f, g) = ("t3:delta", "t3:epsilon", "t3:zeta", "t3:eta");
+    for agent in [d, e, f, g] {
+        t.register(agent, None, None).await;
+    }
+    let text = json!({ "about": "board", "text": "Claims refuse a second task" });
+    let declined = declined_item(&t, A, &text).await;
+    t.advance(TimeDelta::days(2));
+
+    // New agents report it in other words; triage resolves those items as duplicates, two
+    // links deep. Under the bar, the item stays declined.
+    let first = item(&t, B, "One task at a time is too strict").await;
+    report(
+        &t,
+        C,
+        json!({ "about": "board", "text": "One task at a time is too strict" }),
+    )
+    .await;
+    let (s, v) = user_resolve(&t, &first, json!({ "kind": "duplicate", "task": declined })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(t.get_task(&declined).await["status"], "done");
+    let other = json!({ "about": "board", "text": "Doing limit blocks a quick fix" });
+    let second = report(&t, d, other.clone()).await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    report(&t, d, other.clone()).await;
+    report(&t, B, other).await;
+    assert_eq!(t.get_task(&declined).await["status"], "done");
+
+    // Resolving the second as a duplicate of the first runs the check: five reports from
+    // three new agents since the decline, all on its duplicates.
+    let (s, v) = user_resolve(&t, &second, json!({ "kind": "duplicate", "task": first })).await;
+    assert_eq!(s, 200, "{v}");
+    let task = t.get_task(&declined).await;
+    assert_eq!(task["status"], "open", "{task}");
+    let noted = notes(&t, &declined).await;
+    let note = noted.iter().find(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with("reopened: 5 reports from 3 agents since it was declined at"),
+        "{note}"
+    );
+    assert!(note.contains("(3 agents new since then)"), "{note}");
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{declined}"), None, None)
+        .await;
+    let reopen = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_updated" && e["payload"]["to"] == "open")
+        .unwrap();
+    assert_eq!(reopen["actor"], "user");
+
+    // Declined again: duplicate reports since then count on a report to the item, and the
+    // agents that reported its duplicates before are not new.
+    decline(&t, C, &declined).await;
+    t.advance(TimeDelta::days(2));
+    let third = item(&t, e, "Second claim is refused").await;
+    report(
+        &t,
+        f,
+        json!({ "about": "board", "text": "Second claim is refused" }),
+    )
+    .await;
+    let (s, v) = user_resolve(&t, &third, json!({ "kind": "duplicate", "task": declined })).await;
+    assert_eq!(s, 200, "{v}");
+    for agent in [B, d] {
+        report(&t, agent, text.clone()).await;
+    }
+    assert_eq!(
+        t.get_task(&declined).await["status"],
+        "done",
+        "two new agents"
+    );
+    report(&t, g, text).await;
+    let task = t.get_task(&declined).await;
+    assert_eq!(task["status"], "open", "{task}");
+    let noted = notes(&t, &declined).await;
+    let note = noted.iter().rfind(|n| n.starts_with("reopened:")).unwrap();
+    assert!(
+        note.starts_with("reopened: 5 reports from 5 agents since it was declined at"),
+        "{note}"
+    );
+    assert!(note.contains("(3 agents new since then)"), "{note}");
+}
+
+#[tokio::test]
+async fn a_new_signal_item_does_not_recount_errors_its_duplicate_original_took() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let mut n = 100;
+    let mut miss = async |agent: &str| {
+        n += 1;
+        t.fail("GET", &format!("/v1/tasks/factory-{n}"), Some(agent), None)
+            .await;
+        t.advance(TimeDelta::minutes(1));
+    };
+    let original = item(&t, C, "Looking up a missing task fails").await;
+    let work = t.task(A, "factory", "Explain missing tasks").await;
+    let (s, v) = user_resolve(&t, &original, json!({ "kind": "routed", "task": work })).await;
+    assert_eq!(s, 200, "{v}");
+    for agent in [A, A, B] {
+        miss(agent).await;
+    }
+    let signal = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["feedback"]["source"] == "signal")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = user_resolve(
+        &t,
+        &signal,
+        json!({ "kind": "duplicate", "task": original }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // The next error goes to the original; then its routed task is done.
+    miss(C).await;
+    assert_eq!(t.get_task(&original).await["feedback"]["reports"], 5);
+    assert!(t.claim(A, &work).await.0.is_success());
+    assert!(t.done(A, &work, check(0)).await.0.is_success());
+
+    // Later errors count afresh: two are under the threshold, the third files a new item
+    // with only those three, one report row each.
+    let before = reported(&t).await.as_u64().unwrap();
+    miss(A).await;
+    miss(B).await;
+    assert_eq!(reported(&t).await.as_u64().unwrap(), before);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM feedback"),
+        2,
+        "no new item yet"
+    );
+    miss(A).await;
+    assert_eq!(reported(&t).await.as_u64().unwrap(), before + 3);
+    let items = t
+        .ok("GET", "/v1/tasks?board=board-feedback", None, None)
+        .await;
+    let recurred = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["feedback"]["recurs"] == signal.as_str())
+        .unwrap();
+    assert_eq!(recurred["feedback"]["reports"], 3);
+}
+
 /// The original's `reports`, `reporters` and `last_reported_at`, as the API shows the item
 /// on its own and in a list of the feedback board.
 async fn counts(t: &T, item: &str) -> (Value, Value, Value) {

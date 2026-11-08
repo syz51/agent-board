@@ -669,7 +669,8 @@ fn routed_note(
 }
 
 /// Sends a declined item back to triage once agents keep reporting it: declined at least
-/// `declined_reopen_after_days` ago, with `declined_reopen_reports` reports since then from
+/// `declined_reopen_after_days` ago, with `declined_reopen_reports` reports since then, on
+/// it or on the items resolved as its duplicates (`CLUSTER_SINCE`), from
 /// `declined_reopen_agents` agents that had not reported it before. It moves to `open`,
 /// unowned and unresolved, with a note giving the counts since the decline. Every report
 /// is a row of `feedback_reports`, and `resolved_report` is the newest row (of any item) at
@@ -692,18 +693,16 @@ fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &
         [item.as_str()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    // An agent counts as new when it had not reported the problem by the decline: not on
-    // this item, nor on an item resolved as its duplicate. The creator reported it first,
-    // even on an item adopted from a plain task, which has no row.
-    let (since, agents, new_agents): (u32, u32, u32) = cx.db.query_row(
-        "SELECT COUNT(*), COUNT(DISTINCT agent), COUNT(DISTINCT CASE WHEN agent <> ?3 \
-         AND agent NOT IN (SELECT agent FROM feedback_reports WHERE id <= ?2 AND (task = ?1 \
-         OR task IN (SELECT task FROM feedback WHERE resolution = 'duplicate' \
-         AND resolution_task = ?1))) \
-         THEN agent END) FROM feedback_reports WHERE task = ?1 AND id > ?2",
-        params![item.as_str(), last_report, created_by],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let (since, agents, new_agents): (u32, u32, u32) =
+        cx.db.prepare_cached(CLUSTER_SINCE)?.query_row(
+            params![
+                item.as_str(),
+                DUPLICATE_DEPTH_MAX as i64,
+                last_report,
+                created_by
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
     if since < cx.s.declined_reopen_reports || new_agents < cx.s.declined_reopen_agents {
         return Ok(());
     }
@@ -886,6 +885,26 @@ pub(crate) const CLUSTER_ERRORS: &str = concat!(
     "SELECT COUNT(*) FROM feedback_reports WHERE signal = 1 \
      AND task IN (SELECT task FROM cluster)"
 );
+
+/// The cluster's reports after report row `?3` (the newest at a decline): their count,
+/// their agents, and the agents new since then. An agent counts as new when it had not
+/// reported the problem by then, on any item of the cluster, and is not `?4`: the creator
+/// reported it first, even on an item adopted from a plain task, which has no row.
+const CLUSTER_SINCE: &str = concat!(
+    cluster!(),
+    "SELECT COUNT(*), COUNT(DISTINCT agent), COUNT(DISTINCT CASE WHEN agent <> ?4 \
+     AND agent NOT IN (SELECT agent FROM feedback_reports WHERE id <= ?3 \
+     AND task IN (SELECT task FROM cluster)) THEN agent END) \
+     FROM feedback_reports WHERE id > ?3 AND task IN (SELECT task FROM cluster)"
+);
+
+/// The newest report of feedback item `?1` and of the items its duplicate links lead to,
+/// at most `?2` links on, as `live_item` follows them.
+const CHAIN_LAST_REPORTED: &str = "WITH RECURSIVE chain (task, depth) AS (SELECT ?1, 0 \
+     UNION SELECT f.resolution_task, c.depth + 1 FROM chain c JOIN feedback f \
+     ON f.task = c.task AND f.resolution = 'duplicate' AND f.resolution_task IS NOT NULL \
+     WHERE c.depth < ?2) \
+     SELECT MAX(last_reported_at) FROM feedback WHERE task IN (SELECT task FROM chain)";
 
 /// Forgets the resolution of a reopened item, so it is live again.
 pub(crate) fn reopen(cx: &Ctx<'_>, id: &TaskId) -> Result<()> {
@@ -1111,6 +1130,13 @@ pub(crate) fn resolve(
             .unwrap_or_else(|| task.created_by.clone());
         let signal = feedback.source == FeedbackSource::Signal;
         note_reports(cx, &live, &author, &by, &task.title, signal)?;
+        // Its reports since the decline count toward sending a declined original back.
+        if matches!(
+            resolution(cx, &live)?,
+            Some((Some(ResolutionKind::Declined), _))
+        ) {
+            reopen_declined(cx, &live, &author, &by)?;
+        }
     }
     get_task(cx, id)
 }
@@ -1264,14 +1290,16 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
         Prior::None => None,
     };
     // Records outlive the signal window (error_retention_days), so only those within it
-    // count. Errors that an earlier item took (before its fix) do not count towards a new one.
+    // count. Errors that an earlier item took (before its fix) do not count towards a new
+    // one, nor do those it passed on to the item its duplicate links lead to.
     let mut from = now - cx.s.signal_window_ms();
     if let Some(earlier) = &earlier {
-        let last: i64 = cx.db.query_row(
-            "SELECT last_reported_at FROM feedback WHERE task = ?1",
-            [earlier.as_str()],
-            |r| r.get(0),
-        )?;
+        let last: i64 = cx
+            .db
+            .prepare_cached(CHAIN_LAST_REPORTED)?
+            .query_row(params![earlier.as_str(), DUPLICATE_DEPTH_MAX as i64], |r| {
+                r.get(0)
+            })?;
         from = from.max(last + 1);
     }
     let (count, refused): (u32, u32) = cx.db.query_row(
