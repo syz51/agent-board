@@ -130,8 +130,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. A
   claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
   it, with a claim's checks, so an agent returning to its own work is not sent away; a
-  `blocked_reason` still refuses it, since the reason may name a wait the server cannot
-  see, such as an ask. Another live agent's parked task is refused, naming the owner. After
+  `blocked_reason` or an open ask on the task still refuses it, since the task may wait on
+  the user. Another live agent's parked task is refused, naming the owner. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). File
