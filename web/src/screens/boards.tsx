@@ -409,6 +409,13 @@ function TaskTally({ board }: { board: Board }) {
                     {counts[segment.key]}
                   </strong>{" "}
                   <span>{segment.label}</span>
+                  {/* How much of ready the coordinator may start; an older server omits it. */}
+                  {segment.key === "ready" && board.counts.ready_auto !== null && (
+                    <>
+                      {" "}
+                      <span>(auto {board.counts.ready_auto})</span>
+                    </>
+                  )}
                 </li>
               ),
           )}

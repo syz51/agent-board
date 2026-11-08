@@ -32,6 +32,8 @@ export const statusCounts = object({
   done: integer,
   dropped: integer,
   ready: integer,
+  /** The ready tasks with `auto` on; `null` from a server that predates it. */
+  ready_auto: nullable(integer),
 });
 
 export const board = object({
