@@ -125,11 +125,18 @@ pub async fn read(
         bail!("the usage endpoint answered {status}");
     }
     let answer: Answer = resp.json().await.context("reading the usage answer")?;
-    Ok(Some(ReportUsage {
+    let report = ReportUsage {
         five_hour: answer.five_hour.and_then(Window::into_proto),
         seven_day: answer.seven_day.and_then(Window::into_proto),
         read_at: now,
-    }))
+    };
+    // An empty reading would release every board the last one holds.
+    if report.five_hour.is_none() && report.seven_day.is_none() {
+        bail!(
+            "the usage answer has no five_hour or seven_day utilization: its format may have changed"
+        );
+    }
+    Ok(Some(report))
 }
 
 /// The access token, unless there is none or it has expired by `now`.

@@ -775,8 +775,9 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   `action`; `json` has `hold` with the slugs only. Empty and left out otherwise, and by
   servers that predate it, which clients read as not held.
   For an agent with a board, when a usage reading exists, a `usage:` line follows the
-  `hold:` line: in full snapshots always, in `delta` and `alerts` only while the board is
-  over its `usage_stop_at` (they then have text even when nothing else changed). It reads
+  `hold:` line: in full snapshots always, in `delta` only while the board is over its
+  `usage_stop_at` (it then has text even when nothing else changed), never in `alerts`.
+  It reads
   `5h 12% · week 74% · read 3m ago · this board starts no new task at 90%`, or while over
   `week 92% >= this board's stop at 90% -> usage is high: start no new task or child
   thread; finish or park the tasks in doing. The week window resets 2026-11-15 00:59Z.`
@@ -796,12 +797,14 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
 - `PUT /v1/usage` `[ReportUsage]` → `[Usage]`. Device tokens: the reading is stored with
   the caller's device (403 `forbidden` for a caller without one). `five_hour` and
   `seven_day` are each optional `{percent, resets_at?}`, as the usage endpoint gives
-  them; `read_at` is required. 400 `invalid` when a percent is not a number from 0 to
-  1000, or `read_at` is more than 5 minutes ahead of the server's clock. The server keeps
+  them, and at least one is required; `read_at` is required. 400 `invalid` when both
+  windows are missing, a percent is not a number from 0 to 1000, or `read_at` is more
+  than 5 minutes ahead of the server's clock or more than 30 minutes behind it (it would
+  already be stale). The server keeps
   one reading, the newest by `read_at`: an older report changes nothing, and the answer is
   the reading kept.
 - `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` prints it, with
-  the active boards it stops from new work.
+  the boards it stops from new work, paused ones included.
 - A reading is fresh for 30 minutes after `read_at`. A board is over when a window of a
   fresh reading has `percent` at or above its `usage_stop_at` and its `resets_at`, when
   known, is still ahead.

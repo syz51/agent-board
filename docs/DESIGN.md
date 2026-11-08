@@ -317,12 +317,15 @@ high for it. There is no total cap.
   (`GET https://api.anthropic.com/api/oauth/usage`) at most every 5 minutes, at a
   reconcile. It signs in with Claude Code's own token: the macOS login keychain item
   `Claude Code-credentials` (read with `security`), or `~/.claude/.credentials.json`
-  elsewhere. It never refreshes the token, which could sign Claude Code out: with an
-  expired token or no sign-in it skips the reading. The token never leaves the device and
-  is never logged. The daemon reports each window's percent and reset time
-  (`PUT /v1/usage`). The server keeps one reading for the account, the newest by read
-  time, with the device that sent it. Between its own readings, each reconcile takes the
-  server's newest (`GET /v1/usage`).
+  elsewhere. It reads only the default sign-in, not one under `CLAUDE_CONFIG_DIR`. It
+  never refreshes the token, which could sign Claude Code out: with an expired token or
+  no sign-in it skips the reading. The token never leaves the device and is never
+  logged. An answer with neither window is an error, not an empty reading. The daemon
+  reports each window's percent and reset time (`PUT /v1/usage`); when the report fails,
+  it acts on its own reading. The server keeps one reading for the account, the newest by
+  read time, with the device that sent it. Between its own readings, each reconcile takes
+  the server's newest (`GET /v1/usage`). The usage is read after the reconcile's thread
+  checks, so a slow read never delays them.
 - **Setting**: each board has `usage_stop_at`, a percent from 1 to 100, default 90. Only
   the user may raise it; anyone may lower it. A lower stop makes a board give way first,
   so the user ranks boards by it.
@@ -331,15 +334,19 @@ high for it. There is no total cap.
   nothing: a device that cannot read the usage never stops work.
 - **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
   it when there is a reading: `5h 12% · week 74% · read 3m ago · this board starts no new
-  task at 90%`. While the board is over, every kind shows it, also when nothing else
-  changed: `week 92% >= this board's stop at 90% -> usage is high: start no new task or
+  task at 90%`. While the board is over, deltas (one per prompt) show it too, also when
+  nothing else changed; `alerts` snapshots, which come with tool calls under the smallest
+  cap, never do: `week 92% >= this board's stop at 90% -> usage is high: start no new task or
   child thread; finish or park the tasks in doing. The week window resets …`. The
   coordinator starts no task while it shows; tasks in progress finish.
 - **Daemon**: while a board is over, the daemon drops its ready and cleared wake-ups at
   their send. Other wake-ups still go: answers, unblocked tasks, reviews and idle owners
-  concern work already started. When a board leaves the over state, the daemon wakes its
-  coordinator once to read its snapshot and start ready tasks.
-- `board usage` prints the reading and the boards it holds.
+  concern work already started; a resumed board and a restarted coordinator also get
+  their turn, and the snapshot's `usage:` line tells them to start nothing new. When a
+  board leaves the over state, the daemon wakes its coordinator once to read its snapshot
+  and start ready tasks. A daemon with no reading at all, as after a restart while the
+  server is unreachable, keeps the boards it held.
+- `board usage` prints the reading and the boards it holds, paused ones included.
 
 ## Runtime integration
 
@@ -1006,6 +1013,8 @@ keeping untrusted text out of those channels, so:
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  before them come the `hold:` and `usage:` lines, which the cap never cuts, and which
+  `alerts` snapshots never carry for usage (see "Usage");
   `you` names the tasks the agent holds in `doing`, on any board, next to how many it may
   hold (`doing factory-12 (limit 1)`, or `doing none (limit 1)`), so it learns the limit
   before a claim is refused; the board's coordinator finds its `parallel_tasks` limit at

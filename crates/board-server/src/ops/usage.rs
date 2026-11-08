@@ -1,6 +1,6 @@
 //! The account usage a device daemon last read (`docs/API.md`, "Usage").
 
-use board_proto::{DeviceName, ReportUsage, Timestamp, Usage, UsageWindow};
+use board_proto::{DeviceName, ReportUsage, Timestamp, USAGE_FRESH_MINUTES, Usage, UsageWindow};
 use rusqlite::{OptionalExtension, params};
 
 use crate::db::{Ctx, parse_json};
@@ -9,9 +9,16 @@ use crate::error::{Result, invalid};
 /// A reading dated further ahead than this is refused: the device's clock is wrong.
 const CLOCK_SKEW_MINUTES: i64 = 5;
 
-/// Checks a report before it is stored: percents are finite and in range, and the read
-/// time is not ahead of the server's clock.
+/// Checks a report before it is stored: it has a window, percents are finite and in
+/// range, and the read time is neither ahead of the server's clock nor already stale.
 pub(crate) fn validate_report(req: ReportUsage, now: Timestamp) -> Result<ReportUsage> {
+    // An empty reading, newer than the last, would release every board it holds.
+    if req.five_hour.is_none() && req.seven_day.is_none() {
+        return Err(invalid(
+            "the reading has no five_hour or seven_day window",
+            "send at least one window; if the usage endpoint gave none, report nothing",
+        ));
+    }
     for (field, window) in [("five_hour", &req.five_hour), ("seven_day", &req.seven_day)] {
         if let Some(UsageWindow { percent, .. }) = window
             && !(percent.is_finite() && (0.0..=1000.0).contains(percent))
@@ -26,6 +33,15 @@ pub(crate) fn validate_report(req: ReportUsage, now: Timestamp) -> Result<Report
         return Err(invalid(
             format!("read_at {} is ahead of the server's clock", req.read_at),
             "send the time the usage was read; check the device's clock",
+        ));
+    }
+    if req.read_at < now - chrono::TimeDelta::minutes(USAGE_FRESH_MINUTES) {
+        return Err(invalid(
+            format!(
+                "read_at {} is more than {USAGE_FRESH_MINUTES} minutes behind the server's clock, so it would hold no board",
+                req.read_at
+            ),
+            "send a reading as soon as it is read; check the device's clock",
         ));
     }
     Ok(req)

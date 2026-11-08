@@ -58,7 +58,12 @@ pub fn title(text: &str) -> String {
 
 /// `3m ago`, `2h ago`, `4d ago`, or `in 5m` for future times.
 pub fn ago(at: Timestamp) -> String {
-    let secs = (Utc::now() - at).num_seconds();
+    ago_at(at, Utc::now())
+}
+
+/// [`ago`] as seen at `now`.
+pub fn ago_at(at: Timestamp, now: Timestamp) -> String {
+    let secs = (now - at).num_seconds();
     let (n, future) = if secs < 0 {
         (-secs, true)
     } else {
@@ -529,14 +534,15 @@ pub fn usage(usage: Option<&Usage>, boards: &[Board], now: Timestamp) -> String 
         }
         lines.push(line);
     }
-    let mut read = format!("read {} by {}", ago(usage.read_at), usage.device);
+    let mut read = format!("read {} by {}", ago_at(usage.read_at, now), usage.device);
     if !usage.fresh(now) {
         read.push_str(" (stale: it holds no board)");
     }
     lines.push(read);
+    // Paused boards too, as the daemon and snapshots count them: the hold outlasts a resume.
     let held: Vec<String> = boards
         .iter()
-        .filter(|b| b.status == board_proto::BoardStatus::Active)
+        .filter(|b| b.status != board_proto::BoardStatus::Closed)
         .filter_map(|b| {
             usage
                 .over(b.usage_stop_at, now)

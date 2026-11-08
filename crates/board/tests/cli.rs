@@ -2723,15 +2723,22 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
     );
     let mut loose = board_fixture("loose", &[]);
     loose.usage_stop_at = 95;
-    e.stub
-        .on("GET /v1/boards", [board_fixture("factory", &[]), loose]);
+    // Paused boards count too, as the daemon holds them; closed ones do not.
+    let mut parked = board_fixture("parked", &[]);
+    parked.status = board_proto::BoardStatus::Paused;
+    let mut closed = board_fixture("closed", &[]);
+    closed.status = board_proto::BoardStatus::Closed;
+    e.stub.on(
+        "GET /v1/boards",
+        [board_fixture("factory", &[]), loose, parked, closed],
+    );
     let out = e.run(&["usage"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         stdout(&out).trim_end(),
         format!(
             "5h 12%\nweek 92% · resets {}\nread 2m ago by mac\nstarting no new task: factory \
-             (week >= 90%)",
+             (week >= 90%), parked (week >= 90%)",
             resets.format("%Y-%m-%d %H:%MZ")
         )
     );

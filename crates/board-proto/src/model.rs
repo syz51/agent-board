@@ -153,9 +153,8 @@ pub struct UsageWindow {
     pub resets_at: Option<Timestamp>,
 }
 
-/// Which window of [`Usage`] a reading is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Which window of [`Usage`] a reading is about; not on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageWindowKind {
     FiveHour,
     SevenDay,

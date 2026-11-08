@@ -325,7 +325,13 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
         board: board.as_ref().map(|b| b.to_string()),
         seq,
         hold: held.iter().map(ToString::to_string).collect(),
-        usage: usage.filter(|u| req.kind == SnapshotKind::Full || u.over.is_some()),
+        // Alerts snapshots come with tool calls and have the smallest cap, so the line goes
+        // only into full snapshots and, while over, into the deltas at each prompt.
+        usage: usage.filter(|u| match req.kind {
+            SnapshotKind::Full => true,
+            SnapshotKind::Delta => u.over.is_some(),
+            SnapshotKind::Alerts => false,
+        }),
         you: None,
         counts: None,
         dispatch: None,
@@ -369,7 +375,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             }
         }
         SnapshotKind::Alerts => {
-            if model.alerts.is_empty() && model.hold.is_empty() && !over {
+            if model.alerts.is_empty() && model.hold.is_empty() {
                 String::new()
             } else {
                 render_capped(model, req.format, cx.s.snapshot_alerts_chars)
@@ -448,7 +454,11 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<UsageView>> {
     let Some(usage) = crate::ops::usage::latest(cx)? else {
         return Ok(None);
     };
-    let stop_at = get_board(cx, board)?.usage_stop_at;
+    let stop_at: u32 = cx.db.query_row(
+        "SELECT usage_stop_at FROM boards WHERE slug = ?1",
+        [board.as_str()],
+        |r| r.get(0),
+    )?;
     Ok(Some(UsageView {
         five_hour: usage.five_hour.map(|w| shown_percent(w.percent)),
         week: usage.seven_day.map(|w| shown_percent(w.percent)),

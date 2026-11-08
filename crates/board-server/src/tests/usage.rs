@@ -75,6 +75,10 @@ async fn usage_reports_are_validated() {
         reading(0, 10.0, 1000.5),
         // Further ahead of the server's clock than the allowed skew.
         reading(6, 10.0, 10.0),
+        // Stale already: the device's clock is behind.
+        reading(-31, 10.0, 10.0),
+        // No window: it would release every board the last reading holds.
+        json!({ "read_at": at(0) }),
         json!({ "seven_day": { "percent": 10.0 } }),
     ] {
         let (code, err, v) = t.fail("PUT", "/v1/usage", None, Some(body)).await;
@@ -178,7 +182,8 @@ async fn snapshots_show_the_usage_and_say_to_stop_while_it_is_over() {
     assert_eq!(snapshot(&t, "kind=delta").await, "");
     assert_eq!(snapshot(&t, "kind=alerts").await, "");
 
-    // Over the stop: every kind carries the line, with what to do and when it resets.
+    // Over the stop: full snapshots and deltas carry the line, with what to do and when it
+    // resets. Alerts, which come with tool calls under the smallest cap, never do.
     t.ok("PUT", "/v1/usage", None, Some(reading(3, 20.0, 92.0)))
         .await;
     let over = format!(
@@ -186,10 +191,11 @@ async fn snapshots_show_the_usage_and_say_to_stop_while_it_is_over() {
          child thread; finish or park the tasks in doing. The week window resets {}.",
         (start() + TimeDelta::minutes(3 + 3 * 24 * 60)).format("%Y-%m-%d %H:%MZ")
     );
-    for kind in ["full", "delta", "alerts"] {
+    for kind in ["full", "delta"] {
         let snap = snapshot(&t, &format!("kind={kind}")).await;
         assert_eq!(usage_line(&snap), Some(over.as_str()), "{kind}:\n{snap}");
     }
+    assert_eq!(snapshot(&t, "kind=alerts").await, "");
     let yaml = snapshot(&t, "kind=full&format=yaml").await;
     assert!(
         yaml.contains("usage:\n  five_hour: 20\n  week: 92\n"),
@@ -222,19 +228,22 @@ async fn snapshots_show_the_usage_and_say_to_stop_while_it_is_over() {
     )
     .await;
 
-    // A stale reading holds nothing: the line clears from deltas and alerts.
+    // A stale reading holds nothing: the line clears from deltas.
     t.advance(TimeDelta::minutes(31));
     let full = snapshot(&t, "kind=full").await;
     assert!(
         usage_line(&full).unwrap().contains("read 31m ago"),
         "{full}"
     );
-    assert_eq!(usage_line(&snapshot(&t, "kind=alerts").await), None);
+    assert_eq!(usage_line(&snapshot(&t, "kind=delta").await), None);
 
     // A fresh reading under the stop clears it too.
-    t.ok("PUT", "/v1/usage", None, Some(reading(34, 1.0, 10.0)))
+    t.ok("PUT", "/v1/usage", None, Some(reading(34, 99.0, 10.0)))
         .await;
-    assert_eq!(usage_line(&snapshot(&t, "kind=alerts").await), None);
+    assert!(usage_line(&snapshot(&t, "kind=delta").await).is_some());
+    t.ok("PUT", "/v1/usage", None, Some(reading(35, 1.0, 10.0)))
+        .await;
+    assert_eq!(usage_line(&snapshot(&t, "kind=delta").await), None);
 }
 
 #[tokio::test]
@@ -252,11 +261,11 @@ async fn a_window_past_its_reset_is_not_over() {
         })),
     )
     .await;
-    let snap = snapshot(&t, "kind=alerts").await;
+    let snap = snapshot(&t, "kind=delta").await;
     assert!(
         usage_line(&snap).unwrap().starts_with("usage: 5h 99% >="),
         "{snap}"
     );
     t.advance(TimeDelta::minutes(11));
-    assert_eq!(usage_line(&snapshot(&t, "kind=alerts").await), None);
+    assert_eq!(usage_line(&snapshot(&t, "kind=delta").await), None);
 }

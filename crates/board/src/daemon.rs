@@ -1280,8 +1280,9 @@ impl<T: T3> Daemon<T> {
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
-        self.refresh_usage(now).await;
         let mut checks = self.check_threads(&boards, now, checks_until).await;
+        // After the thread checks, so a slow usage read never takes their time.
+        self.refresh_usage(now).await;
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -3281,7 +3282,6 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// The line for `wake` when what it is about still holds, else `None`.
     /// Whether the usage holds `slug` from new work at `now`: a window of a fresh reading
     /// is at or above the board's `usage_stop_at`.
     fn usage_holds(&self, slug: &BoardSlug, now: Timestamp) -> bool {
@@ -3294,7 +3294,8 @@ impl<T: T3> Daemon<T> {
     /// Takes a new usage reading: from the endpoint, when [`USAGE_POLL_EVERY`] has passed
     /// since this daemon last read it, reported to the server; else the newest any device
     /// reported. Then wakes the coordinators of boards the usage no longer holds. A
-    /// failure keeps the last reading, which goes stale and then holds nothing.
+    /// failure keeps the last reading, which goes stale and then holds nothing; with no
+    /// reading at all, as after a restart, the boards held stay held.
     async fn refresh_usage(&mut self, now: Timestamp) {
         let mut reported = None;
         if let UsageSource::ClaudeCode { url, credentials } = &self.usage_source
@@ -3306,7 +3307,16 @@ impl<T: T3> Daemon<T> {
             match crate::usage::read(url, credentials, now).await {
                 Ok(Some(report)) => match self.client().report_usage(&report).await {
                     Ok(usage) => reported = Some(usage),
-                    Err(err) => tracing::warn!("reporting the usage: {err:#}"),
+                    Err(err) => {
+                        tracing::warn!("reporting the usage: {err:#}");
+                        // The server is likely unreachable too: act on the local reading.
+                        reported = Some(Usage {
+                            five_hour: report.five_hour,
+                            seven_day: report.seven_day,
+                            read_at: report.read_at,
+                            device: self.ctx.device.clone(),
+                        });
+                    }
                 },
                 Ok(None) => tracing::debug!(
                     "usage: Claude Code is not signed in here or its token has expired"
@@ -3321,6 +3331,9 @@ impl<T: T3> Daemon<T> {
                 Ok(None) => {}
                 Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
             },
+        }
+        if self.usage.is_none() {
+            return;
         }
         let held: BTreeSet<BoardSlug> = self
             .boards
@@ -3351,6 +3364,7 @@ impl<T: T3> Daemon<T> {
         self.state.usage_held = held;
     }
 
+    /// The line for `wake` when what it is about still holds, else `None`.
     async fn recheck(
         &self,
         agent: &AgentId,
