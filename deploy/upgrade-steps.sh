@@ -59,7 +59,7 @@ server-unlock)
     fi
     ;;
 server-upgrade)
-    clone=$1 port=$2 db=$3 url=$4 sha=$5 token=$6
+    clone=$1 port=$2 db=$3 url=$4 sha=$5 token=$6 image=$7
     cd "$clone"
     git_dir=$(git rev-parse --git-dir)
     [ "$(cat "$git_dir/agent-board-upgrade.lock/owner" 2>/dev/null)" = "$token" ] ||
@@ -75,10 +75,16 @@ server-upgrade)
     git fetch --quiet "$url" main || fail "git fetch of $url in $clone failed: the server is unchanged"
     git checkout --quiet --detach "$sha" ||
         fail "git checkout $sha in $clone failed: the server is unchanged"
-    # Build before the backup, so the copy misses only the seconds of the restart.
-    if ! BOARD_COMMIT=$short compose build board; then
+    # Get the image before the backup, so the copy misses only the seconds of the restart.
+    # The running container keeps its image when agent-board:local moves.
+    if [ "$image" = build ]; then
+        if ! BOARD_COMMIT=$short compose build board; then
+            git checkout --quiet --detach "$prev"
+            fail "the image build failed at $short: the server still runs the old image and the clone is back at $prev. Read the output above, fix it, and run again"
+        fi
+    elif ! docker pull --quiet "$image" >/dev/null || ! docker tag "$image" agent-board:local; then
         git checkout --quiet --detach "$prev"
-        fail "the image build failed at $short: the server still runs the old image and the clone is back at $prev. Read the output above, fix it, and run again"
+        fail "pulling $image failed: the server still runs the old image and the clone is back at $prev. Check that the server reaches ghcr.io and run again, or pass --build to build on the server"
     fi
     ts=$(date -u +%Y%m%dT%H%M%SZ)
     backup="$data/pre-upgrade-$ts.db"
@@ -98,7 +104,7 @@ server-upgrade)
     if [ "$prev" != "$sha" ]; then
         echo "$prev" >"$git_dir/agent-board-previous"
     fi
-    BOARD_COMMIT=$short compose up -d board ||
+    BOARD_COMMIT=$short compose up -d --no-build board ||
         fail "the new container did not start at $short: read 'docker compose -f $clone/deploy/compose.yaml logs board', fix it and run again, or roll back"
     i=0
     while [ $i -lt 60 ]; do

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Upgrades the board server and every home device to one pinned revision.
 #
-#   deploy/upgrade.sh [--yes] [--rollback] [--config FILE] REV
+#   deploy/upgrade.sh [--yes] [--rollback] [--build] [--config FILE] REV
 #
-# REV is a full commit SHA on main or a v* release tag whose commit is on main. Without
-# --yes the script prints the plan (each host: current revision -> new revision) and
-# changes nothing. With --yes it locks the server, builds the new image, backs up the
-# database, restarts the server and waits for /healthz, then installs the board CLI at REV
-# on each device and restarts its `board watch` daemon. It stops at the first failure and
-# says what to do next. It refuses a REV older than a host's current one unless
-# --rollback is given.
+# REV is a full commit SHA on main or a v* release tag whose commit is on main. The server
+# runs the image CI published for that commit (ghcr.io/syz51/agent-board:sha-<commit>):
+# this script checks its build provenance with `gh attestation verify` and the server pulls
+# it by digest. --build builds the image on the server instead. Without --yes the script
+# prints the plan (each host: current revision -> new revision) and changes nothing. With
+# --yes it locks the server, pulls or builds the new image, backs up the database,
+# restarts the server and waits for /healthz, then installs the board CLI at REV on each
+# device and restarts its `board watch` daemon. It stops at the first failure and says
+# what to do next. It refuses a REV older than a host's current one unless --rollback is
+# given.
 #
 # Hosts come from a config file outside the repository (docs/DEPLOY.md, "Upgrade"):
 #   server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
@@ -18,7 +21,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -29,12 +32,14 @@ die() {
 
 yes=0
 rollback=0
+build=0
 config="${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf"
 rev=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --yes) yes=1 ;;
     --rollback) rollback=1 ;;
+    --build) build=1 ;;
     --config)
         [ $# -ge 2 ] || usage
         config=$2
@@ -89,6 +94,29 @@ fi
 git -C "$repo" merge-base --is-ancestor "$sha" "$main_tip" ||
     die "$rev is not on main of $git_url: merge it first, or pass a commit that is"
 short=${sha:0:12}
+
+# --- Image -----------------------------------------------------------------------------
+
+# The server pulls the image by digest, and only a digest whose provenance says it was
+# built by this repository's CI from this commit on main, on a GitHub-hosted runner.
+image=${BOARD_IMAGE:-ghcr.io/syz51/agent-board}
+[[ $image =~ ^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+$ ]] ||
+    die "BOARD_IMAGE must be ghcr.io/<owner>/<repository>, the image CI publishes"
+image_repo=${image#ghcr.io/}
+if [ $build = 1 ]; then
+    image_ref=build
+else
+    command -v gh >/dev/null ||
+        die "gh checks the image's provenance and is not installed: install it, or pass --build to build on the server"
+    digest=$(gh attestation verify "oci://$image:sha-$sha" --repo "$image_repo" \
+        --signer-workflow "$image_repo/.github/workflows/ci.yml" --source-ref refs/heads/main \
+        --source-digest "$sha" --deny-self-hosted-runners --format json \
+        --jq '[.[].verificationResult.statement.subject[].digest.sha256] | unique | .[]') ||
+        die "no image with verified provenance at $image:sha-$sha (see above). CI publishes one for each push to main in its 'image' job: wait for it, upgrade to a later commit on main, or pass --build to build on the server"
+    [[ $digest =~ ^[0-9a-f]{64}$ ]] ||
+        die "the provenance of $image:sha-$sha names '$digest', not one sha256 digest: pass --build to build on the server"
+    image_ref="$image@sha256:$digest"
+fi
 
 # --- Hosts ---------------------------------------------------------------------------
 
@@ -233,6 +261,11 @@ else
     echo "  server $server: ${server_prev:0:12} (running ${server_running}) -> $short"
 fi
 check_order "server" "$server_prev"
+if [ "$image_ref" = build ]; then
+    echo "  image: built on the server (--build)"
+else
+    echo "  image: $image_ref (provenance checked)"
+fi
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     prev=${device_prev[$i]}
@@ -269,7 +302,7 @@ fi
 
 if [ $server_skip = 0 ]; then
     echo "server $server: upgrading"
-    run_on "$server" "$server_id" server-upgrade "$clone" "$port" "$db" "$git_url" "$sha" "$token" ||
+    run_on "$server" "$server_id" server-upgrade "$clone" "$port" "$db" "$git_url" "$sha" "$token" "$image_ref" ||
         die "the server upgrade stopped (see above); no device was changed. $rollback_hint"
 fi
 

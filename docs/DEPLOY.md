@@ -173,6 +173,17 @@ commit SHA on `main`, or a `v*` release tag whose commit is on `main`. Both are 
 against the repository the hosts install from (`BOARD_GIT_URL`, default this one on
 GitHub), not against the clone's own remotes.
 
+The server runs the image CI publishes for each push to `main`:
+`ghcr.io/syz51/agent-board:sha-<commit>` (linux/amd64, built on a GitHub-hosted runner,
+with build provenance). The script checks that provenance on the device it runs on with
+`gh attestation verify`: the image must come from this repository's `ci.yml`, from that
+commit on `main`, on a GitHub-hosted runner. The server then pulls the image by the
+verified digest, so it runs exactly what was checked. The device needs `gh` (logged in);
+the server needs to reach `ghcr.io`. A commit whose CI run was cancelled or has not
+finished has no image yet: wait for the `image` job, upgrade to a later commit, or pass
+`--build`, which builds the image on the server as before (minutes of full CPU on a small
+host). `BOARD_IMAGE` (default `ghcr.io/syz51/agent-board`) names another image for a fork.
+
 ```sh
 deploy/upgrade.sh 0123456789abcdef0123456789abcdef01234567          # print the plan only
 deploy/upgrade.sh --yes 0123456789abcdef0123456789abcdef01234567    # apply it
@@ -200,8 +211,9 @@ nothing. With `--yes` it:
    that died, and is replaced.
 2. Refuses a revision older than any host's current one, so a late run cannot install an
    older build. `--rollback` allows it on purpose.
-3. On the server, checks out the revision (a detached `HEAD`) and builds the image while
-   the old server keeps running. A failed build puts the clone back.
+3. On the server, checks out the revision (a detached `HEAD`) and pulls the verified image
+   (or builds it with `--build`) while the old server keeps running. A failed pull or build
+   puts the clone back.
 4. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
    admin backup` in the running container, and checks it is not empty. It keeps the five
    newest of these copies; the backup timer keeps the history.
