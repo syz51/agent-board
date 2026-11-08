@@ -173,13 +173,21 @@ host.
   server for a minute. A reply that misses the budget says the server is slow and that
   board tools and the CLI, which wait longer, still work; the next hook tries again, and
   only three slow replies in a row make the device's hooks skip the server, for ten
-  seconds. A connection not open (TLS included) within half a second, or 0.1 seconds
-  before the reply's deadline when that comes first, counts as unreachable. Any answer
-  resets both.
-  The server's deadline is set after the hook's local steps (Keychain, process table, T3,
-  git). When those steps left the server under half a second, it is too little to judge:
-  a connection that does not open then ends with the reply's deadline, as slow, and a slow
-  reply changes nothing; a connection that fails at once still counts as unreachable.
+  seconds. Any answer resets both.
+  The server's deadline falls 1.3 seconds after the hook starts (the 1.5-second budget less
+  0.2 seconds kept for writing state and output). The local steps (Keychain, process table,
+  T3, git), the client build and a Stop's local work all count against the server's share.
+  The hook measures that share just before its first request. A share under half a second
+  is too little to judge: a slow reply changes nothing.
+  A direct connection's deadline is set when the connection starts: half a second later, or
+  0.1 seconds before the reply's deadline when that comes first. A connection not open (TLS
+  included) by then counts as unreachable. With under half a second left when it starts, it is too little to
+  judge: the connection has no deadline of its own and ends with the reply's deadline, as
+  slow, and that changes nothing. A connection that fails at once still counts as
+  unreachable.
+  Debug builds honor `BOARD_HOOK_SERVER_SHARE_MS`: it gives the server that many
+  milliseconds from just before the first request, whatever the local steps took, so tests
+  need no timing. Release builds ignore it.
 - **Hook relay**: while `board watch` runs, hooks reach the server through it, so a hook
   pays for neither a TLS handshake (0.04 to 0.3 seconds over a relayed tailnet path) nor a
   Keychain lookup. The daemon serves `$BOARD_HOME/run/hook.sock`: the directory has mode
