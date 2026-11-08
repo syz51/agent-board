@@ -500,10 +500,10 @@ fn add_report(
     } else {
         reporter.to_string()
     };
-    let (reports, reporters, kind): (u32, String, Option<String>) = cx.db.query_row(
-        "SELECT reports, reporters, resolution FROM feedback WHERE task = ?1",
+    let (reports, reporters): (u32, String) = cx.db.query_row(
+        "SELECT reports, reporters FROM feedback WHERE task = ?1",
         [item.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let reports = reports.saturating_add(1);
     let mut reporters: Vec<AgentId> = parse_json(&reporters)?;
@@ -519,9 +519,7 @@ fn add_report(
     )?;
     record_report(cx, item, reporter, signal)?;
     note_reports(cx, item, reporter, &actor, summary, signal)?;
-    if kind.as_deref() == Some("declined") {
-        reopen_declined(cx, item, reporter, &actor)?;
-    }
+    reopen_declined(cx, item, reporter, &actor)?;
     get_task(cx, item)
 }
 
@@ -668,30 +666,39 @@ fn routed_note(
     )
 }
 
-/// Sends a declined item back to triage once agents keep reporting it: declined at least
+/// Sends item `item`, if it is declined, back to triage once agents keep reporting it:
+/// declined at least
 /// `declined_reopen_after_days` ago, with `declined_reopen_reports` reports since then, on
 /// it or on the items resolved as its duplicates (`CLUSTER_SINCE`), from
 /// `declined_reopen_agents` agents that had not reported it before. It moves to `open`,
 /// unowned and unresolved, with a note giving the counts since the decline. Every report
 /// is a row of `feedback_reports`, and `resolved_report` is the newest row (of any item) at
 /// the decline, so the counts do not depend on the capped `reporters` or on clock ties; a
-/// later decline starts afresh.
+/// later decline starts afresh. Runs on each report to a live item, and when a resolve
+/// passes a duplicate's reports to one.
 fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &str) -> Result<()> {
-    let (declined_at, last_report, reason): (i64, i64, Option<String>) = cx.db.query_row(
-        "SELECT resolved_at, resolved_report, resolution_reason FROM feedback WHERE task = ?1",
+    type Row = (Option<String>, Option<i64>, Option<i64>, Option<String>);
+    let (kind, declined_at, last_report, reason): Row = cx.db.query_row(
+        "SELECT resolution, resolved_at, resolved_report, resolution_reason FROM feedback \
+         WHERE task = ?1",
         [item.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
+    let (Some("declined"), Some(declined_at), Some(last_report)) =
+        (kind.as_deref(), declined_at, last_report)
+    else {
+        return Ok(());
+    };
     let now = cx.now_ms();
     if now - declined_at < cx.s.declined_reopen_ms() {
         return Ok(());
     }
     // A declined item is done: resolving moves it there, and reopening clears the
     // resolution.
-    let (owner, created_by): (Option<String>, String) = cx.db.query_row(
-        "SELECT owner, created_by FROM tasks WHERE id = ?1",
+    let owner: Option<String> = cx.db.query_row(
+        "SELECT owner FROM tasks WHERE id = ?1",
         [item.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
     let (since, agents, new_agents): (u32, u32, u32) =
         cx.db.prepare_cached(CLUSTER_SINCE)?.query_row(
@@ -699,7 +706,7 @@ fn reopen_declined(cx: &mut Ctx<'_>, item: &TaskId, reporter: &AgentId, actor: &
                 item.as_str(),
                 DUPLICATE_DEPTH_MAX as i64,
                 last_report,
-                created_by
+                declined_at
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -886,24 +893,28 @@ pub(crate) const CLUSTER_ERRORS: &str = concat!(
      AND task IN (SELECT task FROM cluster)"
 );
 
-/// The cluster's reports after report row `?3` (the newest at a decline): their count,
-/// their agents, and the agents new since then. An agent counts as new when it had not
-/// reported the problem by then, on any item of the cluster, and is not `?4`: the creator
-/// reported it first, even on an item adopted from a plain task, which has no row.
+/// The cluster's reports since a decline at `?4`, when report row `?3` was the newest:
+/// their count, their agents, and the agents new since then. A report counts when its row
+/// came after `?3` and its time is not before `?4`, since a signal item's rows copy errors
+/// from before it was filed. An agent counts as new when it had not reported the problem
+/// by then, on any item of the cluster, nor created one of them: the creator reported it
+/// first, even on an item adopted from a plain task, which has no row.
 const CLUSTER_SINCE: &str = concat!(
     cluster!(),
-    "SELECT COUNT(*), COUNT(DISTINCT agent), COUNT(DISTINCT CASE WHEN agent <> ?4 \
-     AND agent NOT IN (SELECT agent FROM feedback_reports WHERE id <= ?3 \
-     AND task IN (SELECT task FROM cluster)) THEN agent END) \
-     FROM feedback_reports WHERE id > ?3 AND task IN (SELECT task FROM cluster)"
+    ", report_rows AS (SELECT agent, id > ?3 AND at >= ?4 AS since FROM feedback_reports \
+     WHERE task IN (SELECT task FROM cluster)), \
+     earlier (agent) AS (SELECT agent FROM report_rows WHERE NOT since UNION \
+     SELECT created_by FROM tasks WHERE id IN (SELECT task FROM cluster) \
+     AND created_at <= ?4) \
+     SELECT COUNT(*), COUNT(DISTINCT agent), COUNT(DISTINCT CASE WHEN agent NOT IN \
+     (SELECT agent FROM earlier) THEN agent END) FROM report_rows WHERE since"
 );
 
 /// The newest report of feedback item `?1` and of the items its duplicate links lead to,
 /// at most `?2` links on, as `live_item` follows them.
 const CHAIN_LAST_REPORTED: &str = "WITH RECURSIVE chain (task, depth) AS (SELECT ?1, 0 \
      UNION SELECT f.resolution_task, c.depth + 1 FROM chain c JOIN feedback f \
-     ON f.task = c.task AND f.resolution = 'duplicate' AND f.resolution_task IS NOT NULL \
-     WHERE c.depth < ?2) \
+     ON f.task = c.task AND f.resolution = 'duplicate' WHERE c.depth < ?2) \
      SELECT MAX(last_reported_at) FROM feedback WHERE task IN (SELECT task FROM chain)";
 
 /// Forgets the resolution of a reopened item, so it is live again.
@@ -1130,13 +1141,8 @@ pub(crate) fn resolve(
             .unwrap_or_else(|| task.created_by.clone());
         let signal = feedback.source == FeedbackSource::Signal;
         note_reports(cx, &live, &author, &by, &task.title, signal)?;
-        // Its reports since the decline count toward sending a declined original back.
-        if matches!(
-            resolution(cx, &live)?,
-            Some((Some(ResolutionKind::Declined), _))
-        ) {
-            reopen_declined(cx, &live, &author, &by)?;
-        }
+        // Its reports since a decline count toward sending a declined original back.
+        reopen_declined(cx, &live, &author, &by)?;
     }
     get_task(cx, id)
 }

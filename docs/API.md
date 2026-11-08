@@ -593,14 +593,17 @@ use, autopilot off). Items get `auto` from that board's autopilot.
     three things: the item was declined at least `declined_reopen_after_days` ago; it has
     gained at least `declined_reopen_reports` reports since the decline, from any agent,
     on it or on items resolved as its duplicates (and theirs, up to 8 links); and at least
-    `declined_reopen_agents` of the agents behind them are new. A new agent had not
-    reported it before the decline: not on this item, not on those duplicates, and not as
-    its creator.
-    The report that meets all three moves it to `open`, unowned, with the resolution
-    cleared and `version` raised. Reports that met the bar during the wait take effect
-    with the next report after it. A `finding` note, credited to that
-    reporter, starts `reopened:` and gives the reports and agents since the decline, how
-    many agents are new, the decline time and its reason. It comes with `note_added` and a
+    `declined_reopen_agents` of the agents behind them are new. A report counts when both its
+    row and its time come after the decline, so errors that a signal item copied from before the decline do
+    not count. A new agent had not reported it before the decline: not on this item, not on
+    those duplicates, and not as the creator of one of them.
+    The report or duplicate resolve that meets all three moves it to `open`, unowned, with
+    the resolution cleared and `version` raised. Reports that met the bar during the wait
+    take effect with the next report or duplicate resolve after it. A `finding` note,
+    credited to that reporter (on a resolve, the duplicate's latest reporter), starts
+    `reopened:` and gives the reports and agents since the decline, how many agents are
+    new, the decline time and its reason. The events' actor is the reporter, the server
+    for an error signal, or the resolver. It comes with `note_added` and a
     `task_updated` event `{"fields": ["status", "feedback"], "from": "done", "to": "open",
     "reopened": {"reports", "agents", "new_agents"}}`; when the item still had an owner,
     `fields` also lists `owner`, and the event carries `owner` (null) and `previous_owner`. Every report counts,
