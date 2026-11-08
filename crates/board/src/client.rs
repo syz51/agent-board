@@ -218,6 +218,42 @@ pub struct ErrorsQuery {
 /// server that accepts and never answers cannot hold it up.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The pauses before each repeat of a read that the reverse proxy failed (502, 503, and 504
+/// where safe), as it does for a few seconds while the server restarts.
+pub const READ_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(1), Duration::from_secs(2)];
+
+/// Which failed answers a request is sent again after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// None: a write, which a lost answer may have applied.
+    Never,
+    /// 502 and 503, where the proxy did not reach the server: a read that moves a cursor
+    /// (the snapshot's alerts), which a 504's lost answer may have moved.
+    Unreached,
+    /// 502, 503 and 504: a read that changes nothing.
+    Unanswered,
+}
+
+impl Retry {
+    fn covers(self, status: StatusCode) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Unreached => {
+                matches!(
+                    status,
+                    StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE
+                )
+            }
+            Self::Unanswered => matches!(
+                status,
+                StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -227,6 +263,8 @@ pub struct Client {
     agent: Option<AgentId>,
     /// Bounds each request and its answer; for the event stream, only until it opens.
     timeout: Option<Duration>,
+    /// The pauses before repeating a read the proxy failed; empty sends each read once.
+    read_retries: &'static [Duration],
 }
 
 impl fmt::Debug for Client {
@@ -259,6 +297,7 @@ impl Client {
             token: Some(token),
             agent,
             timeout,
+            read_retries: &[],
         })
     }
 
@@ -322,6 +361,7 @@ impl Client {
             token: None,
             agent: None,
             timeout: Some(timeout),
+            read_retries: &[],
         })
     }
 
@@ -329,6 +369,15 @@ impl Client {
     pub fn with_timeout(self, timeout: Duration) -> Self {
         Self {
             timeout: Some(timeout),
+            ..self
+        }
+    }
+
+    /// The same client repeating a read the proxy failed after each of `delays` in turn
+    /// ([`READ_RETRY_DELAYS`]); empty sends each read once. Writes are always sent once.
+    pub fn with_read_retries(self, delays: &'static [Duration]) -> Self {
+        Self {
+            read_retries: delays,
             ..self
         }
     }
@@ -349,7 +398,65 @@ impl Client {
         req
     }
 
-    async fn send<T: DeserializeOwned>(&self, mut req: RequestBuilder) -> Result<T> {
+    /// Sends `req`, again after each pause in `read_retries` while `retry` covers the answer.
+    async fn send<T: DeserializeOwned>(&self, req: RequestBuilder, retry: Retry) -> Result<T> {
+        let mut delays = if retry == Retry::Never {
+            &[]
+        } else {
+            self.read_retries
+        };
+        let mut tries = 1;
+        let (status, bytes) = loop {
+            if let Some((delay, rest)) = delays.split_first()
+                && let Some(copy) = req.try_clone()
+            {
+                let answer = self.send_once(copy).await?;
+                if !retry.covers(answer.0) {
+                    break answer;
+                }
+                tracing::debug!("server answered {}; repeating in {delay:?}", answer.0);
+                tokio::time::sleep(*delay).await;
+                delays = rest;
+                tries += 1;
+            } else {
+                break self.send_once(req).await?;
+            }
+        };
+        if status.is_success() {
+            let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+            return serde_json::from_slice(body).context("unexpected answer from the server");
+        }
+        let err = match serde_json::from_slice::<ApiError>(&bytes) {
+            Ok(error) => ServerError { status, error }.into(),
+            Err(_) => anyhow::anyhow!(
+                "server answered {status}: {}",
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ),
+        };
+        if !Retry::Unanswered.covers(status) {
+            return Err(err);
+        }
+        let times = if tries > 1 {
+            format!(" {tries} times")
+        } else {
+            String::new()
+        };
+        Err(err.context(if retry == Retry::Never {
+            format!(
+                "the board server may be restarting (it answered {status}): check with a read whether this change took effect before you repeat it"
+            )
+        } else {
+            format!(
+                "the board server may be restarting (it answered {status}{times}): this call only reads, so it is safe to repeat in a few seconds"
+            )
+        }))
+    }
+
+    /// Sends `req` once: the answer's status and body.
+    async fn send_once(&self, mut req: RequestBuilder) -> Result<(StatusCode, Vec<u8>)> {
         if let Some(timeout) = self.timeout {
             req = req.timeout(timeout);
         }
@@ -368,28 +475,17 @@ impl Client {
         note_server_build(resp.headers());
         let status = resp.status();
         let bytes = resp.bytes().await.context("reading the server's answer")?;
-        if status.is_success() {
-            let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
-            return serde_json::from_slice(body).context("unexpected answer from the server");
-        }
-        match serde_json::from_slice::<ApiError>(&bytes) {
-            Ok(error) => Err(ServerError { status, error }.into()),
-            Err(_) => Err(anyhow::anyhow!(
-                "server answered {status}: {}",
-                String::from_utf8_lossy(&bytes)
-                    .chars()
-                    .take(200)
-                    .collect::<String>()
-            )),
-        }
+        Ok((status, bytes.to_vec()))
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.send(self.request(Method::GET, path)).await
+        self.send(self.request(Method::GET, path), Retry::Unanswered)
+            .await
     }
 
     async fn get_query<T: DeserializeOwned, Q: Serialize>(&self, path: &str, q: &Q) -> Result<T> {
-        self.send(self.request(Method::GET, path).query(q)).await
+        self.send(self.request(Method::GET, path).query(q), Retry::Unanswered)
+            .await
     }
 
     async fn with_body<T: DeserializeOwned, B: Serialize>(
@@ -398,7 +494,8 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        self.send(self.request(method, path).json(body)).await
+        self.send(self.request(method, path).json(body), Retry::Never)
+            .await
     }
 
     // Health
@@ -459,8 +556,11 @@ impl Client {
 
     /// Deletes a closed board (user tokens only); the server answers 204.
     pub async fn delete_board(&self, slug: &BoardSlug) -> Result<()> {
-        self.send(self.request(Method::DELETE, &format!("/v1/boards/{slug}")))
-            .await
+        self.send(
+            self.request(Method::DELETE, &format!("/v1/boards/{slug}")),
+            Retry::Never,
+        )
+        .await
     }
 
     pub async fn join(&self, slug: &BoardSlug) -> Result<Board> {
@@ -483,7 +583,8 @@ impl Client {
     /// Releases the coordinator lease; the server answers with the board.
     pub async fn release_coordinator(&self, slug: &BoardSlug) -> Result<Board> {
         let path = format!("/v1/boards/{slug}/coordinator");
-        self.send(self.request(Method::DELETE, &path)).await
+        self.send(self.request(Method::DELETE, &path), Retry::Never)
+            .await
     }
 
     // Tasks
@@ -615,8 +716,14 @@ impl Client {
 
     // Snapshots and events
 
+    /// A snapshot, which moves the agent's alert cursor: repeated only when the proxy did
+    /// not reach the server, so a 504's lost answer cannot skip alerts.
     pub async fn snapshot(&self, q: &SnapshotQuery) -> Result<Snapshot> {
-        self.get_query("/v1/snapshot", q).await
+        self.send(
+            self.request(Method::GET, "/v1/snapshot").query(q),
+            Retry::Unreached,
+        )
+        .await
     }
 
     pub async fn events(
