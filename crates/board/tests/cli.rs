@@ -2489,3 +2489,100 @@ fn brief_prints_what_the_daemon_briefs_the_coordinator_with() {
     );
     assert!(stdout(&out).contains(board::daemon::TRIAGE_PROMPT));
 }
+
+#[test]
+fn brief_prints_each_daemon_dispatch_brief_filled_in() {
+    use board::brief::{JudgeKind, WORKER_CLOSER, judge_brief, worker_brief};
+    let e = env();
+    let factory: board_proto::BoardSlug = "factory".parse().unwrap();
+    let task = |n| board_proto::TaskId::new(&factory, n);
+    let brief = |args: &[&str]| {
+        let out = e.run(&[&["brief", "factory", "--kind"], args].concat());
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        stdout(&out)
+    };
+
+    let worker = brief(&["worker", "--task", "factory-7"]);
+    assert_eq!(
+        worker,
+        format!("{}\n", worker_brief(&factory, &task(7), WORKER_CLOSER))
+    );
+    assert!(worker.starts_with("# Worker\n\nYou do task factory-7 of board factory"));
+    assert!(worker.contains("1. `task_claim factory-7`."), "{worker}");
+    assert!(worker.contains("The board's review judge reviews your result."));
+
+    let review = brief(&["review", "--task", "factory-7"]);
+    assert_eq!(
+        review,
+        format!("{}\n", judge_brief(JudgeKind::Review, &factory, &[task(7)]))
+    );
+    assert!(review.contains("You are the review judge of board factory."));
+    assert!(review.contains("You review factory-7, now in `review`."));
+
+    let verdict = brief(&["verdict", "--task", "factory-8", "--task", "factory-9"]);
+    assert_eq!(
+        verdict,
+        format!(
+            "{}\n",
+            judge_brief(JudgeKind::Verdict, &factory, &[task(8), task(9)])
+        )
+    );
+    assert!(verdict.contains("the pending proposals factory-8 and factory-9."));
+
+    let goal = brief(&["goal"]);
+    assert_eq!(
+        goal,
+        format!("{}\n", judge_brief(JudgeKind::Goal, &factory, &[]))
+    );
+    assert!(goal.contains("You are the goal judge of board factory."));
+
+    let triage = brief(&["triage", "--task", "factory-10"]);
+    assert_eq!(
+        triage,
+        format!(
+            "{}\n",
+            judge_brief(JudgeKind::Triage, &factory, &[task(10)])
+        )
+    );
+    assert!(triage.contains("For each item (factory-10), one at a time"));
+
+    for text in [&worker, &review, &verdict, &goal, &triage] {
+        assert!(!text.contains('{'), "a placeholder is left: {text}");
+    }
+    for text in [&review, &verdict, &goal, &triage] {
+        assert!(text.starts_with(board::brief::JUDGE_SHARED_PROMPT.split('{').next().unwrap()));
+        assert!(text.chars().count() < board::brief::JUDGE_BRIEF_CHARS_MAX);
+    }
+    assert!(e.stub.requests().is_empty(), "no server needed");
+}
+
+#[test]
+fn brief_says_which_tasks_each_kind_takes() {
+    let e = env();
+    for (args, says) in [
+        (&["--kind", "worker"][..], "pass --task <id> once"),
+        (
+            &[
+                "--kind",
+                "worker",
+                "--task",
+                "factory-1",
+                "--task",
+                "factory-2",
+            ],
+            "pass --task <id> once",
+        ),
+        (&["--kind", "review"], "pass --task <id>, once per task"),
+        (&["--kind", "verdict"], "pass --task <id>, once per task"),
+        (&["--kind", "triage"], "pass --task <id>, once per task"),
+        (
+            &["--kind", "goal", "--task", "factory-1"],
+            "leave out --task",
+        ),
+        (&["--task", "factory-1"], "leave out --task"),
+    ] {
+        let out = e.run(&[&["brief", "factory"], args].concat());
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
+    }
+}
