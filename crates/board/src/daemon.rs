@@ -82,8 +82,13 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// A named coordinator's thread that T3 found live is not asked about again for this long.
 /// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
 /// each minute costs a home device more than the check is worth. A failed send to the
-/// thread, or its agent ending, asks again on the next reconcile.
+/// thread, or its agent ending, asks again on the next reconcile. A thread whose check
+/// timed out is not asked about again for this long either: it counts as failing meanwhile.
 pub const THREAD_RECHECK: TimeDelta = TimeDelta::minutes(5);
+/// How many coordinator thread checks run at once. Each `t3` process needs about half a
+/// second of CPU to start; nine at once on a busy device took 4-5 seconds each, and longer
+/// than [`Timing::thread_check`] under a build, so every check timed out together.
+pub const THREAD_CHECKS_AT_ONCE: usize = 2;
 /// An ended coordinator's lease is released once checks of its thread have failed this
 /// long, so another home device takes over while T3 is down, and one slow check does not
 /// hand the board away.
@@ -119,8 +124,9 @@ pub struct Timing {
     pub flush_budget: Duration,
     /// The last flush before exiting gets this long; what it does not send stays saved.
     pub stop_budget: Duration,
-    /// Each board's `t3 thread show` gets this long. The boards' checks run side by side,
-    /// so a slow T3 for one thread delays a reconcile by this much at most.
+    /// Each board's `t3 thread show` gets this long. The boards' checks run
+    /// [`THREAD_CHECKS_AT_ONCE`] at a time, and none starts after half of
+    /// `reconcile_budget`, so the rest of the reconcile keeps its time.
     pub thread_check: Duration,
     /// The first delay before reopening the event stream.
     pub reconnect_first: Duration,
@@ -600,6 +606,8 @@ pub struct Daemon<T: T3> {
     failures: BTreeMap<BoardSlug, StartFailure>,
     /// Coordinator threads T3 last found live, and when: see [`THREAD_RECHECK`].
     threads_live: BTreeMap<String, Timestamp>,
+    /// Coordinator threads whose last check timed out, and when: see [`THREAD_RECHECK`].
+    threads_timed_out: BTreeMap<String, Timestamp>,
     /// Boards whose coordinator thread check has failed since, and when it first failed.
     checks_failing: BTreeMap<BoardSlug, Timestamp>,
     /// Agents with queued wake-ups, as last read or reported.
@@ -625,6 +633,7 @@ impl<T: T3> Daemon<T> {
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
             threads_live: BTreeMap::new(),
+            threads_timed_out: BTreeMap::new(),
             checks_failing: BTreeMap::new(),
             agents: BTreeMap::new(),
             sending: Vec::new(),
@@ -742,9 +751,11 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Whether each coordinator thread of ours that a home board still leaves to us is live,
-    /// by board: asked side by side, each within [`Timing::thread_check`]. A thread the
-    /// board names as coordinator and T3 found live less than [`THREAD_RECHECK`] ago counts
-    /// as live without asking.
+    /// by board: asked [`THREAD_CHECKS_AT_ONCE`] at a time, each within
+    /// [`Timing::thread_check`], none started after half of [`Timing::reconcile_budget`]. A
+    /// thread the board names as coordinator and T3 found live less than [`THREAD_RECHECK`]
+    /// ago counts as live without asking; one whose check timed out less than that ago
+    /// counts as failing without asking.
     async fn check_threads(
         &mut self,
         boards: &[Board],
@@ -756,28 +767,60 @@ impl<T: T3> Daemon<T> {
             let Some(local) = self.state.coordinators.get(&board.slug) else {
                 continue;
             };
+            let recent = |at: &Timestamp| now - *at < THREAD_RECHECK;
             match &board.coordinator {
                 Some(named) if *named != local.agent => continue,
                 Some(_)
                     if local.registered
-                        && self
-                            .threads_live
-                            .get(&local.thread)
-                            .is_some_and(|at| now - *at < THREAD_RECHECK) =>
+                        && self.threads_live.get(&local.thread).is_some_and(recent) =>
                 {
                     checks.insert(board.slug.clone(), Ok(true));
                 }
-                _ => ask.push((board.slug.clone(), local.thread.clone())),
+                _ => match self
+                    .threads_timed_out
+                    .get(&local.thread)
+                    .filter(|at| recent(at))
+                {
+                    Some(at) => {
+                        let err = anyhow::anyhow!(
+                            "t3 thread show {} timed out at {at}; not asked again before {}",
+                            local.thread,
+                            *at + THREAD_RECHECK
+                        );
+                        checks.insert(board.slug.clone(), Err(err));
+                    }
+                    None => ask.push((board.slug.clone(), local.thread.clone())),
+                },
             }
         }
-        let answers =
-            futures_util::future::join_all(ask.iter().map(|(_, thread)| self.thread_live(thread)))
-                .await;
+        let deadline = tokio::time::Instant::now() + self.timing.reconcile_budget / 2;
+        let this = &*self;
+        let answers: Vec<Result<bool>> =
+            futures_util::stream::iter(ask.iter().map(|(_, thread)| async move {
+                tokio::time::timeout_at(deadline, this.thread_live(thread))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "t3 thread show {thread} not reached within the reconcile's checks; asked on the next reconcile"
+                        ))
+                    })
+            }))
+            .buffered(THREAD_CHECKS_AT_ONCE)
+            .collect()
+            .await;
         for ((slug, thread), answer) in ask.into_iter().zip(answers) {
             if matches!(answer, Ok(true)) {
-                self.threads_live.insert(thread, now);
+                self.threads_live.insert(thread.clone(), now);
             } else {
                 self.threads_live.remove(&thread);
+            }
+            match &answer {
+                Err(err) if err.downcast_ref::<TimedOut>().is_some() => {
+                    self.threads_timed_out.insert(thread, now);
+                }
+                _ => {
+                    self.threads_timed_out.remove(&thread);
+                }
             }
             checks.insert(slug, answer);
         }
@@ -788,6 +831,8 @@ impl<T: T3> Daemon<T> {
             .map(|c| c.thread.as_str())
             .collect();
         self.threads_live
+            .retain(|thread, _| ours.contains(&thread.as_str()));
+        self.threads_timed_out
             .retain(|thread, _| ours.contains(&thread.as_str()));
         checks
     }
@@ -1043,9 +1088,7 @@ impl<T: T3> Daemon<T> {
         let sent = self
             .send_wake(&local.agent, &rebrief_message(slug, triage))
             .await;
-        if !matches!(sent, Sent::Delivered) {
-            self.threads_live.remove(local.agent.native());
-        }
+        self.forget_thread_check(local.agent.native(), &sent);
         match sent {
             Sent::Delivered => {
                 tracing::info!(
@@ -2010,13 +2053,21 @@ impl<T: T3> Daemon<T> {
         }
     }
 
+    /// A send that failed may mean the thread is gone: the next reconcile asks T3. One that
+    /// T3 answered as gone also ends the wait after a timed-out check, since T3 answers.
+    fn forget_thread_check(&mut self, thread: &str, sent: &Sent) {
+        if !matches!(sent, Sent::Delivered) {
+            self.threads_live.remove(thread);
+        }
+        if matches!(sent, Sent::Gone(_)) {
+            self.threads_timed_out.remove(thread);
+        }
+    }
+
     /// Records how sending `out` went.
     fn settle(&mut self, out: Outgoing, sent: Sent, now: Timestamp) {
         let agent = out.agent;
-        if !matches!(sent, Sent::Delivered) {
-            // A send that failed may mean the thread is gone: the next reconcile asks T3.
-            self.threads_live.remove(agent.native());
-        }
+        self.forget_thread_check(agent.native(), &sent);
         let kinds = || {
             let mut kinds: Vec<&str> = out.wakes.iter().map(|w| w.about.kind()).collect();
             kinds.sort_unstable();

@@ -500,10 +500,14 @@ settings in use, warned once per edit.
     send it is still checked, so an agent that ended or paused meanwhile has its answers
     passed on. The event retries go on past one the server keeps failing and stop only
     when the server cannot be reached. The daemon reconciles at start and on its tick,
-    also while the stream is down. The boards' `t3 thread show` checks run side by side,
-    10 seconds each; one that fails or runs out of time still renews a named coordinator
-    at work, and only a check that answers replaces it. One whose session ended is not
-    renewed while the checks fail, and once they have failed for 10 minutes its lease is
+    also while the stream is down. The boards' `t3 thread show` checks run two at a time,
+    10 seconds each, and none starts after the first 45 seconds of the reconcile: each
+    `t3` process needs about half a second of CPU to start, so nine at once on a busy
+    device took 4-5 seconds each and timed out together under a build. A thread whose
+    check timed out is not asked about again for 5 minutes and counts as failing
+    meanwhile, unless a send to it finds it gone. A check that fails or runs out of time
+    still renews a named coordinator at work, and only a check that answers replaces it.
+    One whose session ended is not renewed while the checks fail, and once they have failed for 10 minutes its lease is
     released, so another home device takes over while T3 is down; its record stays, so
     the thread is adopted again once T3 answers, unless another coordinator is named by
     then. Each check starts a `t3` process of about 180 MB, so a named

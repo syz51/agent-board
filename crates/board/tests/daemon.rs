@@ -64,6 +64,9 @@ struct FakeT3 {
     fail_info: Arc<AtomicBool>,
     /// How many times `t3 thread show` ran.
     infos: Arc<AtomicUsize>,
+    /// How many `t3 thread show` run now, and the most that ever ran at once.
+    infos_running: Arc<AtomicUsize>,
+    infos_at_once: Arc<AtomicUsize>,
     /// Threads whose `t3 thread send` never answers.
     hang_send: Arc<Mutex<Vec<String>>>,
     /// Threads whose `t3 thread send` fails, as for an archived thread.
@@ -178,6 +181,16 @@ impl T3 for FakeT3 {
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
         self.infos.fetch_add(1, Ordering::SeqCst);
+        let running = self.infos_running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.infos_at_once.fetch_max(running, Ordering::SeqCst);
+        // Counted down when the check ends or is dropped on its timeout.
+        struct Ended(Arc<AtomicUsize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _ended = Ended(self.infos_running.clone());
         if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
             std::future::pending::<()>().await;
         }
@@ -3669,9 +3682,11 @@ fn a_second_watch_on_the_same_home_exits_naming_the_first() {
 }
 
 #[tokio::test]
-async fn a_hanging_thread_check_holds_up_no_other_board() {
+async fn hung_thread_checks_run_two_at_a_time_and_wait_before_asking_again() {
     let mut e = env();
     e.daemon.timing.thread_check = Duration::from_millis(300);
+    // Checks start only in the first half of the budget: until 500 ms.
+    e.daemon.timing.reconcile_budget = Duration::from_millis(1000);
     let mut boards = Vec::new();
     for (slug, thread) in [("factory", "coord"), ("other", "hung"), ("third", "slow")] {
         let agent = format!("t3:{thread}");
@@ -3700,12 +3715,14 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
         boards.push(board);
     }
     e.stub.on("GET /v1/boards", &boards);
-    // T3 answers for no thread: one after another, the checks would take 900 ms.
+    // T3 answers for no thread.
     e.t3.hang_info
         .lock()
         .unwrap()
         .extend(["coord".into(), "hung".into(), "slow".into()]);
+    let infos = |e: &Env| e.t3.infos.load(Ordering::SeqCst);
 
+    // Two checks run and time out at 300 ms; the third starts then and is cut at 500 ms.
     let started = Instant::now();
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(11))
@@ -3713,9 +3730,15 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
         .unwrap();
     let took = started.elapsed();
     assert!(
-        took < Duration::from_millis(700),
-        "the checks ran side by side, each cut at 300 ms: {took:?}"
+        took < Duration::from_millis(900),
+        "the checks stopped at half the budget: {took:?}"
     );
+    assert_eq!(
+        e.t3.infos_at_once.load(Ordering::SeqCst),
+        2,
+        "two at a time"
+    );
+    assert_eq!(infos(&e), 3);
     for slug in ["factory", "other", "third"] {
         assert_eq!(
             e.stub
@@ -3726,6 +3749,154 @@ async fn a_hanging_thread_check_holds_up_no_other_board() {
         );
     }
     assert_eq!(e.daemon.state.coordinators.len(), 3, "none replaced");
+
+    // A minute later only the check that was cut short runs: the timed-out ones wait.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(12))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), 4);
+    assert_eq!(e.daemon.state.coordinators.len(), 3);
+
+    // THREAD_RECHECK after their timeout, the first two are asked again; the third still waits.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(16))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), 6);
+    assert_eq!(e.daemon.state.coordinators.len(), 3);
+}
+
+#[tokio::test]
+async fn a_coordinator_whose_checks_time_out_is_still_replaced_once_t3_answers() {
+    let archive = |e: &Env| {
+        e.t3.hang_info.lock().unwrap().clear();
+        e.t3.threads.lock().unwrap().insert(
+            "coord".into(),
+            ThreadInfo {
+                archived: true,
+                runtime: Runtime::Claude,
+            },
+        );
+    };
+    let lease = |e: &Env, method: &str| {
+        e.stub
+            .requests_to(&format!("{method} /v1/boards/factory/coordinator"))
+            .len()
+    };
+    let infos = |e: &Env| e.t3.infos.load(Ordering::SeqCst);
+    let reconcile = async |e: &mut Env, minutes: i64| {
+        e.stub.clear();
+        e.daemon
+            .reconcile(at() + chrono::Duration::minutes(minutes))
+            .await
+            .unwrap();
+    };
+
+    // At work: the timed-out check renews it. Its thread is archived meanwhile, and the
+    // next check, THREAD_RECHECK later, replaces it.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    reconcile(&mut e, 11).await;
+    assert_eq!(
+        (infos(&e), lease(&e, "POST"), lease(&e, "DELETE")),
+        (1, 1, 0)
+    );
+    archive(&e);
+    reconcile(&mut e, 12).await;
+    assert_eq!(infos(&e), 1, "not asked again yet");
+    assert_eq!(starts(&e.t3), 0);
+    reconcile(&mut e, 16).await;
+    assert_eq!(infos(&e), 3, "asked, then the new thread's runtime read");
+    assert_eq!(lease(&e, "DELETE"), 1, "the archived thread is released");
+    assert_eq!(starts(&e.t3), 1, "and replaced");
+
+    // Its session ended: timed-out checks, and the waits between them, still count toward
+    // CHECK_FAIL_RELEASE, so the lease goes 10 minutes after the first timeout.
+    let (mut e, _) = coordinator_env(AgentState::Ended, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    for (minutes, asked) in [(11, 1), (12, 1), (16, 2)] {
+        reconcile(&mut e, minutes).await;
+        assert_eq!(infos(&e), asked, "at +{minutes}");
+        assert_eq!(
+            (lease(&e, "POST"), lease(&e, "DELETE")),
+            (0, 0),
+            "at +{minutes}"
+        );
+    }
+    reconcile(&mut e, 21).await;
+    assert_eq!(infos(&e), 3);
+    assert_eq!(lease(&e, "DELETE"), 1, "released after CHECK_FAIL_RELEASE");
+    // No one takes the board; T3 answers again and the thread turns out archived: replaced
+    // at the next check.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    archive(&e);
+    reconcile(&mut e, 22).await;
+    assert_eq!((infos(&e), starts(&e.t3)), (3, 0), "still waiting");
+    reconcile(&mut e, 26).await;
+    assert_eq!((infos(&e), starts(&e.t3)), (5, 1), "asked, then replaced");
+
+    // A wake-up that T3 refuses because the thread is archived means T3 answers again: the
+    // next reconcile asks at once instead of waiting out THREAD_RECHECK.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.timing.thread_check = Duration::from_millis(50);
+    e.t3.hang_info.lock().unwrap().push("coord".into());
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    reconcile(&mut e, 11).await;
+    archive(&e);
+    e.t3.refuse_send.lock().unwrap().push("coord".into());
+    let now = at() + chrono::Duration::minutes(12);
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            now,
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(now).await;
+    assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(infos(&e), 2, "the failed send asked T3 about the thread");
+    reconcile(&mut e, 13).await;
+    assert_eq!(starts(&e.t3), 1, "replaced without waiting");
 }
 
 #[tokio::test]
