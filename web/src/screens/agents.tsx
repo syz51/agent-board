@@ -119,22 +119,23 @@ export function AgentsScreen() {
  * The agents list's columns from 820px of width: who and where it runs, then what it is
  * working on, which takes the rest. Two columns leave no empty band between them.
  */
-const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[380px_minmax(0,1fr)]";
+const ROW = "grid gap-x-6 px-(--gutter) @min-[820px]:grid-cols-[300px_minmax(0,1fr)]";
 
 /**
  * One agent per row: who, its state and where it runs, then its task, handoff and, for a
  * coordinator, its turn endings. Narrow lists stack the two.
  */
 function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
-  const where = [
-    agent.role === "coordinator" ? "Coordinator" : null,
-    agent.device,
-    agent.runtime,
-    agent.repo?.replace(/^github\.com\//, ""),
-    agent.branch,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  const repo = agent.repo?.replace(/^github\.com\//, "");
+  // Its role and machine in words, then the repository and branch as the ids they are.
+  const parts: { text: string; id?: boolean }[] = [
+    ...(agent.role === "coordinator" ? [{ text: "Coordinator" }] : []),
+    ...(agent.device ? [{ text: agent.device }] : []),
+    ...(agent.runtime ? [{ text: agent.runtime }] : []),
+    ...(repo ? [{ text: repo, id: true }] : []),
+    ...(agent.branch ? [{ text: agent.branch, id: true }] : []),
+  ];
+  const where = parts.map((part) => part.text).join(" · ");
   return (
     <article className={`${ROW} gap-y-2.5 py-3 hover:bg-muted/60`}>
       <header className="grid grid-cols-[28px_minmax(0,1fr)] content-start items-center justify-items-start gap-x-2.5 gap-y-1">
@@ -160,7 +161,12 @@ function AgentCard({ agent, task }: { agent: Agent; task: Task | undefined }) {
           data-slot="where"
           title={where}
         >
-          {where}
+          {parts.map((part, index) => (
+            <span key={index}>
+              {index > 0 && " · "}
+              {part.id ? <span className="ident">{part.text}</span> : part.text}
+            </span>
+          ))}
         </p>
       </header>
       <div className="grid min-w-0 content-start gap-2">

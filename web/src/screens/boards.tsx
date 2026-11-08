@@ -346,12 +346,12 @@ const CELL_CLASS: Record<string, string> = {
 };
 
 /**
- * The boards table's columns. Every row is one height on wide screens: the name line never
- * wraps (a long slug ends in an ellipsis), the goal keeps to two lines, the tally to one
- * and the coordinator to two, so the cells sit centred in a 78px row.
+ * The boards table's columns. Every row is one height on wide screens: the name line, with
+ * its whole slug and states, the goal in two lines, the tally and the coordinator in two at
+ * most, so the cells sit centred in a 78px row.
  */
 const ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,172px)_40px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-4";
+  "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'name_name'_'tasks_tasks'_'coord_coord'_'asks_pilot'] gap-x-3.5 gap-y-3 @min-[760px]:grid-cols-[minmax(0,1fr)_minmax(0,400px)_minmax(0,150px)_32px_64px] @min-[760px]:[grid-template-areas:'name_tasks_coord_asks_pilot'] @min-[760px]:gap-x-3";
 
 function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, Agent> }) {
   const data = useMemo(
@@ -414,11 +414,9 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
 function BoardName({ board }: { board: Board }) {
   return (
     <>
-      {/* One line: the name, its slug and its states. Where they do not fit, the slug gives
-          way first, ending in an ellipsis (whole on hover and in the board's address); the
-          name and the states keep their width. */}
-      <div className="flex h-5 min-w-0 items-center gap-x-2">
-        <h3 className="max-w-full flex-none truncate text-sm font-semibold tracking-[-0.006em]">
+      {/* One line: the name, its slug and its states, none of them cut. */}
+      <div className="flex min-h-5 min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em] [overflow-wrap:anywhere]">
           <Link
             className="text-foreground"
             to="/boards/$slug"
@@ -428,10 +426,7 @@ function BoardName({ board }: { board: Board }) {
             {board.title}
           </Link>
         </h3>
-        <span
-          className="ident min-w-0 flex-[0_1000_auto] truncate text-meta text-muted-foreground"
-          title={board.slug}
-        >
+        <span className="ident min-w-0 text-meta [overflow-wrap:anywhere] text-muted-foreground">
           {board.slug}
         </span>
         {board.status !== "active" && (
@@ -510,7 +505,14 @@ function TaskTally({ board }: { board: Board }) {
 
 function Coordinator({ board, coordinator, agents }: BoardRowData) {
   if (board.coordinator === null) {
-    return <span className="text-muted-foreground">No coordinator</span>;
+    return (
+      <span className="text-muted-foreground">
+        <span className="@min-[760px]:sr-only">No coordinator</span>
+        <span className="hidden @min-[760px]:inline" aria-hidden="true">
+          –
+        </span>
+      </span>
+    );
   }
   if (!coordinator) return <Who id={board.coordinator} agents={agents} />;
   return (
@@ -524,7 +526,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
 function BoardAsks({ board }: { board: Board }) {
   if (board.open_asks === 0) {
     return (
-      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline">
+      <span className="hidden text-meta text-muted-foreground @min-[760px]:inline-block @min-[760px]:w-[1ch] @min-[760px]:text-center">
         <span aria-hidden="true">–</span>
         <span className="sr-only">No asks</span>
       </span>

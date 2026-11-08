@@ -13,11 +13,12 @@ inset panel, and lists that run edge to edge across it.
   detail; states sit inline beside names, not stacked under them. Fixed columns size to
   their content, and the last column takes what is left.
 - **Density**: 36px task rows and 38px group bands. Boards rows are one 78px height: the
-  name, slug and states share one line (a long slug ends in an ellipsis, whole on hover),
-  the goal keeps to two lines, the task tally to one and the coordinator to two; the Asks
-  column is right-aligned. Agents are a two-column table: who, with
-  its state, when last seen and one quiet line of where it runs (cut with an ellipsis,
-  whole on hover); then what it is working on, with its handoff. Priority labels share one
+  name, slug and states share one line, none of them cut, the goal keeps to two lines, the
+  task tally to one and the coordinator to two; an empty cell is a dash, and the Asks
+  column is right-aligned. Agents are a two-column table: who (in a 300px column), with
+  its state, when last seen and one quiet line of where it runs, its repository and branch
+  set as ids (cut with an ellipsis, whole on hover); then what it is working on, with its
+  handoff. Priority labels share one
   weight; the bars carry the level.
 - **Type**: Inter at 13px body, 12.5px meta, 24px page titles and 28px task titles; prose
   stops at a 100-character measure.
@@ -58,4 +59,4 @@ inset panel, and lists that run edge to edge across it.
 
 - Small type and edge-to-edge rows favour scanning on a desktop over reading on a phone.
 - Cards are gone from lists, so a row's extent shows only by its rules and hover.
-- A board's slug can end in an ellipsis on Home when its name and states fill the line.
+- A board with a long name and slug takes a second line for them on a narrow desktop.
