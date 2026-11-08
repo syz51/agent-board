@@ -48,6 +48,26 @@ describe("home", () => {
     expect(titles).toEqual(["Waiting on you", "Boards", "In progress"]);
   });
 
+  test("shows how much of ready is auto, and ready alone from an older server", async () => {
+    const [board, other] = state.boards();
+    // A server that predates ready_auto leaves it out, which decodes to null.
+    const boards = [
+      { ...board!, counts: { ...board!.counts, ready: 3, ready_auto: 2 } },
+      { ...other!, counts: { ...other!.counts, ready: 4, ready_auto: null } },
+    ];
+    await renderInApp(<HomeScreen />, {
+      seed: (client) => {
+        seed(client);
+        client.setQueryData(queries.boards().queryKey, boards);
+      },
+    });
+    const tallies = screen.getAllByRole("list", { name: "Tasks by status" });
+    const ready = (list: HTMLElement) =>
+      within(list).getByText("ready").closest("li")?.textContent?.replace(/\s+/g, " ").trim();
+    expect(ready(tallies[0]!)).toBe("3 ready (auto 2)");
+    expect(ready(tallies[1]!)).toBe("4 ready");
+  });
+
   test("lists every task in progress, so its counts match its rows", async () => {
     await renderInApp(<HomeScreen />, { seed });
     const progress = screen.getByRole("region", { name: /In progress/ });

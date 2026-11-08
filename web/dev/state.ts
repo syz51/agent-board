@@ -529,6 +529,7 @@ export class DevState {
         done: count("done"),
         dropped: count("dropped"),
         ready: tasks.filter((task) => task.ready).length,
+        ready_auto: tasks.filter((task) => task.ready && task.auto).length,
       },
       open_asks: this.data.asks.filter((ask) => ask.board === board.slug && ask.status === "open")
         .length,
