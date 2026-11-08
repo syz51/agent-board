@@ -83,6 +83,11 @@ export function nullable<T>(decode: Decoder<T>): Decoder<T | null> {
   return (value, path) => (value === null || value === undefined ? null : decode(value, path));
 }
 
+/** A `#[serde(default)]` field on the Rust side: `fallback` when an older server skips it. */
+export function withDefault<T>(decode: Decoder<T>, fallback: T): Decoder<T> {
+  return (value, path) => (value === undefined ? fallback : decode(value, path));
+}
+
 export function array<T>(decode: Decoder<T>): Decoder<T[]> {
   return (value, path) => {
     if (!Array.isArray(value)) throw new DecodeError(path, "an array", value);

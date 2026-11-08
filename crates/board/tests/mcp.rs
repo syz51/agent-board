@@ -380,6 +380,24 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(sent["summary"], "Parser fixed; PR #4 is open.");
     assert_eq!(sent["evidence"][0]["value"], "4e1c2ab");
 
+    // task_list proposals=true asks for proposals, and keeps only them from a server that
+    // predates the filter.
+    let mut proposal = task_fixture("factory-20", "Cache builds");
+    proposal.body = "Proposal: cache the builds.".into();
+    proposal.auto = false;
+    stub.on(
+        "GET /v1/tasks",
+        [proposal, task_fixture("factory-21", "Ordinary")],
+    );
+    let listed = mcp.call(11, "task_list", json!({"proposals": true}));
+    assert_ne!(listed["isError"], true, "{listed}");
+    assert_eq!(
+        stub.requests_to("GET /v1/tasks")[0].query_pairs()["proposal"],
+        "true"
+    );
+    assert!(text(&listed).contains("factory-20"), "{listed}");
+    assert!(!text(&listed).contains("factory-21"), "{listed}");
+
     let bad = mcp.call(6, "task_show", json!({"id": "not an id"}));
     assert_eq!(bad["isError"], true);
     assert!(text(&bad).starts_with("error: invalid arguments"));

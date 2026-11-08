@@ -1840,12 +1840,10 @@ fn no_project(board: &Board) -> String {
     )
 }
 
-/// A pending proposal: open, not `auto`, with a body starting `Proposal:`
-/// (prompts/coordinator.md "Proposals"). Its filing wakes the coordinator to review it.
+/// A pending proposal (prompts/coordinator.md "Proposals"). Its filing wakes the
+/// coordinator to review it.
 fn is_proposal(task: &board_proto::Task) -> bool {
-    task.status == board_proto::TaskStatus::Open
-        && !task.auto
-        && task.body.trim_start().starts_with("Proposal:")
+    task.is_pending_proposal()
 }
 
 fn priority(p: &Priority) -> String {

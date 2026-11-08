@@ -307,6 +307,9 @@ pub struct LsArgs {
     /// Only ready tasks.
     #[arg(long)]
     ready: bool,
+    /// Only pending proposals, which wait for another agent's verdict.
+    #[arg(long)]
+    proposals: bool,
     #[arg(long)]
     board: Option<BoardSlug>,
     #[arg(long, value_parser = enum_arg::<TaskStatus>())]
@@ -344,8 +347,9 @@ pub struct AddArgs {
     #[arg(long, value_parser = enum_arg::<Priority>())]
     priority: Option<Priority>,
     /// May the coordinator start it without the user? Default: the board's autopilot. Set
-    /// false only when the user must act or decide, or for a proposal (a body starting
-    /// "Proposal:") until another agent accepts it; waiting on a task is a blocker.
+    /// false only when the user must act or decide; waiting on a task is a blocker. A
+    /// proposal (a body starting "Proposal:") is always stored not auto until another agent
+    /// accepts it.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     auto: Option<bool>,
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time.
@@ -729,6 +733,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 status: a.status,
                 owner: a.owner,
                 ready: a.ready.then_some(true),
+                proposal: a.proposals.then_some(true),
                 mine: a.mine.then_some(true),
                 limit: a.limit,
             };
