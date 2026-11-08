@@ -505,6 +505,228 @@ async fn claims_follow_ownership_blockers_and_the_doing_limit() {
 }
 
 #[tokio::test]
+async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+
+    // The owner's claim resumes its task in review, as task_update status=doing would.
+    let reviewed = task_in(&t, TaskStatus::Review).await;
+    let (s, v) = t.claim(B, &reviewed).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("owns {reviewed}")),
+        "{v}"
+    );
+    let before = t.get_task(&reviewed).await;
+    let (s, v) = t.claim(A, &reviewed).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(A)),
+        "{v}"
+    );
+    assert_eq!(v["doing_since"], before["doing_since"], "{v}");
+    let events = events_of(&t, &reviewed).await;
+    let event = events.last().unwrap();
+    assert_eq!(
+        event,
+        &(
+            "task_updated".to_owned(),
+            json!({ "fields": ["status"], "from": "review", "to": "doing" })
+        ),
+        "{events:?}"
+    );
+
+    // A blocked task resumes once its blockers are done; until then the claim names them.
+    let blocker = t.task(A, "factory", "Blocker").await;
+    let waiting = t.task(A, "factory", "Waits").await;
+    assert!(t.claim(A, &waiting).await.0.is_success());
+    let (s, v) = t
+        .patch(
+            A,
+            &waiting,
+            json!({ "status": "blocked", "blockers": [blocker] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(A, &waiting).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains(&blocker), "{v}");
+    // The owner is not sent away to other ready work.
+    assert!(!v["next"].as_str().unwrap().contains("ready"), "{v}");
+    assert!(t.claim(A, &blocker).await.0.is_success());
+    let (s, v) = t.done(A, &blocker, check(0)).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(A, &waiting).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "doing", "{v}");
+
+    // A blocked reason may name a wait on the user: refused, quoting it.
+    let asked = t.task(A, "factory", "Waits on the user").await;
+    assert!(t.claim(A, &asked).await.0.is_success());
+    let (s, v) = t
+        .patch(
+            A,
+            &asked,
+            json!({ "status": "blocked", "blocked_reason": "waiting on ask #12" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(A, &asked).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("\"waiting on ask #12\"")
+            && next.contains(&format!("task_update {asked} status=doing")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&asked).await["status"], "blocked", "{v}");
+
+    // Nobody's blocked task resumes for whoever claims it, who becomes its owner.
+    let first = t.task(A, "factory", "First").await;
+    let unowned = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Unowned", "blockers": [first] }),
+        )
+        .await;
+    let (s, v) = t.patch(A, &unowned, json!({ "status": "blocked" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["owner"], Value::Null, "{v}");
+    assert!(t.claim(A, &first).await.0.is_success());
+    let (s, v) = t.done(A, &first, check(0)).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(B, &unowned).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(B)),
+        "{v}"
+    );
+    let events = events_of(&t, &unowned).await;
+    let event = events.last().unwrap();
+    assert_eq!(
+        event,
+        &(
+            "task_updated".to_owned(),
+            json!({
+                "fields": ["status", "owner"], "from": "blocked", "to": "doing",
+                "owner": B, "previous_owner": null,
+            })
+        ),
+        "{events:?}"
+    );
+
+    // Nobody's blocked task that also waits on an open ask, a date, or a verdict stays put.
+    let blocker = t.task(A, "factory", "Blocker of the rest").await;
+    let parked = |title: &'static str, body: &'static str| {
+        let t = &t;
+        let blocker = blocker.clone();
+        async move {
+            let id = t
+                .task_with(
+                    A,
+                    json!({ "board": "factory", "title": title, "body": body,
+                            "blockers": [blocker] }),
+                )
+                .await;
+            let (s, v) = t.patch(A, &id, json!({ "status": "blocked" })).await;
+            assert!(s.is_success(), "{v}");
+            id
+        }
+    };
+    let on_ask = parked("Waits on an ask", "").await;
+    let dated = parked("Waits for a date", "").await;
+    let proposal = parked("Proposed", "Proposal: cache the builds. Size S.").await;
+    let later = (t.state.now() + TimeDelta::days(2)).to_rfc3339();
+    let (s, v) = t.patch(A, &dated, json!({ "not_before": later })).await;
+    assert!(s.is_success(), "{v}");
+    assert!(t.claim(A, &blocker).await.0.is_success());
+    let (s, v) = t.done(A, &blocker, check(0)).await;
+    assert!(s.is_success(), "{v}");
+    let ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "task": on_ask, "kind": "decision",
+                "question": "Go ahead?", "options": ["yes", "no"],
+            })),
+        )
+        .await;
+    for (id, says) in [
+        (&on_ask, format!("ask #{}", ask["id"])),
+        (&dated, "waits until".to_owned()),
+        (&proposal, "proposal not yet accepted".to_owned()),
+    ] {
+        let (s, v) = t.claim(B, id).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (400, Some("invalid_transition")),
+            "{v}"
+        );
+        assert!(v["message"].as_str().unwrap().contains(&says), "{v}");
+        assert_eq!(t.get_task(id).await["status"], "blocked", "{v}");
+    }
+
+    // Resumes are not claims from ready.
+    let stats = t.ok("GET", "/v1/stats?days=1", None, None).await;
+    assert_eq!(stats["claims_refused"], 1, "{stats}");
+}
+
+#[tokio::test]
+async fn claim_of_a_parked_task_keeps_the_doing_limit_and_stale_owners() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 1).await;
+    let reviewed = task_in(&t, TaskStatus::Review).await;
+    let busy = t.task(A, "factory", "Busy").await;
+    assert!(t.claim(A, &busy).await.0.is_success());
+
+    // At the doing limit, the owner's resume is refused like a claim.
+    let (s, v) = t.claim(A, &reviewed).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains(&busy), "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("then claim {reviewed}")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&reviewed).await["status"], "review", "{v}");
+
+    // A stale owner's parked task is taken, not claimed.
+    t.advance(stale_after() + TimeDelta::hours(1));
+    t.register(B, Some(REPO), Some("main")).await;
+    let (s, v) = t.claim(B, &reviewed).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("stale"), "{v}");
+}
+
+#[tokio::test]
 async fn fifty_concurrent_claims_have_one_winner() {
     let t = T::new();
     t.board("factory", &[]).await;
