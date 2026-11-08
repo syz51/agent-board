@@ -317,12 +317,16 @@ pub struct Agent {
     pub runtime: Runtime,
     pub device: DeviceName,
     pub role: AgentRole,
+    /// A T3 thread's current title (from the hooks); a board's coordinator keeps
+    /// `<slug> coordinator` from its daemon.
     pub title: Option<String>,
     /// Repo key (normalized origin URL) of the agent's working directory, if in a repo.
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub cwd: Option<String>,
-    /// Provider and host ids, for example `{"claude_session": "...", "t3_parent": "..."}`.
+    /// Provider and host ids, for example `{"claude_session": "...", "t3_thread": "...",
+    /// "t3_parent": "...", "t3_link": "https://..."}`; `t3_link` is the T3 thread's link in
+    /// the T3 app, always `https://` (the server refuses any other).
     pub native_ids: BTreeMap<String, String>,
     pub forked_from: Option<AgentId>,
     pub state: AgentState,

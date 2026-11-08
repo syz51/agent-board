@@ -3,25 +3,21 @@ import { Link } from "@tanstack/react-router";
 import { createColumnHelper, tableFeatures, useTable } from "@tanstack/react-table";
 import { useMemo, useState } from "react";
 import { api } from "@/api/client.ts";
-import type { Agent, Ask, Board, Task } from "@/api/schema.ts";
+import type { Agent, Board, Task } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Switch } from "@/components/ui/switch.tsx";
 import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
-import { PlainText } from "@/text/markdown.tsx";
 import { useNow } from "@/live/runtime.ts";
 import {
   AgentStateBadge,
   agentIndex,
-  AskKind,
   Empty,
   ErrorNotice,
   ExpandableLine,
-  listClass,
   PageHeader,
   QueryFrame,
-  RelTime,
   StatePill,
   useAgents,
   useTitle,
@@ -30,16 +26,15 @@ import {
 import { ConfirmDialog } from "@/ui/confirm.tsx";
 import { Icon, StatusIcon, statusLabel } from "@/ui/icons.tsx";
 import { ArrangedSections, Section } from "@/ui/sections.tsx";
-import { newestFirst, useOpenAsks } from "./asks.tsx";
+import { AskRows, useOpenAsks } from "./asks.tsx";
 import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
-import { unseenCount, Updates, UpdatesHeader, useUpdates } from "./updates.tsx";
 
 // Boards come second, so the overview is in reach without scrolling past the work in hand.
-const HOME_SECTIONS = ["asks", "boards", "progress", "updates"] as const;
+const HOME_SECTIONS = ["asks", "boards", "progress"] as const;
 
 /**
- * Home: what waits on the user, every board, what is in progress and what changed since they
- * last looked. Each section collapses and moves; the arrangement is kept per browser.
+ * Home: what waits on the user, every board and what is in progress. Each section collapses
+ * and moves; the arrangement is kept per browser.
  */
 export function HomeScreen() {
   useTitle("Home");
@@ -47,7 +42,6 @@ export function HomeScreen() {
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
   const openAsks = useOpenAsks().data ?? [];
-  const updates = useUpdates().data;
   const active = useQuery(queries.activeTasks());
   const closed = useMemo(
     () =>
@@ -91,7 +85,12 @@ export function HomeScreen() {
                   }
                   {...state}
                 >
-                  <WaitingAsks asks={openAsks} />
+                  <AskRows
+                    asks={openAsks}
+                    limit={HOME_ROWS}
+                    empty="Nothing waits on you."
+                    showBoard
+                  />
                 </Section>
               );
             case "progress":
@@ -106,17 +105,6 @@ export function HomeScreen() {
                       <InProgress tasks={inProgress(list, closed)} agents={agents} now={now} />
                     )}
                   </QueryFrame>
-                </Section>
-              );
-            case "updates":
-              return (
-                <Section
-                  title="Since you last looked"
-                  count={updates ? unseenCount(updates) : undefined}
-                  aside={updates && <UpdatesHeader updates={updates} />}
-                  {...state}
-                >
-                  <Updates />
                 </Section>
               );
             case "boards":
@@ -186,55 +174,6 @@ function InProgress({
   );
 }
 
-/** The newest open asks, one line each; the Needs you page lists them all. */
-function WaitingAsks({ asks }: { asks: Ask[] }) {
-  if (asks.length === 0) {
-    return <p className="text-meta text-muted-foreground">Nothing waits on you.</p>;
-  }
-  return (
-    <ul className={listClass}>
-      {newestFirst(asks)
-        .slice(0, HOME_ROWS)
-        .map((ask) => (
-          <li key={ask.id}>
-            {/* The left edge takes the kind's colour, as on the Needs you cards: these rows
-                wait on the user, unlike every other row on Home. */}
-            <Link
-              className={cn(
-                "group/ask relative grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5",
-                "before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
-                ask.kind === "action" ? "before:bg-amber" : "before:bg-status-review",
-              )}
-              to="/asks/$id"
-              params={{ id: String(ask.id) }}
-            >
-              <AskKind kind={ask.kind} />
-              <span
-                className="truncate font-medium max-md:col-span-2 max-md:row-start-2 max-md:line-clamp-3 max-md:whitespace-normal"
-                title={plainLine(ask.question)}
-              >
-                {/* Tags show as code here too, as in the ask itself. */}
-                <PlainText className="[white-space:inherit]" text={plainLine(ask.question)} />
-              </span>
-              {/* Where and when; on hover or focus, what a click does. */}
-              <span className="grid text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
-                <span className="col-start-1 row-start-1 [@media(hover:hover)]:group-hover/ask:invisible [@media(hover:hover)]:group-focus-visible/ask:invisible">
-                  {ask.board} · <RelTime at={ask.created_at} />
-                </span>
-                <span
-                  className="invisible col-start-1 row-start-1 inline-flex items-center justify-end gap-1 font-medium text-link [@media(hover:hover)]:group-hover/ask:visible [@media(hover:hover)]:group-focus-visible/ask:visible"
-                  aria-hidden="true"
-                >
-                  Answer <Icon name="arrow" className="size-3.5" />
-                </span>
-              </span>
-            </Link>
-          </li>
-        ))}
-    </ul>
-  );
-}
-
 /**
  * Tasks being worked on or waiting for review, on boards that are not closed: doing first,
  * then review, each most recently updated first. Exported for tests.
@@ -247,15 +186,6 @@ export function inProgress(tasks: Task[], closedBoards: ReadonlySet<string>): Ta
         (task.status === "doing" || task.status === "review") && !closedBoards.has(task.board),
     )
     .sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
-}
-
-/** The first line of agent markdown without its markup, for a one-line preview. */
-export function plainLine(text: string): string {
-  const line = text.trim().split("\n")[0] ?? "";
-  return line
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/(\*\*|__|`|~~)/g, "")
-    .replace(/^#+\s*/, "");
 }
 
 const SEGMENTS = [

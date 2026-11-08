@@ -132,7 +132,7 @@ export const queries = {
     queryOptions({
       queryKey: ["said", agentId, limit],
       queryFn: fetching(() => api.agentSaid(agentId, limit)),
-      meta: { tags: [tags.updates] },
+      meta: { tags: [tags.said] },
     }),
   openAsks: () =>
     queryOptions({
@@ -145,11 +145,5 @@ export const queries = {
       queryKey: ["ask", id],
       queryFn: fetching(() => api.ask(id)),
       meta: { tags: [tags.asks] },
-    }),
-  updates: (board: string) =>
-    queryOptions({
-      queryKey: ["updates", board],
-      queryFn: fetching(() => api.updates(board ? { board } : {})),
-      meta: { tags: [tags.updates] },
     }),
 };

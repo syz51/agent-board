@@ -26,6 +26,7 @@ import {
 import { FilterSelect, FilterToggle, SearchField } from "@/ui/filters.tsx";
 import { Icon, StatusIcon } from "@/ui/icons.tsx";
 import { useCollapsed } from "@/ui/sections.tsx";
+import { AskRows, useOpenAsks } from "./asks.tsx";
 
 const route = getRouteApi("/boards/$slug");
 
@@ -186,6 +187,8 @@ export function BoardScreen() {
         </p>
       )}
 
+      <BoardAsks slug={slug} />
+
       {/* While tasks load the bar shows disabled, so the header holds still. A board with
           nothing to filter, or whose tasks failed to load, has no bar: it would only look
           broken there. */}
@@ -282,6 +285,48 @@ export function BoardScreen() {
   );
 }
 
+/** How many of a board's open asks its page lists; Needs you, filtered to the board, has all. */
+export const BOARD_ASK_ROWS = 5;
+
+/**
+ * The board's open asks above its tasks: what the board waits on the user for comes first.
+ * Nothing shows while the asks load or when none is open.
+ */
+function BoardAsks({ slug }: { slug: string }) {
+  const open = useOpenAsks().data;
+  const asks = useMemo(() => (open ?? []).filter((ask) => ask.board === slug), [open, slug]);
+  if (asks.length === 0) return null;
+  return (
+    <div className="mb-5">
+      <TaskBoard>
+        <TaskGroupSection
+          id="board-asks"
+          heading={
+            <>
+              <Icon name="inbox" className="size-3.5 text-amber" />
+              Waiting on you
+            </>
+          }
+          count={asks.length}
+          aside={
+            asks.length > BOARD_ASK_ROWS && (
+              <Link
+                className="inline-flex min-h-7 items-center gap-1 text-meta font-medium max-md:min-h-11"
+                to="/asks"
+                search={{ board: slug }}
+              >
+                All {asks.length} asks <Icon name="arrow" className="size-3.5" />
+              </Link>
+            )
+          }
+        >
+          <AskRows asks={asks} limit={BOARD_ASK_ROWS} empty="" inFrame />
+        </TaskGroupSection>
+      </TaskBoard>
+    </div>
+  );
+}
+
 function ownerOptions(tasks: Task[], agents: Map<string, Agent>) {
   const ids = [...new Set(tasks.flatMap((task) => (task.owner ? [task.owner] : [])))];
   return ids
@@ -305,6 +350,7 @@ export function TaskGroupSection({
   collapsed = false,
   onToggle,
   level = 2,
+  aside,
   children,
 }: {
   id: string;
@@ -315,6 +361,8 @@ export function TaskGroupSection({
   onToggle?: () => void;
   /** 3 where the groups sit inside a titled section, as on the home page. */
   level?: 2 | 3;
+  /** A link at the heading's right end, outside the heading itself. */
+  aside?: ReactNode;
   children: ReactNode;
 }) {
   const bodyId = useId();
@@ -326,41 +374,58 @@ export function TaskGroupSection({
       <span className="text-meta font-medium text-subtle-foreground tabular-nums">{count}</span>
     </>
   );
+  const headingEl = (
+    <Heading
+      id={id}
+      className={cn(
+        "text-sm font-semibold",
+        !aside && "bg-muted/45",
+        !aside && !collapsed && "border-b",
+        aside && "min-w-0 flex-1",
+        !onToggle && row,
+      )}
+    >
+      {onToggle ? (
+        <button
+          type="button"
+          className={cn(
+            row,
+            "group/toggle cursor-pointer text-left hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+          )}
+          aria-expanded={!collapsed}
+          aria-controls={bodyId}
+          onClick={onToggle}
+        >
+          {/* Left of the label, as on the home page's sections. */}
+          <Icon
+            name="chevronDown"
+            className={cn(
+              "size-3.5 flex-none text-muted-foreground transition-transform group-hover/toggle:text-foreground motion-reduce:transition-none",
+              collapsed && "-rotate-90",
+            )}
+          />
+          {label}
+        </button>
+      ) : (
+        label
+      )}
+    </Heading>
+  );
   return (
     <section aria-labelledby={id}>
-      <Heading
-        id={id}
-        className={cn(
-          "bg-muted/45 text-sm font-semibold",
-          !collapsed && "border-b",
-          !onToggle && row,
-        )}
-      >
-        {onToggle ? (
-          <button
-            type="button"
-            className={cn(
-              row,
-              "group/toggle cursor-pointer text-left hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
-            )}
-            aria-expanded={!collapsed}
-            aria-controls={bodyId}
-            onClick={onToggle}
-          >
-            {/* Left of the label, as on the home page's sections. */}
-            <Icon
-              name="chevronDown"
-              className={cn(
-                "size-3.5 flex-none text-muted-foreground transition-transform group-hover/toggle:text-foreground motion-reduce:transition-none",
-                collapsed && "-rotate-90",
-              )}
-            />
-            {label}
-          </button>
-        ) : (
-          label
-        )}
-      </Heading>
+      {aside ? (
+        <div
+          className={cn(
+            "flex items-center gap-3 bg-muted/45 pr-(--gutter)",
+            !collapsed && "border-b",
+          )}
+        >
+          {headingEl}
+          {aside}
+        </div>
+      ) : (
+        headingEl
+      )}
       <div id={bodyId} hidden={collapsed}>
         {children}
       </div>

@@ -43,7 +43,6 @@ function seed(client: QueryClient) {
     queries.openAsks().queryKey,
     state.asks(new URLSearchParams({ status: "open" })),
   );
-  client.setQueryData(queries.updates("").queryKey, state.updates(none));
   client.setQueryData(queries.agents().queryKey, state.agents(none));
 }
 

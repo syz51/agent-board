@@ -4,6 +4,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
 import { renderRoute } from "../../test/render.tsx";
 import { queries } from "../live/query.ts";
+import { agentAnchor } from "../ui/common.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
 const state = new DevState(() => now);
@@ -31,7 +32,6 @@ afterEach(() => {
 function seed(client: QueryClient) {
   client.setQueryData(queries.boards().queryKey, state.boards());
   client.setQueryData(queries.openAsks().queryKey, []);
-  client.setQueryData(queries.updates("").queryKey, state.updates(none));
   client.setQueryData(queries.agents().queryKey, agents);
   client.setQueryData(
     queries.doingTasks().queryKey,
@@ -42,13 +42,42 @@ function seed(client: QueryClient) {
   }
 }
 
+/** An agent's card, found by the anchor other pages link to. */
+const card = (handle: string) =>
+  waitFor(() => {
+    const found = document.getElementById(agentAnchor(handle));
+    if (!found) throw new Error(`no card for ${handle}`);
+    return found;
+  });
+
 describe("the agents list", () => {
+  test("names each agent by its thread title beside its handle, and links its T3 thread", async () => {
+    await renderRoute("/agents", { seed });
+    const linked = agents.find((agent) => agent.title && agent.native_ids.t3_link)!;
+    const row = await card(linked.handle);
+    const heading = within(row).getByRole("heading", { level: 2 });
+    expect(heading.textContent).toBe(`${linked.title}${linked.handle}`);
+    const open = within(row).getByRole("link", { name: /Open in T3 Code/ });
+    expect(open.getAttribute("href")).toBe(linked.native_ids.t3_link ?? "");
+    expect(open.getAttribute("target")).toBe("_blank");
+    expect(open.getAttribute("rel")).toBe("noopener noreferrer");
+    // An agent without a thread link has no such link.
+    const unlinked = agents.find((agent) => agent.state !== "ended" && !agent.native_ids.t3_link)!;
+    const other = await card(unlinked.handle);
+    expect(within(other).queryByRole("link", { name: /Open in T3 Code/ })).toBeNull();
+  });
+
+  test("highlights the card another page linked to", async () => {
+    const [linked, other] = agents.filter((agent) => agent.state !== "ended");
+    await renderRoute(`/agents#${agentAnchor(linked!.handle)}`, { seed });
+    expect((await card(linked!.handle)).className).toContain("bg-accent");
+    expect((await card(other!.handle)).className).not.toContain("bg-accent");
+  });
+
   test("says where each agent runs in one line under its name, with no details column", async () => {
     await renderRoute("/agents", { seed });
     const coordinator = agents.find((agent) => agent.role === "coordinator" && agent.repo)!;
-    const row = await waitFor(() =>
-      screen.getByRole("heading", { level: 2, name: coordinator.handle }).closest("article")!,
-    );
+    const row = await card(coordinator.handle);
     const line = row.querySelector("header [data-slot=where]");
     expect(line?.textContent).toBe(
       [
@@ -66,9 +95,7 @@ describe("the agents list", () => {
     await renderRoute("/agents", { seed });
     const marked = agents.find((agent) => /<\/?[a-z]/i.test(handoff(agent.id)?.now ?? ""))!;
     expect(marked).toBeTruthy();
-    const row = await waitFor(() =>
-      screen.getByRole("heading", { level: 2, name: marked.handle }).closest("article")!,
-    );
+    const row = await card(marked.handle);
     const tags = [...row.querySelectorAll("code.raw-tag")].map((node) => node.textContent);
     expect(tags).toContain("</board>");
   });

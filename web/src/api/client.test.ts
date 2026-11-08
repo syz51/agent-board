@@ -39,7 +39,6 @@ describe("api client parsing", () => {
       if (handoff) return json(state.handoff(decodeURIComponent(handoff[1] ?? "")));
       const said = pathname.match(/^\/v1\/agents\/(.+)\/said$/);
       if (said) return json(state.said(decodeURIComponent(said[1] ?? ""), searchParams));
-      if (pathname === "/v1/updates") return json(state.updates(searchParams));
       if (pathname === "/healthz") return json({ ok: true, seq: state.seq });
       if (pathname === "/v1/boards") return json(state.boards());
       if (pathname.startsWith("/v1/boards/")) return json(state.board(pathname.slice(11)));
@@ -81,26 +80,13 @@ describe("api client parsing", () => {
     expect((await api.task("factory-9")).task.summary).toContain("CRLF");
     expect((await api.task("factory-12")).task.summary).toBeNull();
 
-    const updates = await api.updates();
-    expect(updates.since).toBe(updates.seen_at);
-    expect(updates.done.map((item) => item.task)).toEqual(["factory-9", "web-view-5", "docs-7"]);
-    expect(updates.done[1]?.evidence.map((item) => item.kind)).toEqual(["pr", "commit", "check"]);
-    expect(updates.done[2]).toMatchObject({ parent: "docs-1", summary: null });
-    expect(updates.said.map((item) => item.id)).toEqual([5, 3, 4]);
-    expect(updates.more).toBe(false);
-    expect((await api.updates({ board: "docs" })).done.map((item) => item.task)).toEqual([
-      "docs-7",
-    ]);
-    const everything = await api.updates({ since: "2020-01-01T00:00:00Z" });
-    expect(everything.said.length).toBe(5);
-
     const coordinator = agents.find((agent) => agent.handle === "t3:c2d0")?.id ?? "";
     const said = await api.agentSaid(coordinator, 3);
     expect(said.map((item) => item.id)).toEqual([5, 4, 2]);
     expect(said.every((item) => item.agent === coordinator)).toBe(true);
   });
 
-  test("decodes updates, a seen cursor and turn endings, and rejects bad ones", async () => {
+  test("decodes turn endings and rejects bad ones", async () => {
     const said = {
       id: 3,
       agent: "t3:c2d0",
@@ -108,50 +94,10 @@ describe("api client parsing", () => {
       text: "Round done.",
       at: "2026-11-06T12:00:00Z",
     };
-    const done = {
-      task: "factory-9",
-      board: "factory",
-      parent: null,
-      title: "Fix CRLF",
-      summary: "Fixed.",
-      owner: "t3:a91c",
-      done_at: "2026-11-06T11:00:00Z",
-      evidence: [
-        {
-          kind: "pr" as const,
-          value: "https://github.com/example/factory/pull/41",
-          exit_code: null,
-          agent: "t3:a91c",
-          at: "2026-11-06T11:00:00Z",
-        },
-      ],
-    };
-    const body = { seen_at: null, since: null, done: [done], said: [said], more: true };
-    expect(await fakeFetch(() => json(body)).api.updates()).toEqual(body);
-    expect(
-      await fakeFetch(() => json({ seen_at: "2026-11-06T12:00:00Z" })).api.markSeen(
-        "2026-11-06T12:00:00Z",
-      ),
-    ).toEqual({ seen_at: "2026-11-06T12:00:00Z" });
     expect(await fakeFetch(() => json([said])).api.agentSaid("t3:c2d0")).toEqual([said]);
-
-    const { summary: _, owner: __, parent: ___, ...bare } = done;
-    const decoded = await fakeFetch(() => json({ ...body, done: [bare] })).api.updates();
-    expect(decoded.done[0]).toMatchObject({ summary: null, owner: null, parent: null });
-
-    const badSaid = fakeFetch(() => json({ ...body, said: [{ ...said, id: "3" }] }));
-    expect((await failure(badSaid.api.updates())).message).toContain(
-      'said[0].id: expected an integer, got "3"',
-    );
-    const badTime = fakeFetch(() => json({ ...body, done: [{ ...done, done_at: "earlier" }] }));
-    expect((await failure(badTime.api.updates())).message).toContain(
-      "done[0].done_at: expected an RFC 3339 time",
-    );
-    const noMore = fakeFetch(() => json({ seen_at: null, since: null, done: [], said: [] }));
-    expect((await failure(noMore.api.updates())).message).toContain("more: expected a boolean");
-    const badCursor = fakeFetch(() => json({ seen_at: null }));
-    expect((await failure(badCursor.api.markSeen("2026-11-06T12:00:00Z"))).code).toBe(
-      "bad_response",
+    const badSaid = fakeFetch(() => json([{ ...said, id: "3" }]));
+    expect((await failure(badSaid.api.agentSaid("t3:c2d0"))).message).toContain(
+      '[0].id: expected an integer, got "3"',
     );
   });
 
@@ -161,8 +107,6 @@ describe("api client parsing", () => {
     await api.tasks({ status: "doing", limit: 5 });
     await api.asks({ status: "open" });
     await api.handoff("t3:7f3a").catch(() => {});
-    await api.updates().catch(() => {});
-    await api.updates({ board: "factory", since: "2026-11-06T12:00:00Z" }).catch(() => {});
     await api.agentSaid("t3:c2d0", 3).catch(() => {});
     await api.agentSaid("t3:c2d0").catch(() => {});
     expect(calls.map((call) => call.url)).toEqual([
@@ -170,8 +114,6 @@ describe("api client parsing", () => {
       "/v1/tasks?status=doing&limit=5",
       "/v1/asks?status=open",
       "/v1/agents/t3%3A7f3a/handoff",
-      "/v1/updates",
-      "/v1/updates?board=factory&since=2026-11-06T12%3A00%3A00Z",
       "/v1/agents/t3%3Ac2d0/said?limit=3",
       "/v1/agents/t3%3Ac2d0/said",
     ]);
@@ -188,11 +130,9 @@ describe("api client parsing", () => {
     });
     await api.setAutopilot("factory", false);
     await api.answerAsk(7, "The existing ops chat");
-    await api.markSeen("2026-11-06T11:58:00Z").catch(() => {});
     expect(calls.map((call) => [call.init?.method, call.url, call.init?.body])).toEqual([
       ["PATCH", "/v1/boards/factory", '{"autopilot":false}'],
       ["POST", "/v1/asks/7/answer", '{"answer":"The existing ops chat"}'],
-      ["PUT", "/v1/updates/seen", '{"at":"2026-11-06T11:58:00Z"}'],
     ]);
     expect((calls[1]?.init?.headers as Record<string, string>)["content-type"]).toBe(
       "application/json",
