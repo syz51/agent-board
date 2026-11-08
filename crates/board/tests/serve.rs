@@ -134,6 +134,18 @@ fn serve_admin_and_client_work_together() {
     assert_eq!(tasks[0]["id"], "e2e-1");
     assert_eq!(tasks[0]["status"], "doing");
     assert_eq!(tasks[0]["owner"], "t3:thread-e2e");
+    // Claiming its own task in review resumes it, with the claim's note count.
+    let out = client(&["update", "e2e-1", "--status", "review"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = client(&["note", "e2e-1", "PR opened"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = client(&["claim", "e2e-1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("claimed e2e-1 doing") && text.contains("1 note on e2e-1"),
+        "{text}"
+    );
 
     // The web view (or its placeholder) is served outside /v1.
     let mut web = TcpStream::connect(("127.0.0.1", port)).unwrap();

@@ -127,7 +127,11 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
   it for choosing the identity; in a T3 thread the check still runs once, because
   `--agent` there may name only the thread's own agent.
-- **Ownership is durable; leases expire.** A claimed task stays owned across restarts. After
+- **Ownership is durable; leases expire.** A claimed task stays owned across restarts. A
+  claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
+  it, with a claim's checks, so an agent returning to its own work is not sent away; a
+  `blocked_reason` or an open ask on the task still refuses it, since the task may wait on
+  the user. Another live agent's parked task is refused, naming the owner. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). File
@@ -235,7 +239,17 @@ refuses over-long text before sending, with the server's message and hint, so it
 use limits a server raised above the defaults; its enum flags list their values in
 `--help` and in the error for an unknown one. The server's instructions ask agents to
 report, with `feedback`, anything in a setup that cost them a step and then carry on;
-`task_note` no longer offers the `feedback` kind.
+`task_note` no longer offers the `feedback` kind. A runtime may show tools by name only
+until it loads their schemas (Claude Code defers MCP tools behind `ToolSearch`), and agents
+that call a tool unseen guess its arguments. So the instructions name the tools most board
+work calls, to load before the first board call (`board_snapshot`, `task_claim`,
+`task_add`, `task_note`, `handoff_set`, `task_update`, `task_done`, `task_show`,
+`lease_paths`, `feedback`, `ask_user`), and the values agents guess wrong: the task
+argument is `id` in `task_show`, `task_claim`, `task_update`, `task_done` and `task_note`
+but `task` in `lease_paths` and `ask_user`, priority `p1|p2|p3`, note kind
+`note|finding|decision`, `handoff_set` needs `now` and `next`, and `task_done` evidence is
+`checks` of `{command, exit_code}`, `commits`, `prs` or `artifacts`, not prose. In words
+for any client, since Codex has no `ToolSearch`.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
@@ -248,7 +262,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. On Claude Code, the snapshot (cached too) or the `board_join` hint ends with the `ToolSearch` call (`select:mcp__board__…`, with `max_results` set to the tool count) that loads the tools the MCP instructions name, `board_join` first in the hint, for when the tools show by name only; Codex gets the context alone. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
 | Background read of a T3 thread | When `t3 thread show` misses a hook's 0.4 seconds (at `SessionStart` or a `Stop` title check), the hook starts `board read-thread` on its own (its own process group, not waited for), so the hook takes no longer. It gives `t3 thread show` 30 seconds and leaves the answer, with the time it asked, in `$BOARD_HOME/state/thread-reads/<runtime>-<session>.json`; what goes wrong goes to `$BOARD_HOME/state/read-thread.log` (started over at 256 KiB). A later hook of the session registers a read that holds a title, link or parent other than the registered ones: `UserPromptSubmit`, a `PostToolUse` with a heartbeat due (so at most once a minute), or a `Stop` with no title check due. It registers after its own work, in what is left of its budget (at `Stop`, then marks the agent idle again). The read goes once the server took it or refused it as invalid; a read that tells nothing new, asked T3 before the registered facts were read, is over an hour old or is of another thread is dropped. A session starts a read at most every 45 seconds and logs its first at info level; while one may run, `SessionStart` and a due `Stop` check do not ask T3. Registering a read counts no title check. `SessionEnd` and the week-old pruning of session caches remove the read too |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
