@@ -954,6 +954,47 @@ async fn a_long_stuck_list_continues_in_the_next_message() {
     assert_eq!(notifier.sent_after_check(&fake).await.len(), 2);
 }
 
+/// Marks `agent` stopped by a usage limit, as its hook does, until `until` (or until
+/// further notice).
+async fn pause(t: &T, agent: &str, until: Option<chrono::DateTime<chrono::Utc>>) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "paused", "paused_until": until })),
+    )
+    .await;
+}
+
+/// Marks `agent` ended, as the hook does when T3 closes its idle session.
+async fn end(t: &T, agent: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+}
+
+/// The stuck alerts among `texts`.
+fn stuck_only(texts: Vec<String>) -> Vec<String> {
+    texts
+        .into_iter()
+        .filter(|text| text.starts_with("Stuck:"))
+        .collect()
+}
+
+/// The stuck alerts sent, once a check that finds one has run.
+async fn first_stuck(notifier: &mut Scheduled, fake: &Fake) -> Vec<String> {
+    loop {
+        let texts = stuck_only(notifier.sent_after_check(fake).await);
+        if !texts.is_empty() {
+            return texts;
+        }
+    }
+}
+
 #[tokio::test]
 async fn finished_and_paused_tasks_are_not_reported() {
     let (fake, api_base) = fake_api().await;
@@ -968,25 +1009,33 @@ async fn finished_and_paused_tasks_are_not_reported() {
     // Done before the threshold, and the done event itself: no message.
     assert!(t.done(A, &done, super::check(0)).await.0.is_success());
     assert!(t.claim(A, &paused).await.0.is_success());
-    // The coordinator stops on a usage limit: the pause has its own message.
-    let until = (t.state.now() + stuck_after() * 3).timestamp_millis();
-    t.exec(&format!(
-        "UPDATE agents SET role = 'coordinator', state = 'paused', paused_until = {until} \
-         WHERE id = '{A}'"
-    ));
+    // The owner stops on a usage limit, which has its own message; T3 closes its idle
+    // session meanwhile.
+    let reset = t.state.now() + stuck_after() * 3;
+    pause(&t, A, Some(reset)).await;
+    t.advance(TimeDelta::minutes(30));
+    end(&t, A).await;
     t.advance(stuck_after() * 2);
-    assert_eq!(notifier.sent_after_check(&fake).await, Vec::<String>::new());
-    // Past the reset the paused task is reported; the done one never is.
-    t.advance(stuck_after() * 2);
-    let sent = fake.wait("sendMessage", 1).await;
-    let text = sent[0]["text"].as_str().unwrap();
-    assert!(text.contains(&format!("\n{paused} doing")), "{text}");
-    assert!(!text.contains(done.as_str()), "{text}");
-    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // Reset less than a quiet period ago: T3 has just resumed it.
+    t.advance(stuck_after() * 3 / 2);
+    assert_eq!(
+        stuck_only(notifier.sent_after_check(&fake).await),
+        Vec::<String>::new()
+    );
+    // Quiet for a whole period after the reset: reported; the done task never is.
+    t.advance(stuck_after());
+    let texts = first_stuck(&mut notifier, &fake).await;
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{paused} doing")), "{texts:?}");
+    assert!(!texts[0].contains(done.as_str()), "{texts:?}");
 }
 
 #[tokio::test]
-async fn only_a_paused_coordinator_holds_back_its_stuck_tasks() {
+async fn a_coordinator_paused_until_further_notice_holds_back_its_tasks() {
     const W: &str = "t3:worker";
     let (fake, api_base) = fake_api().await;
     let t = T::new();
@@ -997,22 +1046,85 @@ async fn only_a_paused_coordinator_holds_back_its_stuck_tasks() {
     assert!(t.claim(A, &coordinator).await.0.is_success());
     let worker = t.task(A, "factory", "Build it").await;
     assert!(t.claim(W, &worker).await.0.is_success());
-    // A worker's pause has no message of its own, so its task is reported. A coordinator
-    // paused until further notice holds its task back.
-    let until = (t.state.now() + stuck_after() * 3).timestamp_millis();
+    // With no reset time only the user resumes them: a coordinator's pause is reported and
+    // holds its task back; a worker's is not reported, so its task is.
     t.exec(&format!(
-        "UPDATE agents SET state = 'paused', paused_until = {until} WHERE id = '{W}';
-         UPDATE agents SET role = 'coordinator', state = 'paused', paused_until = NULL \
-         WHERE id = '{A}';"
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
     ));
+    pause(&t, A, None).await;
+    pause(&t, W, None).await;
     let mut notifier = Scheduled::start(&t, api_base, |_| {});
 
     t.advance(stuck_after() * 2);
+    let texts = first_stuck(&mut notifier, &fake).await;
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].starts_with("Stuck: 1 task "), "{texts:?}");
+    assert!(texts[0].contains(&format!("\n{worker} doing")), "{texts:?}");
+}
+
+#[tokio::test]
+async fn a_usage_limit_is_reported_once_per_reset() {
+    const W: &str = "t3:worker";
+    let (fake, api_base) = fake_api().await;
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.register(W, None, None).await;
+    t.board("factory", &[A]).await;
+    t.exec(&format!(
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
+    ));
+    let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+    let _notifier = Scheduled::start(&t, api_base, |c| {
+        c.stuck_after_secs = 0;
+        c.utc_offset = tokyo;
+    });
+    let reset = t.state.now() + TimeDelta::hours(9);
+
+    pause(&t, A, Some(reset)).await;
     let sent = fake.wait("sendMessage", 1).await;
-    let text = sent[0]["text"].as_str().unwrap();
-    assert!(text.starts_with("Stuck: 1 task "), "{text}");
-    assert!(text.contains(&format!("\n{worker} doing")), "{text}");
-    assert_eq!(notifier.sent_after_check(&fake).await.len(), 1);
+    let first = sent[0]["text"].as_str().unwrap();
+    let local = reset
+        .with_timezone(&tokyo)
+        .format("%Y-%m-%d %H:%M +09:00")
+        .to_string();
+    assert!(first.starts_with("Usage limit: Coordinator "), "{first}");
+    assert!(
+        first.contains(&format!(" is paused until {local}. Other agents")),
+        "{first}"
+    );
+
+    // While the limit holds: its session ends, a wake resumes it and it stops again, and a
+    // worker stops on the same limit. None of it is reported again.
+    for _ in 0..3 {
+        t.advance(TimeDelta::minutes(30));
+        end(&t, A).await;
+        t.register(A, None, None).await;
+        pause(&t, A, Some(reset)).await;
+    }
+    pause(&t, W, Some(reset)).await;
+    // Another limit, with its own reset, is reported, for a worker too.
+    pause(&t, W, Some(reset + TimeDelta::hours(1))).await;
+    let sent = fake.wait("sendMessage", 2).await;
+    let second = sent[1]["text"].as_str().unwrap();
+    assert!(second.starts_with("Usage limit: Agent "), "{second}");
+    // A coordinator paused until further notice is reported each time; a worker is not.
+    pause(&t, W, None).await;
+    // (Registering again made it a worker: no board names it coordinator.)
+    t.exec(&format!(
+        "UPDATE agents SET role = 'coordinator' WHERE id = '{A}'"
+    ));
+    pause(&t, A, None).await;
+    pause(&t, A, None).await;
+    let sent = fake.wait("sendMessage", 4).await;
+    for message in &sent[2..] {
+        let text = message["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Coordinator ") && text.ends_with(" is paused until further notice."),
+            "{text}"
+        );
+    }
+    // Events are notified in order, so nothing earlier is still on its way.
+    assert_eq!(texts(&fake).len(), 4, "{:?}", texts(&fake));
 }
 
 #[tokio::test]

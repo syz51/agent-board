@@ -320,7 +320,9 @@ registers without a repo).
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
     So an ended T3 agent on this device is woken like an idle one while T3 has its thread
-    unarchived. The daemon asks T3 once per state change; when T3 does not answer, the
+    unarchived, unless its session ended while it waited for a usage-limit reset: the
+    server keeps that reset on the ended agent, and its lines are kept until then like a
+    paused agent's (a wake before the reset would only stop on the limit again). The daemon asks T3 once per state change; when T3 does not answer, the
     send is tried. A thread archived later, which no event announces, is found when a send
     to it fails, and its answers then go to the coordinator. Lines dropped for an agent
     the daemon cannot wake from its own device, and answers with no other coordinator to
@@ -387,7 +389,12 @@ registers without a repo).
 - **Telegram**: when an ask is created the server sends it to the user's chat, with the
   options as buttons and a link to the web view. The server long-polls the Bot API, so no
   public endpoint is needed; answers are accepted only from that chat. The same channel
-  reports a coordinator paused on a usage limit. The chat is `[telegram] chat_id` when set;
+  reports a usage limit once per reset time, naming the first agent that stopped on it
+  and the reset in `utc_offset` time. While a limit holds every agent that runs stops on
+  it, and T3 resumes an agent whose idle session it closed, so one limit would otherwise
+  be reported again and again. A coordinator paused with no reset time is reported each
+  time, since only the user resumes it. The resets reported are kept in memory, so a
+  restart reports a limit still holding at most once more. The chat is `[telegram] chat_id` when set;
   otherwise it is paired: `board admin telegram-pair` on the host prints a one-time code
   (stored hashed, valid 15 minutes), and the first private chat that sends the bot `/start
   <code>` is stored as the chat, and open asks are sent to it. `--replace` makes a code that
@@ -403,9 +410,11 @@ registers without a repo).
     4 hours), is reported once, with its owner, how long it has been quiet, its last event
     and a link. The tasks found at one check share one message; those past its length
     (3,500 characters) go in the next check's message. A task is reported again only
-    after a new event and another quiet period. Tasks of a coordinator paused on a usage
-    limit wait until the reset (or, without an end time, until it resumes), since that
-    pause is reported apart; a paused worker's tasks are reported. Done, dropped, open and
+    after a new event and another quiet period. Tasks whose owner stopped on a usage limit
+    wait until a whole quiet period after its reset, since the limit is reported apart and
+    T3 resumes the owner at the reset; the owner's pause events are read, as a resumed
+    owner no longer shows the reset. Tasks of a coordinator paused with no reset time wait
+    until it resumes; a worker's are reported. Done, dropped, open and
     blocked tasks are never reported, and finishing a task sends nothing.
   - *Daily digest*: once per local day, at the first check past `digest_at` (default
     09:00 at `utc_offset`, default UTC), or up to an hour later when that check falls

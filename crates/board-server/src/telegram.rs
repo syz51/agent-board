@@ -1,7 +1,9 @@
 //! Telegram notifier: sends each new ask to the chat, with its options as buttons, and
 //! long-polls the Bot API for answers (a button press, or a reply to the ask's message)
 //! from that chat only. A withdrawn ask's message is edited to say so and loses its
-//! buttons. No public endpoint is needed.
+//! buttons. No public endpoint is needed. An agent stopped by a usage limit is reported once
+//! per reset time, whichever agents stop on it, and a coordinator paused until further
+//! notice each time.
 //!
 //! Every minute it also reports tasks in doing or review that went quiet past
 //! `stuck_after_secs`, in one message per check and once until they change, and sends a
@@ -17,6 +19,7 @@
 //! The bot token is part of every Bot API URL, so request errors are logged without their
 //! URL and the token never reaches the log.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use board_proto::{AgentRole, AskStatus, Event, EventType, Timestamp};
@@ -62,6 +65,8 @@ struct Bot {
     base: String,
     /// `[telegram] chat_id`, which wins over a paired chat.
     configured: Option<i64>,
+    /// Offset that times in messages are shown in.
+    utc_offset: FixedOffset,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +179,7 @@ pub(crate) fn spawn_with(
         http,
         base: format!("{}/bot{token}", config.api_base.trim_end_matches('/')),
         configured: config.chat_id,
+        utc_offset: config.utc_offset,
     };
     if config.chat_id.is_none()
         && state
@@ -221,6 +227,7 @@ async fn notify_loop(
     mut events: broadcast::Receiver<Event>,
     mut last: i64,
 ) {
+    let mut limits = Limits::default();
     loop {
         let received = tokio::select! {
             () = state.stopped() => return,
@@ -232,14 +239,14 @@ async fn notify_loop(
                     continue;
                 }
                 last = event.seq;
-                notify(&state, &bot, &event).await;
+                notify(&state, &bot, &event, &mut limits).await;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(
                     missed = n,
                     "telegram notifier fell behind the event feed; replaying"
                 );
-                if let Err(error) = replay(&state, &bot, &mut last).await {
+                if let Err(error) = replay(&state, &bot, &mut last, &mut limits).await {
                     tracing::error!(%error, after = last, "telegram replay failed");
                 }
             }
@@ -249,7 +256,7 @@ async fn notify_loop(
 }
 
 /// Notifies the stored events after `last`, advancing it.
-async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
+async fn replay(state: &AppState, bot: &Bot, last: &mut i64, limits: &mut Limits) -> Result<()> {
     loop {
         let since = *last;
         let page = state
@@ -258,7 +265,7 @@ async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
         let full = page.events.len() == events::MAX_LIMIT as usize;
         for event in &page.events {
             *last = event.seq;
-            notify(state, bot, event).await;
+            notify(state, bot, event, limits).await;
         }
         if !full {
             return Ok(());
@@ -266,11 +273,11 @@ async fn replay(state: &AppState, bot: &Bot, last: &mut i64) -> Result<()> {
     }
 }
 
-async fn notify(state: &AppState, bot: &Bot, event: &Event) {
+async fn notify(state: &AppState, bot: &Bot, event: &Event, limits: &mut Limits) {
     let result = match event.event_type {
         EventType::AskCreated => send_ask(state, bot, event).await,
         EventType::AskWithdrawn => mark_withdrawn(state, bot, event).await,
-        EventType::AgentStateChanged => report_paused(state, bot, event).await,
+        EventType::AgentStateChanged => report_paused(state, bot, event, limits).await,
         _ => Ok(()),
     };
     if let Err(error) = result {
@@ -399,8 +406,32 @@ async fn ask_text(state: &AppState, id: i64) -> Result<(board_proto::Ask, String
     Ok((ask, text))
 }
 
-/// Reports a coordinator that stopped on a usage limit.
-async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()> {
+/// The usage-limit resets already reported. While a limit holds, every agent that runs
+/// stops on it, and one stopped agent may stop again each time it is resumed (T3 closes its
+/// idle session, and a message resumes it); the limit is reported once. Kept in memory: a
+/// restart reports a limit still holding at most once more.
+#[derive(Debug, Default)]
+struct Limits {
+    reported: BTreeSet<Timestamp>,
+}
+
+impl Limits {
+    /// Whether the reset at `until` is new, recording it if so. Resets already past are
+    /// forgotten.
+    fn first(&mut self, until: Timestamp, now: Timestamp) -> bool {
+        self.reported.retain(|reset| *reset > now);
+        self.reported.insert(until)
+    }
+}
+
+/// Reports an agent stopped by a usage limit, once per reset time; a coordinator paused
+/// with no reset time is reported every time, since only the user resumes it.
+async fn report_paused(
+    state: &AppState,
+    bot: &Bot,
+    event: &Event,
+    limits: &mut Limits,
+) -> Result<()> {
     if event.payload.get("to").and_then(Value::as_str) != Some("paused") {
         return Ok(());
     }
@@ -408,21 +439,38 @@ async fn report_paused(state: &AppState, bot: &Bot, event: &Event) -> Result<()>
         return Ok(());
     };
     let agent = state.read(move |cx| get_agent(cx, &id)).await?;
-    if agent.role != AgentRole::Coordinator {
-        return Ok(());
+    let coordinator = agent.role == AgentRole::Coordinator;
+    // The event's reset, not the agent's: the agent may have moved on since.
+    let until: Option<Timestamp> = event
+        .payload
+        .get("paused_until")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    match until {
+        Some(until) if until <= state.now() || !limits.first(until, state.now()) => {
+            return Ok(());
+        }
+        None if !coordinator => return Ok(()),
+        _ => {}
     }
     let Some(chat) = bot.chat(state).await? else {
         return Ok(());
     };
-    let until = agent
-        .paused_until
-        .map_or_else(|| "further notice".to_owned(), |t| t.to_rfc3339());
-    let boards: Vec<String> = agent.boards.iter().map(ToString::to_string).collect();
-    let text = format!(
-        "Coordinator {} ({}) is paused until {until}.",
-        agent.handle,
-        boards.join(", ")
-    );
+    let who = if coordinator && !agent.boards.is_empty() {
+        let boards: Vec<String> = agent.boards.iter().map(ToString::to_string).collect();
+        format!("Coordinator {} ({})", agent.handle, boards.join(", "))
+    } else if coordinator {
+        format!("Coordinator {}", agent.handle)
+    } else {
+        format!("Agent {}", agent.handle)
+    };
+    let text = match until {
+        Some(until) => format!(
+            "Usage limit: {who} is paused until {}. Other agents that stop on this limit are \
+             not reported, and their tasks are not reported stuck before it resets.",
+            local(until, bot.utc_offset)
+        ),
+        None => format!("{who} is paused until further notice."),
+    };
     bot.send(json!({ "chat_id": chat, "text": text }))
         .await
         .map(|_| ())

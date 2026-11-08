@@ -329,6 +329,11 @@ impl Reach {
             return Self::Never(Unreachable::NotT3);
         }
         match agent.state {
+            // A session closed while it waited for a usage-limit reset: the limit still
+            // holds, and a message before the reset would only stop on it again.
+            AgentState::Ended if agent.paused_until.is_some_and(|until| until > now) => {
+                Self::Paused
+            }
             // T3 closes idle sessions, which marks their agents ended; a message resumes
             // the thread unless T3 says it is gone. When T3 did not answer, the send finds out.
             AgentState::Ended => match seen.thread {
@@ -394,9 +399,11 @@ fn is_fresh(wake: &Wake, paused_until: Option<Timestamp>, now: Timestamp) -> boo
     now - from < WAKE_TTL
 }
 
+/// The usage-limit reset `seen` waits for: a paused agent's, or that of one whose session
+/// ended while it waited, which the server keeps.
 fn paused_until(seen: &Seen) -> Option<Timestamp> {
     match seen.agent.state {
-        AgentState::Paused => seen.agent.paused_until,
+        AgentState::Paused | AgentState::Ended => seen.agent.paused_until,
         _ => None,
     }
 }
