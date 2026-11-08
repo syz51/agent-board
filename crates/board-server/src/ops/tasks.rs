@@ -727,7 +727,7 @@ fn check_doing_limit(cx: &Ctx<'_>, agent: &AgentId, task: &TaskId) -> Result<()>
         return Err(refused(
             format!("you already have {} in doing", doing.join(", ")),
             format!(
-                "finish {0} (task_done) or {1}, then take {task}",
+                "finish {0} (task_done) or {1}, then claim {task}",
                 doing[0],
                 park_hint(&doing[0])
             ),
@@ -761,7 +761,8 @@ fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
     ))
 }
 
-/// Claims an open task: one conditional update, so concurrent claims have one winner.
+/// Claims an open task: one conditional update, so concurrent claims have one winner. A
+/// parked task (review or blocked) that is the caller's or nobody's resumes instead.
 pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
     touch_agent(cx, agent)?;
     let task = get_task(cx, id)?;
@@ -778,20 +779,28 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
             "pick another task from ready (task_list ready=true)",
         ));
     }
-    if task.status != TaskStatus::Open {
-        let next = if task.owner_stale && !task.status.is_closed() {
-            format!("its owner is stale: take it with {}", take_hint(id))
-        } else if task.status.is_closed() {
-            format!("reopen it first (task_update {id} status=open) if it needs more work")
-        } else {
-            "pick another task from ready (task_list ready=true)".to_owned()
-        };
+    if matches!(task.status, TaskStatus::Review | TaskStatus::Blocked)
+        && (owned_by_me || task.owner.is_none())
+    {
+        return resume(cx, &task, agent);
+    }
+    // Left: a closed task, or one in progress whose owner is stale.
+    if task.status.is_closed() {
         return Err(bad_transition(
             format!(
-                "{id} is {}; only open tasks can be claimed",
+                "{id} is {}; closed tasks cannot be claimed",
                 status_str(task.status)
             ),
-            next,
+            format!("reopen it first (task_update {id} status=open) if it needs more work"),
+        ));
+    }
+    if task.status != TaskStatus::Open {
+        return Err(bad_transition(
+            format!(
+                "{id} is {} and its owner is stale; claim does not take it",
+                status_str(task.status)
+            ),
+            format!("take it with {}", take_hint(id)),
         ));
     }
     if task.proposal {
@@ -822,6 +831,73 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         serde_json::json!({ "previous_owner": previous }),
     )?;
     get_task(cx, id)
+}
+
+/// Resumes a parked task (review or blocked) that is the caller's or nobody's, for
+/// `claim`: a claim's checks, then `update` with `status: doing`, so the change and its
+/// event are the same as `task_update status=doing` and stats do not count it as a claim
+/// from ready. A `blocked_reason` or an open ask on the task refuses it: it may wait on the
+/// user.
+fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
+    let id = &task.id;
+    // Stored only on blocked tasks and only when not blank.
+    if let Some(reason) = &task.blocked_reason {
+        return Err(bad_transition(
+            format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
+            format!(
+                "it is blocked for \"{reason}\": resume it ({}) only once that no longer holds",
+                resume_hint(id)
+            ),
+        ));
+    }
+    let ask: Option<i64> = cx
+        .db
+        .query_row(
+            "SELECT id FROM asks WHERE task = ?1 AND status = 'open' ORDER BY id LIMIT 1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(ask) = ask {
+        return Err(bad_transition(
+            format!("{id} waits on ask #{ask}, so claiming does not resume it"),
+            format!(
+                "wait for the user's answer to ask #{ask}, then resume it ({})",
+                resume_hint(id)
+            ),
+        ));
+    }
+    let waiting = open_blockers(cx, id)?;
+    if !waiting.is_empty() {
+        let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
+        return Err(bad_transition(
+            format!("{id} waits on {}", list.join(", ")),
+            format!(
+                "help finish them, or remove the ones it no longer waits on (task_update {id} \
+                 with blockers), then claim it again"
+            ),
+        ));
+    }
+    check_not_before(cx, task)?;
+    update(
+        cx,
+        id,
+        UpdateTask {
+            agent: agent.clone(),
+            version: task.version,
+            status: Some(TaskStatus::Doing),
+            title: None,
+            body: None,
+            acceptance: None,
+            priority: None,
+            blockers: None,
+            blocked_reason: None,
+            auto: None,
+            not_before: None,
+            owner: None,
+        },
+        false,
+    )
 }
 
 /// Records a refused claim for the stats (the refused transaction itself rolled back).
@@ -969,7 +1045,8 @@ fn check_handover(
                     format!("to work on it yourself, claim it (task_claim {id})")
                 } else {
                     format!(
-                        "to work on it yourself, resume it (task_update {id} status=doing) without owner"
+                        "to work on it yourself, resume it ({}) without owner",
+                        resume_hint(id)
                     )
                 },
             ),
@@ -1007,7 +1084,10 @@ fn check_handover(
     if !owned {
         return Err(invalid(
             format!("nobody owns {id}, so it cannot be handed over"),
-            format!("resume it for that agent: task_update {id} status=doing owner={target}"),
+            format!(
+                "resume it for that agent: {} owner={target}",
+                resume_hint(id)
+            ),
         ));
     }
     let Some(found) = find_agent(cx, target)? else {
@@ -1027,7 +1107,6 @@ fn check_handover(
     Ok(())
 }
 
-/// How to take a stale owner's task, through MCP or the CLI.
 /// The refusal of an unaccepted proposal moving to doing. The hint keeps the claimant,
 /// who may be the proposer, from accepting it itself.
 fn unaccepted_proposal(id: &TaskId) -> Error {
@@ -1040,8 +1119,14 @@ fn unaccepted_proposal(id: &TaskId) -> Error {
     )
 }
 
+/// How to take a stale owner's task, through MCP or the CLI.
 fn take_hint(id: &TaskId) -> String {
     format!("task_claim {id} take=true, or board take {id}")
+}
+
+/// How to move a parked task back to doing.
+fn resume_hint(id: &TaskId) -> String {
+    format!("task_update {id} status=doing")
 }
 
 /// `check_doing_limit` for `owner`, worded for the caller when someone else is the owner.
@@ -1352,7 +1437,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
                 status_str(task.status)
             ),
             match task.status {
-                TaskStatus::Blocked => format!("resume it first (task_update {id} status=doing)"),
+                TaskStatus::Blocked => format!("resume it first ({})", resume_hint(id)),
                 _ => format!("claim it first with task_claim {id}"),
             },
         ));
