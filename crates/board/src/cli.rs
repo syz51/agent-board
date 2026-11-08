@@ -27,9 +27,14 @@ use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
 )]
 pub struct Cli {
     /// Act as this agent id instead of the one from the environment. In a T3 thread, only
-    /// the thread's own id is accepted.
+    /// the thread's own id is accepted. An id the server does not know is refused, unless
+    /// --register is given too.
     #[arg(long, global = true)]
     pub agent: Option<String>,
+    /// Register the --agent id when the server does not know it yet: for a script that
+    /// acts under its own fixed id. Sessions register through their hooks instead.
+    #[arg(long, global = true, requires = "agent")]
+    pub register: bool,
     /// Print JSON instead of text. Each command's --help names the shape it prints.
     #[arg(long, global = true)]
     pub json: bool,
@@ -967,12 +972,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
         return Err(err);
     }
     if cli.command.acts_as_agent() {
-        ctx()?.ensure_registered().await?;
+        let explicit = cli.agent.as_ref().map(|_| "--agent");
+        ctx()?.ensure_registered(explicit, cli.register).await?;
     }
     let out: Output = match cli.command {
         Command::Login { server, device } => return login(&home, server, device),
         Command::Install(cmd) => return crate::install::run(cmd),
-        Command::Mcp => return crate::mcp::serve(home, cli.agent).await,
+        Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
         Command::Ls(a) => {

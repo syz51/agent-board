@@ -133,6 +133,13 @@ server's minute sweep deletes older ones.
   300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
   `AGENT_TITLE_CHARS_MAX`).
   Clients register on session start (hooks) and before acting when the agent is unknown.
+  The client registers before acting only an agent its environment names: an id named by
+  `--agent` (CLI, also `board mcp --agent`) or `agent=` (MCP) that the server does not know
+  is refused before anything is written, with an error that says to drop the flag to act
+  as yourself; a new agent registers through its session's hooks or the daemon. A script
+  that acts under its own fixed id passes `--register` with `--agent` to register it; the
+  hooks register an explicit `--agent` as before, and `agent=` never registers. (Clients
+  before this change registered any unknown id named this way.)
   Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
   `agent_state_changed` event (`from` its old state, `to` `running`).
 - Every call that acts as an agent marks it seen. One marked `ended` that makes such a call

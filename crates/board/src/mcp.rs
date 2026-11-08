@@ -625,7 +625,9 @@ pub fn tools() -> Vec<Tool> {
 }
 
 /// Runs the MCP server on stdin and stdout until the client disconnects.
-pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
+/// `register` lets an unknown `--agent` given at start-up register; `agent=` never does.
+pub async fn serve(home: Home, explicit_agent: Option<String>, register: bool) -> Result<()> {
+    let named_at_start = explicit_agent.is_some();
     // Decided once: whether this server's session runs inside another agent session.
     let (default_agent, own) = tokio::task::spawn_blocking(move || {
         let default = agent_from_env(explicit_agent.as_deref()).map_err(|e| format!("{e:#}"));
@@ -640,6 +642,8 @@ pub async fn serve(home: Home, explicit_agent: Option<String>) -> Result<()> {
     let server = BoardMcp {
         home,
         default_agent,
+        named_at_start,
+        register,
         own,
         ctx: Mutex::new(None),
         registered: Mutex::default(),
@@ -657,6 +661,10 @@ struct BoardMcp {
     /// The agent this server acts as unless a tool call names one, resolved at start-up;
     /// an error is reported on each call that needs it.
     default_agent: std::result::Result<Option<AgentId>, String>,
+    /// The default agent was named by `--agent` at start-up, not by the environment.
+    named_at_start: bool,
+    /// `--register` was given at start-up: an unknown `--agent` registers.
+    register: bool,
     /// The identity this server proves; `agent=` may name no other.
     own: Option<AgentId>,
     /// Built on first use, so a server started before `board login` still works after it.
@@ -704,11 +712,17 @@ impl BoardMcp {
             let named: AgentId = named.parse().context("agent")?;
             crate::identity::refuse_borrowed(self.own.as_ref(), &named, "agent=")?;
         }
+        // An explicitly named agent the server does not know is refused, not registered.
+        let (explicit, register) = match &agent {
+            Some(_) => (Some("agent="), false),
+            None if self.named_at_start => (Some("--agent"), self.register),
+            None => (None, false),
+        };
         let ctx = self.ctx(agent.as_deref()).await?;
         if let Some(agent) = ctx.client.agent()
             && !self.registered.lock().await.contains(agent)
         {
-            ctx.ensure_registered().await?;
+            ctx.ensure_registered(explicit, register).await?;
             self.registered.lock().await.insert(agent.clone());
         }
         let out: Output = match name {

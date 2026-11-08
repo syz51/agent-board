@@ -86,13 +86,23 @@ impl Ctx {
 
     /// Registers the calling agent when the server does not know it yet: a CLI or MCP
     /// call from a session whose start hook did not run. A known agent is left as it is.
-    pub async fn ensure_registered(&self) -> Result<()> {
+    /// An agent named explicitly (`flag`, such as `--agent`) is registered only with
+    /// `register`; otherwise an unknown one is refused before anything is written, since a
+    /// hand-typed id would stay listed as running with nothing to end it.
+    pub async fn ensure_registered(&self, explicit: Option<&str>, register: bool) -> Result<()> {
         let Some(agent) = self.client.agent() else {
             return Ok(());
         };
         match self.client.agent_info(agent).await {
             Ok(_) => Ok(()),
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                if let Some(flag) = explicit.filter(|_| !register) {
+                    bail!(
+                        "{flag} names {agent}, which the server does not know, so nothing was \
+                         done: drop {flag} to act as yourself. A new agent registers through \
+                         its session's hooks or the daemon, not through {flag}."
+                    );
+                }
                 let runtime = match agent.source() {
                     AgentSource::Codex => Runtime::Codex,
                     AgentSource::T3 | AgentSource::Claude => Runtime::Claude,
