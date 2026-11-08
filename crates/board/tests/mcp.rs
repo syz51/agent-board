@@ -572,3 +572,44 @@ fn agent_naming_another_agent_is_refused_in_a_t3_thread() {
     assert_ne!(ok["isError"], true, "{ok}");
     assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/claim").len(), 1);
 }
+
+#[test]
+fn an_unknown_argument_is_refused_before_anything_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let listed = mcp.request(2, "tools/list", json!({}));
+    let tools = listed["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 16);
+    for (n, tool) in (3..).zip(tools) {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
+        let refused = mcp.call(n, name, json!({"blocked_by": ["factory-2"]}));
+        assert_eq!(refused["isError"], true, "{name}: {refused}");
+        let message = text(&refused);
+        assert!(
+            message.starts_with(&format!(
+                "error: invalid arguments: {name} has no argument `blocked_by`; it accepts "
+            )),
+            "{message}"
+        );
+        for accepted in tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+        {
+            assert!(message.contains(accepted.as_str()), "{name}: {message}");
+        }
+    }
+    assert!(stub.requests().is_empty(), "nothing reached the server");
+}

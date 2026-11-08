@@ -321,6 +321,7 @@ const TOOLS: &[ToolSpec] = &[
                                 "exit_code": {"type": "integer"},
                             },
                             "required": ["command", "exit_code"],
+                            "additionalProperties": false,
                         },
                     }),
                     false,
@@ -551,6 +552,7 @@ fn tool(spec: &ToolSpec) -> Tool {
         "type": "object",
         "properties": properties,
         "required": required,
+        "additionalProperties": false,
     }) {
         Value::Object(map) => map,
         _ => unreachable!("built as an object"),
@@ -628,8 +630,13 @@ impl BoardMcp {
         })
     }
 
-    async fn call(&self, name: &str, args: Value) -> Result<String> {
+    async fn call(&self, name: &str, mut args: Value) -> Result<String> {
+        refuse_unknown_args(name, &args)?;
         let agent = args.get("agent").and_then(Value::as_str).map(str::to_owned);
+        // Taken here, so the argument types below refuse every field they do not read.
+        if let Some(map) = args.as_object_mut() {
+            map.remove("agent");
+        }
         if let Some(named) = &agent {
             let named: AgentId = named.parse().context("agent")?;
             crate::identity::refuse_borrowed(self.own.as_ref(), &named, "agent=")?;
@@ -778,7 +785,7 @@ impl BoardMcp {
                 ops::resolve(&ctx, &a.id, req).await?
             }
             "board_join" => {
-                let a: BoardArgs = parse(args)?;
+                let a: JoinArgs = parse(args)?;
                 ops::join(&ctx, a.board).await?
             }
             other => anyhow::bail!("unknown tool {other:?}; see tools/list"),
@@ -787,16 +794,53 @@ impl BoardMcp {
     }
 }
 
+/// Refuses arguments the tool's schema does not declare, so a guessed name fails instead
+/// of being dropped while the call answers ok.
+fn refuse_unknown_args(name: &str, args: &Value) -> Result<()> {
+    // An unknown tool is refused later, with its own message.
+    let Some(spec) = TOOLS.iter().find(|spec| spec.name == name) else {
+        return Ok(());
+    };
+    let accepted: Vec<&str> = (spec.params)()
+        .into_iter()
+        .map(|(name, ..)| name)
+        .chain(["agent"])
+        .collect();
+    let unknown: Vec<String> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .filter(|key| !accepted.contains(&key.as_str()))
+        .map(|key| format!("`{key}`"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let noun = if unknown.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    anyhow::bail!(
+        "invalid arguments: {name} has no {noun} {}; it accepts {}. Call {name} again with \
+         only those arguments.",
+        unknown.join(", "),
+        accepted.join(", ")
+    )
+}
+
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|err| anyhow::anyhow!("invalid arguments: {err}"))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SnapshotArgs {
     kind: Option<SnapshotKind>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BoardArgs {
     board: Option<BoardSlug>,
     #[serde(default)]
@@ -804,6 +848,13 @@ struct BoardArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinArgs {
+    board: Option<BoardSlug>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     board: Option<BoardSlug>,
     status: Option<TaskStatus>,
@@ -820,6 +871,7 @@ struct ListArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShowArgs {
     id: TaskId,
     #[serde(default)]
@@ -827,6 +879,7 @@ struct ShowArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddArgs {
     title: String,
     board: Option<BoardSlug>,
@@ -845,6 +898,7 @@ struct AddArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimArgs {
     id: TaskId,
     #[serde(default)]
@@ -852,6 +906,7 @@ struct ClaimArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     id: TaskId,
     status: Option<TaskStatus>,
@@ -876,12 +931,14 @@ fn null_as_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Check {
     command: String,
     exit_code: i32,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoneArgs {
     id: TaskId,
     #[serde(default)]
@@ -896,6 +953,7 @@ struct DoneArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NoteArgs {
     id: TaskId,
     text: String,
@@ -903,6 +961,7 @@ struct NoteArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HandoffArgs {
     now: String,
     next: String,
@@ -911,6 +970,7 @@ struct HandoffArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LeaseArgs {
     globs: Vec<String>,
     task: Option<TaskId>,
@@ -918,6 +978,7 @@ struct LeaseArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskArgs {
     question: String,
     kind: Option<AskKind>,
@@ -928,6 +989,7 @@ struct AskArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FeedbackArgs {
     about: String,
     text: String,
@@ -935,6 +997,7 @@ struct FeedbackArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveArgs {
     id: TaskId,
     kind: ResolutionKind,
@@ -943,6 +1006,7 @@ struct ResolveArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskIdArgs {
     id: i64,
 }
@@ -1032,6 +1096,117 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("only when every acceptance check passes; file what remains first")
+        );
+    }
+
+    /// Parses `args` with the argument type `call` uses for `tool`.
+    fn parse_for(tool: &str, args: Value) -> Result<()> {
+        match tool {
+            "board_snapshot" => parse::<SnapshotArgs>(args).map(drop),
+            "board_status" => parse::<BoardArgs>(args).map(drop),
+            "task_list" => parse::<ListArgs>(args).map(drop),
+            "task_show" => parse::<ShowArgs>(args).map(drop),
+            "task_add" => parse::<AddArgs>(args).map(drop),
+            "task_claim" => parse::<ClaimArgs>(args).map(drop),
+            "task_update" => parse::<UpdateArgs>(args).map(drop),
+            "task_done" => parse::<DoneArgs>(args).map(drop),
+            "task_note" => parse::<NoteArgs>(args).map(drop),
+            "handoff_set" => parse::<HandoffArgs>(args).map(drop),
+            "lease_paths" => parse::<LeaseArgs>(args).map(drop),
+            "ask_user" => parse::<AskArgs>(args).map(drop),
+            "ask_withdraw" => parse::<AskIdArgs>(args).map(drop),
+            "feedback" => parse::<FeedbackArgs>(args).map(drop),
+            "feedback_resolve" => parse::<ResolveArgs>(args).map(drop),
+            "board_join" => parse::<JoinArgs>(args).map(drop),
+            other => panic!("no argument type for {other}"),
+        }
+    }
+
+    /// The schema an agent reads and the type `call` parses name the same arguments, so
+    /// refusing undeclared ones drops nothing a tool reads, and no declared one is ignored.
+    #[test]
+    fn schemas_and_argument_types_name_the_same_fields() {
+        for tool in tools() {
+            let schema = &tool.input_schema;
+            assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
+            let mut declared: Vec<String> = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|name| *name != "agent")
+                .cloned()
+                .collect();
+            declared.sort();
+            // serde names the unknown field, then the type's fields, each in backticks.
+            let err = parse_for(&tool.name, json!({"\u{1}": 0}))
+                .unwrap_err()
+                .to_string();
+            let mut read: Vec<String> = err
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            read.sort();
+            assert_eq!(declared, read, "{}: {err}", tool.name);
+        }
+        let done = tools().into_iter().find(|t| t.name == "task_done").unwrap();
+        assert_eq!(
+            done.input_schema["properties"]["checks"]["items"]["additionalProperties"],
+            false
+        );
+        let err = parse_for(
+            "task_done",
+            json!({"id": "factory-1", "checks": [{"command": "x", "exit_code": 0, "ok": true}]}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `ok`"), "{err}");
+    }
+
+    #[test]
+    fn unknown_arguments_are_refused_with_the_accepted_ones() {
+        for tool in tools() {
+            let mut args = json!({"blocked_by": ["factory-2"]});
+            for (name, ..) in (TOOLS.iter().find(|s| s.name == tool.name).unwrap().params)() {
+                args[name] = Value::Null;
+            }
+            let err = refuse_unknown_args(&tool.name, &args)
+                .unwrap_err()
+                .to_string();
+            let accepted: Vec<&str> = tool.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                err.starts_with(&format!(
+                    "invalid arguments: {} has no argument `blocked_by`; it accepts ",
+                    tool.name
+                )),
+                "{err}"
+            );
+            for name in accepted {
+                assert!(
+                    err.contains(name),
+                    "{}: {name} missing from {err}",
+                    tool.name
+                );
+            }
+            assert!(err.ends_with(&format!(
+                "Call {} again with only those arguments.",
+                tool.name
+            )));
+            args.as_object_mut().unwrap().remove("blocked_by");
+            refuse_unknown_args(&tool.name, &args).unwrap();
+        }
+        let err = refuse_unknown_args("task_note", &json!({"id": "x", "txt": "a", "knd": "b"}))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("invalid arguments: task_note has no arguments `knd`, `txt`; "),
+            "{err}"
         );
     }
 
