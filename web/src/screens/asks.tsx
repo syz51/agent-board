@@ -24,11 +24,12 @@ import {
   QueryFrame,
   RelTime,
   SectionTitle,
+  StatusBadge,
   useAgents,
   useTitle,
   Who,
 } from "@/ui/common.tsx";
-import { Icon, StatusPill } from "@/ui/icons.tsx";
+import { Icon } from "@/ui/icons.tsx";
 import { HandoffView } from "./agents.tsx";
 import { TaskBoard, TaskGroupSection, TaskList } from "./board.tsx";
 import { UpdatesSection } from "./updates.tsx";
@@ -279,7 +280,7 @@ export function AskScreen() {
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
             // The answer comes first; what the ask is about sits beside it on wide screens.
-            <div className="grid items-start gap-x-8 gap-y-6 lg:grid-cols-[minmax(0,1fr)_minmax(260px,320px)]">
+            <div className="grid items-start gap-x-8 gap-y-6 lg:grid-cols-[minmax(0,2fr)_minmax(240px,1fr)] xl:grid-cols-[minmax(0,1fr)_300px]">
               <AskCard ask={data} agents={agents} standalone />
               <AskContext ask={data} agents={agents} />
             </div>
@@ -323,11 +324,16 @@ function AskTask({ id, agents }: { id: string; agents: Map<string, Agent> }) {
   const { task } = detail.data;
   return (
     <div className="grid gap-2 rounded-lg border bg-card px-3.5 py-3">
-      <Link className="text-sm font-medium text-foreground" to="/tasks/$id" params={{ id }}>
+      <Link
+        className="line-clamp-2 text-sm font-medium [overflow-wrap:anywhere] text-foreground"
+        to="/tasks/$id"
+        params={{ id }}
+        title={task.title}
+      >
         {task.title}
       </Link>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-meta">
-        <StatusPill status={task.status} />
+        <StatusBadge status={task.status} ready={task.ready} />
         <span className="ident text-muted-foreground">{id}</span>
         <Owner task={task} agents={agents} />
       </div>

@@ -51,7 +51,10 @@ export function ErrorNotice({
       className={cn(
         "mb-5 flex flex-wrap items-start gap-x-4 gap-y-3 has-[>svg]:grid-cols-none",
         compact ? "px-3.5 py-2.5" : "px-4.5 py-4",
-        !compact && (warn ? "border-warn-border" : "border-error-border"),
+        // A rail on the left edge, as ask cards have, so the failure reads before the details.
+        !compact && "overflow-hidden before:absolute before:inset-y-0 before:left-0 before:w-[3px]",
+        !compact &&
+          (warn ? "border-warn-border before:bg-amber" : "border-error-border before:bg-error"),
       )}
     >
       {!compact && (

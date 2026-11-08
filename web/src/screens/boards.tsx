@@ -67,18 +67,18 @@ export function BoardsScreen() {
               .map((ask) => (
                 <li key={ask.id}>
                   <Link
-                    className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[minmax(0,1fr)] max-md:gap-1"
+                    className="grid min-h-9 grid-cols-[96px_minmax(0,1fr)_auto] items-center gap-3.5 px-(--gutter) py-1.5 text-foreground hover:bg-muted hover:no-underline max-md:grid-cols-[auto_minmax(0,1fr)] max-md:gap-x-2.5 max-md:gap-y-0.5"
                     to="/asks/$id"
                     params={{ id: String(ask.id) }}
                   >
                     <AskKind kind={ask.kind} />
                     <span
-                      className="truncate font-medium max-md:line-clamp-2 max-md:whitespace-normal"
+                      className="truncate font-medium max-md:col-span-2 max-md:row-start-2"
                       title={plainLine(ask.question)}
                     >
                       {plainLine(ask.question)}
                     </span>
-                    <span className="text-meta whitespace-nowrap text-muted-foreground">
+                    <span className="text-meta whitespace-nowrap text-muted-foreground max-md:col-start-2 max-md:row-start-1">
                       {ask.board} · <RelTime at={ask.created_at} />
                     </span>
                   </Link>
