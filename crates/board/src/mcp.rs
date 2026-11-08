@@ -632,11 +632,15 @@ impl BoardMcp {
 
     async fn call(&self, name: &str, mut args: Value) -> Result<String> {
         refuse_unknown_args(name, &args)?;
-        let agent = args.get("agent").and_then(Value::as_str).map(str::to_owned);
         // Taken here, so the argument types below refuse every field they do not read.
-        if let Some(map) = args.as_object_mut() {
-            map.remove("agent");
-        }
+        let agent = match args.as_object_mut().and_then(|map| map.remove("agent")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(agent)) => Some(agent),
+            Some(other) => anyhow::bail!(
+                "invalid arguments: agent must be an agent id string, not {other}. Call {name} \
+                 again with a string, or leave agent out to act as yourself."
+            ),
+        };
         if let Some(named) = &agent {
             let named: AgentId = named.parse().context("agent")?;
             crate::identity::refuse_borrowed(self.own.as_ref(), &named, "agent=")?;
@@ -650,7 +654,7 @@ impl BoardMcp {
         }
         let out: Output = match name {
             "board_snapshot" => {
-                let a: SnapshotArgs = parse(args)?;
+                let a: SnapshotArgs = parse(name, args)?;
                 let kind = a.kind.unwrap_or(SnapshotKind::Full);
                 let since = match kind {
                     SnapshotKind::Full => None,
@@ -666,11 +670,11 @@ impl BoardMcp {
                 out
             }
             "board_status" => {
-                let a: BoardArgs = parse(args)?;
+                let a: BoardArgs = parse(name, args)?;
                 ops::status(&ctx, a.board, a.detailed).await?
             }
             "task_list" => {
-                let a: ListArgs = parse(args)?;
+                let a: ListArgs = parse(name, args)?;
                 let query = TaskQuery {
                     board: a.board,
                     status: a.status,
@@ -683,11 +687,11 @@ impl BoardMcp {
                 ops::task_list(&ctx, &query, a.detailed).await?
             }
             "task_show" => {
-                let a: ShowArgs = parse(args)?;
+                let a: ShowArgs = parse(name, args)?;
                 ops::task_show(&ctx, &a.id, a.detailed).await?
             }
             "task_add" => {
-                let a: AddArgs = parse(args)?;
+                let a: AddArgs = parse(name, args)?;
                 let new = ops::NewTask {
                     board: a.board,
                     title: a.title,
@@ -703,12 +707,12 @@ impl BoardMcp {
                 ops::task_add(&ctx, new).await?
             }
             "task_claim" => {
-                let a: ClaimArgs = parse(args)?;
+                let a: ClaimArgs = parse(name, args)?;
                 let action = if a.take { "take" } else { "claim" };
                 ops::task_action(&ctx, &a.id, action).await?
             }
             "task_update" => {
-                let a: UpdateArgs = parse(args)?;
+                let a: UpdateArgs = parse(name, args)?;
                 let changes = ops::TaskChanges {
                     status: a.status,
                     title: a.title,
@@ -724,7 +728,7 @@ impl BoardMcp {
                 ops::task_update(&ctx, &a.id, changes).await?
             }
             "task_done" => {
-                let a: DoneArgs = parse(args)?;
+                let a: DoneArgs = parse(name, args)?;
                 let evidence = ops::Evidence {
                     checks: a
                         .checks
@@ -738,19 +742,19 @@ impl BoardMcp {
                 ops::task_done(&ctx, &a.id, evidence, a.summary).await?
             }
             "task_note" => {
-                let a: NoteArgs = parse(args)?;
+                let a: NoteArgs = parse(name, args)?;
                 ops::task_note(&ctx, &a.id, a.kind.unwrap_or(NoteKind::Note), a.text).await?
             }
             "handoff_set" => {
-                let a: HandoffArgs = parse(args)?;
+                let a: HandoffArgs = parse(name, args)?;
                 ops::handoff_set(&ctx, a.now, a.next, a.blockers).await?
             }
             "lease_paths" => {
-                let a: LeaseArgs = parse(args)?;
+                let a: LeaseArgs = parse(name, args)?;
                 ops::lease_paths(&ctx, a.globs, a.task, a.ttl_secs).await?
             }
             "ask_user" => {
-                let a: AskArgs = parse(args)?;
+                let a: AskArgs = parse(name, args)?;
                 let ask = ops::NewAsk {
                     board: a.board,
                     task: a.task,
@@ -761,11 +765,11 @@ impl BoardMcp {
                 ops::ask_user(&ctx, ask).await?
             }
             "ask_withdraw" => {
-                let a: AskIdArgs = parse(args)?;
+                let a: AskIdArgs = parse(name, args)?;
                 ops::ask_withdraw(&ctx, a.id).await?
             }
             "feedback" => {
-                let a: FeedbackArgs = parse(args)?;
+                let a: FeedbackArgs = parse(name, args)?;
                 let req = CreateFeedback {
                     about: a.about,
                     text: a.text,
@@ -776,7 +780,7 @@ impl BoardMcp {
                 ops::feedback(&ctx, req).await?
             }
             "feedback_resolve" => {
-                let a: ResolveArgs = parse(args)?;
+                let a: ResolveArgs = parse(name, args)?;
                 let req = ResolveFeedback {
                     kind: a.kind,
                     task: a.task,
@@ -785,7 +789,7 @@ impl BoardMcp {
                 ops::resolve(&ctx, &a.id, req).await?
             }
             "board_join" => {
-                let a: JoinArgs = parse(args)?;
+                let a: JoinArgs = parse(name, args)?;
                 ops::join(&ctx, a.board).await?
             }
             other => anyhow::bail!("unknown tool {other:?}; see tools/list"),
@@ -794,12 +798,12 @@ impl BoardMcp {
     }
 }
 
-/// Refuses arguments the tool's schema does not declare, so a guessed name fails instead
-/// of being dropped while the call answers ok.
+/// Refuses an unknown tool, and arguments the tool's schema does not declare, before
+/// anything is loaded or sent: a guessed name fails instead of being dropped while the
+/// call answers ok.
 fn refuse_unknown_args(name: &str, args: &Value) -> Result<()> {
-    // An unknown tool is refused later, with its own message.
     let Some(spec) = TOOLS.iter().find(|spec| spec.name == name) else {
-        return Ok(());
+        anyhow::bail!("unknown tool {name:?}; see tools/list");
     };
     let accepted: Vec<&str> = (spec.params)()
         .into_iter()
@@ -829,8 +833,12 @@ fn refuse_unknown_args(name: &str, args: &Value) -> Result<()> {
     )
 }
 
-fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
-    serde_json::from_value(args).map_err(|err| anyhow::anyhow!("invalid arguments: {err}"))
+fn parse<T: DeserializeOwned>(name: &str, args: Value) -> Result<T> {
+    serde_json::from_value(args).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid arguments: {err}. Call {name} again with arguments that match its schema."
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -1102,22 +1110,22 @@ mod tests {
     /// Parses `args` with the argument type `call` uses for `tool`.
     fn parse_for(tool: &str, args: Value) -> Result<()> {
         match tool {
-            "board_snapshot" => parse::<SnapshotArgs>(args).map(drop),
-            "board_status" => parse::<BoardArgs>(args).map(drop),
-            "task_list" => parse::<ListArgs>(args).map(drop),
-            "task_show" => parse::<ShowArgs>(args).map(drop),
-            "task_add" => parse::<AddArgs>(args).map(drop),
-            "task_claim" => parse::<ClaimArgs>(args).map(drop),
-            "task_update" => parse::<UpdateArgs>(args).map(drop),
-            "task_done" => parse::<DoneArgs>(args).map(drop),
-            "task_note" => parse::<NoteArgs>(args).map(drop),
-            "handoff_set" => parse::<HandoffArgs>(args).map(drop),
-            "lease_paths" => parse::<LeaseArgs>(args).map(drop),
-            "ask_user" => parse::<AskArgs>(args).map(drop),
-            "ask_withdraw" => parse::<AskIdArgs>(args).map(drop),
-            "feedback" => parse::<FeedbackArgs>(args).map(drop),
-            "feedback_resolve" => parse::<ResolveArgs>(args).map(drop),
-            "board_join" => parse::<JoinArgs>(args).map(drop),
+            "board_snapshot" => parse::<SnapshotArgs>(tool, args).map(drop),
+            "board_status" => parse::<BoardArgs>(tool, args).map(drop),
+            "task_list" => parse::<ListArgs>(tool, args).map(drop),
+            "task_show" => parse::<ShowArgs>(tool, args).map(drop),
+            "task_add" => parse::<AddArgs>(tool, args).map(drop),
+            "task_claim" => parse::<ClaimArgs>(tool, args).map(drop),
+            "task_update" => parse::<UpdateArgs>(tool, args).map(drop),
+            "task_done" => parse::<DoneArgs>(tool, args).map(drop),
+            "task_note" => parse::<NoteArgs>(tool, args).map(drop),
+            "handoff_set" => parse::<HandoffArgs>(tool, args).map(drop),
+            "lease_paths" => parse::<LeaseArgs>(tool, args).map(drop),
+            "ask_user" => parse::<AskArgs>(tool, args).map(drop),
+            "ask_withdraw" => parse::<AskIdArgs>(tool, args).map(drop),
+            "feedback" => parse::<FeedbackArgs>(tool, args).map(drop),
+            "feedback_resolve" => parse::<ResolveArgs>(tool, args).map(drop),
+            "board_join" => parse::<JoinArgs>(tool, args).map(drop),
             other => panic!("no argument type for {other}"),
         }
     }
@@ -1168,45 +1176,49 @@ mod tests {
     fn unknown_arguments_are_refused_with_the_accepted_ones() {
         for tool in tools() {
             let mut args = json!({"blocked_by": ["factory-2"]});
-            for (name, ..) in (TOOLS.iter().find(|s| s.name == tool.name).unwrap().params)() {
+            for name in tool.input_schema["properties"].as_object().unwrap().keys() {
                 args[name] = Value::Null;
             }
             let err = refuse_unknown_args(&tool.name, &args)
                 .unwrap_err()
                 .to_string();
-            let accepted: Vec<&str> = tool.input_schema["properties"]
+            let listed = err
+                .strip_prefix(&format!(
+                    "invalid arguments: {} has no argument `blocked_by`; it accepts ",
+                    tool.name
+                ))
+                .and_then(|rest| {
+                    rest.strip_suffix(&format!(
+                        ". Call {} again with only those arguments.",
+                        tool.name
+                    ))
+                })
+                .unwrap_or_else(|| panic!("{err}"));
+            let mut listed: Vec<&str> = listed.split(", ").collect();
+            listed.sort();
+            let mut declared: Vec<&str> = tool.input_schema["properties"]
                 .as_object()
                 .unwrap()
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert!(
-                err.starts_with(&format!(
-                    "invalid arguments: {} has no argument `blocked_by`; it accepts ",
-                    tool.name
-                )),
-                "{err}"
-            );
-            for name in accepted {
-                assert!(
-                    err.contains(name),
-                    "{}: {name} missing from {err}",
-                    tool.name
-                );
-            }
-            assert!(err.ends_with(&format!(
-                "Call {} again with only those arguments.",
-                tool.name
-            )));
+            declared.sort();
+            assert_eq!(listed, declared, "{err}");
             args.as_object_mut().unwrap().remove("blocked_by");
             refuse_unknown_args(&tool.name, &args).unwrap();
         }
         let err = refuse_unknown_args("task_note", &json!({"id": "x", "txt": "a", "knd": "b"}))
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.to_string()
-                .starts_with("invalid arguments: task_note has no arguments `knd`, `txt`; "),
+            err.starts_with("invalid arguments: task_note has no arguments `"),
             "{err}"
+        );
+        assert!(err.contains("`txt`") && err.contains("`knd`"), "{err}");
+        let err = refuse_unknown_args("task_notes", &json!({})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"unknown tool "task_notes"; see tools/list"#
         );
     }
 

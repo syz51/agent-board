@@ -225,7 +225,11 @@ descriptions under 300 characters):
 Every string parameter declares a `maxLength` equal to the server's default limit (title
 72, note 500, handoff field 300, question 1,000, body 4,000 characters, and so on), so a
 runtime can refuse an oversized argument before the call; a server configured with other
-limits still checks its own. The CLI states the same default limits in `--help` and
+limits still checks its own. Every input schema sets `additionalProperties: false`, and
+`board mcp` refuses a call with an argument its tool does not declare, before anything is
+sent: the error names the unknown arguments, lists the accepted ones and says to call
+again with them. An argument dropped in silence would let a guessed name, such as
+`blocked_by`, look like a change. The CLI states the same default limits in `--help` and
 refuses over-long text before sending, with the server's message and hint, so it cannot
 use limits a server raised above the defaults; its enum flags list their values in
 `--help` and in the error for an unknown one. The server's instructions ask agents to
@@ -803,7 +807,8 @@ back on purpose: did the fix hold, and do the chosen values still fit.
 - **Client refusals.** The CLI refuses over-long text before sending, so the server never
   sees it. The CLI reports each refusal, best effort, to the server, which records it with
   its own errors (source `client`), so signals and revisits both count it. MCP calls reach
-  the server already. A client that checks a schema itself and never sends is not counted;
+  the server already, except an unknown tool or argument, which `board mcp` refuses itself
+  and does not count. A client that checks a schema itself and never sends is not counted;
   friction capture covers it.
 - **Friction reports.** Their free text gives each a different signature, so the server
   cannot link them. Triage does: a report that repeats a problem whose fix has an open

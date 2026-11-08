@@ -603,13 +603,34 @@ fn an_unknown_argument_is_refused_before_anything_is_sent() {
             )),
             "{message}"
         );
-        for accepted in tool["inputSchema"]["properties"]
+        let mut declared: Vec<&str> = tool["inputSchema"]["properties"]
             .as_object()
             .unwrap()
             .keys()
-        {
-            assert!(message.contains(accepted.as_str()), "{name}: {message}");
-        }
+            .map(String::as_str)
+            .collect();
+        declared.sort();
+        let mut listed: Vec<&str> = message
+            .split_once("it accepts ")
+            .and_then(|(_, rest)| rest.split_once(". Call "))
+            .unwrap_or_else(|| panic!("{message}"))
+            .0
+            .split(", ")
+            .collect();
+        listed.sort();
+        assert_eq!(listed, declared, "{message}");
+        assert!(
+            message.ends_with(&format!("Call {name} again with only those arguments.")),
+            "{message}"
+        );
     }
+
+    // An agent that is not a string is refused, not dropped for the default identity.
+    let refused = mcp.call(100, "task_claim", json!({"id": "factory-3", "agent": 42}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        text(&refused).starts_with("error: invalid arguments: agent must be an agent id string"),
+        "{refused}"
+    );
     assert!(stub.requests().is_empty(), "nothing reached the server");
 }
