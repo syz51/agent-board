@@ -1634,12 +1634,11 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     assert_eq!(breaker(&e), json!({}));
 }
 
+/// A `PATH` whose `git` takes most of the hook's budget to name the remote, as on a busy
+/// Mac, so the server's share of the budget is too little to judge it.
 #[cfg(unix)]
-#[test]
-fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
+fn slow_git_path(e: &Env) -> String {
     use std::os::unix::fs::PermissionsExt as _;
-    let (e, start) = cached_env();
-    // A `git` that takes most of the budget to name the remote, as on a busy Mac.
     let real = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
@@ -1658,11 +1657,18 @@ fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
     )
     .unwrap();
     std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
+    format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
-    );
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slow_reply_after_slow_local_steps_counts_no_strike() {
+    let (e, start) = cached_env();
+    let path = slow_git_path(&e);
     e.stub.hang(Duration::from_secs(10));
     let began = Instant::now();
     let (reply, _) = e.hook_env("session-start", "claude", start, &[("PATH", &path)]);
@@ -1741,17 +1747,61 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
     assert!(context(&reply, "SessionStart").starts_with("board server unreachable"));
 }
 
-#[test]
-fn a_connect_that_hangs_counts_as_unreachable() {
-    let (e, start) = cached_env();
-    // TEST-NET-1 (RFC 5737): packets to it are dropped, so the connect hangs, as to a tailnet
-    // peer that is asleep; where a network refuses it at once, it is unreachable all the same.
+/// Points the hook at TEST-NET-1 (RFC 5737): packets to it are dropped, so the connect
+/// hangs, as to a tailnet peer that is asleep; where a network refuses it at once, it is
+/// unreachable all the same.
+fn hang_connects(e: &Env) {
     std::fs::write(
         e.home.join("config.toml"),
         format!("server = \"http://192.0.2.1:9\"\ndevice = \"{DEVICE}\"\n"),
     )
     .unwrap();
-    let (reply, elapsed) = timed(&e, "session-start", &start);
+}
+
+/// Runs a `SessionStart` hook with its debug log and returns its reply, its time, and
+/// whether it had too little time left to judge the server.
+fn session_start_judged(
+    e: &Env,
+    start: &Value,
+    env: &[(&str, &str)],
+) -> (Option<Value>, Duration, bool) {
+    let env = [env, &[("BOARD_LOG", "board::hook=debug")]].concat();
+    let began = Instant::now();
+    let out = board(
+        &e.home,
+        &e.repo,
+        &env,
+        &["hook", "session-start", "--runtime", "claude"],
+        &start.to_string(),
+    );
+    let elapsed = began.elapsed();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let log = stderr(&out);
+    assert!(log.contains(": server share "), "{log}");
+    let short = log.contains(", too little to judge");
+    (serde_json::from_str(&stdout(&out)).ok(), elapsed, short)
+}
+
+#[test]
+fn a_connect_that_hangs_counts_as_unreachable() {
+    let (e, start) = cached_env();
+    hang_connects(&e);
+    // On a loaded machine the hook's local steps may leave the server too little time to
+    // judge (the next test); then the hook is tried again.
+    let (reply, elapsed) = (0..5)
+        .find_map(|_| {
+            let (reply, elapsed, short) = session_start_judged(&e, &start, &[]);
+            if !short {
+                return Some((reply, elapsed));
+            }
+            assert_eq!(
+                breaker(&e),
+                Value::Null,
+                "too little time leaves the breaker"
+            );
+            None
+        })
+        .expect("every try had too little time to judge the server");
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     let text = context(&reply, "SessionStart");
     assert!(text.starts_with("board server unreachable"), "{text}");
@@ -1762,6 +1812,30 @@ fn a_connect_that_hangs_counts_as_unreachable() {
     assert!(
         until - chrono::Utc::now() > chrono::Duration::seconds(50),
         "{open}"
+    );
+}
+
+/// A connect that hangs while the hook's local steps took most of the budget had too little
+/// time to fail on its own deadline: it ends with the request, as slow, and the breaker stays
+/// as it was. The connect's deadline never races the request's, so the outcome is fixed.
+#[cfg(unix)]
+#[test]
+fn a_connect_that_hangs_after_slow_local_steps_reads_as_slow() {
+    let (e, start) = cached_env();
+    hang_connects(&e);
+    let path = slow_git_path(&e);
+    let (reply, elapsed, short) = session_start_judged(&e, &start, &[("PATH", &path)]);
+    assert!(short, "the slow git leaves the server too little time");
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    // On a very slow runner the hook's own guard may answer first, with nothing.
+    if reply.is_some() {
+        let text = context(&reply, "SessionStart");
+        assert!(text.starts_with("board server slow"), "{text}");
+    }
+    assert_eq!(
+        breaker(&e),
+        Value::Null,
+        "the server had too little time to judge it"
     );
 }
 

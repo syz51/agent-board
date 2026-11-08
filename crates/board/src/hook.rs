@@ -62,9 +62,12 @@ const CONNECT_BUDGET: Duration = Duration::from_millis(500);
 /// What a `Stop` leaves of the server share after registering a renamed thread, so the
 /// hook answers before its own deadline.
 const RENAME_MARGIN: Duration = Duration::from_millis(50);
-/// A failure to get an answer within a deadline shorter than this, because the hook's local
-/// steps took the rest of the budget, leaves the breaker as it was.
-const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
+/// A server share shorter than this, because the hook's local steps took the rest of the
+/// budget, is too little to judge the server: a failure leaves the breaker as it was, and a
+/// connect that hangs ends with the request, as slow. It leaves the connect's deadline well
+/// before the request's, so the two never race and a connect that hangs is unreachable.
+const SERVER_SHARE_FAIR: Duration = Duration::from_millis(600);
+const _: () = assert!(CONNECT_BUDGET.as_millis() + 100 <= SERVER_SHARE_FAIR.as_millis());
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
@@ -390,6 +393,13 @@ async fn handle(
         }
     };
     let remaining = BUDGET.saturating_sub(started.elapsed() + MARGIN);
+    let fair = remaining >= SERVER_SHARE_FAIR;
+    tracing::debug!(
+        "hook {}: server share {}ms{}",
+        event.name(),
+        remaining.as_millis(),
+        if fair { "" } else { ", too little to judge" }
+    );
     let deadline = tokio::time::Instant::now() + remaining.saturating_sub(RENAME_MARGIN);
     let relayed = matches!(route, Route::Relay(_));
     let client = match route {
@@ -397,7 +407,9 @@ async fn handle(
             .with_agent(Some(agent.clone()))
             .with_timeout(remaining),
         Route::Direct(token) => {
-            let connect = CONNECT_BUDGET.min(remaining);
+            // Too little time to judge: the connect's deadline falls past the request's,
+            // which ends the request first, so a connect that hangs reads as slow.
+            let connect = if fair { CONNECT_BUDGET } else { BUDGET };
             Client::with_connect_timeout(server, token, Some(agent.clone()), remaining, connect)?
         }
     };
@@ -475,7 +487,7 @@ async fn handle(
         // The relay failed, not the server.
         _ if !judged => breaker.clone(),
         // This device left the server too little time to judge it.
-        Some(_) if remaining < SERVER_SHARE_FAIR => breaker.clone(),
+        Some(_) if !fair => breaker.clone(),
         failure => breaker.after(failure, hook.now)?,
     };
     if next != breaker {
