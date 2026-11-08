@@ -556,6 +556,17 @@ use, autopilot off). Items get `auto` from that board's autopilot.
     would take no reports because the duplicate links lead back to it.
   - `forwarded`: handed elsewhere (another tracker, the user); `reason` says where.
   - `declined`: not acted on; `reason` says why. It stays live, so repeats keep counting.
+    When agents keep reporting it, the server sends it back to triage: once it was
+    declined at least `declined_reopen_after_days` ago and has gained at least
+    `declined_reopen_reports` reports since the decline from at least
+    `declined_reopen_agents` agents that had not reported it before (its creator counts as
+    an earlier reporter), the report that reaches the bar moves it to `open`, unowned, with
+    the resolution cleared and `version` raised. A `finding` note, credited to that
+    reporter, starts `reopened:` and gives the reports and agents since the decline, how
+    many agents are new, the decline time and its reason. It comes with `note_added` and a
+    `task_updated` event `{"fields": ["status", "feedback", "owner"?], "from": "done",
+    "to": "open", "reopened": {"reports", "agents", "new_agents"}}`. Every report counts,
+    not just the 20 in `reporters`. Declining it again starts a new count.
   - `fixed`: the resolver fixed the cause itself; `reason` says what changed (such as the
     file and line, or the setting). It is not live: a later report opens a new item that
     `recurs` this one.
@@ -693,6 +704,7 @@ no nonce.
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 | API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |
+| Declined feedback item reopened after, with reports and new agents since the decline (`declined_reopen_after_days`, `declined_reopen_reports`, `declined_reopen_agents`) | 1 day, 5 reports, 3 agents |
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
