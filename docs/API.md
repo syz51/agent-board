@@ -432,7 +432,10 @@ browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 (`/take`, which is logged). Moving a task to `open`, from any status, clears its owner.
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
-`owner` and `previous_owner`. A `blocked` task nobody owns is refused a move to `review`
+`owner` and `previous_owner`. Like a claim, a move to `doing` (from `blocked` or `review`)
+is refused with 400 `invalid_transition` while a blocker is not done or `not_before` has
+not passed. The check reads the task as the request leaves it, so the same request may
+drop those blockers (`blockers`) or clear `not_before` (`null`); `next` says which. A `blocked` task nobody owns is refused a move to `review`
 with 400 `invalid_transition` (`next` says to resume it first): a task in `review` has an
 owner to finish it, who brought it through `doing`.
 
@@ -455,7 +458,9 @@ another agent records a `verdict:` note and an accept sets `auto` (`DESIGN.md`,
 
 `blocked` needs `blocked_reason` or at least one blocker that is not done. A
 `blocked_reason` that is not blank is accepted only with status `blocked` (400 `invalid`
-otherwise; a blank one is ignored), and every move out of `blocked` clears it. Blockers
+otherwise). A blank one (empty or only spaces) means no reason, with any status: it
+clears the reason and is never refused for being empty. Every move out of `blocked`
+clears it. Blockers
 must exist and must not form a cycle; they may be on any board. A task is not `ready`, and
 cannot be claimed, until every blocker is done, wherever it is. `GET /v1/tasks/{id}` lists
 the tasks waiting on it in `blocks`, from every board, and a blocker's `task_done` event,

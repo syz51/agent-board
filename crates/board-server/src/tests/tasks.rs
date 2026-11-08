@@ -402,6 +402,133 @@ async fn blocked_needs_a_reason_or_an_open_blocker() {
 }
 
 #[tokio::test]
+async fn a_blank_blocked_reason_clears_it() {
+    let t = setup().await;
+    // Resuming with a cleared reason, as agents send it: the blank reason means none.
+    for blank in ["", "  "] {
+        let id = task_in(&t, TaskStatus::Blocked).await;
+        let (s, v) = t
+            .patch(
+                A,
+                &id,
+                json!({ "status": "doing", "blocked_reason": blank }),
+            )
+            .await;
+        assert!(s.is_success(), "{v}");
+        assert_eq!(
+            (&v["status"], &v["blocked_reason"]),
+            (&json!("doing"), &Value::Null),
+            "{v}"
+        );
+        let (s, v) = t.done(A, &id, check(0)).await;
+        assert!(s.is_success(), "{v}");
+    }
+    // Blocked with a blank reason and nothing to wait on is still refused, for that.
+    let id = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = t
+        .patch(A, &id, json!({ "status": "blocked", "blocked_reason": "" }))
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().contains("needs a reason"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn moving_to_doing_waits_on_blockers_and_not_before_as_a_claim_does() {
+    let t = setup().await;
+    let first = t.task(A, "factory", "First step").await;
+    let second = t.task(A, "factory", "Second step").await;
+    assert!(t.claim(A, &second).await.0.is_success());
+    let (s, v) = t
+        .patch(
+            A,
+            &second,
+            json!({ "status": "blocked", "blockers": [first] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // A blocker not done refuses the move.
+    let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{first} (open)")),
+        "{v}"
+    );
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("task_update {second} status=doing blockers=")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&second).await["status"], "blocked");
+
+    // The same request may drop the blocker it no longer waits on.
+    let (s, v) = t
+        .patch(A, &second, json!({ "status": "doing", "blockers": [] }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "doing", "{v}");
+
+    // A not_before still ahead refuses it too, until it passes or the request clears it.
+    let at = super::iso(super::start() + TimeDelta::days(1));
+    let (s, v) = t
+        .patch(
+            A,
+            &second,
+            json!({ "status": "blocked", "blocked_reason": "later", "not_before": at }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().contains("waits until"),
+        "{v}"
+    );
+    assert!(
+        v["next"].as_str().unwrap().contains(&format!(
+            "task_update {second} status=doing not_before=none"
+        )),
+        "{v}"
+    );
+    let (s, v) = t
+        .patch(A, &second, json!({ "status": "doing", "not_before": null }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "doing", "{v}");
+
+    // Review to doing waits the same way; once the date passes the move goes through.
+    let (s, v) = t
+        .patch(A, &second, json!({ "status": "review", "not_before": at }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    t.advance(TimeDelta::days(1));
+    let (s, v) = t.patch(A, &second, json!({ "status": "doing" })).await;
+    assert!(s.is_success(), "{v}");
+}
+
+#[tokio::test]
 async fn done_requires_evidence() {
     // A holds several tasks at once here.
     let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;

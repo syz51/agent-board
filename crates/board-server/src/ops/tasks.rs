@@ -87,7 +87,8 @@ pub(crate) fn validate_update(req: &UpdateTask, s: &Settings) -> Result<()> {
         req.body.as_deref().unwrap_or(""),
         req.acceptance.as_deref().unwrap_or(""),
     )?;
-    if let Some(reason) = &req.blocked_reason {
+    // A blank reason means none, as `update` reads it: it clears the reason.
+    if let Some(reason) = req.blocked_reason.as_ref().filter(|r| !r.trim().is_empty()) {
         check_line("blocked_reason", reason, s.note_chars)?;
     }
     if req.blockers.as_ref().is_some_and(|b| b.len() > 20) {
@@ -1215,6 +1216,55 @@ pub(crate) fn release(
     get_task(cx, id)
 }
 
+/// Refuses a `PATCH` into `doing` while `blockers` (the list the request leaves) has one
+/// that is not done or `not_before` is still ahead, as a claim would.
+fn check_ready_to_start(
+    cx: &Ctx<'_>,
+    id: &TaskId,
+    blockers: &[TaskId],
+    not_before: Option<Timestamp>,
+) -> Result<()> {
+    let mut waiting: Vec<String> = Vec::new();
+    for b in blockers {
+        let status: Option<String> = cx
+            .db
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [b.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(status) = status.filter(|s| s != "done") {
+            waiting.push(format!("{b} ({status})"));
+        }
+    }
+    if !waiting.is_empty() {
+        return Err(bad_transition(
+            format!(
+                "{id} waits on {}, so it cannot move to doing",
+                waiting.join(", ")
+            ),
+            format!(
+                "help finish them, or drop the ones it no longer waits on in the same request \
+                 (task_update {id} status=doing blockers=[the rest])"
+            ),
+        ));
+    }
+    if let Some(at) = not_before.filter(|&at| at > cx.now) {
+        return Err(bad_transition(
+            format!(
+                "{id} waits until {}, so it cannot move to doing",
+                at.format("%Y-%m-%d %H:%MZ")
+            ),
+            format!(
+                "wait until then, or clear it in the same request if it should start now \
+                 (task_update {id} status=doing not_before=none)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn update(
     cx: &mut Ctx<'_>,
     id: &TaskId,
@@ -1393,6 +1443,11 @@ pub(crate) fn update(
     };
     if not_before != task.not_before {
         fields.push("not_before");
+    }
+    // Starting work waits as a claim does, on what the task names after this request: the
+    // same request may remove the blockers or the not_before it no longer waits on.
+    if to == TaskStatus::Doing && from != TaskStatus::Doing {
+        check_ready_to_start(cx, id, &blockers, not_before)?;
     }
     if fields.is_empty() {
         return Ok(task);
