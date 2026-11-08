@@ -461,15 +461,27 @@ impl Client {
         agent: Option<AgentId>,
         timeout: Option<Duration>,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(timeout.unwrap_or(Duration::from_secs(10)))
+        let http =
+            reqwest::Client::builder().connect_timeout(timeout.unwrap_or(Duration::from_secs(10)));
+        Self::build(http, base, Some(token), agent, timeout)
+    }
+
+    /// A client from `http`, which gets the user agent; each request gets `timeout`.
+    fn build(
+        http: reqwest::ClientBuilder,
+        base: &str,
+        token: Option<String>,
+        agent: Option<AgentId>,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let http = http
             .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the HTTP client")?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
-            token: Some(token),
+            token,
             agent,
             timeout,
             read_retries: &[],
@@ -514,40 +526,23 @@ impl Client {
     where
         F: Fn() -> Option<Duration> + Clone + Send + Sync + 'static,
     {
-        let http = reqwest::Client::builder()
-            .connector_layer(ConnectLimit(limit))
-            .timeout(timeout)
-            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("building the HTTP client")?;
-        Ok(Self {
-            http,
-            base: base.trim_end_matches('/').to_owned(),
-            token: Some(token),
-            agent,
-            timeout: Some(timeout),
-            read_retries: &[],
-        })
+        let http = reqwest::Client::builder().connector_layer(ConnectLimit(limit));
+        Self::build(http, base, Some(token), agent, Some(timeout))
     }
 
     /// A client that reaches the server through the device daemon's relay on the Unix
     /// socket `socket` (see `relay`), with `timeout` for each whole request. It sends no
     /// token: the relay adds the device's.
     pub fn relayed(socket: &std::path::Path, timeout: Duration) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .unix_socket(socket)
-            .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("building the HTTP client")?;
-        Ok(Self {
+        let http = reqwest::Client::builder().unix_socket(socket);
+        // Not used to connect: the relay forwards to its own server.
+        Self::build(
             http,
-            // Not used to connect: the relay forwards to its own server.
-            base: "http://board-relay.invalid".to_owned(),
-            token: None,
-            agent: None,
-            timeout: Some(timeout),
-            read_retries: &[],
-        })
+            "http://board-relay.invalid",
+            None,
+            None,
+            Some(timeout),
+        )
     }
 
     /// The same client with `timeout` for each whole request; it keeps its connections.

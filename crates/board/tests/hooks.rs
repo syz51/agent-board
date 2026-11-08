@@ -1591,9 +1591,10 @@ fn timed_env(
     (reply, began.elapsed())
 }
 
-/// Debug builds of the hook give the server exactly this share of the budget, however long
-/// the local steps take, so a test of the breaker does not depend on the runner's speed.
-const SHARE_ENV: &str = "BOARD_HOOK_SERVER_SHARE_MS";
+// Debug builds of the hook give the server exactly the share in `SHARE_ENV`, from just
+// before its first request, however long the local steps and the client build take, so a
+// test of the breaker does not depend on the runner's speed.
+use board::hook::SHARE_ENV;
 /// A fair share: enough to judge the server.
 const FAIR_SHARE: [(&str, &str); 1] = [(SHARE_ENV, "1000")];
 /// What a hook whose local steps took most of the budget leaves the server: too little to
@@ -1664,9 +1665,10 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     assert_eq!(breaker(&e), json!({}));
 }
 
-/// A hook that answers within its budget when it gives the server all of it.
+/// A hook that answers within its budget with the real share, whether the server is slow or
+/// its connect hangs.
 #[test]
-fn a_slow_server_costs_a_hook_no_more_than_its_budget() {
+fn a_slow_server_or_a_hung_connect_costs_a_hook_no_more_than_its_budget() {
     let (e, start) = cached_env();
     e.stub.hang(Duration::from_secs(10));
     let (reply, elapsed) = timed(&e, "session-start", &start);
@@ -1674,6 +1676,14 @@ fn a_slow_server_costs_a_hook_no_more_than_its_budget() {
     // On a very slow runner the hook's own guard may answer first, with nothing.
     if reply.is_some() {
         assert!(context(&reply, "SessionStart").starts_with("board server slow"));
+    }
+
+    let _listener = hang_connects(&e);
+    let (reply, elapsed) = timed(&e, "session-start", &start);
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    if reply.is_some() {
+        let text = context(&reply, "SessionStart");
+        assert!(text.starts_with("board server "), "{text}");
     }
 }
 
