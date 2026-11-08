@@ -218,6 +218,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]

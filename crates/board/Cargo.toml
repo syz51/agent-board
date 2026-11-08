@@ -29,11 +29,14 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "io-std", "io-util", "net", "time", "fs", "signal", "sync"] }
 toml = "1.2.0"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [lints]
 workspace = true
