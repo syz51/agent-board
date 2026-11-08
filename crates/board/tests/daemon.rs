@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,8 @@ struct FakeT3 {
     hang_info: Arc<Mutex<Vec<String>>>,
     /// `t3 thread show` fails while set.
     fail_info: Arc<AtomicBool>,
+    /// How many times `t3 thread show` ran.
+    infos: Arc<AtomicUsize>,
     /// Threads whose `t3 thread send` never answers.
     hang_send: Arc<Mutex<Vec<String>>>,
     /// Threads whose `t3 thread send` fails, as for an archived thread.
@@ -166,6 +168,7 @@ impl T3 for FakeT3 {
     }
 
     async fn thread_info(&self, thread: &str) -> Result<Option<ThreadInfo>> {
+        self.infos.fetch_add(1, Ordering::SeqCst);
         if self.hang_info.lock().unwrap().iter().any(|t| t == thread) {
             std::future::pending::<()>().await;
         }
@@ -437,8 +440,14 @@ async fn an_ended_coordinator_is_replaced_and_a_live_one_renewed() {
         autopilot(None, &[DEVICE]),
     );
     e.stub.clear();
+    // Found live a minute ago: T3 is not asked again until THREAD_RECHECK has passed.
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(12))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.calls().len(), 1, "not checked again yet");
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(16))
         .await
         .unwrap();
     assert_eq!(e.t3.calls().len(), 2);
@@ -897,6 +906,62 @@ fn state_changed(seq: i64, agent: &str, to: AgentState, paused_until: Option<Tim
         task: None,
         payload: json!({ "from": "running", "to": to, "paused_until": paused_until }),
     }
+}
+
+#[tokio::test]
+async fn a_live_coordinator_thread_is_asked_about_once_per_recheck_and_after_a_failure() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    let infos = |e: &Env| e.t3.infos.load(Ordering::SeqCst);
+    for minute in 0..=10 {
+        e.daemon
+            .reconcile(at() + chrono::Duration::minutes(minute))
+            .await
+            .unwrap();
+    }
+    assert_eq!(infos(&e), 3, "at minutes 0, 5 and 10, not every minute");
+
+    // A failed send to the thread asks again on the next reconcile.
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at() + chrono::Duration::minutes(10)).await;
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    let before = infos(&e);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(11))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), before + 1, "asked again after the failed send");
+
+    // So does its agent ending.
+    e.daemon
+        .on_event(
+            &state_changed(11, &agent, AgentState::Ended, None),
+            at() + chrono::Duration::minutes(11),
+        )
+        .await
+        .unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(12))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), before + 2, "asked again after the agent ended");
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(13))
+        .await
+        .unwrap();
+    assert_eq!(infos(&e), before + 2, "then not again within the interval");
 }
 
 fn threads(t3: &FakeT3) -> Vec<String> {
@@ -2577,6 +2642,73 @@ async fn a_board_without_a_mapped_repo_starts_in_its_board_projects_path() {
     let (t3, stub) = start_with(board_fixture("factory", &[REPO]), config).await;
     assert_eq!(started(&t3).0, Path::new("/src/agent-board"));
     assert_eq!(stub.requests_to("POST /v1/agents")[0].body["repo"], REPO);
+}
+
+/// An env whose daemon has no project for the factory board yet, nor a `config.toml`.
+fn unmapped_env() -> Env {
+    let e = env_with_projects(BTreeMap::new());
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e
+}
+
+/// Writes the env daemon's `config.toml` with the given projects.
+fn write_config(e: &Env, projects: BTreeMap<String, PathBuf>) {
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects,
+        ..Config::default()
+    }
+    .save(&Home::at(e._dir.path().join("home")))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_project_added_to_config_toml_starts_the_coordinator_without_a_restart() {
+    let mut e = unmapped_env();
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "no project: nothing to start");
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/coordinator")
+            .is_empty()
+    );
+
+    // Mapped while the daemon runs: the next reconcile starts it, at the same instant, so
+    // the failed start's back-off does not hold it either.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
+}
+
+#[tokio::test]
+async fn an_unreadable_config_toml_keeps_the_projects_in_use() {
+    let mut e = unmapped_env();
+    write_config(&e, BTreeMap::new());
+    let home = Home::at(e._dir.path().join("home"));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+
+    std::fs::write(home.config_path(), "projects = [not toml").unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "an invalid file changes nothing");
+    std::fs::remove_file(home.config_path()).unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty(), "a missing file changes nothing");
+
+    // Fixed: read again.
+    write_config(&e, projects());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e.t3).0, Path::new("/src/agent-board"));
 }
 
 #[tokio::test]
