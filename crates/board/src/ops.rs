@@ -23,6 +23,40 @@ use crate::identity::RepoInfo;
 use crate::render;
 use crate::t3::T3;
 
+/// How an agent other than the environment's own was named, which decides how the
+/// refusal of an unknown one reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedAgent {
+    /// `--agent` on a CLI command.
+    CliFlag,
+    /// `--agent` given to `board mcp` at start-up.
+    McpStart,
+    /// `agent=` in an MCP tool call.
+    McpArg,
+}
+
+impl NamedAgent {
+    fn unknown(self, agent: &AgentId) -> anyhow::Error {
+        let what = "which the server does not know, so nothing was done";
+        let hooks = "A new session registers through its hooks or the daemon";
+        match self {
+            Self::CliFlag => anyhow::anyhow!(
+                "--agent names {agent}, {what}: drop --agent to act as yourself. {hooks}; a \
+                 script that acts under its own fixed id passes --register with --agent."
+            ),
+            Self::McpStart => anyhow::anyhow!(
+                "this MCP server was started with --agent {agent}, {what}. Ask the user to \
+                 start it without --agent, so it acts as the session, or with --register \
+                 for a script's own fixed id."
+            ),
+            Self::McpArg => anyhow::anyhow!(
+                "agent= names {agent}, {what}: leave agent out to act as yourself (to give \
+                 another agent a task, hand it over with owner=). {hooks}."
+            ),
+        }
+    }
+}
+
 /// Everything a command needs: configuration, a client and where it runs.
 #[derive(Debug, Clone)]
 pub struct Ctx {
@@ -86,22 +120,17 @@ impl Ctx {
 
     /// Registers the calling agent when the server does not know it yet: a CLI or MCP
     /// call from a session whose start hook did not run. A known agent is left as it is.
-    /// An agent named explicitly (`flag`, such as `--agent`) is registered only with
-    /// `register`; otherwise an unknown one is refused before anything is written, since a
-    /// hand-typed id would stay listed as running with nothing to end it.
-    pub async fn ensure_registered(&self, explicit: Option<&str>, register: bool) -> Result<()> {
+    /// An agent named by hand (`named`) is refused instead when unknown, before anything is
+    /// written, since such an id would stay listed as running with nothing to end it.
+    pub async fn ensure_registered(&self, named: Option<NamedAgent>) -> Result<()> {
         let Some(agent) = self.client.agent() else {
             return Ok(());
         };
         match self.client.agent_info(agent).await {
             Ok(_) => Ok(()),
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
-                if let Some(flag) = explicit.filter(|_| !register) {
-                    bail!(
-                        "{flag} names {agent}, which the server does not know, so nothing was \
-                         done: drop {flag} to act as yourself. A new agent registers through \
-                         its session's hooks or the daemon, not through {flag}."
-                    );
+                if let Some(named) = named {
+                    return Err(named.unknown(agent));
                 }
                 let runtime = match agent.source() {
                     AgentSource::Codex => Runtime::Codex,

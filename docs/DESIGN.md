@@ -126,7 +126,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   until `SessionEnd` (entries untouched for 7 days are pruned at `SessionStart`), `board
   mcp` decides at start-up, and CLI commands decide per run. An explicit `--agent` skips
   it for choosing the identity; in a T3 thread the check still runs once, because
-  `--agent` there may name only the thread's own agent.
+  `--agent` there may name only the thread's own agent. A hand-named id the server does not
+  know is refused, not registered, since nothing would ever end it; a script with its own
+  fixed id opts in with `--register`.
 - **Ownership is durable; leases expire.** A claimed task stays owned across restarts. A
   claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
   it, with a claim's checks, so an agent returning to its own work is not sent away; a

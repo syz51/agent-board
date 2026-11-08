@@ -133,13 +133,14 @@ server's minute sweep deletes older ones.
   300 characters and a `title` at most 200 (`NATIVE_ID_CHARS_MAX`,
   `AGENT_TITLE_CHARS_MAX`).
   Clients register on session start (hooks) and before acting when the agent is unknown.
-  The client registers before acting only an agent its environment names: an id named by
-  `--agent` (CLI, also `board mcp --agent`) or `agent=` (MCP) that the server does not know
-  is refused before anything is written, with an error that says to drop the flag to act
-  as yourself; a new agent registers through its session's hooks or the daemon. A script
-  that acts under its own fixed id passes `--register` with `--agent` to register it; the
-  hooks register an explicit `--agent` as before, and `agent=` never registers. (Clients
-  before this change registered any unknown id named this way.)
+  The client registers before acting only the agent its environment names: an id named by
+  hand, by `--agent` (CLI, also `board mcp --agent`) or `agent=` (MCP), that the server does
+  not know is refused before anything is written, with an error that says how to act as
+  yourself; a new agent registers through its session's hooks or the daemon. A T3 thread's
+  own id counts as not named, and so does an `agent=` that repeats the agent `board mcp`
+  acts as. A script that acts under its own fixed id passes `--register`
+  with `--agent` to register it; the hooks register an explicit `--agent` as before.
+  (Clients before this change registered any unknown id named this way.)
   Registering marks the agent `running`; one that was `idle`, `paused` or `ended` gets one
   `agent_state_changed` event (`from` its old state, `to` `running`).
 - Every call that acts as an agent marks it seen. One marked `ended` that makes such a call
@@ -152,10 +153,10 @@ server's minute sweep deletes older ones.
 - Wherever a request names an agent to look up (`owner` in `[UpdateTask]` and in
   `GET /v1/tasks`), its short handle works too.
 - Clients act only as themselves: in a T3 thread, outside a nested session, `--agent`
-  (CLI) and `agent=` (MCP) may name only the thread's own agent, and any other id is
-  refused before anything is sent, with an error that says to drop the flag. Elsewhere,
-  where the environment proves no identity, any agent may be named. The server does not
-  check this.
+  (CLI, also `board mcp --agent`) and `agent=` (MCP) may name only the thread's own agent,
+  and any other id is refused before anything is sent, with an error that says to drop the
+  flag. Elsewhere, where the environment proves no identity, any agent the server knows
+  may be named. The server does not check this.
 - `GET /v1/agents?board=&state=` → `[Agent]` list. With `board`, agents not seen for more
   than 7 days are left out whatever their state, since a session that crashed never sends
   `ended`. Kept are agents that wait for a usage-limit reset still to come (`paused_until`
