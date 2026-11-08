@@ -992,7 +992,11 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     }
                     let mut action =
                         format!("task_update {} blockers=[{}]", task.id, remaining.join(","));
-                    if task.status == TaskStatus::Blocked && remaining.is_empty() {
+                    // A not_before still ahead holds the move to doing, so it is not offered.
+                    if task.status == TaskStatus::Blocked
+                        && remaining.is_empty()
+                        && task.not_before.is_none_or(|at| at <= cx.now)
+                    {
                         action.push_str(" status=doing");
                     }
                     out.insert(
