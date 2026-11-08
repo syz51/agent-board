@@ -225,7 +225,7 @@ function WaitingTasks({
       <p className="-mt-1.5 mb-3 max-w-[68ch] text-meta text-muted-foreground">
         Blocked tasks and tasks only you can start, with no open ask.
       </p>
-      {/* The board's rows with an amber edge, like action asks. */}
+      {/* Manual tags in amber, the colour of asks that wait on an action from you. */}
       <div className="[&_[data-tag=manual]]:border-amber/35 [&_[data-tag=manual]]:bg-amber-soft [&_[data-tag=manual]]:text-amber">
         <TaskBoard>
           {groups.map(({ board, tasks }) => (
@@ -257,17 +257,19 @@ export function AskScreen() {
   const { id } = askRoute.useParams();
   const askId = Number(id);
   const valid = Number.isSafeInteger(askId) && askId > 0;
-  useTitle(`Ask #${id}`);
+  // The number as read, so `/asks/012` is titled "Ask #12".
+  const label = valid ? `Ask #${askId}` : `Ask #${id}`;
+  useTitle(label);
   const ask = useQuery({ ...queries.ask(askId), enabled: valid });
   const agentList = useAgents().data;
   const agents = useMemo(() => agentIndex(agentList), [agentList]);
 
   return (
     <>
-      <Crumbs current={`Ask #${id}`}>
+      <Crumbs current={label}>
         <Link to="/asks">Needs you</Link>
       </Crumbs>
-      <PageHeader title={`Ask #${id}`} />
+      <PageHeader title={label} />
       {valid ? (
         <QueryFrame query={ask} label="Loading ask">
           {(data) => (
@@ -299,7 +301,8 @@ function AskContext({ ask, agents }: { ask: Ask; agents: Map<string, Agent> }) {
       <section className="grid gap-2">
         <h2 className={heading}>Asked by</h2>
         <Who id={ask.agent} agents={agents} />
-        <HandoffView agentId={ask.agent} />
+        {/* As on the agents page, an ended agent's handoff is history, not context. */}
+        {agents.get(ask.agent)?.state !== "ended" && <HandoffView agentId={ask.agent} />}
       </section>
     </aside>
   );

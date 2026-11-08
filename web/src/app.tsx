@@ -46,13 +46,13 @@ export function Shell() {
       </header>
       {/* The content sits on an inset panel, raised off the sidebar's tone on wide screens. */}
       <div className="min-w-0 lg:py-2 lg:pr-2">
-        <div className="bg-background lg:min-h-[calc(100vh-16px)] lg:overflow-clip lg:rounded-lg lg:shadow-panel">
+        <div className="bg-background [--gutter:--spacing(4)] lg:min-h-[calc(100vh-16px)] lg:overflow-clip lg:rounded-lg lg:shadow-panel lg:[--gutter:--spacing(7)]">
           <ConnectionBanner />
           <main
             id="main"
             ref={main}
             tabIndex={-1}
-            className="px-(--gutter) pt-5 pb-16 [--gutter:--spacing(4)] max-md:pb-[calc(92px+env(safe-area-inset-bottom))] lg:pt-6 lg:pb-16 lg:[--gutter:--spacing(7)]"
+            className="px-(--gutter) pt-5 pb-16 max-md:pb-[calc(92px+env(safe-area-inset-bottom))] lg:pt-6"
           >
             <Outlet />
           </main>
@@ -234,7 +234,7 @@ function ConnectionBanner() {
   return (
     <div
       className={cn(
-        "flex items-center gap-2.5 border-b px-(--gutter) py-2 text-meta [--gutter:--spacing(4)] lg:[--gutter:--spacing(7)]",
+        "flex items-center gap-2.5 border-b px-(--gutter) py-2 text-meta",
         state.kind === "offline"
           ? "border-error-border bg-error-soft text-error"
           : "border-warn-border bg-warn-soft text-warn",

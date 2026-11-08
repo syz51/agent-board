@@ -211,23 +211,27 @@ export function StateDot({ state }: { state: "running" | "paused" | "idle" | "en
   );
 }
 
-/** A pill with a state dot: agent and board states. */
+/** A pill with a state dot: agent and board states. `bare` drops the fill, for table cells. */
 export function StatePill({
   state,
+  bare,
   children,
 }: {
   state: "running" | "paused" | "idle" | "ended" | "closed";
+  bare?: boolean | undefined;
   children: ReactNode;
 }) {
   return (
     <span
       className={cn(
-        "inline-flex h-5.5 items-center gap-1.5 rounded-full pr-2.25 pl-1.75 text-xs font-[550] whitespace-nowrap",
+        "inline-flex items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
+        !bare && "h-5.5 rounded-full pr-2.25 pl-1.75",
         state === "running"
           ? "bg-status-ready-soft text-status-ready"
           : state === "paused"
             ? "bg-amber-soft text-amber"
             : "bg-status-open-soft text-status-open",
+        bare && "bg-transparent",
       )}
     >
       <StateDot state={state} />
@@ -236,38 +240,16 @@ export function StatePill({
   );
 }
 
-/**
- * An agent's state as a mark and a word, for a cell that stays one line high; a pause's end
- * moves to the tooltip.
- */
-export function AgentStateInline({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
+export function AgentStateBadge({
+  agent,
+  bare,
+}: {
+  agent: Pick<Agent, "state" | "paused_until">;
+  bare?: boolean;
+}) {
   const now = useNow();
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 text-xs font-[550] whitespace-nowrap",
-        agent.state === "running"
-          ? "text-status-ready"
-          : agent.state === "paused"
-            ? "text-amber"
-            : "text-status-open",
-      )}
-      title={
-        agent.state === "paused" && agent.paused_until
-          ? `Paused until ${formatUntil(agent.paused_until, now)}`
-          : undefined
-      }
-    >
-      <StateDot state={agent.state} />
-      {agent.state[0]?.toUpperCase() + agent.state.slice(1)}
-    </span>
-  );
-}
-
-export function AgentStateBadge({ agent }: { agent: Pick<Agent, "state" | "paused_until"> }) {
-  const now = useNow();
-  return (
-    <StatePill state={agent.state}>
+    <StatePill state={agent.state} bare={bare}>
       {agent.state === "paused" && agent.paused_until ? (
         <>
           Paused until{" "}
@@ -426,18 +408,15 @@ export function AskKind({ kind }: { kind: "action" | "decision" }) {
 }
 
 /**
- * One line of agent text, cut to the width with an ellipsis. It is a button: a click, tap,
- * Enter or Space shows the whole text, so it can be read without hovering.
+ * Agent text cut to two lines with an ellipsis. It is a button: a click, tap, Enter or Space
+ * shows the whole text, so it can be read without hovering.
  */
 export function ExpandableLine({
   text,
   className,
-  lines = 1,
 }: {
   text: string;
   className?: string | undefined;
-  /** How many lines show while closed. */
-  lines?: 1 | 2;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -445,7 +424,7 @@ export function ExpandableLine({
       type="button"
       className={cn(
         "block min-h-6 w-full min-w-0 cursor-pointer rounded-xs text-left text-inherit",
-        open ? "whitespace-pre-wrap" : lines === 2 ? "line-clamp-2" : "truncate",
+        open ? "whitespace-pre-wrap" : "line-clamp-2",
         className,
       )}
       aria-expanded={open}

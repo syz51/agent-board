@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils.ts";
 import { fetching, invalidateTags, queries } from "@/live/query.ts";
 import { tags } from "@/live/refresh.ts";
 import {
-  AgentStateInline,
+  AgentStateBadge,
   agentIndex,
   AskKind,
   Empty,
@@ -215,7 +215,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
     getRowId: (row) => row.board.slug,
   });
   return (
-    <section className="edge @container overflow-hidden border-y bg-card" aria-label="All boards">
+    <div className="edge @container overflow-hidden border-y bg-card">
       {table.getHeaderGroups().map((group) => (
         <div
           key={group.id}
@@ -249,7 +249,7 @@ function BoardTable({ boards, agents }: { boards: Board[]; agents: Map<string, A
           </li>
         ))}
       </ul>
-    </section>
+    </div>
   );
 }
 
@@ -257,11 +257,11 @@ function BoardName({ board }: { board: Board }) {
   return (
     <>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-        <h2 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
+        <h3 className="min-w-0 text-sm font-semibold tracking-[-0.006em]">
           <Link className="text-foreground" to="/boards/$slug" params={{ slug: board.slug }}>
             {board.title}
           </Link>
-        </h2>
+        </h3>
         <span className="ident text-meta text-muted-foreground">{board.slug}</span>
         {board.status !== "active" && (
           <StatePill state={board.status}>
@@ -276,7 +276,7 @@ function BoardName({ board }: { board: Board }) {
         )}
       </div>
       {board.goal ? (
-        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} lines={2} />
+        <ExpandableLine className="text-meta text-muted-foreground" text={board.goal} />
       ) : (
         <p className="text-meta leading-6 text-muted-foreground">No goal written.</p>
       )}
@@ -338,7 +338,7 @@ function Coordinator({ board, coordinator, agents }: BoardRowData) {
   return (
     <>
       <Who id={coordinator.id} agents={agents} />
-      <AgentStateInline agent={coordinator} />
+      <AgentStateBadge agent={coordinator} bare />
     </>
   );
 }

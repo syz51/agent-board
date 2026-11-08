@@ -17,7 +17,7 @@ const badgeVariants = cva(
         ghost: "[a&]:hover:bg-accent [a&]:hover:text-accent-foreground",
         link: "text-primary underline-offset-4 [a&]:hover:underline",
         // agent-board tones: always beside text that says the same thing.
-        accent: "border-primary/35 bg-primary-soft text-link",
+        accent: "border-signal/35 bg-primary-soft text-link",
         warn: "border-amber/35 bg-amber-soft text-amber",
         ok: "border-status-ready/35 bg-status-ready-soft text-status-ready",
         bad: "border-status-blocked/35 bg-status-blocked-soft text-status-blocked",

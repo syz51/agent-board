@@ -6,8 +6,8 @@ import { extendTailwindMerge } from "tailwind-merge";
 const twMerge = extendTailwindMerge({
   extend: {
     theme: {
-      text: ["2xs", "meta", "title", "display", "display-phone"],
-      shadow: ["raise", "overlay"],
+      text: ["2xs", "meta", "title", "display", "display-phone", "headline"],
+      shadow: ["raise", "overlay", "panel"],
     },
   },
 });

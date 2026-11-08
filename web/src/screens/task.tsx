@@ -212,7 +212,7 @@ function TaskView({
 
           {summary && (
             <Section id="task-summary" title="Summary" first>
-              <div className="leading-relaxed">
+              <div className="max-w-[100ch] leading-relaxed">
                 <Markdown text={summary} />
               </div>
             </Section>
@@ -220,7 +220,7 @@ function TaskView({
 
           <Section id="task-description" title="Description" first={!summary && !task.feedback}>
             {task.body.trim() ? (
-              <div className="leading-relaxed">
+              <div className="max-w-[100ch] leading-relaxed">
                 <Markdown text={task.body} />
               </div>
             ) : (
@@ -283,7 +283,7 @@ function TaskView({
                         <RelTime at={note.at} />
                       </span>
                     </div>
-                    <p>
+                    <p className="max-w-[100ch]">
                       <PlainText text={note.text} />
                     </p>
                   </li>

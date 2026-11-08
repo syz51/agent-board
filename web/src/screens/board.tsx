@@ -74,6 +74,16 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
   ];
 }
 
+const NO_FILTERS: TaskFilters = { q: "", priority: "", owner: "", readyOnly: false };
+
+/**
+ * Whether a board shows any task before filtering, by the rule the list uses: dropped tasks
+ * and tasks done over 30 days ago do not count. Exported for tests.
+ */
+export function showsTasks(tasks: Task[], now: number): boolean {
+  return groupTasks(tasks, NO_FILTERS, now).some((group) => group.tasks.length > 0);
+}
+
 /** The filters a board's URL holds. */
 export function filtersOf(search: BoardSearch): TaskFilters {
   return {
@@ -148,7 +158,7 @@ export function BoardScreen() {
       >
         <fieldset
           className="contents"
-          disabled={tasks.data === undefined || (!filtered && tasks.data.length === 0)}
+          disabled={tasks.data === undefined || (!filtered && !showsTasks(tasks.data, now))}
         >
           <SearchField
             label="Search tasks"

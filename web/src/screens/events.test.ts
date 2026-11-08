@@ -73,6 +73,11 @@ describe("event marks", () => {
     expect(eventMark(event("task_updated", { from: "doing", to: "review" })).status).toBe("review");
     expect(eventMark(event("task_done", { from: "doing", to: "done" })).status).toBe("done");
     expect(eventMark(event("task_claimed", {})).status).toBe("doing");
+    expect(eventMark(event("task_taken", { from: "t3:aa", status: "review" })).status).toBe(
+      "review",
+    );
+    expect(eventMark(event("task_taken", { from: "t3:aa", status: "doing" })).status).toBe("doing");
+    expect(eventMark(event("task_released", { from: "doing" })).status).toBe("open");
     expect(eventMark(event("ask_created", { ask: 8, kind: "action" })).icon).toBe("hand");
     expect(eventMark(event("evidence_added", { kind: "check", exit_code: 1 })).icon).toBe("cross");
     expect(eventMark(event("evidence_added", { kind: "check", exit_code: 0 })).icon).toBe("shield");

@@ -157,6 +157,13 @@ export function eventMark(event: BoardEvent): {
       return { status: "open", tone: "" };
     case "task_claimed":
       return { status: "doing", tone: "" };
+    case "task_taken": {
+      // Taking a task keeps its status, or moves an open one to doing; the payload says which.
+      const status = typeof payload.status === "string" ? TASK_STATUS[payload.status] : undefined;
+      return { status: status ?? "doing", tone: "" };
+    }
+    case "task_released":
+      return { status: "open", tone: "" };
     case "task_done":
       return { status: "done", tone: "" };
     case "task_updated":
@@ -189,7 +196,7 @@ export function eventMark(event: BoardEvent): {
 }
 
 /** The mark itself: a status symbol or an icon on a node tinted with the mark's own color. */
-export function EventMark({ event, className }: { event: BoardEvent; className?: string }) {
+function EventMark({ event, className }: { event: BoardEvent; className?: string }) {
   const mark = eventMark(event);
   return (
     <span
