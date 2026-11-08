@@ -250,6 +250,23 @@ async fn a_telegram_reply_searches_asks_by_chat_and_message() {
     assert!(!p.contains("SCAN"), "{p}");
 }
 
+/// touch() finds the caller's device peers along `agents_device`, not by scanning every
+/// agent ever registered, once per touched path.
+#[tokio::test]
+async fn touch_peer_lookups_search_agents_by_device() {
+    use crate::ops::leases::{OVERLAP_TOUCHES, PEER_SCANS_DROP, PEER_WROTE};
+    let t = T::new();
+    big_board(&t, 30, 30).await;
+    for sql in [&*PEER_WROTE, &*PEER_SCANS_DROP, &*OVERLAP_TOUCHES] {
+        let p = plan(&t, sql);
+        assert!(
+            p.contains("SEARCH agents USING INDEX agents_device"),
+            "{sql}:\n{p}"
+        );
+        assert!(!p.contains("SCAN agents"), "{sql}:\n{p}");
+    }
+}
+
 /// The two-query recent() picks the same events, in the same order, as the one query it
 /// replaced.
 #[tokio::test]
