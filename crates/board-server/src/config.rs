@@ -300,7 +300,10 @@ pub struct Settings {
     pub snapshot_peer_items: usize,
     pub title_chars: usize,
     pub note_chars: usize,
+    /// Handoff `next` and `blockers`.
     pub handoff_field_chars: usize,
+    /// Handoff `now`, which says where the work stands and runs longer than `next`.
+    pub handoff_now_chars: usize,
     pub question_chars: usize,
     pub body_chars: usize,
     /// Board that feedback items are filed on; created on first use.
@@ -347,10 +350,11 @@ impl Default for Settings {
             snapshot_ready_items: 3,
             snapshot_recent_items: 3,
             snapshot_peer_items: 8,
-            title_chars: 72,
-            note_chars: 500,
+            title_chars: 80,
+            note_chars: 800,
             handoff_field_chars: 300,
-            question_chars: 1000,
+            handoff_now_chars: 400,
+            question_chars: 1500,
             body_chars: 4000,
             feedback_board: "board-feedback".parse().expect("a valid slug"),
             signal_min_reports: 3,
@@ -386,6 +390,7 @@ impl Settings {
             ("title_chars", self.title_chars as u64),
             ("note_chars", self.note_chars as u64),
             ("handoff_field_chars", self.handoff_field_chars as u64),
+            ("handoff_now_chars", self.handoff_now_chars as u64),
             ("question_chars", self.question_chars as u64),
             ("body_chars", self.body_chars as u64),
             ("signal_min_reports", u64::from(self.signal_min_reports)),

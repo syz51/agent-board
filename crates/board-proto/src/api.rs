@@ -424,7 +424,7 @@ pub struct DoneTask {
 }
 
 /// Longest `DoneTask.summary`, in characters.
-pub const SUMMARY_CHARS_MAX: usize = 600;
+pub const SUMMARY_CHARS_MAX: usize = 800;
 
 /// Longest `Said.text`, in characters.
 pub const SAID_CHARS_MAX: usize = 4000;

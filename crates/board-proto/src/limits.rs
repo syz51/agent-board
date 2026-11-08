@@ -41,6 +41,7 @@ pub const CLIENT_CHECKED_FIELDS: &[&str] = &[
     "signature",
     "reason",
     "goal",
+    "summary",
 ];
 
 /// A text field over its length limit, counted in characters.
@@ -111,6 +112,7 @@ pub fn longer_text_goes(field: &str) -> Option<&'static str> {
         "option" => "explain the options in the question",
         "body" | "acceptance" => "split the work into child tasks",
         "evidence value" => "link to the log or artifact instead",
+        "summary" => "put the detail in a note on the task",
         _ => return None,
     })
 }

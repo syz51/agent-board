@@ -135,6 +135,15 @@ async fn ask_fields_are_validated() {
         let (status, code, _) = t.fail("POST", "/v1/asks", Some(A), Some(bad)).await;
         assert_eq!((status, code.as_str()), (400, "invalid"));
     }
+    // A question takes 1,500 characters (ask #98).
+    assert_eq!(defaults().question_chars, 1500);
+    t.ok(
+        "POST",
+        "/v1/asks",
+        Some(A),
+        Some(body(&"q".repeat(1500), vec![])),
+    )
+    .await;
     let (status, _, _) = t
         .fail(
             "POST",

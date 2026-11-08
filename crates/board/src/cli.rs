@@ -8,7 +8,8 @@ use board_proto::{
     ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
     EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
     FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
-    ResolveFeedback, SnapshotFormat, SnapshotKind, TaskId, TaskStatus, UpdateBoard,
+    ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
+    UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -213,7 +214,7 @@ pub enum Command {
     },
     /// Show your handoff, or replace it with --now and --next.
     Handoff {
-        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_field_chars))]
+        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_now_chars))]
         now: Option<String>,
         #[arg(long, requires = "now", help = at_most("The first concrete action", limits().handoff_field_chars))]
         next: Option<String>,
@@ -574,8 +575,10 @@ pub struct DoneArgs {
         EVIDENCE_VALUE_CHARS_MAX,
     ))]
     artifacts: Vec<String>,
-    /// For the user: what changed and what they should know (at most 600 characters).
-    #[arg(long)]
+    #[arg(long, help = at_most(
+        "For the user: what changed and what they should know",
+        SUMMARY_CHARS_MAX,
+    ))]
     summary: Option<String>,
 }
 
@@ -757,6 +760,7 @@ impl Command {
                 for values in [&a.checks, &a.commits, &a.prs, &a.artifacts] {
                     check_all("evidence value", values, EVIDENCE_VALUE_CHARS_MAX)?;
                 }
+                check_opt("summary", &a.summary, SUMMARY_CHARS_MAX)?;
             }
             Self::Note { text, .. } => check_chars("text", text, l.note_chars)?,
             Self::Handoff {
@@ -765,7 +769,7 @@ impl Command {
                 blockers,
                 ..
             } => {
-                check_opt("now", now, l.handoff_field_chars)?;
+                check_opt("now", now, l.handoff_now_chars)?;
                 check_opt("next", next, l.handoff_field_chars)?;
                 check_chars("blockers", blockers, l.handoff_field_chars)?;
             }
@@ -1330,6 +1334,7 @@ mod tests {
             &["add", long],
             &["update", "factory-1", "--title", long],
             &["done", "factory-1", "--pr", long],
+            &["done", "factory-1", "--pr", "x", "--summary", long],
             &["note", "factory-1", long],
             &["handoff", "--now", long, "--next", "x"],
             &["ask", long],
