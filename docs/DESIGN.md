@@ -662,7 +662,8 @@ one task and one section of the prompt, not the days before it.
   needs is on the board.
 
 **The switch**: a board setting `dispatch`, either `thread` (the coordinator, default) or
-`daemon`. Only the user sets it. When a board switches to `daemon`:
+`daemon`, set with `board board set <slug> --dispatch daemon`. When a board switches to
+`daemon`:
 
 1. The daemon stops waking the coordinator thread.
 2. It sends that thread one last message: record each instruction the user gave in chat
