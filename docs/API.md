@@ -404,9 +404,23 @@ is not done (see "Temporary boards").
   `globs` is leased once. Each lease in the answer names its repo. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
   `warning` (absent otherwise) names the board's repos: peers working the task there get no
-  warning from this lease. `lease_paths` (MCP) and `board lease` print it as a `warning:` line
-  above the leases.
+  warning from this lease. With a `task` that is `done` or `dropped`, the leases are taken
+  without a task and the `warning` says so. Leasing a glob the caller already holds renews
+  the same lease; when the live lease named another task, or none, the lease then names no
+  task and the `warning` lists those globs, so closing one task never ends a lease another
+  still needs. Several warnings are joined with `; `. `lease_paths` (MCP) and `board lease`
+  print it as a `warning:` line above the leases.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
+- Leases end with their task. When a task goes to `done` (`/done`, or a feedback item's
+  `/resolve`), `dropped` (`PATCH`, by whoever may move it) or `open` (`/release`, or
+  `PATCH`), every lease whose `task` names it is deleted, whoever holds it, in the same
+  transaction: work on it has stopped, and an open task's next owner should not be warned
+  about its own files. Each records `lease_released` on the task's board, with the task, by
+  the agent that moved it, with payload `{id, agent, repo, glob}` (`agent` is the holder, as
+  in `lease_expired`; an explicit `DELETE` records `{id, repo, glob}` by the holder, with no
+  board). A task moved to `blocked` or `review`, or handed to another owner, keeps its
+  leases. (Servers before this change kept such leases until their holder ended or they
+  expired.)
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
   paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
