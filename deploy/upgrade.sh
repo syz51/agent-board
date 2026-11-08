@@ -109,9 +109,11 @@ image_repo=${image#ghcr.io/}
 verify_image() {
     command -v gh >/dev/null ||
         die "gh checks the image's provenance and is not installed: install it, or pass --build to build on the server"
-    gh auth status >/dev/null 2>&1 ||
-        die "gh is not logged in: run gh auth login, or pass --build to build on the server"
-    local digest
+    local status digest
+    if ! status=$(gh auth status 2>&1); then
+        printf '%s\n' "$status" >&2
+        die "gh auth status failed (its output is above); nothing was changed. Either gh is not logged in: run gh auth login. Or gh cannot reach GitHub: fix the network and run again. Or pass --build to build on the server"
+    fi
     digest=$(gh attestation verify "oci://$image:sha-$sha" --repo "$image_repo" \
         --signer-workflow "$image_repo/.github/workflows/ci.yml" --source-ref refs/heads/main \
         --source-digest "$sha" --deny-self-hosted-runners --format json \
