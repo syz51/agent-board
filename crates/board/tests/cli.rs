@@ -826,6 +826,17 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
         "{}",
         stdout(&out)
     );
+    // A server clock a few minutes ahead of this one is not a history that starts late.
+    recent.since =
+        Some(chrono::Utc::now() - chrono::TimeDelta::days(7) + chrono::TimeDelta::minutes(5));
+    e.stub.on("GET /v1/stats", &recent);
+    let out = e.run(&["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("stats, last 7 days\n"),
+        "{}",
+        stdout(&out)
+    );
     e.stub.on("GET /v1/stats", &stats);
 
     // `--json` prints the server's `Stats` unchanged: the weekly review reads it.
@@ -836,12 +847,12 @@ fn stats_asks_for_the_days_and_prints_a_summary_or_the_stats_json() {
     let json: Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(json["doing_minutes_median"], Value::Null);
     assert_eq!(json["boards"][0]["wait_minutes_p90"], 90.0);
-    assert_eq!(e.stub.requests_to("GET /v1/stats")[2].query, "days=30");
+    assert_eq!(e.stub.requests_to("GET /v1/stats")[3].query, "days=30");
 
     // Out-of-range days fail before any request; stats do not register the agent.
     let out = e.run(&["stats", "--days", "0"]);
     assert!(!out.status.success());
-    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 3);
+    assert_eq!(e.stub.requests_to("GET /v1/stats").len(), 4);
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
 }
 

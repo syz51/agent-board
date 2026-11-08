@@ -524,18 +524,24 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   predate it); and `boards` (empty from servers that predate it), one `[BoardStats]` per
   board with events in the period, by slug: `board`; `claims`, claims of auto tasks that
   waited ready (tasks created claimed are left out), with `wait_minutes_median` and
-  `wait_minutes_p90` from ready to claimed (ready from the latest of: created, released,
-  moved to `open`, `auto`, blockers or `not_before` changed, `not_before` passed, last
-  blocker done); `tasks_done` and `done_per_day`; `doing_minutes_median`, time in `doing`
-  with `review` excluded; `lease_conflicts`, lease conflicts and file-touch overlaps on the
-  board's repos; `reopened_after_review`, moves from `review` to `open`, `doing` or
-  `blocked`; `pr_links` in the evidence of the tasks done; `limit_pauses` of member agents
-  and `limit_pauses_per_day`; `paused_hours`, until each pause's reset, an earlier move to
-  a working state, or now; and `peak_running_at_pause`, the most member agents running when
-  one paused (`null` without pauses). Rates are per day since `since`, and medians and
-  percentiles are `null` when nothing was measured. Without `--json` it prints a
-  summary, says when the history starts within the period asked, and adds one
-  line per board.
+  `wait_minutes_p90` from ready to claimed. A task is ready at the latest of: its last
+  creation, release, move to `open`, or change of `auto`, blockers or `not_before`; the
+  `not_before` it has then (the one it was created with until a change); and its last
+  blocker done. A cleared or earlier `not_before` makes it ready sooner. `tasks_done` and
+  `done_per_day`; `doing_minutes_median`, time in `doing` since the task was last done,
+  with `review` excluded; `lease_conflicts`, lease conflicts and file-touch overlaps in the
+  board's repos, whichever task a lease names, if any; `reopened_after_review`, moves from
+  `review` to `open`, `doing` or `blocked`; `pr_links` in the evidence of the tasks done;
+  `limit_pauses` of member agents after they joined, and `limit_pauses_per_day`;
+  `paused_hours`, until each pause's reset, an earlier move to a working state, the
+  session's end when the pause named no reset, or now (a repeated pause before the reset
+  extends it to a later reset named; one after the reset is a new pause); and `peak_running_at_pause`, the most member agents running when one
+  paused (`null` without pauses). A member counts as running when its latest registration
+  or state change before the pause left it running and it acted within the owner
+  staleness threshold before it. Rates are per day since `since`, and medians and
+  percentiles are `null` when nothing was measured. Without `--json` it prints a summary,
+  says when the history starts more than an hour into the period asked, and adds one line
+  per board.
 - `board errors [--since T] [--code C] [--route R] [--grep TEXT] [--limit N] --json` →
   `[ErrorLog]` from `GET /v1/errors`. `--since` takes an RFC 3339 time, a date
   (`YYYY-MM-DD`, midnight UTC) or a duration back from now (`30m`, `12h`, `14d`); `--grep`
