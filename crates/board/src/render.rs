@@ -555,13 +555,18 @@ pub fn event_list(events: &[Event]) -> String {
     events.iter().map(event_line).collect::<Vec<_>>().join("\n")
 }
 
-pub fn lease_line(lease: &Lease) -> String {
+/// One of the caller's own leases, with its task. It omits the agent: the caller knows who
+/// it is, and a delegated thread's id is too long to repeat on every line.
+fn lease_line(lease: &Lease) -> String {
+    let task = lease
+        .task
+        .as_ref()
+        .map_or_else(|| "no task".into(), TaskId::to_string);
     format!(
-        "lease #{} {} {} by {} expires {}",
+        "lease #{} {} {} for {task} expires {}",
         lease.id,
         lease.repo,
         title(&lease.glob),
-        lease.agent,
         ago(lease.expires_at)
     )
 }
@@ -946,5 +951,42 @@ mod tests {
         let mut bare = detail;
         bare.handles.clear();
         assert!(task_detail(&bare, true).contains(&format!(" owner {LONG}")));
+    }
+
+    #[test]
+    fn own_leases_name_their_task_and_not_the_agent() {
+        const LONG: &str = "t3:thread:delegated-task:command%3Amcp%3A8f8e";
+        let lease = |id: i64, task: Option<&str>, glob: &str| -> Lease {
+            serde_json::from_value(json!({
+                "id": id, "agent": LONG, "task": task, "repo": "github.com/acme/web",
+                "glob": glob, "expires_at": Utc::now() + TimeDelta::minutes(30),
+            }))
+            .unwrap()
+        };
+        let result = LeaseResult {
+            leases: vec![
+                lease(90, Some("acme-8"), "src/**"),
+                lease(91, None, "web/**"),
+            ],
+            conflicts: vec![],
+            warning: None,
+        };
+        let text = lease_result(&result, &LeaseHolders::default());
+        assert!(!text.contains("delegated-task"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].starts_with("lease #90 github.com/acme/web \"src/**\" for acme-8 expires in "),
+            "{text}"
+        );
+        assert!(
+            lines[1]
+                .starts_with("lease #91 github.com/acme/web \"web/**\" for no task expires in "),
+            "{text}"
+        );
+        // The --json output is the server's answer as it is, still with each lease's agent.
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["leases"][0]["agent"], LONG);
+        assert_eq!(value["leases"][1]["task"], Value::Null);
     }
 }
