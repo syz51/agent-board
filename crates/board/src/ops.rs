@@ -1020,9 +1020,9 @@ pub async fn errors(ctx: &Ctx, q: &ErrorsQuery) -> Result<Output> {
     Ok(Output::new(render::errors(&log), &log))
 }
 
-pub async fn stats(ctx: &Ctx, days: u32) -> Result<Output> {
+pub async fn stats(ctx: &Ctx, days: u32, now: Timestamp) -> Result<Output> {
     let stats = ctx.client.stats(days).await?;
-    Ok(Output::new(render::stats(&stats), &stats))
+    Ok(Output::new(render::stats(&stats, now), &stats))
 }
 
 /// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a

@@ -12,7 +12,7 @@ use board_proto::{
     Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Handoff, Lease, LeaseResult, Note,
     NoteKind, Stats, Task, TaskDetail, TaskStatus, Timestamp, TouchResult,
 };
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 
 /// Header above peer-written free text.
@@ -607,17 +607,27 @@ pub fn errors(log: &ErrorLog) -> String {
 }
 
 /// `board stats`: the feedback-loop counts, one topic per line. A server that predates
-/// feedback items reports zero feedback.
-pub fn stats(stats: &Stats) -> String {
+/// feedback items reports zero feedback. `now` is the caller's clock.
+pub fn stats(stats: &Stats, now: Timestamp) -> String {
     let minutes = |m: Option<f64>| m.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.0}m"));
     let day = if stats.days == 1 { "day" } else { "days" };
-    format!(
-        "stats, last {} {day}\n\
+    // The server's history starts after the window asked for: say what it covers. The hour
+    // of slack keeps a server clock a little ahead of this one from setting it off.
+    let truncated_after = now - TimeDelta::days(i64::from(stats.days)) + TimeDelta::hours(1);
+    let window = match stats.since {
+        Some(since) if since > truncated_after => format!(
+            "since {}, where the server's history starts (asked: last {} {day})",
+            since.format("%Y-%m-%d %H:%MZ"),
+            stats.days
+        ),
+        _ => format!("last {} {day}", stats.days),
+    };
+    let mut out = format!(
+        "stats, {window}\n\
          tasks: {} created · {} done ({} without a check, {} under a minute in doing) · median {} in doing\n\
          claims: {} refused · {} stale owners taken over · {} lease conflicts\n\
          asks: {} created · {} answered · median {} to answer\n\
          feedback: {} reported · {} filed · resolved {} routed, {} duplicate, {} forwarded, {} declined, {} fixed",
-        stats.days,
         stats.tasks_created,
         stats.tasks_done,
         stats.done_without_check_evidence,
@@ -638,7 +648,33 @@ pub fn stats(stats: &Stats) -> String {
         stats.feedback.resolved.forwarded,
         stats.feedback.resolved.declined,
         stats.feedback.resolved.fixed,
-    )
+    );
+    for b in &stats.boards {
+        let _ = write!(
+            out,
+            "\nboard {}: wait median {}, p90 {} over {} · {:.1} done a day, median {} in doing · \
+             {} reopened after review · {} · {} · limit: {} ({:.1} a day), {:.1}h paused, {} running at most when one paused",
+            b.board,
+            minutes(b.wait_minutes_median),
+            minutes(b.wait_minutes_p90),
+            plural(b.claims as usize, "claim", "claims"),
+            b.done_per_day,
+            minutes(b.doing_minutes_median),
+            b.reopened_after_review,
+            plural(
+                b.lease_conflicts as usize,
+                "lease conflict",
+                "lease conflicts"
+            ),
+            plural(b.pr_links as usize, "PR link", "PR links"),
+            plural(b.limit_pauses as usize, "pause", "pauses"),
+            b.limit_pauses_per_day,
+            b.paused_hours,
+            b.peak_running_at_pause
+                .map_or_else(|| "n/a".to_owned(), |n| n.to_string()),
+        );
+    }
+    out
 }
 
 /// One warning line per overlap, or nothing.
