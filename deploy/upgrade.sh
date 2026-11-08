@@ -5,14 +5,14 @@
 #
 # REV is a full commit SHA on main or a v* release tag whose commit is on main. The server
 # runs the image CI published for that commit (ghcr.io/syz51/agent-board:sha-<commit>):
-# this script checks its build provenance with `gh attestation verify` and the server pulls
-# it by digest. --build builds the image on the server instead. Without --yes the script
-# prints the plan (each host: current revision -> new revision) and changes nothing. With
-# --yes it locks the server, pulls or builds the new image, backs up the database,
-# restarts the server and waits for /healthz, then installs the board CLI at REV on each
-# device and restarts its `board watch` daemon. It stops at the first failure and says
-# what to do next. It refuses a REV older than a host's current one unless --rollback is
-# given.
+# before it upgrades the server, this script checks the image's build provenance with
+# `gh attestation verify` and the server pulls it by digest. --build builds the image on
+# the server instead. Without --yes the script prints the plan (each host: current
+# revision -> new revision) and changes nothing. With --yes it locks the server, pulls or
+# builds the new image, backs up the database, restarts the server and waits for /healthz,
+# then installs the board CLI at REV on each device and restarts its `board watch` daemon.
+# It stops at the first failure and says what to do next. It refuses a REV older than a
+# host's current one unless --rollback is given.
 #
 # Hosts come from a config file outside the repository (docs/DEPLOY.md, "Upgrade"):
 #   server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
@@ -98,25 +98,29 @@ short=${sha:0:12}
 # --- Image -----------------------------------------------------------------------------
 
 # The server pulls the image by digest, and only a digest whose provenance says it was
-# built by this repository's CI from this commit on main, on a GitHub-hosted runner.
+# built by this repository's CI from this commit on main, on a GitHub-hosted runner. The
+# provenance is checked only by a run that applies a server upgrade (see "Apply").
 image=${BOARD_IMAGE:-ghcr.io/syz51/agent-board}
 [[ $image =~ ^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+$ ]] ||
     die "BOARD_IMAGE must be ghcr.io/<owner>/<repository>, the image CI publishes"
 image_repo=${image#ghcr.io/}
-if [ $build = 1 ]; then
-    image_ref=build
-else
+
+# verify_image: prints the one digest of $image:sha-$sha whose provenance checks out.
+verify_image() {
     command -v gh >/dev/null ||
         die "gh checks the image's provenance and is not installed: install it, or pass --build to build on the server"
+    gh auth status >/dev/null 2>&1 ||
+        die "gh is not logged in: run gh auth login, or pass --build to build on the server"
+    local digest
     digest=$(gh attestation verify "oci://$image:sha-$sha" --repo "$image_repo" \
         --signer-workflow "$image_repo/.github/workflows/ci.yml" --source-ref refs/heads/main \
         --source-digest "$sha" --deny-self-hosted-runners --format json \
         --jq '[.[].verificationResult.statement.subject[].digest.sha256] | unique | .[]') ||
-        die "no image with verified provenance at $image:sha-$sha (see above). CI publishes one for each push to main in its 'image' job: wait for it, upgrade to a later commit on main, or pass --build to build on the server"
+        die "gh found no image with verified provenance at $image:sha-$sha; nothing was changed. Read gh's output above. CI publishes an image only for a commit that was the head of a push to main (its 'image' job), so a recent commit may have none yet and an older commit or a v* tag on another commit has none: wait for the job, upgrade to a later commit on main, or pass --build to build on the server. The verification itself can fail too (gh too old for these flags, or no network): fix that and run again"
     [[ $digest =~ ^[0-9a-f]{64}$ ]] ||
-        die "the provenance of $image:sha-$sha names '$digest', not one sha256 digest: pass --build to build on the server"
-    image_ref="$image@sha256:$digest"
-fi
+        die "the provenance of $image:sha-$sha names '$digest', not one sha256 digest; nothing was changed: pass --build to build on the server"
+    printf '%s\n' "$digest"
+}
 
 # --- Hosts ---------------------------------------------------------------------------
 
@@ -261,10 +265,12 @@ else
     echo "  server $server: ${server_prev:0:12} (running ${server_running}) -> $short"
 fi
 check_order "server" "$server_prev"
-if [ "$image_ref" = build ]; then
+if [ $server_skip = 1 ]; then
+    : # The server keeps its image.
+elif [ $build = 1 ]; then
     echo "  image: built on the server (--build)"
 else
-    echo "  image: $image_ref (provenance checked)"
+    echo "  image: $image:sha-$sha (provenance checked when applied)"
 fi
 i=0
 while [ $i -lt ${#devices[@]} ]; do
@@ -286,6 +292,14 @@ if [ $yes = 0 ]; then
     exit 0
 fi
 
+# Only a server upgrade needs the image, so a rerun that finishes the devices needs no gh.
+image_ref=build
+if [ $server_skip = 0 ] && [ $build = 0 ]; then
+    digest=$(verify_image) || exit 1
+    image_ref="$image@sha256:$digest"
+    echo "image: provenance verified for $image_ref"
+fi
+
 # The revision to roll back to: the server's before this run, or, when an earlier run
 # already moved it, the one that run recorded.
 back=$server_prev
@@ -293,7 +307,8 @@ if [ "$back" = "$sha" ]; then
     back=$server_recorded
 fi
 if [[ $back =~ $sha_re ]]; then
-    rollback_hint="to roll back the code: $(printf '%q' "$0") --config $(printf '%q' "$config") --rollback --yes $back (pre-upgrade backups are in $(dirname "$db") on the server; migrations do not run backwards)"
+    # --build, since a commit from before CI published images has none to pull.
+    rollback_hint="to roll back the code: $(printf '%q' "$0") --config $(printf '%q' "$config") --rollback --build --yes $back (pre-upgrade backups are in $(dirname "$db") on the server; migrations do not run backwards)"
 else
     rollback_hint="the server records no earlier revision to roll back to"
 fi

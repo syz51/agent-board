@@ -173,16 +173,27 @@ commit SHA on `main`, or a `v*` release tag whose commit is on `main`. Both are 
 against the repository the hosts install from (`BOARD_GIT_URL`, default this one on
 GitHub), not against the clone's own remotes.
 
-The server runs the image CI publishes for each push to `main`:
-`ghcr.io/syz51/agent-board:sha-<commit>` (linux/amd64, built on a GitHub-hosted runner,
-with build provenance). The script checks that provenance on the device it runs on with
-`gh attestation verify`: the image must come from this repository's `ci.yml`, from that
-commit on `main`, on a GitHub-hosted runner. The server then pulls the image by the
-verified digest, so it runs exactly what was checked. The device needs `gh` (logged in);
-the server needs to reach `ghcr.io`. A commit whose CI run was cancelled or has not
-finished has no image yet: wait for the `image` job, upgrade to a later commit, or pass
-`--build`, which builds the image on the server as before (minutes of full CPU on a small
-host). `BOARD_IMAGE` (default `ghcr.io/syz51/agent-board`) names another image for a fork.
+The server runs the image CI publishes for each push to `main`, once every other check
+passes: `ghcr.io/syz51/agent-board:sha-<commit>` (built on a GitHub-hosted runner, smoke
+tested, with build provenance). When a run with `--yes` upgrades the server, the script
+checks that provenance on the device it runs on with `gh attestation verify`: the image
+must come from this repository's `ci.yml`, from that commit on `main`, on a GitHub-hosted
+runner. The server then pulls the image by the verified digest, so it runs exactly what
+was checked. The device needs `gh`, logged in (`gh auth login`); the server needs to reach
+`ghcr.io`. A plan without `--yes`, and a rerun that only finishes the devices, do not call
+`gh`. `BOARD_IMAGE` (default `ghcr.io/syz51/agent-board`) names another image for a fork.
+
+`--build` builds the image on the server instead, as before (minutes of full CPU on a
+small host). Pass it when there is no image to pull:
+
+- The server is not linux/amd64. CI publishes that platform only.
+- The commit's CI run was cancelled or has not finished: wait for the `image` job, upgrade
+  to a later commit, or build.
+- The commit was never the head of a push to `main`: a commit in the middle of a pushed
+  range, a `v*` tag on such a commit, or a commit from before CI published images.
+
+The rollback command the script prints passes `--build`, so it works for any earlier
+commit.
 
 ```sh
 deploy/upgrade.sh 0123456789abcdef0123456789abcdef01234567          # print the plan only
@@ -211,18 +222,22 @@ nothing. With `--yes` it:
    that died, and is replaced.
 2. Refuses a revision older than any host's current one, so a late run cannot install an
    older build. `--rollback` allows it on purpose.
-3. On the server, checks out the revision (a detached `HEAD`) and pulls the verified image
-   (or builds it with `--build`) while the old server keeps running. A failed pull or build
-   puts the clone back.
-4. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
+3. Verifies the image's provenance, unless the server already runs the revision or
+   `--build` is given.
+4. On the server, checks out the revision (a detached `HEAD`) and pulls the verified image
+   and tags it `agent-board:local` (or builds it with `--build`) while the old server keeps
+   running. A failed pull or build puts the clone and the tag back.
+5. Writes a fresh backup to `pre-upgrade-<UTC time>.db` beside the database with `board
    admin backup` in the running container, and checks it is not empty. It keeps the five
-   newest of these copies; the backup timer keeps the history.
-5. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
-   reports that commit.
-6. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
+   newest of these copies; the backup timer keeps the history. A failed backup puts the
+   clone and the tag back.
+6. Starts the new container with `BOARD_COMMIT=<commit>` and waits until `/healthz`
+   reports that commit. Then it removes the image the old container ran; it removes no
+   other image.
+7. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
    it is already installed, restarts `board watch` (launchd or the systemd user unit), and
    checks `cargo install --list`.
-7. Prints each device's revision, the previous ones, and the rollback command.
+8. Prints each device's revision, the previous ones, and the rollback command.
 
 It stops at the first failed step and says what to do next. A failed server step leaves
 every device unchanged. After any failure, fix the cause and run the same command again:

@@ -75,22 +75,32 @@ server-upgrade)
     git fetch --quiet "$url" main || fail "git fetch of $url in $clone failed: the server is unchanged"
     git checkout --quiet --detach "$sha" ||
         fail "git checkout $sha in $clone failed: the server is unchanged"
+    # The image agent-board:local names now, if any: a failure below names it again, and
+    # a healthy start removes it.
+    prev_image=$(docker image inspect -f '{{.Id}}' agent-board:local 2>/dev/null) || prev_image=""
+    # undo: puts the clone and agent-board:local back where they were.
+    undo() {
+        git checkout --quiet --detach "$prev"
+        if [ -n "$prev_image" ] && ! docker tag "$prev_image" agent-board:local; then
+            echo "upgrade: could not name $prev_image agent-board:local again: run 'docker tag $prev_image agent-board:local' on the server" >&2
+        fi
+    }
     # Get the image before the backup, so the copy misses only the seconds of the restart.
     # The running container keeps its image when agent-board:local moves.
     if [ "$image" = build ]; then
         if ! BOARD_COMMIT=$short compose build board; then
-            git checkout --quiet --detach "$prev"
+            undo
             fail "the image build failed at $short: the server still runs the old image and the clone is back at $prev. Read the output above, fix it, and run again"
         fi
     elif ! docker pull --quiet "$image" >/dev/null || ! docker tag "$image" agent-board:local; then
-        git checkout --quiet --detach "$prev"
-        fail "pulling $image failed: the server still runs the old image and the clone is back at $prev. Check that the server reaches ghcr.io and run again, or pass --build to build on the server"
+        undo
+        fail "pulling $image failed: the server still runs the old image and the clone is back at $prev. The server may not reach ghcr.io, or may not be linux/amd64, the only platform CI publishes: fix the first and run again, or pass --build to build on the server"
     fi
     ts=$(date -u +%Y%m%dT%H%M%SZ)
     backup="$data/pre-upgrade-$ts.db"
     if ! compose exec -T board board admin backup --db "$db" --out "$backup" >/dev/null ||
         [ ! -s "$backup" ]; then
-        git checkout --quiet --detach "$prev"
+        undo
         fail "the backup to $backup failed, so the old server keeps running and the clone is back at $prev: check 'docker compose -f $clone/deploy/compose.yaml ps' and the container's logs. A server that is not running needs the manual steps in docs/DEPLOY.md"
     fi
     echo "backup: $backup"
@@ -111,6 +121,13 @@ server-upgrade)
         body=$(health "$port")
         case "$body" in *"\"commit\":\"$short\""*)
             echo "healthz: $(printf '%s' "$body" | grep -o '"\(ok\|version\|commit\|schema_version\)":[^,}]*' | tr '\n' ' ')"
+            # Remove the image the old container ran, so images do not pile up. Docker
+            # refuses while another container or tag still uses it; that is fine.
+            new_image=$(docker image inspect -f '{{.Id}}' agent-board:local 2>/dev/null) || new_image=""
+            if [ -n "$prev_image" ] && [ -n "$new_image" ] && [ "$prev_image" != "$new_image" ] &&
+                docker image rm "$prev_image" >/dev/null 2>&1; then
+                echo "removed the previous image $prev_image"
+            fi
             exit 0
             ;;
         esac
