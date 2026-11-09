@@ -800,10 +800,10 @@ settings in use, warned once per edit.
 Status: partly built (agent-board-308; the user chose it on 2026-11-08). Built: the
 `dispatch` board setting, the `dispatch` agent and judge registration, with their rights
 and records (`docs/API.md`, "Daemon dispatch"); the worker and judge briefs
-(`prompts/worker.md`, `prompts/judges/`); and the dispatcher's lease and its worker starts
-at one slot. Each is marked "built" below. Not built yet: more than one slot, the
-lease-overlap skip, the gone-asker and away-owner steps, the judges, merging and
-finishing, the switch's last message and the rollout. It replaces the
+(`prompts/worker.md`, `prompts/judges/`); the dispatcher's lease, its worker starts in
+every slot, the lease-overlap skip, and the gone-asker and away-owner steps. Each is
+marked "built" below. Not built yet: the judges, merging and finishing, the switch's last
+message and the rollout. It replaces the
 coordinator thread above one board at a time. Until a board switches, the previous
 section holds for that board.
 
@@ -858,18 +858,18 @@ one task and one section of the prompt, not the days before it.
 | PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task |
 | A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals |
 | An ask answered, asker can be woken | The asker, as today |
-| An ask answered, asker gone | The dispatcher: a `decision` note with the answer, then the task back to `open` |
-| An owner away from `doing` | Wake it as today. At the repeat, if it is still away, the dispatcher sets the task `open` with a note naming the old thread and branch |
+| An ask answered, asker gone | The dispatcher: a `decision` note with the answer, then the task back to `open` (built) |
+| An owner away from `doing` | Wake it as today. At the repeat, if it is still away, the dispatcher sets the task `open` with a note naming the old thread and branch (built) |
 | Nothing ready or in progress, goal review due | A goal judge |
 | A ready item on the feedback board | A triage judge |
 | A changed standing prompt | Nothing: each new thread starts with the current briefs |
 
 **Slots**: `parallel_tasks` still limits the tasks in progress: tasks in `doing` that
 workers own, plus tasks the dispatcher started a worker for that it has not claimed yet.
-Built: one slot, whatever `parallel_tasks` says. Any task in `doing` on the board takes it,
-whoever owns it, such as a child of the coordinator thread from before the switch. Until
-the lease-overlap skip is built, a worker that leaves its task `open`, ends without
-claiming it, or whose start fails, frees the slot and keeps that task waiting 30 minutes.
+Built: any task in `doing` on the board takes a slot, whoever owns it, such as a child of
+the coordinator thread from before the switch. A worker that ends without claiming its
+task, or whose start fails, frees the slot and keeps that task waiting 30 minutes. So does
+a worker that gives its task back while no other task is in progress.
 Judges do not count, but at most 2 judges run per board at once. The rest wait, oldest
 first. With one slot, the dispatcher takes the highest-priority ready `auto` task, the
 oldest first on a tie. With more slots, code checks only the mechanical rules:
@@ -877,9 +877,20 @@ oldest first on a tie. With more slots, code checks only the mechanical rules:
 - Neither task waits on the other.
 - No agent of the board stopped on a usage limit since the tasks in progress started.
 
+Built: a task waits on another when either lists the other among its blockers. A task in
+progress started when its worker started, or, for one no worker here follows, at its last
+update. A usage-limit stop is an agent's move to `paused`. While a task in progress cannot
+be read, nothing starts beside it.
+
+**Gone asker and away owner** (built): an asker cannot be woken when it is no T3 thread
+and has ended or is unknown, or when its thread is gone. An away owner's task is released
+at the server's repeat notice, or as soon as a wake-up finds its thread gone. A dispatcher
+that missed both notices, such as one deployed after them, does not release the task.
+
 The file rules are left to the worker's lease check. A worker whose lease overlaps
 another task in progress stops and leaves its task `open`. The dispatcher skips that task
-until a task in progress ends. The rules a coordinator judged by eye (size L, shared kinds
+until a task in progress ends (built: it skips a task its worker gave back while other
+tasks were in progress, until one of those leaves `doing`). The rules a coordinator judged by eye (size L, shared kinds
 of files) are dropped. The revisit measures what dropping them costs.
 
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>

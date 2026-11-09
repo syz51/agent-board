@@ -39,8 +39,10 @@
 //!
 //! A board set to daemon dispatch (`dispatch: daemon`) runs no coordinator thread: this
 //! daemon holds its coordinator lease as `dispatch:<device>` and starts a worker thread for
-//! the next ready task while a slot is free (see [`Worker`]). Its agents get the wake-ups
-//! above as before, but no coordinator is woken or re-briefed.
+//! each next ready task while one of its `parallel_tasks` slots is free (see [`Worker`]).
+//! Its agents get the wake-ups above as before, but no coordinator is woken or re-briefed:
+//! what would go to it for an agent no device can wake (an answer to a gone asker, an owner
+//! still away at the repeat idle notice) the dispatcher does itself (see [`Owed`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -50,7 +52,7 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, DeviceName, Dispatch, ErrorCode, Event, EventType, NoteKind, Priority,
-    RegisterAgent, Runtime, Task, TaskId, TaskStatus, Timestamp, Usage,
+    RegisterAgent, Runtime, Task, TaskId, TaskStatus, Timestamp, UpdateTask, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -118,10 +120,17 @@ pub const CHECK_FAIL_RELEASE: TimeDelta = TimeDelta::minutes(10);
 /// How long a worker thread may take to claim its task: one that has not by then, or whose
 /// session ended first, no longer holds a slot.
 pub const WORKER_CLAIM_WAIT: TimeDelta = TimeDelta::minutes(20);
-/// How long a task whose worker gave it back to `open`, or never claimed it, waits before
-/// the dispatcher starts another worker for it, so a worker that stops at once (a lease
-/// overlap, a failing session) is not started again on every reconcile.
+/// How long a task whose worker never claimed it, whose start failed, or that its worker
+/// gave back to `open` while no other task was in progress, waits before the dispatcher
+/// starts another worker for it, so a worker that stops at once (a failing session) is not
+/// started again on every reconcile. One given back while other tasks were in progress, as
+/// a lease overlap does, waits instead until one of those ends ([`WatchState::worker_skips`]).
 pub const WORKER_RETRY: TimeDelta = TimeDelta::minutes(30);
+/// How long a usage-limit stop is remembered: it holds a further worker back only while a
+/// task in progress started before it.
+pub const USAGE_STOP_KEPT: TimeDelta = TimeDelta::days(7);
+/// How many tasks in `doing` the dispatcher reads per board to count its slots.
+const DOING_READ: u32 = 100;
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -227,6 +236,106 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub worker_retry: BTreeMap<TaskId, Timestamp>,
+    /// Tasks whose worker gave them back to `open` while other tasks were in progress (a
+    /// lease overlap, `prompts/worker.md` step 3), with those tasks: no worker starts for
+    /// one until a task in its set is no longer in progress. Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_worker_skips",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub worker_skips: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    /// The last usage-limit stop of each agent (its move to `paused`), kept for
+    /// [`USAGE_STOP_KEPT`]: a further worker starts beside the tasks in progress only when
+    /// no agent of the board stopped since they started. Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_usage_stops",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub usage_stops: BTreeMap<AgentId, Timestamp>,
+    /// The first idle notice of each task in `doing` on a board this device dispatches: the
+    /// server's repeat of the same spell releases the task when its owner is still away.
+    /// Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_idle_notices",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub idle_notices: BTreeMap<TaskId, IdleNotice>,
+    /// Steps the dispatcher owes for agents it cannot wake, done on its next reconcile.
+    /// Those this version cannot read are skipped.
+    #[serde(
+        default,
+        deserialize_with = "lenient_owed",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub owed: Vec<Owed>,
+}
+
+/// The server's first notice that a task's owner is away from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdleNotice {
+    pub away: AgentId,
+    /// Since when the owner has been away, as the notice says.
+    pub since: Timestamp,
+    /// When the notice came.
+    pub noticed: Timestamp,
+}
+
+/// A step the dispatcher of a board owes for an agent no device can wake
+/// (`docs/DESIGN.md`, "Daemon dispatch", Routing).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum Owed {
+    /// An ask answered whose asker is gone: a `decision` note with the answer on its task,
+    /// then the task back to `open`. `check_gone` when nothing has shown yet that the
+    /// asker is gone: the step is done only when it has ended or is unknown.
+    Answer {
+        board: BoardSlug,
+        ask: i64,
+        asker: AgentId,
+        check_gone: bool,
+        /// Whether the note is on the task, so a retry does not add it twice.
+        #[serde(default)]
+        noted: bool,
+        at: Timestamp,
+    },
+    /// An owner still away at the repeat of the idle notice, or whose thread is gone: the
+    /// task back to `open` with a note naming its old thread and branch.
+    Release {
+        board: BoardSlug,
+        task: TaskId,
+        away: AgentId,
+        since: Timestamp,
+        noticed: Timestamp,
+        #[serde(default)]
+        noted: bool,
+        at: Timestamp,
+    },
+}
+
+impl Owed {
+    fn board(&self) -> &BoardSlug {
+        match self {
+            Owed::Answer { board, .. } | Owed::Release { board, .. } => board,
+        }
+    }
+
+    fn at(&self) -> Timestamp {
+        match self {
+            Owed::Answer { at, .. } | Owed::Release { at, .. } => *at,
+        }
+    }
+
+    /// Whether `other` is the same step: the same ask, or the same task.
+    fn same(&self, other: &Owed) -> bool {
+        match (self, other) {
+            (Owed::Answer { ask: a, .. }, Owed::Answer { ask: b, .. }) => a == b,
+            (Owed::Release { task: a, .. }, Owed::Release { task: b, .. }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// A worker thread the dispatcher started for one task. It holds one of the board's
@@ -249,6 +358,39 @@ pub struct Worker {
     /// Whether its thread is noted on the task.
     #[serde(default)]
     pub noted: bool,
+}
+
+/// A task that holds one of a board's slots, as the dispatcher counts them.
+#[derive(Debug, Clone)]
+struct InProgress {
+    /// `None` when it could not be read: nothing starts beside it then.
+    task: Option<Task>,
+    /// When it started: its worker's start, else its last update.
+    since: Timestamp,
+}
+
+/// What became of a worker the dispatcher follows.
+#[derive(Debug, Clone)]
+enum Followed {
+    /// It holds its slot: it has its task in `doing`, or may still claim it. `task` is
+    /// `None` when the task could not be read.
+    Holds {
+        task: Option<Box<Task>>,
+        since: Timestamp,
+    },
+    /// It claimed its task and gave it back to `open`.
+    Left,
+    /// It no longer holds a slot for any other reason.
+    Freed,
+}
+
+/// Whether neither `task` nor any task in progress waits on the other.
+fn independent(task: &Task, in_progress: &BTreeMap<TaskId, InProgress>) -> bool {
+    !task.blockers.iter().any(|b| in_progress.contains_key(b))
+        && !in_progress
+            .values()
+            .filter_map(|p| p.task.as_ref())
+            .any(|p| p.blockers.contains(&task.id))
 }
 
 /// The wake-up messages to one agent whose send timed out: T3 may or may not have
@@ -456,6 +598,53 @@ fn lenient_worker_retry<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::deserialize(d)?,
         "the worker retry",
     ))
+}
+
+/// Each task's skip read on its own, like [`lenient_queues`].
+fn lenient_worker_skips<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, BTreeSet<TaskId>>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the worker skip",
+    ))
+}
+
+/// Each agent's usage-limit stop read on its own, like [`lenient_queues`].
+fn lenient_usage_stops<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<AgentId, Timestamp>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the usage-limit stop",
+    ))
+}
+
+/// Each task's idle notice read on its own, like [`lenient_queues`].
+fn lenient_idle_notices<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, IdleNotice>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the idle notice",
+    ))
+}
+
+/// Owed steps read one by one; those this version cannot read are skipped.
+fn lenient_owed<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Owed>, D::Error> {
+    let serde_json::Value::Array(steps) = serde_json::Value::deserialize(d)? else {
+        return Ok(Vec::new());
+    };
+    Ok(steps
+        .into_iter()
+        .filter_map(|step| match serde_json::from_value(step) {
+            Ok(step) => Some(step),
+            Err(_) => {
+                tracing::warn!("watch state: skipped an owed step this version cannot read");
+                None
+            }
+        })
+        .collect())
 }
 
 /// The entries of `value`, an object by agent or task id, that this version can read;
@@ -1441,6 +1630,23 @@ impl<T: T3> Daemon<T> {
         self.state
             .worker_retry
             .retain(|task, at| *at > now && boards.contains_key(&task.board()));
+        let daemon = |slug: &BoardSlug| {
+            boards
+                .get(slug)
+                .is_some_and(|b| b.dispatch == Dispatch::Daemon)
+        };
+        self.state
+            .worker_skips
+            .retain(|task, _| daemon(&task.board()));
+        self.state
+            .idle_notices
+            .retain(|task, _| daemon(&task.board()));
+        self.state
+            .owed
+            .retain(|step| daemon(step.board()) && now - step.at() < WAKE_TTL);
+        self.state
+            .usage_stops
+            .retain(|_, at| now - *at < USAGE_STOP_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
         self.save()
@@ -2267,10 +2473,10 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Runs a home board set to daemon dispatch: holds its coordinator lease as this
-    /// device's dispatch agent, follows the workers it started there, and starts a worker for
-    /// the next ready task while a slot is free, the board's usage allows new work and no
-    /// failed start waits for its retry. One slot for now, whatever `parallel_tasks` says:
-    /// the rules for more are not built yet (`docs/DESIGN.md`, "Daemon dispatch", Slots).
+    /// device's dispatch agent, does the steps it owes for agents no device can wake, follows
+    /// the workers it started there, and starts workers for the next ready tasks while slots
+    /// are free, the board's usage allows new work and no failed start waits for its retry
+    /// (`docs/DESIGN.md`, "Daemon dispatch", Slots).
     async fn dispatch(&mut self, board: &Board, now: Timestamp) -> Result<()> {
         let slug = &board.slug;
         let agent = self.dispatch_agent();
@@ -2285,12 +2491,9 @@ impl<T: T3> Daemon<T> {
         if !self.hold_dispatch_lease(board, &agent, now).await? {
             return Ok(());
         }
-        let in_progress = self.follow_workers(board, &agent, now).await;
-        self.save()?;
-        if in_progress > 0 || self.usage_holds(slug, now) {
-            return Ok(());
-        }
-        // A task in `doing` that no worker of this daemon follows also takes the slot: one
+        self.pay_owed(slug, &agent, now).await;
+        let followed = self.follow_workers(board, &agent, now).await;
+        // A task in `doing` that no worker of this daemon follows also takes a slot: one
         // the coordinator thread started before the switch, a worker another device started
         // before the lease moved here, or one that claimed after its claim wait.
         let doing = self
@@ -2298,12 +2501,87 @@ impl<T: T3> Daemon<T> {
             .tasks(&TaskQuery {
                 board: Some(slug.clone()),
                 status: Some(TaskStatus::Doing),
-                limit: Some(1),
+                limit: Some(DOING_READ),
                 ..TaskQuery::default()
             })
             .await
-            .context("listing the tasks in doing")?;
-        if doing.iter().any(|t| t.status == TaskStatus::Doing) {
+            .context("listing the tasks in doing");
+        let doing = match doing {
+            Ok(doing) => doing,
+            Err(err) => {
+                self.save()?;
+                return Err(err);
+            }
+        };
+        let mut in_progress: BTreeMap<TaskId, InProgress> = doing
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Doing)
+            .map(|t| {
+                let since = t.updated_at;
+                (
+                    t.id.clone(),
+                    InProgress {
+                        task: Some(t),
+                        since,
+                    },
+                )
+            })
+            .collect();
+        let mut left = Vec::new();
+        for (task, followed) in followed {
+            match followed {
+                Followed::Holds {
+                    task: current,
+                    since,
+                } => {
+                    let entry = in_progress
+                        .entry(task)
+                        .or_insert(InProgress { task: None, since });
+                    entry.since = since;
+                    if let Some(current) = current {
+                        entry.task = Some(*current);
+                    }
+                }
+                Followed::Left => left.push(task),
+                Followed::Freed => {}
+            }
+        }
+        // A worker that gave its task back while other tasks were in progress stopped on a
+        // lease overlap, by its brief: that task waits until one of them ends. With nothing
+        // else in progress it stopped for another reason, and waits out the retry.
+        for task in left {
+            let others: BTreeSet<TaskId> = in_progress
+                .keys()
+                .filter(|t| **t != task)
+                .cloned()
+                .collect();
+            if others.is_empty() {
+                tracing::warn!(
+                    "the worker of {task} left it open; no new worker for it before {}",
+                    now + WORKER_RETRY
+                );
+                self.state.worker_retry.insert(task, now + WORKER_RETRY);
+            } else {
+                tracing::info!(
+                    "the worker of {task} left it open beside {}; it starts again once one of them ends",
+                    others
+                        .iter()
+                        .map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                self.state.worker_skips.insert(task, others);
+            }
+        }
+        self.state.worker_skips.retain(|task, others| {
+            task.board() != *slug || others.iter().all(|t| in_progress.contains_key(t))
+        });
+        self.state
+            .idle_notices
+            .retain(|task, _| task.board() != *slug || in_progress.contains_key(task));
+        self.save()?;
+        let slots = board.parallel_tasks.max(1) as usize;
+        if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
         }
         if let Some(failure) = self.failures.get(slug)
@@ -2312,15 +2590,17 @@ impl<T: T3> Daemon<T> {
         {
             return Ok(());
         }
-        let Some(task) = self.next_task(slug, now).await? else {
+        if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress).await? {
             return Ok(());
-        };
-        match self.start_worker(board, &task, &agent, now).await {
-            Ok(()) => {
-                self.failures.remove(slug);
-                Ok(())
+        }
+        for task in self.next_tasks(slug, now).await? {
+            if in_progress.len() >= slots {
+                break;
             }
-            Err(err) => {
+            if !independent(&task, &in_progress) {
+                continue;
+            }
+            if let Err(err) = self.start_worker(board, &task, &agent, now).await {
                 self.note_failure(board, now);
                 // One task that cannot start does not hold up the others. A start that
                 // recorded its worker gets this when that worker is found to have no thread.
@@ -2329,9 +2609,51 @@ impl<T: T3> Daemon<T> {
                         .worker_retry
                         .insert(task.id.clone(), now + WORKER_RETRY);
                 }
-                Err(err.context(format!("starting a worker for {}", task.id)))
+                return Err(err.context(format!("starting a worker for {}", task.id)));
+            }
+            self.failures.remove(slug);
+            in_progress.insert(
+                task.id.clone(),
+                InProgress {
+                    task: Some(task),
+                    since: now,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a further worker may start on `slug` beside the tasks in progress: each of
+    /// them could be read, and no agent of the board stopped on a usage limit since the
+    /// first of them started.
+    async fn may_start_beside(
+        &self,
+        slug: &BoardSlug,
+        in_progress: &BTreeMap<TaskId, InProgress>,
+    ) -> Result<bool> {
+        if in_progress.values().any(|p| p.task.is_none()) {
+            return Ok(false);
+        }
+        let Some(first) = in_progress.values().map(|p| p.since).min() else {
+            return Ok(true);
+        };
+        for (agent, at) in &self.state.usage_stops {
+            if *at < first {
+                continue;
+            }
+            let member = match self.client().agent_info(agent).await {
+                Ok(info) => info.boards.contains(slug),
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+                Err(err) => return Err(err.context("reading an agent that stopped on usage")),
+            };
+            if member {
+                tracing::info!(
+                    "{agent} stopped on a usage limit at {at}, after the tasks in progress on {slug} started; no further worker starts beside them"
+                );
+                return Ok(false);
             }
         }
+        Ok(true)
     }
 
     /// Claims or renews the lease of `board` as `agent`, every [`RENEW_EVERY`]; false when
@@ -2398,9 +2720,14 @@ impl<T: T3> Daemon<T> {
         Ok(())
     }
 
-    /// Updates the workers started on `board` from their tasks, and returns how many still
-    /// hold a slot. One that cannot be read holds its slot until it can.
-    async fn follow_workers(&mut self, board: &Board, agent: &AgentId, now: Timestamp) -> usize {
+    /// Updates the workers started on `board` from their tasks, and returns what became of
+    /// each. One that cannot be read holds its slot until it can.
+    async fn follow_workers(
+        &mut self,
+        board: &Board,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> Vec<(TaskId, Followed)> {
         let tasks: Vec<TaskId> = self
             .state
             .workers
@@ -2408,35 +2735,39 @@ impl<T: T3> Daemon<T> {
             .filter(|(task, _)| task.board() == board.slug)
             .map(|(task, _)| task.clone())
             .collect();
-        let mut in_progress = 0;
+        let mut followed = Vec::new();
         for task in tasks {
             let Some(mut worker) = self.state.workers.get(&task).cloned() else {
                 continue;
             };
-            let holds = match self
+            let outcome = match self
                 .follow_worker(board, &task, &mut worker, agent, now)
                 .await
             {
-                Ok(holds) => holds,
+                Ok(outcome) => outcome,
                 Err(err) => {
                     tracing::warn!("worker of {task}: {err:#}");
-                    true
+                    Followed::Holds {
+                        task: None,
+                        since: worker.started_at,
+                    }
                 }
             };
-            if holds {
-                in_progress += 1;
-                self.state.workers.insert(task, worker);
+            if matches!(outcome, Followed::Holds { .. }) {
+                self.state.workers.insert(task.clone(), worker);
             } else {
                 self.state.workers.remove(&task);
             }
+            followed.push((task, outcome));
         }
-        in_progress
+        followed
     }
 
     /// Whether `worker` still holds a slot: it has the task in `doing`, or may still claim
     /// it. A start that did not record its thread looks for it first, and a thread not
-    /// noted on the task yet is noted. A worker that gives the task back to `open`, or ends
-    /// without claiming it, holds it from another worker for [`WORKER_RETRY`].
+    /// noted on the task yet is noted. A worker that ends without claiming the task holds
+    /// it from another worker for [`WORKER_RETRY`]; one that gives it back to `open` after
+    /// claiming it is [`Followed::Left`].
     async fn follow_worker(
         &mut self,
         board: &Board,
@@ -2444,7 +2775,7 @@ impl<T: T3> Daemon<T> {
         worker: &mut Worker,
         agent: &AgentId,
         now: Timestamp,
-    ) -> Result<bool> {
+    ) -> Result<Followed> {
         let thread = match worker.thread.clone() {
             Some(thread) => thread,
             None => match self.find_worker_thread(board, task, worker).await? {
@@ -2456,7 +2787,7 @@ impl<T: T3> Daemon<T> {
                     self.state
                         .worker_retry
                         .insert(task.clone(), now + WORKER_RETRY);
-                    return Ok(false);
+                    return Ok(Followed::Freed);
                 }
             },
         };
@@ -2468,43 +2799,50 @@ impl<T: T3> Daemon<T> {
         }
         let current = match self.client().task(task).await {
             Ok(detail) => detail.task,
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(false),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                return Ok(Followed::Freed);
+            }
             Err(err) => return Err(err),
+        };
+        let holds = |current: Task| Followed::Holds {
+            task: Some(Box::new(current)),
+            since: worker.started_at,
         };
         let worker_agent = thread_agent(&thread)?;
         if current.status == TaskStatus::Doing && current.owner.as_ref() == Some(&worker_agent) {
             worker.claimed = true;
-            return Ok(true);
+            return Ok(holds(current));
         }
         let open = current.status == TaskStatus::Open && current.owner.is_none();
-        let stopped = if worker.claimed {
+        if worker.claimed {
             // It parked the task, finished it, or gave it back.
-            open
-        } else if !open {
-            // Closed, or taken by another agent, before the worker claimed it.
-            false
-        } else {
-            let ended = match self.client().agent_info(&worker_agent).await {
-                Ok(info) => info.state == AgentState::Ended,
-                // Its session has not started yet.
-                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
-                Err(err) => return Err(err),
-            };
-            if !ended && now - worker.started_at < WORKER_CLAIM_WAIT {
-                return Ok(true);
-            }
-            true
-        };
-        if stopped {
-            tracing::warn!(
-                "worker thread {thread} left {task} open; no new worker for it before {}",
-                now + WORKER_RETRY
-            );
-            self.state
-                .worker_retry
-                .insert(task.clone(), now + WORKER_RETRY);
+            return Ok(if open {
+                Followed::Left
+            } else {
+                Followed::Freed
+            });
         }
-        Ok(false)
+        if !open {
+            // Closed, or taken by another agent, before the worker claimed it.
+            return Ok(Followed::Freed);
+        }
+        let ended = match self.client().agent_info(&worker_agent).await {
+            Ok(info) => info.state == AgentState::Ended,
+            // Its session has not started yet.
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+            Err(err) => return Err(err),
+        };
+        if !ended && now - worker.started_at < WORKER_CLAIM_WAIT {
+            return Ok(holds(current));
+        }
+        tracing::warn!(
+            "worker thread {thread} did not claim {task}; no new worker for it before {}",
+            now + WORKER_RETRY
+        );
+        self.state
+            .worker_retry
+            .insert(task.clone(), now + WORKER_RETRY);
+        Ok(Followed::Freed)
     }
 
     /// The thread of a worker start that did not record it (the daemon was killed, or `t3`
@@ -2586,9 +2924,10 @@ impl<T: T3> Daemon<T> {
         Ok(())
     }
 
-    /// The task the next worker on `slug` takes: the highest-priority ready `auto` task,
-    /// the oldest first on a tie, that has no worker and no retry still to wait for.
-    async fn next_task(&self, slug: &BoardSlug, now: Timestamp) -> Result<Option<Task>> {
+    /// The tasks the next workers on `slug` take, in order: the ready `auto` tasks that
+    /// have no worker, no retry still to wait for and no skip, the highest priority first
+    /// and the oldest first on a tie.
+    async fn next_tasks(&self, slug: &BoardSlug, now: Timestamp) -> Result<Vec<Task>> {
         let tasks = self
             .client()
             .tasks(&TaskQuery {
@@ -2599,17 +2938,20 @@ impl<T: T3> Daemon<T> {
                 ..TaskQuery::default()
             })
             .await?;
-        Ok(tasks
+        let mut tasks: Vec<Task> = tasks
             .into_iter()
             .filter(|t| t.ready && t.auto && !is_proposal(t))
             .filter(|t| !self.state.workers.contains_key(&t.id))
+            .filter(|t| !self.state.worker_skips.contains_key(&t.id))
             .filter(|t| {
                 self.state
                     .worker_retry
                     .get(&t.id)
                     .is_none_or(|at| *at <= now)
             })
-            .min_by_key(|t| (t.priority, t.created_at)))
+            .collect();
+        tasks.sort_by_key(|t| (t.priority, t.created_at));
+        Ok(tasks)
     }
 
     /// Starts a worker thread for `task`, in a new worktree on `task/<id>` when the project
@@ -2877,6 +3219,12 @@ impl<T: T3> Daemon<T> {
                 self.gone.remove(&agent);
             }
             self.note_state(event, now);
+            if event.payload["to"] == "paused"
+                && let Ok(agent) = event.actor.parse::<AgentId>()
+            {
+                let at = self.state.usage_stops.entry(agent).or_insert(event.at);
+                *at = (*at).max(event.at);
+            }
             // Back at work: a notice that it was away no longer holds, for it or for the
             // coordinator it was passed to.
             if event.payload["to"] == "running"
@@ -2890,7 +3238,8 @@ impl<T: T3> Daemon<T> {
                 self.state.wakes.retain(|_, queue| !queue.wakes.is_empty());
             }
         }
-        let (reconcile, wakes) = self.examine(event).await?;
+        let (mut reconcile, wakes) = self.examine(event).await?;
+        reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
             let wake = Wake {
                 board,
@@ -2903,6 +3252,222 @@ impl<T: T3> Daemon<T> {
         }
         self.state.last_seq = Some(self.state.last_seq.unwrap_or(0).max(event.seq));
         Ok(reconcile)
+    }
+
+    /// What the dispatcher of the event's board, when this device runs it, takes from it:
+    /// an answer to an asker that is no T3 thread, which no daemon can wake, and the
+    /// server's idle notices, whose repeat for an owner still away releases the task.
+    /// Returns true when a step is owed.
+    fn note_for_dispatch(&mut self, event: &Event, now: Timestamp) -> bool {
+        let Some(slug) = event.board.as_ref().filter(|s| self.dispatches_here(s)) else {
+            return false;
+        };
+        let dispatcher = self.dispatch_agent();
+        match event.event_type {
+            EventType::AskAnswered => {
+                let asker = event.payload["agent"]
+                    .as_str()
+                    .and_then(|a| a.parse::<AgentId>().ok());
+                let (Some(ask), Some(asker)) = (event.payload["id"].as_i64(), asker) else {
+                    return false;
+                };
+                if asker.source() == AgentSource::T3 || asker == dispatcher {
+                    return false;
+                }
+                self.owe(Owed::Answer {
+                    board: slug.clone(),
+                    ask,
+                    asker,
+                    check_gone: true,
+                    noted: false,
+                    at: now,
+                })
+            }
+            EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
+                let away = event.payload["away"]
+                    .as_str()
+                    .and_then(|a| a.parse::<AgentId>().ok());
+                let since =
+                    serde_json::from_value::<Timestamp>(event.payload["idle_doing"].clone());
+                let (Some(task), Some(away), Ok(since)) = (&event.task, away, since) else {
+                    return false;
+                };
+                if away == dispatcher {
+                    return false;
+                }
+                let repeat = self
+                    .state
+                    .idle_notices
+                    .get(task)
+                    .is_some_and(|n| n.away == away && n.since == since);
+                if !repeat {
+                    let notice = IdleNotice {
+                        away,
+                        since,
+                        noticed: event.at,
+                    };
+                    self.state.idle_notices.insert(task.clone(), notice);
+                    return false;
+                }
+                self.state.idle_notices.remove(task);
+                self.owe(Owed::Release {
+                    board: slug.clone(),
+                    task: task.clone(),
+                    away,
+                    since,
+                    noticed: event.at,
+                    noted: false,
+                    at: now,
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Adds `step` unless the same one is owed already; true when added.
+    fn owe(&mut self, step: Owed) -> bool {
+        if self.state.owed.iter().any(|o| o.same(&step)) {
+            return false;
+        }
+        self.state.owed.push(step);
+        true
+    }
+
+    /// Does the steps owed on `slug` as its dispatch agent `agent`. A step that fails on a
+    /// transient error is tried again on the next reconcile, until [`WAKE_TTL`] after it
+    /// was owed.
+    async fn pay_owed(&mut self, slug: &BoardSlug, agent: &AgentId, now: Timestamp) {
+        let mut kept = Vec::new();
+        for mut step in std::mem::take(&mut self.state.owed) {
+            if step.board() != slug {
+                kept.push(step);
+                continue;
+            }
+            if now - step.at() >= WAKE_TTL {
+                tracing::warn!("dispatcher of {slug}: {step:?} was not done in time; dropped");
+                continue;
+            }
+            match self.pay(&mut step, agent).await {
+                Ok(true) => {
+                    if let Owed::Release { task, .. } = &step {
+                        // It starts again at once, with a new worker.
+                        self.state.workers.remove(task);
+                        self.state.worker_skips.remove(task);
+                        self.state.worker_retry.remove(task);
+                        self.state.idle_notices.remove(task);
+                    }
+                }
+                Ok(false) => {}
+                Err(err) if is_transient(&err) => {
+                    tracing::warn!("dispatcher of {slug}: {err:#}; trying again");
+                    kept.push(step);
+                }
+                Err(err) => tracing::warn!("dispatcher of {slug}: {err:#}; dropped"),
+            }
+        }
+        // Steps owed while these ran come after.
+        kept.append(&mut self.state.owed);
+        self.state.owed = kept;
+    }
+
+    /// Does one owed step; true when it set the task `open`.
+    async fn pay(&self, step: &mut Owed, agent: &AgentId) -> Result<bool> {
+        let client = self.client().with_agent(Some(agent.clone()));
+        match step {
+            Owed::Answer {
+                ask,
+                asker,
+                check_gone,
+                noted,
+                ..
+            } => {
+                let found = client
+                    .ask(*ask)
+                    .await
+                    .with_context(|| format!("reading ask #{ask}"))?;
+                let (Some(task), Some(answer)) = (found.task, found.answer) else {
+                    return Ok(false);
+                };
+                if *check_gone && !gone(&client, asker).await? {
+                    return Ok(false);
+                }
+                if !*noted {
+                    let text = clip_note(format!(
+                        "decision: the user answered ask #{ask} from {asker}, which cannot be woken: {answer}"
+                    ));
+                    add_note(&client, &task, agent, NoteKind::Decision, text).await?;
+                    *noted = true;
+                }
+                let current = match client.task(&task).await {
+                    Ok(detail) => detail.task,
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(false),
+                    Err(err) => return Err(err),
+                };
+                let held = matches!(
+                    current.status,
+                    TaskStatus::Doing | TaskStatus::Blocked | TaskStatus::Review
+                ) && current.owner.as_ref().is_none_or(|o| o == asker);
+                if !held {
+                    return Ok(false);
+                }
+                set_open(&client, &current, agent)
+                    .await
+                    .with_context(|| format!("setting {task} open after ask #{ask}"))?;
+                tracing::info!("{task}: ask #{ask} answered for gone {asker}; set open");
+                Ok(true)
+            }
+            Owed::Release {
+                task,
+                away,
+                since,
+                noticed,
+                noted,
+                ..
+            } => {
+                let current = match client.task(task).await {
+                    Ok(detail) => detail.task,
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(false),
+                    Err(err) => return Err(err),
+                };
+                if current.status != TaskStatus::Doing || current.owner.as_ref() != Some(away) {
+                    return Ok(false);
+                }
+                if self.back_since(away, *noticed).await? {
+                    return Ok(false);
+                }
+                if !*noted {
+                    let info = match client.agent_info(away).await {
+                        Ok(info) => Some(info),
+                        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
+                        Err(err) => return Err(err),
+                    };
+                    let thread = info
+                        .as_ref()
+                        .and_then(|i| i.native_ids.get("t3_link"))
+                        .map_or_else(|| away.to_string(), |link| format!("{away} ({link})"));
+                    let branch = self
+                        .state
+                        .workers
+                        .get(task)
+                        .and_then(|w| w.branch.clone())
+                        .or_else(|| info.and_then(|i| i.branch))
+                        .map_or_else(|| "none recorded".to_owned(), |b| format!("`{b}`"));
+                    let text = clip_note(format!(
+                        "note: the owner was away from this task since {} and still was after the \
+                         server's repeat notice, or its thread is gone, so the dispatcher set it \
+                         open for a new worker. Old thread: {thread}. Branch: {branch}.",
+                        since.format("%Y-%m-%d %H:%MZ")
+                    ));
+                    add_note(&client, task, agent, NoteKind::Note, text).await?;
+                    *noted = true;
+                }
+                set_open(&client, &current, agent)
+                    .await
+                    .with_context(|| format!("setting {task} open from away {away}"))?;
+                tracing::info!("{task}: {away} away since {since}; set open");
+                Ok(true)
+            }
+        }
     }
 
     /// Adds `wake` to `agent`'s queue unless the same one is already there.
@@ -3431,7 +3996,7 @@ impl<T: T3> Daemon<T> {
             }
             // Unknown to the server: its answers and idle notices go to the coordinator.
             Checked::Unknown => {
-                let unheard = self.forward(agent, &mut queue.wakes, true);
+                let unheard = self.forward(agent, &mut queue.wakes, true, now);
                 if unheard > 0 {
                     tracing::warn!(
                         "waking {agent}: unknown to the server; {unheard} answers to its asks \
@@ -3483,7 +4048,7 @@ impl<T: T3> Daemon<T> {
                 queue
                     .wakes
                     .retain(|w| !matches!(&w.about, WakeAbout::Idle { away, .. } if away == agent));
-                self.forward(agent, &mut queue.wakes, false);
+                self.forward(agent, &mut queue.wakes, false, now);
                 self.requeue(agent.clone(), queue);
                 return None;
             }
@@ -3497,7 +4062,7 @@ impl<T: T3> Daemon<T> {
                     .iter()
                     .filter(|w| !passed_on(agent, &w.about, idle))
                     .count();
-                let unheard = self.forward(agent, &mut queue.wakes, idle);
+                let unheard = self.forward(agent, &mut queue.wakes, idle, now);
                 if !why.expected() {
                     if dropped > 0 {
                         tracing::warn!("waking {agent}: {why}; {dropped} wake-ups dropped");
@@ -3572,11 +4137,22 @@ impl<T: T3> Daemon<T> {
     /// board's coordinator, once each: an answer or an idle notice no one hears of would
     /// stall its task. `idle` when no device can wake `from`. Returns how many have no
     /// coordinator to go to (none named, or `from` is it); a queue kept for later tries
-    /// those again.
-    fn forward(&mut self, from: &AgentId, wakes: &mut [Wake], idle: bool) -> usize {
+    /// those again. On a board this device dispatches there is no coordinator thread: once
+    /// no device can wake `from`, the dispatcher owes the step itself (see [`Owed`]); until
+    /// then the wake-up waits for `from`.
+    fn forward(&mut self, from: &AgentId, wakes: &mut [Wake], idle: bool, now: Timestamp) -> usize {
         let mut unheard = 0;
         for wake in wakes {
             if !passed_on(from, &wake.about, idle) || wake.forwarded {
+                continue;
+            }
+            if self.dispatches_here(&wake.board) {
+                if idle {
+                    wake.forwarded = true;
+                    if let Some(step) = owed_for(from, wake, now) {
+                        self.owe(step);
+                    }
+                }
                 continue;
             }
             let coordinator = self
@@ -3807,7 +4383,7 @@ impl<T: T3> Daemon<T> {
                 if let Some(queue) = self.state.wakes.remove(&agent) {
                     wakes.extend(queue.wakes);
                 }
-                let unheard = self.forward(&agent, &mut wakes, true);
+                let unheard = self.forward(&agent, &mut wakes, true, now);
                 if unheard > 0 {
                     tracing::warn!(
                         "waking {agent}: {unheard} answers to its asks or idle notices dropped, \
@@ -4190,6 +4766,101 @@ fn back_off(queue: &mut WakeQueue, now: Timestamp, lookup: bool) -> TimeDelta {
 }
 
 /// Is this a failure that may pass on its own: no answer, or a server-side error?
+/// The step the dispatcher owes for `wake`, which no device can wake `from` for.
+fn owed_for(from: &AgentId, wake: &Wake, now: Timestamp) -> Option<Owed> {
+    match &wake.about {
+        WakeAbout::Answered { ask, asker } => Some(Owed::Answer {
+            board: wake.board.clone(),
+            ask: *ask,
+            asker: asker.clone(),
+            check_gone: false,
+            noted: false,
+            at: now,
+        }),
+        WakeAbout::Idle {
+            task,
+            away,
+            since,
+            noticed,
+        } if away == from => Some(Owed::Release {
+            board: wake.board.clone(),
+            task: task.clone(),
+            away: away.clone(),
+            since: *since,
+            noticed: *noticed,
+            noted: false,
+            at: now,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `agent` is gone: ended, or unknown to the server.
+async fn gone(client: &Client, agent: &AgentId) -> Result<bool> {
+    match client.agent_info(agent).await {
+        Ok(info) => Ok(info.state == AgentState::Ended),
+        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+/// The longest note the dispatcher adds, in characters.
+const NOTE_CHARS: usize = 800;
+
+/// `text` cut to [`NOTE_CHARS`], ending in an ellipsis when cut.
+fn clip_note(text: String) -> String {
+    if text.chars().count() <= NOTE_CHARS {
+        return text;
+    }
+    let mut cut: String = text.chars().take(NOTE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+async fn add_note(
+    client: &Client,
+    task: &TaskId,
+    agent: &AgentId,
+    kind: NoteKind,
+    text: String,
+) -> Result<()> {
+    client
+        .add_note(
+            task,
+            &AddNote {
+                agent: agent.clone(),
+                kind,
+                text,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Sets `task` `open` as `agent`, at the version read.
+async fn set_open(client: &Client, task: &Task, agent: &AgentId) -> Result<()> {
+    client
+        .update_task(
+            &task.id,
+            &UpdateTask {
+                agent: agent.clone(),
+                version: task.version,
+                status: Some(TaskStatus::Open),
+                title: None,
+                body: None,
+                acceptance: None,
+                priority: None,
+                blockers: None,
+                blocked_reason: None,
+                auto: None,
+                not_before: None,
+                owner: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 fn is_transient(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<ServerError>() {
         Some(server) => !server.status.is_client_error(),
