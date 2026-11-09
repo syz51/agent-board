@@ -872,8 +872,20 @@ pub async fn set_boards_status(
     to: BoardStatus,
 ) -> Result<Output> {
     let boards = ctx.client.boards().await?;
+    let resuming = to == BoardStatus::Active;
+    // The feedback board always stays active: a pause leaves it out, or refuses it by name.
+    let feedback = ctx.config.feedback_board();
+    if !resuming && let Some(slug) = named.iter().find(|s| **s == feedback) {
+        bail!(
+            "board {slug} is the feedback board, which always stays active: leave it out \
+             (board pause with no names already skips it)"
+        );
+    }
     let mut targets: Vec<&Board> = if named.is_empty() {
-        boards.iter().filter(|b| b.status == from).collect()
+        boards
+            .iter()
+            .filter(|b| b.status == from && (resuming || b.slug != feedback))
+            .collect()
     } else {
         let mut targets = Vec::new();
         for slug in &named {
@@ -893,11 +905,9 @@ pub async fn set_boards_status(
         }
         targets
     };
-    let resuming = to == BoardStatus::Active;
-    // The feedback board resumes first, always. The server resumes it with any other board;
-    // when it is among the targets, it also goes first here.
+    // A feedback board paused before that rule resumes first. The server resumes it with
+    // any other board; when it is among the targets, it also goes first here.
     if resuming {
-        let feedback = ctx.config.feedback_board();
         targets.sort_by_key(|b| b.slug != feedback);
     }
     let verb = match to {

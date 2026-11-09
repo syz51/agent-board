@@ -168,6 +168,15 @@ pub(crate) fn update(
              (ask_user) to raise it",
         ));
     }
+    // The user keeps the feedback board on whatever other boards do, so triage never stops.
+    // Closing it, to retire or delete it, is a separate act and stays open.
+    if *slug == cx.s.feedback_board && req.status == Some(BoardStatus::Paused) {
+        return Err(bad_transition(
+            format!("board {slug} is the feedback board, which always stays active"),
+            "leave it out: pause other boards by name (board pause <slug>…); board pause \
+             with no names already skips it",
+        ));
+    }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -214,9 +223,8 @@ pub(crate) fn update(
     if fields.is_empty() {
         return Ok(before);
     }
-    // The user wants the feedback board resumed first, always: resuming any other board
-    // resumes it too when it is paused, with its event recorded first, so triage never stays
-    // paused while other work runs.
+    // The feedback board cannot be paused any more, but one paused before that rule is
+    // resumed with any other board, its event recorded first.
     if before.status == BoardStatus::Paused
         && req.status == Some(BoardStatus::Active)
         && *slug != cx.s.feedback_board

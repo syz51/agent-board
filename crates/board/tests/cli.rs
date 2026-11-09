@@ -675,6 +675,7 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
             with("beta", BoardStatus::Active),
             with("gamma", BoardStatus::Paused),
             with("old", BoardStatus::Closed),
+            with("board-feedback", BoardStatus::Active),
         ],
     );
     for slug in ["alpha", "beta", "gamma"] {
@@ -695,6 +696,12 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     }
     assert!(e.stub.requests_to("PATCH /v1/boards/gamma").is_empty());
     assert!(e.stub.requests_to("PATCH /v1/boards/old").is_empty());
+    assert!(
+        e.stub
+            .requests_to("PATCH /v1/boards/board-feedback")
+            .is_empty(),
+        "the feedback board always stays active"
+    );
 
     // Resume, named: only that board, even with others paused.
     e.stub
@@ -718,6 +725,10 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     for (args, says) in [
         (["pause", "nope"], "no board nope"),
         (["pause", "old"], "board old is closed"),
+        (
+            ["pause", "board-feedback"],
+            "board board-feedback is the feedback board, which always stays active",
+        ),
     ] {
         let out = e.run(&args);
         assert!(!out.status.success());

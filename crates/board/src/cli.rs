@@ -288,13 +288,15 @@ pub enum Command {
     Boards,
     /// Pause all your work: every active board, or only those named. Their coordinators,
     /// the threads they started and the agents on their tasks stop at their next hook, and
-    /// the daemon starts nothing on them. `board resume` undoes it.
+    /// the daemon starts nothing on them. `board resume` undoes it. The feedback board always
+    /// stays active: it is skipped, and naming it fails.
     Pause {
-        /// Boards to pause. Default: every active board.
+        /// Boards to pause. Default: every active board but the feedback board.
         boards: Vec<BoardSlug>,
     },
     /// Resume every paused board, or only those named; the daemon wakes their coordinators.
-    /// A paused feedback board always resumes first, also when only other boards are named.
+    /// A feedback board paused before it had to stay active resumes first, also when only
+    /// other boards are named.
     Resume {
         /// Boards to resume. Default: every paused board.
         boards: Vec<BoardSlug>,

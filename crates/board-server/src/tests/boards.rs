@@ -720,16 +720,51 @@ async fn only_the_user_raises_parallel_tasks_and_anyone_lowers_it() {
     }
 }
 
+/// Puts the feedback board in the paused state a server allowed before the feedback board
+/// always stayed active; the API refuses it now.
+fn pause_feedback_board_directly(t: &T) {
+    t.exec("UPDATE boards SET status = 'paused' WHERE slug = 'board-feedback'");
+}
+
 #[tokio::test]
-async fn resuming_any_board_resumes_the_feedback_board_first() {
+async fn the_feedback_board_is_never_paused() {
+    let t = T::new();
+    let paused = Some(json!({ "status": "paused" }));
+    t.board("board-feedback", &[]).await;
+    t.board("factory", &[]).await;
+    let (code, kind, body) = t
+        .fail("PATCH", "/v1/boards/board-feedback", None, paused.clone())
+        .await;
+    assert_eq!((code, kind.as_str()), (400, "invalid_transition"), "{body}");
+    let says = |field: &str, text: &str| body[field].as_str().unwrap().contains(text);
+    assert!(says("message", "always stays active"), "{body}");
+    assert!(says("next", "board pause <slug>"), "{body}");
+    let (code, _) = t
+        .as_user("PATCH", "/v1/boards/board-feedback", paused.clone())
+        .await;
+    assert_eq!(code.as_u16(), 400, "the user is refused too");
+    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
+    assert_eq!(feedback["status"], "active");
+
+    // Other changes to it, and restating active, still go through; other boards pause.
+    let goal = Some(json!({ "goal": "triage", "status": "active" }));
+    t.ok("PATCH", "/v1/boards/board-feedback", None, goal).await;
+    t.ok("PATCH", "/v1/boards/factory", None, paused).await;
+}
+
+#[tokio::test]
+async fn resuming_any_board_resumes_a_paused_feedback_board_first() {
     let t = T::new();
     let status = |s: &str| Some(json!({ "status": s }));
     let status_of = |board: Value| board["status"].as_str().unwrap().to_owned();
     for slug in ["board-feedback", "factory", "other"] {
         t.board(slug, &[]).await;
+    }
+    for slug in ["factory", "other"] {
         let path = format!("/v1/boards/{slug}");
         t.ok("PATCH", &path, None, status("paused")).await;
     }
+    pause_feedback_board_directly(&t);
 
     let resumed = t
         .ok("PATCH", "/v1/boards/factory", None, status("active"))
@@ -755,19 +790,9 @@ async fn resuming_any_board_resumes_the_feedback_board_first() {
         .collect();
     assert_eq!(resumes, [json!("board-feedback"), json!("factory")]);
 
-    // Pausing the feedback board alone holds, and resuming it alone resumes nothing else.
-    t.ok("PATCH", "/v1/boards/board-feedback", None, status("paused"))
-        .await;
-    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
-    assert_eq!(status_of(feedback), "paused");
-    t.ok("PATCH", "/v1/boards/board-feedback", None, status("active"))
-        .await;
-    let other = t.ok("GET", "/v1/boards/other", None, None).await;
-    assert_eq!(status_of(other), "paused");
-
-    // Changing an active board, or reopening a closed one, leaves the feedback board paused.
-    t.ok("PATCH", "/v1/boards/board-feedback", None, status("paused"))
-        .await;
+    // Changing an active board, or reopening a closed one, leaves a paused feedback board
+    // as it is.
+    pause_feedback_board_directly(&t);
     let goal = Some(json!({ "goal": "ship" }));
     t.ok("PATCH", "/v1/boards/factory", None, goal).await;
     t.ok("PATCH", "/v1/boards/other", None, status("closed"))
@@ -797,9 +822,10 @@ async fn an_agent_resuming_a_board_resumes_the_feedback_board_too() {
     let status = |s: &str| Some(json!({ "status": s }));
     for slug in ["board-feedback", "factory"] {
         t.board(slug, &[]).await;
-        let path = format!("/v1/boards/{slug}");
-        t.ok("PATCH", &path, None, status("paused")).await;
     }
+    t.ok("PATCH", "/v1/boards/factory", None, status("paused"))
+        .await;
+    pause_feedback_board_directly(&t);
     t.register("t3:alpha", None, None).await;
     t.ok(
         "PATCH",

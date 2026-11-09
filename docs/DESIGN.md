@@ -282,11 +282,12 @@ pauses only those. `board resume [<slug>…]` sets every `paused` board, or thos
 back to `active`. Autopilot stays as it was, and closed boards are never touched (naming
 one, or an unknown board, fails before any change). Both print the boards they changed.
 
-The feedback board resumes first, always: triage must not stay paused while other work
-runs. Resuming any other paused board, with the CLI or the API, also resumes a paused
-feedback board, before it and in the same write. `board resume` resumes it first
-and lists it first, also when only other boards are named. Pausing the feedback board on
-its own still holds until it is resumed, by name or with another board.
+The feedback board is always active, whatever other boards do: feedback is filed and
+triaged while other work is paused. The server refuses to pause it, from an agent or the
+user; closing it, to retire or delete it, is still allowed. `board pause` with no names
+skips it, and naming it fails before any change. A feedback board paused before this rule
+resumes with any other board, with the CLI or the API, before it and in the same write;
+`board resume` lists it first.
 
 A paused board **holds** the agents that work for it: its coordinator (the lease holder,
 also after the lease lapsed, since only a release clears it), every thread that
