@@ -449,7 +449,10 @@ settings in use, warned once per edit.
   is fetched first (a failed fetch is logged, and the local copy used). `<branch>` is
   `coordinator/<board>`, or `coordinator/<board>-<UTC time>` when that branch exists, since
   T3 can only create a branch. A folder outside git, or nested in a repository, starts the
-  thread in the folder, as before. The coordinator prompt forbids changing files,
+  thread in the folder, as before. git alone decides (`git rev-parse`), following links as
+  git does, so a folder macOS holds for a privacy prompt or refuses fails the start, with
+  the error naming the System Settings grant to give, instead of passing as a folder
+  outside git; a missing folder is left for T3 to report. The coordinator prompt forbids changing files,
   switching branches or merging in the project root; file work the coordinator does itself
   happens in a worktree of its own, on a new branch per task. A coordinator started before
   this rule, or adopted, still runs in the folder it had; the prompt tells it to add a
@@ -784,7 +787,19 @@ settings in use, warned once per edit.
     when the server cannot be reached. The daemon reconciles at start and on its tick,
     also while the stream is down. The boards' `t3 thread show` checks run two at a time,
     10 seconds each, and none starts once 45 seconds of the reconcile have passed; a
-    board whose check did not start is left as it is until the next reconcile. Each `t3`
+    board whose check did not start is left as it is until the next reconcile. Coordinator
+    starts go board by board, those whose last start failed last unless their hosting
+    settings changed or an adoption was requested since, so a retry that waits out a
+    timeout (git waiting on a macOS privacy prompt, for one) cannot take the time the
+    others need. Each start ends by 67.5 seconds into the reconcile (three quarters of its
+    90), which leaves time for a release and the save. A start that runs out of time ends
+    as when `t3` times out: its lease is released unless it recorded its thread, and a
+    saved pending start mark stays, so the next start finds the thread T3 made. It gets
+    the start back-off and goes last, unless less than 45 seconds were left when it began:
+    then the boards before it took the time, and it is tried again on the next reconcile.
+    A failed start's back-off counts from its failure. A failure ends when the board's
+    coordinator is kept or started, or another coordinator runs the board. The git commands a start runs in the project wait at most 20 seconds
+    each, and `git fetch` 60. Each `t3`
     process needs about half a second of CPU to start, so nine at once on a busy device
     took 4-5 seconds each and timed out together under a build. A check that fails or
     runs out of time still renews a named coordinator at work, and only a check that
