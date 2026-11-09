@@ -45,28 +45,12 @@ pub struct AgentLocal {
     /// Overlap alerts shown after tool calls, newest last: see [`AgentLocal::first_sight`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlaps_shown: Vec<ShownOverlap>,
-    /// Background subagents the agent launched (Claude Code's `Agent` tool), newest last:
-    /// see [`AgentLocal::launched`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subagents: Vec<Launched>,
+    /// Last heartbeat from a subagent's `PostToolUse`, apart from the agent's own
+    /// (`last_heartbeat`), so a subagent the hold lets work on never takes the heartbeat
+    /// that halts the agent's own held turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_heartbeat: Option<Timestamp>,
 }
-
-/// A background subagent the agent launched, with what the launching turn knew of the hold.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Launched {
-    /// The runtime's id of the subagent, which its own hooks carry as `agent_id`.
-    pub id: String,
-    /// The launching turn began while held and went on: the user's own message asked for
-    /// the work (see [`AgentLocal::turn_unblocked`]).
-    pub unblocked: bool,
-    /// When the board that held the launching turn was paused, if the server said.
-    pub held_since: Option<Timestamp>,
-    pub at: Timestamp,
-}
-
-/// Launched subagents are remembered this long, and at most this many.
-const SUBAGENT_MEMORY: TimeDelta = TimeDelta::days(1);
-const SUBAGENTS_KEPT: usize = 50;
 
 /// An overlap alert the hooks showed: a peer's lease or edit of a path, as of `at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,44 +92,10 @@ impl AgentLocal {
         }
     }
 
-    /// The current turn began while held and goes on: its prompt showed the hold, which
-    /// tells the agent to go on only for the user's own request.
-    pub fn turn_unblocked(&self) -> bool {
-        self.held && !self.halted()
-    }
-
-    /// Records a background subagent the current turn launched, or subagent `by` did, with
-    /// whether the hold let the launcher work on. Its tool calls outlive the turn, whose
-    /// end clears what it knew of the hold.
-    pub fn launched(&mut self, id: &str, by: Option<&str>, now: Timestamp) {
-        let unblocked = self.held
-            && match by {
-                Some(by) => self.subagent_passes(by),
-                None => self.turn_unblocked(),
-            };
-        self.subagents
-            .retain(|s| s.id != id && now - s.at < SUBAGENT_MEMORY);
-        self.subagents.push(Launched {
-            id: id.to_owned(),
-            unblocked,
-            held_since: self.held_since,
-            at: now,
-        });
-        let excess = self.subagents.len().saturating_sub(SUBAGENTS_KEPT);
-        self.subagents.drain(..excess);
-    }
-
-    /// Whether the hold lets subagent `id` work on: its launching turn was unblocked by a
-    /// pause no older than the one that holds the agent now. A subagent not recorded as
-    /// launched in the background runs in the foreground, within the turn that launched
-    /// it, so that turn decides.
-    pub fn subagent_passes(&self, id: &str) -> bool {
-        if !self.held {
-            return true;
-        }
-        match self.subagents.iter().find(|s| s.id == id) {
-            Some(s) => s.unblocked && self.held_since <= s.held_since,
-            None => self.turn_unblocked(),
+    /// What the hold judges a foreground subagent by: the current turn, which runs it.
+    pub fn turn_launch(&self) -> Launched {
+        Launched {
+            turn_seen_at: self.turn_seen_at,
         }
     }
 
@@ -408,6 +358,53 @@ pub fn prune_tool_starts(home: &Home, age: std::time::Duration) -> Result<()> {
     prune_dir(&home.state_dir().join("tool-starts"), age)
 }
 
+/// A subagent the agent launched in the background (Claude Code's `Agent` tool), which
+/// outlives the launching turn and so what the agent's state knows of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Launched {
+    /// The server's time of the launching turn's prompt snapshot (`AgentLocal::turn_seen_at`).
+    pub turn_seen_at: Option<Timestamp>,
+}
+
+impl Launched {
+    /// Whether a hold paused at `held_since` lets the subagent work on: the pause came
+    /// before its launching turn began, so that turn's prompt showed the hold and the turn
+    /// went on, which the hold allows only for the user's own request. Without either time
+    /// it is held, since the turn's prompt may predate a later pause.
+    pub fn passes(&self, held_since: Option<Timestamp>) -> bool {
+        matches!((held_since, self.turn_seen_at), (Some(paused), Some(turn)) if paused <= turn)
+    }
+}
+
+fn launched_path(home: &Home, agent: &AgentId, subagent: &str) -> PathBuf {
+    home.state_dir().join("subagents").join(format!(
+        "{}.{}.json",
+        file_stem(agent),
+        safe_stem(subagent)
+    ))
+}
+
+/// Records subagent `subagent` of `agent`, in a file of its own: parallel launches each
+/// run a hook, and the agent's state file is written whole by every hook.
+pub fn save_launched(
+    home: &Home,
+    agent: &AgentId,
+    subagent: &str,
+    launched: &Launched,
+) -> Result<()> {
+    write_json(&launched_path(home, agent, subagent), launched)
+}
+
+/// The record of subagent `subagent`; `None` for a foreground subagent, never recorded.
+pub fn load_launched(home: &Home, agent: &AgentId, subagent: &str) -> Option<Launched> {
+    read_json(&launched_path(home, agent, subagent))
+}
+
+/// Removes records of subagents launched more than `age` ago.
+pub fn prune_launched(home: &Home, age: std::time::Duration) -> Result<()> {
+    prune_dir(&home.state_dir().join("subagents"), age)
+}
+
 /// The file stems of agent ids begin with their source and an encoded `:` ([`file_stem`]);
 /// the named state files (the daemon's, the hooks' breaker) never do.
 const AGENT_STEMS: [&str; 3] = ["t3_3a", "claude_3a", "codex_3a"];
@@ -602,6 +599,50 @@ pub fn remove_named(home: &Home, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subagent_passes_only_a_pause_older_than_its_launching_turn() {
+        let at = |s: &str| Some(s.parse::<Timestamp>().unwrap());
+        let launched = Launched {
+            turn_seen_at: at("2030-01-01T10:00:00Z"),
+        };
+        assert!(launched.passes(at("2030-01-01T09:00:00Z")));
+        assert!(launched.passes(at("2030-01-01T10:00:00Z")));
+        assert!(
+            !launched.passes(at("2030-01-01T10:05:00Z")),
+            "a later pause"
+        );
+        assert!(
+            !launched.passes(None),
+            "an older server: no time to compare"
+        );
+        let untimed = Launched { turn_seen_at: None };
+        assert!(
+            !untimed.passes(at("2030-01-01T09:00:00Z")),
+            "a turn without a prompt"
+        );
+    }
+
+    #[test]
+    fn subagent_records_are_kept_apart_per_agent_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let parent: AgentId = "t3:parent".parse().unwrap();
+        let other: AgentId = "t3:other".parse().unwrap();
+        let launched = Launched {
+            turn_seen_at: Some("2030-01-01T10:00:00Z".parse().unwrap()),
+        };
+        save_launched(&home, &parent, "a1", &launched).unwrap();
+        assert_eq!(load_launched(&home, &parent, "a1"), Some(launched));
+        assert_eq!(load_launched(&home, &other, "a1"), None);
+        assert_eq!(
+            load_launched(&home, &parent, "a2"),
+            None,
+            "a foreground subagent"
+        );
+        prune_launched(&home, std::time::Duration::ZERO).unwrap();
+        assert_eq!(load_launched(&home, &parent, "a1"), None);
+    }
 
     #[test]
     fn an_overlap_shows_once_an_hour_and_then_only_for_a_newer_change() {

@@ -1358,19 +1358,27 @@ fn a_subagent_of_a_turn_the_user_unblocked_works_on_through_the_hold() {
     serve_hold_at(&e, "2030-01-01T10:00:00Z", Some("2030-01-01T09:00:00Z"));
     prompt(&e, "fix this properly");
     launch_background(&e, "a-review");
-    // The parent's turn ends while the reviewer runs.
+    launch_background(&e, "a-tests");
+    // The parent's turn ends while the reviewers run.
     assert_eq!(stop(&e), None, "the turn ends quietly");
-    heartbeat_due_again(&e);
-    let reply = subagent_read(&e, "a-review");
-    assert!(not_halted(&reply), "{reply:?}");
-    let text = context(&reply, "PostToolUse");
-    assert!(text.contains("launched you for this work"), "{text}");
-    assert!(!text.contains("-> stop"), "no refusal hold line: {text}");
+    for id in ["a-review", "a-tests"] {
+        heartbeat_due_again(&e);
+        let reply = subagent_read(&e, id);
+        assert!(not_halted(&reply), "{id}: {reply:?}");
+        let text = context(&reply, "PostToolUse");
+        assert!(text.contains("began while held and went on"), "{text}");
+        assert!(!text.contains("-> stop"), "no refusal hold line: {text}");
+    }
+    // The subagent's heartbeat leaves the agent's own: a turn with no prompt still halts.
+    let snapshots = e.stub.requests_to("GET /v1/snapshot").len();
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("the parent's halt")["continue"], false);
+    assert_eq!(e.stub.requests_to("GET /v1/snapshot").len(), snapshots + 1);
     // A foreground subagent runs within the turn that launched it, so that turn decides.
     prompt(&e, "and the docs");
     heartbeat_due_again(&e);
     let text = context(&subagent_read(&e, "a-docs"), "PostToolUse");
-    assert!(text.contains("launched you for this work"), "{text}");
+    assert!(text.contains("began while held and went on"), "{text}");
 
     // A later pause holds it again.
     serve_hold_at(&e, "2030-01-01T10:20:00Z", Some("2030-01-01T10:10:00Z"));
@@ -1415,7 +1423,9 @@ fn heartbeat_due_again(e: &Env) {
         board::state::file_stem(&CLAUDE_AGENT.parse().unwrap())
     ));
     let mut local: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    local.as_object_mut().unwrap().remove("last_heartbeat");
+    let local_map = local.as_object_mut().unwrap();
+    local_map.remove("last_heartbeat");
+    local_map.remove("subagent_heartbeat");
     std::fs::write(&path, local.to_string()).unwrap();
 }
 
