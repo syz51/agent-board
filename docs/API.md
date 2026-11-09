@@ -453,19 +453,23 @@ Reopening a closed board, or any change on it, starts the period again.
     `next` names it and says to wait for its answer, or to withdraw it (`ask_withdraw`, or
     `board withdraw`), then claim again.
   - owned by another live agent: 409 `claim_refused` naming the owner. When the caller
-    stands in for an owner whose session ended, `next` names `take=true`.
+    stands in for an owner whose session ended, 400 `invalid_transition` instead, with
+    `next` naming `take=true`, and the claim is not counted in `claims_refused`.
   - owned by a stale agent: 400 `invalid_transition`, with `next` naming `take=true`.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
-  board coordinator or user only (as status changes below).
+  an agent standing in for an owner whose session ended, board coordinator or user only
+  (as status changes below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`, or at once
   when the caller stands in for an owner whose session ended (see "Standing in for an ended
   owner" below), else 409 `claim_refused`; records a `task_taken` event naming the previous
-  owner, which the stats count in `tasks_taken_stale` either way (see "CLI output for
-  scripts"). Taking an `open` task moves it to `doing`,
+  owner (`from`) and the new `status`, which the stats count in `tasks_taken_stale` (see
+  "CLI output for scripts"); a stand-in's take carries `stand_in: true` and is not
+  counted there. Taking an `open` task moves it to `doing`,
   so it is refused like a claim while a blocker is not done or `not_before` has not passed.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner, or an agent standing in for
   an owner whose session ended, only (403 `forbidden` otherwise, also for a task nobody
-  owns; for the board's coordinator, `next` names the handover to itself first), from
+  owns; for the board's coordinator, once the owner's session has ended, `next` names the
+  handover to itself first), from
   `doing`, `review` or `blocked`, else 400 `invalid_transition`. The owner closes its
   `blocked` task directly, also while it has another task in `doing`, since a wait often
   ends off the board; this clears
@@ -513,15 +517,17 @@ to resume it first): a task in `review` has an owner to finish it, who brought i
 `doing`.
 
 Standing in for an ended owner: while a task's owner is marked `ended` (its session ended
-and it has not acted since, see "Agents"), the task's creator (`created_by`) and the T3
-threads that delegated the owner (up its `t3_parent` chain, at most 8 levels) act as its
-owner. They may take it at once with `/take` (logged), move or release it, hand it over and
-mark it done, without waiting until the owner is stale, so a parent finishes what its
-finished child still owns. Taking it or moving it to `doing` makes the caller the owner,
-within its `doing` limit; moving it to `review` or `blocked`, or marking it done, leaves
-the owner as it is. An owner that acts again is `running`, and the task is its own again.
-Others are refused as before, and the refusal's `next` names this rule. (Servers before
-this change made them wait until the owner was stale.)
+and it has not acted since, see "Agents"), with no usage-limit reset ahead (`paused_until`
+not after now) and no thread it delegated at work (as the idle `doing` notice above
+judges), the task's creator (`created_by`; for a feedback item, whose creator is its
+reporter, nobody) and the T3 threads that delegated the owner (up its `t3_parent` chain, at
+most 8 levels) act as its owner. They may take it at once with `/take` (logged), move or
+release it, hand it over and mark it done, without waiting until the owner is stale, so a
+parent finishes what its finished child still owns. Taking it or moving it to `doing` makes
+the caller the owner, within its `doing` limit; moving it to `review` or `blocked`, or
+marking it done, leaves the owner as it is. An owner that acts again is `running`, and the
+task is its own again. Others are refused as before, and the refusal's `next` names this
+rule. (Servers before this change made them wait until the owner was stale.)
 
 Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
 body is a reporter's text, triaged instead), and its body starts `Proposal:` after leading

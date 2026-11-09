@@ -284,7 +284,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_claim",
-        description: "Claim a task before working on it: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless a blocked reason or an open ask holds it. Refused when another live agent owns it. take=true takes a task whose owner is stale. To release, set status open with task_update.",
+        description: "Claim a task before working on it: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless a blocked reason or an open ask holds it. Refused when another live agent owns it. take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -1189,8 +1189,9 @@ mod tests {
         );
         for tool in &tools {
             let description = tool.description.as_deref().unwrap();
-            // task_claim also states the doing limit and the resume path (DESIGN.md).
-            let cap = if tool.name == "task_claim" { 560 } else { 300 };
+            // task_claim also states the doing limit, the resume path (DESIGN.md) and who
+            // may take a task.
+            let cap = if tool.name == "task_claim" { 620 } else { 300 };
             assert!(description.chars().count() < cap, "{}", tool.name);
             assert!(
                 tool.input_schema["properties"]["agent"].is_object(),
@@ -1208,7 +1209,8 @@ mod tests {
             "Also resumes your own, or nobody's, task in review or blocked, unless a blocked \
              reason or an open ask holds it",
             "Refused when another live agent owns it",
-            "take=true takes a task whose owner is stale",
+            "take=true takes a task whose owner is stale, or ended when you created the task \
+             or delegated the owner",
             "To release, set status open with task_update",
         ] {
             assert!(claim.contains(fact), "{fact}");

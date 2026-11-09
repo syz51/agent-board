@@ -2806,9 +2806,13 @@ async fn the_creator_or_a_delegating_parent_takes_an_ended_childs_task_at_once()
     // An unrelated agent still waits until the owner is stale.
     let (s, v) = take(&t, B, &ids[0]).await;
     assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
-    // A plain claim by the parent names the take.
+    // A plain claim by the parent names the take, and is not counted as refused.
     let (s, v) = t.claim(PARENT, &ids[0]).await;
-    assert_eq!(s.as_u16(), 409, "{v}");
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
     assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
 
     // The parent, the agent that delegated the parent, and the creator take at once.
@@ -2823,9 +2827,20 @@ async fn the_creator_or_a_delegating_parent_takes_an_ended_childs_task_at_once()
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM events WHERE type = 'task_taken' \
-             AND json_extract(payload, '$.from') = '{CHILD}'"
+             AND json_extract(payload, '$.from') = '{CHILD}' \
+             AND json_extract(payload, '$.stand_in') = 1"
         )),
         3
+    );
+    // None of them was stale, nor a refused claim; B's refused take is not a claim either.
+    let stats = t.ok("GET", "/v1/stats", None, None).await;
+    assert_eq!(
+        (
+            stats["tasks_taken_stale"].as_u64(),
+            stats["claims_refused"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "{stats}"
     );
 }
 
@@ -2894,4 +2909,126 @@ async fn a_delegating_parent_closes_moves_or_hands_back_an_ended_childs_task() {
     );
     let (s, v) = take(&t, PARENT, &revived).await;
     assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+}
+
+async fn release(t: &T, agent: &str, task: &str) -> (u16, Value) {
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{task}/release"),
+            Some(agent),
+            Some(json!({ "agent": agent })),
+        )
+        .await;
+    (s.as_u16(), v)
+}
+
+#[tokio::test]
+async fn the_creator_releases_hands_over_or_closes_an_ended_owners_task() {
+    let t = setup().await;
+    delegation(&t).await;
+    let [released, handed, closed] = [
+        childs_task(&t).await,
+        childs_task(&t).await,
+        childs_task(&t).await,
+    ];
+    // A feedback item's creator is only its reporter: it does not stand in.
+    let item = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "the snapshot hangs" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(CHILD, &item).await.0.is_success());
+    assert_eq!(t.get_task(&item).await["created_by"], A);
+
+    // While the child runs, the creator is refused like anyone else.
+    let (s, v) = release(&t, A, &released).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("while its session runs"),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+
+    end_session(&t, CHILD).await;
+    let (s, v) = release(&t, A, &released).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("open"), None),
+        "{v}"
+    );
+    let (s, v) = patch_as(&t, A, false, &handed, json!({ "owner": B })).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("review"), Some(B)),
+        "{v}"
+    );
+    let (s, v) = t.done(A, &closed, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+
+    let (s, v) = take(&t, A, &item).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    let (s, v) = t.done(A, &item, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    // The parent that delegated its owner still stands in.
+    let (s, v) = take(&t, PARENT, &item).await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(PARENT)), "{v}");
+}
+
+#[tokio::test]
+async fn nobody_stands_in_while_the_owner_may_come_back() {
+    let t = setup().await;
+    delegation(&t).await;
+    let grandchild = "t3:thread:delegated-task:c1-g1";
+    let [delegating, limited] = [childs_task(&t).await, childs_task(&t).await];
+
+    // The ended child's own delegate still works: its task waits for it.
+    register_delegated(&t, grandchild, CHILD).await;
+    end_session(&t, CHILD).await;
+    let (s, v) = take(&t, PARENT, &delegating).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    end_session(&t, grandchild).await;
+    let (s, v) = take(&t, PARENT, &delegating).await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(PARENT)), "{v}");
+
+    // A session that ended waiting for a usage-limit reset comes back after it.
+    register_delegated(&t, CHILD, PARENT).await;
+    let reset = t.state.now() + TimeDelta::hours(6);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CHILD}/state"),
+        Some(CHILD),
+        Some(json!({ "state": "paused", "paused_until": reset.to_rfc3339() })),
+    )
+    .await;
+    end_session(&t, CHILD).await;
+    let (s, v) = take(&t, A, &limited).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    let (s, v) = t.done(A, &limited, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    t.advance(TimeDelta::hours(7));
+    assert_eq!(t.get_task(&limited).await["owner_stale"], false);
+    let (s, v) = take(&t, A, &limited).await;
+    assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
 }
