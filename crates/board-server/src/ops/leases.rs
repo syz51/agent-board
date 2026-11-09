@@ -47,16 +47,26 @@ macro_rules! delegated_down_cte {
 }
 pub(crate) use delegated_down_cte;
 
+/// The recursive CTE `up(id, depth)`: agent `?1` at depth 0, then the T3 threads that
+/// delegated it, up the chain, to depth `?2`. A macro, as [`delegated_down_cte`].
+macro_rules! delegated_up_cte {
+    () => {
+        "up(id, depth) AS ( \
+           SELECT ?1, 0 \
+           UNION \
+           SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
+           FROM agents a JOIN up ON a.id = up.id \
+           WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
+             AND up.depth < ?2)"
+    };
+}
+pub(crate) use delegated_up_cte;
+
 /// The query of [`delegation_family`]: `?1` the agent, `?2` the depth.
 pub(crate) const DELEGATION_FAMILY: &str = concat!(
-    "WITH RECURSIVE \
-     up(id, depth) AS ( \
-       SELECT ?1, 0 \
-       UNION \
-       SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
-       FROM agents a JOIN up ON a.id = up.id \
-       WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
-         AND up.depth < ?2), ",
+    "WITH RECURSIVE ",
+    delegated_up_cte!(),
+    ", ",
     delegated_down_cte!(),
     " SELECT id FROM up UNION SELECT id FROM down"
 );

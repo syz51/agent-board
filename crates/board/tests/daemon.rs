@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, Home};
-use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
+use board::daemon::{Adoption, Coordinator, Daemon, RELEASE_GRACE, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
 use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut, UserMessage};
@@ -6746,7 +6746,8 @@ async fn a_worker_that_leaves_its_task_open_frees_its_slot_and_the_task_waits() 
     let later = at() + chrono::Duration::minutes(1);
     e.daemon.reconcile(later).await.unwrap();
 
-    // It gives the task back, as after a lease overlap: another task gets the slot.
+    // It gives the task back with nothing else in progress: another task gets the slot,
+    // and factory-4 waits its retry.
     task_at(&e, "factory-4", TaskStatus::Open, None);
     e.daemon.reconcile(later).await.unwrap();
     let starts = worker_starts(&e.t3);
@@ -7021,6 +7022,12 @@ async fn a_worker_entry_this_version_cannot_read_is_skipped_not_the_rest_of_the_
     saved["workers"]["factory-6"] = json!({ "title": 3 });
     saved["workers"]["not a task"] = saved["workers"]["factory-4"].clone();
     saved["worker_retry"] = json!({ "factory-7": "soon", "factory-8": at() });
+    saved["worker_skips"] = json!({ "factory-7": "factory-4", "factory-8": ["factory-4"] });
+    saved["owed"] = json!([
+        { "step": "judge", "board": "factory" },
+        { "step": "release", "board": "factory", "task": "factory-8", "away": "t3:w",
+          "since": at(), "noticed": at(), "at": at() },
+    ]);
     std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
 
     let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
@@ -7030,4 +7037,526 @@ async fn a_worker_entry_this_version_cannot_read_is_skipped_not_the_rest_of_the_
         restarted.state.worker_retry.keys().collect::<Vec<_>>(),
         [&"factory-8".parse::<board_proto::TaskId>().unwrap()]
     );
+    assert_eq!(
+        restarted.state.worker_skips.keys().collect::<Vec<_>>(),
+        [&"factory-8".parse::<board_proto::TaskId>().unwrap()]
+    );
+    assert_eq!(restarted.state.owed.len(), 1);
+}
+
+/// A daemon-dispatch board this device runs with `slots` tasks at once, with `tasks` ready.
+fn slots_env(slots: u32, tasks: &[board_proto::Task]) -> Env {
+    let e = dispatch_env(tasks);
+    let mut board = daemon_board(None);
+    board.parallel_tasks = slots;
+    let mut held = daemon_board(Some(DISPATCH));
+    held.parallel_tasks = slots;
+    e.stub.on("GET /v1/boards", [board]);
+    e.stub.on("POST /v1/boards/factory/coordinator", held);
+    e
+}
+
+/// A task in `doing` owned by `owner`, as the list of tasks gives it.
+fn doing_task(id: &str, owner: &str, blockers: &[&str]) -> board_proto::Task {
+    let mut task = ready_task(id, board_proto::Priority::P1, -60);
+    task.status = TaskStatus::Doing;
+    task.ready = false;
+    task.owner = Some(owner.parse().unwrap());
+    task.blockers = blockers.iter().map(|b| b.parse().unwrap()).collect();
+    task
+}
+
+fn titles(t3: &FakeT3) -> Vec<String> {
+    worker_starts(t3)
+        .into_iter()
+        .map(|(title, _)| title)
+        .collect()
+}
+
+#[tokio::test]
+async fn two_slots_start_two_independent_tasks_and_an_unclaimed_worker_holds_its_slot() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    let mut e = slots_env(2, &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-4 Task factory-4", "factory-5 Task factory-5"]
+    );
+    assert_eq!(e.daemon.state.workers.len(), 2);
+
+    // Neither has claimed its task yet: both still hold their slots.
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 2);
+
+    // A task in doing that no worker here follows counts with the unclaimed one.
+    let mut e = slots_env(2, &tasks);
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            doing_task("factory-9", "t3:old-child", &[]),
+            tasks[0].clone(),
+            tasks[1].clone(),
+        ],
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1, "both slots are taken");
+
+    // Parked, the worker frees its slot for the next task.
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-4", TaskStatus::Review, Some(&owner));
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            doing_task("factory-9", "t3:old-child", &[]),
+            tasks[1].clone(),
+        ],
+    );
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-4 Task factory-4", "factory-5 Task factory-5"]
+    );
+}
+
+#[tokio::test]
+async fn a_task_that_waits_on_a_task_in_progress_or_that_one_waits_on_is_not_started() {
+    use board_proto::Priority::{P1, P2};
+    // It waits on the task in progress.
+    // It waits on the task in progress: the server does not count it ready.
+    let mut waits = ready_task("factory-4", P1, 0);
+    waits.blockers = vec!["factory-9".parse().unwrap()];
+    waits.ready = false;
+    let mut e = slots_env(2, &[]);
+    e.stub.on(
+        "GET /v1/tasks",
+        [doing_task("factory-9", "t3:other", &[]), waits.clone()],
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // An independent task takes the slot instead.
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            doing_task("factory-9", "t3:other", &[]),
+            waits,
+            ready_task("factory-5", P2, 1),
+        ],
+    );
+    e.stub.on(
+        "POST /v1/tasks/factory-5/notes",
+        note(&"factory-5".parse().unwrap()),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-5 Task factory-5"]);
+
+    // The task in progress waits on it.
+    let mut e = slots_env(2, &[ready_task("factory-4", P1, 0)]);
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            doing_task("factory-9", "t3:other", &["factory-4"]),
+            ready_task("factory-4", P1, 0),
+        ],
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
+async fn after_a_usage_limit_stop_since_the_tasks_in_progress_started_no_further_task_starts() {
+    use board_proto::Priority::P1;
+    let mut e = slots_env(2, &[ready_task("factory-4", P1, 0)]);
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            doing_task("factory-9", "t3:other", &[]),
+            ready_task("factory-4", P1, 0),
+        ],
+    );
+    // An agent of the board stopped on its usage limit after factory-9 started.
+    let member = "t3:member";
+    let mut info = agent_fixture(member, DEVICE, AgentState::Paused);
+    info.boards = vec![factory()];
+    e.stub.on(&format!("GET {}", agent_path(member)), &info);
+    let stop = state_changed(
+        40,
+        member,
+        AgentState::Paused,
+        Some(at() + chrono::Duration::hours(2)),
+    );
+    e.daemon.on_event(&stop, at()).await.unwrap();
+    assert_eq!(e.daemon.state.usage_stops.len(), 1);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // An agent of another board stopping does not count.
+    info.boards = vec![];
+    e.stub.on(&format!("GET {}", agent_path(member)), &info);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // Nor does a stop from before the tasks in progress started.
+    let mut e = slots_env(2, &[ready_task("factory-4", P1, 0)]);
+    let mut started = doing_task("factory-9", "t3:other", &[]);
+    started.updated_at = at() + chrono::Duration::minutes(5);
+    e.stub
+        .on("GET /v1/tasks", [started, ready_task("factory-4", P1, 0)]);
+    info.boards = vec![factory()];
+    e.stub.on(&format!("GET {}", agent_path(member)), &info);
+    e.daemon.on_event(&stop, at()).await.unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+}
+
+#[tokio::test]
+async fn a_task_left_open_on_a_lease_overlap_waits_until_a_task_in_progress_ends() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+    ];
+    let mut e = slots_env(2, &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-4", TaskStatus::Doing, Some(&owner));
+    task_at(&e, "factory-5", TaskStatus::Doing, Some(&owner));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 2);
+
+    // factory-5's lease overlaps factory-4: its worker gives it back and ends. It is not
+    // started again while factory-4 is in progress, however long that takes.
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    let f4: board_proto::TaskId = "factory-4".parse().unwrap();
+    let f5: board_proto::TaskId = "factory-5".parse().unwrap();
+    assert_eq!(
+        e.daemon.state.worker_skips[&f5],
+        std::collections::BTreeSet::from([f4.clone()])
+    );
+    assert!(e.daemon.state.worker_retry.is_empty());
+    let much_later = later + board::daemon::WORKER_RETRY * 3;
+    e.daemon.reconcile(much_later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 2);
+
+    // Saved, so a restarted daemon keeps the skip.
+    let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.worker_skips, e.daemon.state.worker_skips);
+
+    // factory-4 ends: factory-5 starts again at once.
+    task_at(&e, "factory-4", TaskStatus::Review, Some(&owner));
+    e.stub.on("GET /v1/tasks", &tasks[1..]);
+    e.daemon.reconcile(much_later).await.unwrap();
+    let starts = titles(&e.t3);
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2], "factory-5 Task factory-5");
+    assert!(e.daemon.state.worker_skips.is_empty());
+}
+
+/// A daemon-dispatch board this device runs, its lease held, with factory-7 `status` and
+/// owned by `owner`, ready to be set open.
+async fn owed_env(status: TaskStatus, owner: &str) -> Env {
+    let mut e = dispatch_env(&[]);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut task = detail("factory-7", false, &[]);
+    task.task.status = status;
+    task.task.owner = Some(owner.parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-7", &task);
+    e.stub
+        .on("POST /v1/tasks/factory-7/notes", note(&task.task.id));
+    let mut open = task.task.clone();
+    open.status = TaskStatus::Open;
+    open.owner = None;
+    e.stub.on("POST /v1/tasks/factory-7/release", open);
+    if status == TaskStatus::Doing {
+        e.stub
+            .on("GET /v1/tasks", [doing_task("factory-7", owner, &[])]);
+    }
+    e
+}
+
+fn set_open(e: &Env) -> Vec<Recorded> {
+    e.stub.requests_to("POST /v1/tasks/factory-7/release")
+}
+
+#[tokio::test]
+async fn an_answer_to_a_gone_asker_is_noted_on_its_task_and_the_task_set_open() {
+    // An asker no daemon can wake, ended: the dispatcher does the step on its reconcile.
+    let asker = "claude:session";
+    let mut e = owed_env(TaskStatus::Blocked, asker).await;
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    assert!(e.daemon.on_event(&ev, at()).await.unwrap());
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    e.daemon.reconcile(at()).await.unwrap();
+
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-7/notes");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(notes[0].body["kind"], "decision");
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains("ask #3") && text.contains("sqlite <b>"),
+        "{text}"
+    );
+    let opened = set_open(&e);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].body, json!({ "agent": DISPATCH }));
+    assert!(e.daemon.state.owed.is_empty());
+
+    // A task its asker parked in review goes back to open too.
+    let mut e = owed_env(TaskStatus::Review, asker).await;
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
+
+    // A live asker hears of its answer itself: nothing is done for it while it is there.
+    let mut e = owed_env(TaskStatus::Blocked, asker).await;
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Idle),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-7/notes")
+            .is_empty()
+    );
+    assert!(set_open(&e).is_empty());
+    assert_eq!(
+        e.daemon.state.owed.len(),
+        1,
+        "kept while the asker is there"
+    );
+
+    // It ends without taking the answer up: the step is done.
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let later = at() + chrono::Duration::minutes(5);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
+    assert!(e.daemon.state.owed.is_empty());
+
+    // A T3 asker whose thread is gone: found at the flush, then done by the dispatcher.
+    let gone = "t3:gone";
+    let mut e = owed_env(TaskStatus::Blocked, gone).await;
+    e.stub.on(
+        &format!("GET {}", agent_path(gone)),
+        agent_fixture(gone, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, gone);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    e.daemon.flush(at()).await;
+    assert_eq!(e.daemon.state.owed.len(), 1);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-7/notes").len(),
+        1
+    );
+    assert_eq!(set_open(&e).len(), 1);
+    assert!(
+        e.t3.sends().is_empty(),
+        "no coordinator thread to pass it to"
+    );
+
+    // Another home device holds the lease: this one owes nothing it could never do.
+    let mut e = owed_env(TaskStatus::Blocked, asker).await;
+    e.stub.on(
+        "GET /v1/boards",
+        [daemon_board(Some("dispatch:other-device"))],
+    );
+    e.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        409,
+        "claim_refused",
+        "held by dispatch:other-device",
+        "wait",
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    assert!(e.daemon.state.owed.is_empty());
+}
+
+/// The server's idle notice for factory-7, away since 40 minutes before `at()`, at `noticed`.
+fn idle_notice(seq: i64, away: &str, noticed: Timestamp) -> Event {
+    let since = at() - chrono::Duration::minutes(40);
+    let mut notice = event(seq, EventType::TaskUpdated, Some("factory-7"), "server");
+    notice.at = noticed;
+    notice.payload = json!({ "fields": [], "idle_doing": since, "away": away });
+    notice
+}
+
+#[tokio::test]
+async fn an_owner_still_away_at_the_repeat_notice_loses_its_task() {
+    let owner = "t3:worker";
+    let mut e = owed_env(TaskStatus::Doing, owner).await;
+    let mut info = agent_fixture(owner, DEVICE, AgentState::Idle);
+    info.branch = Some("task/factory-7".into());
+    info.native_ids.insert(
+        "t3_link".into(),
+        "https://t3.example.test/threads/worker".into(),
+    );
+    e.stub.on(&format!("GET {}", agent_path(owner)), &info);
+
+    // The first notice wakes the owner as before, and releases nothing.
+    e.daemon
+        .on_event(&idle_notice(30, owner, at()), at())
+        .await
+        .unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(set_open(&e).is_empty());
+    assert_eq!(e.daemon.state.wakes.len(), 1);
+
+    // The repeat wakes the owner again; the dispatcher gives it time to come back.
+    let repeat = at() + chrono::Duration::minutes(40);
+    assert!(
+        e.daemon
+            .on_event(&idle_notice(31, owner, repeat), repeat)
+            .await
+            .unwrap()
+    );
+    e.daemon.reconcile(repeat).await.unwrap();
+    assert!(set_open(&e).is_empty());
+    assert_eq!(e.daemon.state.owed.len(), 1);
+
+    // Still away after that: the task goes back to open with a note.
+    let graced = repeat + RELEASE_GRACE;
+    e.daemon.reconcile(graced).await.unwrap();
+    let opened = set_open(&e);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].agent.as_deref(), Some(DISPATCH));
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-7/notes");
+    assert_eq!(notes.len(), 1);
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains("https://t3.example.test/threads/worker") && text.contains("task/factory-7"),
+        "{text}"
+    );
+    assert!(e.daemon.state.owed.is_empty());
+    assert!(e.daemon.state.idle_notices.is_empty());
+
+    // An owner back at work since the repeat keeps its task.
+    let mut e = owed_env(TaskStatus::Doing, owner).await;
+    let mut back = agent_fixture(owner, DEVICE, AgentState::Running);
+    back.last_seen = repeat + chrono::Duration::minutes(1);
+    e.stub.on(&format!("GET {}", agent_path(owner)), &back);
+    e.daemon
+        .on_event(&idle_notice(30, owner, at()), at())
+        .await
+        .unwrap();
+    e.daemon
+        .on_event(&idle_notice(31, owner, repeat), repeat)
+        .await
+        .unwrap();
+    e.daemon.reconcile(graced).await.unwrap();
+    assert!(set_open(&e).is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-7/notes")
+            .is_empty()
+    );
+    assert!(e.daemon.state.owed.is_empty());
+
+    // A notice of a new spell is a first notice again.
+    let mut e = owed_env(TaskStatus::Doing, owner).await;
+    e.stub.on(&format!("GET {}", agent_path(owner)), &info);
+    e.daemon
+        .on_event(&idle_notice(30, owner, at()), at())
+        .await
+        .unwrap();
+    let mut later = idle_notice(31, owner, repeat);
+    later.payload["idle_doing"] = json!(at());
+    e.daemon.on_event(&later, repeat).await.unwrap();
+    e.daemon.reconcile(graced).await.unwrap();
+    assert!(set_open(&e).is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    let worker = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-4", TaskStatus::Doing, Some(&worker));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+
+    // Its thread is archived, its agent ended: the task stays in doing, holding the slot,
+    // until the server's notice that its owner is away.
+    e.t3.threads.lock().unwrap().remove(NEW_THREAD);
+    let mut info = agent_fixture(&worker, DEVICE, AgentState::Ended);
+    info.branch = Some("task/factory-4".into());
+    e.stub.on(&format!("GET {}", agent_path(&worker)), &info);
+    let mut doing = detail("factory-4", false, &[]);
+    doing.task.status = TaskStatus::Doing;
+    doing.task.owner = Some(worker.parse().unwrap());
+    let mut open = doing.task.clone();
+    open.status = TaskStatus::Open;
+    open.owner = None;
+    e.stub.on("POST /v1/tasks/factory-4/release", open);
+    let noticed = at() + chrono::Duration::minutes(40);
+    let mut notice = event(30, EventType::TaskUpdated, Some("factory-4"), "server");
+    notice.at = noticed;
+    notice.payload = json!({ "fields": [], "idle_doing": later, "away": worker });
+    e.daemon.on_event(&notice, noticed).await.unwrap();
+    e.daemon.flush(noticed).await;
+    e.daemon.flush(noticed).await;
+    assert_eq!(
+        e.daemon.state.owed.len(),
+        1,
+        "the wake found the thread gone"
+    );
+
+    // The task goes back to open, naming the old thread and branch, and a new worker
+    // starts for it at once.
+    e.daemon.reconcile(noticed + RELEASE_GRACE).await.unwrap();
+    let opened = e.stub.requests_to("POST /v1/tasks/factory-4/release");
+    assert_eq!(opened.len(), 1);
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    let texts: Vec<&str> = notes
+        .iter()
+        .map(|n| n.body["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert!(
+        texts[1].contains(&worker) && texts[1].contains("task/factory-4"),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(worker_starts(&e.t3).len(), 2);
 }

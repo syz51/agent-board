@@ -1088,18 +1088,9 @@ pub async fn board_adopt(
              each device to keep)"
         );
     }
-    if !board
-        .repos
-        .iter()
-        .any(|repo| ctx.config.projects.contains_key(repo))
-    {
-        bail!(
-            "config.toml has no [projects] path for any repo of board {slug} ({}); add one, \
-             since the daemon registers the coordinator in that project",
-            board.repos.join(", ")
-        );
-    }
-    // The daemon runs the thread only while the folder is there.
+    // The daemon's own lookup ([projects] for a board repo, else [board_projects] for the
+    // board), so adopt accepts exactly the folders the daemon runs the thread in; the
+    // daemon runs it only while the folder is there.
     let project = daemon::host_folder(&ctx.config, &board)?;
     if let Some(current) = &board.coordinator {
         if *current == agent {
