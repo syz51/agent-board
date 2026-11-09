@@ -522,9 +522,25 @@ pub fn board_list(boards: &[Board]) -> String {
 
 /// `board usage`: the reading, one line per window, then the active boards it stops from
 /// starting new work.
-pub fn usage(usage: Option<&Usage>, boards: &[Board], now: Timestamp) -> String {
+/// `board usage`: the reading, the boards it holds and the pace; `reserve` is the reserve
+/// set, `None` while the pace is off.
+pub fn usage(
+    usage: Option<&Usage>,
+    reserve: Option<f64>,
+    boards: &[Board],
+    now: Timestamp,
+) -> String {
     let Some(usage) = usage else {
-        return "no usage reading yet: a daemon (board watch) reports one every 5 minutes".into();
+        let mut text = String::from(
+            "no usage reading yet: a daemon (board watch) reports one every 5 minutes",
+        );
+        if let Some(r) = reserve {
+            let _ = write!(
+                text,
+                "\npace: reserve {r:.1}% set; it applies from the first reading"
+            );
+        }
+        return text;
     };
     let mut lines = Vec::new();
     for (kind, window) in usage.windows() {
@@ -551,6 +567,42 @@ pub fn usage(usage: Option<&Usage>, boards: &[Board], now: Timestamp) -> String 
         .collect();
     if !held.is_empty() {
         lines.push(format!("starting no new task: {}", held.join(", ")));
+    }
+    match usage.pace_at(now) {
+        Some(p) => {
+            lines.push(format!(
+                "pace: reserve {:.1}% · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
+                p.reserve,
+                p.anchor,
+                p.line,
+                p.allowance(),
+                p.projected,
+                p.next_day().format("%Y-%m-%d %H:%MZ")
+            ));
+            if p.hard_since.is_some() {
+                lines.push(format!(
+                    "hard line: weekly use reached {:.1}%: agents working for a board halt",
+                    p.hard_line()
+                ));
+            }
+            let limits: Vec<String> = boards
+                .iter()
+                .filter(|b| b.status != board_proto::BoardStatus::Closed)
+                .map(|b| format!("{} {}", b.slug, p.limit(b.parallel_tasks.max(1))))
+                .collect();
+            if !limits.is_empty() {
+                lines.push(format!("tasks at once by pace: {}", limits.join(", ")));
+            }
+        }
+        None if usage.pace.is_some() => {
+            lines.push("pace: not applied (the reading is stale or its week has reset)".into())
+        }
+        None => match reserve {
+            Some(r) => lines.push(format!(
+                "pace: reserve {r:.1}% set; not applied (the reading gives no weekly reset time)"
+            )),
+            None => lines.push("pace: off (`board usage --reserve 5.5` turns it on)".into()),
+        },
     }
     lines.join("\n")
 }

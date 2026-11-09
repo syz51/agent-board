@@ -1441,6 +1441,32 @@ fn read_tool(e: &Env) -> (Option<Value>, String) {
 }
 
 #[test]
+fn the_weekly_usage_at_the_reserve_stops_a_running_turn_with_a_usage_reason() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    serve_hold(&e, false);
+    prompt(&e, "go");
+
+    let mut snap = snapshot_fixture(SnapshotKind::Alerts, "", 2);
+    snap.text = "<board>\nhold: factory: weekly usage 95% reached 94.5% -> stop\n</board>".into();
+    snap.held_by = vec!["factory".parse().unwrap()];
+    snap.held_for_usage = true;
+    e.stub.on("GET /v1/snapshot", snap);
+    let (reply, _) = read_tool(&e);
+    let reply = reply.expect("a halt");
+    assert_eq!(reply["continue"], false, "{reply}");
+    let reason = reply["stopReason"].as_str().unwrap();
+    assert!(
+        reason.contains("weekly usage reached your reserve")
+            && reason.contains("factory")
+            && reason.contains("board usage --reserve"),
+        "{reason}"
+    );
+}
+
+#[test]
 fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
     let e = env();
     let mut h = doing_with_handoff(&e, None);

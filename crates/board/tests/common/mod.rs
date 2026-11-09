@@ -606,6 +606,7 @@ pub fn snapshot_fixture(kind: SnapshotKind, text: &str, seq: i64) -> Snapshot {
         at: Utc::now(),
         held_by: Vec::new(),
         held_since: None,
+        held_for_usage: false,
     }
 }
 

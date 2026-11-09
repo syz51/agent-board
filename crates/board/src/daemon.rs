@@ -103,6 +103,11 @@ pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// The daemon reads the usage endpoint at most this often; between its own readings, each
 /// reconcile takes the newest reading any device reported.
 pub const USAGE_POLL_EVERY: TimeDelta = TimeDelta::minutes(5);
+/// ... and this often while the weekly pace is near a line ([`Usage::near_line`]).
+pub const USAGE_POLL_NEAR: TimeDelta = TimeDelta::minutes(1);
+/// After the usage endpoint refuses a reading for its rate limit, the daemon reads it only
+/// every [`USAGE_POLL_EVERY`] for this long.
+pub const USAGE_REFUSED_BACKOFF: TimeDelta = TimeDelta::minutes(30);
 /// A named coordinator's thread that T3 found live is not asked about again for this long.
 /// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
 /// each minute costs a home device more than the check is worth. A failed send to the
@@ -1464,6 +1469,8 @@ pub struct Daemon<T: T3> {
     pub usage: Option<Usage>,
     /// When this daemon last read the usage endpoint itself.
     usage_polled: Option<Timestamp>,
+    /// When the usage endpoint last refused a reading for its rate limit.
+    usage_refused: Option<Timestamp>,
     /// Whether this device's dispatch agent is registered since the daemon started.
     dispatch_registered: bool,
     /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
@@ -1493,6 +1500,7 @@ impl<T: T3> Daemon<T> {
             usage_source: UsageSource::Server,
             usage: None,
             usage_polled: None,
+            usage_refused: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
         }
@@ -2685,7 +2693,7 @@ impl<T: T3> Daemon<T> {
             .idle_notices
             .retain(|task, _| task.board() != *slug || in_progress.contains_key(task));
         self.save()?;
-        let slots = board.parallel_tasks.max(1) as usize;
+        let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
         if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
         }
@@ -4530,25 +4538,47 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Whether the usage holds `slug` from new work at `now`: a window of a fresh reading
-    /// is at or above the board's `usage_stop_at`.
+    /// is at or above the board's `usage_stop_at`, or the weekly pace is 0.
     fn usage_holds(&self, slug: &BoardSlug, now: Timestamp) -> bool {
         let (Some(board), Some(usage)) = (self.boards.get(slug), &self.usage) else {
             return false;
         };
         usage.over(board.usage_stop_at, now).is_some()
+            || usage.pace_limit(board.parallel_tasks.max(1), now) == 0
     }
 
-    /// Takes a new usage reading: from the endpoint, when [`USAGE_POLL_EVERY`] has passed
-    /// since this daemon last read it, reported to the server; else the newest any device
+    /// How many of a board's `slots` the weekly pace leaves at `now`.
+    fn pace_limit(&self, slots: u32, now: Timestamp) -> u32 {
+        self.usage
+            .as_ref()
+            .map_or(slots, |u| u.pace_limit(slots, now))
+    }
+
+    /// How long after its last reading the daemon reads the usage endpoint again: every
+    /// minute near a pace line, unless the endpoint refused a reading in the last 30
+    /// minutes; else every 5 minutes.
+    fn usage_poll_every(&self, now: Timestamp) -> TimeDelta {
+        let refused = self
+            .usage_refused
+            .is_some_and(|at| now - at < USAGE_REFUSED_BACKOFF);
+        let near = self.usage.as_ref().is_some_and(|u| u.near_line(now));
+        if near && !refused {
+            USAGE_POLL_NEAR
+        } else {
+            USAGE_POLL_EVERY
+        }
+    }
+
+    /// Takes a new usage reading: from the endpoint, when [`Self::usage_poll_every`] has
+    /// passed since this daemon last read it, reported to the server; else the newest any device
     /// reported. Then wakes the coordinators of boards the usage no longer holds. A
     /// failure keeps the last reading, which goes stale and then holds nothing; with no
     /// reading at all, as after a restart, the boards held stay held.
     async fn refresh_usage(&mut self, now: Timestamp) {
         let mut reported = None;
+        let every = self.usage_poll_every(now);
         if let UsageSource::ClaudeCode { url, credentials } = &self.usage_source
-            && self
-                .usage_polled
-                .is_none_or(|at| now - at >= USAGE_POLL_EVERY)
+            && self.usage_polled.is_none_or(|at| now - at >= every)
         {
             self.usage_polled = Some(now);
             match crate::usage::read(url, credentials, now).await {
@@ -4562,13 +4592,21 @@ impl<T: T3> Daemon<T> {
                             seven_day: report.seven_day,
                             read_at: report.read_at,
                             device: self.ctx.device.clone(),
+                            // The server computes the pace: keep the last one it gave, so
+                            // a failed report does not lift its hold.
+                            pace: self.usage.as_ref().and_then(|u| u.pace),
                         });
                     }
                 },
                 Ok(None) => tracing::debug!(
                     "usage: Claude Code is not signed in here or its token has expired"
                 ),
-                Err(err) => tracing::warn!("reading the usage: {err:#}"),
+                Err(err) => {
+                    if err.is::<crate::usage::Refused>() {
+                        self.usage_refused = Some(now);
+                    }
+                    tracing::warn!("reading the usage: {err:#}");
+                }
             }
         }
         match reported {
@@ -4624,6 +4662,14 @@ impl<T: T3> Daemon<T> {
             .boards
             .get(slug)
             .is_some_and(|b| b.status == BoardStatus::Paused)
+        {
+            return Ok(None);
+        }
+        // The weekly usage at the user's reserve holds a board as a pause does.
+        if self
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.hard_since(now).is_some())
         {
             return Ok(None);
         }
@@ -4775,10 +4821,19 @@ impl<T: T3> Daemon<T> {
                     .boards
                     .get(slug)
                     .map_or(board_proto::USAGE_STOP_AT_DEFAULT, |b| b.usage_stop_at);
+                let paced = self
+                    .usage
+                    .as_ref()
+                    .is_some_and(|u| u.pace_at(now).is_some());
+                let pace = if paced {
+                    ", and the weekly pace allows a task"
+                } else {
+                    ""
+                };
                 Some(format!(
                     "board {slug}: the account usage no longer stops new work on this board \
-                     (stop at {stop_at}%). Read your board snapshot, then start ready tasks \
-                     as usual"
+                     (stop at {stop_at}%{pace}). Read your board snapshot, then start ready \
+                     tasks up to the limit on its you: line"
                 ))
             }
             // The agent is no longer this board's coordinator, or the usage is high again.

@@ -848,14 +848,35 @@ pub async fn boards(ctx: &Ctx) -> Result<Output> {
 }
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
-pub async fn usage(ctx: &Ctx, now: Timestamp) -> Result<Output> {
+pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
+    let mut set = None;
+    if let Some(reserve) = reserve {
+        set = Some(
+            ctx.client
+                .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                .await?,
+        );
+    }
     let usage = ctx.client.usage().await?;
     let boards = match &usage {
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
+    // A reading without a pace may still have a reserve, waiting for a weekly reset time.
+    let reserve = match (set, usage.as_ref().and_then(|u| u.pace)) {
+        (Some(set), _) => set.reserve,
+        (None, Some(p)) => Some(p.reserve),
+        (None, None) => match ctx.client.usage_reserve().await {
+            Ok(r) => r.reserve,
+            Err(err) => {
+                // A server that predates the reserve: render it as off.
+                tracing::debug!("reading the usage reserve: {err:#}");
+                None
+            }
+        },
+    };
     Ok(Output::new(
-        render::usage(usage.as_ref(), &boards, now),
+        render::usage(usage.as_ref(), reserve, &boards, now),
         &usage,
     ))
 }
