@@ -4513,8 +4513,9 @@ impl<T: T3> Daemon<T> {
                             seven_day: report.seven_day,
                             read_at: report.read_at,
                             device: self.ctx.device.clone(),
-                            // The server computes the pace; without it, none holds.
-                            pace: None,
+                            // The server computes the pace: keep the last one it gave, so
+                            // a failed report does not lift its hold.
+                            pace: self.usage.as_ref().and_then(|u| u.pace),
                         });
                     }
                 },
@@ -4582,6 +4583,14 @@ impl<T: T3> Daemon<T> {
             .boards
             .get(slug)
             .is_some_and(|b| b.status == BoardStatus::Paused)
+        {
+            return Ok(None);
+        }
+        // The weekly usage at the user's reserve holds a board as a pause does.
+        if self
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.hard_since(now).is_some())
         {
             return Ok(None);
         }

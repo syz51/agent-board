@@ -1360,7 +1360,7 @@ fn parse_reserve(value: &str) -> Result<Reserve> {
     let n: f64 = value
         .parse()
         .map_err(|_| anyhow::anyhow!("expected a percent such as 5.5, or off"))?;
-    if !(n.is_finite() && (0.0..100.0).contains(&n)) {
+    if !board_proto::UsagePace::valid_reserve(n) {
         anyhow::bail!("expected a percent from 0 to below 100, or off");
     }
     Ok(Reserve(Some(n)))

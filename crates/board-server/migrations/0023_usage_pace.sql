@@ -1,4 +1,4 @@
--- The weekly usage pace (docs/DESIGN.md, "Usage pace"). One row: the reserve (NULL: the
+-- The weekly usage pace (docs/DESIGN.md, "Usage", Pace). One row: the reserve (NULL: the
 -- pace is off), the current pace day's start and its first weekly reading, and since when
 -- the measured weekly use is at the hard line.
 CREATE TABLE usage_pace (

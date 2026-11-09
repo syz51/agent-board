@@ -105,6 +105,9 @@ pub struct ReportUsage {
 /// may lower it or turn it off. The answer is the setting now.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UsageReserve {
+    /// Required: a missing field is refused rather than read as `null`, which turns the
+    /// pace off.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub reserve: Option<f64>,
 }
 
@@ -1108,8 +1111,16 @@ mod tests {
             ..pace(70.0)
         });
         assert_eq!(u.pace_limit(3, now), 0, "at the hard line");
-        assert!(u.hard(now));
-        assert!(!u.hard(now + chrono::TimeDelta::minutes(30)), "stale");
+        assert_eq!(u.hard_since(now), Some(now));
+        assert!(
+            !u.near_line(now),
+            "past the line nothing changes until the reset"
+        );
+        assert_eq!(
+            u.hard_since(now + chrono::TimeDelta::minutes(30)),
+            None,
+            "stale"
+        );
         assert_eq!(
             u.pace_limit(3, now + chrono::TimeDelta::hours(2)),
             3,

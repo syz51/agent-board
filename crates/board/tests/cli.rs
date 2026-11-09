@@ -2913,6 +2913,18 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(v["seven_day"]["percent"], 92.0);
 
+    // A reserve set, but no pace yet: said so, not "off".
+    e.stub
+        .on("GET /v1/usage/reserve", json!({ "reserve": 5.5 }));
+    let out = e.run(&["usage"]);
+    assert!(
+        stdout(&out).ends_with(
+            "pace: reserve 5.5% set; not applied (the reading gives no weekly reset time)\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
+
     // With a reserve: the day's line, the projection and each board's pace limit.
     let day_start = resets - chrono::Duration::hours(48);
     e.stub.on(

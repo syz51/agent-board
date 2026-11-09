@@ -393,16 +393,23 @@ high for it. There is no total cap.
     it, and its `parallel_tasks` otherwise. The snapshot's `usage:` line shows the pace,
     and the `you:` line's limit is the smaller of the two. At 0 the `usage:` line shows
     in deltas too, as for over, and the coordinator starts nothing new.
-  - Hard line: at a weekly use of `100 - reserve`, every agent working for a board is
-    held, as by a pause ("Pausing work"), with the usage as the reason. The hooks end its
-    running turn. The hold ends when the use falls below the line (a weekly reset) or the
-    user lowers the reserve.
+  - Hard line: at a weekly use of `100 - reserve`, every agent working for an active
+    board is held, as by a pause ("Pausing work"), with the usage as the reason. The
+    server dates it by its own clock when the reading arrives. The hooks end a turn
+    begun before it, and the daemon starts no turn for the boards' wake-ups. The hold
+    ends when the use falls below the line (a weekly reset) or the user lowers the
+    reserve.
+  - The day's anchor matches the day by its start; the reset time is rounded to the
+    minute first, as the endpoint's moves by fractions of a second.
   - A stale reading, or one past its weekly reset, applies no pace, as for over.
   - The daemon drops ready and cleared wake-ups while a board's pace limit is 0, starts
-    at most the limit, and wakes the coordinator once when it rises again. It reads the
-    usage every minute while within 2 points of a line (the day's or the hard line),
-    otherwise every 5 minutes. After the usage endpoint refuses a read (HTTP 429), it reads
-    every 5 minutes for 30 minutes.
+    at most the limit, and wakes the coordinator once when it rises again. When its
+    report fails, it keeps the server's last pace with its own reading. It reads the
+    usage every minute while the use is below the lower line (the day's or the hard
+    line) and it or the projection is within 2 points of it, otherwise every 5 minutes.
+    After the usage endpoint refuses a read (HTTP 429), it reads every 5 minutes for 30
+    minutes.
+  - The Telegram stalled alert skips a board the usage stops (over, or a pace of 0).
 - `board usage` prints the reading, the boards it holds, paused ones included, and the
   pace: the reserve, the day's line and allowance, the projection, the next day's start
   and each board's pace limit.

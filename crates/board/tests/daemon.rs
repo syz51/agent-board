@@ -7340,3 +7340,63 @@ async fn the_daemon_reads_the_usage_every_minute_near_a_pace_line_until_refused(
     e.daemon.reconcile(next).await.unwrap();
     assert_eq!(reads(&e), 7);
 }
+
+#[tokio::test]
+async fn the_weekly_hard_line_holds_every_wake_of_its_boards() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let mut hard = paced_reading(80.0, at());
+    hard["pace"]["hard_since"] = json!(at());
+    e.stub.on("GET /v1/usage", hard);
+    e.daemon.reconcile(at()).await.unwrap();
+    let ev = answered(&e, 11, 3, agent.as_str());
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // Below the hard line, an answer goes as before.
+    let later = at() + chrono::Duration::minutes(1);
+    e.stub.on("GET /v1/usage", paced_reading(70.0, later));
+    e.daemon.reconcile(later).await.unwrap();
+    let ev = answered(&e, 12, 4, agent.as_str());
+    e.daemon.on_event(&ev, later).await.unwrap();
+    e.daemon.flush(later).await;
+    let text: String = e.t3.sends().iter().map(|(_, m)| m.as_str()).collect();
+    assert!(text.contains("ask #4"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_usage_report_keeps_the_last_pace() {
+    use board::usage::{Credentials, UsageSource};
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/usage", paced_reading(80.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+
+    let creds = e._dir.path().join("credentials.json");
+    std::fs::write(
+        &creds,
+        json!({ "claudeAiOauth": {
+            "accessToken": "tok-123",
+            "expiresAt": (at() + chrono::Duration::hours(8)).timestamp_millis(),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    e.daemon.usage_source = UsageSource::ClaudeCode {
+        url: format!("{}/api/oauth/usage", e.stub.url),
+        credentials: Credentials::File(creds),
+    };
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 70.0, "resets_at": null } }),
+    );
+    e.stub
+        .on_status("PUT /v1/usage", 400, json!({ "code": "invalid" }));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.stub.requests_to("PUT /v1/usage").len(), 1);
+    assert!(e.daemon.state.usage_held.contains(&factory()), "still held");
+    e.daemon.flush(later).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+}

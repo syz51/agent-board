@@ -584,9 +584,14 @@ fn launched_subagent(input: &Value) -> Option<&str> {
 
 /// `text` with its `hold:` line replaced by one for a subagent the hold lets work on; the
 /// line goes first when the server's text has none the hook recognizes.
-fn subagent_hold(text: &str, boards: &[board_proto::BoardSlug]) -> String {
+fn subagent_hold(text: &str, boards: &[board_proto::BoardSlug], for_usage: bool) -> String {
+    let why = if for_usage {
+        "held: the weekly usage reached the user's reserve"
+    } else {
+        "paused"
+    };
     let line = format!(
-        "hold: {} paused -> the turn that launched you began while held and went on, which the \
+        "hold: {} {why} -> the turn that launched you began while held and went on, which the \
          hold allows only for the user's own request: finish your task, and start no other \
          task, child thread or wake-up.",
         board_names(boards)
@@ -1669,12 +1674,13 @@ impl Hook<'_> {
             *beat = Some(self.now);
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
             let boards = snap.held_by.clone();
+            let for_usage = snap.held_for_usage;
             let reason = halt_reason(&snap);
             let mut alerts = self.keep(snap)?;
             if self.local.held && self.subagent_passes() {
                 // The subagent's turn holds no user message, so the hold line would stop
                 // the work its launching turn went on with.
-                alerts = subagent_hold(&alerts, &boards);
+                alerts = subagent_hold(&alerts, &boards, for_usage);
             } else if self.local.halted() {
                 // A turn that was running when its board was paused stops here, at every
                 // heartbeat until it ends: a runtime may not end it at the first (a
@@ -2631,18 +2637,28 @@ mod tests {
         let text = subagent_hold(
             "<board>\nhold: factory paused -> stop\nusage: 5h 8%\n</board>",
             &boards,
+            false,
         );
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4, "{text}");
         assert!(lines[1].starts_with("hold: factory paused -> the turn that launched you"));
         assert!(!text.contains("-> stop"), "{text}");
         // A server text the hook does not recognize keeps its lines, after the hook's own.
-        let text = subagent_hold("<board>\nHOLD factory\n</board>", &boards);
+        let text = subagent_hold("<board>\nHOLD factory\n</board>", &boards, false);
         assert!(
             text.starts_with("hold: factory paused -> the turn"),
             "{text}"
         );
         assert!(text.ends_with("<board>\nHOLD factory\n</board>"), "{text}");
+        let text = subagent_hold(
+            "<board>\nhold: factory: weekly usage\n</board>",
+            &boards,
+            true,
+        );
+        assert!(
+            text.contains("hold: factory held: the weekly usage reached the user's reserve -> "),
+            "{text}"
+        );
     }
 
     #[test]

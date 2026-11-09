@@ -102,7 +102,8 @@ fn record_weekly(cx: &Ctx<'_>, at: Timestamp, week: UsageWindow) -> Result<()> {
             params![start.timestamp_millis(), week.percent],
         )?;
     }
-    mark_hard(cx, at, week.percent)
+    // Server time, as the hooks compare it with when a turn began.
+    mark_hard(cx, cx.now, week.percent)
 }
 
 /// Sets `hard_since` to `at` when the weekly use at `percent` reaches `100 - reserve` and
@@ -118,8 +119,11 @@ fn mark_hard(cx: &Ctx<'_>, at: Timestamp, percent: f64) -> Result<()> {
 }
 
 /// The pace day that holds `at` in a week that resets at `reset`: its start, and how many
-/// days run from that start to the reset, at least 1.
+/// days run from that start to the reset, at least 1. The reset is rounded to the minute,
+/// since the endpoint's reset time may move by a fraction of a second between readings.
 fn pace_day(at: Timestamp, reset: Timestamp) -> (Timestamp, i32) {
+    let minute = 60_000;
+    let reset = ts((reset.timestamp_millis() + minute / 2).div_euclid(minute) * minute);
     let day = DAY.num_milliseconds();
     let left = (reset - at).num_milliseconds();
     // A week resets within 7 days, so this fits.
@@ -201,7 +205,7 @@ fn pace(cx: &Ctx<'_>, usage: &Usage) -> Result<Option<UsagePace>> {
 /// Checks a reserve: finite, from 0 to below 100.
 pub(crate) fn validate_reserve(req: UsageReserve) -> Result<UsageReserve> {
     if let Some(r) = req.reserve
-        && !(r.is_finite() && (0.0..100.0).contains(&r))
+        && !UsagePace::valid_reserve(r)
     {
         return Err(invalid(
             format!("reserve={r} is out of range"),

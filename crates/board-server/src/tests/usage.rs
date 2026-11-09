@@ -309,6 +309,15 @@ async fn only_the_user_lowers_the_usage_reserve_or_turns_it_off() {
             .await;
         assert_eq!(code, 400, "{v}");
     }
+    // A missing field is refused, not read as off.
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserv": 6.0 })))
+        .await;
+    assert!(s.is_client_error(), "{v}");
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", Some(ME), None).await,
+        json!({ "reserve": 6.0 })
+    );
     let (s, v) = t
         .as_user("PUT", "/v1/usage/reserve", reserve(json!(5.5)))
         .await;
@@ -330,6 +339,31 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
     t.register(ME, Some(REPO), None).await;
     t.register("t3:other", Some(REPO), None).await;
     t.board("factory", &[REPO]).await;
+    // The other agent coordinated a board that is closed now.
+    t.board("old", &[REPO]).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/old",
+            Some(json!({ "autopilot": true })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    t.ok(
+        "POST",
+        "/v1/boards/old/coordinator",
+        Some("t3:other"),
+        Some(json!({ "device": "mac", "agent": "t3:other" })),
+    )
+    .await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/old",
+            Some(json!({ "status": "closed" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
     let (s, v) = t
         .as_user(
             "PATCH",
@@ -384,14 +418,16 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
     );
 
     // 2.5 points in 15 minutes projects 83.3 in 5 more: within 2 points, one at a time.
+    // The reset time moved by a fraction of a second: the same day, the same anchor.
     t.advance(TimeDelta::minutes(15));
-    t.ok(
-        "PUT",
-        "/v1/usage",
-        None,
-        Some(week_reading(15, 82.5, reset)),
-    )
-    .await;
+    let mut reading = week_reading(15, 82.5, reset);
+    reading["seven_day"]["resets_at"] = json!(
+        (start() + TimeDelta::minutes(reset) + TimeDelta::milliseconds(400))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    );
+    t.ok("PUT", "/v1/usage", None, Some(reading)).await;
+    let pace = t.ok("GET", "/v1/usage", None, None).await["pace"].clone();
+    assert_eq!(pace["anchor"], 80.0, "{pace}");
     let full = snapshot(&t, "kind=full").await;
     assert!(
         usage_line(&full)
@@ -489,6 +525,29 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
         .ok("GET", "/v1/snapshot?kind=alerts", Some(ME), None)
         .await;
     assert_eq!(snap["held_since"], at(12 * 60 + 10));
+
+    // A pause after the line dates the hold from the pause, so it ends turns begun since.
+    t.advance(TimeDelta::minutes(2));
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "status": "paused" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let snap = t
+        .ok("GET", "/v1/snapshot?kind=alerts", Some(ME), None)
+        .await;
+    assert_eq!(snap["held_since"], at(12 * 60 + 12), "{snap}");
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "status": "active" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
 
     // The user lowers the reserve: the hold ends.
     let (s, v) = t

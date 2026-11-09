@@ -760,6 +760,11 @@ impl Client {
     }
 
     /// Sets the weekly usage reserve; lowering it or turning it off is for the user only.
+    /// The usage reserve; `reserve` is `None` while the pace is off.
+    pub async fn usage_reserve(&self) -> Result<UsageReserve> {
+        self.get("/v1/usage/reserve").await
+    }
+
     pub async fn set_usage_reserve(&self, body: &UsageReserve) -> Result<UsageReserve> {
         self.with_body(Method::PUT, "/v1/usage/reserve", body).await
     }

@@ -315,10 +315,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
     let latest = crate::ops::usage::latest(cx)?;
-    let hard = latest
-        .as_ref()
-        .and_then(|u| u.pace_at(cx.now))
-        .and_then(|p| p.hard_since);
+    let hard = latest.as_ref().and_then(|u| u.hard_since(cx.now));
     let (held, held_since) = held_by(cx, &agent.id, hard)?;
     let hold_usage = (hard.is_some() && !held.is_empty())
         .then(|| latest.as_ref().and_then(hard_reason))
@@ -523,9 +520,7 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
             line: tenth(p.line),
             projected: tenth(p.projected),
             limit,
-            next_day: (p.day_start + chrono::TimeDelta::hours(24))
-                .format("%Y-%m-%d %H:%MZ")
-                .to_string(),
+            next_day: p.next_day().format("%Y-%m-%d %H:%MZ").to_string(),
             action: (limit == 0).then_some(PACE_ACTION),
         }
     });
@@ -595,15 +590,17 @@ message in this turn asks for it.";
 const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
 task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
 
-/// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` every board, not only
-/// paused ones (the hard usage line). The agent and the T3 threads
+/// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` active boards too, not
+/// only paused ones (the hard usage line), `?4` now: an active board's coordinator counts
+/// only while its lease runs. The agent and the T3 threads
 /// that delegated it, up the chain, as in [`crate::ops::leases::DELEGATION_FAMILY`].
 const HELD_BY: &str = concat!(
     "WITH RECURSIVE ",
     crate::ops::leases::delegated_up_cte!(),
     " SELECT b.slug, b.paused_at FROM boards b \
-     WHERE (b.status = 'paused' OR ?3) \
-       AND (b.coordinator IN (SELECT id FROM up) \
+     WHERE (b.status = 'paused' OR (?3 AND b.status = 'active')) \
+       AND ((b.coordinator IN (SELECT id FROM up) \
+             AND (b.status = 'paused' OR b.coordinator_expires_at > ?4)) \
             OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
                        AND t.owner IN (SELECT id FROM up))) \
      ORDER BY b.slug"
@@ -613,7 +610,8 @@ const HELD_BY: &str = concat!(
 /// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
 /// threads it started and those working its tasks, and no one else. With them, when the
 /// latest of them was paused. Once the weekly usage reached the hard line at `hard`, it
-/// holds every board the agent works for, each since its earlier hold.
+/// holds every active board the agent works for too, and the hold dates from the latest
+/// pause or `hard`, whichever came later: a new cause of a hold ends turns begun before it.
 fn held_by(
     cx: &Ctx<'_>,
     agent: &AgentId,
@@ -626,18 +624,19 @@ fn held_by(
             params![
                 agent.as_str(),
                 crate::ops::leases::DELEGATION_DEPTH,
-                hard.is_some()
+                hard.is_some(),
+                cx.now.timestamp_millis()
             ],
             |r| Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;
-    let hard = hard.map(|at| at.timestamp_millis());
+    let hard = hard
+        .filter(|_| !rows.is_empty())
+        .map(|at| at.timestamp_millis());
     let since = rows
         .iter()
-        .filter_map(|(_, paused)| match (*paused, hard) {
-            (Some(p), Some(h)) => Some(p.min(h)),
-            (p, h) => p.or(h),
-        })
+        .filter_map(|(_, paused)| *paused)
+        .chain(hard)
         .max()
         .map(crate::db::ts);
     Ok((rows.into_iter().map(|(slug, _)| slug).collect(), since))

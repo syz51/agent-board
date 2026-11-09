@@ -155,7 +155,7 @@ pub const PACE_NEAR_POINTS: f64 = 2.0;
 pub const PACE_PROJECT_MINUTES: i64 = 5;
 
 /// How the weekly usage left is spread over the days to the weekly reset, keeping a
-/// reserve for the user (`docs/DESIGN.md`, "Usage pace"). Days run back from the reset in
+/// reserve for the user (`docs/DESIGN.md`, "Usage", Pace). Days run back from the reset in
 /// 24-hour steps.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UsagePace {
@@ -201,10 +201,22 @@ impl UsagePace {
         }
     }
 
-    /// Whether the weekly use at `percent` or the projection is within
-    /// [`PACE_NEAR_POINTS`] of the day's line or the hard line.
+    /// Whether the weekly use at `percent` is still below the day's line and the hard line
+    /// while it or the projection is within [`PACE_NEAR_POINTS`] of the lower one. Past the
+    /// line nothing changes until the next day or the weekly reset.
     pub fn near(&self, percent: f64) -> bool {
-        self.projected.max(percent) >= self.line.min(self.hard_line()) - PACE_NEAR_POINTS
+        let line = self.line.min(self.hard_line());
+        percent < line && self.projected.max(percent) >= line - PACE_NEAR_POINTS
+    }
+
+    /// When the next pace day begins.
+    pub fn next_day(&self) -> Timestamp {
+        self.day_start + chrono::TimeDelta::hours(24)
+    }
+
+    /// Whether `reserve` is a weekly percent a reserve may be: finite, from 0 to below 100.
+    pub fn valid_reserve(reserve: f64) -> bool {
+        reserve.is_finite() && (0.0..100.0).contains(&reserve)
     }
 }
 
@@ -278,9 +290,9 @@ impl Usage {
             .map_or(parallel_tasks, |p| p.limit(parallel_tasks))
     }
 
-    /// Whether the measured weekly use is at the hard line at `now`.
-    pub fn hard(&self, now: Timestamp) -> bool {
-        self.pace_at(now).is_some_and(|p| p.hard_since.is_some())
+    /// Since when the measured weekly use is at the hard line, if it is at `now`.
+    pub fn hard_since(&self, now: Timestamp) -> Option<Timestamp> {
+        self.pace_at(now).and_then(|p| p.hard_since)
     }
 
     /// Whether a daemon should read the usage every minute: the pace is near a line.
