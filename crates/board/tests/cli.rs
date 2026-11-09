@@ -740,13 +740,29 @@ fn resume_lists_and_resumes_the_feedback_board_first() {
         b.status = status;
         b
     };
+    let slugs = ["alpha", "beta", "board-feedback"];
+    // The first read sees alpha and the feedback board paused; the read back sees the
+    // server's answer, every board active.
+    let before = |e: &Env| {
+        e.stub.clear();
+        e.stub.once(
+            "GET /v1/boards",
+            slugs.map(|s| {
+                let paused = s != "beta";
+                with(
+                    s,
+                    if paused {
+                        BoardStatus::Paused
+                    } else {
+                        BoardStatus::Active
+                    },
+                )
+            }),
+        );
+    };
     e.stub.on(
         "GET /v1/boards",
-        [
-            with("alpha", BoardStatus::Paused),
-            with("beta", BoardStatus::Active),
-            with("board-feedback", BoardStatus::Paused),
-        ],
+        slugs.map(|s| with(s, BoardStatus::Active)),
     );
     for slug in ["alpha", "board-feedback"] {
         e.stub.on(
@@ -762,35 +778,41 @@ fn resume_lists_and_resumes_the_feedback_board_first() {
             .map(|r| r.path.clone())
             .collect()
     };
+    let listed = |text: &str| -> Vec<String> {
+        text.lines()
+            .skip(1)
+            .map(|l| l.split_whitespace().next().unwrap().to_owned())
+            .collect()
+    };
 
     // Every paused board: the feedback board first, though it sorts after alpha.
+    before(&e);
     let out = e.run(&["resume"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(
-        text.starts_with("resumed 2 boards:\n  board-feedback "),
-        "{text}"
-    );
+    assert!(text.starts_with("resumed 2 boards:"), "{text}");
+    assert_eq!(listed(&text), ["board-feedback", "alpha"], "{text}");
     assert_eq!(
         patches(&e),
         ["/v1/boards/board-feedback", "/v1/boards/alpha"]
     );
 
-    // Named without it: it still comes first, as the server resumes it too.
+    // Named without it: only alpha is sent; the feedback board the server resumed along
+    // with it is read back and listed first.
+    before(&e);
     let out = e.run(&["resume", "alpha"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(
-        text.starts_with("resumed 2 boards:\n  board-feedback "),
-        "{text}"
-    );
+    assert!(text.starts_with("resumed 2 boards:"), "{text}");
+    assert_eq!(listed(&text), ["board-feedback", "alpha"], "{text}");
+    assert_eq!(patches(&e), ["/v1/boards/alpha"]);
 
-    // Naming only boards that are not paused resumes nothing, the feedback board included.
-    let before = patches(&e).len();
+    // Naming only boards that are not paused resumes nothing and reads nothing back.
+    before(&e);
     let out = e.run(&["resume", "beta"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out).trim(), "no boards resumed: none was paused");
-    assert_eq!(patches(&e).len(), before);
+    assert!(patches(&e).is_empty());
 }
 
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the

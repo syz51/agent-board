@@ -293,6 +293,7 @@ pub enum Command {
         boards: Vec<BoardSlug>,
     },
     /// Resume every paused board, or only those named; the daemon wakes their coordinators.
+    /// A paused feedback board always resumes first, also when only other boards are named.
     Resume {
         /// Boards to resume. Default: every paused board.
         boards: Vec<BoardSlug>,

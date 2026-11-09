@@ -243,8 +243,9 @@ server's minute sweep deletes older ones.
   first moves the feedback board to `active` when it is paused, in the same write, with
   its own `board_updated` event recorded first. `board pause [<slug>…]` and
   `board resume [<slug>…]` set every active (or paused) board, or those named, with this
-  endpoint; `--json` prints the changed `[Board]` list. A resume lists the device's
-  feedback board first whenever it resumes it, also when only other boards were named.
+  endpoint; `--json` prints the changed `[Board]` list. A resume sends the device's
+  feedback board first when it is among the targets, then reads the boards again and lists
+  first any board the server resumed along with them.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by

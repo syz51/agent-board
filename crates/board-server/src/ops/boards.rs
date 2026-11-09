@@ -9,7 +9,7 @@ use crate::config::Settings;
 use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
-use crate::store::{agent_missing, board_missing, find_board, get_board};
+use crate::store::{agent_missing, board_missing, get_board};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
 use board_proto::{BOARD_TITLE_LONGER_TEXT_GOES, PARALLEL_TASKS_MAX};
 
@@ -222,7 +222,10 @@ pub(crate) fn update(
         && *slug != cx.s.feedback_board
     {
         let feedback = cx.s.feedback_board.clone();
-        if find_board(cx, &feedback)?.is_some_and(|b| b.status == BoardStatus::Paused) {
+        if cx.exists(
+            "SELECT 1 FROM boards WHERE slug = ?1 AND status = 'paused'",
+            [feedback.as_str()],
+        )? {
             let resume = UpdateBoard {
                 status: Some(BoardStatus::Active),
                 ..UpdateBoard::default()

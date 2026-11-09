@@ -280,8 +280,8 @@ back to `active`. Autopilot stays as it was, and closed boards are never touched
 one, or an unknown board, fails before any change). Both print the boards they changed.
 
 The feedback board resumes first, always: triage must not stay paused while other work
-runs. Resuming any other paused board, from the CLI, the web view or the API, also resumes
-a paused feedback board, before it and in the same write. `board resume` resumes it first
+runs. Resuming any other paused board, with the CLI or the API, also resumes a paused
+feedback board, before it and in the same write. `board resume` resumes it first
 and lists it first, also when only other boards are named. Pausing the feedback board on
 its own still holds until it is resumed, by name or with another board.
 

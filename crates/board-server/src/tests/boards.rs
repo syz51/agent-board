@@ -790,3 +790,35 @@ async fn resuming_a_board_works_without_a_feedback_board() {
         .await;
     assert_eq!(resumed["status"], "active");
 }
+
+#[tokio::test]
+async fn an_agent_resuming_a_board_resumes_the_feedback_board_too() {
+    let t = T::new();
+    let status = |s: &str| Some(json!({ "status": s }));
+    for slug in ["board-feedback", "factory"] {
+        t.board(slug, &[]).await;
+        let path = format!("/v1/boards/{slug}");
+        t.ok("PATCH", &path, None, status("paused")).await;
+    }
+    t.register("t3:alpha", None, None).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        Some("t3:alpha"),
+        status("active"),
+    )
+    .await;
+    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
+    assert_eq!(feedback["status"], "active");
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let resume = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["board"] == "board-feedback" && e["payload"]["status"] == "active")
+        .cloned()
+        .unwrap();
+    assert_eq!(resume["actor"], "t3:alpha", "the caller resumed it");
+}

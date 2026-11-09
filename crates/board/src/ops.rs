@@ -862,7 +862,9 @@ pub async fn usage(ctx: &Ctx, now: Timestamp) -> Result<Output> {
 
 /// `board pause` and `board resume`: sets the boards `named`, or by default every board in
 /// status `from`, to status `to`, and lists the boards it changed. Named boards are checked
-/// before any changes, so a wrong name changes nothing.
+/// before any changes, so a wrong name changes nothing. A resume goes feedback board first
+/// and also lists the boards the server resumed along with the targets (a paused feedback
+/// board).
 pub async fn set_boards_status(
     ctx: &Ctx,
     named: Vec<BoardSlug>,
@@ -891,16 +893,12 @@ pub async fn set_boards_status(
         }
         targets
     };
-    // The feedback board resumes first, always: the server resumes it with any other board,
-    // so a resume lists it first, also when only other boards are named.
-    if to == BoardStatus::Active
-        && targets.iter().any(|b| b.status == from)
-        && let Some(feedback) = boards
-            .iter()
-            .find(|b| b.slug == ctx.config.feedback_board() && b.status == from)
-    {
-        targets.retain(|b| b.slug != feedback.slug);
-        targets.insert(0, feedback);
+    let resuming = to == BoardStatus::Active;
+    // The feedback board resumes first, always. The server resumes it with any other board;
+    // when it is among the targets, it also goes first here.
+    if resuming {
+        let feedback = ctx.config.feedback_board();
+        targets.sort_by_key(|b| b.slug != feedback);
     }
     let verb = match to {
         BoardStatus::Paused => "paused",
@@ -929,6 +927,24 @@ pub async fn set_boards_status(
                 )
             })?;
         changed.push(updated);
+    }
+    // Boards the server resumed along with them (the feedback board) are listed first.
+    if resuming && !changed.is_empty() {
+        let after = ctx
+            .client
+            .boards()
+            .await
+            .context("the boards were resumed, but reading them back failed")?;
+        let along: Vec<Board> = after
+            .into_iter()
+            .filter(|b| b.status == to && !changed.iter().any(|c| c.slug == b.slug))
+            .filter(|b| {
+                boards
+                    .iter()
+                    .any(|old| old.slug == b.slug && old.status == from)
+            })
+            .collect();
+        changed.splice(0..0, along);
     }
     let text = if changed.is_empty() {
         format!("no boards {verb}: none was {}", render::enum_str(&from))
