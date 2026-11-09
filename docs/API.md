@@ -304,8 +304,10 @@ idle time. Nor is a board idle while one of its tasks that is not done blocks an
 unfinished task on another board. Each board is swept in its own transaction; one that
 fails is logged and tried again on the next sweep.
 
-- An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
+- An `active` temporary board idle for `temporary_close_after_secs` is closed:
   `board_updated` with `fields: ["status"]` and actor `server`.
+- A `paused` temporary board is never closed or deleted by the sweep, however long the pause
+  lasts: a pause waits on the user. Resuming it is a change, so its period starts then.
 - A `closed` temporary board idle for `temporary_delete_after_secs` is deleted as by
   `DELETE` above, with actor `server`. Closing is an event, so deletion comes that long after
   the board was closed at the earliest.
