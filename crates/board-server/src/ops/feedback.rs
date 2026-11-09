@@ -27,7 +27,7 @@ const REPORTERS_MAX: usize = 20;
 /// A repeat report adds a note at most this often per item.
 const NOTE_EVERY_MS: i64 = 3_600_000;
 /// Duplicate links followed at most, in case they form a loop.
-const DUPLICATE_DEPTH_MAX: usize = 8;
+pub(crate) const DUPLICATE_DEPTH_MAX: usize = 8;
 /// Characters of a normalized error message kept.
 const TEMPLATE_MAX: usize = 200;
 
@@ -263,6 +263,26 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
         _ => None,
     })
 }
+
+/// The feedback items a report can reach (`live` on `GET /v1/tasks`): the newest item with
+/// each signature, as [`prior`] picks it, when [`live_item`] finds a live item from it. The
+/// same rule in one query, so a list costs one statement however long the history: `chain`
+/// follows duplicate links to feedback items, at most `:live_depth` links deep, and an item
+/// is listed when its chain reaches a link that takes reports. A link that passes reports
+/// on to another feedback item never does, so only the chain's last link can.
+pub(crate) const LIVE_ITEMS: &str = "WITH RECURSIVE chain (start, task, depth) AS (\
+     SELECT f.task, f.task, 0 FROM feedback f \
+     WHERE f.rowid = (SELECT MAX(g.rowid) FROM feedback g WHERE g.signature = f.signature) \
+     UNION ALL SELECT c.start, f.resolution_task, c.depth + 1 FROM chain c \
+     JOIN feedback f ON f.task = c.task AND f.resolution = 'duplicate' \
+     JOIN feedback o ON o.task = f.resolution_task WHERE c.depth < :live_depth) \
+     SELECT c.start FROM chain c JOIN feedback f ON f.task = c.task \
+     JOIN tasks t ON t.id = c.task LEFT JOIN tasks w ON w.id = f.resolution_task \
+     WHERE (f.resolution IS NULL AND t.status NOT IN ('done', 'dropped')) \
+     OR f.resolution = 'declined' \
+     OR (f.resolution = 'routed' AND w.status NOT IN ('done', 'dropped')) \
+     OR (f.resolution = 'duplicate' AND w.status NOT IN ('done', 'dropped') \
+         AND NOT EXISTS (SELECT 1 FROM feedback x WHERE x.task = f.resolution_task))";
 
 /// The resolution kind and task of feedback item `id`, or `None` when it is not one.
 fn resolution(

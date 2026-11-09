@@ -380,9 +380,10 @@ pub(crate) enum Swept {
     Deleted,
 }
 
-/// Idle temporary boards: no open ask, no task in `doing` with a live owner, and no task not
-/// done that an unfinished task on another board waits on (deleting the board would let
-/// that task start without its prerequisite). Each comes
+/// Idle temporary boards: not paused (a pause waits on the user, however long it lasts), no
+/// open ask, no task in `doing` with a live owner, and no task not done that an unfinished
+/// task on another board waits on (deleting the board would let that task start without its
+/// prerequisite). Each comes
 /// with whether it is closed and when it was last active: the newest of its own change, its
 /// newest event and `since`, the server's start, so time the server was down does not
 /// count as idle.
@@ -398,7 +399,8 @@ fn idle_temporary(
                  (SELECT e.at FROM events e WHERE e.board = b.slug ORDER BY e.seq DESC LIMIT 1), \
                  0)) \
              FROM boards b \
-             WHERE b.temporary = 1 AND (:only IS NULL OR b.slug = :only) \
+             WHERE b.temporary = 1 AND b.status != 'paused' \
+               AND (:only IS NULL OR b.slug = :only) \
                AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.board = b.slug AND a.status = 'open') \
                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug \
                                AND t.status = 'doing' AND {live}) \

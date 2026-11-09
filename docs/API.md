@@ -309,8 +309,10 @@ idle time. Nor is a board idle while one of its tasks that is not done blocks an
 unfinished task on another board. Each board is swept in its own transaction; one that
 fails is logged and tried again on the next sweep.
 
-- An `active` or `paused` temporary board idle for `temporary_close_after_secs` is closed:
+- An `active` temporary board idle for `temporary_close_after_secs` is closed:
   `board_updated` with `fields: ["status"]` and actor `server`.
+- A `paused` temporary board is never closed or deleted by the sweep, however long the pause
+  lasts: a pause waits on the user. Resuming it is a change, so its period starts then.
 - A `closed` temporary board idle for `temporary_delete_after_secs` is deleted as by
   `DELETE` above, with actor `server`. Closing is an event, so deletion comes that long after
   the board was closed at the earliest.
@@ -319,8 +321,8 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&limit=` → `[Task]`
-  list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&limit=` →
+  `[Task]` list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
@@ -329,7 +331,20 @@ Reopening a closed board, or any change on it, starts the period again.
   child. Every `Task` has `child_count`, how many tasks name it as parent whatever
   their status; it is absent when none does, and from servers that predate it. The counts
   of a list come from one query, along the parent index. `proposal=true` lists only
-  pending proposals, `false` leaves them out (see "Pending proposals" below). `limit`
+  pending proposals, `false` leaves them out (see "Pending proposals" below).
+  `live=true` lists only the feedback items a new report with their signature would add
+  to, whatever their status, by the rule reports follow (see "Feedback" below): the newest
+  item with each signature, when it is unresolved and not done or dropped, declined,
+  routed to a task that is not done or dropped, or a duplicate whose chain of originals
+  (at most 8 links) ends at such an item or at a plain task that is not done or dropped.
+  Every item of a live chain is listed. `live=false` lists every other task. It combines
+  with every other filter, and `limit` counts the tasks it keeps. `live=true` with a
+  `board` that holds no feedback items is 400 `invalid`, whose hint names the feedback
+  board; without `board` it lists the items wherever they are. Servers that predate `live`
+  ignore it and list every task, so upgrade the server before relying on it. The CLI and
+  MCP catch most such servers: they refuse, saying to upgrade it, when the list holds a
+  task that can never be live (not a feedback item, forwarded, fixed, or closed
+  unresolved). An old server that has only live-looking items passes that check. `limit`
   defaults to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
@@ -877,7 +892,11 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
-  with `children <n>`.
+  with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every
+  feedback item that still takes reports, such as declined ones and ones routed to open
+  work, which `--status` alone cannot select. Against a server that predates the filter it
+  fails with "upgrade it" once the list holds a task that can never be live; upgrade the
+  server first.
 - `board show <id> --json` → `[TaskDetail]` from `GET /v1/tasks/{id}`. Without `--json`, a
   task with children has a `children <n>: done 5 · doing 1 · …` line, a count per status
   (done, review, doing, blocked, open, dropped; statuses without children left out),

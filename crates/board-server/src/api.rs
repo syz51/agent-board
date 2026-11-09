@@ -576,6 +576,7 @@ struct TasksQuery {
     proposal: Option<bool>,
     mine: Option<bool>,
     parent: Option<TaskId>,
+    live: Option<bool>,
     limit: Option<usize>,
 }
 
@@ -603,6 +604,7 @@ async fn list_tasks(
         ready: q.ready,
         proposal: q.proposal,
         parent: q.parent,
+        live: q.live,
         limit: q.limit.unwrap_or(200).clamp(1, 1000),
     };
     Ok(Json(state.read(move |cx| tasks::list(cx, filter)).await?))
