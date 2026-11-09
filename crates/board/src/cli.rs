@@ -206,7 +206,8 @@ pub enum Command {
     Claim { id: TaskId },
     /// Release a task you own back to open.
     Release { id: TaskId },
-    /// Take a task whose owner is stale.
+    /// Take a task whose owner is stale, or whose owner's session ended when you created
+    /// the task or delegated that owner.
     Take { id: TaskId },
     /// Change a task's fields or status.
     Update(UpdateArgs),
@@ -645,7 +646,8 @@ pub struct UpdateArgs {
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.
     #[arg(long)]
     not_before: Option<String>,
-    /// Hand the task to this agent id (owner, the board's coordinator or the user only).
+    /// Hand the task to this agent id (owner, the board's coordinator or the user only, or,
+    /// once the owner's session ended, the task's creator or the agent that delegated it).
     #[arg(long)]
     owner: Option<board_proto::AgentId>,
 }

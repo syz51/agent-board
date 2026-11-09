@@ -181,7 +181,13 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
             [from],
             |r| r.get(0),
         )?,
-        tasks_taken_stale: count_events("task_taken")?,
+        // A stand-in for an ended owner takes a task that is not stale.
+        tasks_taken_stale: cx.db.query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'task_taken' AND at >= ?1 \
+             AND json_extract(payload, '$.stand_in') IS NULL",
+            [from],
+            |r| r.get(0),
+        )?,
         lease_conflicts: sum_payload("lease_created", "conflicts")?
             + sum_payload("files_touched", "overlaps")?,
         asks_created: cx.db.query_row(
