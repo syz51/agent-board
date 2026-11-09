@@ -144,13 +144,17 @@ esac
     ),
     // Linux, unless STUB_OS names another system, so a run on a Mac stays off its keychain.
     ("uname", "#!/bin/sh\necho \"${STUB_OS:-Linux}\"\n"),
-    // A keychain is a file that holds the one identity; the rest succeeds.
+    // A keychain is a file, empty until the identity is imported; the rest succeeds.
     (
         "security",
         r#"#!/bin/sh
 case "$1" in
 create-keychain) : > "$4" ;;
-find-identity) printf '  1) 0123ABCD "agent-board code signing"\n     1 valid identities found\n' ;;
+import) echo identity > "$4" ;;
+find-identity)
+    [ -s "$4" ] || { echo '     0 valid identities found'; exit 0; }
+    printf '  1) 0123ABCD "agent-board code signing"\n     1 valid identities found\n'
+    ;;
 esac
 "#,
     ),
@@ -929,10 +933,36 @@ fn a_failed_signing_warns_and_still_restarts_the_device() {
     );
     let (_, err) = text(&out);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("could not sign"), "{err}");
+    assert!(err.contains("codesign could not sign"), "{err}");
+    assert!(err.contains("could not sign board"), "{err}");
     let log = env.read("log");
     assert!(log.contains("local restart"), "{log}");
     assert!(!log.contains(" sign "), "{log}");
+}
+
+#[test]
+fn a_signing_identity_left_half_made_is_made_again() {
+    let env = Env::new();
+    let new = &env.main[1];
+    // As a run cut short after `security create-keychain` leaves it: no identity inside.
+    let dir = env
+        .root
+        .join("home/Library/Application Support/agent-board/signing");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("password"), "old\n").unwrap();
+    fs::write(dir.join("signing.keychain-db"), "").unwrap();
+
+    let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("making the code-signing identity"), "{err}");
+    assert!(!err.contains("could not sign"), "{err}");
+    assert_ne!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
+    let log = env.read("log");
+    assert!(
+        log.contains("local sign 0123ABCD dev.agent-board.board"),
+        "{log}"
+    );
 }
 
 #[test]

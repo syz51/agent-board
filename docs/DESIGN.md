@@ -756,7 +756,12 @@ settings in use, warned once per edit.
     when the server cannot be reached. The daemon reconciles at start and on its tick,
     also while the stream is down. The boards' `t3 thread show` checks run two at a time,
     10 seconds each, and none starts once 45 seconds of the reconcile have passed; a
-    board whose check did not start is left as it is until the next reconcile. Each `t3`
+    board whose check did not start is left as it is until the next reconcile. Coordinator
+    starts go board by board, those whose last start failed last, so a retry that waits
+    out a timeout (git waiting on a macOS privacy prompt, for one) cannot take the time
+    the others need. A start still running at 81 of the 90 seconds is cut: it counts as a
+    failed start, with the start back-off, and its lease is released at once. No start
+    begins after that; a board not reached is started on the next reconcile. Each `t3`
     process needs about half a second of CPU to start, so nine at once on a busy device
     took 4-5 seconds each and timed out together under a build. A check that fails or
     runs out of time still renews a named coordinator at work, and only a check that

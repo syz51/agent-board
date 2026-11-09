@@ -135,6 +135,8 @@ pub struct Timing {
     /// seconds) is taken as dead and opened again after `last_seq`.
     pub stream_idle: Duration,
     /// A reconcile still running after this long is stopped and runs again on its next tick.
+    /// A coordinator start still running at nine tenths of it is stopped and counts as
+    /// failed; none begins after that.
     pub reconcile_budget: Duration,
     /// Checking the queued wake-ups before a flush sends them stops after this long; the
     /// queues not checked by then back off.
@@ -1276,7 +1278,11 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
-        let checks_until = tokio::time::Instant::now() + self.timing.reconcile_budget / 2;
+        let began = tokio::time::Instant::now();
+        let checks_until = began + self.timing.reconcile_budget / 2;
+        // Starts are cut at nine tenths of the budget, so a start cut short still releases
+        // its lease and the reconcile still saves what it did.
+        let starts_until = began + self.timing.reconcile_budget * 9 / 10;
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
@@ -1316,7 +1322,7 @@ impl<T: T3> Daemon<T> {
                 }
                 None => None,
             };
-            if let Err(err) = self.reconcile_board(board, now, check).await {
+            if let Err(err) = self.reconcile_board(board, now, check, starts_until).await {
                 tracing::warn!("coordinator of {}: {err:#}", board.slug);
             }
         }
@@ -1467,6 +1473,7 @@ impl<T: T3> Daemon<T> {
         board: &Board,
         now: Timestamp,
         check: Option<Result<bool>>,
+        starts_until: tokio::time::Instant,
     ) -> Result<()> {
         let slug = &board.slug;
         let project = self.project_for(board).map(|(_, project)| project);
@@ -1594,9 +1601,31 @@ impl<T: T3> Daemon<T> {
         {
             return Ok(());
         }
-        let started = match adoption {
-            Some(adoption) => self.adopt_thread(board, adoption, now).await,
-            None => self.start_coordinator(board, now).await,
+        if tokio::time::Instant::now() >= starts_until {
+            tracing::warn!(
+                "coordinator of {slug}: the reconcile ran out of time before its start; started on the next reconcile"
+            );
+            return Ok(());
+        }
+        let start = async {
+            match adoption {
+                Some(adoption) => self.adopt_thread(board, adoption, now).await,
+                None => self.start_coordinator(board, now).await,
+            }
+        };
+        let started = match tokio::time::timeout_at(starts_until, start).await {
+            Ok(started) => started,
+            // Counted as a failure, so the board waits and then goes last, and its lease
+            // goes at once rather than when it expires. A thread T3 made meanwhile is found
+            // through the pending start mark.
+            Err(_) => {
+                if !self.state.coordinators.contains_key(slug) {
+                    self.release(slug).await;
+                }
+                Err(anyhow::anyhow!(
+                    "its start was still running when the reconcile ran out of time; tried again after a delay"
+                ))
+            }
         };
         match started {
             Ok(()) => {

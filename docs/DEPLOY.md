@@ -263,7 +263,10 @@ first run makes the identity in its own keychain,
 random password in the 0600 file `password` beside it. `codesign -d -r- ~/.cargo/bin/board`
 then shows `certificate leaf`. macOS asks once more for the first signed build; allow
 it, or turn on `board` under System Settings > Privacy & Security > Files and Folders.
-A failed signing step only prints a warning. Any process of the same user can read that
+A failed signing step only prints a warning that says which part failed, and a keychain
+left half made is made again on the next run. Only this step signs: after installing
+`board` by hand with `cargo install`, run `./deploy/upgrade.sh --yes <rev>` with the
+installed revision, which signs it again without rebuilding. Any process of the same user can read that
 key and sign code that macOS then trusts with board's grants. To stop signing, delete
 that folder; the next upgrade makes a new identity, so remove the step from
 `deploy/upgrade-steps.sh` as well to keep the ad-hoc signature.

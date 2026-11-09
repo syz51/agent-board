@@ -8,7 +8,7 @@
 //! coordinator's worktree may still use it, maybe with a live thread or files git ignores.
 //! So nothing here removes a worktree or changes a branch.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -143,43 +143,62 @@ async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
         .kill_on_drop(true)
         .spawn()
         .context("running git")?;
+    // Only on macOS, and resolved, so a link to a protected folder counts as one.
+    let hint = || {
+        if !cfg!(target_os = "macos") {
+            return "";
+        }
+        let project = project
+            .canonicalize()
+            .unwrap_or_else(|_| project.to_path_buf());
+        privacy_hint(dirs::home_dir().as_deref(), &project).unwrap_or_default()
+    };
     let out = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
         .await
         .with_context(|| {
-            let hint = cfg!(target_os = "macos")
-                .then(|| privacy_hint(dirs::home_dir().as_deref(), project))
-                .flatten()
-                .unwrap_or_default();
             format!(
-                "git {} timed out in {}{hint}",
+                "git {} timed out in {}{}",
                 args.join(" "),
-                project.display()
+                project.display(),
+                hint()
             )
         })??;
+    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // What git says once the user denied the prompt.
+    if !out.status.success() && stderr.contains("Operation not permitted") {
+        stderr.push_str(hint());
+    }
     Ok(GitOutput {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        stderr,
     })
 }
 
-/// What a git timeout in `project` adds on macOS when the folder is one macOS protects:
-/// there git waits, with no end, until the user answers the privacy prompt for board.
+/// What a git timeout or denial in `project` adds on macOS when the folder is one macOS
+/// protects: there git waits, with no end, until the user answers the privacy prompt for
+/// board, and is denied once they refused it.
 fn privacy_hint(home: Option<&Path>, project: &Path) -> Option<&'static str> {
-    const PROTECTED: [&str; 4] = [
+    const PROTECTED: [&str; 5] = [
         "Documents",
         "Desktop",
         "Downloads",
         "Library/Mobile Documents",
+        "Library/CloudStorage",
     ];
-    let home = home?;
-    PROTECTED
-        .iter()
-        .any(|folder| project.starts_with(home.join(folder)))
-        .then_some(
-            ": macOS may be waiting for you to let board use this folder. Answer its prompt, \
-             or turn on board under System Settings > Privacy & Security > Files and Folders",
-        )
+    // Compared without case, as APFS compares names by default.
+    let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+    let project = lower(project);
+    let protected = project.starts_with("/volumes")
+        || home.is_some_and(|home| {
+            PROTECTED
+                .iter()
+                .any(|folder| project.starts_with(lower(&home.join(folder))))
+        });
+    protected.then_some(
+        ": macOS may be keeping board out of this folder. Answer its prompt if one is open, \
+         or turn on board under System Settings > Privacy & Security > Files and Folders",
+    )
 }
 
 #[cfg(test)]
@@ -198,6 +217,9 @@ mod tests {
                 .contains("Privacy & Security > Files and Folders")
         );
         assert!(hint("/Users/u/Library/Mobile Documents/x").is_some());
+        assert!(hint("/Users/u/Library/CloudStorage/Dropbox/x").is_some());
+        assert!(hint("/Volumes/External/repo").is_some());
+        assert!(hint("/users/u/documents/vps").is_some(), "without case");
         assert_eq!(hint("/Users/u/Developer/repo"), None);
         assert_eq!(hint("/Users/u/DocumentsOld/repo"), None);
         assert_eq!(privacy_hint(None, Path::new("/Users/u/Documents/x")), None);
