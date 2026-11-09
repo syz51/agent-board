@@ -883,9 +883,11 @@ update. A usage-limit stop is an agent's move to `paused`. While a task in progr
 be read, nothing starts beside it.
 
 **Gone asker and away owner** (built): an asker cannot be woken when it is no T3 thread
-and has ended or is unknown, or when its thread is gone. An away owner's task is released
-at the server's repeat notice, or as soon as a wake-up finds its thread gone. A dispatcher
-that missed both notices, such as one deployed after them, does not release the task.
+and has ended or is unknown, or when its thread is gone. An asker that is still there is
+checked again on each reconcile, for an hour. An away owner's task is released 5 minutes
+after the server's repeat notice, which also wakes it, or once a wake-up finds its thread
+gone. Only the device that holds the lease does these steps. A dispatcher that missed both
+notices, such as one deployed after them, does not release the task.
 
 The file rules are left to the worker's lease check. A worker whose lease overlaps
 another task in progress stops and leaves its task `open`. The dispatcher skips that task

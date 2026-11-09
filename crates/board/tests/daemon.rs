@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, Home};
-use board::daemon::{Adoption, Coordinator, Daemon, load_adoption, save_adoption};
+use board::daemon::{Adoption, Coordinator, Daemon, RELEASE_GRACE, load_adoption, save_adoption};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
 use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut, UserMessage};
@@ -6800,8 +6800,10 @@ async fn two_slots_start_two_independent_tasks_and_an_unclaimed_worker_holds_its
 async fn a_task_that_waits_on_a_task_in_progress_or_that_one_waits_on_is_not_started() {
     use board_proto::Priority::{P1, P2};
     // It waits on the task in progress.
+    // It waits on the task in progress: the server does not count it ready.
     let mut waits = ready_task("factory-4", P1, 0);
     waits.blockers = vec!["factory-9".parse().unwrap()];
+    waits.ready = false;
     let mut e = slots_env(2, &[]);
     e.stub.on(
         "GET /v1/tasks",
@@ -6947,7 +6949,7 @@ async fn owed_env(status: TaskStatus, owner: &str) -> Env {
     let mut open = task.task.clone();
     open.status = TaskStatus::Open;
     open.owner = None;
-    e.stub.on("PATCH /v1/tasks/factory-7", open);
+    e.stub.on("POST /v1/tasks/factory-7/release", open);
     if status == TaskStatus::Doing {
         e.stub
             .on("GET /v1/tasks", [doing_task("factory-7", owner, &[])]);
@@ -6956,7 +6958,7 @@ async fn owed_env(status: TaskStatus, owner: &str) -> Env {
 }
 
 fn set_open(e: &Env) -> Vec<Recorded> {
-    e.stub.requests_to("PATCH /v1/tasks/factory-7")
+    e.stub.requests_to("POST /v1/tasks/factory-7/release")
 }
 
 #[tokio::test]
@@ -6985,17 +6987,21 @@ async fn an_answer_to_a_gone_asker_is_noted_on_its_task_and_the_task_set_open() 
     );
     let opened = set_open(&e);
     assert_eq!(opened.len(), 1);
-    assert_eq!(
-        opened[0].body,
-        json!({
-            "agent": DISPATCH, "version": 3, "status": "open", "title": null, "body": null,
-            "acceptance": null, "priority": null, "blockers": null, "blocked_reason": null,
-            "auto": null
-        })
-    );
+    assert_eq!(opened[0].body, json!({ "agent": DISPATCH }));
     assert!(e.daemon.state.owed.is_empty());
 
-    // A live asker hears of its answer itself: nothing is done for it.
+    // A task its asker parked in review goes back to open too.
+    let mut e = owed_env(TaskStatus::Review, asker).await;
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
+
+    // A live asker hears of its answer itself: nothing is done for it while it is there.
     let mut e = owed_env(TaskStatus::Blocked, asker).await;
     e.stub.on(
         &format!("GET {}", agent_path(asker)),
@@ -7010,6 +7016,20 @@ async fn an_answer_to_a_gone_asker_is_noted_on_its_task_and_the_task_set_open() 
             .is_empty()
     );
     assert!(set_open(&e).is_empty());
+    assert_eq!(
+        e.daemon.state.owed.len(),
+        1,
+        "kept while the asker is there"
+    );
+
+    // It ends without taking the answer up: the step is done.
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let later = at() + chrono::Duration::minutes(5);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
     assert!(e.daemon.state.owed.is_empty());
 
     // A T3 asker whose thread is gone: found at the flush, then done by the dispatcher.
@@ -7034,6 +7054,28 @@ async fn an_answer_to_a_gone_asker_is_noted_on_its_task_and_the_task_set_open() 
         e.t3.sends().is_empty(),
         "no coordinator thread to pass it to"
     );
+
+    // Another home device holds the lease: this one owes nothing it could never do.
+    let mut e = owed_env(TaskStatus::Blocked, asker).await;
+    e.stub.on(
+        "GET /v1/boards",
+        [daemon_board(Some("dispatch:other-device"))],
+    );
+    e.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        409,
+        "claim_refused",
+        "held by dispatch:other-device",
+        "wait",
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+    let ev = answered(&e, 30, 3, asker);
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    assert!(e.daemon.state.owed.is_empty());
 }
 
 /// The server's idle notice for factory-7, away since 40 minutes before `at()`, at `noticed`.
@@ -7066,7 +7108,7 @@ async fn an_owner_still_away_at_the_repeat_notice_loses_its_task() {
     assert!(set_open(&e).is_empty());
     assert_eq!(e.daemon.state.wakes.len(), 1);
 
-    // At the repeat it is still away: the task goes back to open with a note.
+    // The repeat wakes the owner again; the dispatcher gives it time to come back.
     let repeat = at() + chrono::Duration::minutes(40);
     assert!(
         e.daemon
@@ -7075,9 +7117,14 @@ async fn an_owner_still_away_at_the_repeat_notice_loses_its_task() {
             .unwrap()
     );
     e.daemon.reconcile(repeat).await.unwrap();
+    assert!(set_open(&e).is_empty());
+    assert_eq!(e.daemon.state.owed.len(), 1);
+
+    // Still away after that: the task goes back to open with a note.
+    let graced = repeat + RELEASE_GRACE;
+    e.daemon.reconcile(graced).await.unwrap();
     let opened = set_open(&e);
     assert_eq!(opened.len(), 1);
-    assert_eq!(opened[0].body["status"], "open");
     assert_eq!(opened[0].agent.as_deref(), Some(DISPATCH));
     let notes = e.stub.requests_to("POST /v1/tasks/factory-7/notes");
     assert_eq!(notes.len(), 1);
@@ -7102,13 +7149,14 @@ async fn an_owner_still_away_at_the_repeat_notice_loses_its_task() {
         .on_event(&idle_notice(31, owner, repeat), repeat)
         .await
         .unwrap();
-    e.daemon.reconcile(repeat).await.unwrap();
+    e.daemon.reconcile(graced).await.unwrap();
     assert!(set_open(&e).is_empty());
     assert!(
         e.stub
             .requests_to("POST /v1/tasks/factory-7/notes")
             .is_empty()
     );
+    assert!(e.daemon.state.owed.is_empty());
 
     // A notice of a new spell is a first notice again.
     let mut e = owed_env(TaskStatus::Doing, owner).await;
@@ -7120,7 +7168,7 @@ async fn an_owner_still_away_at_the_repeat_notice_loses_its_task() {
     let mut later = idle_notice(31, owner, repeat);
     later.payload["idle_doing"] = json!(at());
     e.daemon.on_event(&later, repeat).await.unwrap();
-    e.daemon.reconcile(repeat).await.unwrap();
+    e.daemon.reconcile(graced).await.unwrap();
     assert!(set_open(&e).is_empty());
 }
 
@@ -7147,7 +7195,7 @@ async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
     let mut open = doing.task.clone();
     open.status = TaskStatus::Open;
     open.owner = None;
-    e.stub.on("PATCH /v1/tasks/factory-4", open);
+    e.stub.on("POST /v1/tasks/factory-4/release", open);
     let noticed = at() + chrono::Duration::minutes(40);
     let mut notice = event(30, EventType::TaskUpdated, Some("factory-4"), "server");
     notice.at = noticed;
@@ -7163,10 +7211,9 @@ async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
 
     // The task goes back to open, naming the old thread and branch, and a new worker
     // starts for it at once.
-    e.daemon.reconcile(noticed).await.unwrap();
-    let opened = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+    e.daemon.reconcile(noticed + RELEASE_GRACE).await.unwrap();
+    let opened = e.stub.requests_to("POST /v1/tasks/factory-4/release");
     assert_eq!(opened.len(), 1);
-    assert_eq!(opened[0].body["status"], "open");
     let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
     let texts: Vec<&str> = notes
         .iter()
