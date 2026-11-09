@@ -279,6 +279,12 @@ pauses only those. `board resume [<slug>…]` sets every `paused` board, or thos
 back to `active`. Autopilot stays as it was, and closed boards are never touched (naming
 one, or an unknown board, fails before any change). Both print the boards they changed.
 
+The feedback board resumes first, always: triage must not stay paused while other work
+runs. Resuming any other paused board, with the CLI or the API, also resumes a paused
+feedback board, before it and in the same write. `board resume` resumes it first
+and lists it first, also when only other boards are named. Pausing the feedback board on
+its own still holds until it is resumed, by name or with another board.
+
 A paused board **holds** the agents that work for it: its coordinator (the lease holder,
 also after the lease lapsed, since only a release clears it), every thread that
 coordinator delegated, at any depth, the owners of its tasks in `doing`, and their
