@@ -458,6 +458,18 @@ pub(crate) fn ready_sql(t: &str) -> String {
 mod tests {
     use super::*;
 
+    /// An in-memory database with the first `n` migrations, to test the next one.
+    fn migrated_to(n: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..n].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn
+    }
+
     #[test]
     fn migrations_run_once_and_set_user_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -515,13 +527,7 @@ mod tests {
 
     #[test]
     fn items_resolved_before_resolved_report_take_the_reports_recorded_by_then() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..15].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(15);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('f', 't', '', 'active', '[]', 0, '[]', 0, 0); \
@@ -560,13 +566,7 @@ mod tests {
 
     #[test]
     fn tasks_done_before_updates_count_as_seen() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..9].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(9);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);",
@@ -603,13 +603,7 @@ mod tests {
 
     #[test]
     fn asks_sent_before_their_chat_was_recorded_take_the_paired_chat() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..16].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(16);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);
@@ -634,13 +628,7 @@ mod tests {
 
     #[test]
     fn boards_and_asks_stored_before_temporary_boards_are_kept() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..6].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(6);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'closed', '[]', 0, '[]', 0, 0); \
@@ -770,13 +758,7 @@ mod tests {
 
     #[test]
     fn boards_paused_before_paused_at_take_the_time_of_their_last_pause() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..21].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(21);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES \

@@ -514,7 +514,7 @@ const HELD_BY: &str = "WITH RECURSIVE \
        FROM agents a JOIN up ON a.id = up.id \
        WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
          AND up.depth < ?2) \
-     SELECT b.slug, COALESCE(b.paused_at, b.updated_at) FROM boards b \
+     SELECT b.slug, b.paused_at FROM boards b \
      WHERE b.status = 'paused' \
        AND (b.coordinator IN (SELECT id FROM up) \
             OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \

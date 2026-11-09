@@ -227,7 +227,7 @@ pub(crate) fn update(
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
          dispatch = ?11, usage_stop_at = ?12, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
-                          WHEN status = 'paused' THEN COALESCE(paused_at, ?8) ELSE ?8 END \
+                          WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
         params![
             slug.as_str(),
