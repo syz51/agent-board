@@ -1230,6 +1230,97 @@ fn stop_falls_back_to_the_turn_against_a_server_without_change_dates() {
     assert_eq!(stop(&e), None, "one reminder per turn");
 }
 
+/// Serves snapshots that say whether a paused board holds the agent.
+fn serve_hold(e: &Env, held: bool) {
+    let mut snap = snapshot_fixture(SnapshotKind::Delta, "", 2);
+    if held {
+        snap.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+        snap.held_by = vec!["factory".parse().unwrap()];
+    }
+    e.stub.on("GET /v1/snapshot", snap);
+}
+
+/// Lets the next `PostToolUse` run its heartbeat, as a minute later.
+fn heartbeat_due_again(e: &Env) {
+    let path = e.home.join("state").join(format!(
+        "{}.json",
+        board::state::file_stem(&CLAUDE_AGENT.parse().unwrap())
+    ));
+    let mut local: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    local.as_object_mut().unwrap().remove("last_heartbeat");
+    std::fs::write(&path, local.to_string()).unwrap();
+}
+
+fn read_tool(e: &Env) -> (Option<Value>, String) {
+    e.hook(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+        ),
+    )
+}
+
+#[test]
+fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    serve_hold(&e, false);
+    prompt(&e, "go");
+
+    // The board is paused while the turn runs: its next heartbeat ends it.
+    serve_hold(&e, true);
+    let (reply, _) = read_tool(&e);
+    let reply = reply.expect("a halt");
+    assert_eq!(reply["continue"], false, "{reply}");
+    let reason = reply["stopReason"].as_str().unwrap();
+    assert!(
+        reason.contains("factory paused") && reason.contains("board resume"),
+        "{reason}"
+    );
+    assert_eq!(
+        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
+        "idle"
+    );
+    // A runtime that went on anyway (a subagent's tool call) is halted again.
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a second halt")["continue"], false);
+    assert_eq!(
+        stop(&e),
+        None,
+        "no handoff reminder in a halted turn: it would continue the turn"
+    );
+
+    // A turn the user starts while held is told, not stopped.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "claude",
+        e.with("UserPromptSubmit", json!({"prompt": "fix the typo anyway"})),
+    );
+    assert!(context(&reply, "UserPromptSubmit").contains("hold: factory paused"));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert!(
+        reply.as_ref().is_none_or(|r| r.get("continue").is_none()),
+        "{reply:?}"
+    );
+    assert_eq!(
+        stop(&e).unwrap()["decision"],
+        "block",
+        "the user's own turn gets its reminders"
+    );
+
+    // Resumed: no hold line and no halt.
+    serve_hold(&e, false);
+    prompt(&e, "go on");
+    heartbeat_due_again(&e);
+    assert_eq!(read_tool(&e).0, None);
+}
+
 #[test]
 fn codex_stop_always_prints_json() {
     let e = env();

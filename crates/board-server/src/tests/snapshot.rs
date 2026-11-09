@@ -1839,3 +1839,84 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
     let json = text(&snapshot(&t, ME, "format=json").await).to_owned();
     assert!(json.contains("\"cut\":true"), "{json}");
 }
+
+#[tokio::test]
+async fn a_paused_board_holds_its_coordinator_its_threads_and_its_workers() {
+    let t = T::new();
+    let (coordinator, kid, worker, helper, other) =
+        ("t3:coord", "t3:kid", "t3:worker", "t3:helper", "t3:other");
+    for agent in [coordinator, worker, other] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    for (agent, up) in [(kid, coordinator), (helper, worker)] {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(agent),
+            Some(json!({
+                "id": agent, "runtime": "claude", "device": "mac", "repo": REPO,
+                "native_ids": {"t3_thread": &agent[3..], "t3_parent": &up[3..]},
+            })),
+        )
+        .await;
+    }
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(json!({ "device": "mac", "agent": coordinator })),
+    )
+    .await;
+    let id = t.task(worker, "auto", "Work").await;
+    assert!(t.claim(worker, &id).await.0.is_success());
+    let held = |s: &Value| s["held_by"].clone();
+    assert_eq!(held(&snapshot(&t, worker, "kind=full").await), Value::Null);
+
+    let paused = json!({ "status": "paused" });
+    t.ok("PATCH", "/v1/boards/auto", None, Some(paused)).await;
+    let events = t.ok("GET", "/v1/events?board=auto", None, None).await;
+    let last = events["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["type"], "board_updated");
+    assert_eq!(
+        last["payload"],
+        json!({ "fields": ["status"], "status": "paused" })
+    );
+
+    // The coordinator stays held after its lease lapses: the board still names it.
+    t.advance(super::coordinator_ttl() * 2);
+    for agent in [coordinator, kid, worker, helper] {
+        for kind in ["full", "delta", "alerts"] {
+            let snap = snapshot(&t, agent, &format!("kind={kind}")).await;
+            assert_eq!(held(&snap), json!(["auto"]), "{agent} {kind}");
+            assert!(
+                text(&snap).contains("hold: auto paused -> the user paused this work."),
+                "{agent} {kind}: {}",
+                text(&snap)
+            );
+        }
+    }
+    let snap = snapshot(&t, other, "kind=full").await;
+    assert_eq!(held(&snap), Value::Null);
+    assert!(!text(&snap).contains("hold:"), "{}", text(&snap));
+    let yaml = snapshot(&t, kid, "kind=full&format=yaml").await;
+    assert!(
+        text(&yaml).contains("hold:\n  boards: [auto]\n"),
+        "{}",
+        text(&yaml)
+    );
+
+    let active = json!({ "status": "active" });
+    t.ok("PATCH", "/v1/boards/auto", None, Some(active)).await;
+    for agent in [coordinator, kid, worker, helper] {
+        let snap = snapshot(&t, agent, "kind=delta").await;
+        assert_eq!(held(&snap), Value::Null, "{agent}");
+        assert!(!text(&snap).contains("hold:"), "{agent}: {}", text(&snap));
+    }
+}

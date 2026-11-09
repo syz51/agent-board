@@ -272,6 +272,82 @@ for any client, since Codex has no `ToolSearch`.
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
 
+## Pausing work
+
+`board pause` sets every `active` board to `paused` in one command; `board pause <slug>…`
+pauses only those. `board resume [<slug>…]` sets every `paused` board, or those named,
+back to `active`. Autopilot stays as it was, and closed boards are never touched (naming
+one, or an unknown board, fails before any change). Both print the boards they changed.
+
+A paused board **holds** the agents that work for it: its coordinator (the lease holder,
+also after the lease lapsed, since only a release clears it), every thread that
+coordinator delegated, at any depth, the owners of its tasks in `doing`, and their
+delegated threads. The server lists those boards in each snapshot's `held_by` and puts a
+`hold:` line first in its text (`hold:` with `boards` and `action` in `yaml`), in every
+kind, also when nothing else changed. The hooks act on it:
+
+- `PostToolUse` with a heartbeat due (so within about a minute of the pause, at the next
+  tool call that returns) ends a turn that began unheld: `{"continue": false,
+  "stopReason": …}`, after marking the agent idle, without registering it again (which
+  would mark it running) and without marking any overlap shown. Each later heartbeat of
+  that turn halts it again, in case the runtime ended only a subagent or ignored the
+  halt. A tool call that runs long is not stopped until it returns.
+- `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
+  own message asks for the work) and does not stop the turn, since the hook cannot tell
+  the user's message from a T3 notification. That turn is not stopped later either.
+- `Stop` gives no handoff or done reminders in a halted turn, since a reminder continues
+  the turn; the done marks it took are then dropped. A turn begun while held gets them as
+  any other. Both read the hold as of the last heartbeat, so a pause or resume within the
+  last minute is not seen yet; the next heartbeat halts a turn a reminder continued.
+
+The daemon keeps a paused board's coordinator and wakes it once on resume (see "Autopilot
+and the coordinator"). While a board is paused, the daemon drops every wake-up about it
+(ready work, answers, unblocked tasks, idle owners) at its send; the resume wake-up tells
+the coordinator to check those, and to message each halted owner thread to continue its
+task, restarting a task only when its thread is gone. An owner not messaged gets the
+server's idle notice once it has been away `doing_idle_secs`, as usual.
+
+## Usage
+
+Every agent shares the account's usage limits: a 5-hour window and a weekly one. The
+boards know the current usage, so each one stops starting new work when the usage is too
+high for it. There is no total cap.
+
+- **Source**: each daemon reads the endpoint behind Claude Code's `/usage`
+  (`GET https://api.anthropic.com/api/oauth/usage`) at most every 5 minutes, at a
+  reconcile. It signs in with Claude Code's own token: the macOS login keychain item
+  `Claude Code-credentials` (read with `security`), or `~/.claude/.credentials.json`
+  elsewhere. It reads only the default sign-in, not one under `CLAUDE_CONFIG_DIR`. It
+  never refreshes the token, which could sign Claude Code out: with an expired token or
+  no sign-in it skips the reading. The token never leaves the device and is never
+  logged. An answer with neither window is an error, not an empty reading. The daemon
+  reports each window's percent and reset time (`PUT /v1/usage`); when the report fails,
+  it acts on its own reading. The server keeps one reading for the account, the newest by
+  read time, with the device that sent it. Between its own readings, each reconcile takes
+  the server's newest (`GET /v1/usage`). The usage is read after the reconcile's thread
+  checks, so a slow read never delays them.
+- **Setting**: each board has `usage_stop_at`, a percent from 1 to 100, default 90. Only
+  the user may raise it; anyone may lower it. A lower stop makes a board give way first,
+  so the user ranks boards by it.
+- **Over**: a reading is fresh for 30 minutes. A board is over when a window of a fresh
+  reading is at or above its stop and has not reset yet. A stale reading, or none, holds
+  nothing: a device that cannot read the usage never stops work.
+- **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
+  it when there is a reading: `5h 12% · week 74% · read 3m ago · this board starts no new
+  task at 90%`. While the board is over, deltas (one per prompt) show it too, also when
+  nothing else changed; `alerts` snapshots, which come with tool calls under the smallest
+  cap, never do: `week 92% >= this board's stop at 90% -> usage is high: start no new task or
+  child thread; finish or park the tasks in doing. The week window resets …`. The
+  coordinator starts no task while it shows; tasks in progress finish.
+- **Daemon**: while a board is over, the daemon drops its ready and cleared wake-ups at
+  their send. Other wake-ups still go: answers, unblocked tasks, reviews and idle owners
+  concern work already started; a resumed board and a restarted coordinator also get
+  their turn, and the snapshot's `usage:` line tells them to start nothing new. When a
+  board leaves the over state, the daemon wakes its coordinator once to read its snapshot
+  and start ready tasks. A daemon with no reading at all, as after a restart while the
+  server is unreachable, keeps the boards it held.
+- `board usage` prints the reading and the boards it holds, paused ones included.
+
 ## Runtime integration
 
 All hooks call `board hook <event> --runtime claude|codex`, which reads the hook's JSON from
@@ -282,12 +358,12 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 |---|---|
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. On Claude Code, the snapshot (cached too) or the `board_join` hint ends with the `ToolSearch` call (`select:mcp__board__…`, with `max_results` set to the tool count) that loads the tools the MCP instructions name, `board_join` first in the hint, for when the tools show by name only; Codex gets the context alone. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
 | Background read of a T3 thread | When `t3 thread show` misses a hook's 0.4 seconds (at `SessionStart` or a `Stop` title check), the hook starts `board read-thread` on its own (its own process group, not waited for), so the hook takes no longer. It gives `t3 thread show` 30 seconds and leaves the answer, with the time it asked, in `$BOARD_HOME/state/thread-reads/<runtime>-<session>.json`; what goes wrong goes to `$BOARD_HOME/state/read-thread.log` (started over at 256 KiB). A later hook of the session registers a read that holds a title, link or parent other than the registered ones: `UserPromptSubmit`, a `PostToolUse` with a heartbeat due (so at most once a minute), or a `Stop` with no title check due. It registers after its own work, in what is left of its budget (at `Stop`, then marks the agent idle again). The read goes once the server took it or refused it as invalid; a read that tells nothing new, asked T3 before the registered facts were read, is over an hour old or is of another thread is dropped. A session starts a read at most every 45 seconds and logs its first at info level; while one may run, `SessionStart` and a due `Stop` check do not ask T3. Registering a read counts no title check. `SessionEnd` and the week-old pruning of session caches remove the read too |
-| `UserPromptSubmit` | Inject the delta; nothing when nothing changed |
+| `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped (see "Pausing work") |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
-| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts; in a T3 thread, register a finished background read of it (see above). A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
-| `Stop` | Mark idle; when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user). In a T3 thread, the session's first `Stop`, then one at most an hour after the last check, asks T3 for the thread's title and link (the same `t3 thread show`, at most 0.4 seconds, else a background read), since T3 renames a thread after its first turn; not while the server is skipped. The check asks T3 first, since a waiting read may predate a rename; a `Stop` with no check due, or one whose check started a background read, registers a finished read instead. Only a title or link other than the registered one is sent: after the idle update and the reminders, the hook registers the agent again (where it runs now, so a `git` read of the work tree too, and a delegated thread's parent if T3 now gives it) and, since registering marks it running, marks it idle again, in what is left of the hook's budget. A check that finds no change or gets no answer counts as done; a change counts once the server takes it, so a failed registration is tried again at the next `Stop`. One cut off between the two requests leaves the agent marked running until its next hook |
+| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts; end a turn that began before a paused board held the agent (`continue: false`, see "Pausing work"); in a T3 thread, register a finished background read of it (see above). A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
+| `Stop` | Mark idle; while a paused board holds the agent, nothing more. Otherwise, when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: its newest board write or file touch, from MCP or the CLI). A turn that only read or replied stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user). In a T3 thread, the session's first `Stop`, then one at most an hour after the last check, asks T3 for the thread's title and link (the same `t3 thread show`, at most 0.4 seconds, else a background read), since T3 renames a thread after its first turn; not while the server is skipped. The check asks T3 first, since a waiting read may predate a rename; a `Stop` with no check due, or one whose check started a background read, registers a finished read instead. Only a title or link other than the registered one is sent: after the idle update and the reminders, the hook registers the agent again (where it runs now, so a `git` read of the work tree too, and a delegated thread's parent if T3 now gives it) and, since registering marks it running, marks it idle again, in what is left of the hook's budget. A check that finds no change or gets no answer counts as done; a change counts once the server takes it, so a failed registration is tried again at the next `Stop`. One cut off between the two requests leaves the agent marked running until its next hook |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release file leases. A coordinator lease runs on: T3 ends idle sessions while the thread lives on, and the daemon of the lease's device renews it while the thread is live, or releases it |
 | `PreCompact` | Ask the summary to keep the agent id and current task id |
@@ -382,6 +458,16 @@ settings in use, warned once per edit.
   briefing it once, since what it was briefed with is unknown; a pending adoption replaces
   it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
   the lease first, so the ended agent is not named meanwhile.
+- **A paused board**: the daemon starts, wakes and re-briefs nothing on it, but its
+  coordinator's home device keeps the coordinator in `watch.json` and does not release
+  the lease, so the server still names it and holds it (see "Pausing work"). The lease
+  lapses while paused; on resume, the reconcile claims it again for the same thread when
+  T3 finds it live, as for any lapsed lease. A `board_updated` event that sets the status
+  back to `active` queues one `resumed` wake-up for that coordinator, telling it to read
+  its snapshot and handoff, to message each owner thread the pause stopped to continue its
+  task (restarting a task only when its thread is gone), and to check blocked tasks and
+  answered asks, whose wake-ups were dropped while paused. A board paused by a daemon that predates this rule released its lease,
+  so its coordinator is not held and a new one starts on resume.
 - **A coordinator whose folder is gone**: T3 fails every run of a thread whose folder no
   longer exists, at once, before the agent starts, while the thread itself stays and
   `t3 thread show` still lists it. So the daemon counts a coordinator thread live only
@@ -418,8 +504,9 @@ settings in use, warned once per edit.
   changed, so it is briefed once.
 - **A re-brief whose send timed out**: T3 may or may not have delivered it, so the daemon
   records the new digest and keeps the re-brief as unsure in its state, with the time of
-  the send. This covers a wake-up or a usage-limit resume that carried it, and a flush
-  cut short while sending it. From one minute after the send, so T3 has handled the
+  the send. This covers a usage-limit resume that carried it. One that went with a
+  wake-up is tracked with that message instead (A wake-up whose send timed out, below),
+  so a lost message comes back as one. From one minute after the send, so T3 has handled the
   request, each reconcile reads the thread's 100 latest messages with `t3 thread show`,
   while the coordinator works too, so its turns do not push the message out of them.
   The newest user message with a re-brief marker of the board settles it when that
@@ -617,8 +704,33 @@ settings in use, warned once per edit.
   - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
     failure up to 10 minutes, then checks them again before sending. A thread T3 no
     longer has, has archived, or whose worktree is gone, drops them. A send gets 20 seconds and all agents' sends
-    run side by side; one that runs out of time is not sent again, since T3 may have
-    delivered it.
+    run side by side; one that runs out of time may still have been delivered (below).
+  - **A wake-up whose send timed out**: each message ends with a marker line,
+    `(wake-up <first 16 hex digits of a SHA-256 of its text and send time>)`. Before the
+    send, the daemon records the message as unsure in its state, by agent, with what it
+    carries for the first time: the digest, its wake-ups (what they are about), the
+    boards and prompt digests of its re-briefs, its fresh-session notices, and the time;
+    never the text. A delivered send drops the record, and drops from the agent's older
+    unsure messages what it delivered again. A failed send drops it too, since its lines
+    are retried. One that finds the thread gone drops all of the agent's, and passes their
+    answers on with the rest. One that times out, or a flush cut short while sending,
+    keeps it. From one minute after a send, so T3 has handled the request, the flush reads
+    the thread's 100 latest messages with `t3 thread show`, once for all of the agent's
+    due messages, two threads at a time; the same read serves the fresh-session check.
+    The agent's new lines wait while a message is not looked for yet, so what is owed
+    again goes out with them in one message. A user message carrying a marker settles
+    that message. Without one, while T3 has a run of the thread active or queued, the
+    message may still wait in T3's queue, so it is read again a minute later; new lines
+    are not held for that, since a thread left marked running must still be woken. With
+    no such run, or when T3 does not know the thread, what it carried is owed again: its
+    wake-ups are queued again and checked before sending like any line, its re-briefs are
+    owed and go in front of them, and its fresh-session notices are due again for the
+    next wake-up. A wake-up or re-brief owed again is marked so that a second send that
+    times out counts as delivered: each is sent at most twice. A new event about a
+    wake-up so marked clears the mark. A check that fails, times out or reads an unknown
+    format backs off from 30 seconds up to 10 minutes and sends nothing; meanwhile the
+    agent's new lines are not held. A message not settled within an hour is dropped
+    like an expired line.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
     paused agent waited for, is dropped before any send.
   - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
@@ -664,7 +776,8 @@ settings in use, warned once per edit.
   review its children's work.
 - **Usage limits**: there is no fixed concurrency cap; the coordinator decides how much to
   delegate. When an agent stops on a usage limit it is marked paused, and nothing is woken
-  before the reset time.
+  before the reset time. Before a limit is hit, the board's `usage_stop_at` stops new work
+  (see "Usage").
 
 ## Daemon dispatch (partly built)
 
@@ -900,6 +1013,8 @@ keeping untrusted text out of those channels, so:
   and `\u003e`) keeps text from breaking out of its block.
 - **Snapshot** (≤ 2,000 characters): one `<board …>` block of `key: value` lines in a fixed
   order (you, counts, mine, handoff, alerts, peers, ready, waiting, proposals, recent;
+  before them come the `hold:` and `usage:` lines, which the cap never cuts, and which
+  `alerts` snapshots never carry for usage (see "Usage");
   `you` names the tasks the agent holds in `doing`, on any board, next to how many it may
   hold (`doing factory-12 (limit 1)`, or `doing none (limit 1)`), so it learns the limit
   before a claim is refused; the board's coordinator finds its `parallel_tasks` limit at
