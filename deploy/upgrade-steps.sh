@@ -23,6 +23,131 @@ health() {
 compose() {
     docker compose -f deploy/compose.yaml "$@"
 }
+# Signs board in cargo's bin folder with this Mac's own code-signing identity, made on first
+# use, so macOS privacy grants survive upgrades. `cargo install` leaves an ad-hoc signature
+# that macOS knows only by its hash, so every build lost the grant (such as Documents access,
+# which board watch needs for repositories there) and git waited on a new prompt. The key
+# is in its own keychain, unlocked with a random password in a 0600 file beside it, and
+# locked again however signing ends: a subshell, so its trap does that. Each failure says
+# what failed.
+dir="$HOME/Library/Application Support/agent-board/signing"
+keychain="$dir/signing.keychain-db"
+name="agent-board code signing"
+sign_board() (
+    # Where `cargo install` puts board, unless cargo's own install.root setting moves it.
+    bin="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/board"
+    (umask 077 && mkdir -p "$dir") || return 1
+    trap '[ ! -f "$keychain" ] || security lock-keychain "$keychain" ||
+        echo "upgrade: could not lock $keychain again"' EXIT
+    trap 'exit 1' HUP INT TERM
+    # Made again only when a run cut short left it without its keychain or certificate. A
+    # keychain that holds the certificate is never replaced, even without its password: a
+    # new key would lose every privacy grant made for the old one. The search needs no
+    # unlocking, so it comes before the password is needed.
+    remake=yes
+    if [ -f "$keychain" ]; then
+        # 44 is errSecItemNotFound; any other failure says nothing of the certificate.
+        found=0
+        err=$(security find-certificate -c "$name" "$keychain" 2>&1 >/dev/null) || found=$?
+        case $found in
+        0) remake=no ;;
+        44) ;;
+        *)
+            echo "$err"
+            echo "upgrade: security could not search $keychain for the certificate"
+            return 1
+            ;;
+        esac
+    fi
+    if [ "$remake" = no ]; then
+        [ -s "$dir/password" ] || {
+            echo "upgrade: $keychain holds the certificate, but its password file $dir/password is gone." \
+                "Restore that file, or remove the keychain to make a new identity, for which macOS asks for folder access again"
+            return 1
+        }
+        security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
+            echo "upgrade: could not unlock $keychain with the password beside it"
+            return 1
+        }
+    fi
+    if [ "$remake" = yes ]; then
+        echo "upgrade: making the code-signing identity in $dir"
+        forget_signing_identity
+        make_signing_identity || {
+            forget_signing_identity
+            return 1
+        }
+    fi
+    signed=no
+    if ! id=$(signing_id); then
+        echo "upgrade: $keychain holds the certificate \"$name\" but no identity codesign can use"
+    elif ! codesign --force --keychain "$keychain" -s "$id" --identifier dev.agent-board.board "$bin"; then
+        echo "upgrade: codesign could not sign $bin"
+    elif ! codesign -d -r- "$bin" 2>&1 | grep -q 'certificate leaf'; then
+        echo "upgrade: codesign ran, but the signature of $bin names no certificate"
+    else
+        signed=yes
+    fi
+    [ "$signed" = yes ]
+)
+# Prints the hash of the unlocked keychain's identity; fails without one.
+signing_id() {
+    # Listed as untrusted, which codesign accepts: macOS needs only the same key each time.
+    security find-identity -p codesigning "$keychain" |
+        grep -F "\"$name\"" | awk '{ print $2; found = 1; exit } END { exit !found }'
+}
+# Removes the keychain, from macOS's keychain list too, and its password.
+forget_signing_identity() {
+    security delete-keychain "$keychain" 2>/dev/null || true
+    rm -f "$keychain" "$dir/password"
+}
+# Makes the password and a keychain that holds the identity. A subshell, so its trap
+# removes the unencrypted key however it ends.
+make_signing_identity() (
+    (umask 077 && /usr/bin/openssl rand -hex 24 >"$dir/password") || {
+        echo "upgrade: openssl could not make the keychain password"
+        exit 1
+    }
+    password=$(cat "$dir/password")
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    cat >"$tmp/cert.cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $name
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+EOF
+    # /usr/bin/openssl is LibreSSL, whose PKCS#12 files `security import` reads. Its
+    # progress dots are shown only when it fails.
+    /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -config "$tmp/cert.cnf" \
+        -keyout "$tmp/key.pem" -out "$tmp/cert.pem" 2>"$tmp/err" || {
+        cat "$tmp/err"
+        echo "upgrade: openssl could not make the signing certificate"
+        exit 1
+    }
+    /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -name "$name" \
+        -out "$tmp/id.p12" -passout "file:$dir/password" || {
+        echo "upgrade: openssl could not bundle the signing key"
+        exit 1
+    }
+    # A new keychain is unlocked; set-keychain-settings with no options keeps it so.
+    { security create-keychain -p "$password" "$keychain" &&
+        security set-keychain-settings "$keychain" &&
+        security import "$tmp/id.p12" -k "$keychain" -P "$password" \
+            -T /usr/bin/codesign >/dev/null &&
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" \
+            "$keychain" >/dev/null; } || {
+        echo "upgrade: security could not store the signing identity in $keychain"
+        exit 1
+    }
+)
 action=$1
 shift
 case "$action" in
@@ -145,6 +270,12 @@ device-upgrade)
     if [ "$(installed)" != "$sha" ]; then
         BOARD_COMMIT=$(printf '%.12s' "$sha") cargo install --quiet --git "$url" --rev "$sha" --locked --force board ||
             fail "cargo install of $sha failed: read the output above; the previous board stays installed"
+    fi
+    # Signed again even when the install was already there: a run that failed here earlier
+    # may have left the ad-hoc signature. A failure costs only a new privacy prompt. Its
+    # output goes to stderr: upgrade.sh reads this step's stdout as the revision.
+    if [ "$(uname -s)" = Darwin ] && ! sign_board >&2; then
+        echo "upgrade: could not sign board with a lasting identity (see above), so macOS may ask again for folder access" >&2
     fi
     # Restart even when the install was already there: a run that failed here earlier
     # left the old daemon running.

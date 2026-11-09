@@ -145,6 +145,10 @@ const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
 pub const START_RETRY_MAX: TimeDelta = TimeDelta::minutes(30);
+/// The share of `reconcile_budget`, from the reconcile's start, by which its coordinator
+/// starts end; the rest is for a cut start's release and the save. A start cut with less
+/// than half the budget left is not counted as failed: the boards before it took the time.
+const STARTS_SHARE: f64 = 0.75;
 /// Events whose handling failed on a transient error are retried for this long.
 pub const RETRY_EVENTS_FOR: TimeDelta = TimeDelta::minutes(30);
 const RETRY_EVENTS_MAX: usize = 500;
@@ -1399,6 +1403,17 @@ struct StartFailure {
     config: HostingConfig,
     delay: TimeDelta,
     retry_at: Timestamp,
+    /// When the start began.
+    started_at: Timestamp,
+}
+
+impl StartFailure {
+    /// Whether the board still waits on this failure: not once its hosting settings changed
+    /// or an adoption was requested after the start, either of which is new intent.
+    fn stands(&self, board: &Board, adoption: Option<&Adoption>) -> bool {
+        self.config == HostingConfig::of(board)
+            && adoption.is_none_or(|a| a.requested_at <= self.started_at)
+    }
 }
 
 /// What T3 said of a thread: `None` when it cannot run it.
@@ -1428,6 +1443,9 @@ pub struct Daemon<T: T3> {
     boards: BTreeMap<BoardSlug, Board>,
     /// Boards whose coordinator failed to start here, by board.
     failures: BTreeMap<BoardSlug, StartFailure>,
+    /// When the current or last reconcile began: its coordinator starts end in time for the
+    /// rest of it, see [`STARTS_SHARE`].
+    reconcile_began: tokio::time::Instant,
     /// Coordinator threads whose last check T3 answered live or that timed out, and when:
     /// see [`THREAD_RECHECK`].
     last_checks: BTreeMap<String, (LastCheck, Timestamp)>,
@@ -1471,6 +1489,7 @@ impl<T: T3> Daemon<T> {
             state,
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
+            reconcile_began: tokio::time::Instant::now(),
             last_checks: BTreeMap::new(),
             checks_failing: BTreeMap::new(),
             agents: BTreeMap::new(),
@@ -1567,7 +1586,8 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
-        let checks_until = tokio::time::Instant::now() + self.timing.reconcile_budget / 2;
+        self.reconcile_began = tokio::time::Instant::now();
+        let checks_until = self.reconcile_began + self.timing.reconcile_budget / 2;
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
@@ -1594,7 +1614,17 @@ impl<T: T3> Daemon<T> {
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         // After the thread checks, so a slow usage read never takes their time.
         self.refresh_usage(now).await;
-        for board in &boards {
+        // Boards whose last start failed go last: a retry can wait out a git or T3 timeout,
+        // which would otherwise spend the reconcile's budget and leave the boards after it
+        // unstarted. Not one with new intent, which the back-off lets through at once.
+        let mut order: Vec<&Board> = boards.iter().collect();
+        order.sort_by_cached_key(|board| {
+            board.dispatch != Dispatch::Daemon
+                && self.failures.get(&board.slug).is_some_and(|failure| {
+                    failure.stands(board, load_adoption(&self.ctx.home, &board.slug).as_ref())
+                })
+        });
+        for board in order {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
                 self.state.pending_starts.remove(&board.slug);
@@ -1863,11 +1893,17 @@ impl<T: T3> Daemon<T> {
                     Err(err) => return Err(err),
                 };
                 if live {
-                    return if named {
+                    let kept = if named {
                         self.keep_alive(board, local, info, now).await
                     } else {
                         self.adopt(board, local, now).await
                     };
+                    // A start that recorded its thread and then failed or was cut short
+                    // is over once the thread is kept: the board no longer goes last.
+                    if kept.is_ok() {
+                        self.failures.remove(slug);
+                    }
+                    return kept;
                 }
                 tracing::warn!(
                     "coordinator of {slug}: thread {} is gone, archived or its folder is missing; replacing it",
@@ -1887,11 +1923,18 @@ impl<T: T3> Daemon<T> {
             self.release(slug).await;
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
-                Ok(info) if info.state != AgentState::Ended => return Ok(()),
+                // Another coordinator runs the board: a start that failed here no longer waits.
+                Ok(info) if info.state != AgentState::Ended => {
+                    self.failures.remove(slug);
+                    return Ok(());
+                }
                 // T3 ends a session left idle while its thread lives on, and the server keeps
                 // the lease: the daemon of its device renews or releases it. Taken over once
                 // it expires.
-                Ok(info) if info.device != self.ctx.device => return Ok(()),
+                Ok(info) if info.device != self.ctx.device => {
+                    self.failures.remove(slug);
+                    return Ok(());
+                }
                 // Ours, and unknown to this daemon's state. A pending adoption replaces it;
                 // otherwise its thread runs again if T3 has it.
                 Ok(_)
@@ -1927,35 +1970,72 @@ impl<T: T3> Daemon<T> {
             }
             adoption => adoption,
         };
-        // An adoption requested after the last failed start is new intent: tried at once.
         if let Some(failure) = self.failures.get(slug)
-            && failure.config == HostingConfig::of(board)
+            && failure.stands(board, adoption.as_ref())
             && now < failure.retry_at
-            && adoption
-                .as_ref()
-                .is_none_or(|a| a.requested_at <= failure.retry_at - failure.delay)
         {
             return Ok(());
         }
-        let started = match adoption {
-            Some(adoption) => self.adopt_thread(board, adoption, now).await,
-            None => self.start_coordinator(board, now).await,
-        };
-        match started {
-            Ok(()) => {
-                self.failures.remove(slug);
-                Ok(())
+        // Each start ends while the reconcile still has time for its release and save, so
+        // the reconcile's own cut never lands inside a start.
+        let budget = self.timing.reconcile_budget;
+        let limit = (self.reconcile_began + budget.mul_f64(STARTS_SHARE))
+            .saturating_duration_since(tokio::time::Instant::now());
+        if limit.is_zero() {
+            tracing::warn!(
+                "coordinator of {slug}: the reconcile has no time left to start it; started on the next"
+            );
+            return Ok(());
+        }
+        let started_at = now + self.since_reconcile();
+        let start = async {
+            match adoption {
+                Some(adoption) => self.adopt_thread(board, adoption, now).await,
+                None => self.start_coordinator(board, now).await,
             }
-            Err(err) => {
-                self.note_failure(board, now);
+        };
+        let started = match tokio::time::timeout(limit, start).await {
+            Ok(started) => started,
+            Err(_) => {
+                // As when `t3` times out: the lease goes, unless the start recorded its
+                // thread, which the next reconcile keeps. A saved pending mark stays, so the
+                // next start finds the thread T3 made.
+                if !self.state.coordinators.contains_key(slug) {
+                    self.release(slug).await;
+                }
+                let err = anyhow::anyhow!(
+                    "its start took over {}s, the time this reconcile had left",
+                    limit.as_secs()
+                );
+                // Boards before it took the time, not its own start: tried again on the
+                // next reconcile, without a back-off and in its usual place.
+                if limit < budget / 2 {
+                    return Err(err.context("left to the next reconcile"));
+                }
                 Err(err)
             }
+        };
+        if started.is_ok() {
+            self.failures.remove(slug);
+        } else {
+            // The back-off runs from the failure, so a slow one still waits.
+            let failed_at = now + self.since_reconcile();
+            self.note_failure(board, started_at, failed_at);
         }
+        started
     }
 
-    /// Delays the next start on `board`: doubled after each failure, reset when its hosting
-    /// settings change.
-    fn note_failure(&mut self, board: &Board, now: Timestamp) {
+    /// The time since this reconcile began, in whole seconds: its `now` is that start.
+    fn since_reconcile(&self) -> TimeDelta {
+        TimeDelta::from_std(Duration::from_secs(
+            self.reconcile_began.elapsed().as_secs(),
+        ))
+        .expect("a reconcile lasts minutes")
+    }
+
+    /// Delays the next start on `board` after one that began at `started_at` failed at
+    /// `failed_at`: doubled after each failure, reset when its hosting settings change.
+    fn note_failure(&mut self, board: &Board, started_at: Timestamp, failed_at: Timestamp) {
         let config = HostingConfig::of(board);
         let last = self
             .failures
@@ -1963,14 +2043,13 @@ impl<T: T3> Daemon<T> {
             .filter(|last| last.config == config)
             .map(|last| last.delay);
         let delay = next_delay(last, START_RETRY_FIRST, START_RETRY_MAX);
-        self.failures.insert(
-            board.slug.clone(),
-            StartFailure {
-                config,
-                delay,
-                retry_at: now + delay,
-            },
-        );
+        let failure = StartFailure {
+            config,
+            delay,
+            retry_at: failed_at + delay,
+            started_at,
+        };
+        self.failures.insert(board.slug.clone(), failure);
     }
 
     /// Renews the lease of a live coordinator and resumes it after a usage limit.
@@ -2635,7 +2714,7 @@ impl<T: T3> Daemon<T> {
                 continue;
             }
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
-                self.note_failure(board, now);
+                self.note_failure(board, now, now);
                 // One task that cannot start does not hold up the others. A start that
                 // recorded its worker gets this when that worker is found to have no thread.
                 if !self.state.workers.contains_key(&task.id) {
