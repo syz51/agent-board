@@ -576,7 +576,10 @@ settings in use, warned once per edit.
   coordinator (switch autopilot off first), or an ended one of another device whose lease
   still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
   thread, has archived it or its worktree is gone, when the device is not a home device,
-  and when it has no `[projects]` path for the board's repos or that folder is gone. Otherwise it saves the adoption in
+  and when the device has no project folder for the board or that folder is gone. It finds
+  that folder with the daemon's own lookup: a `[projects]` path for one of the board's repos,
+  else the `[board_projects]` path for the board (a board without a mapped repo, such as a
+  feedback board). Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
   device's daemon never starts a thread for the board in between, and then takes the
   coordinator lease for this device, so no other home device does either. If another
