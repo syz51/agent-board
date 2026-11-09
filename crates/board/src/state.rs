@@ -45,7 +45,28 @@ pub struct AgentLocal {
     /// Overlap alerts shown after tool calls, newest last: see [`AgentLocal::first_sight`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlaps_shown: Vec<ShownOverlap>,
+    /// Background subagents the agent launched (Claude Code's `Agent` tool), newest last:
+    /// see [`AgentLocal::launched`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<Launched>,
 }
+
+/// A background subagent the agent launched, with what the launching turn knew of the hold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Launched {
+    /// The runtime's id of the subagent, which its own hooks carry as `agent_id`.
+    pub id: String,
+    /// The launching turn began while held and went on: the user's own message asked for
+    /// the work (see [`AgentLocal::turn_unblocked`]).
+    pub unblocked: bool,
+    /// When the board that held the launching turn was paused, if the server said.
+    pub held_since: Option<Timestamp>,
+    pub at: Timestamp,
+}
+
+/// Launched subagents are remembered this long, and at most this many.
+const SUBAGENT_MEMORY: TimeDelta = TimeDelta::days(1);
+const SUBAGENTS_KEPT: usize = 50;
 
 /// An overlap alert the hooks showed: a peer's lease or edit of a path, as of `at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +91,62 @@ impl AgentLocal {
     pub fn end_turn_hold(&mut self) {
         self.turn_seen_at = None;
         self.hold_told = false;
+    }
+
+    /// The agent is held, as of the last heartbeat, by a pause that came after its turn
+    /// began, both as the server dates them: the heartbeat halts the turn. A turn begun
+    /// while the board was already paused goes on, also once it claims the board's work
+    /// mid-turn. Without either time (an older server, a prompt the server did not
+    /// answer, a turn with no prompt), a turn not told of the hold at its prompt is halted.
+    pub fn halted(&self) -> bool {
+        if !self.held {
+            return false;
+        }
+        match (self.held_since, self.turn_seen_at) {
+            (Some(paused), Some(turn)) => paused > turn,
+            _ => !self.hold_told,
+        }
+    }
+
+    /// The current turn began while held and goes on: its prompt showed the hold, which
+    /// tells the agent to go on only for the user's own request.
+    pub fn turn_unblocked(&self) -> bool {
+        self.held && !self.halted()
+    }
+
+    /// Records a background subagent the current turn launched, or subagent `by` did, with
+    /// whether the hold let the launcher work on. Its tool calls outlive the turn, whose
+    /// end clears what it knew of the hold.
+    pub fn launched(&mut self, id: &str, by: Option<&str>, now: Timestamp) {
+        let unblocked = self.held
+            && match by {
+                Some(by) => self.subagent_passes(by),
+                None => self.turn_unblocked(),
+            };
+        self.subagents
+            .retain(|s| s.id != id && now - s.at < SUBAGENT_MEMORY);
+        self.subagents.push(Launched {
+            id: id.to_owned(),
+            unblocked,
+            held_since: self.held_since,
+            at: now,
+        });
+        let excess = self.subagents.len().saturating_sub(SUBAGENTS_KEPT);
+        self.subagents.drain(..excess);
+    }
+
+    /// Whether the hold lets subagent `id` work on: its launching turn was unblocked by a
+    /// pause no older than the one that holds the agent now. A subagent not recorded as
+    /// launched in the background runs in the foreground, within the turn that launched
+    /// it, so that turn decides.
+    pub fn subagent_passes(&self, id: &str) -> bool {
+        if !self.held {
+            return true;
+        }
+        match self.subagents.iter().find(|s| s.id == id) {
+            Some(s) => s.unblocked && self.held_since <= s.held_since,
+            None => self.turn_unblocked(),
+        }
     }
 
     /// Whether to show `overlap` now, recording it when so. The same path, peer and kind

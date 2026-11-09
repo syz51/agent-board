@@ -1310,6 +1310,104 @@ fn a_turn_told_of_a_hold_is_halted_by_a_later_pause_and_a_turn_without_a_prompt_
     assert_eq!(reply.expect("a halt")["continue"], false);
 }
 
+/// The parent's `PostToolUse` of a background `Agent` launch, as Claude Code sends it.
+fn launch_background(e: &Env, id: &str) {
+    e.hook(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({
+                "tool_name": "Agent",
+                "tool_input": {"description": "Review", "prompt": "Review the diff."},
+                "tool_response": {"isAsync": true, "status": "async_launched", "agentId": id},
+            }),
+        ),
+    );
+}
+
+/// A task in doing whose handoff is newer than the agent's last change: `Stop` ends the
+/// turn without a reminder.
+fn quiet_stops(e: &Env) {
+    doing_with_handoff(e, Some(chrono::Utc::now() - chrono::Duration::hours(2)));
+}
+
+/// A tool call of subagent `id`: Claude Code adds `agent_id` and `agent_type`.
+fn subagent_read(e: &Env, id: &str) -> Option<Value> {
+    e.hook(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({
+                "agent_id": id,
+                "agent_type": "general-purpose",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/x"},
+            }),
+        ),
+    )
+    .0
+}
+
+#[test]
+fn a_subagent_of_a_turn_the_user_unblocked_works_on_through_the_hold() {
+    let e = env();
+    quiet_stops(&e);
+    // The user's own message starts a turn on the paused board; it launches a reviewer.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", Some("2030-01-01T09:00:00Z"));
+    prompt(&e, "fix this properly");
+    launch_background(&e, "a-review");
+    // The parent's turn ends while the reviewer runs.
+    assert_eq!(stop(&e), None, "the turn ends quietly");
+    heartbeat_due_again(&e);
+    let reply = subagent_read(&e, "a-review");
+    assert!(not_halted(&reply), "{reply:?}");
+    let text = context(&reply, "PostToolUse");
+    assert!(text.contains("launched you for this work"), "{text}");
+    assert!(!text.contains("-> stop"), "no refusal hold line: {text}");
+    // A foreground subagent runs within the turn that launched it, so that turn decides.
+    prompt(&e, "and the docs");
+    heartbeat_due_again(&e);
+    let text = context(&subagent_read(&e, "a-docs"), "PostToolUse");
+    assert!(text.contains("launched you for this work"), "{text}");
+
+    // A later pause holds it again.
+    serve_hold_at(&e, "2030-01-01T10:20:00Z", Some("2030-01-01T10:10:00Z"));
+    heartbeat_due_again(&e);
+    let reply = subagent_read(&e, "a-review");
+    assert_eq!(reply.expect("a halt")["continue"], false);
+}
+
+#[test]
+fn a_subagent_of_a_turn_the_user_did_not_unblock_is_held() {
+    let e = env();
+    quiet_stops(&e);
+    // Launched before the pause, by a turn the pause then halted.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", None);
+    prompt(&e, "review it");
+    launch_background(&e, "a-review");
+    serve_hold_at(&e, "2030-01-01T10:06:00Z", Some("2030-01-01T10:05:00Z"));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("the parent's halt")["continue"], false);
+    heartbeat_due_again(&e);
+    let reply = subagent_read(&e, "a-review");
+    assert_eq!(reply.expect("the subagent's halt")["continue"], false);
+
+    // A later turn begun held (a notification, or the user's message) does not let the
+    // older subagent on: the turn that launched it was not unblocked.
+    prompt(&e, "<task-notification>");
+    heartbeat_due_again(&e);
+    let text = context(&subagent_read(&e, "a-review"), "PostToolUse");
+    assert!(text.contains("hold: factory paused -> stop"), "{text}");
+    // Once that turn ends, the subagent is halted as before.
+    stop(&e);
+    heartbeat_due_again(&e);
+    let reply = subagent_read(&e, "a-review");
+    assert_eq!(reply.expect("a halt")["continue"], false);
+}
+
 /// Lets the next `PostToolUse` run its heartbeat, as a minute later.
 fn heartbeat_due_again(e: &Env) {
     let path = e.home.join("state").join(format!(

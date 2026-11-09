@@ -340,12 +340,18 @@ async fn handle(
     };
     steps.mark("agent");
     let now = Utc::now();
+    let mut local = state::load_agent(&home, &agent);
+    // Before any return below: the turn's end clears what it knew of the hold, which the
+    // background subagent it launched works on after it.
+    if post && let Some(id) = launched_subagent(input) {
+        local.launched(id, subagent_id(input), now);
+        state::save_agent(&home, &agent, &local)?;
+    }
     let breaker: Breaker = state::load_named(&home, BREAKER);
     if post && breaker.open_at(now).is_some() {
         // Mid-turn hooks stay quiet while the server is skipped: no scan, token or call.
         return Ok(Reply::Nothing);
     }
-    let local = state::load_agent(&home, &agent);
     // Local work comes before the server's share of the budget is set, so a slow work tree
     // or T3 never looks like a slow server. T3 is asked while the Keychain lookup runs.
     let t3 = match event {
@@ -524,6 +530,49 @@ async fn handle(
     }
     state::save_agent(&hook.home, &hook.agent, &hook.local)?;
     Ok(reply)
+}
+
+/// The runtime's id of the subagent a hook fires in: Claude Code adds `agent_id` to the
+/// hooks of a subagent's tool calls, which share the session (and so the agent) of the
+/// thread that launched it.
+fn subagent_id(input: &Value) -> Option<&str> {
+    input["agent_id"].as_str().filter(|s| !s.is_empty())
+}
+
+/// The subagent a background launch started: Claude Code's `Agent` tool (`Task` before)
+/// answers at once with `async_launched` and the subagent's id.
+fn launched_subagent(input: &Value) -> Option<&str> {
+    if !matches!(input["tool_name"].as_str(), Some("Agent" | "Task")) {
+        return None;
+    }
+    let response = &input["tool_response"];
+    if response["status"] != "async_launched" {
+        return None;
+    }
+    response["agentId"].as_str().filter(|s| !s.is_empty())
+}
+
+/// `text` with its `hold:` line replaced by one for a subagent the hold lets work on.
+fn unblocked_hold(text: &str, boards: &[board_proto::BoardSlug]) -> String {
+    let boards = boards
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    text.split('\n')
+        .map(|line| {
+            if line.starts_with("hold: ") {
+                format!(
+                    "hold: {boards} paused -> the user's own message asked the turn that \
+                     launched you for this work: finish your task, and start no other task, \
+                     child thread or wake-up."
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What the user sees when a heartbeat stops a held agent's turn.
@@ -1525,11 +1574,18 @@ impl Hook<'_> {
             self.local.last_heartbeat = Some(self.now);
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
             let boards = snap.held_by.clone();
-            let alerts = self.keep(snap)?;
-            // A turn that was running when its board was paused stops here, at every
-            // heartbeat until it ends: a runtime may not end it at the first (a subagent's
-            // tool call, or a runtime that ignores the halt).
-            if self.halted() {
+            let mut alerts = self.keep(snap)?;
+            if self.local.held
+                && let Some(id) = subagent_id(self.input)
+                && self.local.subagent_passes(id)
+            {
+                // The subagent's turn holds no user message, so the hold line would stop
+                // the work the user's own message asked its launching turn for.
+                alerts = unblocked_hold(&alerts, &boards);
+            } else if self.local.halted() {
+                // A turn that was running when its board was paused stops here, at every
+                // heartbeat until it ends: a runtime may not end it at the first (a
+                // subagent's tool call, or a runtime that ignores the halt).
                 self.local.overlaps_shown = shown;
                 self.set_state(AgentState::Idle, None).await?;
                 return Ok(Reply::Halt(halt_reason(&boards)));
@@ -1543,21 +1599,6 @@ impl Hook<'_> {
         } else {
             Reply::Context(lines.join("\n"))
         })
-    }
-
-    /// The agent is held, as of the last heartbeat, by a pause that came after its turn
-    /// began, both as the server dates them: the heartbeat halts the turn. A turn begun
-    /// while the board was already paused goes on, also once it claims the board's work
-    /// mid-turn. Without either time (an older server, a prompt the server did not
-    /// answer, a turn with no prompt), a turn not told of the hold at its prompt is halted.
-    fn halted(&self) -> bool {
-        if !self.local.held {
-            return false;
-        }
-        match (self.local.held_since, self.local.turn_seen_at) {
-            (Some(paused), Some(turn)) => paused > turn,
-            _ => !self.local.hold_told,
-        }
     }
 
     /// A `Stop` that follows our own block, ending the turn that answered a reminder.
@@ -1595,7 +1636,7 @@ impl Hook<'_> {
             .await?;
         // A halted turn is not asked to go on: the user paused its work. A turn begun
         // while held (the user's own request) gets the reminders as any other.
-        let reply = if continued || self.halted() {
+        let reply = if continued || self.local.halted() {
             Reply::Nothing
         } else {
             let handoff = self.handoff_reminder().await?;
