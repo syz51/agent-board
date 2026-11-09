@@ -97,6 +97,9 @@ struct Model {
     /// The paused boards that hold this agent ([`held_by`]); never cut.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hold: Vec<String>,
+    /// Set when the hold is the weekly usage at the hard line: why, in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_usage: Option<String>,
     /// The account usage against the board's `usage_stop_at` ([`usage_view`]): in full
     /// snapshots whenever a reading exists, in the others only while over; never cut.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,13 +314,20 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
-    let (held, held_since) = held_by(cx, &agent.id)?;
-    let usage = board
+    let latest = crate::ops::usage::latest(cx)?;
+    let hard = latest
         .as_ref()
-        .map(|b| usage_view(cx, b))
-        .transpose()?
+        .and_then(|u| u.pace_at(cx.now))
+        .and_then(|p| p.hard_since);
+    let (held, held_since) = held_by(cx, &agent.id, hard)?;
+    let hold_usage = (hard.is_some() && !held.is_empty())
+        .then(|| latest.as_ref().and_then(hard_reason))
         .flatten();
-    let over = usage.as_ref().is_some_and(|u| u.over.is_some());
+    let usage = match (&board, &latest) {
+        (Some(b), Some(u)) => Some(usage_view(cx, b, u)?),
+        _ => None,
+    };
+    let over = usage.as_ref().is_some_and(UsageView::stops);
 
     let mut model = Model {
         kind: req.kind,
@@ -325,11 +335,12 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
         board: board.as_ref().map(|b| b.to_string()),
         seq,
         hold: held.iter().map(ToString::to_string).collect(),
+        hold_usage: hold_usage.clone(),
         // Alerts snapshots come with tool calls and have the smallest cap, so the line goes
         // only into full snapshots and, while over, into the deltas at each prompt.
         usage: usage.filter(|u| match req.kind {
             SnapshotKind::Full => true,
-            SnapshotKind::Delta => u.over.is_some(),
+            SnapshotKind::Delta => u.stops(),
             SnapshotKind::Alerts => false,
         }),
         you: None,
@@ -394,6 +405,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             at: cx.now,
             held_by: held,
             held_since,
+            held_for_usage: hold_usage.is_some(),
         },
         agent: agent.id,
         shown,
@@ -429,6 +441,52 @@ struct UsageView {
     /// Set when a window of a fresh reading is at or above `stop_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     over: Option<UsageOver>,
+    /// The weekly pace, while the user keeps a reserve and the reading is fresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pace: Option<PaceView>,
+}
+
+impl UsageView {
+    /// The usage stops new work on the board: a window is over the stop, or the pace is 0.
+    fn stops(&self) -> bool {
+        self.over.is_some() || self.pace.as_ref().is_some_and(|p| p.limit == 0)
+    }
+}
+
+/// The weekly pace as a snapshot shows it, in weekly percent rounded to a tenth.
+#[derive(Debug, Clone, Serialize)]
+struct PaceView {
+    reserve: f64,
+    /// The day's allowance: from the day's first reading up to `line`.
+    allowance: f64,
+    line: f64,
+    projected: f64,
+    /// How many tasks the board may run at once: none, one, or its `parallel_tasks`.
+    limit: u32,
+    /// When the next pace day begins.
+    next_day: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'static str>,
+}
+
+/// What the `usage:` line tells an agent while the pace is 0.
+const PACE_ACTION: &str = "today's share of the weekly usage is spent: start no new task or \
+child thread; finish or park the tasks in doing.";
+
+/// Rounded to a tenth, as shown.
+fn tenth(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// Why the hard line holds the agent, from a reading whose pace is at it.
+fn hard_reason(u: &board_proto::Usage) -> Option<String> {
+    let (week, pace) = (u.seven_day?, u.pace?);
+    Some(format!(
+        "weekly usage {}% reached {}% (the user keeps {}% in reserve)",
+        tenth(week.percent),
+        tenth(pace.hard_line()),
+        tenth(pace.reserve)
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -450,17 +508,28 @@ fn shown_percent(percent: f64) -> u32 {
     percent.floor() as u32
 }
 
-/// The newest usage reading against `board`'s stop, if any device has reported one.
-fn usage_view(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<UsageView>> {
-    let Some(usage) = crate::ops::usage::latest(cx)? else {
-        return Ok(None);
-    };
-    let stop_at: u32 = cx.db.query_row(
-        "SELECT usage_stop_at FROM boards WHERE slug = ?1",
+/// The newest usage reading against `board`'s stop and pace.
+fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Result<UsageView> {
+    let (stop_at, parallel_tasks): (u32, u32) = cx.db.query_row(
+        "SELECT usage_stop_at, parallel_tasks FROM boards WHERE slug = ?1",
         [board.as_str()],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    Ok(Some(UsageView {
+    let pace = usage.pace_at(cx.now).map(|p| {
+        let limit = p.limit(parallel_tasks);
+        PaceView {
+            reserve: tenth(p.reserve),
+            allowance: tenth(p.allowance()),
+            line: tenth(p.line),
+            projected: tenth(p.projected),
+            limit,
+            next_day: (p.day_start + chrono::TimeDelta::hours(24))
+                .format("%Y-%m-%d %H:%MZ")
+                .to_string(),
+            action: (limit == 0).then_some(PACE_ACTION),
+        }
+    });
+    Ok(UsageView {
         five_hour: usage.five_hour.map(|w| shown_percent(w.percent)),
         week: usage.seven_day.map(|w| shown_percent(w.percent)),
         read: ago(cx.now - usage.read_at),
@@ -473,7 +542,8 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<UsageView>> {
                 .map(|at| at.format("%Y-%m-%d %H:%MZ").to_string()),
             action: USAGE_ACTION,
         }),
-    }))
+        pace,
+    })
 }
 
 fn usage_line(u: &UsageView) -> String {
@@ -497,20 +567,42 @@ fn usage_line(u: &UsageView) -> String {
     }
     parts.push(format!("read {} ago", u.read));
     parts.push(format!("this board starts no new task at {}%", u.stop_at));
+    if let Some(p) = &u.pace {
+        if let Some(action) = p.action {
+            return format!(
+                "week projected {}% >= today's line {}% -> {action} The next day's share starts {}.",
+                p.projected, p.line, p.next_day
+            );
+        }
+        let tasks = match p.limit {
+            1 => "one task at a time".to_owned(),
+            n => format!("up to {n} tasks at once"),
+        };
+        parts.push(format!(
+            "pace: today to {}% (allows {}), projected {}%, {tasks}, reserve {}%",
+            p.line, p.allowance, p.projected, p.reserve
+        ));
+    }
     parts.join(" · ")
 }
+
+/// What the `hold:` line tells an agent the hard usage line holds.
+const USAGE_HOLD_ACTION: &str = "the weekly usage reached the user's reserve. Stop: end this \
+turn now, and start no task, child thread or wake-up. Continue only if the user's own \
+message in this turn asks for it.";
 
 /// What the `hold:` line tells a held agent to do.
 const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
 task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
 
-/// The query of [`held_by`]: `?1` the agent, `?2` the depth. The agent and the T3 threads
+/// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` every board, not only
+/// paused ones (the hard usage line). The agent and the T3 threads
 /// that delegated it, up the chain, as in [`crate::ops::leases::DELEGATION_FAMILY`].
 const HELD_BY: &str = concat!(
     "WITH RECURSIVE ",
     crate::ops::leases::delegated_up_cte!(),
     " SELECT b.slug, b.paused_at FROM boards b \
-     WHERE b.status = 'paused' \
+     WHERE (b.status = 'paused' OR ?3) \
        AND (b.coordinator IN (SELECT id FROM up) \
             OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
                        AND t.owner IN (SELECT id FROM up))) \
@@ -520,17 +612,34 @@ const HELD_BY: &str = concat!(
 /// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
 /// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
 /// threads it started and those working its tasks, and no one else. With them, when the
-/// latest of them was paused.
-fn held_by(cx: &Ctx<'_>, agent: &AgentId) -> Result<(Vec<BoardSlug>, Option<Timestamp>)> {
-    let rows: Vec<(BoardSlug, i64)> = cx
+/// latest of them was paused. Once the weekly usage reached the hard line at `hard`, it
+/// holds every board the agent works for, each since its earlier hold.
+fn held_by(
+    cx: &Ctx<'_>,
+    agent: &AgentId,
+    hard: Option<Timestamp>,
+) -> Result<(Vec<BoardSlug>, Option<Timestamp>)> {
+    let rows: Vec<(BoardSlug, Option<i64>)> = cx
         .db
         .prepare_cached(HELD_BY)?
         .query_map(
-            params![agent.as_str(), crate::ops::leases::DELEGATION_DEPTH],
+            params![
+                agent.as_str(),
+                crate::ops::leases::DELEGATION_DEPTH,
+                hard.is_some()
+            ],
             |r| Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;
-    let since = rows.iter().map(|(_, at)| *at).max().map(crate::db::ts);
+    let hard = hard.map(|at| at.timestamp_millis());
+    let since = rows
+        .iter()
+        .filter_map(|(_, paused)| match (*paused, hard) {
+            (Some(p), Some(h)) => Some(p.min(h)),
+            (p, h) => p.or(h),
+        })
+        .max()
+        .map(crate::db::ts);
     Ok((rows.into_iter().map(|(slug, _)| slug).collect(), since))
 }
 
@@ -622,7 +731,11 @@ fn fill_full(
         branch: agent.branch.clone(),
         doing: Vec::new(),
         doing_limit: cx.s.max_doing_per_agent,
-        parallel_tasks,
+        // The weekly pace lowers it for the day.
+        parallel_tasks: parallel_tasks.map(|n| {
+            let pace = model.usage.as_ref().and_then(|u| u.pace.as_ref());
+            pace.map_or(n, |p| n.min(p.limit))
+        }),
     });
     model.counts = board_counts;
     model.dispatch = (dispatch == Dispatch::Daemon).then_some("daemon");
@@ -1736,7 +1849,18 @@ fn counts_line(c: &Counts) -> String {
 fn render_lines(m: &Model) -> String {
     let mut o = String::new();
     if !m.hold.is_empty() {
-        let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.hold.join(", "));
+        match &m.hold_usage {
+            Some(why) => {
+                let _ = writeln!(
+                    o,
+                    "hold: {}: {why} -> {USAGE_HOLD_ACTION}",
+                    m.hold.join(", ")
+                );
+            }
+            None => {
+                let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.hold.join(", "));
+            }
+        }
     }
     if let Some(u) = &m.usage {
         let _ = writeln!(o, "usage: {}", usage_line(u));
@@ -1762,6 +1886,7 @@ fn render_lines(m: &Model) -> String {
         };
         parts.push(format!("doing {doing} (limit {})", you.doing_limit));
         match you.parallel_tasks {
+            Some(0) => parts.push("coordinator, no new task while the pace is 0".to_owned()),
             Some(1) => parts.push("coordinator, one task at a time".to_owned()),
             Some(n) => parts.push(format!("coordinator, up to {n} tasks at once")),
             None => {}
@@ -1916,7 +2041,14 @@ fn render_yaml(m: &Model) -> String {
     if !m.hold.is_empty() {
         o.push_str("hold:\n");
         let _ = writeln!(o, "  boards: [{}]", m.hold.join(", "));
-        let _ = writeln!(o, "  action: {}", q(HOLD_ACTION));
+        if let Some(why) = &m.hold_usage {
+            let _ = writeln!(o, "  usage: {}", q(why));
+        }
+        let action = match m.hold_usage {
+            Some(_) => USAGE_HOLD_ACTION,
+            None => HOLD_ACTION,
+        };
+        let _ = writeln!(o, "  action: {}", q(action));
     }
     if let Some(u) = &m.usage {
         o.push_str("usage:\n");
@@ -1936,6 +2068,18 @@ fn render_yaml(m: &Model) -> String {
                 let _ = writeln!(o, "    resets: {}", q(at));
             }
             let _ = writeln!(o, "    action: {}", q(over.action));
+        }
+        if let Some(p) = &u.pace {
+            o.push_str("  pace:\n");
+            let _ = writeln!(o, "    reserve: {}", p.reserve);
+            let _ = writeln!(o, "    allowance: {}", p.allowance);
+            let _ = writeln!(o, "    line: {}", p.line);
+            let _ = writeln!(o, "    projected: {}", p.projected);
+            let _ = writeln!(o, "    limit: {}", p.limit);
+            let _ = writeln!(o, "    next_day: {}", q(&p.next_day));
+            if let Some(action) = p.action {
+                let _ = writeln!(o, "    action: {}", q(action));
+            }
         }
     }
     if let Some(you) = &m.you {

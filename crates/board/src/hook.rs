@@ -625,11 +625,19 @@ fn is_pull_request_update(input: &Value) -> bool {
         .is_some_and(|p| p.starts_with(PULL_REQUEST_UPDATE))
 }
 
-/// What the user sees when the hold stops a held agent's turn.
-fn halt_reason(boards: &[board_proto::BoardSlug]) -> String {
+/// What the user sees when the hold stops a held agent's turn: a pause, or the weekly
+/// usage at the reserve (`Snapshot::held_for_usage`).
+fn halt_reason(snap: &Snapshot) -> String {
+    if snap.held_for_usage {
+        return format!(
+            "board: the weekly usage reached your reserve, so this turn for {} stopped. \
+             `board usage` shows it; `board usage --reserve` changes it.",
+            board_names(&snap.held_by)
+        );
+    }
     format!(
         "board: {} paused, so this turn stopped. `board resume` continues the work.",
-        board_names(boards)
+        board_names(&snap.held_by)
     )
 }
 
@@ -1621,7 +1629,7 @@ impl Hook<'_> {
             if !snap.held_by.is_empty() {
                 self.local.held = true;
                 self.local.held_since = snap.held_since;
-                return Ok(Reply::Halt(halt_reason(&snap.held_by)));
+                return Ok(Reply::Halt(halt_reason(&snap)));
             }
             self.set_state(AgentState::Running, None).await?;
             snap
@@ -1661,6 +1669,7 @@ impl Hook<'_> {
             *beat = Some(self.now);
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
             let boards = snap.held_by.clone();
+            let reason = halt_reason(&snap);
             let mut alerts = self.keep(snap)?;
             if self.local.held && self.subagent_passes() {
                 // The subagent's turn holds no user message, so the hold line would stop
@@ -1672,7 +1681,7 @@ impl Hook<'_> {
                 // subagent's tool call, or a runtime that ignores the halt).
                 self.local.overlaps_shown = shown;
                 self.set_state(AgentState::Idle, None).await?;
-                return Ok(Reply::Halt(halt_reason(&boards)));
+                return Ok(Reply::Halt(reason));
             }
             if !alerts.is_empty() {
                 lines.push(alerts);

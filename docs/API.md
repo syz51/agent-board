@@ -821,7 +821,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   servers that predate it, which clients read as not held. `held_since` is when the
   latest of those boards was paused: a board keeps the time while it stays paused. The
   hooks end only a turn that began before it. Left out when not held, and by servers that
-  predate it.
+  predate it. The weekly hard line (see "Usage") holds every board the agent works for in
+  the same way, paused or not: `held_since` is then when the line was reached, unless a
+  pause came later, and `held_for_usage` is `true` (left out otherwise, and by servers
+  that predate it). The `hold:` line then gives the usage and the reserve as the reason.
   For an agent with a board, when a usage reading exists, a `usage:` line follows the
   `hold:` line: in full snapshots always, in `delta` only while the board is over its
   `usage_stop_at` (it then has text even when nothing else changed), never in `alerts`.
@@ -856,6 +859,19 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
 - A reading is fresh for 30 minutes after `read_at`. A board is over when a window of a
   fresh reading has `percent` at or above its `usage_stop_at` and its `resets_at`, when
   known, is still ahead.
+- `Usage.pace` `[UsagePace]` is present while a reserve is set and the weekly window has
+  a `resets_at`; left out otherwise, and by servers that predate it: `reserve`,
+  `day_start` (the pace day's start), `anchor` (the day's first weekly percent), `line`
+  (the day's line), `projected` (the weekly percent projected 5 minutes ahead) and
+  `hard_since` (when the weekly percent reached `100 - reserve`; left out below it).
+  Clients apply it only while the reading is fresh and the weekly reset is ahead. A
+  board's pace limit is 0 at the hard line or when `projected >= line`, 1 when `projected
+  >= line - 2`, and its `parallel_tasks` otherwise.
+- `GET /v1/usage/reserve` → `[UsageReserve]` `{reserve}`, `null` while the pace is off.
+- `PUT /v1/usage/reserve` `[UsageReserve]` → `[UsageReserve]`. `reserve` is a weekly
+  percent from 0 to below 100 that agents leave to the user, or `null` to turn the pace
+  off. Anyone may turn it on or raise it; 403 `forbidden` when an agent lowers it or turns
+  it off, which only the user may do. 400 `invalid` for a value out of range.
 
 ### Administration (user only)
 

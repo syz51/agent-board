@@ -552,6 +552,37 @@ pub fn usage(usage: Option<&Usage>, boards: &[Board], now: Timestamp) -> String 
     if !held.is_empty() {
         lines.push(format!("starting no new task: {}", held.join(", ")));
     }
+    match usage.pace_at(now) {
+        Some(p) => {
+            lines.push(format!(
+                "pace: reserve {:.1}% · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
+                p.reserve,
+                p.anchor,
+                p.line,
+                p.allowance(),
+                p.projected,
+                (p.day_start + chrono::TimeDelta::hours(24)).format("%Y-%m-%d %H:%MZ")
+            ));
+            if p.hard_since.is_some() {
+                lines.push(format!(
+                    "hard line: weekly use reached {:.1}%: agents working for a board halt",
+                    p.hard_line()
+                ));
+            }
+            let limits: Vec<String> = boards
+                .iter()
+                .filter(|b| b.status != board_proto::BoardStatus::Closed)
+                .map(|b| format!("{} {}", b.slug, p.limit(b.parallel_tasks.max(1))))
+                .collect();
+            if !limits.is_empty() {
+                lines.push(format!("tasks at once by pace: {}", limits.join(", ")));
+            }
+        }
+        None if usage.pace.is_some() => {
+            lines.push("pace: not applied (the reading is stale or its week has reset)".into())
+        }
+        None => lines.push("pace: off (`board usage --reserve 5.5` turns it on)".into()),
+    }
     lines.join("\n")
 }
 

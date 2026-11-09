@@ -299,9 +299,14 @@ pub enum Command {
         /// Boards to resume. Default: every paused board.
         boards: Vec<BoardSlug>,
     },
-    /// Show the account's latest usage reading, which daemons report, and the boards it
-    /// stops from starting new work (`board board update --usage-stop-at`).
-    Usage,
+    /// Show the account's latest usage reading, which daemons report, the boards it stops
+    /// from starting new work (`board board update --usage-stop-at`) and the weekly pace.
+    Usage {
+        /// Keep this weekly percent for your own use and pace board work to the rest
+        /// (0 to below 100), or `off`. Only the user may lower it or turn it off.
+        #[arg(long, value_parser = parse_reserve)]
+        reserve: Option<Reserve>,
+    },
     /// Create or change a board.
     #[command(subcommand)]
     Board(BoardCommand),
@@ -1208,7 +1213,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::set_boards_status(&ctx()?, boards, BoardStatus::Paused, BoardStatus::Active)
                 .await?
         }
-        Command::Usage => ops::usage(&ctx()?, chrono::Utc::now()).await?,
+        Command::Usage { reserve } => {
+            ops::usage(&ctx()?, reserve.map(|r| r.0), chrono::Utc::now()).await?
+        }
         Command::Board(BoardCommand::Create {
             slug,
             title,
@@ -1340,6 +1347,23 @@ async fn dispatch(cli: Cli) -> Result<()> {
         println!("{}", out.text);
     }
     Ok(())
+}
+
+/// A `--reserve` value: a percent, or `off` (`None`).
+#[derive(Debug, Clone, Copy)]
+pub struct Reserve(pub Option<f64>);
+
+fn parse_reserve(value: &str) -> Result<Reserve> {
+    if value == "off" {
+        return Ok(Reserve(None));
+    }
+    let n: f64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected a percent such as 5.5, or off"))?;
+    if !(n.is_finite() && (0.0..100.0).contains(&n)) {
+        anyhow::bail!("expected a percent from 0 to below 100, or off");
+    }
+    Ok(Reserve(Some(n)))
 }
 
 fn parse_task_list(list: &str) -> Result<Vec<TaskId>> {

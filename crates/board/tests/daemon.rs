@@ -7231,3 +7231,112 @@ async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
     );
     assert_eq!(worker_starts(&e.t3).len(), 2);
 }
+
+/// A reading with a weekly pace whose projection is `projected` against a line at 80.
+fn paced_reading(projected: f64, read: Timestamp) -> serde_json::Value {
+    let mut v = usage_reading(70.0, read);
+    v["pace"] = json!({
+        "reserve": 5.5, "day_start": read - chrono::Duration::hours(1), "anchor": 70.0,
+        "line": 80.0, "projected": projected,
+    });
+    v
+}
+
+#[tokio::test]
+async fn a_pace_of_zero_drops_new_work_wakes_and_wakes_the_coordinator_when_it_rises() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/usage", paced_reading(80.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker"),
+            at(),
+        )
+        .await
+        .unwrap();
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // The projection falls under the line: one task at a time, and the coordinator is told.
+    let later = at() + chrono::Duration::minutes(1);
+    e.stub.on("GET /v1/usage", paced_reading(78.5, later));
+    e.daemon.reconcile(later).await.unwrap();
+    assert!(e.daemon.state.usage_held.is_empty());
+    e.daemon.flush(later).await;
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, "coord");
+    assert!(text.contains("the weekly pace allows a task"), "{text}");
+}
+
+#[tokio::test]
+async fn the_daemon_reads_the_usage_every_minute_near_a_pace_line_until_refused() {
+    use board::daemon::{USAGE_POLL_EVERY, USAGE_POLL_NEAR, USAGE_REFUSED_BACKOFF};
+    use board::usage::{Credentials, UsageSource};
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let creds = e._dir.path().join("credentials.json");
+    std::fs::write(
+        &creds,
+        json!({ "claudeAiOauth": {
+            "accessToken": "tok-123",
+            "expiresAt": (at() + chrono::Duration::hours(8)).timestamp_millis(),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    e.daemon.usage_source = UsageSource::ClaudeCode {
+        url: format!("{}/api/oauth/usage", e.stub.url),
+        credentials: Credentials::File(creds),
+    };
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 70.0, "resets_at": null } }),
+    );
+    let reads = |e: &Env| e.stub.requests_to("GET /api/oauth/usage").len();
+
+    // Far from the line: every 5 minutes.
+    e.stub.on("PUT /v1/usage", paced_reading(72.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.reconcile(at() + USAGE_POLL_NEAR).await.unwrap();
+    assert_eq!(reads(&e), 1);
+
+    // Within 2 points of it: every minute.
+    let t = at() + USAGE_POLL_EVERY;
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, t));
+    e.daemon.reconcile(t).await.unwrap();
+    assert_eq!(reads(&e), 2);
+    e.daemon.reconcile(t + USAGE_POLL_NEAR).await.unwrap();
+    assert_eq!(reads(&e), 3);
+
+    // A refusal: every 5 minutes for 30 minutes.
+    let refused = t + USAGE_POLL_NEAR * 2;
+    e.stub.on_status("GET /api/oauth/usage", 429, json!({}));
+    e.stub.on("GET /v1/usage", paced_reading(78.5, refused));
+    e.daemon.reconcile(refused).await.unwrap();
+    assert_eq!(reads(&e), 4);
+    e.daemon.reconcile(refused + USAGE_POLL_NEAR).await.unwrap();
+    assert_eq!(reads(&e), 4, "backing off");
+    let after = refused + USAGE_POLL_EVERY;
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 70.0, "resets_at": null } }),
+    );
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, after));
+    e.daemon.reconcile(after).await.unwrap();
+    assert_eq!(reads(&e), 5);
+    // After the back-off, every minute again.
+    let done = refused + USAGE_REFUSED_BACKOFF;
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, done));
+    e.daemon.reconcile(done).await.unwrap();
+    assert_eq!(reads(&e), 6);
+    let next = done + USAGE_POLL_NEAR;
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, next));
+    e.daemon.reconcile(next).await.unwrap();
+    assert_eq!(reads(&e), 7);
+}

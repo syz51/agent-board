@@ -848,7 +848,12 @@ pub async fn boards(ctx: &Ctx) -> Result<Output> {
 }
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
-pub async fn usage(ctx: &Ctx, now: Timestamp) -> Result<Output> {
+pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
+    if let Some(reserve) = reserve {
+        ctx.client
+            .set_usage_reserve(&board_proto::UsageReserve { reserve })
+            .await?;
+    }
     let usage = ctx.client.usage().await?;
     let boards = match &usage {
         Some(_) => ctx.client.boards().await?,

@@ -21,6 +21,19 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Reading the sign-in and the endpoint each get this long.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The usage endpoint refused a reading for its rate limit (HTTP 429): the daemon reads
+/// it less often for a while.
+#[derive(Debug)]
+pub struct Refused;
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the usage endpoint answered 429 Too Many Requests")
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// Where the daemon gets the account's usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsageSource {
@@ -121,6 +134,9 @@ pub async fn read(
         .await
         .context("reading the usage endpoint")?;
     let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Refused.into());
+    }
     if !status.is_success() {
         bail!("the usage endpoint answered {status}");
     }

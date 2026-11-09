@@ -269,3 +269,235 @@ async fn a_window_past_its_reset_is_not_over() {
     t.advance(TimeDelta::minutes(11));
     assert_eq!(usage_line(&snapshot(&t, "kind=delta").await), None);
 }
+
+/// A report read `minutes` after the start with only a weekly window that resets
+/// `reset` minutes after the start.
+fn week_reading(minutes: i64, week: f64, reset: i64) -> Value {
+    json!({
+        "seven_day": { "percent": week, "resets_at": at(reset) },
+        "read_at": at(minutes),
+    })
+}
+
+fn you_line(snapshot: &str) -> Option<&str> {
+    snapshot.lines().find(|l| l.starts_with("you: "))
+}
+
+#[tokio::test]
+async fn only_the_user_lowers_the_usage_reserve_or_turns_it_off() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    let reserve = |r: Value| Some(json!({ "reserve": r }));
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", Some(ME), None).await,
+        json!({ "reserve": null })
+    );
+    // Anyone turns it on or raises it.
+    t.ok("PUT", "/v1/usage/reserve", Some(ME), reserve(json!(5.5)))
+        .await;
+    t.ok("PUT", "/v1/usage/reserve", Some(ME), reserve(json!(6.0)))
+        .await;
+    for r in [json!(5.5), Value::Null] {
+        let (code, err, v) = t
+            .fail("PUT", "/v1/usage/reserve", Some(ME), reserve(r))
+            .await;
+        assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    }
+    for r in [json!(-1.0), json!(100.0)] {
+        let (code, _, v) = t
+            .fail("PUT", "/v1/usage/reserve", Some(ME), reserve(r))
+            .await;
+        assert_eq!(code, 400, "{v}");
+    }
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", reserve(json!(5.5)))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", Some(ME), None).await,
+        json!({ "reserve": 5.5 })
+    );
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", reserve(Value::Null))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v, json!({ "reserve": null }));
+}
+
+#[tokio::test]
+async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.register("t3:other", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 3, "autopilot": true })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(ME),
+        Some(json!({ "device": "mac", "agent": ME })),
+    )
+    .await;
+    // Three pace days to the reset: this one began 12 hours before the start.
+    let reset = (2 * 24 + 12) * 60;
+    t.ok("PUT", "/v1/usage", None, Some(week_reading(0, 80.0, reset)))
+        .await;
+    let full = snapshot(&t, "kind=full").await;
+    assert!(!usage_line(&full).unwrap().contains("pace"), "off: {full}");
+
+    t.ok(
+        "PUT",
+        "/v1/usage/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 5.5 })),
+    )
+    .await;
+    // The day's line: 80 + (94.5 - 80) / 3.
+    let pace = t.ok("GET", "/v1/usage", None, None).await["pace"].clone();
+    assert_eq!(pace["anchor"], 80.0);
+    assert_eq!(pace["day_start"], at(-12 * 60));
+    assert!(
+        (pace["line"].as_f64().unwrap() - 84.833).abs() < 0.001,
+        "{pace}"
+    );
+    assert_eq!(pace["projected"], 80.0, "no burn rate yet");
+    let full = snapshot(&t, "kind=full").await;
+    assert!(
+        usage_line(&full).unwrap().ends_with(
+            "pace: today to 84.8% (allows 4.8), projected 80%, up to 3 tasks at once, \
+             reserve 5.5%"
+        ),
+        "{full}"
+    );
+    assert!(
+        you_line(&full)
+            .unwrap()
+            .ends_with("coordinator, up to 3 tasks at once"),
+        "{full}"
+    );
+
+    // 2.5 points in 15 minutes projects 83.3 in 5 more: within 2 points, one at a time.
+    t.advance(TimeDelta::minutes(15));
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(15, 82.5, reset)),
+    )
+    .await;
+    let full = snapshot(&t, "kind=full").await;
+    assert!(
+        usage_line(&full)
+            .unwrap()
+            .contains("projected 83.3%, one task at a time"),
+        "{full}"
+    );
+    assert!(
+        you_line(&full)
+            .unwrap()
+            .ends_with("coordinator, one task at a time"),
+        "{full}"
+    );
+
+    // Projected past the line: no new task, said in deltas too.
+    t.advance(TimeDelta::minutes(15));
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(30, 84.5, reset)),
+    )
+    .await;
+    let stop = "usage: week projected 85.3% >= today's line 84.8% -> today's share of the \
+                weekly usage is spent";
+    for kind in ["full", "delta"] {
+        let snap = snapshot(&t, &format!("kind={kind}")).await;
+        assert!(
+            usage_line(&snap).unwrap().starts_with(stop),
+            "{kind}: {snap}"
+        );
+    }
+    let full = snapshot(&t, "kind=full").await;
+    assert!(
+        you_line(&full)
+            .unwrap()
+            .ends_with("coordinator, no new task while the pace is 0"),
+        "{full}"
+    );
+
+    // The next day re-anchors at its first reading: 84.6 + (94.5 - 84.6) / 2.
+    t.advance(TimeDelta::minutes(12 * 60 - 25));
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(12 * 60 + 5, 84.6, reset)),
+    )
+    .await;
+    let pace = t.ok("GET", "/v1/usage", None, None).await["pace"].clone();
+    assert_eq!(pace["day_start"], at(12 * 60));
+    assert!(
+        (pace["line"].as_f64().unwrap() - 89.55).abs() < 0.001,
+        "{pace}"
+    );
+    assert_eq!(pace["projected"], 84.6, "older readings are dropped");
+
+    // The hard line: agents working for a board halt; others do not.
+    let id = t.task(ME, "factory", "Work").await;
+    assert!(t.claim(ME, &id).await.0.is_success());
+    t.advance(TimeDelta::minutes(5));
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(12 * 60 + 10, 94.5, reset)),
+    )
+    .await;
+    let snap = t
+        .ok("GET", "/v1/snapshot?kind=alerts", Some(ME), None)
+        .await;
+    assert_eq!(snap["held_by"], json!(["factory"]), "{snap}");
+    assert_eq!(snap["held_for_usage"], true);
+    assert_eq!(snap["held_since"], at(12 * 60 + 10));
+    assert!(
+        snap["text"].as_str().unwrap().contains(
+            "hold: factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) \
+             -> the weekly usage reached the user's reserve. Stop:"
+        ),
+        "{snap}"
+    );
+    let other = t
+        .ok("GET", "/v1/snapshot?kind=alerts", Some("t3:other"), None)
+        .await;
+    assert_eq!(other["held_by"], Value::Null, "{other}");
+    // A later reading keeps the time the line was reached.
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(12 * 60 + 11, 95.0, reset)),
+    )
+    .await;
+    let snap = t
+        .ok("GET", "/v1/snapshot?kind=alerts", Some(ME), None)
+        .await;
+    assert_eq!(snap["held_since"], at(12 * 60 + 10));
+
+    // The user lowers the reserve: the hold ends.
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 4.0 })))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let snap = t
+        .ok("GET", "/v1/snapshot?kind=alerts", Some(ME), None)
+        .await;
+    assert_eq!(snap["held_by"], Value::Null, "{snap}");
+    assert!(snap.get("held_for_usage").is_none(), "{snap}");
+}

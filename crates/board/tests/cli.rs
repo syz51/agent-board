@@ -2904,7 +2904,7 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
         stdout(&out).trim_end(),
         format!(
             "5h 12%\nweek 92% · resets {}\nread 2m ago by mac\nstarting no new task: factory \
-             (week >= 90%), parked (week >= 90%)",
+             (week >= 90%), parked (week >= 90%)\npace: off (`board usage --reserve 5.5` turns it on)",
             resets.format("%Y-%m-%d %H:%MZ")
         )
     );
@@ -2912,4 +2912,42 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
     let out = e.run(&["--json", "usage"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(v["seven_day"]["percent"], 92.0);
+
+    // With a reserve: the day's line, the projection and each board's pace limit.
+    let day_start = resets - chrono::Duration::hours(48);
+    e.stub.on(
+        "GET /v1/usage",
+        json!({
+            "seven_day": { "percent": 80.0, "resets_at": resets },
+            "read_at": read,
+            "device": "mac",
+            "pace": {
+                "reserve": 5.5, "day_start": day_start, "anchor": 79.0, "line": 86.75,
+                "projected": 85.0,
+            },
+        }),
+    );
+    let mut wide = board_fixture("wide", &[]);
+    wide.parallel_tasks = 3;
+    e.stub.on("GET /v1/boards", [wide]);
+    e.stub
+        .on("PUT /v1/usage/reserve", json!({ "reserve": 5.5 }));
+    let out = e.run(&["usage", "--reserve", "5.5"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let put = e.stub.requests_to("PUT /v1/usage/reserve");
+    assert_eq!(put.last().unwrap().body, json!({ "reserve": 5.5 }));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "pace: reserve 5.5% · today from 79.0% to 86.8% (allows 7.8) · projected 85.0% · next day {}",
+            (day_start + chrono::Duration::hours(24)).format("%Y-%m-%d %H:%MZ")
+        )) && text.contains("tasks at once by pace: wide 1"),
+        "{text}"
+    );
+    let out = e.run(&["usage", "--reserve", "off"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let put = e.stub.requests_to("PUT /v1/usage/reserve");
+    assert_eq!(put.last().unwrap().body, json!({ "reserve": null }));
+    let out = e.run(&["usage", "--reserve", "100"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
 }
