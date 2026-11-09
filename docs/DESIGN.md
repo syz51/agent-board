@@ -313,7 +313,18 @@ kind, also when nothing else changed. The hooks act on it:
   prompt and when the turn ends.
 - `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
   own message asks for the work) and does not stop the turn, since the hook cannot tell
-  the user's message from a T3 notification. That turn is not stopped later either.
+  the user's message from a T3 notification. That turn is not stopped later either. One
+  notification is recognized: a pull request watch's wake-up, whose prompt starts with
+  `Update on pull request`. T3 sends one at every check or review change, so a held
+  thread would run (and spend usage) for each one while paused. In Claude Code the hook
+  ends that prompt before the model runs, with the same halt and stop reason as a
+  heartbeat, and keeps the watch. It fetches the snapshot before marking the agent
+  running, so an ended prompt changes no state: the agent stays idle (or paused for a
+  usage limit), it is not registered again, and its sequence stays, so the next snapshot
+  brings again the alerts the ended one had. Codex is told of the hold instead, since it
+  may not honor `continue: false` at a prompt. This also ends updates for a watch the
+  user's own request started while paused, and updates about another board's task the
+  thread holds; the stop reason in the thread shows each.
 - `Stop` gives no handoff or done reminders in a halted turn, since a reminder continues
   the turn; the done marks it took are then dropped. A turn begun while held gets them as
   any other. Both read the hold as of the last heartbeat, so a pause or resume within the
@@ -322,9 +333,12 @@ kind, also when nothing else changed. The hooks act on it:
 The daemon keeps a paused board's coordinator and wakes it once on resume (see "Autopilot
 and the coordinator"). While a board is paused, the daemon drops every wake-up about it
 (ready work, answers, unblocked tasks, idle owners) at its send; the resume wake-up tells
-the coordinator to check those, and to message each halted owner thread to continue its
-task, restarting a task only when its thread is gone. An owner not messaged gets the
-server's idle notice once it has been away `doing_idle_secs`, as usual.
+the coordinator to check those and the pull requests of the board's tasks, whose updates
+the hook ended unread (also whether one merged or closed), and to message each halted
+owner thread to continue its task, restarting a task only when its thread is gone. An
+owner not messaged gets the server's idle notice once it has been away `doing_idle_secs`,
+as usual. A board without autopilot has no coordinator to wake: whoever resumes it checks
+its pull requests.
 
 ## Usage
 
@@ -375,9 +389,9 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
-| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. On Claude Code, the snapshot (cached too) or the `board_join` hint ends with the `ToolSearch` call (`select:mcp__board__…`, with `max_results` set to the tool count) that loads the tools the MCP instructions name, `board_join` first in the hint, for when the tools show by name only; Codex gets the context alone. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
+| `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. On Claude Code, the snapshot (cached too) or the `board_join` hint ends with the `ToolSearch` call (`select:mcp__board__…`, with `max_results` set to the tool count) that loads the tools the MCP instructions name, `board_join` first in the hint, for when the tools show by name only; Codex gets the context alone. A thread a parent's `delegate_task` started (its T3 thread id, not a nested session) gets one line after the snapshot (cached too) for a PR waiting on checks, unless its brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task in `review` with a note naming the PR, report and end, since T3 gives such a child no PR watch and forbids polling. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
 | Background read of a T3 thread | When `t3 thread show` misses a hook's 0.4 seconds (at `SessionStart` or a `Stop` title check), the hook starts `board read-thread` on its own (its own process group, not waited for), so the hook takes no longer. It gives `t3 thread show` 30 seconds and leaves the answer, with the time it asked, in `$BOARD_HOME/state/thread-reads/<runtime>-<session>.json`; what goes wrong goes to `$BOARD_HOME/state/read-thread.log` (started over at 256 KiB). A later hook of the session registers a read that holds a title, link or parent other than the registered ones: `UserPromptSubmit`, a `PostToolUse` with a heartbeat due (so at most once a minute), or a `Stop` with no title check due. It registers after its own work, in what is left of its budget (at `Stop`, then marks the agent idle again). The read goes once the server took it or refused it as invalid; a read that tells nothing new, asked T3 before the registered facts were read, is over an hour old or is of another thread is dropped. A session starts a read at most every 45 seconds and logs its first at info level; while one may run, `SessionStart` and a due `Stop` check do not ask T3. Registering a read counts no title check. `SessionEnd` and the week-old pruning of session caches remove the read too |
-| `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped (see "Pausing work") |
+| `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped, except a T3 pull request update in Claude Code, which ends before the model runs (see "Pausing work") |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
@@ -487,9 +501,11 @@ settings in use, warned once per edit.
   T3 finds it live, as for any lapsed lease. A `board_updated` event that sets the status
   back to `active` queues one `resumed` wake-up for that coordinator, telling it to read
   its snapshot and handoff, to message each owner thread the pause stopped to continue its
-  task (restarting a task only when its thread is gone), and to check blocked tasks and
-  answered asks, whose wake-ups were dropped while paused. A board paused by a daemon that predates this rule released its lease,
-  so its coordinator is not held and a new one starts on resume.
+  task (restarting a task only when its thread is gone), to check the pull requests of
+  the board's tasks, whose updates were not handled while paused, and to check blocked
+  tasks and answered asks, whose wake-ups were dropped while paused. A board paused by a
+  daemon that predates this rule released its lease, so its coordinator is not held and a
+  new one starts on resume.
 - **A coordinator whose folder is gone**: T3 fails every run of a thread whose folder no
   longer exists, at once, before the agent starts, while the thread itself stays and
   `t3 thread show` still lists it. So the daemon counts a coordinator thread live only
@@ -579,7 +595,10 @@ settings in use, warned once per edit.
   coordinator (switch autopilot off first), or an ended one of another device whose lease
   still runs (adopt on that device, or wait for the lease to expire), when T3 on that device does not know the
   thread, has archived it or its worktree is gone, when the device is not a home device,
-  and when it has no `[projects]` path for the board's repos or that folder is gone. Otherwise it saves the adoption in
+  and when the device has no project folder for the board or that folder is gone. It finds
+  that folder with the daemon's own lookup: a `[projects]` path for one of the board's repos,
+  else the `[board_projects]` path for the board (a board without a mapped repo, such as a
+  feedback board). Otherwise it saves the adoption in
   `$BOARD_HOME/state/adopt-<board>.json`, only then switches autopilot on, so this
   device's daemon never starts a thread for the board in between, and then takes the
   coordinator lease for this device, so no other home device does either. If another

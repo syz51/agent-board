@@ -1500,6 +1500,71 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
 }
 
 #[test]
+fn a_held_threads_pull_request_update_ends_before_the_model_runs() {
+    let e = env();
+    e.agent_ok();
+    serve_hold(&e, false);
+    prompt(&e, "go");
+    let update = |e: &Env| {
+        e.hook(
+            "user-prompt-submit",
+            "claude",
+            e.with(
+                "UserPromptSubmit",
+                json!({"prompt": "Update on pull request #7 (https://example.com/pull/7), \
+                                  which T3 Code is watching for you: checks passed"}),
+            ),
+        )
+        .0
+    };
+
+    // Not held: the update is a turn like any other.
+    assert!(not_halted(&update(&e)));
+
+    // Held: T3's wake-up for the watched pull request ends at once. It changes no state:
+    // the agent stays as its last turn left it, unregistered again, and its sequence stays.
+    let mut held = snapshot_fixture(SnapshotKind::Delta, "", 5);
+    held.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    held.held_by = vec!["factory".parse().unwrap()];
+    e.stub.on("GET /v1/snapshot", held);
+    let states = e.stub.requests_to(&state_path()).len();
+    let registers = e.stub.requests_to("POST /v1/agents").len();
+    let reply = update(&e).expect("a halt");
+    assert_eq!(reply["continue"], false, "{reply}");
+    let reason = reply["stopReason"].as_str().unwrap();
+    assert!(
+        reason.contains("factory paused") && reason.contains("board resume"),
+        "{reason}"
+    );
+    assert_eq!(e.stub.requests_to(&state_path()).len(), states);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), registers);
+
+    // The user's own message while held is told, not stopped, and its delta starts where
+    // the ended turn's did, so the server brings again the alerts that one had.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "claude",
+        e.with("UserPromptSubmit", json!({"prompt": "check PR 7"})),
+    );
+    assert!(context(&reply, "UserPromptSubmit").contains("hold: factory paused"));
+    let since = |e: &Env| {
+        e.stub
+            .requests_to("GET /v1/snapshot")
+            .last()
+            .unwrap()
+            .query_pairs()["since"]
+            .clone()
+    };
+    assert_eq!(since(&e), "2");
+    assert_eq!(
+        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
+        "running"
+    );
+    prompt(&e, "go on");
+    assert_eq!(since(&e), "5");
+}
+
+#[test]
 fn codex_stop_always_prints_json() {
     let e = env();
     let codex_agent = "codex:thr_9";
@@ -2236,6 +2301,73 @@ fn a_delegated_t3_thread_registers_its_parent() {
     assert_eq!(calls(), 2);
 }
 
+/// T3's PR rules name a `watch_pull_request` it gives a delegated child none of, so a
+/// delegated thread's own board context names the route for a PR waiting on checks, cached
+/// snapshot too, on either runtime. A top-level T3 thread, a session outside T3 and a
+/// session nested in a delegated thread do not get it. The thread id alone decides, so T3
+/// need not answer.
+#[test]
+fn only_a_delegated_t3_threads_session_start_names_the_pr_route() {
+    const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    const ROUTE: &str = "PR waiting on checks, unless your brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task you own in review with a note naming the PR, report, and end; never wait for CI.";
+    let e = env();
+    let no_t3 = e.home.join("no-t3");
+    let start = |runtime: &str, thread: Option<&str>| {
+        let agent = thread.map_or(CLAUDE_AGENT.to_owned(), |t| format!("t3:{t}"));
+        e.stub.clear();
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(&agent, DEVICE, AgentState::Running),
+        );
+        e.stub.on(
+            "GET /v1/snapshot",
+            snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+        );
+        let mut env = vec![("T3CODE_CLI_PATH", no_t3.to_str().unwrap())];
+        if let Some(thread) = thread {
+            env.push(("T3CODE_THREAD_ID", thread));
+        }
+        let payload = e.with("SessionStart", json!({"source": "startup"}));
+        let (reply, _) = e.hook_env("session-start", runtime, payload, &env);
+        context(&reply, "SessionStart")
+    };
+    let delegated = format!("{SNAPSHOT}\n{ROUTE}\n{TOOL_SEARCH}");
+
+    assert_eq!(start("claude", Some(CHILD)), delegated);
+    assert_eq!(start("codex", Some(CHILD)), format!("{SNAPSHOT}\n{ROUTE}"));
+    assert_eq!(start("claude", Some("thread-7")), started());
+    assert_eq!(start("claude", None), started());
+
+    #[cfg(unix)]
+    {
+        e.stub.clear();
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+        );
+        e.stub.on(
+            "GET /v1/snapshot",
+            snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+        );
+        let out = nested_hook(&e, CHILD, "session-start", &e.base("SessionStart"));
+        let reply = serde_json::from_str(&out).ok();
+        assert_eq!(context(&reply, "SessionStart"), started());
+        assert_eq!(
+            e.stub.requests_to("POST /v1/agents")[0].body["id"],
+            CLAUDE_AGENT
+        );
+    }
+
+    // Offline, the delegated thread's cached snapshot names the route too.
+    refuse_connects(&e);
+    let text = start("claude", Some(CHILD));
+    assert!(
+        text.starts_with("board server unreachable: cached snapshot from ")
+            && text.ends_with(&delegated),
+        "{text}"
+    );
+}
+
 /// A `t3` that answers `thread show` with the JSON in `answer` and logs each call to `log`.
 /// A `slow` one answers after 0.7 seconds, as T3 does on a busy Mac: always past the hooks'
 /// own budget for T3 (0.4 seconds), so only a background read gets its answer. It logs a
@@ -2794,7 +2926,7 @@ fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
 /// shell runs it: board <- claude <- claude <- this test. Both `claude`s are bash under
 /// that name, so the real process table shows the chain.
 #[cfg(unix)]
-fn nested_hook(e: &Env, event: &str, payload: &Value) -> String {
+fn nested_hook(e: &Env, thread: &str, event: &str, payload: &Value) -> String {
     use std::io::Write as _;
     let bin = e.home.parent().unwrap().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2814,7 +2946,7 @@ fn nested_hook(e: &Env, event: &str, payload: &Value) -> String {
         .env("BOARD_HOME", &e.home)
         .env("BOARD_TOKEN", TOKEN)
         .env("BOARD_KEYCHAIN", "0")
-        .env("T3CODE_THREAD_ID", "thread-7")
+        .env("T3CODE_THREAD_ID", thread)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("BOARD_LOG")
         .stdin(std::process::Stdio::piped())
@@ -2862,7 +2994,7 @@ fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
         .join(format!("state/sessions/claude-{}.json", SESSION));
 
     // Nested: the session registers as itself, without the thread it runs inside.
-    nested_hook(&e, "session-start", &e.base("SessionStart"));
+    nested_hook(&e, "thread-7", "session-start", &e.base("SessionStart"));
     let register = &e.stub.requests_to("POST /v1/agents")[0];
     assert_eq!(register.body["id"], CLAUDE_AGENT);
     assert!(register.body["native_ids"].get("t3_thread").is_none());
