@@ -36,6 +36,18 @@ use crate::t3::{T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
 const DELEGATED_THREAD: &str = "thread:delegated-task:";
+/// The route a delegated thread's `SessionStart` context names for a PR waiting on checks.
+/// T3's PR rules, which every thread sees, say to call `watch_pull_request`, which T3 gives
+/// a delegated child none of, and forbid polling and `gh pr checks --watch`; a parent's
+/// brief may name this route (the coordinator's does), but children still polled. The
+/// wording follows the coordinator's brief (`prompts/coordinator.md`, step 4), and a brief
+/// that says otherwise wins.
+const DELEGATED_PR_ROUTE: &str = "PR waiting on checks, unless your brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task you own in review with a note naming the PR, report, and end; never wait for CI.";
+
+/// Whether T3 started thread `id` for a parent thread's `delegate_task`.
+fn delegated_thread(id: &str) -> bool {
+    id.starts_with(DELEGATED_THREAD)
+}
 /// Where T3 tells its threads its CLI is.
 const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
 /// Time for asking T3 about the agent's thread (`t3 thread show`, 0.2 to 0.7 seconds
@@ -222,6 +234,9 @@ struct Hook<'a> {
     runtime: Runtime,
     /// The session runs inside another agent session (`identity::is_nested`).
     nested: bool,
+    /// At `SessionStart`, the agent is a T3 thread a parent's `delegate_task` started (its
+    /// own thread, not a nested session's).
+    delegated: bool,
     home: Home,
     device: board_proto::DeviceName,
     client: Client,
@@ -371,8 +386,10 @@ async fn handle(
     };
     // Local work comes before the server's share of the budget is set, so a slow work tree
     // or T3 never looks like a slow server. T3 is asked while the Keychain lookup runs.
+    // The agent is the T3 thread it runs in.
+    let own_thread = !nested && t3_identity_applies(explicit_agent, env);
     let t3 = match event {
-        _ if nested || !t3_identity_applies(explicit_agent, env) => None,
+        _ if !own_thread => None,
         // A hook that skips the server registers nothing, so T3's answer would go unused.
         _ if breaker.open_at(now).is_some() => None,
         HookEvent::SessionStart => thread_at_start(&home, runtime, session, now).await,
@@ -435,11 +452,15 @@ async fn handle(
         Route::Direct(token) => direct_client(server, token, Some(agent.clone()), &connects)?,
     };
     steps.mark("client");
+    let delegated = event == HookEvent::SessionStart
+        && own_thread
+        && t3_thread_id().is_some_and(|id| delegated_thread(&id));
     let mut hook = Hook {
         relayed,
         event,
         runtime,
         nested,
+        delegated,
         device: device.clone(),
         client,
         local,
@@ -977,7 +998,7 @@ async fn thread_at_start(
             return None;
         }
     };
-    if !id.starts_with(DELEGATED_THREAD) {
+    if !delegated_thread(&id) {
         facts.parent = None;
     }
     Some(SeenThread {
@@ -1008,7 +1029,7 @@ fn thread_read_later(
         title: read.title,
         link: read.link,
     };
-    if !id.starts_with(DELEGATED_THREAD) {
+    if !delegated_thread(&id) {
         facts.parent = None;
     }
     let older = cached.t3_thread.as_deref() == Some(id.as_str())
@@ -1082,7 +1103,7 @@ async fn thread_renamed(
     };
     // As at `SessionStart`: a parent only for a delegated thread, else the one registered
     // (T3's answer may now have one the session's first registration missed).
-    if !id.starts_with(DELEGATED_THREAD) {
+    if !delegated_thread(&id) {
         facts.parent = None;
     }
     facts.parent = facts.parent.or(had.parent);
@@ -1287,7 +1308,7 @@ impl Hook<'_> {
     fn offline(&mut self, failure: Failure) -> Reply {
         match self.event {
             HookEvent::SessionStart => match self.cached_snapshot(failure) {
-                Reply::Context(text) => Reply::Context(self.with_tool_search(text, &[])),
+                Reply::Context(text) => Reply::Context(self.board_context(text)),
                 reply => reply,
             },
             HookEvent::UserPromptSubmit if !self.local.offline_notified => {
@@ -1340,6 +1361,17 @@ impl Hook<'_> {
             self.local.turn_started,
             &mut self.local.done_reminded,
         ))
+    }
+
+    /// `SessionStart` context from a board snapshot: a delegated thread's names the route
+    /// for a PR waiting on checks ([`DELEGATED_PR_ROUTE`]), then the `ToolSearch` call.
+    fn board_context(&self, snapshot: String) -> String {
+        let context = if self.delegated {
+            format!("{snapshot}\n{DELEGATED_PR_ROUTE}")
+        } else {
+            snapshot
+        };
+        self.with_tool_search(context, &[])
     }
 
     /// Ends `SessionStart` board context with the `ToolSearch` call that loads `first` and
@@ -1531,7 +1563,7 @@ impl Hook<'_> {
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
-            return Ok(Reply::Context(self.with_tool_search(text, &[])));
+            return Ok(Reply::Context(self.board_context(text)));
         }
         // No board for this agent: hint at a board covering the repo, if any.
         let Some(key) = repo.key else {
