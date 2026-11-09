@@ -313,7 +313,13 @@ kind, also when nothing else changed. The hooks act on it:
   prompt and when the turn ends.
 - `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
   own message asks for the work) and does not stop the turn, since the hook cannot tell
-  the user's message from a T3 notification. That turn is not stopped later either.
+  the user's message from a T3 notification. That turn is not stopped later either. One
+  notification is recognized: a pull request watch's wake-up, whose prompt starts with
+  `Update on pull request #`. T3 sends one at every check or review change, so a held
+  thread would run (and spend usage) for each one while paused. The hook ends that prompt
+  before the model runs, with the same halt and stop reason as a heartbeat, and keeps the
+  watch. The delta that prompt fetched is not read, so the agent's next prompt fetches a
+  full snapshot.
 - `Stop` gives no handoff or done reminders in a halted turn, since a reminder continues
   the turn; the done marks it took are then dropped. A turn begun while held gets them as
   any other. Both read the hold as of the last heartbeat, so a pause or resume within the
@@ -322,8 +328,9 @@ kind, also when nothing else changed. The hooks act on it:
 The daemon keeps a paused board's coordinator and wakes it once on resume (see "Autopilot
 and the coordinator"). While a board is paused, the daemon drops every wake-up about it
 (ready work, answers, unblocked tasks, idle owners) at its send; the resume wake-up tells
-the coordinator to check those, and to message each halted owner thread to continue its
-task, restarting a task only when its thread is gone. An owner not messaged gets the
+the coordinator to check those and the board's open pull requests, whose updates the hook
+ended unread, and to message each halted owner thread to continue its task, restarting a
+task only when its thread is gone. An owner not messaged gets the
 server's idle notice once it has been away `doing_idle_secs`, as usual.
 
 ## Usage
@@ -484,9 +491,11 @@ settings in use, warned once per edit.
   T3 finds it live, as for any lapsed lease. A `board_updated` event that sets the status
   back to `active` queues one `resumed` wake-up for that coordinator, telling it to read
   its snapshot and handoff, to message each owner thread the pause stopped to continue its
-  task (restarting a task only when its thread is gone), and to check blocked tasks and
-  answered asks, whose wake-ups were dropped while paused. A board paused by a daemon that predates this rule released its lease,
-  so its coordinator is not held and a new one starts on resume.
+  task (restarting a task only when its thread is gone), to check the open pull requests
+  of the board's tasks, whose updates were not handled while paused, and to check blocked
+  tasks and answered asks, whose wake-ups were dropped while paused. A board paused by a
+  daemon that predates this rule released its lease, so its coordinator is not held and a
+  new one starts on resume.
 - **A coordinator whose folder is gone**: T3 fails every run of a thread whose folder no
   longer exists, at once, before the agent starts, while the thread itself stays and
   `t3 thread show` still lists it. So the daemon counts a coordinator thread live only

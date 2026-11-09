@@ -597,7 +597,15 @@ fn board_names(boards: &[board_proto::BoardSlug]) -> String {
         .join(", ")
 }
 
-/// What the user sees when a heartbeat stops a held agent's turn.
+/// The prompt is T3's wake-up from a pull request watch (`Update on pull request #…`),
+/// not the user's message.
+fn is_pull_request_wake(input: &Value) -> bool {
+    input["prompt"]
+        .as_str()
+        .is_some_and(|p| p.starts_with("Update on pull request #"))
+}
+
+/// What the user sees when the hold stops a held agent's turn.
 fn halt_reason(boards: &[board_proto::BoardSlug]) -> String {
     format!(
         "board: {} paused, so this turn stopped. `board resume` continues the work.",
@@ -1259,7 +1267,10 @@ impl Hook<'_> {
             HookEvent::SessionStart => self.session_start(repo).await,
             HookEvent::UserPromptSubmit => {
                 let reply = self.user_prompt_submit().await?;
-                self.register_again(repo.as_ref()).await;
+                // Registering marks the agent running, which a halted turn is not.
+                if !matches!(reply, Reply::Halt(_)) {
+                    self.register_again(repo.as_ref()).await;
+                }
                 Ok(reply)
             }
             // Handled before login (`handle`).
@@ -1561,13 +1572,25 @@ impl Hook<'_> {
     }
 
     async fn user_prompt_submit(&mut self) -> Result<Reply> {
-        // After an outage, catch up with a full snapshot instead of a delta.
-        let kind = if self.local.offline_notified {
+        // After an outage or an unread delta, catch up with a full snapshot instead.
+        let kind = if self.local.offline_notified || self.local.delta_unread {
             SnapshotKind::Full
         } else {
             SnapshotKind::Delta
         };
         let snap = self.beat_and_fetch(kind).await?;
+        self.local.delta_unread = false;
+        if !snap.held_by.is_empty() && is_pull_request_wake(self.input) {
+            // A held thread's pull request watch wakes it at every check or review change,
+            // for as long as the pause lasts. End such a turn before the model runs. The
+            // watch stays, and the resume wake-up has the coordinator check the PRs.
+            let boards = snap.held_by.clone();
+            self.keep(snap)?;
+            self.local.end_turn_hold();
+            self.local.delta_unread = true;
+            self.set_state(AgentState::Idle, None).await?;
+            return Ok(Reply::Halt(halt_reason(&boards)));
+        }
         self.local.turn_seen_at = Some(snap.at);
         let text = self.keep(snap)?;
         // The snapshot's `hold:` line tells the agent; only the user's request continues.

@@ -2263,6 +2263,10 @@ async fn a_paused_board_keeps_its_coordinator_and_wakes_it_on_resume() {
         text.contains("board factory: the user resumed this board after a pause"),
         "{text}"
     );
+    assert!(
+        text.contains("Updates on the pull requests of this board's tasks were not handled"),
+        "the hold ended held threads' pull request updates: {text}"
+    );
     assert_eq!(starts(&e.t3), 0, "the same thread carries on");
 }
 

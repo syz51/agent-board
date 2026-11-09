@@ -1500,6 +1500,68 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
 }
 
 #[test]
+fn a_held_threads_pull_request_update_ends_before_the_model_runs() {
+    let e = env();
+    e.agent_ok();
+    serve_hold(&e, false);
+    prompt(&e, "go");
+    let update = |e: &Env| {
+        e.hook(
+            "user-prompt-submit",
+            "claude",
+            e.with(
+                "UserPromptSubmit",
+                json!({"prompt": "Update on pull request #7 (https://example.com/pull/7), \
+                                  which T3 Code is watching for you: checks passed"}),
+            ),
+        )
+        .0
+    };
+
+    // Not held: the update is a turn like any other.
+    assert!(not_halted(&update(&e)));
+
+    // Held: T3's wake-up for the watched pull request ends at once, the agent idle.
+    serve_hold(&e, true);
+    let reply = update(&e).expect("a halt");
+    assert_eq!(reply["continue"], false, "{reply}");
+    let reason = reply["stopReason"].as_str().unwrap();
+    assert!(
+        reason.contains("factory paused") && reason.contains("board resume"),
+        "{reason}"
+    );
+    assert_eq!(
+        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
+        "idle"
+    );
+
+    // The user's own message while held is told, not stopped, and catches up on the
+    // alerts the ended turn fetched with a full snapshot.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "claude",
+        e.with("UserPromptSubmit", json!({"prompt": "check PR 7"})),
+    );
+    assert!(context(&reply, "UserPromptSubmit").contains("hold: factory paused"));
+    let kinds: Vec<String> = e
+        .stub
+        .requests_to("GET /v1/snapshot")
+        .iter()
+        .map(|r| r.query_pairs()["kind"].clone())
+        .collect();
+    assert_eq!(kinds[kinds.len() - 2..], ["delta", "full"], "{kinds:?}");
+    prompt(&e, "go on");
+    assert_eq!(
+        e.stub
+            .requests_to("GET /v1/snapshot")
+            .last()
+            .unwrap()
+            .query_pairs()["kind"],
+        "delta"
+    );
+}
+
+#[test]
 fn codex_stop_always_prints_json() {
     let e = env();
     let codex_agent = "codex:thr_9";

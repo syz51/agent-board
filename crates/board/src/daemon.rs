@@ -4685,8 +4685,10 @@ impl<T: T3> Daemon<T> {
                 "board {slug}: the user resumed this board after a pause. Read your board \
                  snapshot and handoff, then continue. The pause stopped the threads on its \
                  tasks in doing: send each owner thread a message to continue its task, and \
-                 restart a task only when its owner thread is gone. Check blocked tasks and \
-                 answered asks too: their wake-ups were dropped while paused"
+                 restart a task only when its owner thread is gone. Updates on the pull \
+                 requests of this board's tasks were not handled while paused: check each \
+                 open one (checks, reviews, conflicts). Check blocked tasks and answered \
+                 asks too: their wake-ups were dropped while paused"
             )),
             WakeAbout::UsageEased if coordinator && !self.usage_holds(slug, now) => {
                 let stop_at = self
