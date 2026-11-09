@@ -829,3 +829,47 @@ fn task_list_narrows_to_a_parent_and_task_show_counts_its_children() {
     let shown = mcp.call(5, "task_show", json!({"id": "factory-1"}));
     assert!(text(&shown).contains(PARENT_CHILDREN_LINES), "{shown}");
 }
+
+#[test]
+fn task_list_live_sends_the_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let declined = feedback_fixture(
+        "board-feedback-2",
+        Some(board_proto::ResolutionKind::Declined),
+    );
+    stub.on("GET /v1/tasks", [declined]);
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let list = mcp.request(2, "tools/list", json!({}));
+    let task_list = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "task_list")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        task_list["inputSchema"]["properties"]["live"]["type"],
+        "boolean"
+    );
+
+    let live = mcp.call(3, "task_list", json!({"live": true}));
+    assert_ne!(live["isError"], true, "{live}");
+    let q = stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    assert_eq!(q["live"], "true");
+    assert!(text(&live).starts_with("board-feedback-2 done"), "{live}");
+}
