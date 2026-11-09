@@ -304,8 +304,8 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&limit=` → `[Task]`
-  list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&limit=` →
+  `[Task]` list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
@@ -314,8 +314,18 @@ Reopening a closed board, or any change on it, starts the period again.
   child. Every `Task` has `child_count`, how many tasks name it as parent whatever
   their status; it is absent when none does, and from servers that predate it. The counts
   of a list come from one query, along the parent index. `proposal=true` lists only
-  pending proposals, `false` leaves them out (see "Pending proposals" below). `limit`
-  defaults to 200, at most 1,000.
+  pending proposals, `false` leaves them out (see "Pending proposals" below).
+  `live=true` lists only the feedback items that still take reports, whatever their
+  status, by the rule reports follow (see "Feedback" below): unresolved and not done or
+  dropped, declined, a duplicate of a live item (the original is listed too), or routed to
+  (or a duplicate of) a plain task that is not done or dropped. `live=false` leaves them
+  out. It combines with every other filter, and `limit` counts the items it keeps.
+  Feedback items are only on the feedback board, so `live` with another `board` is 400
+  `invalid`, whose hint names the feedback board; without `board` it lists that board's
+  items. Servers that predate `live` ignore it and list every task; the CLI and MCP then
+  refuse, saying to upgrade the server, when the list holds a task that cannot be live
+  (not a feedback item, forwarded, fixed, or closed unresolved). `limit` defaults to 200,
+  at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -823,7 +833,10 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
-  with `children <n>`.
+  with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every
+  feedback item that still takes reports, such as declined ones and ones routed to open
+  work, which `--status` alone cannot select. It fails with "upgrade it" against a server
+  that predates the filter.
 - `board show <id> --json` → `[TaskDetail]` from `GET /v1/tasks/{id}`. Without `--json`, a
   task with children has a `children <n>: done 5 · doing 1 · …` line, a count per status
   (done, review, doing, blocked, open, dropped; statuses without children left out),

@@ -264,6 +264,28 @@ fn live_item(cx: &Ctx<'_>, id: &TaskId, depth: usize) -> Result<Option<TaskId>> 
     })
 }
 
+/// The feedback items that take reports, by [`live_item`]: those it leads somewhere, a
+/// duplicate of a live item included. SQL keeps only the candidates (unresolved and open,
+/// or declined, routed or a duplicate); `live_item` decides each.
+pub(crate) fn live_items(cx: &Ctx<'_>) -> Result<Vec<String>> {
+    let candidates: Vec<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT f.task FROM feedback f JOIN tasks t ON t.id = f.task \
+             WHERE (f.resolution IS NULL AND t.status NOT IN ('done', 'dropped')) \
+             OR f.resolution IN ('declined', 'routed', 'duplicate')",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut live = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        if live_item(cx, &parse_id(&id)?, 0)?.is_some() {
+            live.push(id);
+        }
+    }
+    Ok(live)
+}
+
 /// The resolution kind and task of feedback item `id`, or `None` when it is not one.
 fn resolution(
     cx: &Ctx<'_>,

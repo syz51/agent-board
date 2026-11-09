@@ -371,6 +371,10 @@ pub struct TaskQuery {
     /// Only the direct children of this task; servers before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<TaskId>,
+    /// Only feedback items that take reports (true), or none of them (false); servers
+    /// before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -791,6 +795,13 @@ impl Client {
         {
             anyhow::bail!(
                 "the server does not filter by parent yet; upgrade it, or run `board show {parent}` (MCP: task_show) for its children"
+            );
+        }
+        // Servers that predate the `live` filter ignore it too, and only they can tell a
+        // routed item's task apart, so a task that cannot be live shows the filter was ignored.
+        if q.live == Some(true) && tasks.iter().any(|t| !t.may_be_live()) {
+            anyhow::bail!(
+                "the server does not filter live feedback items yet; upgrade it, then list them again"
             );
         }
         Ok(tasks)

@@ -154,7 +154,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_list",
-        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own) or parent (its direct children).",
+        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children) or live (feedback items that take reports).",
         params: || {
             vec![
                 ("board", board_arg("Board slug."), false),
@@ -182,6 +182,13 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "parent",
                     task_arg("Only the direct children of this task."),
+                    false,
+                ),
+                (
+                    "live",
+                    b(
+                        "Only feedback items that still take reports, whatever their status: unresolved, declined, or routed to (or a duplicate of) work that is not finished.",
+                    ),
                     false,
                 ),
                 ("limit", json!({"type": "integer", "minimum": 1}), false),
@@ -764,6 +771,7 @@ impl BoardMcp {
                     proposal: a.proposals.then_some(true),
                     mine: a.mine.then_some(true),
                     parent: a.parent,
+                    live: a.live.then_some(true),
                     limit: a.limit,
                 };
                 ops::task_list(&ctx, &query, a.detailed).await?
@@ -956,6 +964,8 @@ struct ListArgs {
     #[serde(default)]
     mine: bool,
     parent: Option<TaskId>,
+    #[serde(default)]
+    live: bool,
     limit: Option<u32>,
     #[serde(default)]
     detailed: bool,

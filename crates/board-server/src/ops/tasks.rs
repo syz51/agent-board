@@ -647,6 +647,8 @@ pub(crate) struct TaskFilter {
     pub proposal: Option<bool>,
     /// Only the direct children of this task.
     pub parent: Option<TaskId>,
+    /// Only feedback items that take reports (true), or none of them (false).
+    pub live: Option<bool>,
     pub limit: usize,
 }
 
@@ -694,6 +696,23 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     };
     if let Some(proposal) = &proposal {
         clauses.push(proposal);
+    }
+    // `live_item` decides each item in Rust, so the ids go to SQL as one JSON array and the
+    // limit still applies there.
+    let live = filter
+        .live
+        .map(|want| -> Result<(bool, String)> {
+            let ids = crate::ops::feedback::live_items(cx)?;
+            Ok((want, serde_json::to_string(&ids).expect("ids serialize")))
+        })
+        .transpose()?;
+    if let Some((want, ids)) = &live {
+        clauses.push(if *want {
+            "t.id IN (SELECT value FROM json_each(:live))"
+        } else {
+            "t.id NOT IN (SELECT value FROM json_each(:live))"
+        });
+        params.push((":live", ids));
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }

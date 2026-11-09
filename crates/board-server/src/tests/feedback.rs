@@ -2302,3 +2302,87 @@ async fn a_duplicate_past_the_link_limit_is_refused() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(counts(&t, &original).await.0, 10);
 }
+
+async fn ids(t: &T, query: &str) -> Vec<String> {
+    let mut ids: Vec<String> = t
+        .ok("GET", &format!("/v1/tasks?{query}"), None, None)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn live_lists_exactly_the_items_that_take_reports() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let open_work = t.task(B, "factory", "Open work").await;
+    let done_work = t.task(B, "factory", "Finished work").await;
+
+    let open = item(&t, A, "Unresolved and open").await;
+    let dropped = item(&t, A, "Unresolved but dropped").await;
+    let (s, v) = t.patch(A, &dropped, json!({ "status": "dropped" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let declined = item(&t, A, "Declined").await;
+    decline(&t, A, &declined).await;
+    let routed_open = item(&t, A, "Routed to open work").await;
+    let routed_done = item(&t, A, "Routed to finished work").await;
+    for (item, task) in [(&routed_open, &open_work), (&routed_done, &done_work)] {
+        let (s, v) = user_resolve(&t, item, json!({ "kind": "routed", "task": task })).await;
+        assert_eq!(s, 200, "{v}");
+    }
+    assert!(t.claim(B, &done_work).await.0.is_success());
+    assert!(t.done(B, &done_work, check(0)).await.0.is_success());
+    let duplicate = item(&t, A, "Duplicate of the declined item").await;
+    let (s, v) = user_resolve(
+        &t,
+        &duplicate,
+        json!({ "kind": "duplicate", "task": declined }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let fixed = item(&t, A, "Fixed").await;
+    let (s, v) = user_resolve(
+        &t,
+        &fixed,
+        json!({ "kind": "fixed", "reason": "changed x" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let forwarded = item(&t, A, "Forwarded").await;
+    let (s, v) = user_resolve(
+        &t,
+        &forwarded,
+        json!({ "kind": "forwarded", "reason": "upstream" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    // A plain task on the feedback board was never a feedback item: no report reaches it.
+    let plain = t.task(B, "board-feedback", "Plain task").await;
+
+    let mut live = vec![open.clone(), declined, routed_open, duplicate];
+    live.sort();
+    assert_eq!(ids(&t, "live=true").await, live, "every board");
+    assert_eq!(ids(&t, "board=board-feedback&live=true").await, live);
+    let mut gone = vec![dropped, routed_done, fixed, forwarded, plain];
+    gone.sort();
+    assert_eq!(ids(&t, "board=board-feedback&live=false").await, gone);
+    // It combines with the other filters, and the limit counts live items only.
+    let resolved: Vec<String> = live.iter().filter(|id| **id != open).cloned().collect();
+    assert_eq!(ids(&t, "live=true&status=done").await, resolved);
+    assert_eq!(ids(&t, "live=true&limit=2").await.len(), 2);
+
+    // Feedback items are only on the feedback board: another board is a mistake.
+    let (code, err, v) = t
+        .fail("GET", "/v1/tasks?board=factory&live=true", None, None)
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("board=board-feedback"),
+        "{v}"
+    );
+}
