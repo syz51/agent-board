@@ -234,7 +234,8 @@ const DOING_MOVES: &str = "(x.type IN ('task_claimed', 'task_taken', 'task_relea
 /// Tracks which boards are stalled and returns those due an alert. A board is stalled while
 /// it is active, has autopilot on, has no task in doing and has a ready auto task, unless the
 /// coordinator that holds its lease is paused on a usage limit (that pause has its own
-/// message). Each check records when it first saw a board stalled; a board that stops being
+/// message), or the account usage stops its new work (over its stop, or a weekly pace of
+/// 0: the coordinator is woken when it eases). Each check records when it first saw a board stalled; a board that stops being
 /// stalled, or where a task moved into or out of doing since then, starts over. A board is
 /// due once it has stayed stalled for `quiet_ms` and was not yet reported since then. So
 /// work that became claimable by any route (autopilot switched on, a board resumed, a
@@ -250,7 +251,8 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
                  AND {ready}), \
                s.since, s.sent_at, \
                EXISTS (SELECT 1 FROM events x WHERE x.board = b.slug AND x.seq > s.seq \
-                 AND {DOING_MOVES}) \
+                 AND {DOING_MOVES}), \
+               b.usage_stop_at, b.parallel_tasks \
              FROM boards b \
              LEFT JOIN agents a ON a.id = b.coordinator AND b.coordinator_expires_at > :now \
              LEFT JOIN telegram_stalled s ON s.board = b.slug \
@@ -279,14 +281,21 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<bool>>(7)?.unwrap_or(false),
+                    (r.get::<_, u32>(8)?, r.get::<_, u32>(9)?),
                 ))
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let usage = super::usage::latest(cx)?;
+    let held = |(stop_at, parallel): (u32, u32)| {
+        usage.as_ref().is_some_and(|u| {
+            u.over(stop_at, cx.now).is_some() || u.pace_limit(parallel.max(1), cx.now) == 0
+        })
+    };
     let mut kept = Vec::new();
     let mut due = Vec::new();
-    for (board, coordinator, ready, since, sent_at, moved) in rows {
-        if ready == 0 {
+    for (board, coordinator, ready, since, sent_at, moved, limits) in rows {
+        if ready == 0 || held(limits) {
             continue;
         }
         match since {

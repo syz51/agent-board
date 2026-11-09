@@ -17,6 +17,7 @@ use board_proto::{
     MarkSeen, Note, PutHandoff, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Said,
     SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
     TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Updates, Usage,
+    UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -86,6 +87,7 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/stats", get(show_stats))
         .route("/usage", get(show_usage).put(report_usage))
+        .route("/usage/reserve", get(show_reserve).put(set_reserve))
         .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
@@ -534,6 +536,30 @@ async fn report_usage(
                 let req = usage::validate_report(req, cx.now)?;
                 usage::report(cx, &device, req)
             })
+            .await?,
+    ))
+}
+
+/// `GET /v1/usage/reserve`: the weekly percent kept for the user, or `null` (pace off).
+async fn show_reserve(
+    State(state): State<AppState>,
+    _caller: Caller,
+) -> Result<Json<UsageReserve>> {
+    Ok(Json(state.read(usage::reserve).await?))
+}
+
+/// `PUT /v1/usage/reserve`: anyone raises the reserve or turns it on; only the user lowers
+/// it or turns it off.
+async fn set_reserve(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<UsageReserve>,
+) -> Result<Json<UsageReserve>> {
+    let req = usage::validate_reserve(req)?;
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| usage::set_reserve(cx, req, by_user))
             .await?,
     ))
 }

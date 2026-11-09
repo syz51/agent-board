@@ -141,6 +141,83 @@ pub struct Usage {
     pub read_at: Timestamp,
     /// The device that read it.
     pub device: DeviceName,
+    /// The weekly pace the server computes while a reserve is set; absent while it is off,
+    /// without a weekly window, or from a server that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pace: Option<UsagePace>,
+}
+
+/// Within this many points of a pace line, a board runs one task at a time and daemons
+/// read the usage every minute.
+pub const PACE_NEAR_POINTS: f64 = 2.0;
+
+/// How far ahead [`UsagePace::projected`] looks, in minutes.
+pub const PACE_PROJECT_MINUTES: i64 = 5;
+
+/// How the weekly usage left is spread over the days to the weekly reset, keeping a
+/// reserve for the user (`docs/DESIGN.md`, "Usage", Pace). Days run back from the reset in
+/// 24-hour steps.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UsagePace {
+    /// Weekly percent kept for the user's own use.
+    pub reserve: f64,
+    /// When the current pace day began.
+    pub day_start: Timestamp,
+    /// Weekly percent at the day's first reading.
+    pub anchor: f64,
+    /// Weekly percent the day may reach: the anchor plus the day's share of what is left
+    /// above the anchor and below the reserve.
+    pub line: f64,
+    /// Weekly percent projected [`PACE_PROJECT_MINUTES`] past the reading at the burn rate
+    /// of the last 10 to 30 minutes.
+    pub projected: f64,
+    /// Since when the measured weekly use is at or above `100 - reserve`: agents working
+    /// for a board halt, as for a pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_since: Option<Timestamp>,
+}
+
+impl UsagePace {
+    /// The percent at which agents working for a board halt.
+    pub fn hard_line(&self) -> f64 {
+        100.0 - self.reserve
+    }
+
+    /// The day's allowance in weekly points.
+    pub fn allowance(&self) -> f64 {
+        self.line - self.anchor
+    }
+
+    /// How many tasks a board with `parallel_tasks` may run at once: none once the
+    /// projection reaches the day's line or the hard line is reached, one within
+    /// [`PACE_NEAR_POINTS`] of the line, else all.
+    pub fn limit(&self, parallel_tasks: u32) -> u32 {
+        if self.hard_since.is_some() || self.projected >= self.line {
+            0
+        } else if self.projected >= self.line - PACE_NEAR_POINTS {
+            parallel_tasks.min(1)
+        } else {
+            parallel_tasks
+        }
+    }
+
+    /// Whether the weekly use at `percent` is still below the day's line and the hard line
+    /// while it or the projection is within [`PACE_NEAR_POINTS`] of the lower one. Past the
+    /// line nothing changes until the next day or the weekly reset.
+    pub fn near(&self, percent: f64) -> bool {
+        let line = self.line.min(self.hard_line());
+        percent < line && self.projected.max(percent) >= line - PACE_NEAR_POINTS
+    }
+
+    /// When the next pace day begins.
+    pub fn next_day(&self) -> Timestamp {
+        self.day_start + chrono::TimeDelta::hours(24)
+    }
+
+    /// Whether `reserve` is a weekly percent a reserve may be: finite, from 0 to below 100.
+    pub fn valid_reserve(reserve: f64) -> bool {
+        reserve.is_finite() && (0.0..100.0).contains(&reserve)
+    }
 }
 
 /// One limit window of [`Usage`].
@@ -196,6 +273,34 @@ impl Usage {
             .filter(|(_, w)| w.percent >= f64::from(stop_at))
             .filter(|(_, w)| w.resets_at.is_none_or(|at| at > now))
             .max_by(|a, b| a.1.percent.total_cmp(&b.1.percent))
+    }
+
+    /// The pace, if the reading is fresh and its week has not reset by `now`.
+    pub fn pace_at(&self, now: Timestamp) -> Option<&UsagePace> {
+        let week = self.seven_day?;
+        (self.fresh(now) && week.resets_at.is_none_or(|at| at > now))
+            .then_some(self.pace.as_ref())
+            .flatten()
+    }
+
+    /// How many tasks a board with `parallel_tasks` may run at once at `now`
+    /// ([`UsagePace::limit`]); `parallel_tasks` without a pace.
+    pub fn pace_limit(&self, parallel_tasks: u32, now: Timestamp) -> u32 {
+        self.pace_at(now)
+            .map_or(parallel_tasks, |p| p.limit(parallel_tasks))
+    }
+
+    /// Since when the measured weekly use is at the hard line, if it is at `now`.
+    pub fn hard_since(&self, now: Timestamp) -> Option<Timestamp> {
+        self.pace_at(now).and_then(|p| p.hard_since)
+    }
+
+    /// Whether a daemon should read the usage every minute: the pace is near a line.
+    pub fn near_line(&self, now: Timestamp) -> bool {
+        match (self.pace_at(now), self.seven_day) {
+            (Some(p), Some(week)) => p.near(week.percent),
+            _ => false,
+        }
     }
 }
 

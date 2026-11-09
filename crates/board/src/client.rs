@@ -10,7 +10,7 @@ use board_proto::{
     CreateTask, CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
     JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent, ReportUsage, ResolveFeedback,
     Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -757,6 +757,16 @@ impl Client {
     /// Reports a usage reading; the server keeps the newest and returns it.
     pub async fn report_usage(&self, body: &ReportUsage) -> Result<Usage> {
         self.with_body(Method::PUT, "/v1/usage", body).await
+    }
+
+    /// Sets the weekly usage reserve; lowering it or turning it off is for the user only.
+    /// The usage reserve; `reserve` is `None` while the pace is off.
+    pub async fn usage_reserve(&self) -> Result<UsageReserve> {
+        self.get("/v1/usage/reserve").await
+    }
+
+    pub async fn set_usage_reserve(&self, body: &UsageReserve) -> Result<UsageReserve> {
+        self.with_body(Method::PUT, "/v1/usage/reserve", body).await
     }
 
     /// Deletes a closed board (user tokens only); the server answers 204.

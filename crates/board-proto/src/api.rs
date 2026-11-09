@@ -100,6 +100,17 @@ pub struct ReportUsage {
     pub read_at: Timestamp,
 }
 
+/// `PUT /v1/usage/reserve`: the weekly percent kept for the user's own use, from 0 to
+/// below 100; `null` turns the pace off. Anyone may raise it or turn it on; only the user
+/// may lower it or turn it off. The answer is the setting now.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UsageReserve {
+    /// Required: a missing field is refused rather than read as `null`, which turns the
+    /// pace off.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reserve: Option<f64>,
+}
+
 /// `POST /v1/boards/{slug}/judges`: the holder of the board's coordinator lease registers a
 /// judge, which then has the coordinator's rights on the board until its agent ends or
 /// for at most [`crate::JUDGE_HOURS_MAX`] hours. Registering the same agent again while
@@ -706,6 +717,11 @@ pub struct Snapshot {
     /// before it. Absent when not held, and from servers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_since: Option<Timestamp>,
+    /// The hold is the weekly usage at the hard line (`100 - reserve`), not only a pause:
+    /// `held_by` then lists every board the agent works for, and `held_since` is when
+    /// the line was reached. Absent otherwise, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_for_usage: bool,
 }
 
 /// Answer to `GET /v1/events?since=&board=&limit=`.
@@ -1065,7 +1081,56 @@ mod tests {
             seven_day: week.map(window),
             read_at: now - chrono::TimeDelta::minutes(read_min_ago),
             device: "air".parse().unwrap(),
+            pace: None,
         }
+    }
+
+    #[test]
+    fn the_pace_limit_falls_to_one_near_the_line_and_to_none_at_it() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let mut u = usage(None, Some(78.5), 1);
+        let pace = |projected| crate::UsagePace {
+            reserve: 5.5,
+            day_start: now - chrono::TimeDelta::hours(3),
+            anchor: 78.0,
+            line: 81.0,
+            projected,
+            hard_since: None,
+        };
+        assert_eq!(u.pace_limit(3, now), 3, "no pace without a reserve");
+        u.pace = Some(pace(78.9));
+        assert_eq!(u.pace_limit(3, now), 3);
+        assert!(!u.near_line(now));
+        u.pace = Some(pace(79.0));
+        assert_eq!(u.pace_limit(3, now), 1, "within 2 points");
+        assert!(u.near_line(now));
+        u.pace = Some(pace(81.0));
+        assert_eq!(u.pace_limit(3, now), 0, "at the line");
+        u.pace = Some(crate::UsagePace {
+            hard_since: Some(now),
+            ..pace(70.0)
+        });
+        assert_eq!(u.pace_limit(3, now), 0, "at the hard line");
+        assert_eq!(u.hard_since(now), Some(now));
+        assert!(
+            !u.near_line(now),
+            "past the line nothing changes until the reset"
+        );
+        assert_eq!(
+            u.hard_since(now + chrono::TimeDelta::minutes(30)),
+            None,
+            "stale"
+        );
+        assert_eq!(
+            u.pace_limit(3, now + chrono::TimeDelta::hours(2)),
+            3,
+            "the week reset"
+        );
+        let old: crate::Usage = serde_json::from_value(serde_json::json!({
+            "read_at": "2026-11-08T12:00:00Z", "device": "air",
+        }))
+        .unwrap();
+        assert_eq!(old.pace, None, "a server that predates the pace");
     }
 
     #[test]

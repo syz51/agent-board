@@ -1415,6 +1415,39 @@ async fn a_move_through_doing_between_checks_restarts_the_clock() {
 }
 
 #[tokio::test]
+async fn a_board_the_usage_stops_does_not_stall() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ready", "auto": true }),
+    )
+    .await;
+    // Over the board's stop at 90%: the coordinator is woken when it eases.
+    let report = |t: &T, percent: f64| {
+        let now = t.state.now();
+        Some(json!({
+            "seven_day": { "percent": percent, "resets_at": now + TimeDelta::days(3) },
+            "read_at": now,
+        }))
+    };
+    t.ok("PUT", "/v1/usage", None, report(&t, 95.0)).await;
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() * 2);
+    t.ok("PUT", "/v1/usage", None, report(&t, 95.0)).await;
+    assert!(stalled_now(&t).await.is_empty());
+
+    // It eases: the clock starts then.
+    t.advance(TimeDelta::minutes(1));
+    t.ok("PUT", "/v1/usage", None, report(&t, 40.0)).await;
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    assert_eq!(stalled_now(&t).await, ["factory"]);
+}
+
+#[tokio::test]
 async fn a_paused_or_absent_coordinator_decides_whether_a_board_stalls() {
     let t = T::new();
     t.register(A, None, None).await;
