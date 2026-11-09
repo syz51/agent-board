@@ -212,11 +212,20 @@ pub struct WatchState {
     pub usage_held: BTreeSet<BoardSlug>,
     /// Worker threads this device's dispatcher started on daemon-dispatch boards, by task,
     /// while each holds a slot. Saved before `t3 thread start` runs, as `pending_starts`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_workers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub workers: BTreeMap<TaskId, Worker>,
-    /// Tasks whose worker stopped without parking them, and when another worker may start
-    /// (see [`WORKER_RETRY`]).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Tasks whose worker stopped without parking them, or whose start failed, and when
+    /// another worker may start (see [`WORKER_RETRY`]). Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_worker_retry",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub worker_retry: BTreeMap<TaskId, Timestamp>,
 }
 
@@ -224,7 +233,6 @@ pub struct WatchState {
 /// `parallel_tasks` slots until it parks the task, or stops without claiming it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
-    pub board: BoardSlug,
     /// Its thread; `None` until `t3 thread start` returns. A start the daemon did not live
     /// to finish is found by `title` among the threads created since `started_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,7 +421,7 @@ fn lenient_queues<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<AgentId, WakeQueue>, D::Error> {
     let mut queues: BTreeMap<AgentId, WakeQueue> =
-        lenient_by_agent(serde_json::Value::deserialize(d)?, "the wake-ups");
+        lenient_by_key(serde_json::Value::deserialize(d)?, "the wake-ups");
     queues.retain(|_, queue| !queue.wakes.is_empty());
     Ok(queues)
 }
@@ -422,7 +430,7 @@ fn lenient_queues<'de, D: serde::Deserializer<'de>>(
 fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<AgentId, UnsureWakes>, D::Error> {
-    let mut unsure: BTreeMap<AgentId, UnsureWakes> = lenient_by_agent(
+    let mut unsure: BTreeMap<AgentId, UnsureWakes> = lenient_by_key(
         serde_json::Value::deserialize(d)?,
         "the timed-out wake-up messages",
     );
@@ -430,28 +438,48 @@ fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
     Ok(unsure)
 }
 
-/// The entries of `value`, an object by agent id, that this version can read; `what` names
-/// an entry in the warning for one skipped.
-fn lenient_by_agent<V: serde::de::DeserializeOwned>(
+/// Each worker read on its own, like [`lenient_queues`].
+fn lenient_workers<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, Worker>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the worker",
+    ))
+}
+
+/// Each task's retry time read on its own, like [`lenient_queues`].
+fn lenient_worker_retry<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, Timestamp>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the worker retry",
+    ))
+}
+
+/// The entries of `value`, an object by agent or task id, that this version can read;
+/// `what` names an entry in the warning for one skipped.
+fn lenient_by_key<K: std::str::FromStr + Ord, V: serde::de::DeserializeOwned>(
     value: serde_json::Value,
     what: &str,
-) -> BTreeMap<AgentId, V> {
+) -> BTreeMap<K, V> {
     let serde_json::Value::Object(entries) = value else {
         return BTreeMap::new();
     };
     entries
         .into_iter()
-        .filter_map(|(agent, entry)| {
-            match (agent.parse::<AgentId>(), serde_json::from_value(entry)) {
-                (Ok(id), Ok(entry)) => Some((id, entry)),
+        .filter_map(
+            |(key, entry)| match (key.parse::<K>(), serde_json::from_value(entry)) {
+                (Ok(key), Ok(entry)) => Some((key, entry)),
                 _ => {
                     tracing::warn!(
-                        "watch state: skipped {what} for {agent}, which this version cannot read"
+                        "watch state: skipped {what} for {key}, which this version cannot read"
                     );
                     None
                 }
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -1141,6 +1169,7 @@ struct HostingConfig {
     autopilot: bool,
     status: BoardStatus,
     home_devices: Vec<DeviceName>,
+    dispatch: Dispatch,
 }
 
 impl HostingConfig {
@@ -1150,6 +1179,7 @@ impl HostingConfig {
             autopilot: board.autopilot,
             status: board.status,
             home_devices: board.home_devices.clone(),
+            dispatch: board.dispatch,
         }
     }
 }
@@ -1330,8 +1360,16 @@ impl<T: T3> Daemon<T> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         // A board switched to daemon dispatch has no coordinator thread to check, renew,
-        // wake or re-brief.
-        for board in boards.iter().filter(|b| b.dispatch == Dispatch::Daemon) {
+        // wake or re-brief. Where this device does not run the board, the record stays until
+        // the loop below releases its lease.
+        let replaced: Vec<&Board> = boards
+            .iter()
+            .filter(|b| {
+                b.dispatch == Dispatch::Daemon
+                    && (self.is_home(b) || (self.hosts(b) && b.status == BoardStatus::Paused))
+            })
+            .collect();
+        for board in replaced {
             if let Some(local) = self.state.coordinators.remove(&board.slug) {
                 tracing::info!(
                     "{} is set to daemon dispatch: coordinator thread {} is no longer its coordinator",
@@ -1395,9 +1433,9 @@ impl<T: T3> Daemon<T> {
         self.state
             .pending_starts
             .retain(|slug, _| boards.contains_key(slug));
-        self.state.workers.retain(|_, worker| {
+        self.state.workers.retain(|task, _| {
             boards
-                .get(&worker.board)
+                .get(&task.board())
                 .is_some_and(|b| b.dispatch == Dispatch::Daemon)
         });
         self.state
@@ -1613,9 +1651,10 @@ impl<T: T3> Daemon<T> {
             self.state.coordinators.remove(slug);
             self.checks_failing.remove(slug);
         }
-        if ours_gone {
+        if ours_gone || board.coordinator.as_ref() == Some(&self.dispatch_agent()) {
             // A renewal keeps the coordinator named, so the gone thread would stay named
             // until its replacement claims; releasing first means no one is named meanwhile.
+            // A board switched back from daemon dispatch drops its dispatcher the same way.
             self.release(slug).await;
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
@@ -2235,12 +2274,36 @@ impl<T: T3> Daemon<T> {
     async fn dispatch(&mut self, board: &Board, now: Timestamp) -> Result<()> {
         let slug = &board.slug;
         let agent = self.dispatch_agent();
+        // A device that cannot start workers leaves the lease to a home device that can.
+        if let Err(err) = self.host_folder(board) {
+            if board.coordinator.as_ref() == Some(&agent) {
+                self.release(slug).await;
+            }
+            self.dispatch_renewed.remove(slug);
+            return Err(err);
+        }
         if !self.hold_dispatch_lease(board, &agent, now).await? {
             return Ok(());
         }
         let in_progress = self.follow_workers(board, &agent, now).await;
         self.save()?;
         if in_progress > 0 || self.usage_holds(slug, now) {
+            return Ok(());
+        }
+        // A task in `doing` that no worker of this daemon follows also takes the slot: one
+        // the coordinator thread started before the switch, a worker another device started
+        // before the lease moved here, or one that claimed after its claim wait.
+        let doing = self
+            .client()
+            .tasks(&TaskQuery {
+                board: Some(slug.clone()),
+                status: Some(TaskStatus::Doing),
+                limit: Some(1),
+                ..TaskQuery::default()
+            })
+            .await
+            .context("listing the tasks in doing")?;
+        if doing.iter().any(|t| t.status == TaskStatus::Doing) {
             return Ok(());
         }
         if let Some(failure) = self.failures.get(slug)
@@ -2259,6 +2322,13 @@ impl<T: T3> Daemon<T> {
             }
             Err(err) => {
                 self.note_failure(board, now);
+                // One task that cannot start does not hold up the others. A start that
+                // recorded its worker gets this when that worker is found to have no thread.
+                if !self.state.workers.contains_key(&task.id) {
+                    self.state
+                        .worker_retry
+                        .insert(task.id.clone(), now + WORKER_RETRY);
+                }
                 Err(err.context(format!("starting a worker for {}", task.id)))
             }
         }
@@ -2335,7 +2405,7 @@ impl<T: T3> Daemon<T> {
             .state
             .workers
             .iter()
-            .filter(|(_, w)| w.board == board.slug)
+            .filter(|(task, _)| task.board() == board.slug)
             .map(|(task, _)| task.clone())
             .collect();
         let mut in_progress = 0;
@@ -2382,7 +2452,12 @@ impl<T: T3> Daemon<T> {
                     worker.thread = Some(thread.clone());
                     thread
                 }
-                None => return Ok(false),
+                None => {
+                    self.state
+                        .worker_retry
+                        .insert(task.clone(), now + WORKER_RETRY);
+                    return Ok(false);
+                }
             },
         };
         if !worker.noted {
@@ -2448,7 +2523,7 @@ impl<T: T3> Daemon<T> {
             .await
             .context("looking for the thread of an unfinished worker start")?
             .into_iter()
-            .filter(|t| t.created_at >= worker.started_at)
+            .filter(|t| t.created_at >= worker.started_at && thread_agent(&t.id).is_ok())
             .max_by_key(|t| t.created_at);
         let Some(found) = found else {
             tracing::warn!(
@@ -2554,7 +2629,6 @@ impl<T: T3> Daemon<T> {
         let title = format!("{} {}", task.id, task.title);
         let brief = crate::brief::worker_brief(&board.slug, &task.id, crate::brief::WORKER_CLOSER);
         let mut worker = Worker {
-            board: board.slug.clone(),
             thread: None,
             title,
             branch: worktree.as_ref().map(|w| w.branch.clone()),
@@ -2569,6 +2643,9 @@ impl<T: T3> Daemon<T> {
             .t3
             .start_thread(&project, &worker.title, &brief, worktree.as_ref())
             .await?;
+        // A thread id that names no agent could never be followed, and would hold the slot.
+        thread_agent(&thread)
+            .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
         tracing::info!(
             "started worker thread {thread} for {} on {}",
             task.id,

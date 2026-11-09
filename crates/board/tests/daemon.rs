@@ -6483,7 +6483,12 @@ async fn a_failed_worker_start_is_found_again_or_retried_after_a_delay() {
     assert_eq!(sends[0].0, ORPHAN);
     assert!(sends[0].1.contains("factory-4"), "{}", sends[0].1);
 
-    // A start that made no thread is dropped, and the next waits for the retry delay.
+    // A start that made no thread is dropped, its task waits WORKER_RETRY, and the next
+    // task starts once the board's start backoff ends.
+    let tasks = [
+        ready_task("factory-4", board_proto::Priority::P1, 0),
+        ready_task("factory-5", board_proto::Priority::P1, 1),
+    ];
     let mut e = dispatch_env(&tasks);
     e.t3.fail_start.store(true, Ordering::SeqCst);
     e.daemon.reconcile(at()).await.unwrap();
@@ -6493,12 +6498,20 @@ async fn a_failed_worker_start_is_found_again_or_retried_after_a_delay() {
         .await
         .unwrap();
     assert!(e.daemon.state.workers.is_empty());
+    assert!(
+        e.daemon
+            .state
+            .worker_retry
+            .contains_key(&"factory-4".parse().unwrap())
+    );
     assert_eq!(worker_starts(&e.t3).len(), 1);
     e.daemon
         .reconcile(at() + board::daemon::START_RETRY_FIRST)
         .await
         .unwrap();
-    assert_eq!(worker_starts(&e.t3).len(), 2);
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].0, "factory-5 Task factory-5");
 }
 
 #[tokio::test]
@@ -6604,4 +6617,84 @@ async fn a_task_change_asks_for_a_reconcile_only_on_a_daemon_board_run_here() {
     e.daemon.reconcile(at()).await.unwrap();
     task_at(&e, "factory-4", TaskStatus::Review, Some("t3:w"));
     assert!(!e.daemon.on_event(&moved, at()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_task_in_doing_that_no_worker_here_follows_takes_the_slot() {
+    use board_proto::Priority::P1;
+    // A child of the coordinator thread from before the switch.
+    let mut child = ready_task("factory-9", P1, -60);
+    child.status = TaskStatus::Doing;
+    child.owner = Some("t3:old-child".parse().unwrap());
+    let mut e = dispatch_env(&[child, ready_task("factory-4", P1, 0)]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(dispatch_claims(&e).len(), 1);
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
+async fn a_device_without_the_project_folder_leaves_the_dispatch_lease_to_another() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon = daemon_at(e._dir.path(), &e.stub, BTreeMap::new(), &e.t3);
+    e.stub.on("GET /v1/boards", [daemon_board(Some(DISPATCH))]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", daemon_board(None));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(dispatch_claims(&e).is_empty());
+    assert_eq!(releases(&e), 1);
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
+async fn a_board_switched_back_to_thread_dispatch_releases_the_dispatch_lease() {
+    let mut e = env();
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(DISPATCH), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(DISPATCH)),
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+}
+
+#[tokio::test]
+async fn a_board_switched_to_daemon_dispatch_and_run_elsewhere_releases_its_coordinator() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let mut board = daemon_board(Some(&agent));
+    board.home_devices = vec!["mac-air".parse().unwrap()];
+    e.stub.on("GET /v1/boards", [board]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", daemon_board(None));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+    assert!(e.daemon.state.coordinators.is_empty());
+    assert!(e.t3.sends().is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_entry_this_version_cannot_read_is_skipped_not_the_rest_of_the_state() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    let path = home_of(&e).state_dir().join("watch.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["workers"]["factory-6"] = json!({ "title": 3 });
+    saved["workers"]["not a task"] = saved["workers"]["factory-4"].clone();
+    saved["worker_retry"] = json!({ "factory-7": "soon", "factory-8": at() });
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.workers, e.daemon.state.workers);
+    assert_eq!(restarted.state.workers.len(), 1);
+    assert_eq!(
+        restarted.state.worker_retry.keys().collect::<Vec<_>>(),
+        [&"factory-8".parse::<board_proto::TaskId>().unwrap()]
+    );
 }

@@ -793,8 +793,11 @@ settings in use, warned once per edit.
 
 Status: partly built (agent-board-308; the user chose it on 2026-11-08). Built: the
 `dispatch` board setting, the `dispatch` agent and judge registration, with their rights
-and records (marked "built" below; `docs/API.md`, "Daemon dispatch"). Not built yet: the
-daemon's dispatcher, the briefs, the switch steps and the rollout. It replaces the
+and records (`docs/API.md`, "Daemon dispatch"); the worker and judge briefs
+(`prompts/worker.md`, `prompts/judges/`); and the dispatcher's lease and its worker starts
+at one slot. Each is marked "built" below. Not built yet: more than one slot, the
+lease-overlap skip, the gone-asker and away-owner steps, the judges, merging and
+finishing, the switch's last message and the rollout. It replaces the
 coordinator thread above one board at a time. Until a board switches, the previous
 section holds for that board.
 
@@ -810,7 +813,12 @@ one task and one section of the prompt, not the days before it.
 - **Dispatcher**: the daemon on the device that holds the board's coordinator lease. It
   holds the lease as a device agent (`dispatch:<device>`) with the coordinator's rights on
   the board, and writes its notes and updates as that agent. It runs no model. It does
-  the routine steps in code and starts the threads below.
+  the routine steps in code and starts the threads below. Built: on a `daemon` board its
+  home device registers that agent and holds the lease with the coordinator's lease and
+  device rules. A home device without the board's project folder leaves the lease to
+  another. A board that is paused or at its usage stop gets no new worker. A board
+  switched back to `thread` releases the dispatcher's lease. A judges-only
+  `board_updated` event asks for no reconcile.
 - **Worker**: a T3 thread started for one task. Its brief (`prompts/worker.md`) holds the
   rules a coordinator puts in each brief today (Loop step 4). It works as a delegated
   child does now: it claims the task, leases paths, opens a PR, parks the task in
@@ -824,10 +832,11 @@ one task and one section of the prompt, not the days before it.
 
 **The switch**: a board setting `dispatch`, either `thread` (the coordinator, default) or
 `daemon`, set with `board board set <slug> --dispatch daemon` (built: the setting, shown by
-`board_status` and full snapshots; the daemon does not act on it yet). When a board switches to
+`board_status` and full snapshots). When a board switches to
 `daemon`:
 
-1. The daemon stops waking the coordinator thread.
+1. The daemon stops waking the coordinator thread (built: it drops its record of the
+   thread and sends it nothing).
 2. It sends that thread one last message: record each instruction the user gave in chat
    as a `decision` note, hand each task it owns in `doing` to its child or back to
    `open`, then end.
@@ -851,6 +860,10 @@ one task and one section of the prompt, not the days before it.
 
 **Slots**: `parallel_tasks` still limits the tasks in progress: tasks in `doing` that
 workers own, plus tasks the dispatcher started a worker for that it has not claimed yet.
+Built: one slot, whatever `parallel_tasks` says. Any task in `doing` on the board takes it,
+whoever owns it, such as a child of the coordinator thread from before the switch. Until
+the lease-overlap skip is built, a worker that leaves its task `open`, ends without
+claiming it, or whose start fails, frees the slot and keeps that task waiting 30 minutes.
 Judges do not count, but at most 2 judges run per board at once. The rest wait, oldest
 first. With one slot, the dispatcher takes the highest-priority ready `auto` task, the
 oldest first on a tie. With more slots, code checks only the mechanical rules:
@@ -866,7 +879,9 @@ of files) are dropped. The revisit measures what dropping them costs.
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>
 --title "<id> <title>" -`. The brief goes in on stdin. The folder is the `[projects]`
 folder for the task's repository, and `<base>` is chosen as for a coordinator. The
-dispatcher records the thread in `watch.json` and notes its link on the task. The worker
+dispatcher records the thread in `watch.json` and notes its link on the task (built; the
+branch takes a `-<UTC time>` suffix when `task/<id>` exists, and a start that failed after
+T3 created its thread is found again by title and briefed). The worker
 reads the task's notes itself. Its brief says that every finding and decision is part of
 the work.
 
