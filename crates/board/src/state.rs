@@ -27,6 +27,9 @@ pub struct AgentLocal {
     /// The last snapshot said a paused board holds the agent (`Snapshot::held_by`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
+    /// When the latest board that holds the agent was paused (`Snapshot::held_since`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<Timestamp>,
     /// The current turn began held: its prompt's snapshot told the agent, so a heartbeat
     /// does not stop the turn, which only the user's own request would have continued.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

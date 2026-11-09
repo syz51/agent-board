@@ -702,6 +702,10 @@ pub struct Snapshot {
     /// a held agent's turn. Empty, and absent from servers that predate it, otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_by: Vec<BoardSlug>,
+    /// When the latest of `held_by` was paused: the hooks halt only a turn that began
+    /// before it. Absent when not held, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<Timestamp>,
 }
 
 /// Answer to `GET /v1/events?since=&board=&limit=`.
@@ -799,12 +803,19 @@ mod tests {
             "kind": "delta", "text": "", "seq": 3, "at": "2026-11-09T00:00:00Z"
         });
         let snap: Snapshot = serde_json::from_value(old.clone()).unwrap();
-        assert!(snap.held_by.is_empty());
+        assert!(snap.held_by.is_empty() && snap.held_since.is_none());
         assert_eq!(serde_json::to_value(&snap).unwrap(), old);
         let mut held = old;
         held["held_by"] = serde_json::json!(["factory"]);
-        let snap: Snapshot = serde_json::from_value(held).unwrap();
+        let snap: Snapshot = serde_json::from_value(held.clone()).unwrap();
         assert_eq!(snap.held_by, ["factory".parse::<BoardSlug>().unwrap()]);
+        assert_eq!(snap.held_since, None, "a server without the pause time");
+        held["held_since"] = serde_json::json!("2026-11-08T16:00:00Z");
+        let snap: Snapshot = serde_json::from_value(held).unwrap();
+        assert_eq!(
+            snap.held_since,
+            Some("2026-11-08T16:00:00Z".parse().unwrap())
+        );
     }
 
     #[test]

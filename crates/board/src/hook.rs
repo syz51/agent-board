@@ -1359,6 +1359,7 @@ impl Hook<'_> {
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
         self.local.seq = Some(snap.seq);
         self.local.held = !snap.held_by.is_empty();
+        self.local.held_since = snap.held_since;
         if snap.kind == SnapshotKind::Full {
             state::save_cached_snapshot(&self.home, &self.agent, &snap)?;
         }
@@ -1537,10 +1538,19 @@ impl Hook<'_> {
         })
     }
 
-    /// The agent is held, as of the last heartbeat, and its turn began before that: the
-    /// heartbeat halts the turn.
+    /// The agent is held, as of the last heartbeat, by a pause that came after its turn
+    /// began: the heartbeat halts the turn. A turn the user began while the board was
+    /// already paused goes on, also once it claims the board's work mid-turn. Without
+    /// either time (an older server, a turn with no prompt), a turn not told of the hold
+    /// at its prompt is halted.
     fn halted(&self) -> bool {
-        self.local.held && !self.local.hold_told
+        if !self.local.held || self.local.hold_told {
+            return false;
+        }
+        match (self.local.held_since, self.local.turn_started) {
+            (Some(paused), Some(turn)) => paused > turn,
+            _ => true,
+        }
     }
 
     /// A `Stop` that follows our own block, ending the turn that answered a reminder.

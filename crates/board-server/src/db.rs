@@ -36,6 +36,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0019_agents_device.sql"),
     include_str!("../migrations/0020_daemon_dispatch.sql"),
     include_str!("../migrations/0021_usage.sql"),
+    include_str!("../migrations/0022_board_paused_at.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -765,5 +766,46 @@ mod tests {
         conn.pragma_update(None, "user_version", 99).unwrap();
         drop(conn);
         assert!(open_file(&path).is_err());
+    }
+
+    #[test]
+    fn boards_paused_before_paused_at_take_the_time_of_their_last_pause() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..21].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES \
+             ('p', 't', '', 'paused', '[]', 0, '[]', 0, 90), \
+             ('q', 't', '', 'paused', '[]', 0, '[]', 0, 9), \
+             ('a', 't', '', 'active', '[]', 0, '[]', 0, 80); \
+             INSERT INTO events (at, board, actor, type, payload) VALUES \
+             (40, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}'), \
+             (50, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"active\"}'), \
+             (70, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}'), \
+             (90, 'p', 'user', 'board_updated', '{\"fields\":[\"goal\"]}'), \
+             (60, 'a', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let paused: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT slug, paused_at FROM boards ORDER BY slug")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            paused,
+            [
+                ("a".to_owned(), None),
+                ("p".to_owned(), Some(70)),
+                ("q".to_owned(), Some(9))
+            ]
+        );
     }
 }

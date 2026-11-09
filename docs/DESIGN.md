@@ -287,11 +287,16 @@ delegated threads. The server lists those boards in each snapshot's `held_by` an
 kind, also when nothing else changed. The hooks act on it:
 
 - `PostToolUse` with a heartbeat due (so within about a minute of the pause, at the next
-  tool call that returns) ends a turn that began unheld: `{"continue": false,
+  tool call that returns) ends a turn that began before the pause: `{"continue": false,
   "stopReason": …}`, after marking the agent idle, without registering it again (which
   would mark it running) and without marking any overlap shown. Each later heartbeat of
   that turn halts it again, in case the runtime ended only a subagent or ignored the
-  halt. A tool call that runs long is not stopped until it returns.
+  halt. A tool call that runs long is not stopped until it returns. The server sends the
+  time of the pause with the boards (`held_since`, the latest when several hold the agent;
+  a board keeps the time while it stays paused), and the hook compares it with the turn's
+  `UserPromptSubmit`. So a turn the user began on a board already paused goes on when the
+  agent claims the board's work mid-turn, and after a compaction. Without either time (an
+  older server, or a turn with no prompt), a turn that began unheld is ended.
 - `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
   own message asks for the work) and does not stop the turn, since the hook cannot tell
   the user's message from a T3 notification. That turn is not stopped later either.

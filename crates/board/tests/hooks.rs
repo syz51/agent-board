@@ -1240,6 +1240,45 @@ fn serve_hold(e: &Env, held: bool) {
     e.stub.on("GET /v1/snapshot", snap);
 }
 
+/// Serves snapshots that say a board paused at `since` holds the agent.
+fn serve_hold_since(e: &Env, since: chrono::DateTime<chrono::Utc>) {
+    let mut snap = snapshot_fixture(SnapshotKind::Alerts, "", 2);
+    snap.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    snap.held_by = vec!["factory".parse().unwrap()];
+    snap.held_since = Some(since);
+    e.stub.on("GET /v1/snapshot", snap);
+}
+
+#[test]
+fn a_turn_begun_after_the_pause_goes_on_when_it_claims_the_boards_work() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    // The board was paused an hour ago; the agent works for it only once it claims a task.
+    serve_hold(&e, false);
+    prompt(&e, "work on the paused board");
+    serve_hold_since(&e, chrono::Utc::now() - chrono::Duration::hours(1));
+    let (reply, _) = read_tool(&e);
+    assert!(
+        reply.as_ref().is_none_or(|r| r.get("continue").is_none()),
+        "{reply:?}"
+    );
+    assert_eq!(
+        stop(&e).unwrap()["decision"],
+        "block",
+        "the user's turn gets its reminders"
+    );
+
+    // A pause after the turn began still ends it.
+    serve_hold(&e, false);
+    prompt(&e, "go on");
+    serve_hold_since(&e, chrono::Utc::now() + chrono::Duration::seconds(5));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a halt")["continue"], false);
+}
+
 /// Lets the next `PostToolUse` run its heartbeat, as a minute later.
 fn heartbeat_due_again(e: &Env) {
     let path = e.home.join("state").join(format!(

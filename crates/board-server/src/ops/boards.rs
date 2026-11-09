@@ -220,10 +220,15 @@ pub(crate) fn update(
     if let Some(status) = req.status.filter(|&s| s != before.status) {
         payload["status"] = serde_json::Value::from(enum_str(&status));
     }
+    // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
+    // only turns that began before it.
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
-         dispatch = ?11, usage_stop_at = ?12 WHERE slug = ?1",
+         dispatch = ?11, usage_stop_at = ?12, \
+         paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
+                          WHEN status = 'paused' THEN COALESCE(paused_at, ?8) ELSE ?8 END \
+         WHERE slug = ?1",
         params![
             slug.as_str(),
             req.title.unwrap_or(before.title),

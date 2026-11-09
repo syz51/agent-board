@@ -311,7 +311,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
-    let held = held_by(cx, &agent.id)?;
+    let (held, held_since) = held_by(cx, &agent.id)?;
     let usage = board
         .as_ref()
         .map(|b| usage_view(cx, b))
@@ -393,6 +393,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             seq: scanned_to,
             at: cx.now,
             held_by: held,
+            held_since,
         },
         agent: agent.id,
         shown,
@@ -513,7 +514,8 @@ const HELD_BY: &str = "WITH RECURSIVE \
        FROM agents a JOIN up ON a.id = up.id \
        WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
          AND up.depth < ?2) \
-     SELECT b.slug FROM boards b WHERE b.status = 'paused' \
+     SELECT b.slug, COALESCE(b.paused_at, b.updated_at) FROM boards b \
+     WHERE b.status = 'paused' \
        AND (b.coordinator IN (SELECT id FROM up) \
             OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
                        AND t.owner IN (SELECT id FROM up))) \
@@ -521,17 +523,19 @@ const HELD_BY: &str = "WITH RECURSIVE \
 
 /// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
 /// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
-/// threads it started and those working its tasks, and no one else.
-fn held_by(cx: &Ctx<'_>, agent: &AgentId) -> Result<Vec<BoardSlug>> {
-    let held = cx
+/// threads it started and those working its tasks, and no one else. With them, when the
+/// latest of them was paused.
+fn held_by(cx: &Ctx<'_>, agent: &AgentId) -> Result<(Vec<BoardSlug>, Option<Timestamp>)> {
+    let rows: Vec<(BoardSlug, i64)> = cx
         .db
         .prepare_cached(HELD_BY)?
         .query_map(
             params![agent.as_str(), crate::ops::leases::DELEGATION_DEPTH],
-            |r| parse_id(&r.get::<_, String>(0)?),
+            |r| Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(held)
+    let since = rows.iter().map(|(_, at)| *at).max().map(crate::db::ts);
+    Ok((rows.into_iter().map(|(slug, _)| slug).collect(), since))
 }
 
 /// The board a snapshot is about: the board of the agent's task in `doing`, else a board
