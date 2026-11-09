@@ -289,6 +289,15 @@ impl T3 for FakeT3 {
         }))
     }
 
+    async fn thread_link(&self, thread: &str) -> Result<Option<String>> {
+        Ok(self
+            .threads
+            .lock()
+            .unwrap()
+            .contains_key(thread)
+            .then(|| format!("https://t3.example.test/threads/{thread}")))
+    }
+
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
         self.calls.lock().unwrap().push(Call::List {
             project: project.to_path_buf(),
@@ -6229,5 +6238,463 @@ async fn a_daemon_without_a_reading_keeps_the_boards_it_held() {
         e.t3.sends().is_empty(),
         "no false eased wake: {:?}",
         e.t3.sends()
+    );
+}
+
+// Daemon dispatch.
+
+const DISPATCH: &str = "dispatch:mac-test";
+
+/// A home board set to daemon dispatch, its lease held by `coordinator`.
+fn daemon_board(coordinator: Option<&str>) -> Board {
+    let mut board = autopilot(coordinator, &[DEVICE]);
+    board.dispatch = board_proto::Dispatch::Daemon;
+    board
+}
+
+fn ready_task(id: &str, priority: board_proto::Priority, minutes: i64) -> board_proto::Task {
+    let mut task = task_fixture(id, &format!("Task {id}"));
+    task.priority = priority;
+    task.created_at = at() + chrono::Duration::minutes(minutes);
+    task
+}
+
+/// The task `id` as `GET /v1/tasks/{id}` gives it: `status`, owned by `owner`.
+fn task_at(e: &Env, id: &str, status: TaskStatus, owner: Option<&str>) {
+    let mut detail = detail(id, status == TaskStatus::Open && owner.is_none(), &[]);
+    detail.task.status = status;
+    detail.task.owner = owner.map(|o| o.parse().unwrap());
+    e.stub.on(&format!("GET /v1/tasks/{id}"), detail);
+}
+
+/// A daemon-dispatch board this device runs, with `tasks` ready.
+fn dispatch_env(tasks: &[board_proto::Task]) -> Env {
+    let e = env();
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", tasks);
+    for task in tasks {
+        e.stub
+            .on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
+    }
+    e
+}
+
+fn note(task: &board_proto::TaskId) -> serde_json::Value {
+    json!({"id": 1, "task": task, "agent": DISPATCH, "kind": "note", "text": "noted", "at": at()})
+}
+
+fn worker_starts(t3: &FakeT3) -> Vec<(String, String)> {
+    t3.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Start { title, message, .. } => Some((title, message)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dispatch_claims(e: &Env) -> Vec<Recorded> {
+    e.stub.requests_to("POST /v1/boards/factory/coordinator")
+}
+
+#[tokio::test]
+async fn a_daemon_board_gets_a_worker_for_its_highest_priority_oldest_ready_task() {
+    use board_proto::Priority::{P1, P2};
+    let mut not_auto = ready_task("factory-2", P1, -5);
+    not_auto.auto = false;
+    let tasks = [
+        ready_task("factory-3", P2, -10),
+        not_auto,
+        ready_task("factory-5", P1, 2),
+        ready_task("factory-4", P1, 1),
+    ];
+    let mut e = dispatch_env(&tasks);
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    // The lease is held as the device's dispatch agent, registered first.
+    let registered = e.stub.requests_to("POST /v1/agents");
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].body["id"], DISPATCH);
+    assert_eq!(registered[0].body["device"], DEVICE);
+    let claims = dispatch_claims(&e);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body, json!({"device": DEVICE, "agent": DISPATCH}));
+    assert_eq!(claims[0].agent.as_deref(), Some(DISPATCH));
+
+    // One worker, for the p1 task created first, with the worker brief.
+    let starts = worker_starts(&e.t3);
+    assert_eq!(
+        starts,
+        [(
+            "factory-4 Task factory-4".to_owned(),
+            board::brief::worker_brief(
+                &factory(),
+                &"factory-4".parse().unwrap(),
+                board::brief::WORKER_CLOSER
+            )
+        )]
+    );
+    let worker = &e.daemon.state.workers[&"factory-4".parse().unwrap()];
+    assert_eq!(worker.thread.as_deref(), Some(NEW_THREAD));
+    assert!(worker.noted);
+    assert!(
+        e.daemon.state.coordinators.is_empty(),
+        "no coordinator thread"
+    );
+
+    // Its link is noted on the task, by the dispatch agent.
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(notes[0].body["agent"], DISPATCH);
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("https://t3.example.test/threads/{NEW_THREAD}")),
+        "{text}"
+    );
+
+    // Recorded in watch.json, so a restarted daemon follows the same worker.
+    let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.workers, e.daemon.state.workers);
+
+    // While the worker has not claimed the task, its slot is held: no second worker, and
+    // the lease is not claimed again before its renewal.
+    e.stub.on("GET /v1/boards", [daemon_board(Some(DISPATCH))]);
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    assert_eq!(dispatch_claims(&e).len(), 1);
+
+    // Claimed, it still holds the slot; the lease is renewed after RENEW_EVERY.
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-4", TaskStatus::Doing, Some(&owner));
+    let renew = at() + board::daemon::RENEW_EVERY;
+    e.daemon.reconcile(renew).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    assert_eq!(dispatch_claims(&e).len(), 2);
+    assert!(e.daemon.state.workers[&"factory-4".parse().unwrap()].claimed);
+
+    // Parked in review, the slot is free: the next task gets a worker.
+    task_at(&e, "factory-4", TaskStatus::Review, Some(&owner));
+    e.stub.on("GET /v1/tasks", &tasks[..3]);
+    e.daemon.reconcile(renew).await.unwrap();
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].0, "factory-5 Task factory-5");
+    assert!(
+        !e.daemon
+            .state
+            .workers
+            .contains_key(&"factory-4".parse().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_leaves_its_task_open_frees_its_slot_and_the_task_waits() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+    ];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-4", TaskStatus::Doing, Some(&owner));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+
+    // It gives the task back, as after a lease overlap: another task gets the slot.
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].0, "factory-5 Task factory-5");
+
+    // A worker that ends without claiming its task frees the slot too, and factory-4 still
+    // waits its retry: nothing more starts.
+    let worker_agent = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    e.stub.on(
+        &format!("GET {}", agent_path(&worker_agent)),
+        agent_fixture(&worker_agent, DEVICE, AgentState::Ended),
+    );
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 2);
+    assert!(e.daemon.state.workers.is_empty());
+    assert_eq!(e.daemon.state.worker_retry.len(), 2);
+
+    // After the retry wait, factory-4 gets a new worker.
+    let retry = later + board::daemon::WORKER_RETRY;
+    e.daemon.reconcile(retry).await.unwrap();
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].0, "factory-4 Task factory-4");
+}
+
+#[tokio::test]
+async fn a_worker_that_never_claims_its_task_frees_the_slot_after_the_claim_wait() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    // Its session never registers.
+    let wait = at() + board::daemon::WORKER_CLAIM_WAIT;
+    e.daemon
+        .reconcile(wait - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(e.daemon.state.workers.len(), 1);
+    e.daemon.reconcile(wait).await.unwrap();
+    assert!(e.daemon.state.workers.is_empty());
+    assert_eq!(worker_starts(&e.t3).len(), 1, "the task waits its retry");
+}
+
+#[tokio::test]
+async fn a_failed_worker_start_is_found_again_or_retried_after_a_delay() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    *e.t3.clock.lock().unwrap() = at();
+    e.t3.die_after_create.lock().unwrap().replace(false);
+    e.daemon.reconcile(at()).await.unwrap();
+    let worker = &e.daemon.state.workers[&"factory-4".parse().unwrap()];
+    assert_eq!(worker.thread, None, "recorded before the start");
+
+    // The thread the failed start created is found, briefed and followed: no second start.
+    e.t3.die_after_create.lock().unwrap().take();
+    task_at(&e, "factory-4", TaskStatus::Open, None);
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    let worker = &e.daemon.state.workers[&"factory-4".parse().unwrap()];
+    assert_eq!(worker.thread.as_deref(), Some(ORPHAN));
+    assert!(worker.noted);
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, ORPHAN);
+    assert!(sends[0].1.contains("factory-4"), "{}", sends[0].1);
+
+    // A start that made no thread is dropped, its task waits WORKER_RETRY, and the next
+    // task starts once the board's start backoff ends.
+    let tasks = [
+        ready_task("factory-4", board_proto::Priority::P1, 0),
+        ready_task("factory-5", board_proto::Priority::P1, 1),
+    ];
+    let mut e = dispatch_env(&tasks);
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.t3.fail_start.store(false, Ordering::SeqCst);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    assert!(e.daemon.state.workers.is_empty());
+    assert!(
+        e.daemon
+            .state
+            .worker_retry
+            .contains_key(&"factory-4".parse().unwrap())
+    );
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    e.daemon
+        .reconcile(at() + board::daemon::START_RETRY_FIRST)
+        .await
+        .unwrap();
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].0, "factory-5 Task factory-5");
+}
+
+#[tokio::test]
+async fn a_daemon_board_starts_nothing_while_paused_or_at_its_usage_stop() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    let mut paused = daemon_board(None);
+    paused.status = board_proto::BoardStatus::Paused;
+    e.stub.on("GET /v1/boards", [&paused]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(dispatch_claims(&e).is_empty());
+    assert!(worker_starts(&e.t3).is_empty());
+
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(dispatch_claims(&e).len(), 1, "the lease is still held");
+    assert!(worker_starts(&e.t3).is_empty());
+    assert!(e.t3.sends().is_empty());
+
+    e.stub.on("GET /v1/usage", usage_reading(40.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+}
+
+#[tokio::test]
+async fn a_board_switched_to_daemon_dispatch_drops_its_coordinator_and_is_never_rebriefed() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon
+        .state
+        .coordinators
+        .get_mut(&factory())
+        .unwrap()
+        .briefed = Some("an older prompt".into());
+    e.stub.on("GET /v1/boards", [daemon_board(Some(&agent))]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.flush(at()).await;
+
+    assert!(e.daemon.state.coordinators.is_empty());
+    assert!(e.t3.sends().is_empty(), "no re-brief: {:?}", e.t3.sends());
+    assert!(worker_starts(&e.t3).is_empty());
+    let claims = dispatch_claims(&e);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].body["agent"], DISPATCH);
+
+    // A ready task wakes no coordinator thread; it asks for a reconcile instead.
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    let ready = event(10, EventType::TaskCreated, Some("factory-4"), "t3:worker");
+    assert!(e.daemon.on_event(&ready, at()).await.unwrap());
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+}
+
+#[tokio::test]
+async fn a_board_no_longer_run_here_releases_the_dispatch_lease() {
+    let mut e = dispatch_env(&[]);
+    let mut off = daemon_board(Some(DISPATCH));
+    off.autopilot = false;
+    e.stub.on("GET /v1/boards", [off]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", daemon_board(None));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+    assert!(dispatch_claims(&e).is_empty());
+}
+
+#[tokio::test]
+async fn a_judge_registration_asks_for_no_reconcile() {
+    let mut e = env();
+    let mut judges = event(10, EventType::BoardUpdated, None, DISPATCH);
+    judges.payload = json!({"fields": ["judges"], "judge": "t3:j", "kind": "review"});
+    assert!(!e.daemon.on_event(&judges, at()).await.unwrap());
+    let mut switched = event(11, EventType::BoardUpdated, None, "user");
+    switched.payload = json!({"fields": ["dispatch"]});
+    assert!(e.daemon.on_event(&switched, at()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_task_change_asks_for_a_reconcile_only_on_a_daemon_board_run_here() {
+    let mut e = dispatch_env(&[]);
+    e.daemon.reconcile(at()).await.unwrap();
+    task_at(&e, "factory-4", TaskStatus::Review, Some("t3:w"));
+    let moved = event(10, EventType::TaskUpdated, Some("factory-4"), "t3:w");
+    assert!(e.daemon.on_event(&moved, at()).await.unwrap());
+
+    // A board on a coordinator thread, with none to wake here, does not.
+    let mut e = env();
+    e.stub.on(
+        "GET /v1/boards",
+        [autopilot(Some("t3:other"), &["mac-air"])],
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    task_at(&e, "factory-4", TaskStatus::Review, Some("t3:w"));
+    assert!(!e.daemon.on_event(&moved, at()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_task_in_doing_that_no_worker_here_follows_takes_the_slot() {
+    use board_proto::Priority::P1;
+    // A child of the coordinator thread from before the switch.
+    let mut child = ready_task("factory-9", P1, -60);
+    child.status = TaskStatus::Doing;
+    child.owner = Some("t3:old-child".parse().unwrap());
+    let mut e = dispatch_env(&[child, ready_task("factory-4", P1, 0)]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(dispatch_claims(&e).len(), 1);
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
+async fn a_device_without_the_project_folder_leaves_the_dispatch_lease_to_another() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon = daemon_at(e._dir.path(), &e.stub, BTreeMap::new(), &e.t3);
+    e.stub.on("GET /v1/boards", [daemon_board(Some(DISPATCH))]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", daemon_board(None));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(dispatch_claims(&e).is_empty());
+    assert_eq!(releases(&e), 1);
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
+async fn a_board_switched_back_to_thread_dispatch_releases_the_dispatch_lease() {
+    let mut e = env();
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some(DISPATCH), &[DEVICE])]);
+    e.stub.on(
+        &format!("GET {}", agent_path(DISPATCH)),
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "DELETE /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+}
+
+#[tokio::test]
+async fn a_board_switched_to_daemon_dispatch_and_run_elsewhere_releases_its_coordinator() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    let mut board = daemon_board(Some(&agent));
+    board.home_devices = vec!["mac-air".parse().unwrap()];
+    e.stub.on("GET /v1/boards", [board]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", daemon_board(None));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(releases(&e), 1);
+    assert!(e.daemon.state.coordinators.is_empty());
+    assert!(e.t3.sends().is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_entry_this_version_cannot_read_is_skipped_not_the_rest_of_the_state() {
+    let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    let path = home_of(&e).state_dir().join("watch.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["workers"]["factory-6"] = json!({ "title": 3 });
+    saved["workers"]["not a task"] = saved["workers"]["factory-4"].clone();
+    saved["worker_retry"] = json!({ "factory-7": "soon", "factory-8": at() });
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.workers, e.daemon.state.workers);
+    assert_eq!(restarted.state.workers.len(), 1);
+    assert_eq!(
+        restarted.state.worker_retry.keys().collect::<Vec<_>>(),
+        [&"factory-8".parse::<board_proto::TaskId>().unwrap()]
     );
 }
