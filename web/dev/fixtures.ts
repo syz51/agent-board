@@ -740,7 +740,7 @@ export function createFixtures(now: number): Fixtures {
       task: "factory-12",
       agent: id("t3:7f3a"),
       kind: "note",
-      text: "Dispatched to a worktree thread, <t3-thread://v2/env-1/mcp:launch:0a1b2c>.\nPR https://github.com/example/factory/pull/1, head ace3228. Passed: `bun run check`.",
+      text: "Dispatched to a worktree thread, <t3-thread://v2/env-1/mcp:launch:0a1b2c>, now <t3-thread://v2/env-1/thread:delegated-task:example%3A0a1b2c>.\nPR https://github.com/example/factory/pull/1, head ace3228. Passed: `bun run check`.",
       at: ago(20),
     },
     {
