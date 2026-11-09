@@ -3032,56 +3032,48 @@ async fn a_board_adopted_since_its_start_failed_does_not_wait() {
 }
 
 #[tokio::test]
-async fn a_start_the_reconcile_drops_still_counts_as_failed_and_keeps_its_lease() {
+async fn a_start_out_of_time_releases_its_lease_and_backs_off() {
     let (mut e, alpha, zeta) = alpha_and_zeta();
+    // Starts get three quarters of it: 1.5 seconds, at least half the budget.
+    e.daemon.timing.reconcile_budget = Duration::from_secs(2);
     e.t3.hang_start_in.lock().unwrap().push(src("alpha"));
     e.stub.on("GET /v1/boards", [&alpha]);
-
-    // The reconcile's budget runs out while git or T3 waits: its future is dropped mid-start.
-    let hung = e.t3.start_hung.clone();
-    tokio::select! {
-        _ = e.daemon.reconcile(at()) => panic!("alpha's start never answers"),
-        () = hung.notified() => {}
-    }
+    e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(started_in(&e), [src("alpha")]);
-    // T3 may have made the thread, which the pending start mark finds: the lease stays.
-    assert_eq!(
+    // As when T3 times out: the lease goes, and the pending mark stays for the next start
+    // to find the thread T3 made.
+    let released = |e: &Env| {
         e.stub
             .requests_to("DELETE /v1/boards/alpha/coordinator")
-            .len(),
-        0
-    );
+            .len()
+    };
+    assert_eq!(released(&e), 1);
+    assert!(e.daemon.state.pending_starts.contains_key(&alpha.slug));
 
-    // The back-off runs from the cut, which comes up to the 90-second budget after the
-    // start began: retried at 150 seconds, not 60. Meanwhile zeta starts.
+    // The back-off runs from the cut a second in: retried at 61 seconds. Meanwhile zeta
+    // starts first.
     e.t3.hang_start_in.lock().unwrap().clear();
     e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    let claims = |e: &Env| {
+        e.stub
+            .requests_to("POST /v1/boards/alpha/coordinator")
+            .len()
+    };
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(60))
+        .await
+        .unwrap();
+    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+    assert_eq!(claims(&e), 1);
     e.daemon
         .reconcile(at() + chrono::Duration::seconds(61))
         .await
         .unwrap();
-    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
-    assert_eq!(
-        e.stub
-            .requests_to("DELETE /v1/boards/alpha/coordinator")
-            .len(),
-        0
-    );
-
-    e.daemon
-        .reconcile(at() + chrono::Duration::seconds(149))
-        .await
-        .unwrap();
-    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
-    e.daemon
-        .reconcile(at() + chrono::Duration::seconds(150))
-        .await
-        .unwrap();
-    assert_eq!(started_in(&e), [src("alpha"), src("zeta"), src("alpha")]);
+    assert!(claims(&e) > 1, "retried");
 }
 
 #[tokio::test]
-async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_waits() {
+async fn a_start_out_of_time_before_its_pending_mark_releases_its_lease() {
     // alpha's project fetches from a remote that never answers, as git waits on a macOS
     // prompt: the budget cuts the start while it prepares the worktree, before the mark.
     let dir = tempfile::tempdir().unwrap();
@@ -3099,9 +3091,9 @@ async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_w
     );
     git(&repo, &["config", "core.sshCommand", "sleep 5 && :"]);
     let (mut e, alpha, zeta) = alpha_in_and_zeta(repo);
+    e.daemon.timing.reconcile_budget = Duration::from_secs(2);
     e.stub.on("GET /v1/boards", [&alpha]);
-    let cut = tokio::time::timeout(Duration::from_secs(1), e.daemon.reconcile(at())).await;
-    assert!(cut.is_err(), "the fetch never answers");
+    e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(
         e.stub
             .requests_to("POST /v1/boards/alpha/coordinator")
@@ -3111,48 +3103,69 @@ async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_w
     );
     assert!(started_in(&e).is_empty(), "T3 never asked");
     assert!(e.daemon.state.pending_starts.is_empty());
-
-    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
     let released = |e: &Env| {
         e.stub
             .requests_to("DELETE /v1/boards/alpha/coordinator")
             .len()
     };
-    e.daemon
-        .reconcile(at() + chrono::Duration::seconds(61))
-        .await
-        .unwrap();
     assert_eq!(released(&e), 1, "no thread holds it");
-    assert_eq!(started_in(&e), [src("zeta")]);
+
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
     e.daemon
-        .reconcile(at() + chrono::Duration::seconds(62))
+        .reconcile(at() + chrono::Duration::seconds(60))
         .await
         .unwrap();
-    assert_eq!(released(&e), 1, "released once");
+    assert_eq!(started_in(&e), [src("zeta")]);
+    assert_eq!(released(&e), 1, "alpha waits its back-off");
 }
 
 #[tokio::test]
-async fn an_adoption_cut_short_keeps_its_lease_as_its_thread_may_have_the_brief() {
+async fn an_adoption_out_of_time_releases_its_lease_and_backs_off() {
     let mut e = adoption_env();
+    e.daemon.timing.reconcile_budget = Duration::from_secs(2);
     e.t3.hang_send.lock().unwrap().push(ADOPTED.into());
-    let cut = tokio::time::timeout(Duration::from_millis(500), e.daemon.reconcile(at())).await;
-    assert!(cut.is_err(), "the brief never answers");
+    e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(e.t3.sends().len(), 1);
+    assert_eq!(releases(&e), 1);
 
-    // The thread may work as coordinator already: the lease is not released for another
-    // device to start a second one, and the adoption waits its back-off.
     e.t3.hang_send.lock().unwrap().clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(60))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.sends().len(), 1, "inside the back-off");
     e.daemon
         .reconcile(at() + chrono::Duration::seconds(61))
         .await
         .unwrap();
+    assert_eq!(e.t3.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn a_start_left_little_time_by_the_boards_before_it_is_not_counted_as_failed() {
+    let (mut e, alpha, zeta) = alpha_and_zeta();
+    // Starts end 3 seconds in. alpha's takes 1.8, which leaves zeta's 1.2 seconds: less
+    // than half the budget, so its cut is not its own doing.
+    e.daemon.timing.reconcile_budget = Duration::from_secs(4);
+    *e.t3.start_takes.lock().unwrap() = Duration::from_millis(1800);
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    e.daemon.reconcile(at()).await.unwrap();
+    let claims = |e: &Env| e.stub.requests_to("POST /v1/boards/zeta/coordinator").len();
+    assert_eq!(claims(&e), 1);
     assert_eq!(
         e.stub
-            .requests_to("DELETE /v1/boards/factory/coordinator")
+            .requests_to("DELETE /v1/boards/zeta/coordinator")
             .len(),
-        0
+        1
     );
-    assert_eq!(e.t3.sends().len(), 1);
+
+    // Tried again on the next reconcile, with no back-off.
+    *e.t3.start_takes.lock().unwrap() = Duration::ZERO;
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(5))
+        .await
+        .unwrap();
+    assert!(claims(&e) > 1, "retried");
 }
 
 #[tokio::test]

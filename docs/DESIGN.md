@@ -769,14 +769,14 @@ settings in use, warned once per edit.
     starts go board by board, those whose last start failed last unless their hosting
     settings changed or an adoption was requested since, so a retry that waits out a
     timeout (git waiting on a macOS privacy prompt, for one) cannot take the time the
-    others need. A start counts as failed until it succeeds, so one the reconcile's 90
-    seconds cut short still gets the start back-off, counted from the cut, and goes last;
-    one that returns a failure gets it counted from its return. A new thread's start cut
-    short keeps its lease when its pending start mark was saved, since T3 may have made
-    the thread, which the mark then finds; cut before the mark, it releases the lease at
-    the next reconcile, and again at the one after when that release was cut too. An
-    adoption cut short keeps its lease, since its thread may already have the brief. A
-    failure ends when the board's coordinator is kept or started. The git commands a start runs in the project wait at most 20 seconds
+    others need. Each start ends by 67.5 seconds into the reconcile (three quarters of its
+    90), which leaves time for a release and the save. A start that runs out of time ends
+    as when `t3` times out: its lease is released unless it recorded its thread, and a
+    saved pending start mark stays, so the next start finds the thread T3 made. It gets
+    the start back-off and goes last, unless less than 45 seconds were left when it began:
+    then the boards before it took the time, and it is tried again on the next reconcile.
+    A failed start's back-off counts from its failure. A failure ends when the board's
+    coordinator is kept or started, or another coordinator runs the board. The git commands a start runs in the project wait at most 20 seconds
     each, and `git fetch` 60. Each `t3`
     process needs about half a second of CPU to start, so nine at once on a busy device
     took 4-5 seconds each and timed out together under a build. A check that fails or
