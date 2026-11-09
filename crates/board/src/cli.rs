@@ -570,6 +570,10 @@ pub struct LsArgs {
     /// Only the direct children of this task.
     #[arg(long)]
     parent: Option<TaskId>,
+    /// Only feedback items that still take reports, whatever their status: unresolved and
+    /// not closed, declined, or routed to (or a duplicate of) work that is not closed.
+    #[arg(long)]
+    live: bool,
     #[arg(long)]
     limit: Option<u32>,
     /// Include bodies and acceptance checks.
@@ -690,7 +694,8 @@ pub enum BoardCommand {
         #[arg(long = "home-device")]
         home_devices: Vec<DeviceName>,
         /// For a test or a one-off: the server closes the board once idle (a day by
-        /// default) and deletes it later (a week after closing by default).
+        /// default; never while paused) and deletes it later (a week after closing by
+        /// default).
         #[arg(long)]
         temporary: bool,
     },
@@ -712,8 +717,8 @@ pub enum BoardCommand {
         /// Replace the home devices; repeat for more.
         #[arg(long = "home-device")]
         home_devices: Option<Vec<DeviceName>>,
-        /// Whether the server closes the board once idle and deletes it later. Only the
-        /// user may turn it on for an existing board.
+        /// Whether the server closes the board once idle (never while paused) and deletes
+        /// it later. Only the user may turn it on for an existing board.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         temporary: Option<bool>,
         /// How many tasks the coordinator and its child threads may have in progress at
@@ -1097,6 +1102,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 proposal: a.proposals.then_some(true),
                 mine: a.mine.then_some(true),
                 parent: a.parent,
+                live: a.live.then_some(true),
                 limit: a.limit,
             };
             let ctx = ctx()?;

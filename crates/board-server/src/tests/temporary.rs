@@ -379,14 +379,6 @@ async fn a_temporary_board_in_use_is_not_closed() {
     temporary_board(&t, "noted").await;
     temporary_board(&t, "asked").await;
     temporary_board(&t, "worked").await;
-    temporary_board(&t, "paused").await;
-    t.ok(
-        "PATCH",
-        "/v1/boards/paused",
-        None,
-        Some(json!({ "status": "paused" })),
-    )
-    .await;
     let noted = t.task(A, "noted", "Noted").await;
     let open_ask = ask(&t, A, "asked").await;
     let worked = t.task(A, "worked", "Worked").await;
@@ -411,12 +403,7 @@ async fn a_temporary_board_in_use_is_not_closed() {
     )
     .await;
     t.advance(TimeDelta::hours(2));
-    let swept = sweep(&t).await;
-    // Paused boards are swept like active ones.
-    assert_eq!(
-        (slugs(&swept.closed), slugs(&swept.deleted)),
-        (vec!["paused"], vec![])
-    );
+    assert_eq!(sweep(&t).await, TemporarySweep::default());
 
     // Long after: the noted board's window ran out, the owner went stale, the ask is
     // still open.
@@ -431,6 +418,51 @@ async fn a_temporary_board_in_use_is_not_closed() {
     assert!(sweep(&t).await.closed.is_empty());
     t.advance(TimeDelta::seconds(1));
     assert_eq!(slugs(&sweep(&t).await.closed), vec!["asked"]);
+}
+
+#[tokio::test]
+async fn a_paused_temporary_board_is_never_swept() {
+    let t = T::new();
+    temporary_board(&t, "paused").await;
+    temporary_board(&t, "idle").await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/paused",
+        None,
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+
+    // A pause longer than both windows: the active board is closed and then deleted, the
+    // paused one stays as it is.
+    t.advance(close_after());
+    let swept = sweep(&t).await;
+    assert_eq!(
+        (slugs(&swept.closed), slugs(&swept.deleted)),
+        (vec!["idle"], vec![])
+    );
+    t.advance(delete_after());
+    let swept = sweep(&t).await;
+    assert_eq!(
+        (slugs(&swept.closed), slugs(&swept.deleted)),
+        (vec![], vec!["idle"])
+    );
+    t.advance((close_after() + delete_after()) * 10);
+    assert_eq!(sweep(&t).await, TemporarySweep::default());
+    assert_eq!(status(&t, "paused").await, "paused");
+
+    // Resuming starts the period: the board is closed a full window after the resume.
+    t.ok(
+        "PATCH",
+        "/v1/boards/paused",
+        None,
+        Some(json!({ "status": "active" })),
+    )
+    .await;
+    t.advance(close_after() - TimeDelta::seconds(1));
+    assert_eq!(sweep(&t).await, TemporarySweep::default());
+    t.advance(TimeDelta::seconds(1));
+    assert_eq!(slugs(&sweep(&t).await.closed), vec!["paused"]);
 }
 
 #[tokio::test]

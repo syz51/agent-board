@@ -2563,6 +2563,37 @@ fn brief_prints_what_the_daemon_briefs_the_coordinator_with() {
 }
 
 #[test]
+fn ls_live_sends_the_filter_and_catches_a_server_that_ignores_it() {
+    use board_proto::ResolutionKind::{Declined, Fixed};
+    let e = env();
+    let open = feedback_fixture("board-feedback-1", None);
+    let declined = feedback_fixture("board-feedback-2", Some(Declined));
+    e.stub.on("GET /v1/tasks", [open.clone(), declined.clone()]);
+    let out = e.run(&["ls", "--live", "--board", "board-feedback"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let q = e.stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    assert_eq!(q["live"], "true");
+    assert_eq!(q["board"], "board-feedback");
+    assert_eq!(stdout(&out).lines().count(), 2, "{}", stdout(&out));
+
+    // A server that predates the filter lists items that take no reports, such as fixed ones.
+    let fixed = feedback_fixture("board-feedback-3", Some(Fixed));
+    e.stub.on("GET /v1/tasks", [open, declined, fixed]);
+    let out = e.run(&["ls", "--live"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("does not filter live feedback items yet; upgrade it"),
+        "{}",
+        stderr(&out)
+    );
+    // Without --live the same list is fine, and nothing sends the filter.
+    let out = e.run(&["ls", "--board", "board-feedback"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let q = e.stub.requests_to("GET /v1/tasks")[2].query_pairs();
+    assert!(!q.contains_key("live"), "{q:?}");
+}
+
+#[test]
 fn brief_prints_each_daemon_dispatch_brief_filled_in() {
     use board::brief::{JudgeKind, WORKER_CLOSER, judge_brief, worker_brief};
     let e = env();

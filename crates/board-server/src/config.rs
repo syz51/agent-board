@@ -285,7 +285,7 @@ pub struct Settings {
     /// Done tasks older than this are left out of snapshots.
     pub done_hidden_after_days: u32,
     /// A temporary board idle this long (no event on it, no open ask, no live owner of a
-    /// task in `doing`) is closed.
+    /// task in `doing`) is closed. A paused one is never closed.
     pub temporary_close_after_secs: u64,
     /// A closed temporary board idle this long is deleted.
     pub temporary_delete_after_secs: u64,
