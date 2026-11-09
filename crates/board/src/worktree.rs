@@ -1,19 +1,19 @@
-//! The git worktree a coordinator thread starts in, so it never works in the project root
-//! that other threads share.
+//! The git worktree a coordinator or worker thread starts in, so it never works in the
+//! project root that other threads share.
 //!
-//! When the project folder is the top of a git repository, T3 creates the coordinator's
-//! branch from the default branch and runs the thread in a new worktree on it. The branch
-//! is `coordinator/<slug>`, or `coordinator/<slug>-<UTC time>` when that one exists: `t3
-//! thread start` can only create a branch, never check out one that exists, and an earlier
-//! coordinator's worktree may still use it, maybe with a live thread or files git ignores.
-//! So nothing here removes a worktree or changes a branch.
+//! When the project folder is the top of a git repository, T3 creates the thread's branch
+//! from the default branch and runs the thread in a new worktree on it. The branch is
+//! `coordinator/<slug>` for a coordinator and `task/<id>` for a worker, or that name with
+//! `-<UTC time>` when it exists: `t3 thread start` can only create a branch, never check out
+//! one that exists, and an earlier thread's worktree may still use it, maybe with a live
+//! thread or files git ignores. So nothing here removes a worktree or changes a branch.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{BoardSlug, Timestamp};
+use board_proto::{BoardSlug, TaskId, Timestamp};
 
 use crate::t3::NewWorktree;
 
@@ -24,6 +24,11 @@ pub fn coordinator_branch(slug: &BoardSlug) -> String {
     format!("coordinator/{slug}")
 }
 
+/// The branch the worker of `task` runs on when it is free.
+pub fn worker_branch(task: &TaskId) -> String {
+    format!("task/{task}")
+}
+
 /// The worktree to start the coordinator of `slug` in; `None` when `project` is not the top
 /// of a git repository, so the thread runs in the folder itself.
 pub async fn coordinator_worktree(
@@ -31,11 +36,29 @@ pub async fn coordinator_worktree(
     slug: &BoardSlug,
     now: Timestamp,
 ) -> Result<Option<NewWorktree>> {
+    new_worktree(project, coordinator_branch(slug), now).await
+}
+
+/// The worktree to start the worker of `task` in, as [`coordinator_worktree`].
+pub async fn worker_worktree(
+    project: &Path,
+    task: &TaskId,
+    now: Timestamp,
+) -> Result<Option<NewWorktree>> {
+    new_worktree(project, worker_branch(task), now).await
+}
+
+/// A worktree on `branch`, or on `branch` with the time when that one exists, from the
+/// default branch; `None` when `project` is not the top of a git repository.
+async fn new_worktree(
+    project: &Path,
+    mut branch: String,
+    now: Timestamp,
+) -> Result<Option<NewWorktree>> {
     if !is_repo_top(project).await? {
         return Ok(None);
     }
     let base = default_base(project).await?;
-    let mut branch = coordinator_branch(slug);
     if has_ref(project, &format!("refs/heads/{branch}")).await? {
         branch = format!("{branch}-{}", now.format("%Y%m%d-%H%M%S"));
     }
@@ -63,7 +86,7 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
     Ok(top.is_ok_and(|top| top == folder))
 }
 
-/// The ref new coordinator worktrees start from, fetched first when it is a remote branch:
+/// The ref new worktrees start from, fetched first when it is a remote branch:
 /// the remote's default branch (`origin/HEAD`), else the first of `origin/main`,
 /// `origin/master`, `main` and `master` that exists.
 async fn default_base(project: &Path) -> Result<String> {
@@ -95,12 +118,12 @@ async fn default_base(project: &Path) -> Result<String> {
     }
     let Some(base) = base else {
         bail!(
-            "{} has no origin/HEAD, origin/main, origin/master, main or master to start the coordinator's worktree from; set origin/HEAD (git remote set-head origin --auto)",
+            "{} has no origin/HEAD, origin/main, origin/master, main or master to start new worktrees from; set origin/HEAD (git remote set-head origin --auto)",
             project.display()
         );
     };
     if let Some(name) = base.strip_prefix("origin/") {
-        // A stale remote branch would start the coordinator, and its children, on old code.
+        // A stale remote branch would start the thread, and its children, on old code.
         match git(project, &["fetch", "--quiet", "origin", name]).await {
             Ok(out) if out.ok => {}
             Ok(out) => tracing::warn!(
@@ -231,6 +254,24 @@ mod tests {
                 branch: "coordinator/factory".into()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_worker_branch_is_named_after_its_task_and_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = clone(dir.path(), "main");
+        let task: TaskId = "factory-7".parse().unwrap();
+        let first = worker_worktree(&repo, &task, at()).await.unwrap();
+        assert_eq!(
+            first,
+            Some(NewWorktree {
+                base: "origin/main".into(),
+                branch: "task/factory-7".into()
+            })
+        );
+        run(&repo, &["branch", "task/factory-7", "origin/main"]);
+        let again = worker_worktree(&repo, &task, at()).await.unwrap().unwrap();
+        assert_eq!(again.branch, "task/factory-7-20261108-132005");
     }
 
     #[tokio::test]

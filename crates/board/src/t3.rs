@@ -136,6 +136,10 @@ pub trait T3: Send + Sync {
         thread: &str,
     ) -> impl Future<Output = Result<Option<RecentMessages>>> + Send;
 
+    /// The thread's `https://` link in the T3 app, or `None` when T3 gives none or does not
+    /// know the thread.
+    fn thread_link(&self, thread: &str) -> impl Future<Output = Result<Option<String>>> + Send;
+
     /// The active threads titled `title` in the project containing `project`.
     fn threads_titled(
         &self,
@@ -281,6 +285,13 @@ impl T3 for T3Cli {
             .await?
             .map(|value| parse_recent_messages(&value))
             .transpose()
+    }
+
+    async fn thread_link(&self, thread: &str) -> Result<Option<String>> {
+        Ok(self
+            .thread_facts(thread)
+            .await?
+            .and_then(|facts| facts.link))
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {

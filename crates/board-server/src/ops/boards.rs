@@ -214,6 +214,25 @@ pub(crate) fn update(
     if fields.is_empty() {
         return Ok(before);
     }
+    // The user wants the feedback board resumed first, always: resuming any other board
+    // resumes it too when it is paused, with its event recorded first, so triage never stays
+    // paused while other work runs.
+    if before.status == BoardStatus::Paused
+        && req.status == Some(BoardStatus::Active)
+        && *slug != cx.s.feedback_board
+    {
+        let feedback = cx.s.feedback_board.clone();
+        if cx.exists(
+            "SELECT 1 FROM boards WHERE slug = ?1 AND status = 'paused'",
+            [feedback.as_str()],
+        )? {
+            let resume = UpdateBoard {
+                status: Some(BoardStatus::Active),
+                ..UpdateBoard::default()
+            };
+            update(cx, actor, &feedback, resume, by_user)?;
+        }
+    }
     // A status change names the new status, so a daemon can wake a resumed board's
     // coordinator without reading the board.
     let mut payload = serde_json::json!({ "fields": fields });
