@@ -570,6 +570,10 @@ pub struct LsArgs {
     /// Only the direct children of this task.
     #[arg(long)]
     parent: Option<TaskId>,
+    /// Only feedback items that still take reports, whatever their status: unresolved and
+    /// not closed, declined, or routed to (or a duplicate of) work that is not closed.
+    #[arg(long)]
+    live: bool,
     #[arg(long)]
     limit: Option<u32>,
     /// Include bodies and acceptance checks.
@@ -1098,6 +1102,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 proposal: a.proposals.then_some(true),
                 mine: a.mine.then_some(true),
                 parent: a.parent,
+                live: a.live.then_some(true),
                 limit: a.limit,
             };
             let ctx = ctx()?;

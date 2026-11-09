@@ -13,6 +13,7 @@ use crate::db::{Ctx, enum_str, parse_id, proposal_sql, ready_sql, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
+use crate::ops::feedback::{DUPLICATE_DEPTH_MAX, LIVE_ITEMS};
 use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
     NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks_up_to, seen,
@@ -647,6 +648,8 @@ pub(crate) struct TaskFilter {
     pub proposal: Option<bool>,
     /// Only the direct children of this task.
     pub parent: Option<TaskId>,
+    /// Only feedback items that take reports (true), or none of them (false).
+    pub live: Option<bool>,
     pub limit: usize,
 }
 
@@ -694,6 +697,33 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     };
     if let Some(proposal) = &proposal {
         clauses.push(proposal);
+    }
+    // Feedback items are filed on the feedback board. On a board without any, `live=true`
+    // can only be a mistake, so say where they are rather than answer with an empty list.
+    if filter.live == Some(true)
+        && let Some(board) = &filter.board
+        && *board != cx.s.feedback_board
+        && !cx.exists(
+            "SELECT 1 FROM tasks t JOIN feedback f ON f.task = t.id WHERE t.board = ?1",
+            [board.as_str()],
+        )?
+    {
+        let feedback = &cx.s.feedback_board;
+        return Err(invalid(
+            format!(
+                "board {board} holds no feedback items for live to list; they are on board {feedback}"
+            ),
+            format!("send board={feedback} with live=true, or leave board out"),
+        ));
+    }
+    let live = filter.live.map(|want| {
+        let not = if want { "" } else { "NOT " };
+        format!("t.id {not}IN ({LIVE_ITEMS})")
+    });
+    let live_depth = DUPLICATE_DEPTH_MAX as i64;
+    if let Some(live) = &live {
+        clauses.push(live);
+        params.push((":live_depth", &live_depth));
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }

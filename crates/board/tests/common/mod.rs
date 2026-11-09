@@ -624,3 +624,31 @@ pub fn parent_detail() -> board_proto::TaskDetail {
 
 /// What `show` and `task_show` print for [`parent_detail`]'s children.
 pub const PARENT_CHILDREN_LINES: &str = "children 4: done 2 · blocked 1 · open 1\n  done factory-2,factory-4\n  blocked factory-5\n  open factory-3";
+
+/// A feedback item on `board-feedback`, resolved as `kind` (done) or unresolved (open).
+pub fn feedback_fixture(id: &str, kind: Option<board_proto::ResolutionKind>) -> Task {
+    let mut task = task_fixture(id, "Feedback item");
+    task.board = "board-feedback".parse().unwrap();
+    task.feedback = Some(board_proto::Feedback {
+        about: "board".into(),
+        activity: None,
+        source: board_proto::FeedbackSource::Agent,
+        signature: format!("board:{id}"),
+        reports: 1,
+        reporters: vec!["t3:a".parse().unwrap()],
+        last_reported_at: at(),
+        resolution: kind.map(|kind| board_proto::FeedbackResolution {
+            kind,
+            task: None,
+            reason: Some("why".into()),
+            at: at(),
+            by: "user".into(),
+        }),
+        recurs: None,
+    });
+    // Resolving an item closes it.
+    if kind.is_some() {
+        task.status = TaskStatus::Done;
+    }
+    task
+}
