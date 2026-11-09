@@ -36,23 +36,28 @@
 //! step is retried with the same thread; a new thread is started only once the recorded one
 //! is gone. A board whose coordinator cannot be started here is retried with a growing delay
 //! until its repos, home devices, autopilot switch or status change.
+//!
+//! A board set to daemon dispatch (`dispatch: daemon`) runs no coordinator thread: this
+//! daemon holds its coordinator lease as `dispatch:<device>` and starts a worker thread for
+//! the next ready task while a slot is free (see [`Worker`]). Its agents get the wake-ups
+//! above as before, but no coordinator is woken or re-briefed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
-    ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, Priority, RegisterAgent, Runtime,
-    Task, TaskId, TaskStatus, Timestamp, Usage,
+    AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
+    ClaimCoordinator, DeviceName, Dispatch, ErrorCode, Event, EventType, NoteKind, Priority,
+    RegisterAgent, Runtime, Task, TaskId, TaskStatus, Timestamp, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, ServerError, error_code, is_unreachable};
+use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
@@ -110,6 +115,13 @@ pub const THREAD_CHECKS_AT_ONCE: usize = 2;
 /// long, so another home device takes over while T3 is down, and one slow check does not
 /// hand the board away.
 pub const CHECK_FAIL_RELEASE: TimeDelta = TimeDelta::minutes(10);
+/// How long a worker thread may take to claim its task: one that has not by then, or whose
+/// session ended first, no longer holds a slot.
+pub const WORKER_CLAIM_WAIT: TimeDelta = TimeDelta::minutes(20);
+/// How long a task whose worker gave it back to `open`, or never claimed it, waits before
+/// the dispatcher starts another worker for it, so a worker that stops at once (a lease
+/// overlap, a failing session) is not started again on every reconcile.
+pub const WORKER_RETRY: TimeDelta = TimeDelta::minutes(30);
 const STATE_NAME: &str = "watch";
 /// Delay before retrying a coordinator that failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
@@ -198,6 +210,45 @@ pub struct WatchState {
     /// coordinator is woken to start work again.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub usage_held: BTreeSet<BoardSlug>,
+    /// Worker threads this device's dispatcher started on daemon-dispatch boards, by task,
+    /// while each holds a slot. Saved before `t3 thread start` runs, as `pending_starts`.
+    /// Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_workers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub workers: BTreeMap<TaskId, Worker>,
+    /// Tasks whose worker stopped without parking them, or whose start failed, and when
+    /// another worker may start (see [`WORKER_RETRY`]). Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_worker_retry",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub worker_retry: BTreeMap<TaskId, Timestamp>,
+}
+
+/// A worker thread the dispatcher started for one task. It holds one of the board's
+/// `parallel_tasks` slots until it parks the task, or stops without claiming it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Worker {
+    /// Its thread; `None` until `t3 thread start` returns. A start the daemon did not live
+    /// to finish is found by `title` among the threads created since `started_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    pub title: String,
+    /// The branch of its worktree, when it runs in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub started_at: Timestamp,
+    /// Whether it has claimed the task: from then on, the task leaving its `doing` frees
+    /// the slot.
+    #[serde(default)]
+    pub claimed: bool,
+    /// Whether its thread is noted on the task.
+    #[serde(default)]
+    pub noted: bool,
 }
 
 /// The wake-up messages to one agent whose send timed out: T3 may or may not have
@@ -370,7 +421,7 @@ fn lenient_queues<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<AgentId, WakeQueue>, D::Error> {
     let mut queues: BTreeMap<AgentId, WakeQueue> =
-        lenient_by_agent(serde_json::Value::deserialize(d)?, "the wake-ups");
+        lenient_by_key(serde_json::Value::deserialize(d)?, "the wake-ups");
     queues.retain(|_, queue| !queue.wakes.is_empty());
     Ok(queues)
 }
@@ -379,7 +430,7 @@ fn lenient_queues<'de, D: serde::Deserializer<'de>>(
 fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<AgentId, UnsureWakes>, D::Error> {
-    let mut unsure: BTreeMap<AgentId, UnsureWakes> = lenient_by_agent(
+    let mut unsure: BTreeMap<AgentId, UnsureWakes> = lenient_by_key(
         serde_json::Value::deserialize(d)?,
         "the timed-out wake-up messages",
     );
@@ -387,28 +438,48 @@ fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
     Ok(unsure)
 }
 
-/// The entries of `value`, an object by agent id, that this version can read; `what` names
-/// an entry in the warning for one skipped.
-fn lenient_by_agent<V: serde::de::DeserializeOwned>(
+/// Each worker read on its own, like [`lenient_queues`].
+fn lenient_workers<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, Worker>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the worker",
+    ))
+}
+
+/// Each task's retry time read on its own, like [`lenient_queues`].
+fn lenient_worker_retry<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, Timestamp>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the worker retry",
+    ))
+}
+
+/// The entries of `value`, an object by agent or task id, that this version can read;
+/// `what` names an entry in the warning for one skipped.
+fn lenient_by_key<K: std::str::FromStr + Ord, V: serde::de::DeserializeOwned>(
     value: serde_json::Value,
     what: &str,
-) -> BTreeMap<AgentId, V> {
+) -> BTreeMap<K, V> {
     let serde_json::Value::Object(entries) = value else {
         return BTreeMap::new();
     };
     entries
         .into_iter()
-        .filter_map(|(agent, entry)| {
-            match (agent.parse::<AgentId>(), serde_json::from_value(entry)) {
-                (Ok(id), Ok(entry)) => Some((id, entry)),
+        .filter_map(
+            |(key, entry)| match (key.parse::<K>(), serde_json::from_value(entry)) {
+                (Ok(key), Ok(entry)) => Some((key, entry)),
                 _ => {
                     tracing::warn!(
-                        "watch state: skipped {what} for {agent}, which this version cannot read"
+                        "watch state: skipped {what} for {key}, which this version cannot read"
                     );
                     None
                 }
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -1098,6 +1169,7 @@ struct HostingConfig {
     autopilot: bool,
     status: BoardStatus,
     home_devices: Vec<DeviceName>,
+    dispatch: Dispatch,
 }
 
 impl HostingConfig {
@@ -1107,6 +1179,7 @@ impl HostingConfig {
             autopilot: board.autopilot,
             status: board.status,
             home_devices: board.home_devices.clone(),
+            dispatch: board.dispatch,
         }
     }
 }
@@ -1182,6 +1255,10 @@ pub struct Daemon<T: T3> {
     pub usage: Option<Usage>,
     /// When this daemon last read the usage endpoint itself.
     usage_polled: Option<Timestamp>,
+    /// Whether this device's dispatch agent is registered since the daemon started.
+    dispatch_registered: bool,
+    /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
+    dispatch_renewed: BTreeMap<BoardSlug, Timestamp>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1206,6 +1283,8 @@ impl<T: T3> Daemon<T> {
             usage_source: UsageSource::Server,
             usage: None,
             usage_polled: None,
+            dispatch_registered: false,
+            dispatch_renewed: BTreeMap::new(),
         }
     }
 
@@ -1293,6 +1372,26 @@ impl<T: T3> Daemon<T> {
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
+        // A board switched to daemon dispatch has no coordinator thread to check, renew,
+        // wake or re-brief. Where this device does not run the board, the record stays until
+        // the loop below releases its lease.
+        let replaced: Vec<&Board> = boards
+            .iter()
+            .filter(|b| {
+                b.dispatch == Dispatch::Daemon
+                    && (self.is_home(b) || (self.hosts(b) && b.status == BoardStatus::Paused))
+            })
+            .collect();
+        for board in replaced {
+            if let Some(local) = self.state.coordinators.remove(&board.slug) {
+                tracing::info!(
+                    "{} is set to daemon dispatch: coordinator thread {} is no longer its coordinator",
+                    board.slug,
+                    local.thread
+                );
+            }
+            self.state.pending_starts.remove(&board.slug);
+        }
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         // After the thread checks, so a slow usage read never takes their time.
         self.refresh_usage(now).await;
@@ -1309,14 +1408,23 @@ impl<T: T3> Daemon<T> {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
                 self.state.pending_starts.remove(&board.slug);
+                self.dispatch_renewed.remove(&board.slug);
                 // A paused board keeps its coordinator thread and names it still, so the
                 // server holds that thread while paused (`Snapshot::held_by`), and the same
-                // thread is woken when the board resumes instead of a new one starting.
+                // thread is woken when the board resumes instead of a new one starting. A
+                // paused daemon-dispatch board starts no worker until it resumes.
                 if self.hosts(board) && board.status == BoardStatus::Paused {
                     continue;
                 }
-                if self.state.coordinators.remove(&board.slug).is_some() {
+                let dispatching = board.coordinator.as_ref() == Some(&self.dispatch_agent());
+                if self.state.coordinators.remove(&board.slug).is_some() || dispatching {
                     self.release(&board.slug).await;
+                }
+                continue;
+            }
+            if board.dispatch == Dispatch::Daemon {
+                if let Err(err) = self.dispatch(board, now).await {
+                    tracing::warn!("dispatcher of {}: {err:#}", board.slug);
                 }
                 continue;
             }
@@ -1346,6 +1454,16 @@ impl<T: T3> Daemon<T> {
             .retain(|slug, _| boards.contains_key(slug));
         self.state
             .pending_starts
+            .retain(|slug, _| boards.contains_key(slug));
+        self.state.workers.retain(|task, _| {
+            boards
+                .get(&task.board())
+                .is_some_and(|b| b.dispatch == Dispatch::Daemon)
+        });
+        self.state
+            .worker_retry
+            .retain(|task, at| *at > now && boards.contains_key(&task.board()));
+        self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
         self.save()
     }
@@ -1561,9 +1679,10 @@ impl<T: T3> Daemon<T> {
             self.state.coordinators.remove(slug);
             self.checks_failing.remove(slug);
         }
-        if ours_gone {
+        if ours_gone || board.coordinator.as_ref() == Some(&self.dispatch_agent()) {
             // A renewal keeps the coordinator named, so the gone thread would stay named
             // until its replacement claims; releasing first means no one is named meanwhile.
+            // A board switched back from daemon dispatch drops its dispatcher the same way.
             self.release(slug).await;
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
@@ -1623,7 +1742,11 @@ impl<T: T3> Daemon<T> {
         // Counted as failed until it returns, so a start the reconcile's budget cuts short
         // (git or T3 waiting out its timeout) still backs off, from the cut, and goes last.
         // Its lease stays for now: T3 may have made the thread, which the pending mark finds.
-        self.note_failure(board, now);
+        let cut = TimeDelta::from_std(self.timing.reconcile_budget)
+            .expect("the reconcile budget is seconds long");
+        let failure = self.note_failure(board, now);
+        failure.retry_at += cut;
+        failure.unfinished = true;
         let started = match adoption {
             Some(adoption) => self.adopt_thread(board, adoption, now).await,
             None => self.start_coordinator(board, now).await,
@@ -1642,10 +1765,9 @@ impl<T: T3> Daemon<T> {
         started
     }
 
-    /// Delays the next start on `board`, which begins at `now`, as though the reconcile's
-    /// budget cut it short: doubled after each failure, reset when its hosting settings
-    /// change. A start that returns an error is retried `delay` after `now` instead.
-    fn note_failure(&mut self, board: &Board, now: Timestamp) {
+    /// Delays the next start on `board` after one that began at `now` failed: doubled after
+    /// each failure, reset when its hosting settings change.
+    fn note_failure(&mut self, board: &Board, now: Timestamp) -> &mut StartFailure {
         let config = HostingConfig::of(board);
         let last = self
             .failures
@@ -1653,18 +1775,20 @@ impl<T: T3> Daemon<T> {
             .filter(|last| last.config == config)
             .map(|last| last.delay);
         let delay = next_delay(last, START_RETRY_FIRST, START_RETRY_MAX);
-        let cut = TimeDelta::from_std(self.timing.reconcile_budget)
-            .expect("the reconcile budget is seconds long");
-        self.failures.insert(
-            board.slug.clone(),
-            StartFailure {
-                config,
-                delay,
-                retry_at: now + cut + delay,
-                started_at: now,
-                unfinished: true,
-            },
-        );
+        let failure = StartFailure {
+            config,
+            delay,
+            retry_at: now + delay,
+            started_at: now,
+            unfinished: false,
+        };
+        match self.failures.entry(board.slug.clone()) {
+            Entry::Occupied(mut slot) => {
+                slot.insert(failure);
+                slot.into_mut()
+            }
+            Entry::Vacant(slot) => slot.insert(failure),
+        }
     }
 
     /// Renews the lease of a live coordinator and resumes it after a usage limit.
@@ -2176,6 +2300,418 @@ impl<T: T3> Daemon<T> {
         }
     }
 
+    /// This device's dispatch agent, which holds the lease of the daemon-dispatch boards it
+    /// runs.
+    fn dispatch_agent(&self) -> AgentId {
+        AgentId::dispatch(&self.ctx.device)
+    }
+
+    /// Whether `slug` is a daemon-dispatch board this device runs when it holds the lease.
+    fn dispatches_here(&self, slug: &BoardSlug) -> bool {
+        self.boards
+            .get(slug)
+            .is_some_and(|b| b.dispatch == Dispatch::Daemon && self.is_home(b))
+    }
+
+    /// Runs a home board set to daemon dispatch: holds its coordinator lease as this
+    /// device's dispatch agent, follows the workers it started there, and starts a worker for
+    /// the next ready task while a slot is free, the board's usage allows new work and no
+    /// failed start waits for its retry. One slot for now, whatever `parallel_tasks` says:
+    /// the rules for more are not built yet (`docs/DESIGN.md`, "Daemon dispatch", Slots).
+    async fn dispatch(&mut self, board: &Board, now: Timestamp) -> Result<()> {
+        let slug = &board.slug;
+        let agent = self.dispatch_agent();
+        // A device that cannot start workers leaves the lease to a home device that can.
+        if let Err(err) = self.host_folder(board) {
+            if board.coordinator.as_ref() == Some(&agent) {
+                self.release(slug).await;
+            }
+            self.dispatch_renewed.remove(slug);
+            return Err(err);
+        }
+        if !self.hold_dispatch_lease(board, &agent, now).await? {
+            return Ok(());
+        }
+        let in_progress = self.follow_workers(board, &agent, now).await;
+        self.save()?;
+        if in_progress > 0 || self.usage_holds(slug, now) {
+            return Ok(());
+        }
+        // A task in `doing` that no worker of this daemon follows also takes the slot: one
+        // the coordinator thread started before the switch, a worker another device started
+        // before the lease moved here, or one that claimed after its claim wait.
+        let doing = self
+            .client()
+            .tasks(&TaskQuery {
+                board: Some(slug.clone()),
+                status: Some(TaskStatus::Doing),
+                limit: Some(1),
+                ..TaskQuery::default()
+            })
+            .await
+            .context("listing the tasks in doing")?;
+        if doing.iter().any(|t| t.status == TaskStatus::Doing) {
+            return Ok(());
+        }
+        if let Some(failure) = self.failures.get(slug)
+            && failure.config == HostingConfig::of(board)
+            && now < failure.retry_at
+        {
+            return Ok(());
+        }
+        let Some(task) = self.next_task(slug, now).await? else {
+            return Ok(());
+        };
+        match self.start_worker(board, &task, &agent, now).await {
+            Ok(()) => {
+                self.failures.remove(slug);
+                Ok(())
+            }
+            Err(err) => {
+                self.note_failure(board, now);
+                // One task that cannot start does not hold up the others. A start that
+                // recorded its worker gets this when that worker is found to have no thread.
+                if !self.state.workers.contains_key(&task.id) {
+                    self.state
+                        .worker_retry
+                        .insert(task.id.clone(), now + WORKER_RETRY);
+                }
+                Err(err.context(format!("starting a worker for {}", task.id)))
+            }
+        }
+    }
+
+    /// Claims or renews the lease of `board` as `agent`, every [`RENEW_EVERY`]; false when
+    /// another device holds it.
+    async fn hold_dispatch_lease(
+        &mut self,
+        board: &Board,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let slug = &board.slug;
+        let named = board.coordinator.as_ref() == Some(agent);
+        // A clock set back renews at once.
+        if named
+            && self
+                .dispatch_renewed
+                .get(slug)
+                .is_some_and(|at| (TimeDelta::zero()..RENEW_EVERY).contains(&(now - *at)))
+        {
+            return Ok(true);
+        }
+        if !self.dispatch_registered {
+            self.register_dispatch(agent).await?;
+            self.dispatch_registered = true;
+        }
+        match self.claim(slug, Some(agent)).await {
+            Ok(updated) => {
+                if !named {
+                    tracing::info!("{agent} dispatches {slug}");
+                }
+                self.boards.insert(slug.clone(), updated);
+                self.dispatch_renewed.insert(slug.clone(), now);
+                Ok(true)
+            }
+            Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => {
+                self.dispatch_renewed.remove(slug);
+                Ok(false)
+            }
+            Err(err) => {
+                // The server may have lost the agent: registered again on the next try.
+                self.dispatch_registered = false;
+                Err(err)
+            }
+        }
+    }
+
+    async fn register_dispatch(&self, agent: &AgentId) -> Result<()> {
+        self.client()
+            .with_agent(Some(agent.clone()))
+            .register(&RegisterAgent {
+                id: agent.clone(),
+                // The runtime of the threads it starts.
+                runtime: Runtime::Claude,
+                device: self.ctx.device.clone(),
+                role: AgentRole::Coordinator,
+                title: Some(format!("dispatcher on {}", self.ctx.device)),
+                repo: None,
+                branch: None,
+                cwd: None,
+                native_ids: BTreeMap::new(),
+                forked_from: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Updates the workers started on `board` from their tasks, and returns how many still
+    /// hold a slot. One that cannot be read holds its slot until it can.
+    async fn follow_workers(&mut self, board: &Board, agent: &AgentId, now: Timestamp) -> usize {
+        let tasks: Vec<TaskId> = self
+            .state
+            .workers
+            .iter()
+            .filter(|(task, _)| task.board() == board.slug)
+            .map(|(task, _)| task.clone())
+            .collect();
+        let mut in_progress = 0;
+        for task in tasks {
+            let Some(mut worker) = self.state.workers.get(&task).cloned() else {
+                continue;
+            };
+            let holds = match self
+                .follow_worker(board, &task, &mut worker, agent, now)
+                .await
+            {
+                Ok(holds) => holds,
+                Err(err) => {
+                    tracing::warn!("worker of {task}: {err:#}");
+                    true
+                }
+            };
+            if holds {
+                in_progress += 1;
+                self.state.workers.insert(task, worker);
+            } else {
+                self.state.workers.remove(&task);
+            }
+        }
+        in_progress
+    }
+
+    /// Whether `worker` still holds a slot: it has the task in `doing`, or may still claim
+    /// it. A start that did not record its thread looks for it first, and a thread not
+    /// noted on the task yet is noted. A worker that gives the task back to `open`, or ends
+    /// without claiming it, holds it from another worker for [`WORKER_RETRY`].
+    async fn follow_worker(
+        &mut self,
+        board: &Board,
+        task: &TaskId,
+        worker: &mut Worker,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let thread = match worker.thread.clone() {
+            Some(thread) => thread,
+            None => match self.find_worker_thread(board, task, worker).await? {
+                Some(thread) => {
+                    worker.thread = Some(thread.clone());
+                    thread
+                }
+                None => {
+                    self.state
+                        .worker_retry
+                        .insert(task.clone(), now + WORKER_RETRY);
+                    return Ok(false);
+                }
+            },
+        };
+        if !worker.noted {
+            match self.note_worker(task, &thread, worker, agent).await {
+                Ok(()) => worker.noted = true,
+                Err(err) => tracing::warn!("noting worker thread {thread} on {task}: {err:#}"),
+            }
+        }
+        let current = match self.client().task(task).await {
+            Ok(detail) => detail.task,
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let worker_agent = thread_agent(&thread)?;
+        if current.status == TaskStatus::Doing && current.owner.as_ref() == Some(&worker_agent) {
+            worker.claimed = true;
+            return Ok(true);
+        }
+        let open = current.status == TaskStatus::Open && current.owner.is_none();
+        let stopped = if worker.claimed {
+            // It parked the task, finished it, or gave it back.
+            open
+        } else if !open {
+            // Closed, or taken by another agent, before the worker claimed it.
+            false
+        } else {
+            let ended = match self.client().agent_info(&worker_agent).await {
+                Ok(info) => info.state == AgentState::Ended,
+                // Its session has not started yet.
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+                Err(err) => return Err(err),
+            };
+            if !ended && now - worker.started_at < WORKER_CLAIM_WAIT {
+                return Ok(true);
+            }
+            true
+        };
+        if stopped {
+            tracing::warn!(
+                "worker thread {thread} left {task} open; no new worker for it before {}",
+                now + WORKER_RETRY
+            );
+            self.state
+                .worker_retry
+                .insert(task.clone(), now + WORKER_RETRY);
+        }
+        Ok(false)
+    }
+
+    /// The thread of a worker start that did not record it (the daemon was killed, or `t3`
+    /// failed or timed out): the newest thread with its title created since, briefed when its
+    /// message never reached it; `None` when there is none, or it cannot be briefed.
+    async fn find_worker_thread(
+        &self,
+        board: &Board,
+        task: &TaskId,
+        worker: &Worker,
+    ) -> Result<Option<String>> {
+        let project = self.host_folder(board)?;
+        let found = self
+            .t3
+            .threads_titled(&project, &worker.title)
+            .await
+            .context("looking for the thread of an unfinished worker start")?
+            .into_iter()
+            .filter(|t| t.created_at >= worker.started_at && thread_agent(&t.id).is_ok())
+            .max_by_key(|t| t.created_at);
+        let Some(found) = found else {
+            tracing::warn!(
+                "the worker start for {task} at {} made no thread",
+                worker.started_at
+            );
+            return Ok(None);
+        };
+        if !found.ran {
+            let brief = crate::brief::worker_brief(&board.slug, task, crate::brief::WORKER_CLOSER);
+            if let Err(err) = self.t3.send(&found.id, &brief).await {
+                tracing::warn!(
+                    "briefing worker thread {} left by an earlier start for {task}: {err:#}; archive it in T3",
+                    found.id
+                );
+                return Ok(None);
+            }
+        }
+        tracing::warn!(
+            "worker of {task}: adopting thread {}, which a start at {} launched but did not record",
+            found.id,
+            worker.started_at
+        );
+        Ok(Some(found.id))
+    }
+
+    /// Notes on `task` the worker thread started for it, by its T3 link when T3 gives one.
+    async fn note_worker(
+        &self,
+        task: &TaskId,
+        thread: &str,
+        worker: &Worker,
+        agent: &AgentId,
+    ) -> Result<()> {
+        let link = match self.t3.thread_link(thread).await {
+            Ok(Some(link)) => link,
+            Ok(None) => format!("thread {thread}"),
+            Err(err) => {
+                tracing::debug!("reading the link of thread {thread}: {err:#}");
+                format!("thread {thread}")
+            }
+        };
+        let branch = worker
+            .branch
+            .as_ref()
+            .map(|b| format!(" on branch {b}"))
+            .unwrap_or_default();
+        let text = format!("note: the dispatcher started a worker for this task{branch}: {link}");
+        self.client()
+            .with_agent(Some(agent.clone()))
+            .add_note(
+                task,
+                &AddNote {
+                    agent: agent.clone(),
+                    kind: NoteKind::Note,
+                    text,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The task the next worker on `slug` takes: the highest-priority ready `auto` task,
+    /// the oldest first on a tie, that has no worker and no retry still to wait for.
+    async fn next_task(&self, slug: &BoardSlug, now: Timestamp) -> Result<Option<Task>> {
+        let tasks = self
+            .client()
+            .tasks(&TaskQuery {
+                board: Some(slug.clone()),
+                ready: Some(true),
+                proposal: Some(false),
+                limit: Some(1000),
+                ..TaskQuery::default()
+            })
+            .await?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.ready && t.auto && !is_proposal(t))
+            .filter(|t| !self.state.workers.contains_key(&t.id))
+            .filter(|t| {
+                self.state
+                    .worker_retry
+                    .get(&t.id)
+                    .is_none_or(|at| *at <= now)
+            })
+            .min_by_key(|t| (t.priority, t.created_at)))
+    }
+
+    /// Starts a worker thread for `task`, in a new worktree on `task/<id>` when the project
+    /// folder is a repository's top, with the worker brief; records it before the start, so
+    /// a start the daemon does not live to finish is found again, then notes it on the task.
+    async fn start_worker(
+        &mut self,
+        board: &Board,
+        task: &Task,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> Result<()> {
+        let project = self.host_folder(board)?;
+        let worktree = crate::worktree::worker_worktree(&project, &task.id, now)
+            .await
+            .context("preparing the worker's worktree")?;
+        let title = format!("{} {}", task.id, task.title);
+        let brief = crate::brief::worker_brief(&board.slug, &task.id, crate::brief::WORKER_CLOSER);
+        let mut worker = Worker {
+            thread: None,
+            title,
+            branch: worktree.as_ref().map(|w| w.branch.clone()),
+            started_at: now,
+            claimed: false,
+            noted: false,
+        };
+        // On disk before T3 can create the thread.
+        self.state.workers.insert(task.id.clone(), worker.clone());
+        self.save()?;
+        let thread = self
+            .t3
+            .start_thread(&project, &worker.title, &brief, worktree.as_ref())
+            .await?;
+        // A thread id that names no agent could never be followed, and would hold the slot.
+        thread_agent(&thread)
+            .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
+        tracing::info!(
+            "started worker thread {thread} for {} on {}",
+            task.id,
+            board.slug
+        );
+        worker.thread = Some(thread.clone());
+        self.state.workers.insert(task.id.clone(), worker.clone());
+        self.save()?;
+        match self.note_worker(&task.id, &thread, &worker, agent).await {
+            Ok(()) => {
+                worker.noted = true;
+                self.state.workers.insert(task.id.clone(), worker);
+            }
+            // Noted on a later reconcile.
+            Err(err) => tracing::warn!("noting worker thread {thread} on {}: {err:#}", task.id),
+        }
+        Ok(())
+    }
+
     /// [`project_for`] on this device.
     fn project_for(&self, board: &Board) -> Option<(Option<String>, PathBuf)> {
         project_for(&self.ctx.config, board)
@@ -2451,6 +2987,16 @@ impl<T: T3> Daemon<T> {
         let Some(slug) = &event.board else {
             return Ok((false, wakes));
         };
+        // On a daemon-dispatch board run here, a task that changes may become ready or free
+        // a slot: the reconcile it asks for starts the next worker.
+        let mut reconcile = self.dispatches_here(slug)
+            && matches!(
+                event.event_type,
+                EventType::TaskCreated
+                    | EventType::TaskReleased
+                    | EventType::TaskUpdated
+                    | EventType::TaskDone
+            );
         match event.event_type {
             EventType::BoardCreated => return Ok((true, wakes)),
             // A board paused and active again: its coordinator, which stopped when it was
@@ -2467,8 +3013,12 @@ impl<T: T3> Daemon<T> {
                 }
                 return Ok((true, wakes));
             }
-            // This device's own lease claims and releases change nothing a reconcile would act on.
-            EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
+            // This device's own lease claims and releases change nothing a reconcile would act
+            // on, nor does a judge's registration, which each lease holder makes per judge.
+            EventType::BoardUpdated => {
+                let judges = event.payload["fields"] == serde_json::json!(["judges"]);
+                return Ok((!judges && !self.is_own_claim(event), wakes));
+            }
             // The server's notice that a task's owner has been away from it: the owner; the
             // coordinator when the owner is no T3 thread, which no daemon can wake. Whether
             // the owner is on this device and still away is checked when the wake-up is sent.
@@ -2509,7 +3059,7 @@ impl<T: T3> Daemon<T> {
                             let about = WakeAbout::Review { task: task.clone() };
                             wakes.push((slug.clone(), coordinator.clone(), about));
                         }
-                        return Ok((false, wakes));
+                        return Ok((reconcile, wakes));
                     }
                     let detail = self.client().task(task).await?;
                     let about = if detail.task.ready && detail.task.auto {
@@ -2554,6 +3104,7 @@ impl<T: T3> Daemon<T> {
                         }
                     }
                     for (board, ready) in ready {
+                        reconcile |= self.dispatches_here(&board);
                         if let Some(coordinator) =
                             self.wakeable(self.coordinator_here(&board), event)
                         {
@@ -2592,7 +3143,7 @@ impl<T: T3> Daemon<T> {
             }
             _ => {}
         }
-        Ok((false, wakes))
+        Ok((reconcile, wakes))
     }
 
     /// Whether every blocker of `task` is done, wherever it is.

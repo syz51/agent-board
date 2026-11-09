@@ -332,6 +332,28 @@ impl Task {
     pub fn is_pending_proposal(&self) -> bool {
         is_pending_proposal(self.status, self.auto, &self.body, self.feedback.is_some())
     }
+
+    /// Whether the task's own fields allow it to be a live feedback item, one that takes
+    /// reports: a feedback item that is unresolved and not closed, or declined, routed or a
+    /// duplicate. Whether one of the latter is live depends on the task it names, which only
+    /// the server sees (`live` on `GET /v1/tasks`), so a true answer is not proof. Clients
+    /// use a false one to spot a server that ignored the filter.
+    pub fn may_be_live(&self) -> bool {
+        let Some(feedback) = &self.feedback else {
+            return false;
+        };
+        match feedback.resolution.as_ref().map(|r| r.kind) {
+            None => !self.status.is_closed(),
+            Some(ResolutionKind::Forwarded | ResolutionKind::Fixed) => false,
+            // `Unknown` is a kind from a newer server, which may take reports.
+            Some(
+                ResolutionKind::Declined
+                | ResolutionKind::Routed
+                | ResolutionKind::Duplicate
+                | ResolutionKind::Unknown,
+            ) => true,
+        }
+    }
 }
 
 /// What the reporter was doing when a setup cost it a step.
@@ -714,5 +736,42 @@ mod tests {
         let read: Task = serde_json::from_value(task).unwrap();
         assert!(!read.proposal);
         assert_eq!(serde_json::to_value(&read).unwrap()["proposal"], false);
+    }
+
+    #[test]
+    fn may_be_live_reads_a_feedback_items_own_fields() {
+        let task = |status: &str, resolution: Option<&str>| -> Task {
+            let mut feedback = serde_json::json!({
+                "about": "board", "source": "agent", "signature": "board:x", "reports": 1,
+                "reporters": ["t3:a"], "last_reported_at": "2026-11-06T12:00:00Z",
+            });
+            if let Some(kind) = resolution {
+                feedback["resolution"] = serde_json::json!({
+                    "kind": kind, "at": "2026-11-06T12:00:00Z", "by": "user",
+                });
+            }
+            serde_json::from_value(serde_json::json!({
+                "id": "board-feedback-1", "board": "board-feedback", "parent": null,
+                "title": "T", "body": "", "acceptance": "", "status": status,
+                "priority": "p2", "blocked_reason": null, "owner": null, "owner_stale": false,
+                "blockers": [], "ready": false, "auto": false, "created_by": "t3:a",
+                "version": 1, "created_at": "2026-11-06T12:00:00Z",
+                "updated_at": "2026-11-06T12:00:00Z", "feedback": feedback,
+            }))
+            .unwrap()
+        };
+        assert!(task("open", None).may_be_live());
+        assert!(task("doing", None).may_be_live());
+        assert!(!task("done", None).may_be_live());
+        assert!(!task("dropped", None).may_be_live());
+        for kind in ["declined", "routed", "duplicate", "from-a-newer-server"] {
+            assert!(task("done", Some(kind)).may_be_live(), "{kind}");
+        }
+        for kind in ["forwarded", "fixed"] {
+            assert!(!task("done", Some(kind)).may_be_live(), "{kind}");
+        }
+        let mut plain = task("open", None);
+        plain.feedback = None;
+        assert!(!plain.may_be_live(), "a plain task takes no reports");
     }
 }
