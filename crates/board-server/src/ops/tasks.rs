@@ -805,6 +805,21 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         && !task.owner_stale
         && !task.status.is_closed()
     {
+        // A stand-in is told its step without counting as a refused claim.
+        if acts_for_ended_owner(cx, &task, agent)? {
+            return Err(bad_transition(
+                format!(
+                    "{id} is {} and its owner {}'s session has ended; claim does not take it",
+                    status_str(task.status),
+                    owner_desc(cx, owner)?
+                ),
+                format!(
+                    "you created {id} or delegated its owner: take it with {}, or move or \
+                     close it as its owner would",
+                    take_hint(id)
+                ),
+            ));
+        }
         return Err(refused(
             format!("claim refused: {} owns {id}", owner_desc(cx, owner)?),
             "pick another task from ready (task_list ready=true)",
@@ -960,7 +975,8 @@ pub(crate) fn record_refusal(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> 
     Ok(())
 }
 
-/// Takes a task whose owner is stale.
+/// Takes a task whose owner is stale, or whose owner's session ended when the caller
+/// stands in for it ([`acts_for_ended_owner`]).
 pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
     touch_agent(cx, agent)?;
     let task = get_task(cx, id)?;
@@ -979,14 +995,15 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
             format!("reopen it first (task_update {id} status=open) if it needs more work"),
         ));
     }
-    if !task.owner_stale {
+    let stand_in = !task.owner_stale;
+    if stand_in && !acts_for_ended_owner(cx, &task, agent)? {
         let hours = cx.s.owner_stale_after_secs / 3600;
         return Err(refused(
             format!(
                 "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
                 owner_desc(cx, &owner)?
             ),
-            "pick another task from ready (task_list ready=true)",
+            format!("pick another task from ready (task_list ready=true); {STAND_IN_RULE}"),
         ));
     }
     let status = match task.status {
@@ -1012,23 +1029,110 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
         agent.as_str(),
         EventType::TaskTaken,
         Some(id),
-        serde_json::json!({ "from": owner, "status": status }),
+        if stand_in {
+            serde_json::json!({ "from": owner, "status": status, "stand_in": true })
+        } else {
+            serde_json::json!({ "from": owner, "status": status })
+        },
     )?;
     get_task(cx, id)
 }
 
-fn require_owner(task: &Task, agent: &AgentId, action: &str) -> Result<()> {
+/// The query of [`acts_for_ended_owner`]: whether `?3` delegated `?1`, directly or through
+/// its own children, within depth `?2`.
+pub(crate) const DELEGATED_BY: &str = concat!(
+    "WITH RECURSIVE ",
+    crate::ops::leases::delegated_up_cte!(),
+    " SELECT EXISTS (SELECT 1 FROM up WHERE depth > 0 AND id = ?3)"
+);
+
+/// Whether `owner`'s session has ended with nothing of it left to come back: its state is
+/// `ended`, with no usage-limit reset ahead, and no thread it delegated (at any depth) is
+/// at work, as [`DELEGATE_AT_WORK`] judges for the idle sweep.
+fn owner_session_ended(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+    let now = cx.now_ms();
+    let ended = cx
+        .db
+        .query_row(
+            "SELECT state = 'ended' AND (paused_until IS NULL OR paused_until <= ?2) \
+             FROM agents WHERE id = ?1",
+            params![owner.as_str(), now],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !ended {
+        return Ok(false);
+    }
+    let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
+        params![
+            owner.as_str(),
+            crate::ops::leases::DELEGATION_DEPTH,
+            now - cx.s.doing_idle_ms(),
+            now
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(!at_work)
+}
+
+/// Whether `agent` stands in for `task`'s owner (`docs/API.md`, "Tasks"): the owner's
+/// session has ended ([`owner_session_ended`]), and `agent` created the task (unless it is
+/// a feedback item, whose creator is only its reporter) or delegated the owner (a T3 thread
+/// whose `t3_parent` chain leads from the owner to `agent`). Such an agent may take the
+/// task at once and move, hand over, release or close it as its owner may, so a parent
+/// can finish what its finished child still owns.
+fn acts_for_ended_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<bool> {
+    let Some(owner) = task.owner.as_ref().filter(|o| *o != agent) else {
+        return Ok(false);
+    };
+    let created = task.created_by == *agent && task.feedback.is_none();
+    let delegated = created
+        || cx.db.prepare_cached(DELEGATED_BY)?.query_row(
+            params![
+                owner.as_str(),
+                crate::ops::leases::DELEGATION_DEPTH,
+                agent.as_str()
+            ],
+            |r| r.get(0),
+        )?;
+    Ok(delegated && owner_session_ended(cx, owner)?)
+}
+
+/// What the task's creator or the agent that delegated its owner may do once the owner's
+/// session ends, for refusals of other callers.
+const STAND_IN_RULE: &str = "the task's creator and the agents that \
+     delegated its owner may take, move or close it once the owner's session has ended";
+
+/// The owner of `task`, or an agent standing in for it ([`acts_for_ended_owner`]), may go
+/// on; anyone else is refused, with the step that fits the caller.
+fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Result<()> {
     match &task.owner {
         Some(owner) if owner == agent => Ok(()),
+        Some(_) if acts_for_ended_owner(cx, task, agent)? => Ok(()),
         Some(owner) => Err(forbidden(
-            format!("only the owner {owner} may {action} {}", task.id),
+            format!(
+                "only the owner {owner} may {action} {} while its session runs",
+                task.id
+            ),
             if task.owner_stale {
                 format!(
                     "the owner is stale: take it first with {}",
                     take_hint(&task.id)
                 )
+            } else if owner_session_ended(cx, owner)?
+                && crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
+            {
+                format!(
+                    "the owner's session has ended; with the board's coordinator rights, hand \
+                     it to yourself first (task_update {} owner={agent}), then {action} it",
+                    task.id
+                )
             } else {
-                format!("add a note instead (task_note {})", task.id)
+                format!(
+                    "ask the owner in a note (task_note {}); {STAND_IN_RULE}",
+                    task.id
+                )
             },
         )),
         None => Err(forbidden(
@@ -1039,9 +1143,9 @@ fn require_owner(task: &Task, agent: &AgentId, action: &str) -> Result<()> {
 }
 
 /// Who may change the status of `task` (`docs/API.md`, "Tasks"): anyone while it has no
-/// owner or is closed; otherwise its owner, the board's coordinator (or a live judge of the
-/// board) or the user. Others
-/// take a stale owner's task first, which is logged.
+/// owner or is closed; otherwise its owner, an agent standing in for an owner whose session
+/// ended ([`acts_for_ended_owner`]), the board's coordinator (or a live judge of the board)
+/// or the user. Others take a stale owner's task first, which is logged.
 fn require_status_rights(
     cx: &Ctx<'_>,
     task: &Task,
@@ -1055,12 +1159,13 @@ fn require_status_rights(
     if crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)? {
         return Ok(());
     }
-    require_owner(task, agent, action)
+    require_owner(cx, task, agent, action)
 }
 
-/// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, the board's
-/// coordinator (or a live judge of the board) or the user. `owned` is whether the task has an owner once the request's
-/// status change applies, and `to` that status. The target must be a live agent.
+/// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, an agent standing in
+/// for an owner whose session ended ([`acts_for_ended_owner`]), the board's coordinator (or a
+/// live judge of the board) or the user. `owned` is whether the task has an owner once the
+/// request's status change applies, and `to` that status. The target must be a live agent.
 fn check_handover(
     cx: &Ctx<'_>,
     task: &Task,
@@ -1073,12 +1178,14 @@ fn check_handover(
     let id = &task.id;
     let allowed = by_user
         || task.owner.as_ref() == Some(agent)
-        || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?;
+        || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
+        || acts_for_ended_owner(cx, task, agent)?;
     if !allowed {
         return Err(match &task.owner {
             Some(owner) => forbidden(
                 format!(
-                    "only the owner {owner}, the board's coordinator or the user may hand {id} over"
+                    "only the owner {owner}, the board's coordinator or the user may hand {id} \
+                     over while the owner's session runs"
                 ),
                 if task.owner_stale {
                     format!(
@@ -1086,7 +1193,7 @@ fn check_handover(
                         take_hint(id)
                     )
                 } else {
-                    format!("ask the owner in a note (task_note {id})")
+                    format!("ask the owner in a note (task_note {id}); {STAND_IN_RULE}")
                 },
             ),
             None => forbidden(
@@ -1214,7 +1321,7 @@ pub(crate) fn release(
     let task = get_task(cx, id)?;
     if task.owner.is_none() {
         // Nothing to release: refused with the "claim it first" hint.
-        require_owner(&task, agent, "release")?;
+        require_owner(cx, &task, agent, "release")?;
     }
     require_status_rights(cx, &task, agent, by_user, "release")?;
     if task.status.is_closed() {
@@ -1533,7 +1640,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     if req.version != task.version {
         return Err(version_conflict(&task, req.version));
     }
-    require_owner(&task, &req.agent, "complete")?;
+    require_owner(cx, &task, &req.agent, "complete")?;
     // The owner closes its blocked task directly: the wait often ends off the board, and
     // resuming it first would hit the doing limit. Done clears `blocked_reason`.
     if !matches!(

@@ -11,7 +11,9 @@ use crate::db::{live_sql, ready_sql};
 use crate::ops::asks::BY_TELEGRAM_MESSAGE;
 use crate::ops::feedback::{CLUSTER, CLUSTER_ERRORS, CLUSTER_REPORTERS};
 use crate::ops::leases::DELEGATION_FAMILY;
-use crate::ops::tasks::{AWAY_SINCE, DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN, TOLD};
+use crate::ops::tasks::{
+    AWAY_SINCE, DELEGATE_AT_WORK, DELEGATED_BY, ENTERED_DOING, LAST_RUN, TOLD,
+};
 use crate::snapshot::{
     ALERT_EVENTS, ALERTS_LEFT, RECENT_OFF_BOARD, RECENT_ON_BOARD, RECENT_SCAN, recent_candidates,
 };
@@ -230,6 +232,15 @@ async fn hot_queries_search_indexes_instead_of_scanning_or_sorting() {
         let p = plan(&t, sql);
         assert!(p.contains("USING INDEX agents_t3_parent"), "{p}");
     }
+
+    // Who delegated a task's owner, as a stand-in's request checks: up the chain one agent
+    // at a time by primary key, no scan of agents.
+    let p = plan(&t, DELEGATED_BY);
+    assert!(
+        p.contains("SEARCH a USING INDEX sqlite_autoindex_agents_1 (id=?)"),
+        "{p}"
+    );
+    assert!(!p.contains("SCAN a"), "{p}");
 
     // The idle-owner sweep: an owner's own events along `events_actor`, read backwards for
     // its last run; a task's along `events_task`. No scan of events, no sort.
