@@ -137,10 +137,16 @@ pub(crate) fn update(
     cx: &mut Ctx<'_>,
     actor: &str,
     slug: &BoardSlug,
-    req: UpdateBoard,
+    mut req: UpdateBoard,
     by_user: bool,
 ) -> Result<Board> {
     let before = get_board(cx, slug)?;
+    // The user keeps the feedback board on whatever other boards do, so triage never stops.
+    // A pause of it is dropped, not refused, so an older client's `board pause` of every
+    // board goes on to the rest. Closing it, to retire or delete it, is a separate act.
+    if *slug == cx.s.feedback_board && req.status == Some(BoardStatus::Paused) {
+        req.status = None;
+    }
     if req.temporary == Some(true) && !before.temporary && !by_user {
         return Err(forbidden(
             format!("only the user may make board {slug} temporary"),
@@ -166,15 +172,6 @@ pub(crate) fn update(
             format!("only the user may raise usage_stop_at on board {slug}"),
             "a higher stop lets the board spend more of the shared usage limit; ask the user \
              (ask_user) to raise it",
-        ));
-    }
-    // The user keeps the feedback board on whatever other boards do, so triage never stops.
-    // Closing it, to retire or delete it, is a separate act and stays open.
-    if *slug == cx.s.feedback_board && req.status == Some(BoardStatus::Paused) {
-        return Err(bad_transition(
-            format!("board {slug} is the feedback board, which always stays active"),
-            "leave it out: pause other boards by name (board pause <slug>…); board pause \
-             with no names already skips it",
         ));
     }
     let mut fields = Vec::new();
@@ -222,24 +219,6 @@ pub(crate) fn update(
     );
     if fields.is_empty() {
         return Ok(before);
-    }
-    // The feedback board cannot be paused any more, but one paused before that rule is
-    // resumed with any other board, its event recorded first.
-    if before.status == BoardStatus::Paused
-        && req.status == Some(BoardStatus::Active)
-        && *slug != cx.s.feedback_board
-    {
-        let feedback = cx.s.feedback_board.clone();
-        if cx.exists(
-            "SELECT 1 FROM boards WHERE slug = ?1 AND status = 'paused'",
-            [feedback.as_str()],
-        )? {
-            let resume = UpdateBoard {
-                status: Some(BoardStatus::Active),
-                ..UpdateBoard::default()
-            };
-            update(cx, actor, &feedback, resume, by_user)?;
-        }
     }
     // A status change names the new status, so a daemon can wake a resumed board's
     // coordinator without reading the board.
@@ -379,6 +358,24 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         )?;
     }
     Ok(())
+}
+
+/// Resumes the feedback board when it is paused, a state left from servers that allowed it,
+/// as the server, so the daemon wakes its coordinator. Returns whether it did.
+pub(crate) fn resume_feedback_board(cx: &mut Ctx<'_>) -> Result<bool> {
+    let slug = cx.s.feedback_board.clone();
+    if !cx.exists(
+        "SELECT 1 FROM boards WHERE slug = ?1 AND status = 'paused'",
+        [slug.as_str()],
+    )? {
+        return Ok(false);
+    }
+    let resume = UpdateBoard {
+        status: Some(BoardStatus::Active),
+        ..UpdateBoard::default()
+    };
+    update(cx, "server", &slug, resume, false)?;
+    Ok(true)
 }
 
 /// What the sweep did to one temporary board.

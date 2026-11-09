@@ -239,16 +239,14 @@ server's minute sweep deletes older ones.
   An update that changes `status` adds the new one to the `board_updated` payload
   (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
   reads `active` (see `DESIGN.md`, "Pausing work"). The server's feedback board
-  (`defaults.feedback_board`) is never paused: `status: paused` for it is refused with
-  `400 invalid_transition`, for the user too (closing it is allowed). An update that
-  moves another board from `paused` to `active` first moves the feedback board to `active`
-  when it is paused (a state left from servers before that rule), in the same write, with
-  its own `board_updated` event recorded first. `board pause [<slug>…]` and
-  `board resume [<slug>…]` set every active (or paused) board, or those named, with this
-  endpoint; `--json` prints the changed `[Board]` list. A pause skips the device's
-  feedback board and fails before any change when it is named. A resume sends the
-  feedback board first when it is among the targets, then reads the boards again and lists
-  first any board the server resumed along with them.
+  (`defaults.feedback_board`) is never paused: the server drops `status: paused` for it,
+  for the user too, applies the rest of the update and answers `200` with the board
+  still `active` (closing it is allowed). The minute sweep sets a feedback board left
+  `paused` by an older server back to `active`, recorded as `board_updated` by `server`.
+  `board pause [<slug>…]` and `board resume [<slug>…]` set every active (or paused) board,
+  or those named, with this endpoint; `--json` prints the changed `[Board]` list. A board
+  the server kept active is left out of that list, and the text lists it apart, as does
+  `board board update --status paused`.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by

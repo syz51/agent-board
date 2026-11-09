@@ -684,23 +684,45 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
             with(slug, BoardStatus::Paused),
         );
     }
+    // The server keeps its feedback board active and says so in its answer.
+    e.stub.on(
+        "PATCH /v1/boards/board-feedback",
+        with("board-feedback", BoardStatus::Active),
+    );
     let out = e.run(&["pause"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.starts_with("paused 2 boards:"), "{text}");
     assert!(text.contains("alpha") && text.contains("beta") && !text.contains("gamma"));
-    for slug in ["alpha", "beta"] {
+    assert!(
+        text.trim_end().ends_with(
+            "\nboard-feedback stays active: the server never pauses its feedback board, so \
+             triage goes on"
+        ),
+        "{text}"
+    );
+    for slug in ["alpha", "beta", "board-feedback"] {
         let body = &e.stub.requests_to(&format!("PATCH /v1/boards/{slug}"))[0].body;
         assert_eq!(body["status"], "paused", "{body}");
         assert_eq!(body["autopilot"], Value::Null, "autopilot stays as it is");
     }
     assert!(e.stub.requests_to("PATCH /v1/boards/gamma").is_empty());
     assert!(e.stub.requests_to("PATCH /v1/boards/old").is_empty());
+
+    // Named alone, it is the only board asked, and none is paused.
+    let out = e.run(&["pause", "board-feedback"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
     assert!(
-        e.stub
-            .requests_to("PATCH /v1/boards/board-feedback")
-            .is_empty(),
-        "the feedback board always stays active"
+        text.starts_with("no boards paused\nboard-feedback stays active:"),
+        "{text}"
+    );
+    let out = e.run(&["board", "update", "board-feedback", "--status", "paused"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("\nboard-feedback stays active: the server never pauses"),
+        "{}",
+        stdout(&out)
     );
 
     // Resume, named: only that board, even with others paused.
@@ -725,10 +747,6 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     for (args, says) in [
         (["pause", "nope"], "no board nope"),
         (["pause", "old"], "board old is closed"),
-        (
-            ["pause", "board-feedback"],
-            "board board-feedback is the feedback board, which always stays active",
-        ),
     ] {
         let out = e.run(&args);
         assert!(!out.status.success());
@@ -740,90 +758,6 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
             .all(|r| r.method == "GET"),
         "no board changed"
     );
-}
-
-#[test]
-fn resume_lists_and_resumes_the_feedback_board_first() {
-    use board_proto::BoardStatus;
-    let e = env();
-    let with = |slug: &str, status: BoardStatus| {
-        let mut b = board_fixture(slug, &[]);
-        b.status = status;
-        b
-    };
-    let slugs = ["alpha", "beta", "board-feedback"];
-    // The first read sees alpha and the feedback board paused; the read back sees the
-    // server's answer, every board active.
-    let before = |e: &Env| {
-        e.stub.clear();
-        e.stub.once(
-            "GET /v1/boards",
-            slugs.map(|s| {
-                let paused = s != "beta";
-                with(
-                    s,
-                    if paused {
-                        BoardStatus::Paused
-                    } else {
-                        BoardStatus::Active
-                    },
-                )
-            }),
-        );
-    };
-    e.stub.on(
-        "GET /v1/boards",
-        slugs.map(|s| with(s, BoardStatus::Active)),
-    );
-    for slug in ["alpha", "board-feedback"] {
-        e.stub.on(
-            &format!("PATCH /v1/boards/{slug}"),
-            with(slug, BoardStatus::Active),
-        );
-    }
-    let patches = |e: &Env| -> Vec<String> {
-        e.stub
-            .requests()
-            .iter()
-            .filter(|r| r.method == "PATCH")
-            .map(|r| r.path.clone())
-            .collect()
-    };
-    let listed = |text: &str| -> Vec<String> {
-        text.lines()
-            .skip(1)
-            .map(|l| l.split_whitespace().next().unwrap().to_owned())
-            .collect()
-    };
-
-    // Every paused board: the feedback board first, though it sorts after alpha.
-    before(&e);
-    let out = e.run(&["resume"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    let text = stdout(&out);
-    assert!(text.starts_with("resumed 2 boards:"), "{text}");
-    assert_eq!(listed(&text), ["board-feedback", "alpha"], "{text}");
-    assert_eq!(
-        patches(&e),
-        ["/v1/boards/board-feedback", "/v1/boards/alpha"]
-    );
-
-    // Named without it: only alpha is sent; the feedback board the server resumed along
-    // with it is read back and listed first.
-    before(&e);
-    let out = e.run(&["resume", "alpha"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    let text = stdout(&out);
-    assert!(text.starts_with("resumed 2 boards:"), "{text}");
-    assert_eq!(listed(&text), ["board-feedback", "alpha"], "{text}");
-    assert_eq!(patches(&e), ["/v1/boards/alpha"]);
-
-    // Naming only boards that are not paused resumes nothing and reads nothing back.
-    before(&e);
-    let out = e.run(&["resume", "beta"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out).trim(), "no boards resumed: none was paused");
-    assert!(patches(&e).is_empty());
 }
 
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the
