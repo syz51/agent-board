@@ -135,8 +135,6 @@ pub struct Timing {
     /// seconds) is taken as dead and opened again after `last_seq`.
     pub stream_idle: Duration,
     /// A reconcile still running after this long is stopped and runs again on its next tick.
-    /// A coordinator start still running at nine tenths of it is stopped and counts as
-    /// failed; none begins after that.
     pub reconcile_budget: Duration,
     /// Checking the queued wake-ups before a flush sends them stops after this long; the
     /// queues not checked by then back off.
@@ -1278,22 +1276,22 @@ impl<T: T3> Daemon<T> {
 
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
-        let began = tokio::time::Instant::now();
-        let checks_until = began + self.timing.reconcile_budget / 2;
-        // Starts are cut at nine tenths of the budget, so a start cut short still releases
-        // its lease and the reconcile still saves what it did.
-        let starts_until = began + self.timing.reconcile_budget * 9 / 10;
+        let checks_until = tokio::time::Instant::now() + self.timing.reconcile_budget / 2;
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         // After the thread checks, so a slow usage read never takes their time.
         self.refresh_usage(now).await;
-        // Boards whose last start failed go last: a retry can wait out a git or T3 timeout
-        // (git waits on a macOS privacy prompt, for one), which would otherwise spend the
-        // reconcile's budget and leave the boards after it unstarted.
+        // Boards whose last start failed go last: a retry can wait out a git or T3 timeout,
+        // which would otherwise spend the reconcile's budget and leave the boards after it
+        // unstarted. Not one whose hosting settings changed since, which is new intent.
         let mut order: Vec<&Board> = boards.iter().collect();
-        order.sort_by_key(|board| self.failures.contains_key(&board.slug));
+        order.sort_by_key(|board| {
+            self.failures
+                .get(&board.slug)
+                .is_some_and(|failure| failure.config == HostingConfig::of(board))
+        });
         for board in order {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -1322,7 +1320,7 @@ impl<T: T3> Daemon<T> {
                 }
                 None => None,
             };
-            if let Err(err) = self.reconcile_board(board, now, check, starts_until).await {
+            if let Err(err) = self.reconcile_board(board, now, check).await {
                 tracing::warn!("coordinator of {}: {err:#}", board.slug);
             }
         }
@@ -1473,7 +1471,6 @@ impl<T: T3> Daemon<T> {
         board: &Board,
         now: Timestamp,
         check: Option<Result<bool>>,
-        starts_until: tokio::time::Instant,
     ) -> Result<()> {
         let slug = &board.slug;
         let project = self.project_for(board).map(|(_, project)| project);
@@ -1528,11 +1525,17 @@ impl<T: T3> Daemon<T> {
                     Err(err) => return Err(err),
                 };
                 if live {
-                    return if named {
+                    let kept = if named {
                         self.keep_alive(board, local, info, now).await
                     } else {
                         self.adopt(board, local, now).await
                     };
+                    // A start that recorded its thread and then failed or was cut short
+                    // is over once the thread is kept: the board no longer goes last.
+                    if kept.is_ok() {
+                        self.failures.remove(slug);
+                    }
+                    return kept;
                 }
                 tracing::warn!(
                     "coordinator of {slug}: thread {} is gone, archived or its folder is missing; replacing it",
@@ -1601,42 +1604,18 @@ impl<T: T3> Daemon<T> {
         {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= starts_until {
-            tracing::warn!(
-                "coordinator of {slug}: the reconcile ran out of time before its start; started on the next reconcile"
-            );
-            return Ok(());
-        }
-        let start = async {
-            match adoption {
-                Some(adoption) => self.adopt_thread(board, adoption, now).await,
-                None => self.start_coordinator(board, now).await,
-            }
+        // Counted as failed until it succeeds, so a start the reconcile's budget cuts short
+        // (git or T3 waiting out its timeout) still backs off and goes last. Its lease stays
+        // held: T3 may have made the thread, which the pending start mark finds.
+        self.note_failure(board, now);
+        let started = match adoption {
+            Some(adoption) => self.adopt_thread(board, adoption, now).await,
+            None => self.start_coordinator(board, now).await,
         };
-        let started = match tokio::time::timeout_at(starts_until, start).await {
-            Ok(started) => started,
-            // Counted as a failure, so the board waits and then goes last, and its lease
-            // goes at once rather than when it expires. A thread T3 made meanwhile is found
-            // through the pending start mark.
-            Err(_) => {
-                if !self.state.coordinators.contains_key(slug) {
-                    self.release(slug).await;
-                }
-                Err(anyhow::anyhow!(
-                    "its start was still running when the reconcile ran out of time; tried again after a delay"
-                ))
-            }
-        };
-        match started {
-            Ok(()) => {
-                self.failures.remove(slug);
-                Ok(())
-            }
-            Err(err) => {
-                self.note_failure(board, now);
-                Err(err)
-            }
+        if started.is_ok() {
+            self.failures.remove(slug);
         }
+        started
     }
 
     /// Delays the next start on `board`: doubled after each failure, reset when its hosting

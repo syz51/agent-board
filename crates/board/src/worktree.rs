@@ -17,7 +17,13 @@ use board_proto::{BoardSlug, Timestamp};
 
 use crate::t3::NewWorktree;
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// A git command that only reads the repository answers in well under a second, unless
+/// something holds it, such as a macOS privacy prompt for a protected folder, which git
+/// waits on with no end. So a stuck start fails soon instead of spending the daemon's
+/// reconcile on one board.
+const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A fetch, which waits on the network.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The branch the coordinator of `slug` runs on when it is free.
 pub fn coordinator_branch(slug: &BoardSlug) -> String {
@@ -48,7 +54,12 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
     let Ok(folder) = project.canonicalize() else {
         return Ok(false);
     };
-    let out = git(project, &["rev-parse", "--show-toplevel"]).await?;
+    let out = git(
+        project,
+        &["rev-parse", "--show-toplevel"],
+        LOCAL_GIT_TIMEOUT,
+    )
+    .await?;
     if !out.ok {
         if out.stderr.contains("not a git repository") {
             return Ok(false);
@@ -75,6 +86,7 @@ async fn default_base(project: &Path) -> Result<String> {
             "--short",
             "refs/remotes/origin/HEAD",
         ],
+        LOCAL_GIT_TIMEOUT,
     )
     .await?;
     let mut base = head
@@ -101,7 +113,13 @@ async fn default_base(project: &Path) -> Result<String> {
     };
     if let Some(name) = base.strip_prefix("origin/") {
         // A stale remote branch would start the coordinator, and its children, on old code.
-        match git(project, &["fetch", "--quiet", "origin", name]).await {
+        match git(
+            project,
+            &["fetch", "--quiet", "origin", name],
+            FETCH_TIMEOUT,
+        )
+        .await
+        {
             Ok(out) if out.ok => {}
             Ok(out) => tracing::warn!(
                 "fetching {base} in {}: {}; starting from the local copy",
@@ -118,7 +136,12 @@ async fn default_base(project: &Path) -> Result<String> {
 }
 
 async fn has_ref(project: &Path, full: &str) -> Result<bool> {
-    let out = git(project, &["rev-parse", "--verify", "--quiet", full]).await?;
+    let out = git(
+        project,
+        &["rev-parse", "--verify", "--quiet", full],
+        LOCAL_GIT_TIMEOUT,
+    )
+    .await?;
     Ok(out.ok)
 }
 
@@ -128,8 +151,8 @@ struct GitOutput {
     stderr: String,
 }
 
-/// Runs `git -C <project> <args>` and returns its output.
-async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
+/// Runs `git -C <project> <args>` and returns its output, stopping it after `timeout`.
+async fn git(project: &Path, args: &[&str], timeout: Duration) -> Result<GitOutput> {
     let child = tokio::process::Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")
@@ -153,7 +176,7 @@ async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
             .unwrap_or_else(|_| project.to_path_buf());
         privacy_hint(dirs::home_dir().as_deref(), &project).unwrap_or_default()
     };
-    let out = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
+    let out = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .with_context(|| {
             format!(
@@ -163,16 +186,22 @@ async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
                 hint()
             )
         })??;
-    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // What git says once the user denied the prompt.
-    if !out.status.success() && stderr.contains("Operation not permitted") {
-        stderr.push_str(hint());
-    }
+    let ok = out.status.success();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     Ok(GitOutput {
-        ok: out.status.success(),
+        ok,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr,
+        stderr: with_denial_hint(ok, stderr, hint),
     })
+}
+
+/// Git's error output, with the privacy hint after it when git failed on a folder macOS
+/// denied it, as it does once the user refused the prompt.
+fn with_denial_hint(ok: bool, stderr: String, hint: impl FnOnce() -> &'static str) -> String {
+    if ok || !stderr.contains("Operation not permitted") {
+        return stderr;
+    }
+    format!("{}{}", stderr.trim_end(), hint())
 }
 
 /// What a git timeout or denial in `project` adds on macOS when the folder is one macOS
@@ -223,6 +252,48 @@ mod tests {
         assert_eq!(hint("/Users/u/Developer/repo"), None);
         assert_eq!(hint("/Users/u/DocumentsOld/repo"), None);
         assert_eq!(privacy_hint(None, Path::new("/Users/u/Documents/x")), None);
+    }
+
+    #[test]
+    fn a_denied_folder_adds_the_hint_on_the_same_line() {
+        let hint = || ": macOS may be keeping board out of this folder";
+        let denied =
+            "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted\n".to_owned();
+        assert_eq!(
+            with_denial_hint(false, denied, hint),
+            "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted: macOS may be keeping board out of this folder"
+        );
+        let other = "fatal: not a git repository\n".to_owned();
+        assert_eq!(with_denial_hint(false, other.clone(), hint), other);
+        assert_eq!(
+            with_denial_hint(true, "Operation not permitted\n".into(), hint),
+            "Operation not permitted\n",
+            "not on success"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_command_that_hangs_is_stopped_at_its_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reading a FIFO with no writer blocks, as git does on an unanswered macOS prompt.
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let err = git(
+            dir.path(),
+            &["hash-object", "fifo"],
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            format!("{err:#}").contains("git hash-object fifo timed out in"),
+            "{err:#}"
+        );
     }
 
     /// Runs git in `dir` with no user or system config, so signing or hooks set there do not

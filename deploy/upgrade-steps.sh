@@ -27,44 +27,58 @@ compose() {
 # use, so macOS privacy grants survive upgrades. `cargo install` leaves an ad-hoc signature
 # that macOS knows only by its hash, so every build lost the grant (such as Documents access,
 # which board watch needs for repositories there) and git waited on a new prompt. The key
-# is in its own keychain, unlocked with a random password in a 0600 file beside it.
-# Each failure says what failed.
+# is in its own keychain, unlocked with a random password in a 0600 file beside it, and
+# locked again after signing. Each failure says what failed.
 sign_board() {
     dir="$HOME/Library/Application Support/agent-board/signing"
     keychain="$dir/signing.keychain-db"
     name="agent-board code signing"
     bin="${CARGO_HOME:-$HOME/.cargo}/bin/board"
     (umask 077 && mkdir -p "$dir") || return 1
-    # A keychain that does not unlock or holds no identity, as a run cut short leaves it,
-    # is made again.
-    if ! id=$(signing_id); then
-        echo "upgrade: making the code-signing identity in $dir"
-        rm -f "$keychain" "$dir/password"
-        if ! make_signing_identity; then
-            rm -f "$keychain" "$dir/password"
+    # Made again only when a run cut short left it without its password, keychain or
+    # certificate. A keychain that holds the certificate is never replaced: a new key would
+    # lose every privacy grant made for the old one.
+    remake=no
+    if [ -s "$dir/password" ] && [ -f "$keychain" ]; then
+        security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
+            echo "upgrade: could not unlock $keychain with the password beside it"
             return 1
-        fi
-        id=$(signing_id) || {
-            echo "upgrade: $keychain holds no usable identity named \"$name\" right after it was made"
+        }
+        security find-certificate -c "$name" "$keychain" >/dev/null 2>&1 || remake=yes
+    else
+        remake=yes
+    fi
+    if [ "$remake" = yes ]; then
+        echo "upgrade: making the code-signing identity in $dir"
+        forget_signing_identity
+        make_signing_identity || {
+            forget_signing_identity
             return 1
         }
     fi
-    codesign --force --keychain "$keychain" -s "$id" --identifier dev.agent-board.board "$bin" || {
+    signed=no
+    if ! id=$(signing_id); then
+        echo "upgrade: $keychain holds the certificate \"$name\" but no identity codesign can use"
+    elif ! codesign --force --keychain "$keychain" -s "$id" --identifier dev.agent-board.board "$bin"; then
         echo "upgrade: codesign could not sign $bin"
-        return 1
-    }
-    codesign -d -r- "$bin" 2>&1 | grep -q 'certificate leaf' || {
+    elif ! codesign -d -r- "$bin" 2>&1 | grep -q 'certificate leaf'; then
         echo "upgrade: codesign ran, but the signature of $bin names no certificate"
-        return 1
-    }
+    else
+        signed=yes
+    fi
+    security lock-keychain "$keychain" || echo "upgrade: could not lock $keychain again"
+    [ "$signed" = yes ]
 }
-# Unlocks the keychain and prints the hash of its identity; fails without one.
+# Prints the hash of the unlocked keychain's identity; fails without one.
 signing_id() {
-    [ -s "$dir/password" ] && [ -f "$keychain" ] || return 1
-    security unlock-keychain -p "$(cat "$dir/password")" "$keychain" 2>/dev/null || return 1
     # Listed as untrusted, which codesign accepts: macOS needs only the same key each time.
     security find-identity -p codesigning "$keychain" |
         grep -F "\"$name\"" | awk '{ print $2; found = 1; exit } END { exit !found }'
+}
+# Removes the keychain, from macOS's keychain list too, and its password.
+forget_signing_identity() {
+    security delete-keychain "$keychain" 2>/dev/null || true
+    rm -f "$keychain" "$dir/password"
 }
 # Makes the password and a keychain that holds the identity. A subshell, so its trap
 # removes the unencrypted key however it ends.

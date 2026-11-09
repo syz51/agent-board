@@ -144,21 +144,33 @@ esac
     ),
     // Linux, unless STUB_OS names another system, so a run on a Mac stays off its keychain.
     ("uname", "#!/bin/sh\necho \"${STUB_OS:-Linux}\"\n"),
-    // A keychain is a file, empty until the identity is imported; the rest succeeds.
+    // A keychain is a file, empty until the identity is imported; one that holds only
+    // `certificate` has a certificate but no identity. Unlocking, locking and deleting are logged.
     (
         "security",
         r#"#!/bin/sh
 case "$1" in
 create-keychain) : > "$4" ;;
 import) echo identity > "$4" ;;
+unlock-keychain)
+    [ -z "${STUB_FAIL_UNLOCK:-}" ] || { echo "security: The user name or passphrase you entered is not correct." >&2; exit 51; }
+    echo "${STUB_HOST:-local} unlock" >> "$STATE/log"
+    ;;
+lock-keychain) echo "${STUB_HOST:-local} lock" >> "$STATE/log" ;;
+delete-keychain)
+    rm -f "$2"
+    echo "${STUB_HOST:-local} delete-keychain" >> "$STATE/log"
+    ;;
+find-certificate) [ -s "$4" ] ;;
 find-identity)
-    [ -s "$4" ] || { echo '     0 valid identities found'; exit 0; }
+    grep -qx identity "$4" || { echo '     0 valid identities found'; exit 0; }
     printf '  1) 0123ABCD "agent-board code signing"\n     1 valid identities found\n'
     ;;
 esac
 "#,
     ),
-    // Logs `<host> sign <identity> <identifier>`; `-d` shows the requirement of a signed binary.
+    // Logs `<host> sign <identity> <identifier> <path>`; `-d` shows the requirement of a
+    // signed binary.
     (
         "codesign",
         r#"#!/bin/sh
@@ -166,7 +178,7 @@ case "$1" in
 -d) echo 'designated => identifier "dev.agent-board.board" and certificate leaf = H"00"' ;;
 *)
     [ -z "${STUB_FAIL_SIGN:-}" ] || { echo "codesign: no identity found" >&2; exit 1; }
-    echo "${STUB_HOST:-local} sign $5 $7" >> "$STATE/log"
+    echo "${STUB_HOST:-local} sign $5 $7 $8" >> "$STATE/log"
     ;;
 esac
 "#,
@@ -332,6 +344,8 @@ impl Env {
             "STUB_FAIL_RESTART",
             "STUB_OS",
             "STUB_FAIL_SIGN",
+            "STUB_FAIL_UNLOCK",
+            "CARGO_HOME",
         ] {
             cmd.env_remove(var);
         }
@@ -887,16 +901,24 @@ fn on_macos_each_device_signs_board_with_one_lasting_identity_before_the_restart
         .skip_while(|l| !l.starts_with("local install"))
         .take_while(|l| !l.contains("server-unlock"))
         .collect();
-    let sign = "sign 0123ABCD dev.agent-board.board";
+    // CARGO_HOME is unset, so board is in ~/.cargo/bin.
+    let sign = format!(
+        "sign 0123ABCD dev.agent-board.board {}",
+        env.root.join("home/.cargo/bin/board").display()
+    );
     assert_eq!(
         device,
         [
             format!("local install {new} commit={}", &new[..12]),
+            "local delete-keychain".into(),
             format!("local {sign}"),
+            "local lock".into(),
             "local restart".into(),
             "laptop device-upgrade".into(),
             format!("laptop install {new} commit={}", &new[..12]),
+            "laptop unlock".into(),
             format!("laptop {sign}"),
+            "laptop lock".into(),
             "laptop restart".into(),
         ]
     );
@@ -921,6 +943,18 @@ fn on_macos_each_device_signs_board_with_one_lasting_identity_before_the_restart
     let log = env.read("log");
     assert!(log.contains(&format!("local {sign}")), "{log}");
     assert!(!log.contains("local install"), "{log}");
+    assert!(!log.contains("delete-keychain"), "{log}");
+}
+
+/// Writes a signing folder as an earlier run left it: this password and keychain content.
+fn signing_folder(env: &Env, keychain: &str) -> PathBuf {
+    let dir = env
+        .root
+        .join("home/Library/Application Support/agent-board/signing");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("password"), "old\n").unwrap();
+    fs::write(dir.join("signing.keychain-db"), keychain).unwrap();
+    dir
 }
 
 #[test]
@@ -938,19 +972,18 @@ fn a_failed_signing_warns_and_still_restarts_the_device() {
     let log = env.read("log");
     assert!(log.contains("local restart"), "{log}");
     assert!(!log.contains(" sign "), "{log}");
+    assert!(
+        log.contains("local lock"),
+        "the keychain stays unlocked: {log}"
+    );
 }
 
 #[test]
 fn a_signing_identity_left_half_made_is_made_again() {
     let env = Env::new();
     let new = &env.main[1];
-    // As a run cut short after `security create-keychain` leaves it: no identity inside.
-    let dir = env
-        .root
-        .join("home/Library/Application Support/agent-board/signing");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("password"), "old\n").unwrap();
-    fs::write(dir.join("signing.keychain-db"), "").unwrap();
+    // As a run cut short after `security create-keychain` leaves it: no certificate inside.
+    let dir = signing_folder(&env, "");
 
     let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
     let (_, err) = text(&out);
@@ -959,10 +992,62 @@ fn a_signing_identity_left_half_made_is_made_again() {
     assert!(!err.contains("could not sign"), "{err}");
     assert_ne!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
     let log = env.read("log");
+    assert!(log.contains("local delete-keychain"), "{log}");
     assert!(
         log.contains("local sign 0123ABCD dev.agent-board.board"),
         "{log}"
     );
+}
+
+#[test]
+fn a_keychain_that_does_not_unlock_is_kept_and_reported() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let dir = signing_folder(&env, "identity\n");
+
+    let out = env.run(
+        &["--yes", new],
+        &[("STUB_OS", "Darwin"), ("STUB_FAIL_UNLOCK", "1")],
+    );
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("passphrase you entered is not correct"),
+        "{err}"
+    );
+    assert!(err.contains("could not unlock"), "{err}");
+    assert!(err.contains("could not sign board"), "{err}");
+    // A new key would lose the privacy grants made for this one.
+    assert_eq!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
+    assert_eq!(
+        fs::read_to_string(dir.join("signing.keychain-db")).unwrap(),
+        "identity\n"
+    );
+    let log = env.read("log");
+    assert!(!log.contains(" sign "), "{log}");
+    assert!(!log.contains("delete-keychain"), "{log}");
+    assert!(log.contains("local restart"), "{log}");
+}
+
+#[test]
+fn a_certificate_without_a_usable_identity_is_kept_and_reported() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let dir = signing_folder(&env, "certificate\n");
+
+    let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("no identity codesign can use"), "{err}");
+    assert!(!err.contains("making the code-signing identity"), "{err}");
+    assert_eq!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
+    assert_eq!(
+        fs::read_to_string(dir.join("signing.keychain-db")).unwrap(),
+        "certificate\n"
+    );
+    let log = env.read("log");
+    assert!(!log.contains(" sign "), "{log}");
+    assert!(log.contains("local lock"), "{log}");
 }
 
 #[test]
