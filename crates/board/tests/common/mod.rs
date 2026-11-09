@@ -162,6 +162,23 @@ impl Stub {
         )
     }
 
+    /// Answers the next request to `route` with `body`, then falls back to the route's usual
+    /// answer.
+    pub fn once(&self, route: &str, body: impl Serialize) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .once
+            .entry(route.to_owned())
+            .or_default()
+            .push_back(Canned {
+                status: 200,
+                body: serde_json::to_value(body).unwrap(),
+                delay: Duration::ZERO,
+            });
+        self
+    }
+
     /// Answers the next request to `route` with an `ApiError`, then falls back to the route's
     /// usual answer.
     pub fn once_error(&self, route: &str, status: u16, code: &str, message: &str) -> &Self {
