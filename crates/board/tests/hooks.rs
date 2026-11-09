@@ -2236,6 +2236,44 @@ fn a_delegated_t3_thread_registers_its_parent() {
     assert_eq!(calls(), 2);
 }
 
+/// T3 gives a delegated child no `watch_pull_request` and the parent's brief is not the
+/// child's to read, so only a delegated thread's own board context names the route for a PR
+/// waiting on checks; a top-level T3 thread and a session outside T3 do not get it. The
+/// thread id alone decides, so T3 need not answer.
+#[test]
+fn only_a_delegated_t3_threads_session_start_names_the_pr_route() {
+    const CHILD: &str = "thread:delegated-task:command%3Amcp%3Ac1%3Adelegate-task%3At1";
+    const ROUTE: &str = "PR waiting on checks: turn on auto-merge where the base branch requires checks, park your task in review with a note naming the PR, report, and end; the thread that delegated you merges it.";
+    let e = env();
+    let no_t3 = e.home.join("no-t3");
+    let start = |thread: Option<&str>| {
+        let agent = thread.map_or(CLAUDE_AGENT.to_owned(), |t| format!("t3:{t}"));
+        e.stub.clear();
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(&agent, DEVICE, AgentState::Running),
+        );
+        e.stub.on(
+            "GET /v1/snapshot",
+            snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+        );
+        let mut env = vec![("T3CODE_CLI_PATH", no_t3.to_str().unwrap())];
+        if let Some(thread) = thread {
+            env.push(("T3CODE_THREAD_ID", thread));
+        }
+        let payload = e.with("SessionStart", json!({"source": "startup"}));
+        let (reply, _) = e.hook_env("session-start", "claude", payload, &env);
+        context(&reply, "SessionStart")
+    };
+
+    assert_eq!(
+        start(Some(CHILD)),
+        format!("{SNAPSHOT}\n{ROUTE}\n{TOOL_SEARCH}")
+    );
+    assert_eq!(start(Some("thread-7")), started());
+    assert_eq!(start(None), started());
+}
+
 /// A `t3` that answers `thread show` with the JSON in `answer` and logs each call to `log`.
 /// A `slow` one answers after 0.7 seconds, as T3 does on a busy Mac: always past the hooks'
 /// own budget for T3 (0.4 seconds), so only a background read gets its answer. It logs a
