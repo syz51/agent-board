@@ -1318,6 +1318,12 @@ const ADOPT_REPO: &str = "github.com/example/infra";
 /// threads `live`, `other-live` and `archived`.
 #[cfg(unix)]
 fn adopt_env() -> Env {
+    adopt_env_mapping(&format!("[projects]\n\"{ADOPT_REPO}\""))
+}
+
+/// [`adopt_env`] with the project folder mapped by `key`, such as `[board_projects]\ninfra`.
+#[cfg(unix)]
+fn adopt_env_mapping(key: &str) -> Env {
     let e = env();
     let t3 = e.home.join("fake-t3");
     common::script::write_script(
@@ -1339,7 +1345,7 @@ esac
     std::fs::write(
         e.home.join("config.toml"),
         format!(
-            "{config}t3_bin = \"{}\"\n\n[projects]\n\"{ADOPT_REPO}\" = \"{}\"\n",
+            "{config}t3_bin = \"{}\"\n\n{key} = \"{}\"\n",
             t3.display(),
             project.display()
         ),
@@ -1488,6 +1494,39 @@ fn board_adopt_saves_the_adoption_and_switches_autopilot_on() {
     assert_eq!(json["autopilot"], true);
 }
 
+/// A board without a mapped repo, such as a feedback board, is adopted in the folder
+/// `[board_projects]` names for it, as the daemon runs it.
+#[cfg(unix)]
+#[test]
+fn board_adopt_uses_the_board_projects_folder_of_a_board_without_a_mapped_repo() {
+    for repos in [Vec::new(), vec!["github.com/o/unmapped".to_owned()]] {
+        let e = adopt_env_mapping("[board_projects]\ninfra");
+        let mut feedback = adopt_board(false, None);
+        feedback.repos = repos;
+        e.stub.on("GET /v1/boards/infra", &feedback);
+        let mut on = feedback.clone();
+        on.autopilot = true;
+        e.stub.on("PATCH /v1/boards/infra", &on);
+
+        let out = board(
+            &e.home,
+            &e.cwd,
+            &[],
+            &["board", "adopt", "infra", "live"],
+            "",
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(adoption_file(&e).unwrap()["thread"], "live");
+        assert_eq!(e.stub.requests_to("PATCH /v1/boards/infra").len(), 1);
+        assert_eq!(
+            e.stub
+                .requests_to("POST /v1/boards/infra/coordinator")
+                .len(),
+            1
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
@@ -1563,7 +1602,8 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
         &format!("this device ({DEVICE}) is not a home device of board infra"),
     );
 
-    // No project for the board's repos on this device.
+    // Neither [projects] nor [board_projects] maps the board on this device: the refusal
+    // names both tables.
     let e = adopt_env();
     let mut elsewhere = adopt_board(false, None);
     elsewhere.repos = vec!["github.com/o/other".into()];
@@ -1571,7 +1611,18 @@ fn board_adopt_refuses_with_the_next_step_and_changes_nothing() {
     refused(
         &e,
         "live",
-        "config.toml has no [projects] path for any repo of board infra",
+        "no T3 project for github.com/o/other on this device: add it under [projects] (or the \
+         board under [board_projects]) in config.toml",
+    );
+    // [board_projects] maps another board only.
+    let e = adopt_env_mapping("[board_projects]\nother");
+    let mut unmapped = adopt_board(false, None);
+    unmapped.repos = Vec::new();
+    e.stub.on("GET /v1/boards/infra", &unmapped);
+    refused(
+        &e,
+        "live",
+        "no T3 project for board infra on this device: add it under [board_projects]",
     );
 
     // A closed board.
