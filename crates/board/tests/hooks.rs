@@ -1521,8 +1521,14 @@ fn a_held_threads_pull_request_update_ends_before_the_model_runs() {
     // Not held: the update is a turn like any other.
     assert!(not_halted(&update(&e)));
 
-    // Held: T3's wake-up for the watched pull request ends at once, the agent idle.
-    serve_hold(&e, true);
+    // Held: T3's wake-up for the watched pull request ends at once. It changes no state:
+    // the agent stays as its last turn left it, unregistered again, and its sequence stays.
+    let mut held = snapshot_fixture(SnapshotKind::Delta, "", 5);
+    held.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    held.held_by = vec!["factory".parse().unwrap()];
+    e.stub.on("GET /v1/snapshot", held);
+    let states = e.stub.requests_to(&state_path()).len();
+    let registers = e.stub.requests_to("POST /v1/agents").len();
     let reply = update(&e).expect("a halt");
     assert_eq!(reply["continue"], false, "{reply}");
     let reason = reply["stopReason"].as_str().unwrap();
@@ -1530,35 +1536,32 @@ fn a_held_threads_pull_request_update_ends_before_the_model_runs() {
         reason.contains("factory paused") && reason.contains("board resume"),
         "{reason}"
     );
-    assert_eq!(
-        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
-        "idle"
-    );
+    assert_eq!(e.stub.requests_to(&state_path()).len(), states);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), registers);
 
-    // The user's own message while held is told, not stopped, and catches up on the
-    // alerts the ended turn fetched with a full snapshot.
+    // The user's own message while held is told, not stopped, and its delta starts where
+    // the ended turn's did, so the server brings again the alerts that one had.
     let (reply, _) = e.hook(
         "user-prompt-submit",
         "claude",
         e.with("UserPromptSubmit", json!({"prompt": "check PR 7"})),
     );
     assert!(context(&reply, "UserPromptSubmit").contains("hold: factory paused"));
-    let kinds: Vec<String> = e
-        .stub
-        .requests_to("GET /v1/snapshot")
-        .iter()
-        .map(|r| r.query_pairs()["kind"].clone())
-        .collect();
-    assert_eq!(kinds[kinds.len() - 2..], ["delta", "full"], "{kinds:?}");
-    prompt(&e, "go on");
-    assert_eq!(
+    let since = |e: &Env| {
         e.stub
             .requests_to("GET /v1/snapshot")
             .last()
             .unwrap()
-            .query_pairs()["kind"],
-        "delta"
+            .query_pairs()["since"]
+            .clone()
+    };
+    assert_eq!(since(&e), "2");
+    assert_eq!(
+        e.stub.requests_to(&state_path()).last().unwrap().body["state"],
+        "running"
     );
+    prompt(&e, "go on");
+    assert_eq!(since(&e), "5");
 }
 
 #[test]

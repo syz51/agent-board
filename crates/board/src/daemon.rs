@@ -63,7 +63,7 @@ use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
-use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
+use crate::t3::{PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
 
 /// The coordinator's standing instructions.
@@ -1266,7 +1266,7 @@ pub fn is_user_message(text: &str) -> bool {
     !from_board
         && !text.starts_with(brief_title)
         && !text.starts_with("Delegated task")
-        && !text.starts_with("Update on pull request")
+        && !text.starts_with(PULL_REQUEST_UPDATE)
         && !text.starts_with("Background task completed")
         && text.trim() != "/compact"
 }
@@ -4687,8 +4687,9 @@ impl<T: T3> Daemon<T> {
                  tasks in doing: send each owner thread a message to continue its task, and \
                  restart a task only when its owner thread is gone. Updates on the pull \
                  requests of this board's tasks were not handled while paused: check each \
-                 open one (checks, reviews, conflicts). Check blocked tasks and answered \
-                 asks too: their wake-ups were dropped while paused"
+                 one (checks, reviews, conflicts, and whether it merged or closed). Check \
+                 blocked tasks and answered asks too: their wake-ups were dropped while \
+                 paused"
             )),
             WakeAbout::UsageEased if coordinator && !self.usage_holds(slug, now) => {
                 let stop_at = self

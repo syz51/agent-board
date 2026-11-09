@@ -28,6 +28,10 @@ use board_proto::{
     AGENT_TITLE_CHARS_MAX as TITLE_CHARS_MAX, NATIVE_ID_CHARS_MAX, Runtime, T3_LINK_PREFIX,
     Timestamp,
 };
+
+/// How T3 starts the message that wakes a thread for a pull request it watches
+/// (`Update on pull request #7 (<url>), which T3 Code is watching for you: …`).
+pub const PULL_REQUEST_UPDATE: &str = "Update on pull request";
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 

@@ -38,10 +38,6 @@ pub struct AgentLocal {
     /// halt only without `held_since` and `turn_seen_at`. Cleared as `turn_seen_at` is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold_told: bool,
-    /// A prompt the hold ended before the model ran took a delta that nobody read, so the
-    /// next prompt fetches a full snapshot instead.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub delta_unread: bool,
     /// Tasks the `Stop` hook already reminded the agent to file what remains of, newest
     /// last, so each is reminded about once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
