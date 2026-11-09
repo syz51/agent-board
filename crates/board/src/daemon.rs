@@ -1283,7 +1283,12 @@ impl<T: T3> Daemon<T> {
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         // After the thread checks, so a slow usage read never takes their time.
         self.refresh_usage(now).await;
-        for board in &boards {
+        // Boards whose last start failed go last: a retry can wait out a git or T3 timeout
+        // (git waits on a macOS privacy prompt, for one), which would otherwise spend the
+        // reconcile's budget and leave the boards after it unstarted.
+        let mut order: Vec<&Board> = boards.iter().collect();
+        order.sort_by_key(|board| self.failures.contains_key(&board.slug));
+        for board in order {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
                 self.state.pending_starts.remove(&board.slug);

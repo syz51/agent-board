@@ -142,6 +142,31 @@ esac
         "systemctl",
         "#!/bin/sh\n[ -z \"${STUB_FAIL_RESTART:-}\" ] || exit 1\necho \"${STUB_HOST:-local} restart\" >> \"$STATE/log\"\n",
     ),
+    // Linux, unless STUB_OS names another system, so a run on a Mac stays off its keychain.
+    ("uname", "#!/bin/sh\necho \"${STUB_OS:-Linux}\"\n"),
+    // A keychain is a file that holds the one identity; the rest succeeds.
+    (
+        "security",
+        r#"#!/bin/sh
+case "$1" in
+create-keychain) : > "$4" ;;
+find-identity) printf '  1) 0123ABCD "agent-board code signing"\n     1 valid identities found\n' ;;
+esac
+"#,
+    ),
+    // Logs `<host> sign <identity> <identifier>`; `-d` shows the requirement of a signed binary.
+    (
+        "codesign",
+        r#"#!/bin/sh
+case "$1" in
+-d) echo 'designated => identifier "dev.agent-board.board" and certificate leaf = H"00"' ;;
+*)
+    [ -z "${STUB_FAIL_SIGN:-}" ] || { echo "codesign: no identity found" >&2; exit 1; }
+    echo "${STUB_HOST:-local} sign $5 $7" >> "$STATE/log"
+    ;;
+esac
+"#,
+    ),
 ];
 
 struct Env {
@@ -301,6 +326,8 @@ impl Env {
             "STUB_FAIL_RM",
             "STUB_FAIL_LIST",
             "STUB_FAIL_RESTART",
+            "STUB_OS",
+            "STUB_FAIL_SIGN",
         ] {
             cmd.env_remove(var);
         }
@@ -842,6 +869,70 @@ fn a_device_whose_daemon_did_not_restart_is_restarted_on_the_rerun() {
     let log = env.read("log");
     assert!(log.contains("local restart"), "{log}");
     assert!(!log.contains("local install"), "{log}");
+}
+
+#[test]
+fn on_macos_each_device_signs_board_with_one_lasting_identity_before_the_restart() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let stdout = succeeds(env.run(&["--yes", new], &[("STUB_OS", "Darwin")]));
+
+    let log = env.read("log");
+    let device: Vec<&str> = log
+        .lines()
+        .skip_while(|l| !l.starts_with("local install"))
+        .take_while(|l| !l.contains("server-unlock"))
+        .collect();
+    let sign = "sign 0123ABCD dev.agent-board.board";
+    assert_eq!(
+        device,
+        [
+            format!("local install {new} commit={}", &new[..12]),
+            format!("local {sign}"),
+            "local restart".into(),
+            "laptop device-upgrade".into(),
+            format!("laptop install {new} commit={}", &new[..12]),
+            format!("laptop {sign}"),
+            "laptop restart".into(),
+        ]
+    );
+    // The first device made the identity; its message stays out of the revision summary.
+    let dir = env
+        .root
+        .join("home/Library/Application Support/agent-board/signing");
+    let mode = fs::metadata(dir.join("password")).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+    assert!(dir.join("signing.keychain-db").exists());
+    assert!(
+        stdout.contains(&format!("  local: {new} (was ")),
+        "{stdout}"
+    );
+
+    // A device already at the revision signs again, with the same identity.
+    env.clear_log();
+    succeeds(env.run(&["--yes", new], &[("STUB_OS", "Darwin")]));
+    let log = env.read("log");
+    assert!(log.contains(&format!("local {sign}")), "{log}");
+    assert!(!log.contains("local install"), "{log}");
+}
+
+#[test]
+fn a_failed_signing_warns_and_still_restarts_the_device() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let out = env.run(
+        &["--yes", new],
+        &[("STUB_OS", "Darwin"), ("STUB_FAIL_SIGN", "1")],
+    );
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("could not sign"), "{err}");
+    let log = env.read("log");
+    assert!(log.contains("local restart"), "{log}");
+    assert!(!log.contains(" sign "), "{log}");
 }
 
 #[test]

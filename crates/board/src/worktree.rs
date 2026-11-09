@@ -145,7 +145,17 @@ async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
         .context("running git")?;
     let out = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
         .await
-        .with_context(|| format!("git {} timed out in {}", args.join(" "), project.display()))??;
+        .with_context(|| {
+            let hint = cfg!(target_os = "macos")
+                .then(|| privacy_hint(dirs::home_dir().as_deref(), project))
+                .flatten()
+                .unwrap_or_default();
+            format!(
+                "git {} timed out in {}{hint}",
+                args.join(" "),
+                project.display()
+            )
+        })??;
     Ok(GitOutput {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -153,11 +163,45 @@ async fn git(project: &Path, args: &[&str]) -> Result<GitOutput> {
     })
 }
 
+/// What a git timeout in `project` adds on macOS when the folder is one macOS protects:
+/// there git waits, with no end, until the user answers the privacy prompt for board.
+fn privacy_hint(home: Option<&Path>, project: &Path) -> Option<&'static str> {
+    const PROTECTED: [&str; 4] = [
+        "Documents",
+        "Desktop",
+        "Downloads",
+        "Library/Mobile Documents",
+    ];
+    let home = home?;
+    PROTECTED
+        .iter()
+        .any(|folder| project.starts_with(home.join(folder)))
+        .then_some(
+            ": macOS may be waiting for you to let board use this folder. Answer its prompt, \
+             or turn on board under System Settings > Privacy & Security > Files and Folders",
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn a_timeout_in_a_protected_folder_names_the_privacy_setting() {
+        let home = Path::new("/Users/u");
+        let hint = |project: &str| privacy_hint(Some(home), Path::new(project));
+        assert!(
+            hint("/Users/u/Documents/vps")
+                .unwrap()
+                .contains("Privacy & Security > Files and Folders")
+        );
+        assert!(hint("/Users/u/Library/Mobile Documents/x").is_some());
+        assert_eq!(hint("/Users/u/Developer/repo"), None);
+        assert_eq!(hint("/Users/u/DocumentsOld/repo"), None);
+        assert_eq!(privacy_hint(None, Path::new("/Users/u/Documents/x")), None);
+    }
 
     /// Runs git in `dir` with no user or system config, so signing or hooks set there do not
     /// apply, and panics when it fails.

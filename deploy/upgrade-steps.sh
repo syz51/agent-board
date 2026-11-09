@@ -23,6 +23,61 @@ health() {
 compose() {
     docker compose -f deploy/compose.yaml "$@"
 }
+# Signs ~/.cargo/bin/board with this Mac's own code-signing identity, made on first use, so
+# macOS privacy grants survive upgrades. `cargo install` leaves an ad-hoc signature that
+# macOS knows only by its hash, so every build lost the grant (such as Documents access,
+# which board watch needs for repositories there) and git waited on a new prompt. The key
+# is in its own keychain, unlocked with a random password in a 0600 file beside it.
+sign_board() {
+    dir="$HOME/Library/Application Support/agent-board/signing"
+    keychain="$dir/signing.keychain-db"
+    name="agent-board code signing"
+    bin="$HOME/.cargo/bin/board"
+    (umask 077 && mkdir -p "$dir") || return 1
+    if [ ! -s "$dir/password" ] || [ ! -f "$keychain" ]; then
+        echo "upgrade: making the code-signing identity in $dir"
+        rm -f "$keychain" "$dir/password"
+        (umask 077 && /usr/bin/openssl rand -hex 24 >"$dir/password") || return 1
+        tmp=$(mktemp -d) || return 1
+        cat >"$tmp/cert.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = agent-board code signing
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+EOF
+        # /usr/bin/openssl is LibreSSL, whose PKCS#12 files `security import` reads.
+        if ! /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 36500 \
+            -config "$tmp/cert.cnf" -keyout "$tmp/key.pem" -out "$tmp/cert.pem" 2>/dev/null ||
+            ! /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+                -name "$name" -out "$tmp/id.p12" -passout "file:$dir/password" ||
+            ! security create-keychain -p "$(cat "$dir/password")" "$keychain" ||
+            ! security set-keychain-settings "$keychain" ||
+            ! security unlock-keychain -p "$(cat "$dir/password")" "$keychain" ||
+            ! security import "$tmp/id.p12" -k "$keychain" -P "$(cat "$dir/password")" \
+                -T /usr/bin/codesign >/dev/null ||
+            ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+                -k "$(cat "$dir/password")" "$keychain" >/dev/null; then
+            rm -rf "$tmp"
+            rm -f "$keychain" "$dir/password"
+            return 1
+        fi
+        rm -rf "$tmp"
+    fi
+    security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || return 1
+    # Listed as untrusted, which codesign accepts: macOS needs only the same key each time.
+    id=$(security find-identity -p codesigning "$keychain" |
+        grep -F "\"$name\"" | awk '{ print $2; exit }')
+    [ -n "$id" ] || return 1
+    codesign --force --keychain "$keychain" -s "$id" --identifier dev.agent-board.board "$bin" ||
+        return 1
+    codesign -d -r- "$bin" 2>&1 | grep -q 'certificate leaf'
+}
 action=$1
 shift
 case "$action" in
@@ -145,6 +200,12 @@ device-upgrade)
     if [ "$(installed)" != "$sha" ]; then
         BOARD_COMMIT=$(printf '%.12s' "$sha") cargo install --quiet --git "$url" --rev "$sha" --locked --force board ||
             fail "cargo install of $sha failed: read the output above; the previous board stays installed"
+    fi
+    # Signed again even when the install was already there: a run that failed here earlier
+    # may have left the ad-hoc signature. A failure costs only a new privacy prompt. Its
+    # output goes to stderr: upgrade.sh reads this step's stdout as the revision.
+    if [ "$(uname -s)" = Darwin ] && ! sign_board >&2; then
+        echo "upgrade: could not sign $HOME/.cargo/bin/board with a lasting identity (see above); it keeps its ad-hoc signature, so macOS may ask again for folder access" >&2
     fi
     # Restart even when the install was already there: a run that failed here earlier
     # left the old daemon running.

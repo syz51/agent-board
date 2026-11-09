@@ -58,6 +58,8 @@ struct FakeT3 {
     threads: Arc<Mutex<BTreeMap<String, ThreadInfo>>>,
     /// `t3 thread start` fails while set.
     fail_start: Arc<AtomicBool>,
+    /// `t3 thread start` fails in these projects.
+    fail_start_in: Arc<Mutex<Vec<PathBuf>>>,
     /// While set, `t3 thread start` creates [`ORPHAN`] and then fails, as when the daemon is
     /// killed or `t3` times out mid-start; the value says whether its message got through.
     die_after_create: Arc<Mutex<Option<bool>>>,
@@ -183,7 +185,14 @@ impl T3 for FakeT3 {
             message: message.to_owned(),
             worktree: worktree.cloned(),
         });
-        if self.fail_start.load(Ordering::SeqCst) {
+        if self.fail_start.load(Ordering::SeqCst)
+            || self
+                .fail_start_in
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == project)
+        {
             anyhow::bail!("t3 thread start failed: no such project");
         }
         let now = *self.clock.lock().unwrap();
@@ -2877,6 +2886,57 @@ async fn a_failed_start_backs_off_instead_of_looping() {
         "claim, start, claim as the agent"
     );
     assert_eq!(e.daemon.state.coordinators[&factory()].thread, NEW_THREAD);
+}
+
+#[tokio::test]
+async fn a_board_whose_start_failed_waits_behind_the_others() {
+    let (stuck, other) = ("github.com/o/alpha", "github.com/o/zeta");
+    let mut e = env_with_projects(
+        [
+            (stuck.to_owned(), src("alpha")),
+            (other.to_owned(), src("zeta")),
+        ]
+        .into(),
+    );
+    e.t3.fail_start_in.lock().unwrap().push(src("alpha"));
+    let board = |slug: &str, repo: &str| {
+        let mut board = board_fixture(slug, &[repo]);
+        board.autopilot = true;
+        board.home_devices = vec![DEVICE.parse().unwrap()];
+        board
+    };
+    let (alpha, zeta) = (board("alpha", stuck), board("zeta", other));
+    for b in [&alpha, &zeta] {
+        let path = format!("/v1/boards/{}/coordinator", b.slug);
+        e.stub.on(&format!("POST {path}"), b);
+        e.stub.on(&format!("DELETE {path}"), b);
+    }
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    let started = |e: &Env| -> Vec<PathBuf> {
+        e.t3.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Start { project, .. } => Some(project),
+                _ => None,
+            })
+            .collect()
+    };
+
+    e.stub.on("GET /v1/boards", [&alpha]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(started(&e), [src("alpha")]);
+
+    // Due again, alpha comes after zeta, which sorts after it: a retry that waits out a
+    // timeout cannot use the time zeta's start needs.
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert_eq!(started(&e), [src("alpha"), src("zeta"), src("alpha")]);
 }
 
 /// An env whose board needs a coordinator, with the lease, its release and registration stubbed.
