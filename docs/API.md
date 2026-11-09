@@ -238,9 +238,13 @@ server's minute sweep deletes older ones.
   it sets it, and reports a server that ignored it.
   An update that changes `status` adds the new one to the `board_updated` payload
   (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
-  reads `active` (see `DESIGN.md`, "Pausing work"). `board pause [<slug>…]` and
+  reads `active` (see `DESIGN.md`, "Pausing work"). An update that moves a board other
+  than the server's feedback board (`defaults.feedback_board`) from `paused` to `active`
+  first moves the feedback board to `active` when it is paused, in the same write, with
+  its own `board_updated` event recorded first. `board pause [<slug>…]` and
   `board resume [<slug>…]` set every active (or paused) board, or those named, with this
-  endpoint; `--json` prints the changed `[Board]` list.
+  endpoint; `--json` prints the changed `[Board]` list. A resume lists the device's
+  feedback board first whenever it resumes it, also when only other boards were named.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by

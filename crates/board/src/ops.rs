@@ -870,7 +870,7 @@ pub async fn set_boards_status(
     to: BoardStatus,
 ) -> Result<Output> {
     let boards = ctx.client.boards().await?;
-    let targets: Vec<&Board> = if named.is_empty() {
+    let mut targets: Vec<&Board> = if named.is_empty() {
         boards.iter().filter(|b| b.status == from).collect()
     } else {
         let mut targets = Vec::new();
@@ -891,6 +891,17 @@ pub async fn set_boards_status(
         }
         targets
     };
+    // The feedback board resumes first, always: the server resumes it with any other board,
+    // so a resume lists it first, also when only other boards are named.
+    if to == BoardStatus::Active
+        && targets.iter().any(|b| b.status == from)
+        && let Some(feedback) = boards
+            .iter()
+            .find(|b| b.slug == ctx.config.feedback_board() && b.status == from)
+    {
+        targets.retain(|b| b.slug != feedback.slug);
+        targets.insert(0, feedback);
+    }
     let verb = match to {
         BoardStatus::Paused => "paused",
         _ => "resumed",

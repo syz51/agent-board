@@ -731,6 +731,68 @@ fn pause_and_resume_set_every_board_or_the_named_ones() {
     );
 }
 
+#[test]
+fn resume_lists_and_resumes_the_feedback_board_first() {
+    use board_proto::BoardStatus;
+    let e = env();
+    let with = |slug: &str, status: BoardStatus| {
+        let mut b = board_fixture(slug, &[]);
+        b.status = status;
+        b
+    };
+    e.stub.on(
+        "GET /v1/boards",
+        [
+            with("alpha", BoardStatus::Paused),
+            with("beta", BoardStatus::Active),
+            with("board-feedback", BoardStatus::Paused),
+        ],
+    );
+    for slug in ["alpha", "board-feedback"] {
+        e.stub.on(
+            &format!("PATCH /v1/boards/{slug}"),
+            with(slug, BoardStatus::Active),
+        );
+    }
+    let patches = |e: &Env| -> Vec<String> {
+        e.stub
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .map(|r| r.path.clone())
+            .collect()
+    };
+
+    // Every paused board: the feedback board first, though it sorts after alpha.
+    let out = e.run(&["resume"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("resumed 2 boards:\n  board-feedback "),
+        "{text}"
+    );
+    assert_eq!(
+        patches(&e),
+        ["/v1/boards/board-feedback", "/v1/boards/alpha"]
+    );
+
+    // Named without it: it still comes first, as the server resumes it too.
+    let out = e.run(&["resume", "alpha"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("resumed 2 boards:\n  board-feedback "),
+        "{text}"
+    );
+
+    // Naming only boards that are not paused resumes nothing, the feedback board included.
+    let before = patches(&e).len();
+    let out = e.run(&["resume", "beta"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "no boards resumed: none was paused");
+    assert_eq!(patches(&e).len(), before);
+}
+
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the
 /// ready tasks that wait on the user.
 #[test]

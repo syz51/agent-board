@@ -719,3 +719,74 @@ async fn only_the_user_raises_parallel_tasks_and_anyone_lowers_it() {
         assert_eq!(v["parallel_tasks"], n);
     }
 }
+
+#[tokio::test]
+async fn resuming_any_board_resumes_the_feedback_board_first() {
+    let t = T::new();
+    let status = |s: &str| Some(json!({ "status": s }));
+    let status_of = |board: Value| board["status"].as_str().unwrap().to_owned();
+    for slug in ["board-feedback", "factory", "other"] {
+        t.board(slug, &[]).await;
+        let path = format!("/v1/boards/{slug}");
+        t.ok("PATCH", &path, None, status("paused")).await;
+    }
+
+    let resumed = t
+        .ok("PATCH", "/v1/boards/factory", None, status("active"))
+        .await;
+    assert_eq!(status_of(resumed), "active");
+    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
+    assert_eq!(status_of(feedback), "active");
+    let other = t.ok("GET", "/v1/boards/other", None, None).await;
+    assert_eq!(
+        status_of(other),
+        "paused",
+        "only the feedback board comes along"
+    );
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let resumes: Vec<Value> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["payload"]["status"] == "active")
+        .map(|e| e["board"].clone())
+        .collect();
+    assert_eq!(resumes, [json!("board-feedback"), json!("factory")]);
+
+    // Pausing the feedback board alone holds, and resuming it alone resumes nothing else.
+    t.ok("PATCH", "/v1/boards/board-feedback", None, status("paused"))
+        .await;
+    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
+    assert_eq!(status_of(feedback), "paused");
+    t.ok("PATCH", "/v1/boards/board-feedback", None, status("active"))
+        .await;
+    let other = t.ok("GET", "/v1/boards/other", None, None).await;
+    assert_eq!(status_of(other), "paused");
+
+    // Changing an active board, or reopening a closed one, leaves the feedback board paused.
+    t.ok("PATCH", "/v1/boards/board-feedback", None, status("paused"))
+        .await;
+    let goal = Some(json!({ "goal": "ship" }));
+    t.ok("PATCH", "/v1/boards/factory", None, goal).await;
+    t.ok("PATCH", "/v1/boards/other", None, status("closed"))
+        .await;
+    t.ok("PATCH", "/v1/boards/other", None, status("active"))
+        .await;
+    let feedback = t.ok("GET", "/v1/boards/board-feedback", None, None).await;
+    assert_eq!(status_of(feedback), "paused");
+}
+
+#[tokio::test]
+async fn resuming_a_board_works_without_a_feedback_board() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    let status = |s: &str| Some(json!({ "status": s }));
+    t.ok("PATCH", "/v1/boards/factory", None, status("paused"))
+        .await;
+    let resumed = t
+        .ok("PATCH", "/v1/boards/factory", None, status("active"))
+        .await;
+    assert_eq!(resumed["status"], "active");
+}
