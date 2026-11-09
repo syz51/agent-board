@@ -883,9 +883,8 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
 
 /// `board pause` and `board resume`: sets the boards `named`, or by default every board in
 /// status `from`, to status `to`, and lists the boards it changed. Named boards are checked
-/// before any changes, so a wrong name changes nothing. A resume goes feedback board first
-/// and also lists the boards the server resumed along with the targets (a paused feedback
-/// board).
+/// before any changes, so a wrong name changes nothing. The server never pauses its feedback
+/// board; a pause lists it apart, as kept active.
 pub async fn set_boards_status(
     ctx: &Ctx,
     named: Vec<BoardSlug>,
@@ -893,7 +892,7 @@ pub async fn set_boards_status(
     to: BoardStatus,
 ) -> Result<Output> {
     let boards = ctx.client.boards().await?;
-    let mut targets: Vec<&Board> = if named.is_empty() {
+    let targets: Vec<&Board> = if named.is_empty() {
         boards.iter().filter(|b| b.status == from).collect()
     } else {
         let mut targets = Vec::new();
@@ -914,18 +913,12 @@ pub async fn set_boards_status(
         }
         targets
     };
-    let resuming = to == BoardStatus::Active;
-    // The feedback board resumes first, always. The server resumes it with any other board;
-    // when it is among the targets, it also goes first here.
-    if resuming {
-        let feedback = ctx.config.feedback_board();
-        targets.sort_by_key(|b| b.slug != feedback);
-    }
     let verb = match to {
         BoardStatus::Paused => "paused",
         _ => "resumed",
     };
     let mut changed: Vec<Board> = Vec::new();
+    let mut kept: Vec<Board> = Vec::new();
     for board in targets.into_iter().filter(|b| b.status != to) {
         let body = UpdateBoard {
             status: Some(to),
@@ -947,28 +940,16 @@ pub async fn set_boards_status(
                     }
                 )
             })?;
-        changed.push(updated);
+        if updated.status == to {
+            changed.push(updated);
+        } else {
+            kept.push(updated);
+        }
     }
-    // Boards the server resumed along with them (the feedback board) are listed first.
-    if resuming && !changed.is_empty() {
-        let after = ctx
-            .client
-            .boards()
-            .await
-            .context("the boards were resumed, but reading them back failed")?;
-        let along: Vec<Board> = after
-            .into_iter()
-            .filter(|b| b.status == to && !changed.iter().any(|c| c.slug == b.slug))
-            .filter(|b| {
-                boards
-                    .iter()
-                    .any(|old| old.slug == b.slug && old.status == from)
-            })
-            .collect();
-        changed.splice(0..0, along);
-    }
-    let text = if changed.is_empty() {
+    let mut text = if changed.is_empty() && kept.is_empty() {
         format!("no boards {verb}: none was {}", render::enum_str(&from))
+    } else if changed.is_empty() {
+        format!("no boards {verb}")
     } else {
         let plural = if changed.len() == 1 { "" } else { "s" };
         let mut text = format!("{verb} {} board{plural}:", changed.len());
@@ -978,8 +959,19 @@ pub async fn set_boards_status(
         }
         text
     };
+    for board in &kept {
+        text.push_str(&format!(
+            "\n{} stays {}: {}",
+            board.slug,
+            render::enum_str(&board.status),
+            KEPT_ACTIVE
+        ));
+    }
     Ok(Output::new(text, &changed))
 }
+
+/// Why a board the server was asked to pause stays active.
+const KEPT_ACTIVE: &str = "the server never pauses its feedback board, so triage goes on";
 
 pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
     let board = ctx.client.create_board(&body).await?;
@@ -1023,10 +1015,14 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              --dispatch {wanted}"
         );
     }
-    Ok(Output::new(
-        format!("updated {}", render::board_line(&board)),
-        &board,
-    ))
+    let mut text = format!("updated {}", render::board_line(&board));
+    if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {
+        text.push_str(&format!(
+            "\n{slug} stays {}: {KEPT_ACTIVE}",
+            render::enum_str(&board.status)
+        ));
+    }
+    Ok(Output::new(text, &board))
 }
 
 /// A server that predates handovers ignores `owner` and answers with the owner unchanged,
