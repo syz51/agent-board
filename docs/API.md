@@ -773,7 +773,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   has text. In `lines`, the `hold:` line names the boards and what to do, first after the
   header (a full snapshot's intro comes before it); `yaml` has `hold` with `boards` and
   `action`; `json` has `hold` with the slugs only. Empty and left out otherwise, and by
-  servers that predate it, which clients read as not held.
+  servers that predate it, which clients read as not held. `held_since` is when the
+  latest of those boards was paused: a board keeps the time while it stays paused. The
+  hooks end only a turn that began before it. Left out when not held, and by servers that
+  predate it.
   For an agent with a board, when a usage reading exists, a `usage:` line follows the
   `hold:` line: in full snapshots always, in `delta` only while the board is over its
   `usage_stop_at` (it then has text even when nothing else changed), never in `alerts`.

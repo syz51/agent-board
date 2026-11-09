@@ -434,11 +434,17 @@ async fn handle(
     };
     // Turn boundaries for the done reminder hold whether or not the server answers.
     match event {
-        HookEvent::UserPromptSubmit => hook.local.turn_started = Some(hook.now),
+        // The prompt's snapshot sets the turn's hold anew, also when the server is not
+        // reached, so a mark from an earlier turn never decides this one's halt.
+        HookEvent::UserPromptSubmit => {
+            hook.local.turn_started = Some(hook.now);
+            hook.local.end_turn_hold();
+        }
         // A new or resumed session: done marks left over were from a turn whose Stop never
         // ran. Compaction happens within a turn, so it keeps them and the turn's start.
         HookEvent::SessionStart if input["source"] != "compact" => {
             hook.local.turn_started = None;
+            hook.local.end_turn_hold();
             if let Err(err) = state::take_done(&hook.home, &hook.agent) {
                 tracing::debug!("dropping done marks: {err:#}");
             }
@@ -1359,6 +1365,7 @@ impl Hook<'_> {
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
         self.local.seq = Some(snap.seq);
         self.local.held = !snap.held_by.is_empty();
+        self.local.held_since = snap.held_since;
         if snap.kind == SnapshotKind::Full {
             state::save_cached_snapshot(&self.home, &self.agent, &snap)?;
         }
@@ -1491,6 +1498,7 @@ impl Hook<'_> {
             SnapshotKind::Delta
         };
         let snap = self.beat_and_fetch(kind).await?;
+        self.local.turn_seen_at = Some(snap.at);
         let text = self.keep(snap)?;
         // The snapshot's `hold:` line tells the agent; only the user's request continues.
         self.local.hold_told = self.local.held;
@@ -1537,10 +1545,19 @@ impl Hook<'_> {
         })
     }
 
-    /// The agent is held, as of the last heartbeat, and its turn began before that: the
-    /// heartbeat halts the turn.
+    /// The agent is held, as of the last heartbeat, by a pause that came after its turn
+    /// began, both as the server dates them: the heartbeat halts the turn. A turn begun
+    /// while the board was already paused goes on, also once it claims the board's work
+    /// mid-turn. Without either time (an older server, a prompt the server did not
+    /// answer, a turn with no prompt), a turn not told of the hold at its prompt is halted.
     fn halted(&self) -> bool {
-        self.local.held && !self.local.hold_told
+        if !self.local.held {
+            return false;
+        }
+        match (self.local.held_since, self.local.turn_seen_at) {
+            (Some(paused), Some(turn)) => paused > turn,
+            _ => !self.local.hold_told,
+        }
     }
 
     /// A `Stop` that follows our own block, ending the turn that answered a reminder.
@@ -1594,6 +1611,11 @@ impl Hook<'_> {
                 Reply::Block(text.join("\n"))
             }
         };
+        // A block continues the turn; otherwise it has ended, and a turn without a prompt
+        // that follows has no time of its own.
+        if !matches!(reply, Reply::Block(_)) {
+            self.local.end_turn_hold();
+        }
         self.register_again(repo.as_ref()).await;
         Ok(reply)
     }

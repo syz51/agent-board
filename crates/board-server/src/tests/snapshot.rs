@@ -1880,13 +1880,26 @@ async fn a_paused_board_holds_its_coordinator_its_threads_and_its_workers() {
     assert_eq!(held(&snapshot(&t, worker, "kind=full").await), Value::Null);
 
     let paused = json!({ "status": "paused" });
-    t.ok("PATCH", "/v1/boards/auto", None, Some(paused)).await;
+    t.ok("PATCH", "/v1/boards/auto", None, Some(paused.clone()))
+        .await;
     let events = t.ok("GET", "/v1/events?board=auto", None, None).await;
     let last = events["events"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["type"], "board_updated");
     assert_eq!(
         last["payload"],
         json!({ "fields": ["status"], "status": "paused" })
+    );
+    let since = snapshot(&t, worker, "kind=alerts").await["held_since"].clone();
+    assert_eq!(since, last["at"], "held since the pause");
+    // Pausing again, or changing anything else, keeps the time of the pause.
+    t.advance(TimeDelta::minutes(5));
+    t.ok("PATCH", "/v1/boards/auto", None, Some(paused.clone()))
+        .await;
+    let goal = json!({ "goal": "Ship it" });
+    t.ok("PATCH", "/v1/boards/auto", None, Some(goal)).await;
+    assert_eq!(
+        snapshot(&t, worker, "kind=alerts").await["held_since"],
+        since
     );
 
     // The coordinator stays held after its lease lapses: the board still names it.
@@ -1917,6 +1930,57 @@ async fn a_paused_board_holds_its_coordinator_its_threads_and_its_workers() {
     for agent in [coordinator, kid, worker, helper] {
         let snap = snapshot(&t, agent, "kind=delta").await;
         assert_eq!(held(&snap), Value::Null, "{agent}");
+        assert_eq!(snap["held_since"], Value::Null, "{agent}");
         assert!(!text(&snap).contains("hold:"), "{agent}: {}", text(&snap));
     }
+
+    // A new pause holds from its own time.
+    t.advance(TimeDelta::minutes(5));
+    t.ok("PATCH", "/v1/boards/auto", None, Some(paused)).await;
+    let again = snapshot(&t, worker, "kind=alerts").await["held_since"].clone();
+    let at = |v: &Value| {
+        v.as_str()
+            .unwrap()
+            .parse::<board_proto::Timestamp>()
+            .unwrap()
+    };
+    assert!(at(&again) > at(&since), "{again} after {since}");
+
+    // Held by two boards: since the later pause.
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "two", "title": "Two", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/two/coordinator",
+        Some(worker),
+        Some(json!({ "device": "mac", "agent": worker })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(5));
+    t.ok(
+        "PATCH",
+        "/v1/boards/two",
+        None,
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+    let both = snapshot(&t, worker, "kind=alerts").await;
+    assert_eq!(held(&both), json!(["auto", "two"]));
+    assert!(at(&both["held_since"]) > at(&again), "{both}");
+    t.ok(
+        "PATCH",
+        "/v1/boards/two",
+        None,
+        Some(json!({ "status": "active" })),
+    )
+    .await;
+    assert_eq!(
+        snapshot(&t, worker, "kind=alerts").await["held_since"],
+        again
+    );
 }

@@ -36,6 +36,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0019_agents_device.sql"),
     include_str!("../migrations/0020_daemon_dispatch.sql"),
     include_str!("../migrations/0021_usage.sql"),
+    include_str!("../migrations/0022_board_paused_at.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -457,6 +458,18 @@ pub(crate) fn ready_sql(t: &str) -> String {
 mod tests {
     use super::*;
 
+    /// An in-memory database with the first `n` migrations, to test the next one.
+    fn migrated_to(n: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (index, migration) in MIGRATIONS[..n].iter().enumerate() {
+            conn.execute_batch(migration).unwrap();
+            conn.pragma_update(None, "user_version", index as i64 + 1)
+                .unwrap();
+        }
+        conn
+    }
+
     #[test]
     fn migrations_run_once_and_set_user_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -514,13 +527,7 @@ mod tests {
 
     #[test]
     fn items_resolved_before_resolved_report_take_the_reports_recorded_by_then() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..15].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(15);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('f', 't', '', 'active', '[]', 0, '[]', 0, 0); \
@@ -559,13 +566,7 @@ mod tests {
 
     #[test]
     fn tasks_done_before_updates_count_as_seen() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..9].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(9);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);",
@@ -602,13 +603,7 @@ mod tests {
 
     #[test]
     fn asks_sent_before_their_chat_was_recorded_take_the_paired_chat() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..16].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(16);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0);
@@ -633,13 +628,7 @@ mod tests {
 
     #[test]
     fn boards_and_asks_stored_before_temporary_boards_are_kept() {
-        let conn = Connection::open_in_memory().unwrap();
-        configure(&conn).unwrap();
-        for (index, migration) in MIGRATIONS[..6].iter().enumerate() {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", index as i64 + 1)
-                .unwrap();
-        }
+        let conn = migrated_to(6);
         conn.execute_batch(
             "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
              created_at, updated_at) VALUES ('b', 't', '', 'closed', '[]', 0, '[]', 0, 0); \
@@ -765,5 +754,40 @@ mod tests {
         conn.pragma_update(None, "user_version", 99).unwrap();
         drop(conn);
         assert!(open_file(&path).is_err());
+    }
+
+    #[test]
+    fn boards_paused_before_paused_at_take_the_time_of_their_last_pause() {
+        let conn = migrated_to(21);
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES \
+             ('p', 't', '', 'paused', '[]', 0, '[]', 0, 90), \
+             ('q', 't', '', 'paused', '[]', 0, '[]', 0, 9), \
+             ('a', 't', '', 'active', '[]', 0, '[]', 0, 80); \
+             INSERT INTO events (at, board, actor, type, payload) VALUES \
+             (40, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}'), \
+             (50, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"active\"}'), \
+             (70, 'p', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}'), \
+             (90, 'p', 'user', 'board_updated', '{\"fields\":[\"goal\"]}'), \
+             (60, 'a', 'user', 'board_updated', '{\"fields\":[\"status\"],\"status\":\"paused\"}');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let paused: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT slug, paused_at FROM boards ORDER BY slug")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            paused,
+            [
+                ("a".to_owned(), None),
+                ("p".to_owned(), Some(70)),
+                ("q".to_owned(), Some(9))
+            ]
+        );
     }
 }

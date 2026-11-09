@@ -1240,6 +1240,76 @@ fn serve_hold(e: &Env, held: bool) {
     e.stub.on("GET /v1/snapshot", snap);
 }
 
+/// Serves snapshots the server renders at `at`, held by a board paused at `since`, if any.
+fn serve_hold_at(e: &Env, at: &str, since: Option<&str>) {
+    let mut snap = snapshot_fixture(SnapshotKind::Alerts, "", 2);
+    snap.at = at.parse().unwrap();
+    if let Some(since) = since {
+        snap.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+        snap.held_by = vec!["factory".parse().unwrap()];
+        snap.held_since = Some(since.parse().unwrap());
+    }
+    e.stub.on("GET /v1/snapshot", snap);
+}
+
+fn not_halted(reply: &Option<Value>) -> bool {
+    reply.as_ref().is_none_or(|r| r.get("continue").is_none())
+}
+
+#[test]
+fn a_turn_begun_after_the_pause_goes_on_when_it_claims_the_boards_work() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    // The board was paused an hour before the prompt; the agent works for it only once it
+    // claims a task. Times are the server's, whatever the device's clock says.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", None);
+    prompt(&e, "work on the paused board");
+    serve_hold_at(&e, "2030-01-01T10:01:00Z", Some("2030-01-01T09:00:00Z"));
+    let (reply, _) = read_tool(&e);
+    assert!(not_halted(&reply), "{reply:?}");
+    assert_eq!(
+        stop(&e).unwrap()["decision"],
+        "block",
+        "the user's turn gets its reminders"
+    );
+
+    // A pause after the turn began still ends it.
+    serve_hold_at(&e, "2030-01-01T11:00:00Z", None);
+    prompt(&e, "go on");
+    serve_hold_at(&e, "2030-01-01T11:02:00Z", Some("2030-01-01T11:01:00Z"));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a halt")["continue"], false);
+}
+
+#[test]
+fn a_turn_told_of_a_hold_is_halted_by_a_later_pause_and_a_turn_without_a_prompt_by_any() {
+    let e = env();
+    let mut h = doing_with_handoff(&e, None);
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
+    e.stub.on(&handoff_route(), &h);
+    // The prompt shows the hold, so the user's turn goes on.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", Some("2030-01-01T09:00:00Z"));
+    prompt(&e, "fix it anyway");
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert!(not_halted(&reply), "{reply:?}");
+    // Paused again during the turn: it ends.
+    serve_hold_at(&e, "2030-01-01T10:06:00Z", Some("2030-01-01T10:05:00Z"));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a halt")["continue"], false);
+    assert_eq!(stop(&e), None, "the halted turn ends quietly");
+
+    // A turn with no prompt of its own (a runtime notification) is halted while held.
+    serve_hold_at(&e, "2030-01-01T10:10:00Z", Some("2030-01-01T09:00:00Z"));
+    heartbeat_due_again(&e);
+    let (reply, _) = read_tool(&e);
+    assert_eq!(reply.expect("a halt")["continue"], false);
+}
+
 /// Lets the next `PostToolUse` run its heartbeat, as a minute later.
 fn heartbeat_due_again(e: &Env) {
     let path = e.home.join("state").join(format!(
