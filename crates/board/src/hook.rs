@@ -32,7 +32,7 @@ use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_id
 use crate::mcp;
 use crate::render;
 use crate::state::{self, AgentLocal, DoneMark, SessionLocal, ThreadRead, ToolStart};
-use crate::t3::{T3Cli, ThreadFacts};
+use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
 const DELEGATED_THREAD: &str = "thread:delegated-task:";
@@ -618,7 +618,14 @@ fn board_names(boards: &[board_proto::BoardSlug]) -> String {
         .join(", ")
 }
 
-/// What the user sees when a heartbeat stops a held agent's turn.
+/// The prompt is T3's wake-up from a pull request watch, not the user's message.
+fn is_pull_request_update(input: &Value) -> bool {
+    input["prompt"]
+        .as_str()
+        .is_some_and(|p| p.starts_with(PULL_REQUEST_UPDATE))
+}
+
+/// What the user sees when the hold stops a held agent's turn.
 fn halt_reason(boards: &[board_proto::BoardSlug]) -> String {
     format!(
         "board: {} paused, so this turn stopped. `board resume` continues the work.",
@@ -1280,7 +1287,10 @@ impl Hook<'_> {
             HookEvent::SessionStart => self.session_start(repo).await,
             HookEvent::UserPromptSubmit => {
                 let reply = self.user_prompt_submit().await?;
-                self.register_again(repo.as_ref()).await;
+                // Registering marks the agent running, which a halted turn is not.
+                if !matches!(reply, Reply::Halt(_)) {
+                    self.register_again(repo.as_ref()).await;
+                }
                 Ok(reply)
             }
             // Handled before login (`handle`).
@@ -1599,7 +1609,25 @@ impl Hook<'_> {
         } else {
             SnapshotKind::Delta
         };
-        let snap = self.beat_and_fetch(kind).await?;
+        let snap = if self.runtime == Runtime::Claude && is_pull_request_update(self.input) {
+            // A held thread's pull request watch wakes it at every check or review change,
+            // for as long as the pause lasts. Such a turn ends before the model runs, and
+            // the watch stays; the resume wake-up has the coordinator check the PRs. The
+            // snapshot comes first, so an ended turn changes no state: the agent stays idle
+            // (or paused for a usage limit), and its sequence stays, so the next snapshot
+            // brings again the alerts this one had. Codex is not ended here, since it may
+            // not honor `continue: false` at a prompt; it is told of the hold instead.
+            let snap = self.fetch(kind).await?;
+            if !snap.held_by.is_empty() {
+                self.local.held = true;
+                self.local.held_since = snap.held_since;
+                return Ok(Reply::Halt(halt_reason(&snap.held_by)));
+            }
+            self.set_state(AgentState::Running, None).await?;
+            snap
+        } else {
+            self.beat_and_fetch(kind).await?
+        };
         self.local.turn_seen_at = Some(snap.at);
         let text = self.keep(snap)?;
         // The snapshot's `hold:` line tells the agent; only the user's request continues.
