@@ -206,8 +206,8 @@ export function BoardScreen() {
       </PageHeader>
       {board?.temporary && (
         <p className="-mt-3 mb-5 text-meta text-muted-foreground">
-          Temporary: the server closes this board once it is idle, and deletes it some time after
-          that.
+          Temporary: the server closes this board once it is idle (never while it is paused), and
+          deletes it some time after that.
         </p>
       )}
 
