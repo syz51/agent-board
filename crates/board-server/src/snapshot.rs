@@ -506,20 +506,16 @@ task, child thread or wake-up. Continue only if the user's own message in this t
 
 /// The query of [`held_by`]: `?1` the agent, `?2` the depth. The agent and the T3 threads
 /// that delegated it, up the chain, as in [`crate::ops::leases::DELEGATION_FAMILY`].
-const HELD_BY: &str = "WITH RECURSIVE \
-     up(id, depth) AS ( \
-       SELECT ?1, 0 \
-       UNION \
-       SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
-       FROM agents a JOIN up ON a.id = up.id \
-       WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
-         AND up.depth < ?2) \
-     SELECT b.slug, b.paused_at FROM boards b \
+const HELD_BY: &str = concat!(
+    "WITH RECURSIVE ",
+    crate::ops::leases::delegated_up_cte!(),
+    " SELECT b.slug, b.paused_at FROM boards b \
      WHERE b.status = 'paused' \
        AND (b.coordinator IN (SELECT id FROM up) \
             OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
                        AND t.owner IN (SELECT id FROM up))) \
-     ORDER BY b.slug";
+     ORDER BY b.slug"
+);
 
 /// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
 /// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the

@@ -1979,7 +1979,16 @@ async fn a_coordinator_takes_an_ended_childs_review_task_by_handle_or_full_id() 
     assert_eq!(t.get_task(&by_handle).await["owner"], A);
 
     for (id, owner) in [(&by_handle, handle.as_str()), (&by_id, coordinator)] {
-        assert_eq!(t.done(coordinator, id, check(0)).await.0.as_u16(), 403);
+        // The refusal names the coordinator's step: the handover to itself.
+        let (s, v) = t.done(coordinator, id, check(0)).await;
+        assert_eq!(s.as_u16(), 403, "{v}");
+        assert!(
+            v["next"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("task_update {id} owner={coordinator}")),
+            "{v}"
+        );
         let (s, v) = patch_as(&t, coordinator, false, id, json!({ "owner": owner })).await;
         assert_eq!(
             (s, v["owner"].as_str(), v["status"].as_str()),
@@ -2707,4 +2716,182 @@ async fn a_claim_held_by_an_open_ask_names_how_to_end_it() {
             && next.contains(&format!("ask_withdraw {ask}; CLI: board withdraw {ask}")),
         "{v}"
     );
+}
+
+// A delegation chain: GRANDPARENT delegated PARENT, which delegated CHILD.
+const GRANDPARENT: &str = "t3:grand";
+const PARENT: &str = "t3:thread:delegated-task:g1-p1";
+const CHILD: &str = "t3:thread:delegated-task:p1-c1";
+const STAND_IN: &str = "the task's creator and the agents that delegated its owner may take, \
+     move or close it once the owner's session has ended";
+
+/// Registers `agent` as a T3 thread that `parent` delegated, as the hooks do.
+async fn register_delegated(t: &T, agent: &str, parent: &str) {
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(agent),
+        Some(json!({
+            "id": agent, "runtime": "claude", "device": "mac", "repo": REPO, "branch": "main",
+            "native_ids": {"t3_thread": &agent[3..], "t3_parent": &parent[3..]},
+        })),
+    )
+    .await;
+}
+
+async fn end_session(t: &T, agent: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+}
+
+async fn take(t: &T, agent: &str, task: &str) -> (u16, Value) {
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{task}/take"),
+            Some(agent),
+            Some(json!({ "agent": agent })),
+        )
+        .await;
+    (s.as_u16(), v)
+}
+
+/// A task A created, that CHILD claimed and parked in review.
+async fn childs_task(t: &T) -> String {
+    let id = t.task(A, "factory", "Delegated work").await;
+    assert!(t.claim(CHILD, &id).await.0.is_success());
+    let (s, v) = t.patch(CHILD, &id, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    id
+}
+
+async fn delegation(t: &T) {
+    t.register(GRANDPARENT, Some(REPO), Some("main")).await;
+    register_delegated(t, PARENT, GRANDPARENT).await;
+    register_delegated(t, CHILD, PARENT).await;
+}
+
+#[tokio::test]
+async fn the_creator_or_a_delegating_parent_takes_an_ended_childs_task_at_once() {
+    let t = setup().await;
+    delegation(&t).await;
+    let ids = [
+        childs_task(&t).await,
+        childs_task(&t).await,
+        childs_task(&t).await,
+    ];
+
+    // While the child runs, nobody takes its task, its parents and the creator included.
+    for agent in [PARENT, GRANDPARENT, A, B] {
+        let (s, v) = take(&t, agent, &ids[0]).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (409, Some("claim_refused")),
+            "{agent}: {v}"
+        );
+        assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+    }
+
+    end_session(&t, CHILD).await;
+    assert_eq!(
+        t.get_task(&ids[0]).await["owner_stale"],
+        false,
+        "an owner whose session just ended is not stale"
+    );
+    // An unrelated agent still waits until the owner is stale.
+    let (s, v) = take(&t, B, &ids[0]).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    // A plain claim by the parent names the take.
+    let (s, v) = t.claim(PARENT, &ids[0]).await;
+    assert_eq!(s.as_u16(), 409, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+
+    // The parent, the agent that delegated the parent, and the creator take at once.
+    for (agent, id) in [(PARENT, &ids[0]), (GRANDPARENT, &ids[1]), (A, &ids[2])] {
+        let (s, v) = take(&t, agent, id).await;
+        assert_eq!(
+            (s, v["owner"].as_str(), v["status"].as_str()),
+            (200, Some(agent), Some("doing")),
+            "{agent}: {v}"
+        );
+    }
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM events WHERE type = 'task_taken' \
+             AND json_extract(payload, '$.from') = '{CHILD}'"
+        )),
+        3
+    );
+}
+
+#[tokio::test]
+async fn a_delegating_parent_closes_moves_or_hands_back_an_ended_childs_task() {
+    let t = setup().await;
+    delegation(&t).await;
+    // The parent works on its own task meanwhile, so taking a task into doing hits its
+    // doing limit; closing, moving and handing over do not need the take.
+    let own = t.task(PARENT, "factory", "Parent's own work").await;
+    assert!(t.claim(PARENT, &own).await.0.is_success());
+    let [closed, moved, handed, revived] = [
+        childs_task(&t).await,
+        childs_task(&t).await,
+        childs_task(&t).await,
+        childs_task(&t).await,
+    ];
+    end_session(&t, CHILD).await;
+
+    // An unrelated agent is refused on every route, with a hint naming who may act.
+    let (s, v) = t.done(B, &closed, check(0)).await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (403, Some("forbidden")));
+    assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+    let (s, v) = patch_as(&t, B, false, &moved, json!({ "status": "dropped" })).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+    let (s, v) = patch_as(&t, B, false, &handed, json!({ "owner": B })).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+
+    let (s, v) = take(&t, PARENT, &closed).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    let (s, v) = t.done(PARENT, &closed, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+    let (s, v) = patch_as(
+        &t,
+        PARENT,
+        false,
+        &moved,
+        json!({ "status": "blocked", "blocked_reason": "waits on the deploy" }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("blocked"), Some(CHILD)),
+        "{v}"
+    );
+    let (s, v) = patch_as(&t, PARENT, false, &handed, json!({ "owner": PARENT })).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("review"), Some(PARENT)),
+        "{v}"
+    );
+
+    // A child that acts again runs again, and its task is its own once more.
+    register_delegated(&t, CHILD, PARENT).await;
+    let (s, v) = t.done(PARENT, &revived, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    let (s, v) = take(&t, PARENT, &revived).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
 }

@@ -288,7 +288,13 @@ const TOOLS: &[ToolSpec] = &[
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
-                ("take", b("Take it from a stale owner."), false),
+                (
+                    "take",
+                    b(
+                        "Take it from a stale owner, or from an ended owner you delegated or whose task you created.",
+                    ),
+                    false,
+                ),
             ]
         },
     },
@@ -348,7 +354,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "owner",
                     s(
-                        "Hand the task to this agent id, such as the child doing it, or back to yourself when it is gone. Owner, the board's coordinator or the user only; not for open or closed tasks.",
+                        "Hand the task to this agent id, such as the child doing it, or back to yourself when it is gone. Owner, the board's coordinator or the user only, or, once the owner's session ended, the task's creator or the agent that delegated the owner; not for open or closed tasks.",
                         AGENT_ID_MAX,
                     ),
                     false,

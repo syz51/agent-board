@@ -138,7 +138,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the user. Another live agent's parked task is refused, naming the owner. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
-  child doing it, or back from a child that is gone (logged as an owner change). File
+  child doing it, or back from a child that is gone (logged as an owner change). Once the
+  owner's session has ended, the task's creator and the threads that delegated the owner
+  act as its owner at once (take, move, hand over, done), so a parent finishes what its
+  finished child still owns without the 24-hour wait; an unrelated agent still waits. File
   leases (45 minutes, renewed by heartbeats) are advisory: they warn, never block. A lease
   ends when its holder's session ends, when it expires, or when the task it names goes to
   done, dropped or open, so a lease of finished or abandoned work never warns peers. A task
