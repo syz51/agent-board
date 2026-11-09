@@ -2317,7 +2317,7 @@ async fn ids(t: &T, query: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn live_lists_exactly_the_items_that_take_reports() {
+async fn live_lists_the_items_a_report_would_reach() {
     let t = setup().await;
     t.board("factory", &[]).await;
     let open_work = t.task(B, "factory", "Open work").await;
@@ -2385,4 +2385,51 @@ async fn live_lists_exactly_the_items_that_take_reports() {
         v["next"].as_str().unwrap().contains("board=board-feedback"),
         "{v}"
     );
+}
+
+async fn link(t: &T, item: &str, kind: &str, task: &str) {
+    let (s, v) = user_resolve(t, item, json!({ "kind": kind, "task": task })).await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn live_follows_duplicate_chains_and_lists_only_the_newest_item_per_signature() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    let first_work = t.task(B, "factory", "First fix").await;
+    let later_work = t.task(B, "factory", "Later fix").await;
+
+    // A repeat after the routed work is done files a new item; reopening the work later
+    // does not bring the old item back, because reports go to the newest item only.
+    let old = item(&t, A, "Repeats").await;
+    link(&t, &old, "routed", &first_work).await;
+    assert!(t.claim(B, &first_work).await.0.is_success());
+    assert!(t.done(B, &first_work, check(0)).await.0.is_success());
+    let new = item(&t, A, "Repeats").await;
+    assert_ne!(new, old);
+    let (s, v) = t.patch(B, &first_work, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Every link of a chain that ends at a declined item takes reports.
+    let declined = item(&t, A, "Chain end").await;
+    decline(&t, A, &declined).await;
+    let middle = item(&t, A, "Chain middle").await;
+    link(&t, &middle, "duplicate", &declined).await;
+    let start = item(&t, A, "Chain start").await;
+    link(&t, &start, "duplicate", &middle).await;
+
+    // A chain that ends at work that is now finished takes none.
+    let routed_end = item(&t, A, "Routed end").await;
+    link(&t, &routed_end, "routed", &later_work).await;
+    let follower = item(&t, A, "Follows the routed end").await;
+    link(&t, &follower, "duplicate", &routed_end).await;
+    assert!(t.claim(B, &later_work).await.0.is_success());
+    assert!(t.done(B, &later_work, check(0)).await.0.is_success());
+
+    let mut live = vec![new, declined, middle, start];
+    live.sort();
+    assert_eq!(ids(&t, "live=true").await, live);
+    let mut gone = vec![old, routed_end, follower];
+    gone.sort();
+    assert_eq!(ids(&t, "board=board-feedback&live=false").await, gone);
 }

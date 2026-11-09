@@ -809,8 +809,10 @@ impl Client {
                 "the server does not filter by parent yet; upgrade it, or run `board show {parent}` (MCP: task_show) for its children"
             );
         }
-        // Servers that predate the `live` filter ignore it too, and only they can tell a
-        // routed item's task apart, so a task that cannot be live shows the filter was ignored.
+        // Servers that predate the `live` filter ignore it too. Only the server sees the
+        // status of a routed item's task or a duplicate's original, so the client cannot
+        // filter; a task that can never be live shows the filter was ignored. Best-effort:
+        // a list with only live-looking tasks passes.
         if q.live == Some(true) && tasks.iter().any(|t| !t.may_be_live()) {
             anyhow::bail!(
                 "the server does not filter live feedback items yet; upgrade it, then list them again"

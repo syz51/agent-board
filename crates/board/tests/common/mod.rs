@@ -637,17 +637,18 @@ pub fn feedback_fixture(id: &str, kind: Option<board_proto::ResolutionKind>) -> 
         reports: 1,
         reporters: vec!["t3:a".parse().unwrap()],
         last_reported_at: at(),
-        resolution: kind.map(|kind| {
-            task.status = TaskStatus::Done;
-            board_proto::FeedbackResolution {
-                kind,
-                task: None,
-                reason: Some("why".into()),
-                at: at(),
-                by: "user".into(),
-            }
+        resolution: kind.map(|kind| board_proto::FeedbackResolution {
+            kind,
+            task: None,
+            reason: Some("why".into()),
+            at: at(),
+            by: "user".into(),
         }),
         recurs: None,
     });
+    // Resolving an item closes it.
+    if kind.is_some() {
+        task.status = TaskStatus::Done;
+    }
     task
 }

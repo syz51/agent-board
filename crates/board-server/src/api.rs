@@ -597,19 +597,6 @@ async fn list_tasks(
     } else {
         q.owner
     };
-    // Feedback items live only on the feedback board: on another board the filter can only
-    // be a mistake, so say where they are rather than answer with an empty list.
-    let feedback_board = &state.settings().feedback_board;
-    if q.live.is_some()
-        && let Some(board) = q.board.as_ref().filter(|b| *b != feedback_board)
-    {
-        return Err(invalid(
-            format!(
-                "live filters feedback items, which are on board {feedback_board}, not {board}"
-            ),
-            format!("send board={feedback_board} with live, or leave board out"),
-        ));
-    }
     let filter = TaskFilter {
         board: q.board,
         status: q.status,

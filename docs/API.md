@@ -325,17 +325,20 @@ Reopening a closed board, or any change on it, starts the period again.
   their status; it is absent when none does, and from servers that predate it. The counts
   of a list come from one query, along the parent index. `proposal=true` lists only
   pending proposals, `false` leaves them out (see "Pending proposals" below).
-  `live=true` lists only the feedback items that still take reports, whatever their
-  status, by the rule reports follow (see "Feedback" below): unresolved and not done or
-  dropped, declined, a duplicate of a live item (the original is listed too), or routed to
-  (or a duplicate of) a plain task that is not done or dropped. `live=false` leaves them
-  out. It combines with every other filter, and `limit` counts the items it keeps.
-  Feedback items are only on the feedback board, so `live` with another `board` is 400
-  `invalid`, whose hint names the feedback board; without `board` it lists that board's
-  items. Servers that predate `live` ignore it and list every task; the CLI and MCP then
-  refuse, saying to upgrade the server, when the list holds a task that cannot be live
-  (not a feedback item, forwarded, fixed, or closed unresolved). `limit` defaults to 200,
-  at most 1,000.
+  `live=true` lists only the feedback items a new report with their signature would add
+  to, whatever their status, by the rule reports follow (see "Feedback" below): the newest
+  item with each signature, when it is unresolved and not done or dropped, declined,
+  routed to a task that is not done or dropped, or a duplicate whose chain of originals
+  (at most 8 links) ends at such an item or at a plain task that is not done or dropped.
+  Every item of a live chain is listed. `live=false` lists every other task. It combines
+  with every other filter, and `limit` counts the tasks it keeps. `live=true` with a
+  `board` that holds no feedback items is 400 `invalid`, whose hint names the feedback
+  board; without `board` it lists the items wherever they are. Servers that predate `live`
+  ignore it and list every task, so upgrade the server before relying on it. The CLI and
+  MCP catch most such servers: they refuse, saying to upgrade it, when the list holds a
+  task that can never be live (not a feedback item, forwarded, fixed, or closed
+  unresolved). An old server that has only live-looking items passes that check. `limit`
+  defaults to 200, at most 1,000.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -884,8 +887,9 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
   with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every
   feedback item that still takes reports, such as declined ones and ones routed to open
-  work, which `--status` alone cannot select. It fails with "upgrade it" against a server
-  that predates the filter.
+  work, which `--status` alone cannot select. Against a server that predates the filter it
+  fails with "upgrade it" once the list holds a task that can never be live; upgrade the
+  server first.
 - `board show <id> --json` → `[TaskDetail]` from `GET /v1/tasks/{id}`. Without `--json`, a
   task with children has a `children <n>: done 5 · doing 1 · …` line, a count per status
   (done, review, doing, blocked, open, dropped; statuses without children left out),

@@ -187,7 +187,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "live",
                     b(
-                        "Only feedback items that still take reports, whatever their status: unresolved, declined, or routed to (or a duplicate of) work that is not finished.",
+                        "Only feedback items that still take reports, whatever their status: the newest item per signature that is unresolved and not done or dropped, declined, or routed to (or a duplicate whose chain ends at) work that is not done or dropped.",
                     ),
                     false,
                 ),

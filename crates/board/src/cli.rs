@@ -570,7 +570,8 @@ pub struct LsArgs {
     /// Only the direct children of this task.
     #[arg(long)]
     parent: Option<TaskId>,
-    /// Only feedback items that still take reports, whatever their status.
+    /// Only feedback items that still take reports, whatever their status: unresolved and
+    /// not closed, declined, or routed to (or a duplicate of) work that is not closed.
     #[arg(long)]
     live: bool,
     #[arg(long)]
