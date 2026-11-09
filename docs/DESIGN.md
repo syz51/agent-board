@@ -1161,10 +1161,6 @@ report, not a free-form task (`API.md`, "Feedback"):
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
   changed. A declined item stays live, so repeat reports keep counting against the
   decision; a fixed one does not, so a repeat opens a new item that recurs it.
-- **Listing live items.** Most live items are done (declined, or routed to open work), so
-  no status selects them. `GET /v1/tasks?live=true` (`board ls --live`, MCP `task_list
-  live`) lists exactly the items a report could still reach, by the same rule, so a
-  capture hook can offer an agent's finding every item it may repeat, however old.
 - **Counts across duplicates.** Triage often resolves a report worded differently as a
   `duplicate` of an earlier item, so a problem's weight spreads over many items. An item's
   `reports` and `reporters` therefore include those of its duplicates, counted when it is
