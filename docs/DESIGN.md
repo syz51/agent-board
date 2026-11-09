@@ -758,12 +758,14 @@ settings in use, warned once per edit.
     10 seconds each, and none starts once 45 seconds of the reconcile have passed; a
     board whose check did not start is left as it is until the next reconcile. Coordinator
     starts go board by board, those whose last start failed last unless their hosting
-    settings changed since, so a retry that waits out a timeout (git waiting on a macOS
-    privacy prompt, for one) cannot take the time the others need. A start counts as
-    failed until it succeeds, so one the reconcile's 90 seconds cut short still gets the
-    start back-off and goes last; it keeps its lease, since T3 may have made the thread,
-    which its pending start mark then finds. The git commands a start runs in the
-    project wait at most 10 seconds each, and `git fetch` 60. Each `t3`
+    settings changed or an adoption was requested since, so a retry that waits out a
+    timeout (git waiting on a macOS privacy prompt, for one) cannot take the time the
+    others need. A start counts as failed until it succeeds, so one the reconcile's 90
+    seconds cut short still gets the start back-off, counted from the cut, and goes last.
+    It keeps its lease when its pending start mark was saved, since T3 may have made the
+    thread, which the mark then finds; cut before the mark, it releases the lease at the
+    next reconcile. The git commands a start runs in the project wait at most 20 seconds
+    each, and `git fetch` 60. Each `t3`
     process needs about half a second of CPU to start, so nine at once on a busy device
     took 4-5 seconds each and timed out together under a build. A check that fails or
     runs out of time still renews a named coordinator at work, and only a check that

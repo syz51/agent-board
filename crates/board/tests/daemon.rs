@@ -2980,6 +2980,40 @@ async fn a_board_whose_settings_changed_since_its_start_failed_does_not_wait() {
 }
 
 #[tokio::test]
+async fn a_board_adopted_since_its_start_failed_does_not_wait() {
+    let (mut e, alpha, zeta) = alpha_and_zeta();
+    e.t3.fail_start_in.lock().unwrap().push(src("alpha"));
+    e.stub.on("GET /v1/boards", [&alpha]);
+    e.daemon.reconcile(at()).await.unwrap();
+
+    save_adoption(
+        &home_of(&e),
+        &alpha.slug,
+        &Adoption {
+            thread: ADOPTED.into(),
+            requested_at: at() + chrono::Duration::seconds(10),
+        },
+    )
+    .unwrap();
+    let before = e.stub.requests().len();
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(20))
+        .await
+        .unwrap();
+    let claims: Vec<String> = e.stub.requests()[before..]
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/coordinator"))
+        .map(|r| r.path.clone())
+        .collect();
+    assert_eq!(
+        claims.first().map(String::as_str),
+        Some("/v1/boards/alpha/coordinator"),
+        "the adoption is tried first: {claims:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_start_the_reconcile_drops_still_counts_as_failed_and_keeps_its_lease() {
     let (mut e, alpha, zeta) = alpha_and_zeta();
     e.t3.hang_start_in.lock().unwrap().push(src("alpha"));
@@ -3000,14 +3034,64 @@ async fn a_start_the_reconcile_drops_still_counts_as_failed_and_keeps_its_lease(
         0
     );
 
-    // Within the back-off alpha waits, and zeta starts.
+    // The back-off runs from the cut, which comes up to the 90-second budget after the
+    // start began: retried at 150 seconds, not 60. Meanwhile zeta starts.
     e.t3.hang_start_in.lock().unwrap().clear();
     e.stub.on("GET /v1/boards", [&alpha, &zeta]);
     e.daemon
-        .reconcile(at() + chrono::Duration::seconds(30))
+        .reconcile(at() + chrono::Duration::seconds(61))
         .await
         .unwrap();
     assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+    assert_eq!(
+        e.stub
+            .requests_to("DELETE /v1/boards/alpha/coordinator")
+            .len(),
+        0
+    );
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(149))
+        .await
+        .unwrap();
+    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(150))
+        .await
+        .unwrap();
+    assert_eq!(started_in(&e), [src("alpha"), src("zeta"), src("alpha")]);
+}
+
+#[tokio::test]
+async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_waits() {
+    let (mut e, alpha, zeta) = alpha_and_zeta();
+    e.t3.hang_start_in.lock().unwrap().push(src("alpha"));
+    e.stub.on("GET /v1/boards", [&alpha]);
+    let hung = e.t3.start_hung.clone();
+    tokio::select! {
+        _ = e.daemon.reconcile(at()) => panic!("alpha's start never answers"),
+        () = hung.notified() => {}
+    }
+    // As when git or the claim, before the mark is saved, is what the budget cut.
+    e.daemon.state.pending_starts.remove(&alpha.slug);
+
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    let released = |e: &Env| {
+        e.stub
+            .requests_to("DELETE /v1/boards/alpha/coordinator")
+            .len()
+    };
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert_eq!(released(&e), 1, "no thread holds it");
+    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(62))
+        .await
+        .unwrap();
+    assert_eq!(released(&e), 1, "released once");
 }
 
 /// An env whose board needs a coordinator, with the lease, its release and registration stubbed.

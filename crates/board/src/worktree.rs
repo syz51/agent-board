@@ -17,13 +17,26 @@ use board_proto::{BoardSlug, Timestamp};
 
 use crate::t3::NewWorktree;
 
-/// A git command that only reads the repository answers in well under a second, unless
-/// something holds it, such as a macOS privacy prompt for a protected folder, which git
-/// waits on with no end. So a stuck start fails soon instead of spending the daemon's
-/// reconcile on one board.
-const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(10);
-/// A fetch, which waits on the network.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a git command may run, and whether a timeout may be a macOS privacy prompt.
+#[derive(Clone, Copy)]
+struct Wait {
+    limit: Duration,
+    on_folder: bool,
+}
+
+/// A git command that only reads the repository answers in about a second, unless something
+/// holds it, such as a macOS privacy prompt for a protected folder, which git waits on with
+/// no end. So a stuck start fails soon instead of spending the daemon's reconcile on one
+/// board, with room left for a slow disk or the first run of macOS's git shim.
+const LOCAL: Wait = Wait {
+    limit: Duration::from_secs(20),
+    on_folder: true,
+};
+/// A fetch, which waits on the network; the commands before it already read the folder.
+const FETCH: Wait = Wait {
+    limit: Duration::from_secs(60),
+    on_folder: false,
+};
 
 /// The branch the coordinator of `slug` runs on when it is free.
 pub fn coordinator_branch(slug: &BoardSlug) -> String {
@@ -51,15 +64,10 @@ pub async fn coordinator_worktree(
 /// Whether `project` is the top folder of a git work tree. A folder that does not exist is
 /// not (T3 then reports the missing project), nor is one nested in another repository.
 async fn is_repo_top(project: &Path) -> Result<bool> {
-    let Ok(folder) = project.canonicalize() else {
+    let Ok(folder) = resolve(project).await? else {
         return Ok(false);
     };
-    let out = git(
-        project,
-        &["rev-parse", "--show-toplevel"],
-        LOCAL_GIT_TIMEOUT,
-    )
-    .await?;
+    let out = git(project, &["rev-parse", "--show-toplevel"], LOCAL).await?;
     if !out.ok {
         if out.stderr.contains("not a git repository") {
             return Ok(false);
@@ -70,8 +78,21 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
             out.stderr.trim()
         );
     }
-    let top = Path::new(out.stdout.trim()).canonicalize();
+    let top = resolve(Path::new(out.stdout.trim())).await?;
     Ok(top.is_ok_and(|top| top == folder))
+}
+
+/// `path` with links resolved, off the async executor and within [`LOCAL`]'s limit: a
+/// folder macOS holds for a prompt, or a network volume that stopped answering, blocks it.
+async fn resolve(path: &Path) -> Result<std::io::Result<PathBuf>> {
+    match tokio::time::timeout(LOCAL.limit, tokio::fs::canonicalize(path)).await {
+        Ok(resolved) => Ok(resolved),
+        Err(_) => bail!(
+            "reading {} timed out{}",
+            path.display(),
+            privacy_hint_for(path).await
+        ),
+    }
 }
 
 /// The ref new coordinator worktrees start from, fetched first when it is a remote branch:
@@ -86,7 +107,7 @@ async fn default_base(project: &Path) -> Result<String> {
             "--short",
             "refs/remotes/origin/HEAD",
         ],
-        LOCAL_GIT_TIMEOUT,
+        LOCAL,
     )
     .await?;
     let mut base = head
@@ -113,13 +134,7 @@ async fn default_base(project: &Path) -> Result<String> {
     };
     if let Some(name) = base.strip_prefix("origin/") {
         // A stale remote branch would start the coordinator, and its children, on old code.
-        match git(
-            project,
-            &["fetch", "--quiet", "origin", name],
-            FETCH_TIMEOUT,
-        )
-        .await
-        {
+        match git(project, &["fetch", "--quiet", "origin", name], FETCH).await {
             Ok(out) if out.ok => {}
             Ok(out) => tracing::warn!(
                 "fetching {base} in {}: {}; starting from the local copy",
@@ -136,12 +151,7 @@ async fn default_base(project: &Path) -> Result<String> {
 }
 
 async fn has_ref(project: &Path, full: &str) -> Result<bool> {
-    let out = git(
-        project,
-        &["rev-parse", "--verify", "--quiet", full],
-        LOCAL_GIT_TIMEOUT,
-    )
-    .await?;
+    let out = git(project, &["rev-parse", "--verify", "--quiet", full], LOCAL).await?;
     Ok(out.ok)
 }
 
@@ -151,8 +161,8 @@ struct GitOutput {
     stderr: String,
 }
 
-/// Runs `git -C <project> <args>` and returns its output, stopping it after `timeout`.
-async fn git(project: &Path, args: &[&str], timeout: Duration) -> Result<GitOutput> {
+/// Runs `git -C <project> <args>` and returns its output, stopping it after `wait.limit`.
+async fn git(project: &Path, args: &[&str], wait: Wait) -> Result<GitOutput> {
     let child = tokio::process::Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")
@@ -166,42 +176,50 @@ async fn git(project: &Path, args: &[&str], timeout: Duration) -> Result<GitOutp
         .kill_on_drop(true)
         .spawn()
         .context("running git")?;
-    // Only on macOS, and resolved, so a link to a protected folder counts as one.
-    let hint = || {
-        if !cfg!(target_os = "macos") {
-            return "";
-        }
-        let project = project
-            .canonicalize()
-            .unwrap_or_else(|_| project.to_path_buf());
-        privacy_hint(dirs::home_dir().as_deref(), &project).unwrap_or_default()
+    let Ok(out) = tokio::time::timeout(wait.limit, child.wait_with_output()).await else {
+        let hint = if wait.on_folder {
+            privacy_hint_for(project).await
+        } else {
+            ""
+        };
+        bail!(
+            "git {} timed out in {}{hint}",
+            args.join(" "),
+            project.display()
+        );
     };
-    let out = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .with_context(|| {
-            format!(
-                "git {} timed out in {}{}",
-                args.join(" "),
-                project.display(),
-                hint()
-            )
-        })??;
+    let out = out.context("running git")?;
     let ok = out.status.success();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if denied(ok, &stderr) {
+        stderr = format!("{}{}", stderr.trim_end(), privacy_hint_for(project).await);
+    }
     Ok(GitOutput {
         ok,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: with_denial_hint(ok, stderr, hint),
+        stderr,
     })
 }
 
-/// Git's error output, with the privacy hint after it when git failed on a folder macOS
-/// denied it, as it does once the user refused the prompt.
-fn with_denial_hint(ok: bool, stderr: String, hint: impl FnOnce() -> &'static str) -> String {
-    if ok || !stderr.contains("Operation not permitted") {
-        return stderr;
+/// Whether git failed on a folder macOS denied it, as it does once the user refused the
+/// privacy prompt.
+fn denied(ok: bool, stderr: &str) -> bool {
+    !ok && stderr.contains("Operation not permitted")
+}
+
+/// [`privacy_hint`] for `project` on this Mac, resolved so a link to a protected folder
+/// counts as one. Resolving runs off the executor and gives up after a second, since the
+/// folder may be what holds git.
+async fn privacy_hint_for(project: &Path) -> &'static str {
+    if !cfg!(target_os = "macos") {
+        return "";
     }
-    format!("{}{}", stderr.trim_end(), hint())
+    let resolved = tokio::time::timeout(Duration::from_secs(1), tokio::fs::canonicalize(project))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let project = resolved.as_deref().unwrap_or(project);
+    privacy_hint(dirs::home_dir().as_deref(), project).unwrap_or_default()
 }
 
 /// What a git timeout or denial in `project` adds on macOS when the folder is one macOS
@@ -255,21 +273,11 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_folder_adds_the_hint_on_the_same_line() {
-        let hint = || ": macOS may be keeping board out of this folder";
-        let denied =
-            "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted\n".to_owned();
-        assert_eq!(
-            with_denial_hint(false, denied, hint),
-            "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted: macOS may be keeping board out of this folder"
-        );
-        let other = "fatal: not a git repository\n".to_owned();
-        assert_eq!(with_denial_hint(false, other.clone(), hint), other);
-        assert_eq!(
-            with_denial_hint(true, "Operation not permitted\n".into(), hint),
-            "Operation not permitted\n",
-            "not on success"
-        );
+    fn only_a_failure_macos_denied_counts_as_denied() {
+        let refused = "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted\n";
+        assert!(denied(false, refused));
+        assert!(!denied(false, "fatal: not a git repository\n"));
+        assert!(!denied(true, refused), "not on success");
     }
 
     #[tokio::test]
@@ -282,14 +290,14 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let err = git(
-            dir.path(),
-            &["hash-object", "fifo"],
-            Duration::from_millis(300),
-        )
-        .await
-        .err()
-        .expect("stopped");
+        let wait = Wait {
+            limit: Duration::from_millis(300),
+            ..LOCAL
+        };
+        let err = git(dir.path(), &["hash-object", "fifo"], wait)
+            .await
+            .err()
+            .expect("stopped");
         assert!(
             format!("{err:#}").contains("git hash-object fifo timed out in"),
             "{err:#}"

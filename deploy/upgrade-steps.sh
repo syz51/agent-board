@@ -28,13 +28,18 @@ compose() {
 # that macOS knows only by its hash, so every build lost the grant (such as Documents access,
 # which board watch needs for repositories there) and git waited on a new prompt. The key
 # is in its own keychain, unlocked with a random password in a 0600 file beside it, and
-# locked again after signing. Each failure says what failed.
-sign_board() {
-    dir="$HOME/Library/Application Support/agent-board/signing"
-    keychain="$dir/signing.keychain-db"
-    name="agent-board code signing"
-    bin="${CARGO_HOME:-$HOME/.cargo}/bin/board"
+# locked again however signing ends: a subshell, so its trap does that. Each failure says
+# what failed.
+dir="$HOME/Library/Application Support/agent-board/signing"
+keychain="$dir/signing.keychain-db"
+name="agent-board code signing"
+sign_board() (
+    # Where `cargo install` puts board, unless cargo's own install.root setting moves it.
+    bin="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/board"
     (umask 077 && mkdir -p "$dir") || return 1
+    trap '[ ! -f "$keychain" ] || security lock-keychain "$keychain" ||
+        echo "upgrade: could not lock $keychain again"' EXIT
+    trap 'exit 1' HUP INT TERM
     # Made again only when a run cut short left it without its password, keychain or
     # certificate. A keychain that holds the certificate is never replaced: a new key would
     # lose every privacy grant made for the old one.
@@ -44,7 +49,18 @@ sign_board() {
             echo "upgrade: could not unlock $keychain with the password beside it"
             return 1
         }
-        security find-certificate -c "$name" "$keychain" >/dev/null 2>&1 || remake=yes
+        # 44 is errSecItemNotFound; any other failure says nothing of the certificate.
+        found=0
+        err=$(security find-certificate -c "$name" "$keychain" 2>&1 >/dev/null) || found=$?
+        case $found in
+        0) ;;
+        44) remake=yes ;;
+        *)
+            echo "$err"
+            echo "upgrade: security could not search $keychain for the certificate"
+            return 1
+            ;;
+        esac
     else
         remake=yes
     fi
@@ -66,9 +82,8 @@ sign_board() {
     else
         signed=yes
     fi
-    security lock-keychain "$keychain" || echo "upgrade: could not lock $keychain again"
     [ "$signed" = yes ]
-}
+)
 # Prints the hash of the unlocked keychain's identity; fails without one.
 signing_id() {
     # Listed as untrusted, which codesign accepts: macOS needs only the same key each time.
@@ -91,13 +106,13 @@ make_signing_identity() (
     tmp=$(mktemp -d) || exit 1
     trap 'rm -rf "$tmp"' EXIT
     trap 'exit 1' HUP INT TERM
-    cat >"$tmp/cert.cnf" <<'EOF'
+    cat >"$tmp/cert.cnf" <<EOF
 [req]
 distinguished_name = dn
 x509_extensions = ext
 prompt = no
 [dn]
-CN = agent-board code signing
+CN = $name
 [ext]
 basicConstraints = critical,CA:false
 keyUsage = critical,digitalSignature

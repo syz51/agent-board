@@ -260,14 +260,17 @@ on the new prompt until it times out. So step 7 signs `~/.cargo/bin/board` with 
 self-signed identity that stays the same across builds, as `dev.agent-board.board`. The
 first run makes the identity in its own keychain,
 `~/Library/Application Support/agent-board/signing/signing.keychain-db`, unlocked with a
-random password in the 0600 file `password` beside it, and locked again after signing.
+random password in the 0600 file `password` beside it, and locked again however the step
+ends. It signs `bin/board` under `CARGO_INSTALL_ROOT`, else `CARGO_HOME`, else `~/.cargo`;
+cargo's `install.root` setting is not followed, so set the variable instead.
 `codesign -d -r- ~/.cargo/bin/board` then shows `certificate leaf`. macOS asks once more
 for the first signed build; allow it, or turn on `board` under System Settings > Privacy
 & Security > Files and Folders. A failed signing step only prints a warning that says
 which part failed. A run cut short leaves the password or keychain missing, or a
 keychain without the certificate; the next run makes those again. A keychain that holds
 the certificate is never replaced, since a new key loses the grants: when it does not
-unlock or codesign cannot use it, the warning says so and you fix or remove it. Only
+unlock, `security` cannot search it, or codesign cannot use it, the warning says so and
+you fix or remove it. Only
 this step signs: after installing `board` by hand with `cargo install`, run
 `./deploy/upgrade.sh --yes <rev>` with the installed revision, which signs it again
 without rebuilding. Any process of the same user can read that key and sign code that

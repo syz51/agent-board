@@ -1117,6 +1117,19 @@ struct StartFailure {
     config: HostingConfig,
     delay: TimeDelta,
     retry_at: Timestamp,
+    /// When the start began.
+    started_at: Timestamp,
+    /// The start never returned: the reconcile's budget cut it short, maybe holding the lease.
+    unfinished: bool,
+}
+
+impl StartFailure {
+    /// Whether the board still waits on this failure: not once its hosting settings changed
+    /// or an adoption was requested after the start, either of which is new intent.
+    fn stands(&self, board: &Board, adoption: Option<&Adoption>) -> bool {
+        self.config == HostingConfig::of(board)
+            && adoption.is_none_or(|a| a.requested_at <= self.started_at)
+    }
 }
 
 /// What T3 said of a thread: `None` when it cannot run it.
@@ -1285,12 +1298,12 @@ impl<T: T3> Daemon<T> {
         self.refresh_usage(now).await;
         // Boards whose last start failed go last: a retry can wait out a git or T3 timeout,
         // which would otherwise spend the reconcile's budget and leave the boards after it
-        // unstarted. Not one whose hosting settings changed since, which is new intent.
+        // unstarted. Not one with new intent, which the back-off lets through at once.
         let mut order: Vec<&Board> = boards.iter().collect();
-        order.sort_by_key(|board| {
-            self.failures
-                .get(&board.slug)
-                .is_some_and(|failure| failure.config == HostingConfig::of(board))
+        order.sort_by_cached_key(|board| {
+            self.failures.get(&board.slug).is_some_and(|failure| {
+                failure.stands(board, load_adoption(&self.ctx.home, &board.slug).as_ref())
+            })
         });
         for board in order {
             if !self.is_home(board) {
@@ -1594,32 +1607,44 @@ impl<T: T3> Daemon<T> {
             }
             adoption => adoption,
         };
-        // An adoption requested after the last failed start is new intent: tried at once.
-        if let Some(failure) = self.failures.get(slug)
-            && failure.config == HostingConfig::of(board)
+        if let Some(failure) = self.failures.get_mut(slug)
+            && failure.stands(board, adoption.as_ref())
             && now < failure.retry_at
-            && adoption
-                .as_ref()
-                .is_none_or(|a| a.requested_at <= failure.retry_at - failure.delay)
         {
+            // A start cut short before its pending mark was saved made no thread, so the
+            // lease it may hold goes: another home device can start one meanwhile.
+            let release = failure.unfinished && !self.state.pending_starts.contains_key(slug);
+            failure.unfinished = false;
+            if release {
+                self.release(slug).await;
+            }
             return Ok(());
         }
-        // Counted as failed until it succeeds, so a start the reconcile's budget cuts short
-        // (git or T3 waiting out its timeout) still backs off and goes last. Its lease stays
-        // held: T3 may have made the thread, which the pending start mark finds.
+        // Counted as failed until it returns, so a start the reconcile's budget cuts short
+        // (git or T3 waiting out its timeout) still backs off, from the cut, and goes last.
+        // Its lease stays for now: T3 may have made the thread, which the pending mark finds.
         self.note_failure(board, now);
         let started = match adoption {
             Some(adoption) => self.adopt_thread(board, adoption, now).await,
             None => self.start_coordinator(board, now).await,
         };
-        if started.is_ok() {
-            self.failures.remove(slug);
+        match &started {
+            Ok(()) => {
+                self.failures.remove(slug);
+            }
+            Err(_) => {
+                if let Some(failure) = self.failures.get_mut(slug) {
+                    failure.retry_at = now + failure.delay;
+                    failure.unfinished = false;
+                }
+            }
         }
         started
     }
 
-    /// Delays the next start on `board`: doubled after each failure, reset when its hosting
-    /// settings change.
+    /// Delays the next start on `board`, which begins at `now`, as though the reconcile's
+    /// budget cut it short: doubled after each failure, reset when its hosting settings
+    /// change. A start that returns an error is retried `delay` after `now` instead.
     fn note_failure(&mut self, board: &Board, now: Timestamp) {
         let config = HostingConfig::of(board);
         let last = self
@@ -1628,12 +1653,16 @@ impl<T: T3> Daemon<T> {
             .filter(|last| last.config == config)
             .map(|last| last.delay);
         let delay = next_delay(last, START_RETRY_FIRST, START_RETRY_MAX);
+        let cut = TimeDelta::from_std(self.timing.reconcile_budget)
+            .expect("the reconcile budget is seconds long");
         self.failures.insert(
             board.slug.clone(),
             StartFailure {
                 config,
                 delay,
-                retry_at: now + delay,
+                retry_at: now + cut + delay,
+                started_at: now,
+                unfinished: true,
             },
         );
     }

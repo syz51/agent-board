@@ -161,7 +161,10 @@ delete-keychain)
     rm -f "$2"
     echo "${STUB_HOST:-local} delete-keychain" >> "$STATE/log"
     ;;
-find-certificate) [ -s "$4" ] ;;
+find-certificate)
+    [ -z "${STUB_FAIL_FIND:-}" ] || { echo "security: SecKeychainSearchCopyNext: Internal error" >&2; exit 1; }
+    [ -s "$4" ] || { echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44; }
+    ;;
 find-identity)
     grep -qx identity "$4" || { echo '     0 valid identities found'; exit 0; }
     printf '  1) 0123ABCD "agent-board code signing"\n     1 valid identities found\n'
@@ -345,7 +348,9 @@ impl Env {
             "STUB_OS",
             "STUB_FAIL_SIGN",
             "STUB_FAIL_UNLOCK",
+            "STUB_FAIL_FIND",
             "CARGO_HOME",
+            "CARGO_INSTALL_ROOT",
         ] {
             cmd.env_remove(var);
         }
@@ -1048,6 +1053,58 @@ fn a_certificate_without_a_usable_identity_is_kept_and_reported() {
     let log = env.read("log");
     assert!(!log.contains(" sign "), "{log}");
     assert!(log.contains("local lock"), "{log}");
+}
+
+#[test]
+fn a_keychain_security_cannot_search_is_kept_and_reported() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let dir = signing_folder(&env, "identity\n");
+
+    let out = env.run(
+        &["--yes", new],
+        &[("STUB_OS", "Darwin"), ("STUB_FAIL_FIND", "1")],
+    );
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("Internal error"), "{err}");
+    assert!(err.contains("could not search"), "{err}");
+    assert!(err.contains("could not sign board"), "{err}");
+    assert!(!err.contains("making the code-signing identity"), "{err}");
+    assert_eq!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
+    assert_eq!(
+        fs::read_to_string(dir.join("signing.keychain-db")).unwrap(),
+        "identity\n"
+    );
+    let log = env.read("log");
+    assert!(!log.contains(" sign "), "{log}");
+    assert!(!log.contains("delete-keychain"), "{log}");
+    // The trap locks the keychain the failed run unlocked.
+    assert!(log.contains("local lock"), "{log}");
+    assert!(log.contains("local restart"), "{log}");
+}
+
+#[test]
+fn board_is_signed_where_cargo_install_root_puts_it() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let root = env.root.join("tools");
+    let root_text = root.display().to_string();
+    let out = env.run(
+        &["--yes", new],
+        &[("STUB_OS", "Darwin"), ("CARGO_INSTALL_ROOT", &root_text)],
+    );
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("could not sign"), "{err}");
+    let log = env.read("log");
+    assert!(
+        log.contains(&format!(
+            "local sign 0123ABCD dev.agent-board.board {}",
+            root.join("bin/board").display()
+        )),
+        "{log}"
+    );
 }
 
 #[test]
