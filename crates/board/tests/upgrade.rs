@@ -1085,6 +1085,32 @@ fn a_keychain_security_cannot_search_is_kept_and_reported() {
 }
 
 #[test]
+fn a_keychain_with_the_certificate_but_no_password_is_kept_and_reported() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let dir = signing_folder(&env, "identity\n");
+    fs::remove_file(dir.join("password")).unwrap();
+
+    let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("password file"), "{err}");
+    assert!(err.contains("Restore that file"), "{err}");
+    assert!(err.contains("could not sign board"), "{err}");
+    assert!(!err.contains("making the code-signing identity"), "{err}");
+    assert!(!dir.join("password").exists());
+    assert_eq!(
+        fs::read_to_string(dir.join("signing.keychain-db")).unwrap(),
+        "identity\n"
+    );
+    let log = env.read("log");
+    assert!(!log.contains("local unlock"), "{log}");
+    assert!(!log.contains(" sign "), "{log}");
+    assert!(!log.contains("delete-keychain"), "{log}");
+    assert!(log.contains("local restart"), "{log}");
+}
+
+#[test]
 fn board_is_signed_where_cargo_install_root_puts_it() {
     let env = Env::new();
     let new = &env.main[1];

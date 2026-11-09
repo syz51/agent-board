@@ -432,7 +432,10 @@ settings in use, warned once per edit.
   is fetched first (a failed fetch is logged, and the local copy used). `<branch>` is
   `coordinator/<board>`, or `coordinator/<board>-<UTC time>` when that branch exists, since
   T3 can only create a branch. A folder outside git, or nested in a repository, starts the
-  thread in the folder, as before. The coordinator prompt forbids changing files,
+  thread in the folder, as before. git alone decides (`git rev-parse`), following links as
+  git does, so a folder macOS holds for a privacy prompt or refuses fails the start, with
+  the error naming the System Settings grant to give, instead of passing as a folder
+  outside git; a missing folder is left for T3 to report. The coordinator prompt forbids changing files,
   switching branches or merging in the project root; file work the coordinator does itself
   happens in a worktree of its own, on a new branch per task. A coordinator started before
   this rule, or adopted, still runs in the folder it had; the prompt tells it to add a
@@ -767,10 +770,13 @@ settings in use, warned once per edit.
     settings changed or an adoption was requested since, so a retry that waits out a
     timeout (git waiting on a macOS privacy prompt, for one) cannot take the time the
     others need. A start counts as failed until it succeeds, so one the reconcile's 90
-    seconds cut short still gets the start back-off, counted from the cut, and goes last.
-    It keeps its lease when its pending start mark was saved, since T3 may have made the
-    thread, which the mark then finds; cut before the mark, it releases the lease at the
-    next reconcile. The git commands a start runs in the project wait at most 20 seconds
+    seconds cut short still gets the start back-off, counted from the cut, and goes last;
+    one that returns a failure gets it counted from its return. A new thread's start cut
+    short keeps its lease when its pending start mark was saved, since T3 may have made
+    the thread, which the mark then finds; cut before the mark, it releases the lease at
+    the next reconcile, and again at the one after when that release was cut too. An
+    adoption cut short keeps its lease, since its thread may already have the brief. A
+    failure ends when the board's coordinator is kept or started. The git commands a start runs in the project wait at most 20 seconds
     each, and `git fetch` 60. Each `t3`
     process needs about half a second of CPU to start, so nine at once on a busy device
     took 4-5 seconds each and timed out together under a build. A check that fails or

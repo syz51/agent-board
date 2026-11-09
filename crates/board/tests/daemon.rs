@@ -64,6 +64,8 @@ struct FakeT3 {
     /// prompt; `start_hung` is told once it hangs.
     hang_start_in: Arc<Mutex<Vec<PathBuf>>>,
     start_hung: Arc<tokio::sync::Notify>,
+    /// How long `t3 thread start` takes before it answers.
+    start_takes: Arc<Mutex<Duration>>,
     /// While set, `t3 thread start` creates [`ORPHAN`] and then fails, as when the daemon is
     /// killed or `t3` times out mid-start; the value says whether its message got through.
     die_after_create: Arc<Mutex<Option<bool>>>,
@@ -199,6 +201,8 @@ impl T3 for FakeT3 {
             self.start_hung.notify_one();
             std::future::pending::<()>().await;
         }
+        let takes = *self.start_takes.lock().unwrap();
+        tokio::time::sleep(takes).await;
         if self.fail_start.load(Ordering::SeqCst)
             || self
                 .fail_start_in
@@ -2914,10 +2918,15 @@ async fn a_failed_start_backs_off_instead_of_looping() {
 /// Boards alpha and zeta, which sorts after it, each needing a coordinator here, with their
 /// leases, the leases' release and the registration stubbed. `GET /v1/boards` is left to the test.
 fn alpha_and_zeta() -> (Env, Board, Board) {
+    alpha_in_and_zeta(src("alpha"))
+}
+
+/// [`alpha_and_zeta`] with alpha's project in `alpha_project`.
+fn alpha_in_and_zeta(alpha_project: PathBuf) -> (Env, Board, Board) {
     let (first, second) = ("github.com/o/alpha", "github.com/o/zeta");
     let e = env_with_projects(
         [
-            (first.to_owned(), src("alpha")),
+            (first.to_owned(), alpha_project),
             (second.to_owned(), src("zeta")),
         ]
         .into(),
@@ -3073,16 +3082,35 @@ async fn a_start_the_reconcile_drops_still_counts_as_failed_and_keeps_its_lease(
 
 #[tokio::test]
 async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_waits() {
-    let (mut e, alpha, zeta) = alpha_and_zeta();
-    e.t3.hang_start_in.lock().unwrap().push(src("alpha"));
+    // alpha's project fetches from a remote that never answers, as git waits on a macOS
+    // prompt: the budget cuts the start while it prepares the worktree, before the mark.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(
+        &repo,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", "ssh://example.invalid/repo"],
+    );
+    git(&repo, &["config", "core.sshCommand", "sleep 5 && :"]);
+    let (mut e, alpha, zeta) = alpha_in_and_zeta(repo);
     e.stub.on("GET /v1/boards", [&alpha]);
-    let hung = e.t3.start_hung.clone();
-    tokio::select! {
-        _ = e.daemon.reconcile(at()) => panic!("alpha's start never answers"),
-        () = hung.notified() => {}
-    }
-    // As when git or the claim, before the mark is saved, is what the budget cut.
-    e.daemon.state.pending_starts.remove(&alpha.slug);
+    let cut = tokio::time::timeout(Duration::from_secs(1), e.daemon.reconcile(at())).await;
+    assert!(cut.is_err(), "the fetch never answers");
+    assert_eq!(
+        e.stub
+            .requests_to("POST /v1/boards/alpha/coordinator")
+            .len(),
+        1,
+        "claimed"
+    );
+    assert!(started_in(&e).is_empty(), "T3 never asked");
+    assert!(e.daemon.state.pending_starts.is_empty());
 
     e.stub.on("GET /v1/boards", [&alpha, &zeta]);
     let released = |e: &Env| {
@@ -3095,12 +3123,89 @@ async fn a_start_cut_short_before_its_pending_mark_releases_its_lease_while_it_w
         .await
         .unwrap();
     assert_eq!(released(&e), 1, "no thread holds it");
-    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+    assert_eq!(started_in(&e), [src("zeta")]);
     e.daemon
         .reconcile(at() + chrono::Duration::seconds(62))
         .await
         .unwrap();
     assert_eq!(released(&e), 1, "released once");
+}
+
+#[tokio::test]
+async fn an_adoption_cut_short_keeps_its_lease_as_its_thread_may_have_the_brief() {
+    let mut e = adoption_env();
+    e.t3.hang_send.lock().unwrap().push(ADOPTED.into());
+    let cut = tokio::time::timeout(Duration::from_millis(500), e.daemon.reconcile(at())).await;
+    assert!(cut.is_err(), "the brief never answers");
+    assert_eq!(e.t3.sends().len(), 1);
+
+    // The thread may work as coordinator already: the lease is not released for another
+    // device to start a second one, and the adoption waits its back-off.
+    e.t3.hang_send.lock().unwrap().clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert_eq!(
+        e.stub
+            .requests_to("DELETE /v1/boards/factory/coordinator")
+            .len(),
+        0
+    );
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn a_start_that_fails_slowly_backs_off_from_when_it_failed() {
+    let mut e = start_env();
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    *e.t3.start_takes.lock().unwrap() = Duration::from_millis(1100);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    *e.t3.start_takes.lock().unwrap() = Duration::ZERO;
+
+    // It returned a second after it began: retried a minute after that, not before.
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(60))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 2);
+}
+
+#[tokio::test]
+async fn a_failed_start_whose_thread_is_then_kept_no_longer_waits() {
+    let (mut e, alpha, zeta) = alpha_and_zeta();
+    // T3 made the thread and it was recorded; naming its agent failed.
+    e.stub
+        .once_error("POST /v1/agents", 500, "internal", "the server failed");
+    e.stub.on("GET /v1/boards", [&alpha]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.daemon.state.coordinators[&alpha.slug].thread, NEW_THREAD);
+
+    // Inside the back-off, the recorded thread is kept, which ends the failure.
+    e.stub.on("GET /v1/boards", [&alpha, &zeta]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(5))
+        .await
+        .unwrap();
+    assert_eq!(started_in(&e), [src("alpha"), src("zeta")]);
+
+    // So when that thread is gone, a new one starts at once instead of waiting it out. Both
+    // boards' threads share the fake's id, so zeta starts again too; a gated alpha would not.
+    e.t3.threads.lock().unwrap().remove(NEW_THREAD);
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        started_in(&e),
+        [src("alpha"), src("zeta"), src("alpha"), src("zeta")]
+    );
 }
 
 /// An env whose board needs a coordinator, with the lease, its release and registration stubbed.

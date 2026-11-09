@@ -40,29 +40,35 @@ sign_board() (
     trap '[ ! -f "$keychain" ] || security lock-keychain "$keychain" ||
         echo "upgrade: could not lock $keychain again"' EXIT
     trap 'exit 1' HUP INT TERM
-    # Made again only when a run cut short left it without its password, keychain or
-    # certificate. A keychain that holds the certificate is never replaced: a new key would
-    # lose every privacy grant made for the old one.
-    remake=no
-    if [ -s "$dir/password" ] && [ -f "$keychain" ]; then
-        security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
-            echo "upgrade: could not unlock $keychain with the password beside it"
-            return 1
-        }
+    # Made again only when a run cut short left it without its keychain or certificate. A
+    # keychain that holds the certificate is never replaced, even without its password: a
+    # new key would lose every privacy grant made for the old one. The search needs no
+    # unlocking, so it comes before the password is needed.
+    remake=yes
+    if [ -f "$keychain" ]; then
         # 44 is errSecItemNotFound; any other failure says nothing of the certificate.
         found=0
         err=$(security find-certificate -c "$name" "$keychain" 2>&1 >/dev/null) || found=$?
         case $found in
-        0) ;;
-        44) remake=yes ;;
+        0) remake=no ;;
+        44) ;;
         *)
             echo "$err"
             echo "upgrade: security could not search $keychain for the certificate"
             return 1
             ;;
         esac
-    else
-        remake=yes
+    fi
+    if [ "$remake" = no ]; then
+        [ -s "$dir/password" ] || {
+            echo "upgrade: $keychain holds the certificate, but its password file $dir/password is gone." \
+                "Restore that file, or remove the keychain to make a new identity, for which macOS asks for folder access again"
+            return 1
+        }
+        security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
+            echo "upgrade: could not unlock $keychain with the password beside it"
+            return 1
+        }
     fi
     if [ "$remake" = yes ]; then
         echo "upgrade: making the code-signing identity in $dir"

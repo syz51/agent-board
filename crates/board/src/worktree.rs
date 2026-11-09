@@ -8,7 +8,7 @@
 //! one that exists, and an earlier thread's worktree may still use it, maybe with a live
 //! thread or files git ignores. So nothing here removes a worktree or changes a branch.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -86,13 +86,20 @@ async fn new_worktree(
 
 /// Whether `project` is the top folder of a git work tree. A folder that does not exist is
 /// not (T3 then reports the missing project), nor is one nested in another repository.
+/// git alone answers, with a link followed as git follows it, so a folder macOS holds
+/// for a prompt or refused fails here with the privacy hint instead of passing as no
+/// repository, and nothing is left waiting on it once the command is stopped.
 async fn is_repo_top(project: &Path) -> Result<bool> {
-    let Ok(folder) = resolve(project).await? else {
-        return Ok(false);
-    };
-    let out = git(project, &["rev-parse", "--show-toplevel"], LOCAL).await?;
+    let out = git(
+        project,
+        &["rev-parse", "--is-inside-work-tree", "--show-prefix"],
+        LOCAL,
+    )
+    .await?;
     if !out.ok {
-        if out.stderr.contains("not a git repository") {
+        if out.stderr.contains("not a git repository")
+            || out.stderr.contains("No such file or directory")
+        {
             return Ok(false);
         }
         bail!(
@@ -101,21 +108,9 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
             out.stderr.trim()
         );
     }
-    let top = resolve(Path::new(out.stdout.trim())).await?;
-    Ok(top.is_ok_and(|top| top == folder))
-}
-
-/// `path` with links resolved, off the async executor and within [`LOCAL`]'s limit: a
-/// folder macOS holds for a prompt, or a network volume that stopped answering, blocks it.
-async fn resolve(path: &Path) -> Result<std::io::Result<PathBuf>> {
-    match tokio::time::timeout(LOCAL.limit, tokio::fs::canonicalize(path)).await {
-        Ok(resolved) => Ok(resolved),
-        Err(_) => bail!(
-            "reading {} timed out{}",
-            path.display(),
-            privacy_hint_for(path).await
-        ),
-    }
+    // `true` and an empty prefix at the top; `false` inside `.git`.
+    let mut lines = out.stdout.lines();
+    Ok(lines.next() == Some("true") && lines.next().is_none_or(str::is_empty))
 }
 
 /// The ref new worktrees start from, fetched first when it is a remote branch:
@@ -230,19 +225,60 @@ fn denied(ok: bool, stderr: &str) -> bool {
     !ok && stderr.contains("Operation not permitted")
 }
 
-/// [`privacy_hint`] for `project` on this Mac, resolved so a link to a protected folder
-/// counts as one. Resolving runs off the executor and gives up after a second, since the
-/// folder may be what holds git.
+/// [`privacy_hint`] for `project` on this Mac.
 async fn privacy_hint_for(project: &Path) -> &'static str {
     if !cfg!(target_os = "macos") {
         return "";
     }
-    let resolved = tokio::time::timeout(Duration::from_secs(1), tokio::fs::canonicalize(project))
+    hint_through_links(dirs::home_dir().as_deref(), project)
         .await
-        .ok()
-        .and_then(Result::ok);
-    let project = resolved.as_deref().unwrap_or(project);
-    privacy_hint(dirs::home_dir().as_deref(), project).unwrap_or_default()
+        .unwrap_or_default()
+}
+
+/// [`privacy_hint`] for `project` with its links followed, so a link to a protected folder
+/// counts as one. The path is read one folder at a time from the root and the hint checked
+/// before each read, so nothing inside a protected folder is read: that read would wait on
+/// the same prompt. A read that takes over a second gives up.
+async fn hint_through_links(home: Option<&Path>, project: &Path) -> Option<&'static str> {
+    const MAX_LINKS: usize = 16;
+    let mut path = project.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        let parts: Vec<Component> = path.components().collect();
+        let mut prefix = PathBuf::new();
+        let mut next = None;
+        for (i, part) in parts.iter().enumerate() {
+            match part {
+                Component::CurDir => continue,
+                // `prefix` has no links, so going up is going to its parent.
+                Component::ParentDir => {
+                    prefix.pop();
+                    continue;
+                }
+                Component::Normal(_) => prefix.push(part),
+                Component::RootDir | Component::Prefix(_) => {
+                    prefix.push(part);
+                    continue;
+                }
+            }
+            if let Some(hint) = privacy_hint(home, &prefix) {
+                return Some(hint);
+            }
+            let read = tokio::time::timeout(Duration::from_secs(1), tokio::fs::read_link(&prefix));
+            match read.await {
+                Ok(Ok(target)) => {
+                    let mut resolved = prefix.parent().unwrap_or(&prefix).join(target);
+                    resolved.extend(&parts[i + 1..]);
+                    next = Some(resolved);
+                    break;
+                }
+                // Not a link, or not there.
+                Ok(Err(_)) => {}
+                Err(_) => return None,
+            }
+        }
+        path = next?;
+    }
+    None
 }
 
 /// What a git timeout or denial in `project` adds on macOS when the folder is one macOS
@@ -273,9 +309,47 @@ fn privacy_hint(home: Option<&Path>, project: &Path) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
+
+    #[tokio::test]
+    async fn a_link_to_a_protected_folder_gets_the_hint_without_reading_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // Resolved, as a home folder has no links on the way (/var is one, to /private/var).
+        let home = &dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("Documents/code/repo")).unwrap();
+        std::fs::create_dir(home.join("Developer")).unwrap();
+        std::os::unix::fs::symlink("Documents/code", home.join("code")).unwrap();
+        std::os::unix::fs::symlink("../code/repo", home.join("Developer/repo")).unwrap();
+        let hint = |project: PathBuf| async move { hint_through_links(Some(home), &project).await };
+        assert!(hint(home.join("Documents/x")).await.is_some(), "no link");
+        assert!(
+            hint(home.join("code/repo")).await.is_some(),
+            "a folder on the way"
+        );
+        assert!(
+            hint(home.join("Developer/repo")).await.is_some(),
+            "relative, twice"
+        );
+        assert_eq!(hint(home.join("Developer")).await, None);
+        assert_eq!(hint(home.join("gone/repo")).await, None);
+        // A link to itself ends at the limit.
+        std::os::unix::fs::symlink("loop", home.join("loop")).unwrap();
+        assert_eq!(hint(home.join("loop/repo")).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_folder_git_cannot_enter_is_an_error_not_a_folder_outside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file stands in for the folder: git cannot change into it, as into one macOS
+        // refused, and the start must stop rather than run in the project folder.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = is_repo_top(&file).await.expect_err("an error");
+        assert!(
+            format!("{err:#}").contains("git rev-parse failed in"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn a_timeout_in_a_protected_folder_names_the_privacy_setting() {

@@ -1192,7 +1192,8 @@ struct StartFailure {
     retry_at: Timestamp,
     /// When the start began.
     started_at: Timestamp,
-    /// The start never returned: the reconcile's budget cut it short, maybe holding the lease.
+    /// A new thread's start that never returned: the reconcile's budget cut it short, maybe
+    /// holding the lease, which goes when it saved no pending mark.
     unfinished: bool,
 }
 
@@ -1726,41 +1727,44 @@ impl<T: T3> Daemon<T> {
             }
             adoption => adoption,
         };
-        if let Some(failure) = self.failures.get_mut(slug)
+        if let Some(failure) = self.failures.get(slug)
             && failure.stands(board, adoption.as_ref())
             && now < failure.retry_at
         {
             // A start cut short before its pending mark was saved made no thread, so the
-            // lease it may hold goes: another home device can start one meanwhile.
-            let release = failure.unfinished && !self.state.pending_starts.contains_key(slug);
-            failure.unfinished = false;
-            if release {
+            // lease it may hold goes: another home device can start one meanwhile. Marked
+            // done only once released, so a release the budget cuts is tried again.
+            if failure.unfinished && !self.state.pending_starts.contains_key(slug) {
                 self.release(slug).await;
+                self.failures
+                    .entry(slug.clone())
+                    .and_modify(|failure| failure.unfinished = false);
             }
             return Ok(());
         }
         // Counted as failed until it returns, so a start the reconcile's budget cuts short
         // (git or T3 waiting out its timeout) still backs off, from the cut, and goes last.
-        // Its lease stays for now: T3 may have made the thread, which the pending mark finds.
         let cut = TimeDelta::from_std(self.timing.reconcile_budget)
             .expect("the reconcile budget is seconds long");
+        let began = tokio::time::Instant::now();
         let failure = self.note_failure(board, now);
         failure.retry_at += cut;
-        failure.unfinished = true;
+        // Only a new thread's start: an adoption cut short may have briefed its thread,
+        // which then works as coordinator under this lease.
+        failure.unfinished = adoption.is_none();
         let started = match adoption {
             Some(adoption) => self.adopt_thread(board, adoption, now).await,
             None => self.start_coordinator(board, now).await,
         };
-        match &started {
-            Ok(()) => {
-                self.failures.remove(slug);
-            }
-            Err(_) => {
-                if let Some(failure) = self.failures.get_mut(slug) {
-                    failure.retry_at = now + failure.delay;
-                    failure.unfinished = false;
-                }
-            }
+        if started.is_ok() {
+            self.failures.remove(slug);
+        } else {
+            // Returned: the back-off runs from when it did, so a slow failure still waits.
+            let took = TimeDelta::from_std(Duration::from_secs(began.elapsed().as_secs()))
+                .expect("a start lasts minutes");
+            let failure = self.failures.get_mut(slug).expect("noted before the start");
+            failure.retry_at = now + took + failure.delay;
+            failure.unfinished = false;
         }
         started
     }
