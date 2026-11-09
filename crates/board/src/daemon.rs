@@ -26,7 +26,9 @@
 //! checks them again before sending: a task no longer ready and auto drops its line. Lines
 //! for a running agent are held until its `agent_state_changed` event says it stopped, at
 //! most [`WAKE_HOLD_MAX`]; a paused agent's are kept until its reset. A failed send backs
-//! off, a gone thread drops its lines, and a send that timed out is not repeated.
+//! off, and a gone thread drops its lines. A send that timed out may have been delivered:
+//! a flush looks for its message in the thread a minute later, by the marker it ends with,
+//! and queues its lines again, once, only when the thread never got it.
 //!
 //! Wake-up messages contain only board-generated text and the user's own answers.
 //!
@@ -43,7 +45,7 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, Priority, RegisterAgent, Runtime,
-    Task, TaskId, TaskStatus, Timestamp,
+    Task, TaskId, TaskStatus, Timestamp, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -55,6 +57,7 @@ use crate::config::{Config, Home};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
+use crate::usage::UsageSource;
 
 /// The coordinator's standing instructions.
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
@@ -71,8 +74,8 @@ pub const WAKE_TTL: TimeDelta = TimeDelta::hours(1);
 /// Delay before sending again after a failed send, doubled per failure up to the cap.
 pub const WAKE_RETRY_FIRST: TimeDelta = TimeDelta::seconds(30);
 pub const WAKE_RETRY_MAX: TimeDelta = TimeDelta::minutes(10);
-/// How long one wake-up send may take; one that runs out is not sent again, since T3 may
-/// have delivered it.
+/// How long one wake-up send may take; one that runs out may have been delivered, so it is
+/// sent again only when a later check finds the thread lacks it (see [`UnsureWakes`]).
 const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many agents' wake-ups a flush checks at once.
 const FLUSH_CHECKS_AT_ONCE: usize = 8;
@@ -90,6 +93,9 @@ pub const USER_QUIET: TimeDelta = TimeDelta::minutes(60);
 
 /// Renew the 45-minute coordinator lease this often while the thread is live.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+/// The daemon reads the usage endpoint at most this often; between its own readings, each
+/// reconcile takes the newest reading any device reported.
+pub const USAGE_POLL_EVERY: TimeDelta = TimeDelta::minutes(5);
 /// A named coordinator's thread that T3 found live is not asked about again for this long.
 /// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
 /// each minute costs a home device more than the check is worth. A failed send to the
@@ -179,6 +185,98 @@ pub struct WatchState {
     /// cannot read is skipped rather than resetting the rest of the state.
     #[serde(default, deserialize_with = "lenient_queues")]
     pub wakes: BTreeMap<AgentId, WakeQueue>,
+    /// The wake-up messages to each agent whose send timed out, until a flush finds them
+    /// in the thread or owes what they carried again (see [`UnsureWakes`]). Read leniently
+    /// like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_unsure",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub unsure_wakes: BTreeMap<AgentId, UnsureWakes>,
+    /// Boards the usage held from new work at the last reading: when one drops out, its
+    /// coordinator is woken to start work again.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub usage_held: BTreeSet<BoardSlug>,
+}
+
+/// The wake-up messages to one agent whose send timed out: T3 may or may not have
+/// delivered them. A flush looks for each one's [`wake_marker`] in the thread
+/// [`SEND_CHECK_AFTER`] after its send, and holds the agent's next lines until then, so
+/// they go out with what is owed again. Found, a message is settled; missing while no run
+/// of the thread may still take it, what it carried is owed again, once: its wake-ups are
+/// queued again (see [`Wake::resent`]), its re-briefs are owed, and its fresh-session
+/// notices are due.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UnsureWakes {
+    #[serde(default)]
+    pub messages: Vec<UnsureMessage>,
+    /// The thread is not read again before this: it was busy, or a check failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_after: Option<Timestamp>,
+    /// The delay after the last failed check, doubled per failure; none once a check
+    /// worked. While set, the agent's next lines are not held for a check: a T3 that
+    /// cannot be read must not hold up every wake-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_delay_secs: Option<i64>,
+}
+
+impl UnsureWakes {
+    /// Whether the agent's next lines wait for a check: a message is not looked for yet,
+    /// and no check has failed.
+    pub fn holds(&self, now: Timestamp) -> bool {
+        self.failed_delay_secs.is_none()
+            && self
+                .messages
+                .iter()
+                .any(|m| now - m.since < SEND_CHECK_AFTER)
+    }
+
+    /// Whether a flush reads the thread now: a message is due, and no wait is on.
+    fn read_due(&self, now: Timestamp) -> bool {
+        self.read_after.is_none_or(|after| now >= after)
+            && self
+                .messages
+                .iter()
+                .any(|m| now - m.since >= SEND_CHECK_AFTER)
+    }
+}
+
+/// A wake-up message whose send timed out, by what it carried for the first time; the text
+/// itself is never kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnsureMessage {
+    /// The [`wake_digest`] its marker names.
+    pub digest: String,
+    /// Its wake-ups not sent twice already.
+    #[serde(
+        default,
+        deserialize_with = "lenient_wakes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub wakes: Vec<Wake>,
+    /// Its re-briefs not sent twice already.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebriefs: Vec<RebriefMark>,
+    /// Its fresh-session notices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh: Vec<FreshMark>,
+    /// When the send that may have delivered it ran.
+    pub since: Timestamp,
+}
+
+impl UnsureMessage {
+    fn is_empty(&self) -> bool {
+        self.wakes.is_empty() && self.rebriefs.is_empty() && self.fresh.is_empty()
+    }
+}
+
+/// A re-brief a wake-up message carried: the coordinator's board, and the
+/// [`prompt_digest`] of the standing prompt it carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebriefMark {
+    pub slug: BoardSlug,
+    pub digest: String,
 }
 
 /// One agent's wake-ups not sent yet.
@@ -211,6 +309,10 @@ pub struct Wake {
     /// An answer whose asker cannot be woken now, already passed on to the coordinator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarded: bool,
+    /// Queued again after a send that timed out never reached the thread: one more send
+    /// that times out counts as delivered, so a wake-up is sent at most twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +341,10 @@ pub enum WakeAbout {
         since: Timestamp,
         noticed: Timestamp,
     },
+    /// For the coordinator: the board was paused and is active again (`board resume`).
+    Resumed,
+    /// For the coordinator: the usage no longer holds the board from new work.
+    UsageEased,
 }
 
 impl WakeAbout {
@@ -252,6 +358,8 @@ impl WakeAbout {
             Self::Answered { .. } => "answered",
             Self::Review { .. } => "review",
             Self::Idle { .. } => "idle",
+            Self::Resumed => "resumed",
+            Self::UsageEased => "usage_eased",
         }
     }
 }
@@ -261,25 +369,47 @@ impl WakeAbout {
 fn lenient_queues<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<AgentId, WakeQueue>, D::Error> {
-    let serde_json::Value::Object(queues) = serde_json::Value::deserialize(d)? else {
-        return Ok(BTreeMap::new());
+    let mut queues: BTreeMap<AgentId, WakeQueue> =
+        lenient_by_agent(serde_json::Value::deserialize(d)?, "the wake-ups");
+    queues.retain(|_, queue| !queue.wakes.is_empty());
+    Ok(queues)
+}
+
+/// Each agent's timed-out wake-up message read on its own, like [`lenient_queues`].
+fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<AgentId, UnsureWakes>, D::Error> {
+    let mut unsure: BTreeMap<AgentId, UnsureWakes> = lenient_by_agent(
+        serde_json::Value::deserialize(d)?,
+        "the timed-out wake-up messages",
+    );
+    unsure.retain(|_, u| !u.messages.is_empty());
+    Ok(unsure)
+}
+
+/// The entries of `value`, an object by agent id, that this version can read; `what` names
+/// an entry in the warning for one skipped.
+fn lenient_by_agent<V: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    what: &str,
+) -> BTreeMap<AgentId, V> {
+    let serde_json::Value::Object(entries) = value else {
+        return BTreeMap::new();
     };
-    Ok(queues
+    entries
         .into_iter()
-        .filter_map(
-            |(agent, queue)| match (agent.parse::<AgentId>(), serde_json::from_value(queue)) {
-                (Ok(id), Ok(queue @ WakeQueue { .. })) => {
-                    (!queue.wakes.is_empty()).then_some((id, queue))
-                }
+        .filter_map(|(agent, entry)| {
+            match (agent.parse::<AgentId>(), serde_json::from_value(entry)) {
+                (Ok(id), Ok(entry)) => Some((id, entry)),
                 _ => {
                     tracing::warn!(
-                        "watch state: skipped the wake-ups for {agent}, which this version cannot read"
+                        "watch state: skipped {what} for {agent}, which this version cannot read"
                     );
                     None
                 }
-            },
-        )
-        .collect())
+            }
+        })
+        .collect()
 }
 
 /// Wake-ups read one by one; those this version cannot read are skipped.
@@ -428,13 +558,18 @@ struct Outgoing {
     rebriefs: Vec<HeldRebrief>,
     /// The boards whose coordinator this message tells that a fresh session is due.
     fresh: Vec<FreshMark>,
+    /// The [`wake_digest`] its marker names, when its send was recorded in
+    /// [`WatchState::unsure_wakes`] before it ran: it carries something not sent twice yet.
+    unsure: Option<String>,
 }
 
 /// A fresh-session line that goes out with a wake-up: the coordinator's board, and its
-/// [`FreshSession::since`] before, restored if the send fails.
-struct FreshMark {
-    slug: BoardSlug,
-    since_before: Option<u64>,
+/// [`FreshSession::since`] before, restored if the send fails or never reached the thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FreshMark {
+    pub slug: BoardSlug,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_before: Option<u64>,
 }
 
 /// A re-brief that goes out with a wake-up: the coordinator's board, whether the prompt
@@ -445,9 +580,12 @@ struct HeldRebrief {
     before: Option<String>,
     /// The coordinator's [`Coordinator::rebrief_unsure`] before, restored with `before`.
     unsure_before: Option<UnsureRebrief>,
+    /// Whether this prompt was found missing and is owed again already: a send of it that
+    /// times out counts as delivered.
+    resent: bool,
 }
 
-/// What a check found of a re-brief whose send timed out.
+/// What a check found of a message whose send timed out: a re-brief, or a wake-up message.
 enum Arrival {
     /// The thread has it.
     Found,
@@ -459,11 +597,107 @@ enum Arrival {
     Unknown { err: anyhow::Error, gone: bool },
 }
 
+/// What a flush does about an agent's timed-out wake-up messages ([`UnsureWakes`]), read
+/// before anything changes.
+#[derive(Default)]
+struct Look {
+    /// The agent's lines wait for a message not looked for yet.
+    hold: bool,
+    /// What a read of the thread found of the messages due, if it was read.
+    read: Option<Result<Sorted>>,
+    /// The thread's latest messages, when just read: the fresh-session check uses them
+    /// instead of reading again.
+    recent: Option<crate::t3::RecentMessages>,
+}
+
+/// The due timed-out messages of an agent, sorted by what a read of its thread found.
+struct Sorted {
+    /// The digests of those the thread has.
+    arrived: Vec<String>,
+    /// Those the thread never got: what they carried is owed again.
+    missing: Vec<UnsureMessage>,
+    /// Whether some are neither, since a run of the thread may still take them.
+    waiting: bool,
+}
+
+/// Sorts `unsure`'s messages due at `now` by `read`, a read of the agent's thread. A thread
+/// T3 does not know never got them: the send of their lines finds it gone and passes its
+/// answers on.
+fn sort_unsure(
+    unsure: &UnsureWakes,
+    read: Option<&crate::t3::RecentMessages>,
+    now: Timestamp,
+) -> Sorted {
+    let mut sorted = Sorted {
+        arrived: Vec::new(),
+        missing: Vec::new(),
+        waiting: false,
+    };
+    for message in unsure
+        .messages
+        .iter()
+        .filter(|m| now - m.since >= SEND_CHECK_AFTER)
+    {
+        let marker = wake_marker(&message.digest);
+        let arrival = read.map_or(Arrival::Missing, |recent| {
+            arrival_in(recent, |user| user.iter().any(|m| m.text.contains(&marker)))
+        });
+        match arrival {
+            Arrival::Found => sorted.arrived.push(message.digest.clone()),
+            Arrival::Waiting => sorted.waiting = true,
+            _ => sorted.missing.push(message.clone()),
+        }
+    }
+    sorted
+}
+
+/// Adds `wake` to `wakes` unless one about the same thing is there; then that one counts as
+/// sent twice only when both do, so a new event keeps its own second send.
+fn add_wake(wakes: &mut Vec<Wake>, wake: Wake) {
+    match wakes
+        .iter_mut()
+        .find(|w| w.board == wake.board && w.about == wake.about)
+    {
+        Some(queued) => queued.resent &= wake.resent,
+        None => wakes.push(wake),
+    }
+}
+
+/// `queue` with the wake-ups of `missing`, messages the thread never got, added again, each
+/// marked [`Wake::resent`].
+fn requeue_unsure(mut queue: WakeQueue, missing: &[UnsureMessage]) -> WakeQueue {
+    for wake in missing.iter().flat_map(|m| &m.wakes) {
+        let wake = Wake {
+            resent: true,
+            ..wake.clone()
+        };
+        add_wake(&mut queue.wakes, wake);
+    }
+    queue
+}
+
+/// Whether `recent`, a thread's latest messages, holds a message whose send timed out: `has`
+/// says whether its user messages, oldest first, include it. Without it, it counts as
+/// missing only when T3 has no run of the thread active or queued, which might still take
+/// the message.
+fn arrival_in(
+    recent: &crate::t3::RecentMessages,
+    has: impl FnOnce(&[crate::t3::UserMessage]) -> bool,
+) -> Arrival {
+    if has(&recent.user) {
+        Arrival::Found
+    } else if recent.busy {
+        Arrival::Waiting
+    } else {
+        Arrival::Missing
+    }
+}
+
 /// How a wake-up send went.
 enum Sent {
     Delivered,
-    /// It ran out of time: T3 may have delivered it, so its wake-up lines are not sent
-    /// again, and a re-brief it carried is sent again only when the thread lacks it.
+    /// It ran out of time: T3 may have delivered it, so its wake-up lines and a re-brief it
+    /// carried are sent again only when a later check finds the thread lacks it.
     MaybeDelivered(anyhow::Error),
     /// T3 no longer has the thread, it is archived, or its worktree is gone.
     Gone(anyhow::Error),
@@ -626,13 +860,14 @@ pub struct UnsureRebrief {
     #[serde(default)]
     pub resent: bool,
     /// When the send that may have delivered it ran: it is looked for
-    /// [`REBRIEF_CHECK_AFTER`] later, once T3 has handled a request still in flight.
+    /// [`SEND_CHECK_AFTER`] later, once T3 has handled a request still in flight.
     pub since: Timestamp,
 }
 
-/// A re-brief whose send timed out is looked for in the thread this long after the send,
-/// since T3 may still be handling the request the timed-out `t3 thread send` made.
-pub const REBRIEF_CHECK_AFTER: TimeDelta = TimeDelta::minutes(1);
+/// A re-brief or wake-up message whose send timed out is looked for in the thread this long
+/// after the send, since T3 may still be handling the request the timed-out
+/// `t3 thread send` made.
+pub const SEND_CHECK_AFTER: TimeDelta = TimeDelta::minutes(1);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Coordinator {
@@ -927,6 +1162,13 @@ pub struct Daemon<T: T3> {
     /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
     config_text: Option<String>,
     pub timing: Timing,
+    /// Where the account's usage is read. [`UsageSource::Server`] unless set: `board
+    /// watch` sets Claude Code's endpoint.
+    pub usage_source: UsageSource,
+    /// The newest usage reading, as last read or reported.
+    pub usage: Option<Usage>,
+    /// When this daemon last read the usage endpoint itself.
+    usage_polled: Option<Timestamp>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -948,6 +1190,9 @@ impl<T: T3> Daemon<T> {
             sending: Vec::new(),
             config_text,
             timing: Timing::default(),
+            usage_source: UsageSource::Server,
+            usage: None,
+            usage_polled: None,
         }
     }
 
@@ -1021,9 +1266,12 @@ impl<T: T3> Daemon<T> {
     }
 
     fn is_home(&self, board: &Board) -> bool {
-        board.autopilot
-            && board.status == BoardStatus::Active
-            && board.home_devices.contains(&self.ctx.device)
+        self.hosts(board) && board.status == BoardStatus::Active
+    }
+
+    /// An autopilot board with this device among its homes, whatever its status.
+    fn hosts(&self, board: &Board) -> bool {
+        board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
     /// Starts, renews or resumes the coordinators this device hosts.
@@ -1033,10 +1281,18 @@ impl<T: T3> Daemon<T> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         let mut checks = self.check_threads(&boards, now, checks_until).await;
+        // After the thread checks, so a slow usage read never takes their time.
+        self.refresh_usage(now).await;
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
                 self.state.pending_starts.remove(&board.slug);
+                // A paused board keeps its coordinator thread and names it still, so the
+                // server holds that thread while paused (`Snapshot::held_by`), and the same
+                // thread is woken when the board resumes instead of a new one starting.
+                if self.hosts(board) && board.status == BoardStatus::Paused {
+                    continue;
+                }
                 if self.state.coordinators.remove(&board.slug).is_some() {
                     self.release(&board.slug).await;
                 }
@@ -1446,8 +1702,14 @@ impl<T: T3> Daemon<T> {
 
     /// The [`message_key`] of the newest user message in `agent`'s thread
     /// ([`is_user_message`]), when a coordinator record of `agent` here has a fresh session
-    /// [`FreshSession::due`]: `None` when none has, so nothing is read.
-    async fn fresh_read(&self, agent: &AgentId, now: Timestamp) -> Option<Result<Option<String>>> {
+    /// [`FreshSession::due`]: `None` when none has, so nothing is read. `read`, the
+    /// thread's latest messages when this flush read them already, spares a second read.
+    async fn fresh_read(
+        &self,
+        agent: &AgentId,
+        now: Timestamp,
+        read: Option<&crate::t3::RecentMessages>,
+    ) -> Option<Result<Option<String>>> {
         let due = self
             .state
             .coordinators
@@ -1456,7 +1718,11 @@ impl<T: T3> Daemon<T> {
         if !due {
             return None;
         }
-        let read = match self.read_messages(agent.native()).await {
+        let read = match read {
+            Some(recent) => Ok(Some(recent.clone())),
+            None => self.read_messages(agent.native()).await,
+        };
+        let read = match read {
             Ok(Some(recent)) => Ok(recent
                 .user
                 .iter()
@@ -1506,7 +1772,7 @@ impl<T: T3> Daemon<T> {
     /// between turns. Held too while its board is idle ([`is_idle`]), or wake-ups wait for
     /// it: the next wake-up carries it (see [`Self::flush`]), so a deploy costs an idle
     /// coordinator no turn. A failed send backs off. One that timed out counts as sent until
-    /// a reconcile [`REBRIEF_CHECK_AFTER`] later finds it missing ([`Self::rebrief_arrival`]),
+    /// a reconcile [`SEND_CHECK_AFTER`] later finds it missing ([`Self::rebrief_arrival`]),
     /// which makes it owed again, once. Either makes the next reconcile ask T3 whether the
     /// thread is gone.
     async fn rebrief(
@@ -1544,7 +1810,7 @@ impl<T: T3> Daemon<T> {
             .filter(|unsure| !unsure.resent && local.briefed.as_deref() == Some(digest))
             .map(|unsure| unsure.since);
         if let Some(since) = unsure_since {
-            if backing_off || now - since < REBRIEF_CHECK_AFTER {
+            if backing_off || now - since < SEND_CHECK_AFTER {
                 return;
             }
             match self.rebrief_arrival(&local.thread, slug, triage).await {
@@ -1591,6 +1857,11 @@ impl<T: T3> Daemon<T> {
             || backing_off
             || is_idle(board)
             || self.state.wakes.contains_key(&local.agent)
+            || self
+                .state
+                .unsure_wakes
+                .get(&local.agent)
+                .is_some_and(|u| u.holds(now))
         {
             return;
         }
@@ -1607,37 +1878,146 @@ impl<T: T3> Daemon<T> {
     /// missing only when T3 has no run of the thread active or queued, which might still
     /// take the message.
     async fn rebrief_arrival(&self, thread: &str, slug: &BoardSlug, triage: bool) -> Arrival {
-        let recent = match self.read_messages(thread).await {
-            Ok(Some(recent)) => recent,
-            Ok(None) => {
-                return Arrival::Unknown {
-                    err: anyhow::anyhow!("T3 does not know thread {thread}"),
-                    gone: true,
-                };
-            }
-            Err(err) => return Arrival::Unknown { err, gone: false },
-        };
         let marker = rebrief_marker(slug, triage);
         let any_marker = format!(" of board {slug})");
-        let newest = recent
-            .user
-            .iter()
-            .rev()
-            .map(|m| &m.text)
-            .find(|text| text.contains("(re-brief ") && text.contains(&any_marker));
-        if newest.is_some_and(|text| text.contains(&marker)) {
-            Arrival::Found
-        } else if recent.busy {
-            Arrival::Waiting
-        } else {
-            Arrival::Missing
+        self.arrival(thread, |user| {
+            user.iter()
+                .rev()
+                .map(|m| &m.text)
+                .find(|text| text.contains("(re-brief ") && text.contains(&any_marker))
+                .is_some_and(|text| text.contains(&marker))
+        })
+        .await
+    }
+
+    /// Whether `thread` got a message whose send timed out, from its [`RECENT_MESSAGES`]
+    /// latest messages (see [`arrival_in`]).
+    async fn arrival(
+        &self,
+        thread: &str,
+        has: impl FnOnce(&[crate::t3::UserMessage]) -> bool,
+    ) -> Arrival {
+        match self.read_messages(thread).await {
+            Ok(Some(recent)) => arrival_in(&recent, has),
+            Ok(None) => Arrival::Unknown {
+                err: anyhow::anyhow!("T3 does not know thread {thread}"),
+                gone: true,
+            },
+            Err(err) => Arrival::Unknown { err, gone: false },
+        }
+    }
+
+    /// What a flush does about `agent`'s timed-out wake-up messages, if any, read without
+    /// changing anything: whether its lines wait, and, when a message is due, what a read
+    /// of its thread finds of each. `reads` limits how many threads a flush reads at once.
+    async fn look_for_unsure(
+        &self,
+        agent: &AgentId,
+        unsure: Option<&UnsureWakes>,
+        now: Timestamp,
+        reads: &tokio::sync::Semaphore,
+    ) -> Look {
+        let Some(unsure) = unsure else {
+            return Look::default();
+        };
+        let mut look = Look {
+            hold: unsure.holds(now),
+            ..Look::default()
+        };
+        if unsure.read_due(now) {
+            let _permit = reads.acquire().await;
+            look.read = Some(match self.read_messages(agent.native()).await {
+                Ok(recent) => {
+                    let sorted = sort_unsure(unsure, recent.as_ref(), now);
+                    look.recent = recent;
+                    Ok(sorted)
+                }
+                Err(err) => Err(err),
+            });
+        }
+        look
+    }
+
+    /// Records what [`Self::look_for_unsure`] found of `agent`'s timed-out wake-up messages:
+    /// those found are settled; for those missing, their re-briefs are owed and their
+    /// fresh-session notices due again, while their wake-ups are already in the queue the
+    /// flush checked ([`requeue_unsure`]). A failed read backs off.
+    fn settle_look(&mut self, agent: &AgentId, read: Option<Result<Sorted>>, now: Timestamp) {
+        let Some(read) = read else {
+            return;
+        };
+        let Some(unsure) = self.state.unsure_wakes.get_mut(agent) else {
+            return;
+        };
+        let sorted = match read {
+            Ok(sorted) => sorted,
+            Err(err) => {
+                let last = unsure.failed_delay_secs.map(TimeDelta::seconds);
+                let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
+                tracing::warn!(
+                    "waking {agent}: looking for timed-out messages: {err:#}; trying again in \
+                     {}s",
+                    delay.num_seconds()
+                );
+                unsure.failed_delay_secs = Some(delay.num_seconds());
+                unsure.read_after = Some(now + delay);
+                return;
+            }
+        };
+        unsure.failed_delay_secs = None;
+        // A run that may still take a message is not asked about on every flush.
+        unsure.read_after = sorted.waiting.then(|| now + SEND_CHECK_AFTER);
+        unsure.messages.retain(|m| {
+            !sorted.arrived.contains(&m.digest)
+                && !sorted.missing.iter().any(|x| x.digest == m.digest)
+        });
+        if unsure.messages.is_empty() {
+            self.state.unsure_wakes.remove(agent);
+        }
+        if !sorted.arrived.is_empty() {
+            tracing::info!(
+                "woke {agent}: {} timed-out messages reached the thread",
+                sorted.arrived.len()
+            );
+        }
+        for message in sorted.missing {
+            tracing::warn!(
+                "waking {agent}: a send timed out and the thread never got the message; what \
+                 it carried is sent again"
+            );
+            for mark in message.rebriefs {
+                let Some(local) = self
+                    .state
+                    .coordinators
+                    .get_mut(&mark.slug)
+                    .filter(|c| c.agent == *agent && c.briefed.as_ref() == Some(&mark.digest))
+                else {
+                    continue;
+                };
+                local.briefed = None;
+                local.rebrief_unsure = Some(UnsureRebrief {
+                    digest: mark.digest,
+                    resent: true,
+                    since: message.since,
+                });
+            }
+            for mark in message.fresh {
+                if let Some(local) = self
+                    .state
+                    .coordinators
+                    .get_mut(&mark.slug)
+                    .filter(|c| c.agent == *agent)
+                {
+                    local.fresh.since = mark.since_before;
+                }
+            }
         }
     }
 
     /// The re-briefs `agent` is owed, for each board this device hosts it as coordinator
-    /// of where it was briefed with another standing prompt; marked briefed, and unsure as
-    /// of `now`, at once, so a flush cut short while sending leaves them to be looked for
-    /// in the thread.
+    /// of where it was briefed with another standing prompt; marked briefed at once. The
+    /// message that carries them tracks them ([`UnsureMessage::rebriefs`]), so a flush cut
+    /// short while sending leaves them to be looked for in the thread.
     fn take_owed_rebriefs(&mut self, agent: &AgentId, now: Timestamp) -> Vec<HeldRebrief> {
         let feedback = self.ctx.config.feedback_board();
         self.state
@@ -1648,13 +2028,13 @@ impl<T: T3> Daemon<T> {
                 let triage = *slug == feedback;
                 let digest = prompt_digest(triage);
                 (local.briefed.as_deref() != Some(digest)).then(|| {
-                    let unsure_before = local.rebrief_unsure.clone();
-                    local.rebrief_unsure = unsure_after(local, digest, now);
+                    let resent = unsure_after(local, digest, now).is_none();
                     HeldRebrief {
                         slug: slug.clone(),
                         triage,
                         before: local.briefed.replace(digest.to_owned()),
-                        unsure_before,
+                        unsure_before: local.rebrief_unsure.take(),
+                        resent,
                     }
                 })
             })
@@ -1986,6 +2366,7 @@ impl<T: T3> Daemon<T> {
                 about,
                 queued_at: now,
                 forwarded: false,
+                resent: false,
             };
             self.queue(agent, wake);
         }
@@ -1995,14 +2376,7 @@ impl<T: T3> Daemon<T> {
 
     /// Adds `wake` to `agent`'s queue unless the same one is already there.
     fn queue(&mut self, agent: AgentId, wake: Wake) {
-        let queue = self.state.wakes.entry(agent).or_default();
-        if !queue
-            .wakes
-            .iter()
-            .any(|w| w.board == wake.board && w.about == wake.about)
-        {
-            queue.wakes.push(wake);
-        }
+        add_wake(&mut self.state.wakes.entry(agent).or_default().wakes, wake);
     }
 
     /// Keeps what is known of an agent with queued wake-ups current: its held wake-ups are
@@ -2037,6 +2411,20 @@ impl<T: T3> Daemon<T> {
         };
         match event.event_type {
             EventType::BoardCreated => return Ok((true, wakes)),
+            // A board paused and active again: its coordinator, which stopped when it was
+            // paused. The cached board is still paused until the reconcile this event asks
+            // for, so its coordinator is read from it whatever its status; the wake-up is
+            // checked again against the reconciled board when it is sent.
+            EventType::BoardUpdated if event.payload["status"] == "active" => {
+                let board = self.boards.get(slug).filter(|b| b.autopilot);
+                let coordinator = board
+                    .and_then(|b| b.coordinator.as_ref())
+                    .or_else(|| self.state.coordinators.get(slug).map(|c| &c.agent));
+                if let Some(to) = self.wakeable(coordinator, event) {
+                    wakes.push((slug.clone(), to.clone(), WakeAbout::Resumed));
+                }
+                return Ok((true, wakes));
+            }
             // This device's own lease claims and releases change nothing a reconcile would act on.
             EventType::BoardUpdated => return Ok((!self.is_own_claim(event), wakes)),
             // The server's notice that a task's owner has been away from it: the owner; the
@@ -2252,19 +2640,70 @@ impl<T: T3> Daemon<T> {
     /// [`WAKE_SEND_TIMEOUT`], so a hanging T3 holds the daemon up once per flush, not once
     /// per agent; a flush cut short while sending counts those lines as maybe delivered.
     /// A coordinator owed a re-brief, held while its board was idle, gets the standing
-    /// prompt in front of its lines.
+    /// prompt in front of its lines. Each message ends with a [`wake_marker`]; one whose
+    /// send timed out is looked for in the thread [`SEND_CHECK_AFTER`] later, while the
+    /// agent's next lines wait, and its wake-ups are queued again, once, when the thread
+    /// never got it (see [`UnsureWakes`]).
     pub async fn flush(&mut self, now: Timestamp) {
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
-        let queues: Vec<(AgentId, WakeQueue)> = self
+        for (agent, unsure) in &mut self.state.unsure_wakes {
+            unsure.messages.retain(|m| {
+                let live = now - m.since < WAKE_TTL;
+                if !live {
+                    tracing::warn!(
+                        "waking {agent}: a timed-out message was not found in time; what it \
+                         carried is dropped"
+                    );
+                }
+                live
+            });
+        }
+        self.state
+            .unsure_wakes
+            .retain(|_, unsure| !unsure.messages.is_empty());
+        let agents: BTreeSet<&AgentId> = self
             .state
             .wakes
-            .iter()
-            .map(|(agent, queue)| (agent.clone(), queue.clone()))
+            .keys()
+            .chain(self.state.unsure_wakes.keys())
             .collect();
+        let queues: Vec<(AgentId, WakeQueue, Option<UnsureWakes>)> = agents
+            .into_iter()
+            .map(|agent| {
+                (
+                    agent.clone(),
+                    self.state.wakes.get(agent).cloned().unwrap_or_default(),
+                    self.state.unsure_wakes.get(agent).cloned(),
+                )
+            })
+            .collect();
+        // Thread reads start `t3` processes: as few at once as the reconcile's checks.
+        let reads = tokio::sync::Semaphore::new(THREAD_CHECKS_AT_ONCE);
         let this = &*self;
-        let checked: Vec<(Checked, Option<Result<Option<String>>>)> =
-            futures_util::stream::iter(queues.iter().map(|(agent, queue)| async move {
+        type Read = (
+            Checked,
+            Option<Result<Option<String>>>,
+            Option<Result<Sorted>>,
+            Option<WakeQueue>,
+        );
+        let reads = &reads;
+        let checked: Vec<Read> =
+            futures_util::stream::iter(queues.iter().map(|(agent, queue, unsure)| async move {
                 tokio::time::timeout_at(deadline, async {
+                    let look = this
+                        .look_for_unsure(agent, unsure.as_ref(), now, reads)
+                        .await;
+                    // The wake-ups of messages the thread never got go with the queue.
+                    let requeued = match &look.read {
+                        Some(Ok(sorted)) if !sorted.missing.is_empty() => {
+                            Some(requeue_unsure(queue.clone(), &sorted.missing))
+                        }
+                        _ => None,
+                    };
+                    let queue = requeued.as_ref().unwrap_or(queue);
+                    if look.hold || queue.wakes.is_empty() {
+                        return (Checked::Waiting, None, look.read, requeued);
+                    }
                     let checked = this.check(agent, queue, now).await;
                     // Read only for a message about to go out.
                     let fresh = match &checked {
@@ -2272,21 +2711,21 @@ impl<T: T3> Daemon<T> {
                             rechecks: Some(lines),
                             ..
                         } if lines.iter().any(|l| matches!(l, Ok(Some(_)))) => {
-                            this.fresh_read(agent, now).await
+                            this.fresh_read(agent, now, look.recent.as_ref()).await
                         }
                         _ => None,
                     };
-                    (checked, fresh)
+                    (checked, fresh, look.read, requeued)
                 })
                 .await
-                .unwrap_or((Checked::NotReached, None))
+                .unwrap_or((Checked::NotReached, None, None, None))
             }))
             .buffered(FLUSH_CHECKS_AT_ONCE)
             .collect()
             .await;
         let late = checked
             .iter()
-            .filter(|(c, _)| matches!(c, Checked::NotReached))
+            .filter(|(c, ..)| matches!(c, Checked::NotReached))
             .count();
         if late > 0 {
             tracing::warn!(
@@ -2295,8 +2734,11 @@ impl<T: T3> Daemon<T> {
             );
         }
         let mut outgoing = Vec::new();
-        for ((agent, queue), (checked, fresh)) in queues.into_iter().zip(checked) {
+        for ((agent, queue, _), (checked, fresh, read, requeued)) in queues.into_iter().zip(checked)
+        {
+            self.settle_look(&agent, read, now);
             let fresh_read = self.note_fresh_read(&agent, fresh, now);
+            let queue = requeued.unwrap_or(queue);
             if let Some(mut out) = self.apply(agent, queue, checked, now) {
                 out.rebriefs = self.take_owed_rebriefs(&out.agent, now);
                 for held in out.rebriefs.iter().rev() {
@@ -2312,6 +2754,7 @@ impl<T: T3> Daemon<T> {
                 for mark in &out.fresh {
                     out.message = format!("{}\n{}", out.message, fresh_session_line(&mark.slug));
                 }
+                self.mark_unsure(&mut out, now);
                 outgoing.push(out);
             }
         }
@@ -2559,6 +3002,7 @@ impl<T: T3> Daemon<T> {
             backoff,
             rebriefs: Vec::new(),
             fresh: Vec::new(),
+            unsure: None,
         })
     }
 
@@ -2600,6 +3044,7 @@ impl<T: T3> Daemon<T> {
             wake.forwarded = true;
             let forward = Wake {
                 forwarded: false,
+                resent: false,
                 ..wake.clone()
             };
             self.queue(coordinator, forward);
@@ -2643,10 +3088,95 @@ impl<T: T3> Daemon<T> {
         }
     }
 
+    /// Ends `out`'s message with its [`wake_marker`]. When it carries something not sent
+    /// twice yet (wake-ups, re-briefs, fresh-session notices), records it in
+    /// [`WatchState::unsure_wakes`] before the send, so a flush cut short while sending
+    /// leaves it to be looked for; [`Self::settle`] drops it unless the send timed out.
+    fn mark_unsure(&mut self, out: &mut Outgoing, now: Timestamp) {
+        let digest = wake_digest(&out.message, now);
+        out.message = format!("{}\n{}", out.message, wake_marker(&digest));
+        let message = UnsureMessage {
+            digest: digest.clone(),
+            wakes: out.wakes.iter().filter(|w| !w.resent).cloned().collect(),
+            rebriefs: out
+                .rebriefs
+                .iter()
+                .filter(|held| !held.resent)
+                .map(|held| RebriefMark {
+                    slug: held.slug.clone(),
+                    digest: prompt_digest(held.triage).to_owned(),
+                })
+                .collect(),
+            fresh: out.fresh.clone(),
+            since: now,
+        };
+        if message.is_empty() {
+            return;
+        }
+        let unsure = self
+            .state
+            .unsure_wakes
+            .entry(out.agent.clone())
+            .or_default();
+        unsure.messages.push(message);
+        out.unsure = Some(digest);
+    }
+
+    /// Updates `agent`'s timed-out messages once `out` was sent: one that was delivered
+    /// settles what earlier ones carried of the same, and one that failed is retried as a
+    /// queued wake-up, not looked for. A gone thread drops them all, returning their
+    /// wake-ups, which are passed on with the rest.
+    fn settle_unsure(&mut self, agent: &AgentId, out: &Outgoing, sent: &Sent) -> Vec<Wake> {
+        if matches!(sent, Sent::Gone(_)) {
+            return self
+                .state
+                .unsure_wakes
+                .remove(agent)
+                .into_iter()
+                .flat_map(|u| u.messages)
+                .flat_map(|m| m.wakes)
+                .collect();
+        }
+        let Some(unsure) = self.state.unsure_wakes.get_mut(agent) else {
+            return Vec::new();
+        };
+        match sent {
+            Sent::MaybeDelivered(_) | Sent::Gone(_) => {}
+            Sent::Failed(_) => unsure
+                .messages
+                .retain(|m| Some(&m.digest) != out.unsure.as_ref()),
+            Sent::Delivered => {
+                unsure
+                    .messages
+                    .retain(|m| Some(&m.digest) != out.unsure.as_ref());
+                for message in &mut unsure.messages {
+                    message.wakes.retain(|w| {
+                        !out.wakes
+                            .iter()
+                            .any(|d| d.board == w.board && d.about == w.about)
+                    });
+                    message
+                        .rebriefs
+                        .retain(|r| !out.rebriefs.iter().any(|d| d.slug == r.slug));
+                    message
+                        .fresh
+                        .retain(|f| !out.fresh.iter().any(|d| d.slug == f.slug));
+                }
+                unsure.messages.retain(|m| !m.is_empty());
+            }
+        }
+        if unsure.messages.is_empty() {
+            self.state.unsure_wakes.remove(agent);
+        }
+        Vec::new()
+    }
+
     /// Records how sending `out` went.
     fn settle(&mut self, out: Outgoing, sent: Sent, now: Timestamp) {
-        let agent = out.agent;
+        let agent = out.agent.clone();
         self.forget_thread_check(agent.native(), &sent);
+        let unsure_wakes = self.settle_unsure(&agent, &out, &sent);
+        let recorded = out.unsure.is_some();
         // A failed send leaves the re-briefs owed; the wake-ups' back-off times the retry.
         for held in out.rebriefs {
             let Some(local) = self
@@ -2657,11 +3187,23 @@ impl<T: T3> Daemon<T> {
             else {
                 continue;
             };
-            match sent {
-                Sent::Delivered | Sent::MaybeDelivered(_) => {
-                    // Settled as from before the send, which marked it unsure for a cut flush.
-                    local.rebrief_unsure = held.unsure_before;
-                    settle_rebrief(local, &held.slug, prompt_digest(held.triage), &sent, now);
+            let digest = prompt_digest(held.triage);
+            match &sent {
+                Sent::Delivered => {
+                    settle_rebrief(local, &held.slug, digest, &sent, now);
+                }
+                // Looked for by the flush, as part of the message.
+                Sent::MaybeDelivered(err) => {
+                    local.briefed = Some(digest.to_owned());
+                    local.rebrief_backoff = None;
+                    if held.resent {
+                        tracing::warn!(
+                            "re-briefing {} of {}: {err:#}; sent twice already, so not sent \
+                             again",
+                            local.agent,
+                            held.slug
+                        );
+                    }
                 }
                 Sent::Gone(_) | Sent::Failed(_) => {
                     local.briefed = held.before;
@@ -2695,15 +3237,27 @@ impl<T: T3> Daemon<T> {
                     queue.backoff = None;
                 }
             }
-            Sent::MaybeDelivered(err) => tracing::warn!(
-                "waking {agent} ({}): {err:#}; not sent again, since T3 may have delivered it",
-                kinds()
-            ),
+            Sent::MaybeDelivered(err) => {
+                if recorded {
+                    tracing::warn!(
+                        "waking {agent} ({}): {err:#}; T3 may have delivered it, so a flush \
+                         looks for it in the thread",
+                        kinds()
+                    );
+                } else {
+                    tracing::warn!(
+                        "waking {agent} ({}): {err:#}; its lines were sent twice already, so \
+                         not sent again",
+                        kinds()
+                    );
+                }
+            }
             Sent::Gone(err) => {
                 tracing::warn!(
                     "waking {agent}: {err:#}; its thread is gone, so its wake-ups are dropped"
                 );
                 let mut wakes = out.wakes;
+                wakes.extend(unsure_wakes);
                 if let Some(queue) = self.state.wakes.remove(&agent) {
                     wakes.extend(queue.wakes);
                 }
@@ -2728,6 +3282,88 @@ impl<T: T3> Daemon<T> {
         }
     }
 
+    /// Whether the usage holds `slug` from new work at `now`: a window of a fresh reading
+    /// is at or above the board's `usage_stop_at`.
+    fn usage_holds(&self, slug: &BoardSlug, now: Timestamp) -> bool {
+        let (Some(board), Some(usage)) = (self.boards.get(slug), &self.usage) else {
+            return false;
+        };
+        usage.over(board.usage_stop_at, now).is_some()
+    }
+
+    /// Takes a new usage reading: from the endpoint, when [`USAGE_POLL_EVERY`] has passed
+    /// since this daemon last read it, reported to the server; else the newest any device
+    /// reported. Then wakes the coordinators of boards the usage no longer holds. A
+    /// failure keeps the last reading, which goes stale and then holds nothing; with no
+    /// reading at all, as after a restart, the boards held stay held.
+    async fn refresh_usage(&mut self, now: Timestamp) {
+        let mut reported = None;
+        if let UsageSource::ClaudeCode { url, credentials } = &self.usage_source
+            && self
+                .usage_polled
+                .is_none_or(|at| now - at >= USAGE_POLL_EVERY)
+        {
+            self.usage_polled = Some(now);
+            match crate::usage::read(url, credentials, now).await {
+                Ok(Some(report)) => match self.client().report_usage(&report).await {
+                    Ok(usage) => reported = Some(usage),
+                    Err(err) => {
+                        tracing::warn!("reporting the usage: {err:#}");
+                        // The server is likely unreachable too: act on the local reading.
+                        reported = Some(Usage {
+                            five_hour: report.five_hour,
+                            seven_day: report.seven_day,
+                            read_at: report.read_at,
+                            device: self.ctx.device.clone(),
+                        });
+                    }
+                },
+                Ok(None) => tracing::debug!(
+                    "usage: Claude Code is not signed in here or its token has expired"
+                ),
+                Err(err) => tracing::warn!("reading the usage: {err:#}"),
+            }
+        }
+        match reported {
+            Some(usage) => self.usage = Some(usage),
+            None => match self.client().usage().await {
+                Ok(Some(usage)) => self.usage = Some(usage),
+                Ok(None) => {}
+                Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
+            },
+        }
+        if self.usage.is_none() {
+            return;
+        }
+        let held: BTreeSet<BoardSlug> = self
+            .boards
+            .keys()
+            .filter(|slug| self.usage_holds(slug, now))
+            .cloned()
+            .collect();
+        let eased: Vec<BoardSlug> = self.state.usage_held.difference(&held).cloned().collect();
+        for slug in eased {
+            if let Some(coordinator) = self
+                .coordinator_here(&slug)
+                .filter(|c| c.source() == AgentSource::T3)
+                .cloned()
+            {
+                tracing::info!("usage: {slug} may start new work again; waking {coordinator}");
+                self.queue(
+                    coordinator,
+                    Wake {
+                        board: slug,
+                        about: WakeAbout::UsageEased,
+                        queued_at: now,
+                        forwarded: false,
+                        resent: false,
+                    },
+                );
+            }
+        }
+        self.state.usage_held = held;
+    }
+
     /// The line for `wake` when what it is about still holds, else `None`.
     async fn recheck(
         &self,
@@ -2736,7 +3372,23 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<Option<String>> {
         let slug = &wake.board;
+        // A paused board starts no turn; the coordinator is told what to check on resume.
+        if self
+            .boards
+            .get(slug)
+            .is_some_and(|b| b.status == BoardStatus::Paused)
+        {
+            return Ok(None);
+        }
         let coordinator = self.coordinator_here(slug) == Some(agent);
+        // High usage starts no new work: the coordinator is woken when it eases.
+        if matches!(
+            wake.about,
+            WakeAbout::Ready { .. } | WakeAbout::Cleared { .. }
+        ) && self.usage_holds(slug, now)
+        {
+            return Ok(None);
+        }
         let line = match &wake.about {
             WakeAbout::Ready { task } if coordinator => {
                 let task = self.client().task(task).await?.task;
@@ -2861,8 +3513,28 @@ impl<T: T3> Daemon<T> {
                     }
                 })
             }
-            // The agent is no longer this board's coordinator.
-            WakeAbout::Ready { .. }
+            WakeAbout::Resumed if coordinator => Some(format!(
+                "board {slug}: the user resumed this board after a pause. Read your board \
+                 snapshot and handoff, then continue. The pause stopped the threads on its \
+                 tasks in doing: send each owner thread a message to continue its task, and \
+                 restart a task only when its owner thread is gone. Check blocked tasks and \
+                 answered asks too: their wake-ups were dropped while paused"
+            )),
+            WakeAbout::UsageEased if coordinator && !self.usage_holds(slug, now) => {
+                let stop_at = self
+                    .boards
+                    .get(slug)
+                    .map_or(board_proto::USAGE_STOP_AT_DEFAULT, |b| b.usage_stop_at);
+                Some(format!(
+                    "board {slug}: the account usage no longer stops new work on this board \
+                     (stop at {stop_at}%). Read your board snapshot, then start ready tasks \
+                     as usual"
+                ))
+            }
+            // The agent is no longer this board's coordinator, or the usage is high again.
+            WakeAbout::Resumed
+            | WakeAbout::UsageEased
+            | WakeAbout::Ready { .. }
             | WakeAbout::Cleared { .. }
             | WakeAbout::Proposal { .. }
             | WakeAbout::Review { .. }
@@ -3089,6 +3761,23 @@ pub fn rebrief_marker(slug: &BoardSlug, triage: bool) -> String {
     )
 }
 
+/// Names a wake-up message sent at `now` without keeping its text: the first 16 hex digits
+/// of a SHA-256 digest of the text and the time, which its [`wake_marker`] carries.
+pub fn wake_digest(message: &str, now: Timestamp) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(message);
+    hash.update([0]);
+    hash.update(now.to_rfc3339());
+    crate::config::hex(&hash.finalize())[..16].to_owned()
+}
+
+/// The last line of each wake-up message, naming its [`wake_digest`], so a flush finds the
+/// message among a thread's messages after its send timed out.
+pub fn wake_marker(digest: &str) -> String {
+    format!("(wake-up {digest})")
+}
+
 /// The standing prompt the coordinator of `slug` is briefed with, naming the board;
 /// `triage` for the device's feedback board. `board brief <slug>` prints it, for a fresh
 /// session in the same thread.
@@ -3175,6 +3864,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
     let mut daemon = Daemon::new(ctx, t3);
+    daemon.usage_source = UsageSource::claude_code();
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
         let health = daemon.client().health().await?;
@@ -3402,7 +4092,7 @@ impl<T: T3> Daemon<T> {
 
     /// Sends what is queued, within [`Timing::stop_budget`], and saves the state before
     /// exiting. A flush cut short, here or by the stop request, loses nothing still queued;
-    /// lines it was sending count as maybe delivered and are not sent again.
+    /// lines it was sending count as maybe delivered, to be looked for in the thread.
     async fn stop(&mut self) -> Result<()> {
         tracing::info!("stopping");
         self.note_cut_sends();
@@ -3421,11 +4111,11 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Logs the sends a cut-short flush left unsettled: they may have been delivered, so
-    /// they are not sent again.
+    /// each stays recorded as unsure ([`Daemon::mark_unsure`]) for a flush to look for.
     fn note_cut_sends(&mut self) {
         for agent in std::mem::take(&mut self.sending) {
             tracing::warn!(
-                "waking {agent}: stopped while sending; not sent again, since T3 may have delivered it"
+                "waking {agent}: stopped while sending; T3 may have delivered it, so it is looked for in the thread unless its lines were sent twice already"
             );
         }
     }

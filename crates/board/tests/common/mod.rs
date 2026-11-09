@@ -520,6 +520,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         repos: repos.iter().map(|r| (*r).to_owned()).collect(),
         autopilot: false,
         parallel_tasks: 1,
+        usage_stop_at: board_proto::USAGE_STOP_AT_DEFAULT,
         coordinator: None,
         dispatch: Default::default(),
         home_devices: Vec::new(),
@@ -586,6 +587,8 @@ pub fn snapshot_fixture(kind: SnapshotKind, text: &str, seq: i64) -> Snapshot {
         text: text.to_owned(),
         seq,
         at: Utc::now(),
+        held_by: Vec::new(),
+        held_since: None,
     }
 }
 

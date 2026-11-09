@@ -245,7 +245,7 @@ function TaskView({
           )}
 
           {summary && (
-            <Section id="task-summary" title="Summary" first>
+            <Section id="task-summary" title="Summary" first={!task.feedback}>
               <div className="max-w-[100ch] leading-relaxed">
                 <Markdown text={summary} />
               </div>

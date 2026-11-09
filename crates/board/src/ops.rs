@@ -847,6 +847,92 @@ pub async fn boards(ctx: &Ctx) -> Result<Output> {
     Ok(Output::new(render::board_list(&boards), &boards))
 }
 
+/// `board usage`: the latest reading, and which boards it holds from new work.
+pub async fn usage(ctx: &Ctx, now: Timestamp) -> Result<Output> {
+    let usage = ctx.client.usage().await?;
+    let boards = match &usage {
+        Some(_) => ctx.client.boards().await?,
+        None => Vec::new(),
+    };
+    Ok(Output::new(
+        render::usage(usage.as_ref(), &boards, now),
+        &usage,
+    ))
+}
+
+/// `board pause` and `board resume`: sets the boards `named`, or by default every board in
+/// status `from`, to status `to`, and lists the boards it changed. Named boards are checked
+/// before any changes, so a wrong name changes nothing.
+pub async fn set_boards_status(
+    ctx: &Ctx,
+    named: Vec<BoardSlug>,
+    from: BoardStatus,
+    to: BoardStatus,
+) -> Result<Output> {
+    let boards = ctx.client.boards().await?;
+    let targets: Vec<&Board> = if named.is_empty() {
+        boards.iter().filter(|b| b.status == from).collect()
+    } else {
+        let mut targets = Vec::new();
+        for slug in &named {
+            let board = boards
+                .iter()
+                .find(|b| &b.slug == slug)
+                .ok_or_else(|| anyhow!("no board {slug}: board boards lists them"))?;
+            if board.status == BoardStatus::Closed {
+                bail!(
+                    "board {slug} is closed: reopen it with board board update {slug} --status \
+                     active, or leave it out"
+                );
+            }
+            if !targets.iter().any(|t: &&Board| t.slug == board.slug) {
+                targets.push(board);
+            }
+        }
+        targets
+    };
+    let verb = match to {
+        BoardStatus::Paused => "paused",
+        _ => "resumed",
+    };
+    let mut changed: Vec<Board> = Vec::new();
+    for board in targets.into_iter().filter(|b| b.status != to) {
+        let body = UpdateBoard {
+            status: Some(to),
+            ..UpdateBoard::default()
+        };
+        let updated = ctx
+            .client
+            .update_board(&board.slug, &body)
+            .await
+            .with_context(|| {
+                let done: Vec<String> = changed.iter().map(|b| b.slug.to_string()).collect();
+                format!(
+                    "setting board {} to {verb} ({verb} so far: {})",
+                    board.slug,
+                    if done.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        done.join(", ")
+                    }
+                )
+            })?;
+        changed.push(updated);
+    }
+    let text = if changed.is_empty() {
+        format!("no boards {verb}: none was {}", render::enum_str(&from))
+    } else {
+        let plural = if changed.len() == 1 { "" } else { "s" };
+        let mut text = format!("{verb} {} board{plural}:", changed.len());
+        for board in &changed {
+            text.push_str("\n  ");
+            text.push_str(&render::board_line(board));
+        }
+        text
+    };
+    Ok(Output::new(text, &changed))
+}
+
 pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
     let board = ctx.client.create_board(&body).await?;
     check_temporary(&board, body.temporary, "created")?;
@@ -868,6 +954,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
             "updated board {slug}, but the server ignored parallel_tasks={wanted}: it predates \
              parallel tasks. Upgrade the server, then run board board update {slug} \
              --parallel-tasks {wanted}"
+        );
+    }
+    if let Some(wanted) = body.usage_stop_at
+        && board.usage_stop_at != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored usage_stop_at={wanted}: it predates \
+             usage awareness. Upgrade the server, then run board board update {slug} \
+             --usage-stop-at {wanted}"
         );
     }
     if let Some(wanted) = body.dispatch

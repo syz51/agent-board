@@ -8,9 +8,9 @@ use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
     CreateTask, CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
-    JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent, ResolveFeedback, Snapshot,
-    SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
-    Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask,
+    JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent, ReportUsage, ResolveFeedback,
+    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -745,6 +745,18 @@ impl Client {
     pub async fn update_board(&self, slug: &BoardSlug, body: &UpdateBoard) -> Result<Board> {
         self.with_body(Method::PATCH, &format!("/v1/boards/{slug}"), body)
             .await
+    }
+
+    // Usage
+
+    /// The newest account usage reading, if any device has reported one.
+    pub async fn usage(&self) -> Result<Option<Usage>> {
+        self.get("/v1/usage").await
+    }
+
+    /// Reports a usage reading; the server keeps the newest and returns it.
+    pub async fn report_usage(&self, body: &ReportUsage) -> Result<Usage> {
+        self.with_body(Method::PUT, "/v1/usage", body).await
     }
 
     /// Deletes a closed board (user tokens only); the server answers 204.

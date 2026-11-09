@@ -3,6 +3,7 @@
 //! The `board` binary is a thin wrapper around [`cli::run`]; the modules are a library so
 //! integration tests can drive the daemon with a fake `t3`.
 
+pub mod brief;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod relay;
 pub mod render;
 pub mod state;
 pub mod t3;
+pub mod usage;
 pub mod worktree;
 
 /// The git commit this binary was built from (12 hex digits), or `unknown`.

@@ -81,6 +81,14 @@ pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<Upda
             format!("send parallel_tasks between 1 and {PARALLEL_TASKS_MAX}"),
         ));
     }
+    if let Some(n) = req.usage_stop_at
+        && !(1..=100).contains(&n)
+    {
+        return Err(invalid(
+            format!("usage_stop_at={n} is out of range"),
+            "send usage_stop_at between 1 and 100 (percent of a usage window)",
+        ));
+    }
     Ok(req)
 }
 
@@ -150,6 +158,16 @@ pub(crate) fn update(
              to raise it",
         ));
     }
+    if let Some(n) = req.usage_stop_at
+        && n > before.usage_stop_at
+        && !by_user
+    {
+        return Err(forbidden(
+            format!("only the user may raise usage_stop_at on board {slug}"),
+            "a higher stop lets the board spend more of the shared usage limit; ask the user \
+             (ask_user) to raise it",
+        ));
+    }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -189,13 +207,28 @@ pub(crate) fn update(
         "dispatch",
         req.dispatch.is_some_and(|v| v != before.dispatch),
     );
+    set(
+        "usage_stop_at",
+        req.usage_stop_at.is_some_and(|v| v != before.usage_stop_at),
+    );
     if fields.is_empty() {
         return Ok(before);
     }
+    // A status change names the new status, so a daemon can wake a resumed board's
+    // coordinator without reading the board.
+    let mut payload = serde_json::json!({ "fields": fields });
+    if let Some(status) = req.status.filter(|&s| s != before.status) {
+        payload["status"] = serde_json::Value::from(enum_str(&status));
+    }
+    // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
+    // only turns that began before it.
     cx.db.execute(
         "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
-         dispatch = ?11 WHERE slug = ?1",
+         dispatch = ?11, usage_stop_at = ?12, \
+         paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
+                          WHEN status = 'paused' THEN paused_at ELSE ?8 END \
+         WHERE slug = ?1",
         params![
             slug.as_str(),
             req.title.unwrap_or(before.title),
@@ -209,15 +242,10 @@ pub(crate) fn update(
             req.temporary.unwrap_or(before.temporary),
             req.parallel_tasks.unwrap_or(before.parallel_tasks),
             enum_str(&req.dispatch.unwrap_or(before.dispatch)),
+            req.usage_stop_at.unwrap_or(before.usage_stop_at),
         ],
     )?;
-    cx.emit(
-        Some(slug),
-        actor,
-        EventType::BoardUpdated,
-        None,
-        serde_json::json!({ "fields": fields }),
-    )?;
+    cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
 }
 

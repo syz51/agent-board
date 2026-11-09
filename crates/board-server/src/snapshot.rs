@@ -94,6 +94,13 @@ struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     board: Option<String>,
     seq: i64,
+    /// The paused boards that hold this agent ([`held_by`]); never cut.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hold: Vec<String>,
+    /// The account usage against the board's `usage_stop_at` ([`usage_view`]): in full
+    /// snapshots whenever a reading exists, in the others only while over; never cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     you: Option<You>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,12 +311,27 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
+    let (held, held_since) = held_by(cx, &agent.id)?;
+    let usage = board
+        .as_ref()
+        .map(|b| usage_view(cx, b))
+        .transpose()?
+        .flatten();
+    let over = usage.as_ref().is_some_and(|u| u.over.is_some());
 
     let mut model = Model {
         kind: req.kind,
         agent: agent.handle.clone(),
         board: board.as_ref().map(|b| b.to_string()),
         seq,
+        hold: held.iter().map(ToString::to_string).collect(),
+        // Alerts snapshots come with tool calls and have the smallest cap, so the line goes
+        // only into full snapshots and, while over, into the deltas at each prompt.
+        usage: usage.filter(|u| match req.kind {
+            SnapshotKind::Full => true,
+            SnapshotKind::Delta => u.over.is_some(),
+            SnapshotKind::Alerts => false,
+        }),
         you: None,
         counts: None,
         dispatch: None,
@@ -334,6 +356,9 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             if let Some(board) = &board {
                 fill_full(cx, &mut model, &agent, board, board_counts)?;
                 render_capped(model, req.format, cx.s.snapshot_full_chars)
+            } else if !model.hold.is_empty() {
+                // A thread that joined no board still hears that its work is paused.
+                render_capped(model, req.format, cx.s.snapshot_full_chars)
             } else {
                 String::new()
             }
@@ -343,14 +368,14 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             if shown_now.is_some() && before != shown_now {
                 model.counts = board_counts;
             }
-            if model.alerts.is_empty() && model.counts.is_none() {
+            if model.alerts.is_empty() && model.counts.is_none() && model.hold.is_empty() && !over {
                 String::new()
             } else {
                 render_capped(model, req.format, cx.s.snapshot_delta_chars)
             }
         }
         SnapshotKind::Alerts => {
-            if model.alerts.is_empty() {
+            if model.alerts.is_empty() && model.hold.is_empty() {
                 String::new()
             } else {
                 render_capped(model, req.format, cx.s.snapshot_alerts_chars)
@@ -367,6 +392,8 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             text,
             seq: scanned_to,
             at: cx.now,
+            held_by: held,
+            held_since,
         },
         agent: agent.id,
         shown,
@@ -386,6 +413,129 @@ pub(crate) fn advance(cx: &mut Ctx<'_>, rendered: Rendered) -> Result<Snapshot> 
         params![rendered.agent.as_str(), rendered.snapshot.seq, shown],
     )?;
     Ok(rendered.snapshot)
+}
+
+/// The account usage as a snapshot shows it.
+#[derive(Debug, Clone, Serialize)]
+struct UsageView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    five_hour: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    week: Option<u32>,
+    /// How long ago the reading was taken.
+    read: String,
+    /// The board's `usage_stop_at`.
+    stop_at: u32,
+    /// Set when a window of a fresh reading is at or above `stop_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    over: Option<UsageOver>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageOver {
+    window: &'static str,
+    percent: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets: Option<String>,
+    action: &'static str,
+}
+
+/// What the `usage:` line tells an agent while the usage is at or above the stop.
+const USAGE_ACTION: &str = "usage is high: start no new task or child thread; finish or park \
+the tasks in doing.";
+
+/// Percent as shown: rounded down, so a window shows 90 only once it is at 90.
+fn shown_percent(percent: f64) -> u32 {
+    // In range: the server stores only 0 to 1000.
+    percent.floor() as u32
+}
+
+/// The newest usage reading against `board`'s stop, if any device has reported one.
+fn usage_view(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<UsageView>> {
+    let Some(usage) = crate::ops::usage::latest(cx)? else {
+        return Ok(None);
+    };
+    let stop_at: u32 = cx.db.query_row(
+        "SELECT usage_stop_at FROM boards WHERE slug = ?1",
+        [board.as_str()],
+        |r| r.get(0),
+    )?;
+    Ok(Some(UsageView {
+        five_hour: usage.five_hour.map(|w| shown_percent(w.percent)),
+        week: usage.seven_day.map(|w| shown_percent(w.percent)),
+        read: ago(cx.now - usage.read_at),
+        stop_at,
+        over: usage.over(stop_at, cx.now).map(|(kind, w)| UsageOver {
+            window: kind.label(),
+            percent: shown_percent(w.percent),
+            resets: w
+                .resets_at
+                .map(|at| at.format("%Y-%m-%d %H:%MZ").to_string()),
+            action: USAGE_ACTION,
+        }),
+    }))
+}
+
+fn usage_line(u: &UsageView) -> String {
+    if let Some(o) = &u.over {
+        let resets = o
+            .resets
+            .as_ref()
+            .map(|at| format!(" The {} window resets {at}.", o.window))
+            .unwrap_or_default();
+        return format!(
+            "{} {}% >= this board's stop at {}% -> {}{resets}",
+            o.window, o.percent, u.stop_at, o.action
+        );
+    }
+    let mut parts = Vec::new();
+    if let Some(p) = u.five_hour {
+        parts.push(format!("5h {p}%"));
+    }
+    if let Some(p) = u.week {
+        parts.push(format!("week {p}%"));
+    }
+    parts.push(format!("read {} ago", u.read));
+    parts.push(format!("this board starts no new task at {}%", u.stop_at));
+    parts.join(" · ")
+}
+
+/// What the `hold:` line tells a held agent to do.
+const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
+task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
+
+/// The query of [`held_by`]: `?1` the agent, `?2` the depth. The agent and the T3 threads
+/// that delegated it, up the chain, as in [`crate::ops::leases::DELEGATION_FAMILY`].
+const HELD_BY: &str = "WITH RECURSIVE \
+     up(id, depth) AS ( \
+       SELECT ?1, 0 \
+       UNION \
+       SELECT 't3:' || json_extract(a.native_ids, '$.t3_parent'), up.depth + 1 \
+       FROM agents a JOIN up ON a.id = up.id \
+       WHERE json_extract(a.native_ids, '$.t3_parent') IS NOT NULL \
+         AND up.depth < ?2) \
+     SELECT b.slug, b.paused_at FROM boards b \
+     WHERE b.status = 'paused' \
+       AND (b.coordinator IN (SELECT id FROM up) \
+            OR EXISTS (SELECT 1 FROM tasks t WHERE t.board = b.slug AND t.status = 'doing' \
+                       AND t.owner IN (SELECT id FROM up))) \
+     ORDER BY b.slug";
+
+/// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
+/// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
+/// threads it started and those working its tasks, and no one else. With them, when the
+/// latest of them was paused.
+fn held_by(cx: &Ctx<'_>, agent: &AgentId) -> Result<(Vec<BoardSlug>, Option<Timestamp>)> {
+    let rows: Vec<(BoardSlug, i64)> = cx
+        .db
+        .prepare_cached(HELD_BY)?
+        .query_map(
+            params![agent.as_str(), crate::ops::leases::DELEGATION_DEPTH],
+            |r| Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let since = rows.iter().map(|(_, at)| *at).max().map(crate::db::ts);
+    Ok((rows.into_iter().map(|(slug, _)| slug).collect(), since))
 }
 
 /// The board a snapshot is about: the board of the agent's task in `doing`, else a board
@@ -1589,6 +1739,12 @@ fn counts_line(c: &Counts) -> String {
 
 fn render_lines(m: &Model) -> String {
     let mut o = String::new();
+    if !m.hold.is_empty() {
+        let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.hold.join(", "));
+    }
+    if let Some(u) = &m.usage {
+        let _ = writeln!(o, "usage: {}", usage_line(u));
+    }
     if m.kind == SnapshotKind::Alerts {
         for a in &m.alerts {
             let _ = writeln!(o, "! {} -> {}", a.alert, a.action);
@@ -1761,6 +1917,31 @@ fn render_yaml(m: &Model) -> String {
         let _ = writeln!(o, "board: {}", q(board));
     }
     let _ = writeln!(o, "seq: {}", m.seq);
+    if !m.hold.is_empty() {
+        o.push_str("hold:\n");
+        let _ = writeln!(o, "  boards: [{}]", m.hold.join(", "));
+        let _ = writeln!(o, "  action: {}", q(HOLD_ACTION));
+    }
+    if let Some(u) = &m.usage {
+        o.push_str("usage:\n");
+        if let Some(p) = u.five_hour {
+            let _ = writeln!(o, "  five_hour: {p}");
+        }
+        if let Some(p) = u.week {
+            let _ = writeln!(o, "  week: {p}");
+        }
+        let _ = writeln!(o, "  read: {}", q(&u.read));
+        let _ = writeln!(o, "  stop_at: {}", u.stop_at);
+        if let Some(over) = &u.over {
+            o.push_str("  over:\n");
+            let _ = writeln!(o, "    window: {}", over.window);
+            let _ = writeln!(o, "    percent: {}", over.percent);
+            if let Some(at) = &over.resets {
+                let _ = writeln!(o, "    resets: {}", q(at));
+            }
+            let _ = writeln!(o, "    action: {}", q(over.action));
+        }
+    }
     if let Some(you) = &m.you {
         o.push_str("you:\n");
         let _ = writeln!(o, "  handle: {}", q(&you.handle));

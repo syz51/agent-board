@@ -37,6 +37,11 @@ pub struct Board {
     /// defaults to 1, one task at a time.
     #[serde(default = "one_parallel_task")]
     pub parallel_tasks: u32,
+    /// The account usage, in percent of a limit window, at which the board starts no new
+    /// task (see [`Usage::over`]), 1 to 100. Absent from servers that predate it, so it
+    /// defaults to [`USAGE_STOP_AT_DEFAULT`].
+    #[serde(default = "usage_stop_at_default")]
+    pub usage_stop_at: u32,
     /// The agent currently acting as the board's coordinator, if any.
     pub coordinator: Option<AgentId>,
     /// Who runs the board's autopilot: a coordinator thread, or the daemon of the device
@@ -110,6 +115,88 @@ pub const PARALLEL_TASKS_MAX: u32 = 4;
 
 fn one_parallel_task() -> u32 {
     1
+}
+
+/// The default of [`Board::usage_stop_at`].
+pub const USAGE_STOP_AT_DEFAULT: u32 = 90;
+
+fn usage_stop_at_default() -> u32 {
+    USAGE_STOP_AT_DEFAULT
+}
+
+/// A reading older than this is not acted on: the device that read it may be asleep.
+pub const USAGE_FRESH_MINUTES: i64 = 30;
+
+/// The Claude account's usage, as a device daemon last read it from the usage endpoint
+/// (`docs/API.md`, "Usage"). Every agent shares it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    /// The rolling 5-hour window; absent when the endpoint gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    /// The weekly window; absent when the endpoint gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    /// When the device read it.
+    pub read_at: Timestamp,
+    /// The device that read it.
+    pub device: DeviceName,
+}
+
+/// One limit window of [`Usage`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    /// Percent of the window's limit used: 0 to 100, above 100 once exceeded.
+    pub percent: f64,
+    /// When the window resets, if the endpoint said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<Timestamp>,
+}
+
+/// Which window of [`Usage`] a reading is about; not on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageWindowKind {
+    FiveHour,
+    SevenDay,
+}
+
+impl UsageWindowKind {
+    /// How snapshots and the CLI name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FiveHour => "5h",
+            Self::SevenDay => "week",
+        }
+    }
+}
+
+impl Usage {
+    /// The windows the endpoint gave, the 5-hour one first.
+    pub fn windows(&self) -> impl Iterator<Item = (UsageWindowKind, UsageWindow)> {
+        [
+            (UsageWindowKind::FiveHour, self.five_hour),
+            (UsageWindowKind::SevenDay, self.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(kind, w)| w.map(|w| (kind, w)))
+    }
+
+    /// Whether the reading is recent enough to act on at `now`.
+    pub fn fresh(&self, now: Timestamp) -> bool {
+        now - self.read_at <= chrono::TimeDelta::minutes(USAGE_FRESH_MINUTES)
+    }
+
+    /// The fullest window at or above `stop_at` percent, if the reading is fresh. A window
+    /// whose reset time has passed no longer counts, since it has emptied since the read.
+    pub fn over(&self, stop_at: u32, now: Timestamp) -> Option<(UsageWindowKind, UsageWindow)> {
+        if !self.fresh(now) {
+            return None;
+        }
+        self.windows()
+            .filter(|(_, w)| w.percent >= f64::from(stop_at))
+            .filter(|(_, w)| w.resets_at.is_none_or(|at| at > now))
+            .max_by(|a, b| a.1.percent.total_cmp(&b.1.percent))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -659,6 +659,78 @@ fn dispatch_is_set_shown_and_checked() {
     );
 }
 
+#[test]
+fn pause_and_resume_set_every_board_or_the_named_ones() {
+    use board_proto::BoardStatus;
+    let e = env();
+    let with = |slug: &str, status: BoardStatus| {
+        let mut b = board_fixture(slug, &[]);
+        b.status = status;
+        b
+    };
+    e.stub.on(
+        "GET /v1/boards",
+        [
+            with("alpha", BoardStatus::Active),
+            with("beta", BoardStatus::Active),
+            with("gamma", BoardStatus::Paused),
+            with("old", BoardStatus::Closed),
+        ],
+    );
+    for slug in ["alpha", "beta", "gamma"] {
+        e.stub.on(
+            &format!("PATCH /v1/boards/{slug}"),
+            with(slug, BoardStatus::Paused),
+        );
+    }
+    let out = e.run(&["pause"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("paused 2 boards:"), "{text}");
+    assert!(text.contains("alpha") && text.contains("beta") && !text.contains("gamma"));
+    for slug in ["alpha", "beta"] {
+        let body = &e.stub.requests_to(&format!("PATCH /v1/boards/{slug}"))[0].body;
+        assert_eq!(body["status"], "paused", "{body}");
+        assert_eq!(body["autopilot"], Value::Null, "autopilot stays as it is");
+    }
+    assert!(e.stub.requests_to("PATCH /v1/boards/gamma").is_empty());
+    assert!(e.stub.requests_to("PATCH /v1/boards/old").is_empty());
+
+    // Resume, named: only that board, even with others paused.
+    e.stub
+        .on("PATCH /v1/boards/gamma", with("gamma", BoardStatus::Active));
+    let out = e.run(&["resume", "gamma", "gamma"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("resumed 1 board:"),
+        "{}",
+        stdout(&out)
+    );
+    let patches = e.stub.requests_to("PATCH /v1/boards/gamma");
+    assert_eq!(patches.len(), 1, "a name given twice is changed once");
+    assert_eq!(patches[0].body["status"], "active");
+
+    // Nothing to resume among the named; an unknown or closed board fails before any change.
+    let before = e.stub.requests().len();
+    let out = e.run(&["resume", "alpha"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "no boards resumed: none was paused");
+    for (args, says) in [
+        (["pause", "nope"], "no board nope"),
+        (["pause", "old"], "board old is closed"),
+    ] {
+        let out = e.run(&args);
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains(says), "{}", stderr(&out));
+    }
+    assert!(
+        e.stub.requests()[before..]
+            .iter()
+            .all(|r| r.method == "GET"),
+        "no board changed"
+    );
+}
+
 /// `board boards` shows how much of the ready work a coordinator may start, apart from the
 /// ready tasks that wait on the user.
 #[test]
@@ -2519,4 +2591,190 @@ fn ls_live_sends_the_filter_and_catches_a_server_that_ignores_it() {
     assert!(out.status.success(), "{}", stderr(&out));
     let q = e.stub.requests_to("GET /v1/tasks")[2].query_pairs();
     assert!(!q.contains_key("live"), "{q:?}");
+}
+
+#[test]
+fn brief_prints_each_daemon_dispatch_brief_filled_in() {
+    use board::brief::{JudgeKind, WORKER_CLOSER, judge_brief, worker_brief};
+    let e = env();
+    let factory: board_proto::BoardSlug = "factory".parse().unwrap();
+    let task = |n| board_proto::TaskId::new(&factory, n);
+    let brief = |args: &[&str]| {
+        let out = e.run(&[&["brief", "factory", "--kind"], args].concat());
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        stdout(&out)
+    };
+
+    let worker = brief(&["worker", "--task", "factory-7"]);
+    assert_eq!(
+        worker,
+        format!("{}\n", worker_brief(&factory, &task(7), WORKER_CLOSER))
+    );
+    assert!(worker.starts_with("# Worker\n\nYou do task factory-7 of board factory"));
+    assert!(worker.contains("1. `task_claim factory-7`."), "{worker}");
+    assert!(worker.contains("The board's review judge reviews your result."));
+
+    let review = brief(&["review", "--task", "factory-7"]);
+    assert_eq!(
+        review,
+        format!("{}\n", judge_brief(JudgeKind::Review, &factory, &[task(7)]))
+    );
+    assert!(review.contains("You are the review judge of board factory."));
+    assert!(review.contains("You review factory-7, now in `review`."));
+
+    let verdict = brief(&["verdict", "--task", "factory-8", "--task", "factory-9"]);
+    assert_eq!(
+        verdict,
+        format!(
+            "{}\n",
+            judge_brief(JudgeKind::Verdict, &factory, &[task(8), task(9)])
+        )
+    );
+    assert!(verdict.contains("the pending proposals factory-8 and factory-9."));
+
+    let goal = brief(&["goal"]);
+    assert_eq!(
+        goal,
+        format!("{}\n", judge_brief(JudgeKind::Goal, &factory, &[]))
+    );
+    assert!(goal.contains("You are the goal judge of board factory."));
+
+    let triage = brief(&["triage", "--task", "factory-10"]);
+    assert_eq!(
+        triage,
+        format!(
+            "{}\n",
+            judge_brief(JudgeKind::Triage, &factory, &[task(10)])
+        )
+    );
+    assert!(triage.contains("For each item (factory-10), one at a time"));
+
+    for text in [&worker, &review, &verdict, &goal, &triage] {
+        assert!(!text.contains('{'), "a placeholder is left: {text}");
+    }
+    for text in [&review, &verdict, &goal, &triage] {
+        assert!(text.starts_with(board::brief::JUDGE_SHARED_PROMPT.split('{').next().unwrap()));
+        assert!(text.chars().count() < board::brief::JUDGE_BRIEF_CHARS_MAX);
+    }
+    assert!(e.stub.requests().is_empty(), "no server needed");
+}
+
+#[test]
+fn brief_says_which_tasks_each_kind_takes() {
+    let e = env();
+    for (args, says) in [
+        (&["--kind", "worker"][..], "pass --task <id> once"),
+        (
+            &[
+                "--kind",
+                "worker",
+                "--task",
+                "factory-1",
+                "--task",
+                "factory-2",
+            ],
+            "pass --task <id> once",
+        ),
+        (&["--kind", "review"], "pass --task <id>, once per task"),
+        (&["--kind", "verdict"], "pass --task <id>, once per task"),
+        (&["--kind", "triage"], "pass --task <id>, once per task"),
+        (
+            &["--kind", "goal", "--task", "factory-1"],
+            "leave out --task",
+        ),
+        (&["--task", "factory-1"], "leave out --task"),
+    ] {
+        let out = e.run(&[&["brief", "factory"], args].concat());
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(says), "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn usage_stop_at_is_set_shown_and_checked() {
+    let e = env();
+    let mut board = board_fixture("factory", &[]);
+    board.usage_stop_at = 60;
+    e.stub.on("PATCH /v1/boards/factory", &board);
+    let out = e.run(&["board", "update", "factory", "--usage-stop-at", "60"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["usage_stop_at"], 60);
+    assert!(
+        stdout(&out)
+            .trim_end()
+            .ends_with(" · new work stops at 60% usage"),
+        "{}",
+        stdout(&out)
+    );
+
+    for value in ["0", "101"] {
+        let out = e.run(&["board", "update", "factory", "--usage-stop-at", value]);
+        assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    }
+    assert_eq!(e.stub.requests_to("PATCH /v1/boards/factory").len(), 1);
+
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("usage_stop_at");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--usage-stop-at", "60"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored usage_stop_at=60")
+            && err.contains("board board update factory --usage-stop-at 60"),
+        "{err}"
+    );
+}
+
+#[test]
+fn usage_shows_the_reading_and_the_boards_it_holds() {
+    let e = env();
+    e.stub.on("GET /v1/usage", serde_json::Value::Null);
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("no usage reading yet"),
+        "{}",
+        stdout(&out)
+    );
+
+    let read = chrono::Utc::now() - chrono::Duration::minutes(2);
+    let resets = read + chrono::Duration::hours(30);
+    e.stub.on(
+        "GET /v1/usage",
+        json!({
+            "five_hour": { "percent": 12.7 },
+            "seven_day": { "percent": 92.0, "resets_at": resets },
+            "read_at": read,
+            "device": "mac",
+        }),
+    );
+    let mut loose = board_fixture("loose", &[]);
+    loose.usage_stop_at = 95;
+    // Paused boards count too, as the daemon holds them; closed ones do not.
+    let mut parked = board_fixture("parked", &[]);
+    parked.status = board_proto::BoardStatus::Paused;
+    let mut closed = board_fixture("closed", &[]);
+    closed.status = board_proto::BoardStatus::Closed;
+    e.stub.on(
+        "GET /v1/boards",
+        [board_fixture("factory", &[]), loose, parked, closed],
+    );
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim_end(),
+        format!(
+            "5h 12%\nweek 92% · resets {}\nread 2m ago by mac\nstarting no new task: factory \
+             (week >= 90%), parked (week >= 90%)",
+            resets.format("%Y-%m-%d %H:%MZ")
+        )
+    );
+
+    let out = e.run(&["--json", "usage"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["seven_day"]["percent"], 92.0);
 }

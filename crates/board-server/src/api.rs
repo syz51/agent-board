@@ -14,9 +14,9 @@ use board_proto::{
     AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
     CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
     DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult,
-    MarkSeen, Note, PutHandoff, RegisterAgent, RegisterJudge, ResolveFeedback, Said, SeenCursor,
-    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Updates,
+    MarkSeen, Note, PutHandoff, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Said,
+    SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
+    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Updates, Usage,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -24,7 +24,9 @@ use serde::de::DeserializeOwned;
 use crate::auth::Caller;
 use crate::error::{Error, Result, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
-use crate::ops::{agents, asks, boards, devices, feedback, judges, leases, stats, tasks, updates};
+use crate::ops::{
+    agents, asks, boards, devices, feedback, judges, leases, stats, tasks, updates, usage,
+};
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
 use crate::{events, snapshot, web};
@@ -83,6 +85,7 @@ pub(crate) fn router(state: AppState) -> Router {
             get(list_judges).post(register_judge),
         )
         .route("/stats", get(show_stats))
+        .route("/usage", get(show_usage).put(report_usage))
         .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
@@ -505,6 +508,34 @@ async fn show_stats(
 ) -> Result<Json<Stats>> {
     let days = stats::validate_days(q.days)?;
     Ok(Json(state.read(move |cx| stats::stats(cx, days)).await?))
+}
+
+/// `GET /v1/usage`: the newest account usage a device reported, or `null`.
+async fn show_usage(State(state): State<AppState>, _caller: Caller) -> Result<Json<Option<Usage>>> {
+    Ok(Json(state.read(usage::latest).await?))
+}
+
+/// `PUT /v1/usage`: a device daemon reports the account usage it read. Device tokens only,
+/// since the reading is recorded as the calling device's.
+async fn report_usage(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<ReportUsage>,
+) -> Result<Json<Usage>> {
+    let device = caller.device().cloned().ok_or_else(|| {
+        crate::error::forbidden(
+            "only a device token reports usage",
+            "the board daemon reports it; run it on a device with a device token",
+        )
+    })?;
+    Ok(Json(
+        state
+            .write(move |cx| {
+                let req = usage::validate_report(req, cx.now)?;
+                usage::report(cx, &device, req)
+            })
+            .await?,
+    ))
 }
 
 async fn show_errors(

@@ -1,12 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useRouter, useRouterState } from "@tanstack/react-router";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import { boardOfTask } from "@/lib/ids.ts";
 import { cn } from "@/lib/utils.ts";
 import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
 import { useOpenAsks } from "@/screens/asks.tsx";
-import { Count, Empty, useTitle } from "@/ui/common.tsx";
+import { ThreadBasesContext, threadBases } from "@/text/thread-links.ts";
+import { Count, Empty, useAgents, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 
 /**
@@ -16,6 +18,9 @@ import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
 export function Shell() {
   const main = useRef<HTMLElement>(null);
   const router = useRouter();
+  // T3 thread links in agent text open through the T3 base the agents registered.
+  const agents = useAgents().data;
+  const bases = useMemo(() => threadBases(agents), [agents]);
   useEffect(
     () =>
       router.subscribe("onResolved", (event) => {
@@ -53,7 +58,9 @@ export function Shell() {
             tabIndex={-1}
             className="px-(--gutter) pt-5 pb-16 max-md:pb-[calc(92px+env(safe-area-inset-bottom))] lg:pt-6"
           >
-            <Outlet />
+            <ThreadBasesContext value={bases}>
+              <Outlet />
+            </ThreadBasesContext>
           </main>
         </div>
       </div>
@@ -152,10 +159,13 @@ export function Nav() {
 }
 
 /** Each board, with its open asks, so a board is one click from anywhere on a wide screen. */
-function BoardLinks() {
+export function BoardLinks() {
   const path = usePathname();
   const boards = useQuery(queries.boards());
   const list = (boards.data ?? []).filter((board) => board.status !== "closed");
+  // On a task page, the task's own board is current, not every board whose slug starts it.
+  const taskId = /^\/tasks\/([^/]+)/.exec(path)?.[1];
+  const taskBoard = taskId === undefined ? undefined : boardOfTask(taskId);
   return (
     <nav className="hidden min-h-0 flex-1 overflow-y-auto lg:block" aria-label="Boards">
       <p className="px-2 pb-1 text-xs font-medium text-muted-foreground" aria-hidden="true">
@@ -183,7 +193,7 @@ function BoardLinks() {
       <ul className="grid gap-px">
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
-          const here = path === href || path.startsWith(`/tasks/${board.slug}-`);
+          const here = path === href || board.slug === taskBoard;
           return (
             <li key={board.slug}>
               <Link

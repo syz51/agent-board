@@ -221,6 +221,11 @@ server's minute sweep deletes older ones.
   `forbidden` otherwise), since more tasks at once spend the shared usage limit; anyone may
   restate or lower it. A `Board` from a server that predates it reads as 1, and a client
   leaves the field out of `UpdateBoard` unless it sets it.
+  `usage_stop_at` (1 to 100, default 90; 400 `invalid` otherwise) is the usage percent at
+  which the board starts no new task (see "Usage"). Raising it is user only (403
+  `forbidden` otherwise); anyone may restate or lower it. A `Board` from a server that
+  predates it reads as 90. `board board update <slug> --usage-stop-at N` sets it, and
+  `board boards` shows ` · new work stops at N% usage` when it is not 90.
   `dispatch` (`[Dispatch]`) is who runs the board's autopilot: `thread` (a coordinator
   thread, the default) or `daemon` (the dispatch agent of the device holding the
   coordinator lease; see "Daemon dispatch"). Anyone may change it; the change is recorded
@@ -231,6 +236,11 @@ server's minute sweep deletes older ones.
   `dispatch: daemon` (in `json` and `yaml`, `dispatch` at the top). A `Board` from a server
   that predates it reads as `thread`; a client leaves the field out of `UpdateBoard` unless
   it sets it, and reports a server that ignored it.
+  An update that changes `status` adds the new one to the `board_updated` payload
+  (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
+  reads `active` (see `DESIGN.md`, "Pausing work"). `board pause [<slug>…]` and
+  `board resume [<slug>…]` set every active (or paused) board, or those named, with this
+  endpoint; `--json` prints the changed `[Board]` list.
 - `POST /v1/boards/{slug}/join` `[JoinBoard]` → `[Board]`.
 - `POST /v1/boards/{slug}/coordinator` `[ClaimCoordinator]` → `[Board]`; 409
   `claim_refused` when another device holds the coordinator lease (45 minutes, renewed by
@@ -768,10 +778,49 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   many wait for the next request. Alerts read only the last 10,000 events; an alert names
   the older ones skipped. `json` is
   compact, so all three formats share the same size caps.
+  `held_by` lists the paused boards the agent works for (as their coordinator, a thread it
+  delegated, or the owner of a task in `doing`, or one of its delegates); every kind then
+  has text. In `lines`, the `hold:` line names the boards and what to do, first after the
+  header (a full snapshot's intro comes before it); `yaml` has `hold` with `boards` and
+  `action`; `json` has `hold` with the slugs only. Empty and left out otherwise, and by
+  servers that predate it, which clients read as not held. `held_since` is when the
+  latest of those boards was paused: a board keeps the time while it stays paused. The
+  hooks end only a turn that began before it. Left out when not held, and by servers that
+  predate it.
+  For an agent with a board, when a usage reading exists, a `usage:` line follows the
+  `hold:` line: in full snapshots always, in `delta` only while the board is over its
+  `usage_stop_at` (it then has text even when nothing else changed), never in `alerts`.
+  It reads
+  `5h 12% · week 74% · read 3m ago · this board starts no new task at 90%`, or while over
+  `week 92% >= this board's stop at 90% -> usage is high: start no new task or child
+  thread; finish or park the tasks in doing. The week window resets 2026-11-15 00:59Z.`
+  Percents are rounded down. `json` and `yaml` have `usage` with `five_hour` and `week`
+  (each left out when the reading lacks it), `read` (age), `stop_at`, and while over
+  `over` with `window` (`5h` or `week`), `percent`, `resets` (when known) and `action`.
+  The size caps never cut it.
 - `GET /v1/events?since=&board=&limit=` → `[EventsPage]`. With
   `Accept: text/event-stream`, streams events as SSE (`id: <seq>`, `data: <Event JSON>`),
   resuming from `Last-Event-ID`, else from `since`. Events older than 365 days are pruned
   (the newest event always stays), so the events just after an old `since` may be gone.
+
+### Usage
+
+The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
+
+- `PUT /v1/usage` `[ReportUsage]` → `[Usage]`. Device tokens: the reading is stored with
+  the caller's device (403 `forbidden` for a caller without one). `five_hour` and
+  `seven_day` are each optional `{percent, resets_at?}`, as the usage endpoint gives
+  them, and at least one is required; `read_at` is required. 400 `invalid` when both
+  windows are missing, a percent is not a number from 0 to 1000, or `read_at` is more
+  than 5 minutes ahead of the server's clock or more than 30 minutes behind it (it would
+  already be stale). The server keeps
+  one reading, the newest by `read_at`: an older report changes nothing, and the answer is
+  the reading kept.
+- `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` prints it, with
+  the boards it stops from new work, paused ones included.
+- A reading is fresh for 30 minutes after `read_at`. A board is over when a window of a
+  fresh reading has `percent` at or above its `usage_stop_at` and its `resets_at`, when
+  known, is still ahead.
 
 ### Administration (user only)
 

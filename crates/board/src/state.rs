@@ -24,6 +24,20 @@ pub struct AgentLocal {
     pub reminded_for: Option<Timestamp>,
     /// Set while the server is unreachable and the cached snapshot was already injected.
     pub offline_notified: bool,
+    /// The last snapshot said a paused board holds the agent (`Snapshot::held_by`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+    /// When the latest board that holds the agent was paused (`Snapshot::held_since`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<Timestamp>,
+    /// The server's time of the current turn's prompt snapshot, to compare with
+    /// `held_since` on one clock. Cleared at each prompt and when the turn ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_seen_at: Option<Timestamp>,
+    /// The current turn began held: its prompt's snapshot told the agent. Used to decide a
+    /// halt only without `held_since` and `turn_seen_at`. Cleared as `turn_seen_at` is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_told: bool,
     /// Tasks the `Stop` hook already reminded the agent to file what remains of, newest
     /// last, so each is reminded about once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -51,6 +65,13 @@ const OVERLAP_MEMORY: TimeDelta = TimeDelta::days(1);
 const OVERLAPS_KEPT: usize = 200;
 
 impl AgentLocal {
+    /// Forgets what the current turn knew of the hold: its prompt's time and whether the
+    /// prompt showed the hold. For a new prompt, a new session, and the end of a turn.
+    pub fn end_turn_hold(&mut self) {
+        self.turn_seen_at = None;
+        self.hold_told = false;
+    }
+
     /// Whether to show `overlap` now, recording it when so. The same path, peer and kind
     /// show once an hour at most, and after that only for a newer lease or edit than the
     /// one shown, so an agent re-reads a file once per peer change instead of on every call.

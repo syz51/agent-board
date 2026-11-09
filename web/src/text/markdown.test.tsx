@@ -3,6 +3,7 @@ import { Glob } from "bun";
 import { renderToStaticMarkup } from "react-dom/server";
 import { HOSTILE_BODY, HOSTILE_TITLE } from "../../dev/fixtures.ts";
 import { Markdown, PlainText, safeHref } from "./markdown.tsx";
+import { ThreadBasesContext } from "./thread-links.ts";
 
 /** Rendered HTML; React also escapes `>`, which these tests read as written. */
 const render = (node: React.ReactNode) => renderToStaticMarkup(node).replaceAll("&gt;", ">");
@@ -107,6 +108,29 @@ describe("agent markdown", () => {
     );
     expect(hrefs(html)).toEqual(["https://example.com/pr/1"]);
     expect(html.split("t3-thread://v2/env-1/mcp:launch:abc")).toHaveLength(2);
+    expect(html).toContain("(link not followed)");
+  });
+
+  test("a T3 thread link opens the thread's https page and shows its host", () => {
+    const bases = new Map([["env-1", "https://t3.example/threads/"]]);
+    const text =
+      "Running in <t3-thread://v2/env-1/mcp:abc>, launched as <t3-thread://v2/env-1/mcp:launch:abc>; elsewhere <t3-thread://v2/env-9/mcp:abc>. Plain t3-thread://v2/env-1/mcp:abc text.";
+    const html = render(
+      <ThreadBasesContext value={bases}>
+        <Markdown text={text} />
+      </ThreadBasesContext>,
+    ).replaceAll("<wbr/>", "");
+    // Only the thread on a known environment links; launch ids and unknown environments,
+    // and text that is not an autolink, stay text.
+    expect(hrefs(html)).toEqual(["https://t3.example/threads/env-1/mcp%3Aabc"]);
+    expect(html).toContain("(t3.example)");
+    expect(html.match(/\(link not followed\)/g)).toHaveLength(2);
+    expect(html).toContain("Plain t3-thread://v2/env-1/mcp:abc text.");
+  });
+
+  test("without T3 bases a thread link stays text", () => {
+    const html = md("<t3-thread://v2/env-1/mcp:abc>");
+    expect(hrefs(html)).toEqual([]);
     expect(html).toContain("(link not followed)");
   });
 

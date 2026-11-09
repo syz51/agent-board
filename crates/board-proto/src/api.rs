@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Dispatch,
     Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority,
-    ResolutionKind, Runtime, Said, Task, TaskId, TaskStatus, Timestamp,
+    ResolutionKind, Runtime, Said, Task, TaskId, TaskStatus, Timestamp, UsageWindow,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -82,6 +82,22 @@ pub struct UpdateBoard {
     /// predates it ignores it, so a client checks the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<Dispatch>,
+    /// 1 to 100 (see [`crate::Board::usage_stop_at`]). Raising it is for the user only,
+    /// since it lets the board spend more of the shared usage limit; anyone may lower it.
+    /// A server that predates it ignores it, so a client checks the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_stop_at: Option<u32>,
+}
+
+/// `PUT /v1/usage`: a device daemon reports the account usage it read. The server keeps
+/// the newest reading by `read_at` and records the calling device.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    pub read_at: Timestamp,
 }
 
 /// `POST /v1/boards/{slug}/judges`: the holder of the board's coordinator lease registers a
@@ -681,6 +697,15 @@ pub struct Snapshot {
     /// The event sequence this snapshot reflects; pass it as `since` next time.
     pub seq: i64,
     pub at: Timestamp,
+    /// The paused boards this agent works for, by slug: it is their coordinator, a thread
+    /// that coordinator started, or the owner of a task in `doing` on them. The hooks end
+    /// a held agent's turn. Empty, and absent from servers that predate it, otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_by: Vec<BoardSlug>,
+    /// When the latest of `held_by` was paused: the hooks halt only a turn that began
+    /// before it. Absent when not held, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<Timestamp>,
 }
 
 /// Answer to `GET /v1/events?since=&board=&limit=`.
@@ -770,6 +795,27 @@ mod tests {
         let touches: Touches = serde_json::from_value(old.clone()).unwrap();
         assert!(!touches.scanned && touches.modified.is_empty());
         assert_eq!(serde_json::to_value(&touches).unwrap(), old);
+    }
+
+    #[test]
+    fn snapshots_from_older_servers_hold_no_one() {
+        let old = serde_json::json!({
+            "kind": "delta", "text": "", "seq": 3, "at": "2026-11-09T00:00:00Z"
+        });
+        let snap: Snapshot = serde_json::from_value(old.clone()).unwrap();
+        assert!(snap.held_by.is_empty() && snap.held_since.is_none());
+        assert_eq!(serde_json::to_value(&snap).unwrap(), old);
+        let mut held = old;
+        held["held_by"] = serde_json::json!(["factory"]);
+        let snap: Snapshot = serde_json::from_value(held.clone()).unwrap();
+        assert_eq!(snap.held_by, ["factory".parse::<BoardSlug>().unwrap()]);
+        assert_eq!(snap.held_since, None, "a server without the pause time");
+        held["held_since"] = serde_json::json!("2026-11-08T16:00:00Z");
+        let snap: Snapshot = serde_json::from_value(held).unwrap();
+        assert_eq!(
+            snap.held_since,
+            Some("2026-11-08T16:00:00Z".parse().unwrap())
+        );
     }
 
     #[test]
@@ -976,10 +1022,17 @@ mod tests {
             "older servers run a coordinator thread"
         );
         assert_eq!(update.dispatch, None);
+        assert_eq!(
+            board.usage_stop_at,
+            crate::USAGE_STOP_AT_DEFAULT,
+            "older servers hold no work on usage"
+        );
+        assert_eq!(update.usage_stop_at, None);
         // Older servers reject no field they do not know, and an unset one is not sent.
         let unset = serde_json::to_value(UpdateBoard::default()).unwrap();
         assert_eq!(unset["parallel_tasks"], serde_json::Value::Null);
         assert_eq!(unset["dispatch"], serde_json::Value::Null);
+        assert_eq!(unset["usage_stop_at"], serde_json::Value::Null);
         let set: UpdateBoard =
             serde_json::from_value(serde_json::json!({ "dispatch": "daemon" })).unwrap();
         assert_eq!(set.dispatch, Some(Dispatch::Daemon));
@@ -999,5 +1052,60 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    fn usage(five: Option<f64>, week: Option<f64>, read_min_ago: i64) -> crate::Usage {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let window = |percent| UsageWindow {
+            percent,
+            resets_at: Some(now + chrono::TimeDelta::hours(2)),
+        };
+        crate::Usage {
+            five_hour: five.map(window),
+            seven_day: week.map(window),
+            read_at: now - chrono::TimeDelta::minutes(read_min_ago),
+            device: "air".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn usage_is_over_at_the_fullest_window_of_a_fresh_reading() {
+        use crate::UsageWindowKind::{FiveHour, SevenDay};
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let over = |u: &crate::Usage, at| u.over(at, now).map(|(k, w)| (k, w.percent));
+        let u = usage(Some(95.0), Some(92.0), 1);
+        assert_eq!(over(&u, 90), Some((FiveHour, 95.0)));
+        assert_eq!(over(&u, 93), Some((FiveHour, 95.0)));
+        assert_eq!(over(&u, 96), None);
+        assert_eq!(
+            over(&usage(None, Some(90.0), 1), 90),
+            Some((SevenDay, 90.0))
+        );
+        assert_eq!(over(&usage(Some(99.0), None, 31), 90), None, "stale");
+        assert_eq!(
+            over(&usage(Some(99.0), None, 30), 90),
+            Some((FiveHour, 99.0))
+        );
+        let mut reset = usage(Some(99.0), Some(91.0), 1);
+        reset.five_hour.as_mut().unwrap().resets_at = Some(now);
+        assert_eq!(
+            over(&reset, 90),
+            Some((SevenDay, 91.0)),
+            "a reset window is empty"
+        );
+        reset.seven_day.as_mut().unwrap().resets_at = None;
+        assert_eq!(
+            over(&reset, 90),
+            Some((SevenDay, 91.0)),
+            "no reset time still counts"
+        );
+    }
+
+    #[test]
+    fn a_usage_report_needs_only_the_read_time() {
+        let req: ReportUsage =
+            serde_json::from_value(serde_json::json!({ "read_at": "2026-11-08T12:00:00Z" }))
+                .unwrap();
+        assert_eq!((req.five_hour, req.seven_day), (None, None));
     }
 }
