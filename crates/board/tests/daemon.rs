@@ -4120,7 +4120,7 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     for rule in [
         "give a verdict on each pending proposal on this board that you did not propose",
         "file work it finds but won't do as a proposal",
-        "`task_add` with `auto=false`, a body starting `Proposal:`",
+        // How to file one (`task_add`, `auto=false`) is in the MCP instructions, once.
         "Every task is `auto` unless the user must do or decide it, or it is a pending proposal",
         "and is not a pending proposal, set it `auto`",
         "File them as proposals and delegate their review to a reviewer child",

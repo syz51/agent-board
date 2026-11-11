@@ -351,6 +351,16 @@ pub async fn snapshot(
     Ok(Output::new(text, &snap))
 }
 
+/// Agents `board status` lists unless `detailed`: every live one, then the ended ones seen
+/// last, up to this many together.
+pub const STATUS_AGENTS: usize = 20;
+/// Asks `board asks` lists when the call names no limit and the asks are not the open ones:
+/// the newest.
+pub const ASKS_LIMIT_DEFAULT: usize = 50;
+
+/// Without `detailed`, leaves out the ended agents past [`STATUS_AGENTS`] agents, the ones
+/// seen longest ago, and says how many: a board keeps every agent of the last 7 days, most
+/// of them ended child threads. An agent that is not ended may own work, so it always shows.
 pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Result<Output> {
     let mut lines = Vec::new();
     let me = match ctx.client.agent() {
@@ -370,9 +380,40 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
     let json = match board {
         Some(slug) => {
             let b = ctx.client.board(&slug).await?;
-            let agents = ctx.client.agents(Some(&slug)).await?;
+            let mut agents = ctx.client.agents(Some(&slug)).await?;
+            let mut more = 0;
+            if !detailed {
+                let mut ended: Vec<Timestamp> = agents
+                    .iter()
+                    .filter(|a| a.state == AgentState::Ended)
+                    .map(|a| a.last_seen)
+                    .collect();
+                let keep = STATUS_AGENTS.saturating_sub(agents.len() - ended.len());
+                more = ended.len().saturating_sub(keep);
+                if more > 0 {
+                    ended.sort_unstable_by(|a, b| b.cmp(a));
+                    // The server's order (by handle) stays; ties at the cut go by that order.
+                    let oldest_kept = keep.checked_sub(1).map(|i| ended[i]);
+                    let mut left = keep;
+                    agents.retain(|a| {
+                        if a.state != AgentState::Ended {
+                            return true;
+                        }
+                        let kept = left > 0 && oldest_kept.is_some_and(|at| a.last_seen >= at);
+                        left -= usize::from(kept);
+                        kept
+                    });
+                }
+            }
             lines.push(render::board_detail(&b, &agents, detailed));
-            json!({"board": b, "agents": agents})
+            let mut json = json!({"board": b, "agents": agents});
+            if more > 0 {
+                lines.push(format!(
+                    "left out {more} ended agents, seen before the ones listed: detailed lists every one"
+                ));
+                json["agents_left_out"] = json!(more);
+            }
+            json
         }
         None => {
             let boards = ctx.client.boards().await?;
@@ -914,9 +955,30 @@ pub async fn ask_withdraw(ctx: &Ctx, id: i64) -> Result<Output> {
     ))
 }
 
-pub async fn asks(ctx: &Ctx, status: Option<&str>, board: Option<&BoardSlug>) -> Result<Output> {
-    let asks = ctx.client.asks(status, board).await?;
-    Ok(Output::new(render::ask_list(&asks), &asks))
+/// Lists the newest `limit` asks that match, oldest first, and says how many it left out.
+pub async fn asks(
+    ctx: &Ctx,
+    status: Option<&str>,
+    board: Option<&BoardSlug>,
+    limit: Option<usize>,
+) -> Result<Output> {
+    let mut asks = ctx.client.asks(status, board).await?;
+    // Newest last, whatever order the server sends.
+    asks.sort_by_key(|a| a.id);
+    // Every open ask waits on the user, the oldest the longest, so none is left out unless
+    // the caller asks. The answered and withdrawn ones grow without end.
+    let limit = limit.or((status != Some("open")).then_some(ASKS_LIMIT_DEFAULT));
+    let more = limit.map_or(0, |limit| asks.len().saturating_sub(limit));
+    asks.drain(..more);
+    let mut text = render::ask_list(&asks);
+    if let Some(limit) = limit
+        && more > 0
+    {
+        text.push_str(&format!(
+            "\nlisted the newest {limit}; {more} older match: narrow it with --status or --board, or raise --limit"
+        ));
+    }
+    Ok(Output::new(text, &asks))
 }
 
 pub async fn answer(ctx: &Ctx, id: i64, text: &str) -> Result<Output> {
