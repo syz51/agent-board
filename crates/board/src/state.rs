@@ -50,6 +50,12 @@ pub struct AgentLocal {
     /// that halts the agent's own held turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_heartbeat: Option<Timestamp>,
+    /// Event sequence of the last alerts a subagent's `PostToolUse` fetched: the subagents'
+    /// cursor, apart from the agent's own (`seq`), so the alerts a subagent's tool call
+    /// fetched still reach the agent. Unset until a session's first such fetch, which
+    /// starts from `seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_seq: Option<i64>,
 }
 
 /// An overlap alert the hooks showed: a peer's lease or edit of a path, as of `at`.

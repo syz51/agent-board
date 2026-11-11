@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat,
-    SnapshotKind, TOUCH_PATHS_MAX, TaskId, TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION,
+    PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskId,
+    TaskStatus, Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -364,6 +365,12 @@ async fn handle(
     // Claude Code adds `agent_id` to the hooks of a subagent's tool calls, which share the
     // session, and so the agent, of the thread that launched it.
     let subagent = input["agent_id"].as_str().filter(|s| !s.is_empty());
+    if event == HookEvent::SessionStart && subagent.is_some() {
+        // The snapshot describes the agent and its tasks, not the subagent. Claude Code
+        // 2.1.322 runs this hook after a subagent's compaction without `agent_id`, as it
+        // does for the agent's own, so this holds only for a runtime that sends it.
+        return Ok(Reply::Nothing);
+    }
     // Before any return below: the background subagent works on after the turn that
     // launched it ends, which clears what the agent's state knew of that turn.
     if post
@@ -488,6 +495,8 @@ async fn handle(
         HookEvent::SessionStart if input["source"] != "compact" => {
             hook.local.turn_started = None;
             hook.local.end_turn_hold();
+            // The subagents of an earlier session are gone, and their cursor with them.
+            hook.local.subagent_seq = None;
             if let Err(err) = state::take_done(&hook.home, &hook.agent) {
                 tracing::debug!("dropping done marks: {err:#}");
             }
@@ -610,8 +619,44 @@ fn subagent_hold(text: &str, boards: &[board_proto::BoardSlug], for_usage: bool)
         .collect();
     if replaced {
         lines.join("\n")
+    } else if text.is_empty() {
+        line
     } else {
         format!("{line}\n{text}")
+    }
+}
+
+/// What a subagent can use of the alerts `text` the server rendered for its agent: the
+/// `hold:` line and the overlaps with a peer's edit or lease. The agent's other alerts (an
+/// answered ask, a change to its task, a new peer) and its usage are for the agent, which
+/// alone can act on them. Empty when no such line is left.
+fn subagent_alerts(text: &str) -> String {
+    let overlap = |line: &str| {
+        [EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION]
+            .iter()
+            .any(|action| {
+                line.strip_suffix(action)
+                    .is_some_and(|l| l.ends_with(" -> "))
+            })
+    };
+    let mut useful = false;
+    let lines: Vec<&str> = text
+        .split('\n')
+        .filter(|line| {
+            let alert = line.starts_with("! ");
+            let keep = if alert {
+                overlap(line)
+            } else {
+                !line.starts_with("usage: ")
+            };
+            useful |= keep && (alert || line.starts_with("hold: "));
+            keep
+        })
+        .collect();
+    if useful {
+        lines.join("\n")
+    } else {
+        String::new()
     }
 }
 
@@ -1457,10 +1502,10 @@ impl Hook<'_> {
     }
 
     async fn fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
-        let since = if kind == SnapshotKind::Full {
-            None
-        } else {
-            self.local.seq
+        let since = match (kind, &self.subagent) {
+            (SnapshotKind::Full, _) => None,
+            (_, Some(_)) => self.local.subagent_seq.or(self.local.seq),
+            (_, None) => self.local.seq,
         };
         self.client
             .snapshot(&SnapshotQuery {
@@ -1489,10 +1534,18 @@ impl Hook<'_> {
     }
 
     /// Records the snapshot's sequence (and caches a full one) and returns its text.
+    ///
+    /// A subagent's tool call shares the agent's state, so it moves the subagents' cursor
+    /// and leaves the agent's: the server sends the agent its alerts again, at its own
+    /// next heartbeat. The subagent gets the lines it can use ([`subagent_alerts`]).
     fn keep(&mut self, snap: Snapshot) -> Result<String> {
-        self.local.seq = Some(snap.seq);
         self.local.held = !snap.held_by.is_empty();
         self.local.held_since = snap.held_since;
+        if self.subagent.is_some() {
+            self.local.subagent_seq = Some(snap.seq);
+            return Ok(subagent_alerts(&snap.text));
+        }
+        self.local.seq = Some(snap.seq);
         if snap.kind == SnapshotKind::Full {
             state::save_cached_snapshot(&self.home, &self.agent, &snap)?;
         }
@@ -2663,6 +2716,26 @@ mod tests {
             text.contains("hold: factory held: the weekly usage reached the user's reserve -> "),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_hold_and_overlap_lines_of_its_agents_alerts() {
+        let held = "<board>\nhold: factory paused -> stop\nusage: week 7%\n\
+                    ! ask 7 answered by the user -> read the answer\n</board>";
+        assert_eq!(
+            subagent_alerts(held),
+            "<board>\nhold: factory paused -> stop\n</board>"
+        );
+        // An alert that only quotes an overlap's action is not one.
+        let quoted = "<board>\n! t3:a91c changed your task factory-9 (title \"x -> re-read \
+                      before editing\") -> task_show factory-9\n</board>";
+        assert_eq!(subagent_alerts(quoted), "");
+        assert_eq!(subagent_alerts(""), "");
+        // With nothing left of the server's text, the subagent's own hold line stands alone.
+        let boards = ["factory".parse().unwrap()];
+        let line = subagent_hold("", &boards, false);
+        assert!(line.starts_with("hold: factory paused -> "), "{line}");
+        assert!(!line.contains('\n'), "{line}");
     }
 
     #[test]
