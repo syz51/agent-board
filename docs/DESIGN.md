@@ -100,7 +100,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
-  when the owner is gone. Stats count dones that spent under a minute in `doing`, takeovers
+  when the owner is gone. When the owner is stale or its session ended, and nobody runs the
+  active board (no coordinator, and no daemon dispatch, which closes reviewed tasks
+  itself), the alert goes
+  to the agents that may take the task at once: its creator and the threads that delegated
+  its owner. When they are gone too, it goes to every agent on one of the board's
+  repositories, once the owner is stale, so that the take is not refused. That alert says
+  to check the PR and, once it merged, to take the task (`task_claim <id> take=true`) and
+  mark it done. Stats count dones that spent under a minute in `doing`, takeovers
   and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
@@ -537,7 +544,11 @@ apart from the user's chats, such as environment variables.
   leaves the mark, and the next start adopts the newest `<board> coordinator` thread created
   since then: it sends the prompt first if that thread never ran, and starts a new thread
   only when there is none, or when briefing it failed. Older threads with that title are
-  never taken.
+  never taken. Each start writes its reason to `watch.log` ("started coordinator thread
+  … for <board>: <reason>"): no coordinator named and no thread on record, the thread
+  gone, the named coordinator's session ended or its thread gone, a named coordinator
+  the server does not know, a thread to adopt that is gone, or a switch back from daemon
+  dispatch; when a stood-down thread (below) was gone too, the reason ends by naming it.
 - **Where it runs**: never in the project root, which the user's and other threads share.
   When the project folder is the top of a git repository, the daemon starts the thread
   with `t3 thread start --worktree <base> --branch <branch>`: T3 creates the branch from
@@ -592,6 +603,29 @@ apart from the user's chats, such as environment variables.
   briefing it once, since what it was briefed with is unknown; a pending adoption replaces
   it instead, and a thread T3 no longer has is replaced. In both cases the daemon releases
   the lease first, so the ended agent is not named meanwhile.
+- **A coordinator that stands down**: a coordinator thread stops being the coordinator
+  while the thread itself lives on when autopilot goes off, its device stops being a home
+  device, the board closes or goes to daemon dispatch, the board names another
+  coordinator, or another device takes the lease. The daemon releases the lease where it
+  holds it, logs the reason, and sends the thread one message: it is no longer the
+  coordinator, why, and to stop dispatching (claim no task, start no child or review,
+  close no task as coordinator). Without it the thread would keep dispatching beside the
+  board's limit. The daemon keeps the thread's record in `watch.json` (`stood_down`), so
+  it survives a daemon restart, and saves it before the send, so a daemon killed in
+  between does not send twice. A send that failed is tried again on the next reconcile,
+  three sends at most; one that timed out may have arrived and is not repeated; a thread
+  T3 no longer has drops the record. A thread the board replaced is told only once the
+  named coordinator is known to stand (at work, or another device's); when it does not
+  (unknown to the server, or ended here with its thread gone), our thread is kept without
+  a message and taken again. When this device next has to start a coordinator for the
+  board (for example autopilot goes on again) and no adoption waits, or the thread to
+  adopt is gone, it takes the lease, asks T3 about that thread, and when T3 can still run
+  it, names it coordinator again with one message instead of starting a second thread;
+  that message is marked before its send too. Its briefed prompt is kept, so a re-brief
+  follows only when the prompt changed. A thread that is gone is replaced by a new one,
+  and the start's reason says so. The record goes once the board has a coordinator on
+  this device again; a pending adoption of a live thread wins over it. Rejected: looking for any older
+  `<board> coordinator` thread by title, since threads replaced long ago keep that title.
 - **A paused board**: the daemon starts, wakes and re-briefs nothing on it, but its
   coordinator's home device keeps the coordinator in `watch.json` and does not release
   the lease, so the server still names it and holds it (see "Pausing work"). The lease
