@@ -301,7 +301,12 @@ pub enum Command {
     /// Join a board (default: the one for this repo).
     Join { board: Option<BoardSlug> },
     /// List boards.
-    Boards,
+    Boards {
+        /// Only the boards that cover this repository: its URL, or its key such as
+        /// github.com/owner/name.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Pause all your work: every active board, or only those named. Their coordinators,
     /// the threads they started and the agents on their tasks stop at their next hook, and
     /// the daemon starts nothing on them. `board resume` undoes it. The feedback board always
@@ -637,6 +642,9 @@ pub struct AddArgs {
     title: String,
     #[arg(long)]
     board: Option<BoardSlug>,
+    /// The repository whose board gets the task (its URL or key), in place of --board.
+    #[arg(long, conflicts_with = "board")]
+    repo: Option<String>,
     #[arg(long, default_value = "", help = at_most("Markdown that stands alone", limits().body_chars))]
     body: String,
     #[arg(long = "accept", default_value = "", help = at_most(
@@ -1187,6 +1195,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Add(a) => {
             let new = ops::NewTask {
                 board: a.board,
+                repo: a.repo,
                 title: a.title,
                 body: a.body,
                 acceptance: a.acceptance,
@@ -1272,7 +1281,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Withdraw { id } => ops::ask_withdraw(&ctx()?, id).await?,
         Command::Answer { id, answer } => ops::answer(&ctx()?, id, &answer).await?,
         Command::Join { board } => ops::join(&ctx()?, board).await?,
-        Command::Boards => ops::boards(&ctx()?).await?,
+        Command::Boards { repo } => ops::boards(&ctx()?, repo.as_deref()).await?,
         Command::Pause { boards } => {
             ops::set_boards_status(&ctx()?, boards, BoardStatus::Active, BoardStatus::Paused)
                 .await?

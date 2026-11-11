@@ -666,6 +666,8 @@ pub fn list_since(value: &str, now: Timestamp) -> Result<String> {
 #[derive(Debug, Clone, Default)]
 pub struct NewTask {
     pub board: Option<BoardSlug>,
+    /// The repository whose board gets the task, when no board is named.
+    pub repo: Option<String>,
     pub title: String,
     pub body: String,
     pub acceptance: String,
@@ -679,8 +681,10 @@ pub struct NewTask {
 }
 
 pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
-    let board = match (&new.board, &new.parent) {
-        (None, Some(parent)) => parent.board(),
+    let board = match (&new.board, &new.repo, &new.parent) {
+        (Some(_), Some(_), _) => bail!("pass a board or a repo, not both"),
+        (None, Some(repo), _) => board_of_repo(ctx, repo).await?,
+        (None, None, Some(parent)) => parent.board(),
         _ => ctx.resolve_board(new.board.clone()).await?,
     };
     let task = ctx
@@ -709,6 +713,14 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
     if let Some(kind) = kind {
         record_filed(ctx, task.id.as_str(), kind, task.parent.clone());
     }
+    // A hint, never a refusal: the task exists, so a failed read only loses the hint.
+    let duplicates = match likely_duplicates(ctx, &task).await {
+        Ok(hint) => hint,
+        Err(err) => {
+            tracing::warn!("searching for duplicates of {}: {err:#}", task.id);
+            String::new()
+        }
+    };
     if !new.claim {
         let mut text = format!("added {}", render::task_line(&task));
         if task.is_pending_proposal() {
@@ -717,6 +729,7 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
                  note; an accept sets auto, which makes it claimable.",
             );
         }
+        text.push_str(&duplicates);
         return Ok(Output::new(text, &task));
     }
     // A server that predates `claim` ignores it and creates the task open: claim it now,
@@ -735,9 +748,99 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
         task
     };
     Ok(Output::new(
-        format!("added and claimed {}", render::task_line(&task)),
+        format!("added and claimed {}{duplicates}", render::task_line(&task)),
         &task,
     ))
+}
+
+/// How many likely duplicates `task_add` names.
+const DUPLICATES_MAX: usize = 3;
+
+/// The words of a title that a duplicate would share: letters and digits, lower case,
+/// without words under 3 characters, each once, at most the search's word limit.
+fn title_words(title: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_lowercase)
+    {
+        if !words.contains(&word) && words.len() < board_proto::TASKS_Q_WORDS_MAX {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// The lines `task_add` ends with when the board holds open tasks whose titles share most
+/// of the new title's words, best match first; empty when it holds none. The server's
+/// ranked search finds them; the titles are compared here too, since the search also reads
+/// bodies and notes, and a server that predates it returns every task.
+async fn likely_duplicates(ctx: &Ctx, task: &Task) -> Result<String> {
+    let words = title_words(&task.title);
+    if words.is_empty() {
+        return Ok(String::new());
+    }
+    let found = ctx
+        .client
+        .tasks(&TaskQuery {
+            board: Some(task.board.clone()),
+            q: Some(words.join(" ")),
+            closed: Some(false),
+            limit: Some(20),
+            ..TaskQuery::default()
+        })
+        .await?;
+    let lines: Vec<String> = found
+        .iter()
+        .filter(|t| t.id != task.id)
+        .filter(|t| {
+            let theirs = title_words(&t.title);
+            words.iter().filter(|w| theirs.contains(w)).count() * 2 > words.len()
+        })
+        .take(DUPLICATES_MAX)
+        .map(|t| format!("  {}", render::task_line(t)))
+        .collect();
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "\nlikely duplicates on {}; if one covers this work, drop {} (task_update {} \
+         status=dropped) and add a note there:\n{}",
+        task.board,
+        task.id,
+        task.id,
+        lines.join("\n")
+    ))
+}
+
+/// The key of the repository an agent named, as boards list it.
+fn repo_key(raw: &str) -> Result<String> {
+    board_proto::normalize_repo(raw).ok_or_else(|| {
+        anyhow!("{raw} is not a repository: pass its URL or key, such as github.com/owner/name")
+    })
+}
+
+/// The one active board that covers the repository `raw`.
+async fn board_of_repo(ctx: &Ctx, raw: &str) -> Result<BoardSlug> {
+    let key = repo_key(raw)?;
+    let boards = ctx.client.boards().await?;
+    let covering: Vec<&Board> = boards
+        .iter()
+        .filter(|b| b.status == BoardStatus::Active && b.repos.contains(&key))
+        .collect();
+    match covering.as_slice() {
+        [only] => Ok(only.slug.clone()),
+        [] => bail!("no active board covers {key}: pass a board (see `board boards`)"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|b| b.slug.as_str()).collect();
+            bail!(
+                "{} boards cover {key}: pass one as the board ({})",
+                many.len(),
+                names.join(", ")
+            )
+        }
+    }
 }
 
 /// `claim`, `release` or `take`.
@@ -1174,9 +1277,20 @@ pub async fn join(ctx: &Ctx, board: Option<BoardSlug>) -> Result<Output> {
     ))
 }
 
-pub async fn boards(ctx: &Ctx) -> Result<Output> {
-    let boards = ctx.client.boards().await?;
-    Ok(Output::new(render::board_list(&boards), &boards))
+/// `board boards`: every board, or with `repo` only the boards that cover that repository.
+pub async fn boards(ctx: &Ctx, repo: Option<&str>) -> Result<Output> {
+    let mut boards = ctx.client.boards().await?;
+    let Some(repo) = repo else {
+        return Ok(Output::new(render::board_list(&boards), &boards));
+    };
+    let key = repo_key(repo)?;
+    boards.retain(|b| b.repos.contains(&key));
+    let text = if boards.is_empty() {
+        format!("no board covers {key}; `board boards` lists every board")
+    } else {
+        render::board_list(&boards)
+    };
+    Ok(Output::new(text, &boards))
 }
 
 /// `board usage`: the latest reading, and which boards it holds from new work.

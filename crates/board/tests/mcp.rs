@@ -278,6 +278,36 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert!(text(&added).starts_with("added and claimed factory-20 doing"));
     assert_eq!(stub.requests_to("POST /v1/tasks")[0].body["claim"], true);
 
+    // repo names the board, and the answer names an open task with most of the title's words.
+    stub.on(
+        "GET /v1/boards",
+        [board_fixture("factory", &["github.com/acme/factory"])],
+    );
+    stub.on(
+        "GET /v1/tasks",
+        [task_fixture("factory-7", "Mine the quarry")],
+    );
+    stub.on(
+        "POST /v1/tasks",
+        task_fixture("factory-21", "Mine the old quarry"),
+    );
+    let added = mcp.call(
+        41,
+        "task_add",
+        json!({"title": "Mine the old quarry", "repo": "https://github.com/acme/factory.git"}),
+    );
+    assert_ne!(added["isError"], true, "{added}");
+    assert_eq!(
+        stub.requests_to("POST /v1/tasks")[1].body["board"],
+        "factory"
+    );
+    assert!(
+        text(&added).contains("likely duplicates on factory;")
+            && text(&added).contains("\n  factory-7 "),
+        "{added}"
+    );
+    stub.on("POST /v1/tasks", &doing);
+
     let noted = mcp.call(
         5,
         "task_note",
@@ -441,7 +471,10 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let listed = mcp.call(11, "task_list", json!({"proposals": true}));
     assert_ne!(listed["isError"], true, "{listed}");
     assert_eq!(
-        stub.requests_to("GET /v1/tasks")[0].query_pairs()["proposal"],
+        stub.requests_to("GET /v1/tasks")
+            .last()
+            .unwrap()
+            .query_pairs()["proposal"],
         "true"
     );
     assert!(text(&listed).contains("factory-20"), "{listed}");

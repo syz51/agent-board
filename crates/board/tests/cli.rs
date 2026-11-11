@@ -3418,3 +3418,144 @@ fn status_and_asks_list_a_bounded_number_by_default() {
     let out = e.run(&["asks", "--limit", "0"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
 }
+
+/// `board boards --repo` names the board of a repository, and `board add --repo` files on
+/// it; the answer of an add names the open tasks whose titles share most of its words.
+#[test]
+fn a_repository_names_its_board_and_add_names_likely_duplicates() {
+    let e = env();
+    let mut paused = board_fixture("old", &["github.com/acme/tool"]);
+    paused.status = board_proto::BoardStatus::Paused;
+    e.stub.on(
+        "GET /v1/boards",
+        [
+            board_fixture("factory", &["github.com/acme/factory"]),
+            board_fixture("tool", &["github.com/acme/tool"]),
+            paused,
+        ],
+    );
+
+    // A URL in any form names the boards that cover the repository.
+    let out = e.run(&["boards", "--repo", "git@github.com:Acme/Tool.git"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("tool") && text.contains("old"), "{text}");
+    assert!(!text.contains("factory"), "{text}");
+    let out = e.run(&["boards", "--repo", "github.com/acme/none"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("no board covers github.com/acme/none"),
+        "{}",
+        stdout(&out)
+    );
+    let out = e.run(&["boards", "--repo", "./local"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("is not a repository"),
+        "{}",
+        stderr(&out)
+    );
+
+    // --repo files on the repository's one active board.
+    e.stub.on(
+        "POST /v1/tasks",
+        task_fixture("tool-9", "Fix the parser crash on empty input"),
+    );
+    let mut closed = task_fixture("tool-2", "Fix the parser crash on empty input");
+    closed.status = board_proto::TaskStatus::Done;
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            task_fixture("tool-9", "Fix the parser crash on empty input"),
+            task_fixture("tool-3", "Parser crash on an empty input file"),
+            closed,
+            task_fixture("tool-4", "Document the parser"),
+            task_fixture("tool-5", "Crash of the parser with empty input"),
+            task_fixture("tool-6", "Empty input makes the parser crash"),
+            task_fixture("tool-7", "Parser: crash, empty input"),
+        ],
+    );
+    let out = e.run(&[
+        "add",
+        "Fix the parser crash on empty input",
+        "--repo",
+        "https://github.com/acme/tool",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks")[0].body["board"],
+        "tool"
+    );
+    let search = e.stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    assert_eq!(
+        (search["board"].as_str(), search["closed"].as_str()),
+        ("tool", "false")
+    );
+    assert!(search["q"].contains("parser"), "{search:?}");
+    // The new task, a closed one and one that shares a single word are left out; the
+    // first 3 of the rest are named.
+    let text = stdout(&out);
+    assert!(text.starts_with("added tool-9 "), "{text}");
+    assert!(text.contains("\nlikely duplicates on tool; "), "{text}");
+    let named: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(named, ["tool-3", "tool-5", "tool-6"], "{text}");
+
+    // No likely duplicate: the answer is the plain one. A failed search loses only the hint.
+    e.stub.on(
+        "GET /v1/tasks",
+        [task_fixture("tool-4", "Document the parser")],
+    );
+    let out = e.run(&[
+        "add",
+        "Fix the parser crash on empty input",
+        "--board",
+        "tool",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("likely duplicates"),
+        "{}",
+        stdout(&out)
+    );
+    e.stub.on_status(
+        "GET /v1/tasks",
+        500,
+        json!({"code": "internal", "message": "down"}),
+    );
+    let out = e.run(&[
+        "add",
+        "Fix the parser crash on empty input",
+        "--board",
+        "tool",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("added tool-9 "),
+        "{}",
+        stdout(&out)
+    );
+
+    // A repository without one active board, or with a board too, is refused before the add.
+    let sent = e.stub.requests_to("POST /v1/tasks").len();
+    let out = e.run(&["add", "Fix it", "--repo", "github.com/acme/none"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("no active board covers github.com/acme/none"),
+        "{}",
+        stderr(&out)
+    );
+    let out = e.run(&[
+        "add",
+        "Fix it",
+        "--repo",
+        "github.com/acme/tool",
+        "--board",
+        "tool",
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(e.stub.requests_to("POST /v1/tasks").len(), sent);
+}
