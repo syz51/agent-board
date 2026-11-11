@@ -29,9 +29,11 @@ compose() {
 # which board watch needs for repositories there) and git waited on a new prompt. The key
 # is in its own keychain, unlocked with a random password in a 0600 file beside it, and
 # locked again however signing ends: a subshell, so its trap does that. Each failure says
-# what failed.
+# what failed. A new keychain and its password are made under the `making` names and moved
+# into place only when complete, so a run cut short leaves no keychain that cannot sign.
 dir="$HOME/Library/Application Support/agent-board/signing"
 keychain="$dir/signing.keychain-db"
+making="$dir/making.keychain-db"
 name="agent-board code signing"
 sign_board() (
     # Where `cargo install` puts board, unless cargo's own install.root setting moves it.
@@ -40,6 +42,8 @@ sign_board() (
     trap '[ ! -f "$keychain" ] || security lock-keychain "$keychain" ||
         echo "upgrade: could not lock $keychain again"' EXIT
     trap 'exit 1' HUP INT TERM
+    # What a run killed while it made the identity left.
+    forget_making
     # Made again only when a run cut short left it without its keychain or certificate. A
     # keychain that holds the certificate is never replaced, even without its password: a
     # new key would lose every privacy grant made for the old one. The search needs no
@@ -65,12 +69,7 @@ sign_board() (
                 "Restore that file, or remove the keychain to make a new identity, for which macOS asks for folder access again"
             return 1
         }
-        security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
-            echo "upgrade: could not unlock $keychain with the password beside it"
-            return 1
-        }
-    fi
-    if [ "$remake" = yes ]; then
+    else
         echo "upgrade: making the code-signing identity in $dir"
         forget_signing_identity
         make_signing_identity || {
@@ -78,6 +77,12 @@ sign_board() (
             return 1
         }
     fi
+    # Also after it was made: macOS holds a keychain unlocked by its path, and the new one
+    # was unlocked where it was made, so codesign fails with errSecInternalComponent.
+    security unlock-keychain -p "$(cat "$dir/password")" "$keychain" || {
+        echo "upgrade: could not unlock $keychain with the password beside it"
+        return 1
+    }
     signed=no
     if ! id=$(signing_id); then
         echo "upgrade: $keychain holds the certificate \"$name\" but no identity codesign can use"
@@ -96,21 +101,29 @@ signing_id() {
     security find-identity -p codesigning "$keychain" |
         grep -F "\"$name\"" | awk '{ print $2; found = 1; exit } END { exit !found }'
 }
-# Removes the keychain, from macOS's keychain list too, and its password.
+# Removes the keychain file and its password. The keychain was never in the user's keychain
+# search list, which stays as it is.
 forget_signing_identity() {
     security delete-keychain "$keychain" 2>/dev/null || true
     rm -f "$keychain" "$dir/password"
 }
-# Makes the password and a keychain that holds the identity. A subshell, so its trap
-# removes the unencrypted key however it ends.
+# Removes a keychain and password that are not yet in place.
+forget_making() {
+    [ ! -e "$making" ] || security delete-keychain "$making" 2>/dev/null || true
+    rm -f "$making" "$dir/making.password"
+}
+# Makes the password and a keychain that holds the identity, then moves both into place:
+# the password first, so a run cut short between the two leaves no keychain, and the next
+# run makes the identity again. A subshell, so its trap removes the unencrypted key, and a
+# keychain not yet in place, however it ends.
 make_signing_identity() (
-    (umask 077 && /usr/bin/openssl rand -hex 24 >"$dir/password") || {
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf "$tmp"; forget_making' EXIT
+    (umask 077 && /usr/bin/openssl rand -hex 24 >"$dir/making.password") || {
         echo "upgrade: openssl could not make the keychain password"
         exit 1
     }
-    password=$(cat "$dir/password")
-    tmp=$(mktemp -d) || exit 1
-    trap 'rm -rf "$tmp"' EXIT
+    password=$(cat "$dir/making.password")
     trap 'exit 1' HUP INT TERM
     cat >"$tmp/cert.cnf" <<EOF
 [req]
@@ -133,18 +146,22 @@ EOF
         exit 1
     }
     /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -name "$name" \
-        -out "$tmp/id.p12" -passout "file:$dir/password" || {
+        -out "$tmp/id.p12" -passout "file:$dir/making.password" || {
         echo "upgrade: openssl could not bundle the signing key"
         exit 1
     }
     # A new keychain is unlocked; set-keychain-settings with no options keeps it so.
-    { security create-keychain -p "$password" "$keychain" &&
-        security set-keychain-settings "$keychain" &&
-        security import "$tmp/id.p12" -k "$keychain" -P "$password" \
+    { security create-keychain -p "$password" "$making" &&
+        security set-keychain-settings "$making" &&
+        security import "$tmp/id.p12" -k "$making" -P "$password" \
             -T /usr/bin/codesign >/dev/null &&
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" \
-            "$keychain" >/dev/null; } || {
-        echo "upgrade: security could not store the signing identity in $keychain"
+            "$making" >/dev/null; } || {
+        echo "upgrade: security could not store the signing identity in $making"
+        exit 1
+    }
+    { mv -f "$dir/making.password" "$dir/password" && mv -f "$making" "$keychain"; } || {
+        echo "upgrade: could not move the signing keychain and its password into place in $dir"
         exit 1
     }
 )
