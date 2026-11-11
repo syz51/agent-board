@@ -1280,6 +1280,12 @@ pub fn is_user_message(text: &str) -> bool {
         && text.trim() != "/compact"
 }
 
+/// The last line of a wake-up message, before its marker. The lines above it name what
+/// changed, and the agent's prompt hook adds the board delta (alerts and changed counts) to
+/// the same prompt, so the message asks for no snapshot: that call would cost the agent one
+/// more turn for what the prompt already holds.
+const WAKE_END: &str = "Continue from this and the board delta in this prompt, if there is one.";
+
 /// The line that tells the coordinator of `slug` that a fresh session is due.
 pub fn fresh_session_line(slug: &BoardSlug) -> String {
     format!(
@@ -2091,7 +2097,7 @@ impl<T: T3> Daemon<T> {
             let digest = prompt_digest(triage);
             let owed = local.briefed.as_deref() != Some(digest);
             let resume = format!(
-                "board {}: the usage limit has reset. Run board_snapshot and continue your loop.",
+                "board {}: the usage limit has reset. Continue your loop.",
                 board.slug
             );
             let message = if owed {
@@ -4241,7 +4247,7 @@ impl<T: T3> Daemon<T> {
         }
         Some(Outgoing {
             agent: agent.clone(),
-            message: format!("{}\nRun board_snapshot and continue.", lines.join("\n")),
+            message: format!("{}\n{WAKE_END}", lines.join("\n")),
             wakes: sent,
             backoff,
             rebriefs: Vec::new(),
@@ -5122,7 +5128,7 @@ pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
     let brief = brief(slug, triage);
     let marker = rebrief_marker(slug, triage);
     format!(
-        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop: call board_snapshot.\n{marker}"
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop.\n{marker}"
     )
 }
 

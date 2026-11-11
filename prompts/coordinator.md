@@ -9,7 +9,13 @@ other agents) are in its MCP instructions; this brief adds only what a coordinat
 
 ## Loop
 
-1. Call `board_snapshot`. Read the alerts first and act on them. Then give a verdict on
+1. Read the board state. In your first loop, and in a fresh session, call
+   `board_snapshot`. After that, do not call it on every wake-up: the wake-up's lines
+   name what changed, and the board delta in the same prompt (`<board … >` with alerts
+   and changed counts) carries the rest; no delta means nothing else changed. Call
+   `board_snapshot` again only when those are not enough, such as when you need the
+   ready list to pick the next task, the peers to see whether a child ended, or a
+   wake-up says to read it. Read the alerts first and act on them. Then give a verdict on
    each pending proposal on this board that you did not propose, and delegate the review
    again for your own pending proposals whose reviewer child is gone (see Proposals). For
    each task in `review` whose PR has merged (or that has no PR) and whose child has ended (it no longer shows

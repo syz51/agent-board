@@ -775,6 +775,15 @@ settings in use, warned once per edit.
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
+  - **Text**: one line per change, naming the board and the task or ask, then the line
+    `Continue from this and the board delta in this prompt, if there is one.` The message
+    asks for no `board_snapshot` call, and neither do the re-brief and the usage-limit
+    resume: the `UserPromptSubmit` hook, which every runtime's hooks run, adds the delta
+    (alerts and changed counts) to the same prompt, so a call would cost the agent one more
+    turn for what it already has. An agent whose hooks do not run still gets the lines; it
+    calls `board_snapshot` when it needs more, as its instructions say. Only the first
+    brief and a fresh session, which start a loop, and the resume and usage-eased lines,
+    which follow a time without wake-ups, say to read the snapshot.
   - **Ended is not gone**: T3 closes a Claude session left idle for 30 minutes, and that
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
