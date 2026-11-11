@@ -1396,7 +1396,8 @@ report, not a free-form task (`API.md`, "Feedback"):
   finding, so hourly repeats do not pile up items to answer at `task_done`. Once the item is
   routed to a task and that task is done, a new report opens a new item that `recurs` the
   old one: the fix did not hold, and the history shows it.
-- **Resolution.** Whoever owns an item (or the user) resolves it: `routed` to the task that
+- **Resolution.** Whoever owns an item (or the user) resolves it; an agent that resolves an
+  open item nobody owns claims it in the same step. It is `routed` to the task that
   does the work (on any board), `duplicate` of an earlier item, `forwarded` elsewhere,
   `declined` with a reason, or `fixed` when the resolver fixed the cause itself, saying what
   changed. A declined item stays live, so repeat reports keep counting against the
