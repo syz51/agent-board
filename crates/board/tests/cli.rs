@@ -3376,9 +3376,32 @@ fn status_and_asks_list_a_bounded_number_by_default() {
         ),
         "{text}"
     );
+    // The limit goes to the server, with one ask more to learn that the list was cut.
+    let sent = e.stub.requests_to("GET /v1/asks");
+    assert_eq!(sent.last().unwrap().query_pairs()["limit"], "51");
     let json: Value =
         serde_json::from_str(&stdout(&e.run(&["asks", "--status", "all", "--json"]))).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 50);
+    // A server that cuts the list sends one ask over the limit: more match, uncounted.
+    e.stub.on("GET /v1/asks", &asks[..4]);
+    let text = stdout(&e.run(&["asks", "--status", "all", "--limit", "3"]));
+    assert!(
+        text.starts_with("ask #58 ") && !text.contains("ask #57 "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "listed the newest 3; older ones match: narrow it with --status or --board, or raise --limit\n"
+        ),
+        "{text}"
+    );
+    let sent = e.stub.requests_to("GET /v1/asks");
+    assert_eq!(sent.last().unwrap().query_pairs()["limit"], "4");
+    e.stub.on("GET /v1/asks", &asks);
+    // The probe stays within the server's u32.
+    e.run(&["asks", "--limit", "4294967295"]);
+    let sent = e.stub.requests_to("GET /v1/asks");
+    assert_eq!(sent.last().unwrap().query_pairs()["limit"], "4294967295");
     let text = stdout(&e.run(&["asks", "--status", "all", "--limit", "100"]));
     assert!(
         text.starts_with("ask #1 ") && !text.contains("listed the newest"),

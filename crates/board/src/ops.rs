@@ -21,6 +21,7 @@ use crate::config::{Config, Home, load_token};
 use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
 use crate::render;
+use crate::state::{Filed, FiledMark};
 use crate::t3::T3;
 
 /// How an agent other than the environment's own was named, which decides how the
@@ -698,6 +699,16 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             claim: new.claim,
         })
         .await?;
+    // For the Stop hook, which does not remind an agent that filed follow-ups to file them
+    // (`hook::done_reminder`). The task exists either way, so a failed write costs only that.
+    let kind = if task.is_pending_proposal() {
+        Some(Filed::Proposal)
+    } else {
+        task.parent.as_ref().map(|_| Filed::SubTask)
+    };
+    if let Some(kind) = kind {
+        record_filed(ctx, task.id.as_str(), kind, task.parent.clone());
+    }
     if !new.claim {
         let mut text = format!("added {}", render::task_line(&task));
         if task.is_pending_proposal() {
@@ -894,6 +905,21 @@ pub async fn task_done(
     Ok(Output::new(text, &task))
 }
 
+/// Leaves a mark of what the agent filed for its next `Stop` hook; see [`task_add`].
+fn record_filed(ctx: &Ctx, name: &str, kind: Filed, about: Option<TaskId>) {
+    let mark = FiledMark {
+        kind,
+        about,
+        at: chrono::Utc::now(),
+    };
+    let recorded = ctx
+        .agent()
+        .and_then(|agent| crate::state::record_filed(&ctx.home, agent, name, &mark));
+    if let Err(err) = recorded {
+        tracing::warn!("recording {name} filed for the Stop hook: {err:#}");
+    }
+}
+
 pub async fn task_note(ctx: &Ctx, id: &TaskId, kind: NoteKind, text: String) -> Result<Output> {
     let note = ctx
         .client
@@ -1028,6 +1054,12 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         })
         .await?;
     let created = &answer.ask;
+    record_filed(
+        ctx,
+        &format!("ask-{}", created.id),
+        Filed::Ask,
+        created.task.clone(),
+    );
     let mut text = format!(
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
         render::ask_line(created)
@@ -1038,7 +1070,11 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
     }
     if let Some(task) = &created.task {
         // Advisory: the ask is made either way, so a failed check is reported, not raised.
-        match ctx.client.asks(Some("open"), Some(&created.board)).await {
+        match ctx
+            .client
+            .asks(Some("open"), Some(&created.board), None)
+            .await
+        {
             Ok(open) => {
                 let others: Vec<_> = open
                     .iter()
@@ -1091,20 +1127,31 @@ pub async fn asks(
     board: Option<&BoardSlug>,
     limit: Option<usize>,
 ) -> Result<Output> {
-    let mut asks = ctx.client.asks(status, board).await?;
-    // Newest last, whatever order the server sends.
-    asks.sort_by_key(|a| a.id);
     // Every open ask waits on the user, the oldest the longest, so none is left out unless
     // the caller asks. The answered and withdrawn ones grow without end.
     let limit = limit.or((status != Some("open")).then_some(ASKS_LIMIT_DEFAULT));
+    // The server cuts the list at its limit without saying so: ask for one ask more, so
+    // the text can say that the list was cut. The server reads the limit as a u32.
+    let probe = limit.map(|limit| limit.saturating_add(1).min(u32::MAX as usize));
+    let mut asks = ctx.client.asks(status, board, probe).await?;
+    // Newest last, whatever order the server sends.
+    asks.sort_by_key(|a| a.id);
     let more = limit.map_or(0, |limit| asks.len().saturating_sub(limit));
     asks.drain(..more);
     let mut text = render::ask_list(&asks);
     if let Some(limit) = limit
         && more > 0
     {
+        // One ask over the limit is all a server that cuts the list sends, so it gives no
+        // count; one that predates the limit sends every ask, which gives the count when
+        // more than one is over.
+        let older = if more == 1 {
+            "older ones match".to_owned()
+        } else {
+            format!("{more} older match")
+        };
         text.push_str(&format!(
-            "\nlisted the newest {limit}; {more} older match: narrow it with --status or --board, or raise --limit"
+            "\nlisted the newest {limit}; {older}: narrow it with --status or --board, or raise --limit"
         ));
     }
     Ok(Output::new(text, &asks))
@@ -1583,7 +1630,7 @@ pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
     ))
 }
 
-/// Resolves a feedback item you own (or as the user): it moves to done.
+/// Resolves a feedback item you own or an open one nobody owns (or as the user): it moves to done.
 pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Output> {
     let task = ctx.client.resolve_feedback(id, &req).await?;
     Ok(Output::new(render::task_line(&task), &task))

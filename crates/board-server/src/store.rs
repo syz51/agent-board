@@ -803,6 +803,26 @@ pub(crate) fn load_asks(cx: &Ctx<'_>, filter: &str, extra: &NamedParams<'_>) -> 
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// The newest `limit` asks that pass `filter`, oldest first like [`load_asks`].
+pub(crate) fn load_newest_asks(
+    cx: &Ctx<'_>,
+    filter: &str,
+    extra: &NamedParams<'_>,
+    limit: u32,
+) -> Result<Vec<Ask>> {
+    let mut params = extra.clone();
+    params.push((":limit", &limit));
+    let mut asks = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {ASK_COLUMNS} FROM asks WHERE {filter} ORDER BY id DESC LIMIT :limit"
+        ))?
+        .query_map(params.as_slice(), ask_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    asks.reverse();
+    Ok(asks)
+}
+
 pub(crate) fn get_ask(cx: &Ctx<'_>, id: i64) -> Result<Ask> {
     load_asks(cx, "id = :id", &vec![(":id", &id)])?
         .into_iter()

@@ -121,6 +121,46 @@ async fn only_the_asker_withdraws_an_open_ask() {
 }
 
 #[tokio::test]
+async fn a_limit_lists_the_newest_asks_oldest_first() {
+    let t = T::new();
+    let ids = [
+        ask(&t, "first").await,
+        ask(&t, "second").await,
+        ask(&t, "third").await,
+    ];
+    t.board("other", &[]).await;
+    let listed = |path: &'static str| async {
+        let asks = t.ok("GET", path, None, None).await;
+        let asks: Vec<i64> = asks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect();
+        asks
+    };
+    // Without a limit every ask is listed, as before.
+    assert_eq!(listed("/v1/asks").await, ids);
+    assert_eq!(listed("/v1/asks?limit=2").await, ids[1..]);
+    assert_eq!(listed("/v1/asks?limit=3").await, ids);
+    assert_eq!(listed("/v1/asks?limit=9").await, ids);
+    // A limit of 0 reads as 1.
+    assert_eq!(listed("/v1/asks?limit=0").await, ids[2..]);
+    // The limit counts the asks that pass the filters.
+    let path = format!("/v1/asks/{}/withdraw", ids[2]);
+    t.ok("POST", &path, Some(A), Some(json!({ "agent": A })))
+        .await;
+    assert_eq!(listed("/v1/asks?status=open&limit=1").await, ids[1..2]);
+    assert_eq!(
+        listed("/v1/asks?status=open&board=factory&limit=5").await,
+        ids[..2]
+    );
+    assert_eq!(listed("/v1/asks?board=other&limit=5").await, [0i64; 0]);
+    let (status, code, _) = t.fail("GET", "/v1/asks?limit=x", None, None).await;
+    assert_eq!((status, code.as_str()), (400, "invalid"));
+}
+
+#[tokio::test]
 async fn ask_fields_are_validated() {
     let t = T::new();
     ask(&t, "first").await;

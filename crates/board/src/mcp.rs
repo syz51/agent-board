@@ -640,7 +640,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "feedback_resolve",
-        description: "Resolve a feedback item you own (claim it first): routed to the task doing the work, duplicate of an earlier item that still takes reports (never a closed one), forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
+        description: "Resolve a feedback item you own or nobody owns: routed to the task doing the work, duplicate of an earlier item that still takes reports (never a closed one), forwarded elsewhere, declined, or fixed by you directly, with a reason for the last three. It moves to done.",
         params: || {
             vec![
                 ("id", task_arg("The feedback item."), true),

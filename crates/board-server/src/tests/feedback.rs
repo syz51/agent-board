@@ -719,10 +719,11 @@ async fn resolve_is_for_the_owner_or_the_user() {
     let path = format!("/v1/feedback/{item}/resolve");
     let declined = json!({ "kind": "declined", "reason": "works as designed" });
 
-    // Unowned: an agent must claim first.
-    let (code, err, v) = t.fail("POST", &path, Some(B), Some(declined.clone())).await;
-    assert_eq!((code, err.as_str()), (403, "forbidden"));
-    assert!(v["next"].as_str().unwrap().contains("task_claim"), "{v}");
+    // Unowned: a caller with no agent id is still refused, and claims nothing.
+    let (code, _, v) = t.fail("POST", &path, None, Some(declined.clone())).await;
+    assert_eq!(code, 400, "{v}");
+    assert!(v["next"].as_str().unwrap().contains("X-Board-Agent"), "{v}");
+    assert_eq!(t.get_task(&item).await["status"], "open");
     assert!(t.claim(A, &item).await.0.is_success());
     let (code, err, v) = t.fail("POST", &path, Some(B), Some(declined.clone())).await;
     assert_eq!((code, err.as_str()), (403, "forbidden"));
@@ -816,6 +817,100 @@ async fn resolve_is_for_the_owner_or_the_user() {
         )
         .await;
     assert_eq!(code, 400);
+}
+
+#[tokio::test]
+async fn resolving_an_unowned_item_claims_it_for_the_caller() {
+    let t = setup().await;
+    let item = report(
+        &t,
+        A,
+        json!({ "about": "hooks", "text": "Stop hook hangs" }),
+    )
+    .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The caller's own task in doing does not block the claim: the item closes at once.
+    t.board("factory", &[]).await;
+    let mine = t.task(B, "factory", "Own work").await;
+    assert!(t.claim(B, &mine).await.0.is_success());
+
+    // A resolve refused after the claim leaves the item open and unowned.
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &item,
+        json!({ "kind": "routed", "task": "nowhere-4" }),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    let task = t.get_task(&item).await;
+    assert_eq!(
+        (&task["status"], &task["owner"]),
+        (&json!("open"), &Value::Null)
+    );
+
+    // An item task_claim would refuse (here: an open blocker) is refused too.
+    let (s, v) = t.patch(A, &item, json!({ "blockers": [mine] })).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &item,
+        json!({ "kind": "declined", "reason": "x" }),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("waits on"), "{v}");
+    let (s, v) = t.patch(A, &item, json!({ "blockers": [] })).await;
+    assert!(s.is_success(), "{v}");
+
+    let (s, done) = resolve(
+        &t,
+        Some(B),
+        &item,
+        json!({ "kind": "declined", "reason": "works as designed" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{done}");
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["owner"], B);
+    assert_eq!(done["feedback"]["resolution"]["by"], B);
+    let detail = t.ok("GET", &format!("/v1/tasks/{item}"), None, None).await;
+    let types: Vec<&str> = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "task_claimed" || e["type"] == "task_done")
+        .map(|e| {
+            assert_eq!(e["actor"], B, "{e}");
+            e["type"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(types, ["task_claimed", "task_done"], "{detail}");
+
+    // An item another live agent owns stays refused.
+    let other = report(
+        &t,
+        A,
+        json!({ "about": "hooks", "text": "Start hook is slow" }),
+    )
+    .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(C, &other).await.0.is_success());
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            &format!("/v1/feedback/{other}/resolve"),
+            Some(B),
+            Some(json!({ "kind": "declined", "reason": "no" })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"));
+    assert!(v["message"].as_str().unwrap().contains(C), "{v}");
 }
 
 #[tokio::test]
