@@ -268,7 +268,8 @@ fn snapshot_reading(text: &str, now: Timestamp) -> Option<ReportUsage> {
 /// Whether `snapshot` can follow `known`, the newest reading the daemon has. T3 Code can
 /// date an old reading anew, and within one window the usage only rises. So a snapshot
 /// follows `known` when it has each window `known` has, and each is at least as high as
-/// in `known` or belongs to a later window.
+/// in `known` or belongs to a later window: its reset time is later, or it has none and
+/// the known window has ended.
 pub fn follows(snapshot: &ReportUsage, known: &Usage) -> bool {
     let window = |new: &Option<UsageWindow>, old: &Option<UsageWindow>| match (new, old) {
         (_, None) => true,
@@ -276,9 +277,9 @@ pub fn follows(snapshot: &ReportUsage, known: &Usage) -> bool {
         (Some(new), Some(old)) => {
             // T3 Code may round the percent.
             new.percent >= old.percent.floor()
-                || old.resets_at.is_some_and(|ended| {
-                    ended <= snapshot.read_at
-                        || new.resets_at.is_some_and(|at| at > ended + RESET_MOVED)
+                || old.resets_at.is_some_and(|ended| match new.resets_at {
+                    Some(at) => at > ended + RESET_MOVED,
+                    None => ended <= snapshot.read_at,
                 })
         }
     };
@@ -421,6 +422,13 @@ mod tests {
             "2026-11-11T14:21:00Z",
         );
         assert!(follows(&ended, &known));
+        // The old window's reading dated after its end is still the old reading.
+        let late = snapshot(
+            window(38.0, "2026-11-11T14:20:00.312Z"),
+            week(),
+            "2026-11-11T14:21:00Z",
+        );
+        assert!(!follows(&late, &known));
         // A window missing: reporting it would drop that window's hold.
         assert!(!follows(&snapshot(None, week(), later), &known));
         // Nothing known for a window: any snapshot follows.

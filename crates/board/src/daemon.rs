@@ -1529,6 +1529,8 @@ pub struct Daemon<T: T3> {
     usage_refused: Option<Timestamp>,
     /// When the endpoint may be read again, after a refusal that said how long to wait.
     usage_retry_at: Option<Timestamp>,
+    /// The date of the newest reading taken from T3 Code's file.
+    usage_snapshot_at: Option<Timestamp>,
     /// Whether this device's dispatch agent is registered since the daemon started.
     dispatch_registered: bool,
     /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
@@ -1561,6 +1563,7 @@ impl<T: T3> Daemon<T> {
             usage_polled: None,
             usage_refused: None,
             usage_retry_at: None,
+            usage_snapshot_at: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
         }
@@ -4684,9 +4687,12 @@ impl<T: T3> Daemon<T> {
             } else {
                 every
             };
+            let waited = self.usage_polled.is_none_or(|at| now - at >= wait);
             let due = match self.usage_retry_at {
-                Some(at) => now >= at,
-                None => self.usage_polled.is_none_or(|at| now - at >= wait),
+                // The endpoint's own wait replaces the usual one, but a reading that
+                // stands in still saves the call.
+                Some(at) => now >= at && (snapshot.is_none() || waited),
+                None => waited,
             };
             if due {
                 self.usage_polled = Some(now);
@@ -4708,10 +4714,17 @@ impl<T: T3> Daemon<T> {
                     }
                 }
             }
-            // The endpoint's reading is the newer one; T3 Code's is news only once.
-            reading = reading.or_else(|| {
-                snapshot.filter(|s| self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at))
-            });
+            // The endpoint's reading is the newer one; T3 Code's is news only once, also
+            // when its report fails and the server's older reading comes back.
+            if reading.is_none()
+                && let Some(snapshot) = snapshot.filter(|s| {
+                    self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                        && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+                })
+            {
+                self.usage_snapshot_at = Some(snapshot.read_at);
+                reading = Some(snapshot);
+            }
         }
         let mut reported = None;
         if let Some(report) = reading {

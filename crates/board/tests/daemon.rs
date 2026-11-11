@@ -7960,13 +7960,16 @@ async fn a_t3_snapshot_with_an_old_reading_under_a_new_date_is_not_taken() {
     assert!(!e.daemon.state.usage_held.contains(&factory()));
 }
 
-#[tokio::test]
-async fn a_refused_usage_reading_is_tried_again_when_the_endpoint_says() {
-    use board::daemon::{USAGE_POLL_NEAR, USAGE_RETRY_MAX};
+/// A usage endpoint that answers 429 with `Retry-After` (the stub sends no headers of
+/// its own): its URL, the requests it got and the seconds it tells callers to wait.
+async fn refusing_usage_endpoint() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // The stub sends no headers of its own: an endpoint that answers 429 with Retry-After.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/api/oauth/usage", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
@@ -7992,7 +7995,15 @@ async fn a_refused_usage_reading_is_tried_again_when_the_endpoint_says() {
             socket.write_all(answer.as_bytes()).await.unwrap();
         }
     });
+    (url, hits, retry_after)
+}
 
+#[tokio::test]
+async fn a_refused_usage_reading_is_tried_again_when_the_endpoint_says() {
+    use board::daemon::{USAGE_POLL_NEAR, USAGE_RETRY_MAX};
+    use std::sync::atomic::Ordering;
+
+    let (url, hits, retry_after) = refusing_usage_endpoint().await;
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     let snapshot = usage_source_with_snapshot(&mut e, url);
     e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
@@ -8028,6 +8039,78 @@ async fn a_refused_usage_reading_is_tried_again_when_the_endpoint_says() {
 
     e.daemon.reconcile(again + USAGE_RETRY_MAX).await.unwrap();
     assert_eq!(hits(), 3);
+}
+
+#[tokio::test]
+async fn a_t3_snapshot_stands_in_after_a_refusal_and_is_reported_once_when_the_report_fails() {
+    use board::daemon::USAGE_CHECK_EVERY;
+    use std::sync::atomic::Ordering;
+
+    let (url, hits, _) = refusing_usage_endpoint().await;
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let snapshot = usage_source_with_snapshot(&mut e, url);
+    let hits = || hits.load(Ordering::SeqCst);
+    let reports = |e: &Env| e.stub.requests_to("PUT /v1/usage").len();
+    let minutes = chrono::Duration::minutes;
+    let resets = at() + chrono::Duration::days(2);
+
+    // The first endpoint reading is refused for 2 minutes; T3 Code's is reported.
+    write_snapshot(&snapshot, 50.0, resets, at());
+    e.stub.on("PUT /v1/usage", usage_reading(50.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!((hits(), reports(&e)), (1, 1));
+
+    // The 2 minutes passed, but T3 Code's reading stands in: no endpoint call.
+    let t = at() + minutes(2);
+    write_snapshot(&snapshot, 51.0, resets, t);
+    e.stub.on("PUT /v1/usage", usage_reading(51.0, t));
+    e.daemon.reconcile(t).await.unwrap();
+    assert_eq!((hits(), reports(&e)), (1, 2));
+
+    // A report that fails is not sent again each reconcile, though the server's older
+    // reading comes back.
+    let failed = at() + minutes(3);
+    write_snapshot(&snapshot, 52.0, resets, failed);
+    e.stub
+        .on_status("PUT /v1/usage", 500, json!({}))
+        .on("GET /v1/usage", usage_reading(51.0, t));
+    e.daemon.reconcile(failed).await.unwrap();
+    assert_eq!((hits(), reports(&e)), (1, 3));
+    e.daemon
+        .reconcile(failed + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    e.daemon.reconcile(failed + minutes(1)).await.unwrap();
+    assert_eq!((hits(), reports(&e)), (1, 3));
+
+    // The check of the endpoint still comes.
+    let check = at() + USAGE_CHECK_EVERY;
+    write_snapshot(&snapshot, 53.0, resets, check);
+    e.daemon.reconcile(check).await.unwrap();
+    assert_eq!(hits(), 2);
+}
+
+#[tokio::test]
+async fn near_a_pace_line_the_endpoint_is_read_every_minute_despite_a_t3_snapshot() {
+    use board::daemon::USAGE_POLL_NEAR;
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let url = format!("{}/api/oauth/usage", e.stub.url);
+    let snapshot = usage_source_with_snapshot(&mut e, url);
+    let reads = |e: &Env| e.stub.requests_to("GET /api/oauth/usage").len();
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 70.0, "resets_at": null } }),
+    );
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(reads(&e), 1);
+
+    let t = at() + USAGE_POLL_NEAR;
+    write_snapshot(&snapshot, 70.0, t + chrono::Duration::days(2), t);
+    e.stub.on("PUT /v1/usage", paced_reading(78.5, t));
+    e.daemon.reconcile(t).await.unwrap();
+    assert_eq!(reads(&e), 2);
 }
 
 // Daemon dispatch: judges, merging and finishing.

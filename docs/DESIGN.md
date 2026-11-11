@@ -374,8 +374,8 @@ high for it. There is no total cap.
   logged. An answer with neither window is an error, not an empty reading. The daemon
   reports each window's percent and reset time (`PUT /v1/usage`); when the report fails,
   it acts on its own reading. The server keeps one reading for the account, the newest by
-  read time, with the device that sent it. Between its own readings, each reconcile takes
-  the server's newest (`GET /v1/usage`). The usage is read after the reconcile's thread
+  read time, with the device that sent it. Between its own readings and reports, each
+  reconcile takes the server's newest (`GET /v1/usage`). The usage is read after the reconcile's thread
   checks, so a slow read never delays them.
 - **T3 Code's reading**: T3 Code reads the same endpoint for the same account, and the
   endpoint refuses readers that ask too often (HTTP 429). So each reconcile first reads
@@ -388,12 +388,14 @@ high for it. There is no total cap.
   The file is T3 Code's own format: a missing file, a reading marked unavailable or any
   other shape is no reading, and the daemon reads the endpoint as without it. T3 Code can
   date an old reading anew. Within one window the usage only rises, so a file reading is
-  not taken when it lacks a window the known reading has, or a window is lower without a
-  later reset time and before the known reset time. Nothing else of the file is read, and
-  nothing of it is logged.
+  not taken when it lacks a window the known reading has, or a window is lower than the
+  known one and its reset time is not later (with no reset time: while the known window
+  has not ended). A file reading is reported once, also when the report fails. Nothing
+  else of the file is read, and nothing of it is logged.
 - **Refusals**: after a 429 the daemon reads the endpoint again when the answer's
-  `Retry-After` says, kept between 1 and 10 minutes; without one, after the usual 5
-  minutes. For 30 minutes after a 429 it does not read every minute near a pace line.
+  `Retry-After` says, kept between 1 and 10 minutes; without one, after the usual time.
+  While T3 Code's reading stands in, the 15-minute check still applies. For 30 minutes
+  after a 429 it does not read every minute near a pace line.
 - **Setting**: each board has `usage_stop_at`, a percent from 1 to 100, default 90. Only
   the user may raise it; anyone may lower it. A lower stop makes a board give way first,
   so the user ranks boards by it.
@@ -445,8 +447,9 @@ high for it. There is no total cap.
     report fails, it keeps the server's last pace with its own reading. It reads the
     usage every minute while the use is below the lower line (the day's or the hard
     line) and it or the projection is within 2 points of it, otherwise every 5 minutes.
-    After the usage endpoint refuses a read (HTTP 429), it reads every 5 minutes for 30
-    minutes.
+    For 30 minutes after the usage endpoint refuses a read (HTTP 429), it does not read
+    every minute. T3 Code's reading and the endpoint's `Retry-After` change these times
+    as Usage says.
   - The Telegram stalled alert skips a board the usage stops (over, or a pace of 0).
 - `board usage` prints the reading, the boards it holds, paused ones included, and the
   pace: the reserve, the day's line and allowance, the projection, the next day's start
