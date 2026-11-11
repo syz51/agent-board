@@ -611,6 +611,7 @@ pub fn snapshot_fixture(kind: SnapshotKind, text: &str, seq: i64) -> Snapshot {
         held_by: Vec::new(),
         held_since: None,
         held_for_usage: false,
+        stood_down: Vec::new(),
     }
 }
 

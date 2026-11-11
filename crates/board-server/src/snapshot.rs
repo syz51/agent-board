@@ -12,8 +12,8 @@ use std::sync::LazyLock;
 
 use board_proto::{
     Agent, AgentId, AgentSource, AgentState, BoardSlug, BoardStatus, Dispatch, Event, EventType,
-    Runtime, Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus,
-    Timestamp,
+    Runtime, Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, StoodDownHold, Task, TaskId,
+    TaskStatus, Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -99,6 +99,13 @@ struct Model {
     /// The paused boards that hold this agent ([`held_by`]); never cut.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hold: Vec<String>,
+    /// The boards of `hold` that hold this agent as paused or over the usage line.
+    #[serde(skip)]
+    paused: Vec<String>,
+    /// The boards of `hold` that hold this agent as a stood-down coordinator, with why;
+    /// never cut.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stood_down: Vec<StoodDownHold>,
     /// Set when the hold is the weekly usage at the hard line: why, in words.
     #[serde(skip_serializing_if = "Option::is_none")]
     hold_usage: Option<String>,
@@ -322,8 +329,13 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // The usage is the Claude account's, so its hold and lines reach only Claude agents.
     let latest = crate::ops::usage::latest(cx)?.filter(|_| agent.runtime == Runtime::Claude);
     let hard = latest.as_ref().and_then(|u| u.hard_since(cx.now));
-    let (held, held_since) = held_by(cx, &agent.id, hard)?;
-    let hold_usage = (hard.is_some() && !held.is_empty())
+    let Hold {
+        boards: held,
+        since: held_since,
+        paused,
+        stood_down,
+    } = held_by(cx, &agent.id, hard)?;
+    let hold_usage = (hard.is_some() && !paused.is_empty())
         .then(|| latest.as_ref().and_then(hard_reason))
         .flatten();
     let usage = match (&board, &latest) {
@@ -338,6 +350,8 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
         board: board.as_ref().map(|b| b.to_string()),
         seq,
         hold: held.iter().map(ToString::to_string).collect(),
+        paused: paused.iter().map(ToString::to_string).collect(),
+        stood_down: stood_down.clone(),
         hold_usage: hold_usage.clone(),
         // Alerts snapshots come with tool calls and have the smallest cap, so the line goes
         // only into full snapshots and, while over, into the deltas at each prompt.
@@ -409,6 +423,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             held_by: held,
             held_since,
             held_for_usage: hold_usage.is_some(),
+            stood_down,
         },
         agent: agent.id,
         shown,
@@ -609,6 +624,11 @@ const USAGE_HOLD_ACTION: &str = hold_action!("the weekly usage reached the user'
 /// What the `hold:` line tells a held agent to do.
 const HOLD_ACTION: &str = hold_action!("the user paused this work.");
 
+/// What the `hold:` line tells a stood-down coordinator to do.
+const STAND_DOWN_ACTION: &str = hold_action!(
+    "this thread no longer coordinates the board: children already at work finish on their own."
+);
+
 /// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` active boards too, not
 /// only paused ones (the hard usage line), `?4` now: an active board's coordinator counts
 /// only while its lease runs. The agent and the T3 threads
@@ -625,13 +645,65 @@ const HELD_BY: &str = concat!(
      ORDER BY b.slug"
 );
 
-/// The paused boards `agent` works for: it, or a T3 thread that delegated it, coordinates
-/// the board or owns a task in `doing` on it. A board's pause holds its coordinator, the
-/// threads it started and those working its tasks, and no one else. With them, when the
-/// latest of them was paused. Once the weekly usage reached the hard line at `hard`, it
-/// holds every active board the agent works for too, and the hold dates from the latest
-/// pause or `hard`, whichever came later: a new cause of a hold ends turns begun before it.
-fn held_by(
+/// The boards that hold `agent` (`?1`) as a stood-down coordinator, with when and why it
+/// stood down. A lease left live when the board stopped running the thread does not lift
+/// the hold: only a claim that names the thread, or keeps it named, does.
+const STOOD_DOWN: &str = "SELECT board, since, reason FROM stood_down WHERE agent = ?1 \
+     ORDER BY board";
+
+/// What holds an agent: the boards, when the latest hold began, and which of them hold it
+/// as a stood-down coordinator.
+struct Hold {
+    boards: Vec<BoardSlug>,
+    since: Option<Timestamp>,
+    /// The boards that hold it as paused, or over the usage line ([`paused_or_over`]).
+    paused: Vec<BoardSlug>,
+    stood_down: Vec<StoodDownHold>,
+}
+
+/// The boards that hold `agent`. A paused board holds those it works for: it, or a T3
+/// thread that delegated it, coordinates the board or owns a task in `doing` on it. A
+/// board's pause holds its coordinator, the threads it started and those working its
+/// tasks, and no one else. Once the weekly usage reached the hard line at `hard`, every
+/// active board the agent works for holds it too. A board that stood the agent down as its
+/// coordinator holds that thread alone, not the children it started, which finish their
+/// tasks. The hold dates from the latest pause, stand-down or `hard`: a new cause of a hold
+/// ends turns begun before it.
+fn held_by(cx: &Ctx<'_>, agent: &AgentId, hard: Option<Timestamp>) -> Result<Hold> {
+    let (boards, since) = paused_or_over(cx, agent, hard)?;
+    let stood: Vec<(BoardSlug, i64, String)> = cx
+        .db
+        .prepare_cached(STOOD_DOWN)?
+        .query_map([agent.as_str()], |r| {
+            Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let since = stood
+        .iter()
+        .map(|(_, at, _)| crate::db::ts(*at))
+        .chain(since)
+        .max();
+    let mut all = boards.clone();
+    all.extend(stood.iter().map(|(board, _, _)| board.clone()));
+    all.sort();
+    all.dedup();
+    Ok(Hold {
+        boards: all,
+        since,
+        // A board that also holds the agent as paused or over the usage line shows that
+        // hold alone, so `held_by` less `stood_down` is what holds it in other ways.
+        stood_down: stood
+            .into_iter()
+            .filter(|(board, _, _)| !boards.contains(board))
+            .map(|(board, _, reason)| StoodDownHold { board, reason })
+            .collect(),
+        paused: boards,
+    })
+}
+
+/// The paused boards `agent` works for, and once the usage reached the hard line, the
+/// active ones too ([`held_by`]), with when the latest hold began.
+fn paused_or_over(
     cx: &Ctx<'_>,
     agent: &AgentId,
     hard: Option<Timestamp>,
@@ -1971,19 +2043,26 @@ fn counts_line(c: &Counts) -> String {
 
 fn render_lines(m: &Model) -> String {
     let mut o = String::new();
-    if !m.hold.is_empty() {
+    if !m.paused.is_empty() {
         match &m.hold_usage {
             Some(why) => {
                 let _ = writeln!(
                     o,
                     "hold: {}: {why} -> {USAGE_HOLD_ACTION}",
-                    m.hold.join(", ")
+                    m.paused.join(", ")
                 );
             }
             None => {
-                let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.hold.join(", "));
+                let _ = writeln!(o, "hold: {} paused -> {HOLD_ACTION}", m.paused.join(", "));
             }
         }
+    }
+    for stood in &m.stood_down {
+        let _ = writeln!(
+            o,
+            "hold: {} stood down: {} -> {STAND_DOWN_ACTION}",
+            stood.board, stood.reason
+        );
     }
     if let Some(u) = &m.usage {
         let _ = writeln!(o, "usage: {}", usage_line(u));
@@ -2168,11 +2247,20 @@ fn render_yaml(m: &Model) -> String {
         if let Some(why) = &m.hold_usage {
             let _ = writeln!(o, "  usage: {}", q(why));
         }
-        let action = match m.hold_usage {
-            Some(_) => USAGE_HOLD_ACTION,
-            None => HOLD_ACTION,
+        let action = match (&m.hold_usage, m.paused.is_empty()) {
+            (Some(_), _) => USAGE_HOLD_ACTION,
+            (None, false) => HOLD_ACTION,
+            (None, true) => STAND_DOWN_ACTION,
         };
         let _ = writeln!(o, "  action: {}", q(action));
+        if !m.stood_down.is_empty() {
+            o.push_str("  stood_down:\n");
+            for stood in &m.stood_down {
+                let _ = writeln!(o, "    - board: {}", q(stood.board.as_str()));
+                let _ = writeln!(o, "      reason: {}", q(&stood.reason));
+                let _ = writeln!(o, "      action: {}", q(STAND_DOWN_ACTION));
+            }
+        }
     }
     if let Some(u) = &m.usage {
         o.push_str("usage:\n");

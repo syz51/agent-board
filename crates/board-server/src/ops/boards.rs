@@ -1,6 +1,6 @@
 use board_proto::{
-    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType,
-    TaskId, UpdateBoard,
+    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, Dispatch,
+    EventType, TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -226,6 +226,26 @@ pub(crate) fn update(
     if let Some(status) = req.status.filter(|&s| s != before.status) {
         payload["status"] = serde_json::Value::from(enum_str(&status));
     }
+    // A board that stops running its coordinator thread holds that thread from now on.
+    let stands_down =
+        if req.status == Some(BoardStatus::Closed) && before.status != BoardStatus::Closed {
+            Some("the board is closed")
+        } else if req.dispatch == Some(Dispatch::Daemon) && before.dispatch != Dispatch::Daemon {
+            Some("the board is set to daemon dispatch")
+        } else if req.autopilot == Some(false) && before.autopilot {
+            Some("autopilot was switched off")
+        } else if let Some(homes) = &req.home_devices
+            && last_coordinator(cx, slug)?
+                .and_then(|(_, device)| device)
+                .is_some_and(|device| !homes.iter().any(|home| home.as_str() == device))
+        {
+            Some("its device is no longer one of the board's home devices")
+        } else {
+            None
+        };
+    if let Some(reason) = stands_down {
+        stand_down_last(cx, slug, reason)?;
+    }
     // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
     // only turns that began before it.
     cx.db.execute(
@@ -320,6 +340,7 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
         "DELETE FROM asks WHERE board = ?1".to_owned(),
         "DELETE FROM said WHERE board = ?1".to_owned(),
         "DELETE FROM judges WHERE board = ?1".to_owned(),
+        "DELETE FROM stood_down WHERE board = ?1".to_owned(),
         // Parents are on the same board, so no task elsewhere refers to these.
         "UPDATE tasks SET parent = NULL WHERE board = ?1".to_owned(),
         "INSERT OR REPLACE INTO deleted_boards (slug, next_number) \
@@ -542,6 +563,33 @@ fn coordinator_lease(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Lease> {
         .ok_or_else(|| board_missing(slug))
 }
 
+/// The thread `slug` last named coordinator, with its device: kept after the lease ends.
+fn last_coordinator(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<(String, Option<String>)>> {
+    let row: Option<(Option<String>, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT last_coordinator, last_coordinator_device FROM boards WHERE slug = ?1",
+            [slug.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(agent, device)| agent.map(|agent| (agent, device))))
+}
+
+/// Stands down the thread `slug` last named coordinator, for `reason`: the snapshot holds
+/// it ([`crate::snapshot`]'s `held_by`) until a claim names it coordinator again. A thread
+/// already stood down keeps its first time and reason.
+fn stand_down_last(cx: &Ctx<'_>, slug: &BoardSlug, reason: &str) -> Result<()> {
+    cx.db.execute(
+        "INSERT INTO stood_down (board, agent, since, reason) \
+         SELECT slug, last_coordinator, ?2, ?3 FROM boards \
+         WHERE slug = ?1 AND last_coordinator IS NOT NULL \
+         ON CONFLICT (board, agent) DO NOTHING",
+        params![slug.as_str(), cx.now_ms(), reason],
+    )?;
+    Ok(())
+}
+
 /// Takes or renews the coordinator lease for `req.device`; `req.agent`, once the thread
 /// exists, names the coordinator.
 pub(crate) fn claim_coordinator(
@@ -614,6 +662,36 @@ pub(crate) fn claim_coordinator(
         (None, true) => lease.agent.clone(),
         (None, false) => None,
     };
+    // A thread the claim names coordinator, or keeps named, is no longer stood down, and
+    // the thread it replaces is. The daemon's dispatch agent is not a thread: a switch to
+    // daemon dispatch already stood the last thread down. A claim on a board that runs no
+    // coordinator thread on this device changes neither: a daemon that has not yet seen
+    // the switch to daemon dispatch, or that its device is no longer a home, still renews.
+    let runs_thread: bool = cx.db.query_row(
+        "SELECT dispatch = 'thread' \
+                AND EXISTS (SELECT 1 FROM json_each(home_devices) WHERE value = ?2) \
+         FROM boards WHERE slug = ?1",
+        params![slug.as_str(), req.device.as_str()],
+        |r| r.get(0),
+    )?;
+    if let Some(agent) = agent
+        .as_deref()
+        .filter(|a| runs_thread && !a.starts_with("dispatch:"))
+    {
+        if let Some((last, _)) = last_coordinator(cx, slug)?
+            && last != agent
+        {
+            stand_down_last(cx, slug, "another thread coordinates the board now")?;
+        }
+        cx.db.execute(
+            "DELETE FROM stood_down WHERE board = ?1 AND agent = ?2",
+            params![slug.as_str(), agent],
+        )?;
+        cx.db.execute(
+            "UPDATE boards SET last_coordinator = ?2, last_coordinator_device = ?3 WHERE slug = ?1",
+            params![slug.as_str(), agent, req.device.as_str()],
+        )?;
+    }
     cx.db.execute(
         "UPDATE boards SET coordinator = ?2, coordinator_device = ?3, coordinator_expires_at = ?4 \
          WHERE slug = ?1",

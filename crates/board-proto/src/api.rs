@@ -736,6 +736,19 @@ pub struct Snapshot {
     /// the line was reached. Absent otherwise, and from servers that predate it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held_for_usage: bool,
+    /// The boards in `held_by` that hold this agent as a stood-down coordinator: it last
+    /// coordinated them, and they no longer run it (docs/DESIGN.md, "Standing down a
+    /// coordinator"). Empty, and absent from servers that predate it, otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stood_down: Vec<StoodDownHold>,
+}
+
+/// A board that holds a stood-down coordinator, and why it stood down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoodDownHold {
+    pub board: BoardSlug,
+    /// Such as "autopilot was switched off".
+    pub reason: String,
 }
 
 /// What ends the alert line (`! <alert> -> <action>`) of a peer's edit that overlaps the

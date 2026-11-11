@@ -3493,6 +3493,17 @@ impl<T: T3> Daemon<T> {
         };
         self.last_checks
             .insert(thread.clone(), (LastCheck::Live(live.folder), now));
+        // Named before the message: the server holds a stood-down thread until a claim
+        // names it coordinator again, and the hold would tell it to ignore the message.
+        match self.claim(slug, Some(&stood.coordinator.agent)).await {
+            Ok(updated) => {
+                self.boards.insert(slug.clone(), updated);
+            }
+            Err(err) => {
+                self.release(slug).await;
+                return Err(err.context(format!("naming thread {thread} coordinator of {slug}")));
+            }
+        }
         // Marked on disk before the send: a start cut short or a daemon killed after it
         // does not send the message again.
         if !stood.resuming {

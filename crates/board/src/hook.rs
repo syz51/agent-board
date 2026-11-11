@@ -594,29 +594,26 @@ fn launched_subagent(input: &Value) -> Option<&str> {
     response["agentId"].as_str().filter(|s| !s.is_empty())
 }
 
-/// `text` with its `hold:` line replaced by one for a subagent the hold lets work on; the
-/// line goes first when the server's text has none the hook recognizes.
-fn subagent_hold(text: &str, boards: &[board_proto::BoardSlug], for_usage: bool) -> String {
-    let why = if for_usage {
-        "held: the weekly usage reached the user's reserve"
-    } else {
-        "paused"
-    };
+/// `text` with its `hold:` lines replaced by one for a subagent the hold lets work on, which
+/// names the hold's `cause` ([`hold_cause`]); the line goes first when the server's text has
+/// none the hook recognizes.
+fn subagent_hold(text: &str, cause: &str) -> String {
     let line = format!(
-        "hold: {} {why} -> the turn that launched you began while held and went on, which the \
+        "hold: {cause} -> the turn that launched you began while held and went on, which the \
          hold allows only for the user's own request: finish your task, and start no other \
-         task, child thread or wake-up.",
-        board_names(boards)
+         task, child thread or wake-up."
     );
     let mut replaced = false;
     let lines: Vec<&str> = text
         .split('\n')
-        .map(|l| {
-            if l.starts_with("hold: ") {
-                replaced = true;
-                line.as_str()
+        .filter_map(|l| {
+            if !l.starts_with("hold: ") {
+                Some(l)
+            } else if replaced {
+                None
             } else {
-                l
+                replaced = true;
+                Some(line.as_str())
             }
         })
         .collect();
@@ -678,20 +675,80 @@ fn is_pull_request_update(input: &Value) -> bool {
         .is_some_and(|p| p.starts_with(PULL_REQUEST_UPDATE))
 }
 
-/// What the user sees when the hold stops a held agent's turn: a pause, or the weekly
-/// usage at the reserve (`Snapshot::held_for_usage`).
-fn halt_reason(snap: &Snapshot) -> String {
-    if snap.held_for_usage {
-        return format!(
-            "board: the weekly usage reached your reserve, so this turn for {} stopped. \
-             `board usage` shows it; `board usage --reserve` changes it.",
-            board_names(&snap.held_by)
-        );
+/// The held boards of `snap` that hold the agent as paused, not only as a stood-down
+/// coordinator.
+fn paused_boards(snap: &Snapshot) -> Vec<board_proto::BoardSlug> {
+    snap.held_by
+        .iter()
+        .filter(|board| !snap.stood_down.iter().any(|s| &s.board == *board))
+        .cloned()
+        .collect()
+}
+
+/// The boards that stood the thread down as their coordinator, with why, in words.
+fn stood_down_cause(snap: &Snapshot) -> String {
+    snap.stood_down
+        .iter()
+        .map(|s| {
+            format!(
+                "{} stood this thread down as coordinator ({})",
+                s.board, s.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What holds the agent, in words: the paused boards, or the weekly usage at the reserve
+/// (`Snapshot::held_for_usage`), then the boards that stood the thread down as their
+/// coordinator (`Snapshot::stood_down`).
+fn hold_cause(snap: &Snapshot) -> String {
+    let paused = paused_boards(snap);
+    let mut parts = Vec::new();
+    if !paused.is_empty() {
+        let why = if snap.held_for_usage {
+            "held: the weekly usage reached the user's reserve"
+        } else {
+            "paused"
+        };
+        parts.push(format!("{} {why}", board_names(&paused)));
     }
-    format!(
-        "board: {} paused, so this turn stopped. `board resume` continues the work.",
-        board_names(&snap.held_by)
-    )
+    if !snap.stood_down.is_empty() {
+        parts.push(stood_down_cause(snap));
+    }
+    parts.join("; ")
+}
+
+/// What the user sees when the hold stops a held agent's turn: a pause or the weekly
+/// usage at the reserve (`Snapshot::held_for_usage`), and a stand-down.
+fn halt_reason(snap: &Snapshot) -> String {
+    let paused = paused_boards(snap);
+    let mut parts = Vec::new();
+    if !paused.is_empty() {
+        parts.push(if snap.held_for_usage {
+            format!(
+                "board: the weekly usage reached your reserve, so this turn for {} stopped. \
+                 `board usage` shows it; `board usage --reserve` changes it.",
+                board_names(&paused)
+            )
+        } else {
+            format!(
+                "board: {} paused, so this turn stopped. `board resume` continues the work.",
+                board_names(&paused)
+            )
+        });
+    }
+    if !snap.stood_down.is_empty() {
+        let stood = stood_down_cause(snap);
+        parts.push(if parts.is_empty() {
+            format!(
+                "board: {stood}, so this turn stopped. A message you send this thread still runs."
+            )
+        } else {
+            format!("Also {stood}; a message you send this thread still runs.")
+        });
+    }
+    parts.join(" ")
 }
 
 /// When the hook stops waiting for the server: [`BUDGET`] - [`MARGIN`] after it `started`,
@@ -1764,14 +1821,13 @@ impl Hook<'_> {
         if heartbeat_due(*beat, self.now) {
             *beat = Some(self.now);
             let snap = self.beat_and_fetch(SnapshotKind::Alerts).await?;
-            let boards = snap.held_by.clone();
-            let for_usage = snap.held_for_usage;
+            let cause = hold_cause(&snap);
             let reason = halt_reason(&snap);
             let mut alerts = self.keep(snap)?;
             if self.local.held && self.subagent_passes() {
                 // The subagent's turn holds no user message, so the hold line would stop
                 // the work its launching turn went on with.
-                alerts = subagent_hold(&alerts, &boards, for_usage);
+                alerts = subagent_hold(&alerts, &cause);
             } else if self.local.halted() {
                 // A turn that was running when its board was paused stops here, at every
                 // heartbeat until it ends: a runtime may not end it at the first (a
@@ -2895,31 +2951,100 @@ mod tests {
 
     #[test]
     fn a_passing_subagent_gets_its_own_hold_line_in_place_of_the_servers() {
-        let boards = ["factory".parse().unwrap()];
+        let paused = held_snapshot(&["factory"], &[]);
         let text = subagent_hold(
             "<board>\nhold: factory paused -> stop\nusage: 5h 8%\n</board>",
-            &boards,
-            false,
+            &hold_cause(&paused),
         );
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4, "{text}");
         assert!(lines[1].starts_with("hold: factory paused -> the turn that launched you"));
         assert!(!text.contains("-> stop"), "{text}");
         // A server text the hook does not recognize keeps its lines, after the hook's own.
-        let text = subagent_hold("<board>\nHOLD factory\n</board>", &boards, false);
+        let text = subagent_hold("<board>\nHOLD factory\n</board>", &hold_cause(&paused));
         assert!(
             text.starts_with("hold: factory paused -> the turn"),
             "{text}"
         );
         assert!(text.ends_with("<board>\nHOLD factory\n</board>"), "{text}");
+        let mut usage = paused.clone();
+        usage.held_for_usage = true;
         let text = subagent_hold(
             "<board>\nhold: factory: weekly usage\n</board>",
-            &boards,
-            true,
+            &hold_cause(&usage),
         );
         assert!(
             text.contains("hold: factory held: the weekly usage reached the user's reserve -> "),
             "{text}"
+        );
+        // A paused board and a stand-down give two server lines; the subagent gets one.
+        let both = held_snapshot(&["factory", "infra"], &["infra"]);
+        let text = subagent_hold(
+            "<board>\nhold: factory paused -> stop\nhold: infra stood down: x -> stop\n</board>",
+            &hold_cause(&both),
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("hold: ")).count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "hold: factory paused; infra stood this thread down as coordinator \
+                 (autopilot was switched off) -> the turn"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A snapshot that holds its agent on `held` boards, as stood-down coordinator on the
+    /// `stood_down` ones of them.
+    fn held_snapshot(held: &[&str], stood_down: &[&str]) -> Snapshot {
+        Snapshot {
+            kind: SnapshotKind::Delta,
+            text: String::new(),
+            seq: 1,
+            at: chrono::Utc::now(),
+            held_by: held.iter().map(|b| b.parse().unwrap()).collect(),
+            held_since: None,
+            held_for_usage: false,
+            stood_down: stood_down
+                .iter()
+                .map(|b| board_proto::StoodDownHold {
+                    board: b.parse().unwrap(),
+                    reason: "autopilot was switched off".to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_stood_down_coordinator_halts_with_its_reason() {
+        let text = halt_reason(&held_snapshot(&["factory"], &["factory"]));
+        assert_eq!(
+            text,
+            "board: factory stood this thread down as coordinator (autopilot was switched \
+             off), so this turn stopped. A message you send this thread still runs."
+        );
+        // A pause keeps its words.
+        assert_eq!(
+            halt_reason(&held_snapshot(&["factory"], &[])),
+            "board: factory paused, so this turn stopped. `board resume` continues the work."
+        );
+        // The usage holds only the boards that did not stand the thread down.
+        let mut both = held_snapshot(&["factory", "infra"], &["infra"]);
+        both.held_for_usage = true;
+        assert_eq!(
+            halt_reason(&both),
+            "board: the weekly usage reached your reserve, so this turn for factory stopped. \
+             `board usage` shows it; `board usage --reserve` changes it. Also infra stood this \
+             thread down as coordinator (autopilot was switched off); a message you send this \
+             thread still runs."
+        );
+        assert_eq!(
+            hold_cause(&both),
+            "factory held: the weekly usage reached the user's reserve; infra stood this \
+             thread down as coordinator (autopilot was switched off)"
         );
     }
 
@@ -2937,8 +3062,7 @@ mod tests {
         assert_eq!(subagent_alerts(quoted), "");
         assert_eq!(subagent_alerts(""), "");
         // With nothing left of the server's text, the subagent's own hold line stands alone.
-        let boards = ["factory".parse().unwrap()];
-        let line = subagent_hold("", &boards, false);
+        let line = subagent_hold("", &hold_cause(&held_snapshot(&["factory"], &[])));
         assert!(line.starts_with("hold: factory paused -> "), "{line}");
         assert!(!line.contains('\n'), "{line}");
     }

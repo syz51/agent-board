@@ -640,6 +640,33 @@ apart from the user's chats, such as environment variables.
   and the start's reason says so. The record goes once the board has a coordinator on
   this device again; a pending adoption of a live thread wins over it. Rejected: looking for any older
   `<board> coordinator` thread by title, since threads replaced long ago keep that title.
+
+  The message alone is not enough: a daemon that is down, too old, or has no record of
+  the thread (lost `watch.json`, or the change came before an upgrade) sends none, and
+  T3's wake-ups (a child's report, a pull request watch) then start turns that dispatch
+  again. So the server holds the thread too. It keeps the thread each board last named
+  coordinator (`boards.last_coordinator` and its device), also after the lease is released
+  or lapses. When the board stops running that thread (any cause above but another
+  device's lease, as seen by the server in `PATCH /v1/boards` and the coordinator claim),
+  it records a stand-down (`stood_down`: board, agent, time, reason). The snapshot then
+  lists the board in the thread's `held_by` and `stood_down`, with `held_since` the
+  stand-down's time, and the hooks hold it as for a pause (see "Pausing work"): a turn
+  that began before is ended, a pull request wake-up is ended before the model runs, and
+  every other prompt gets a `hold:` line that lets only the user's own request go on.
+  Only that thread is held; the threads it started and the owners of its tasks finish
+  their work. A claim that names the thread coordinator, or a renewal that keeps it
+  named, deletes the record, but only on a board with thread dispatch that has the
+  claiming device among its homes: the server takes renewals on a board moved to daemon
+  dispatch or away from the device, from a daemon that has not yet seen the change. A
+  live lease alone does not lift the hold either, so a lease left live by a daemon that
+  is down still holds (the server refuses renewals while autopilot is off or the board
+  is not active). The daemon therefore names a stood-down thread with a claim
+  before it sends the message that it coordinates again. The migration that added the
+  record (0026) recorded a stand-down for each board that had already stopped running its
+  last coordinator, from the last change of its autopilot, dispatch or status. Rejected:
+  refusing the stood-down thread's task claims at the server, since the server cannot tell
+  a claim the user asked for; and retrying the daemon's message only, which misses a
+  thread the daemon has no record of.
 - **A paused board**: the daemon starts, wakes and re-briefs nothing on it, but its
   coordinator's home device keeps the coordinator in `watch.json` and does not release
   the lease, so the server still names it and holds it (see "Pausing work"). The lease
