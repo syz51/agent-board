@@ -632,8 +632,11 @@ async fn list_tasks(
         proposal: q.proposal,
         parent: q.parent,
         live: q.live,
-        words: q.q.as_deref().map(tasks::search_words).transpose()?,
-        limit: q.limit.unwrap_or(200).clamp(1, 1000),
+        words: tasks::search_words(q.q.as_deref())?,
+        limit: q
+            .limit
+            .unwrap_or(board_proto::TASKS_LIMIT_DEFAULT as usize)
+            .clamp(1, board_proto::TASKS_LIMIT_MAX as usize),
     };
     Ok(Json(state.read(move |cx| tasks::list(cx, filter)).await?))
 }

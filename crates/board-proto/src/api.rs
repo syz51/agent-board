@@ -245,6 +245,15 @@ pub const ERRORS_LIMIT_DEFAULT: u32 = 100;
 /// Longest `q` filter of `GET /v1/errors`, in characters.
 pub const ERRORS_Q_CHARS_MAX: usize = 200;
 
+/// Tasks `GET /v1/tasks` lists when the request names no `limit`.
+pub const TASKS_LIMIT_DEFAULT: u32 = 200;
+/// Most tasks one `GET /v1/tasks` answer lists.
+pub const TASKS_LIMIT_MAX: u32 = 1_000;
+/// Longest `q` search of `GET /v1/tasks`, in characters.
+pub const TASKS_Q_CHARS_MAX: usize = 200;
+/// Most words one `q` search of `GET /v1/tasks` takes.
+pub const TASKS_Q_WORDS_MAX: usize = 8;
+
 /// `POST /v1/errors`: an error the client answered itself, before sending the request it
 /// would have made, such as text over a limit. The server records it with its own errors
 /// (source `client`), for the calling agent, under the signature its own answer to that

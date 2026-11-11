@@ -194,12 +194,16 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "q",
                     s(
-                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words, in any letter case.",
-                        200,
+                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words (at most 8), in any letter case.",
+                        board_proto::TASKS_Q_CHARS_MAX,
                     ),
                     false,
                 ),
-                ("limit", json!({"type": "integer", "minimum": 1}), false),
+                (
+                    "limit",
+                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 200."}),
+                    false,
+                ),
                 (
                     "detailed",
                     b("Include bodies and acceptance checks."),

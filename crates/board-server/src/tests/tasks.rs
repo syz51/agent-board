@@ -3083,7 +3083,15 @@ async fn q_lists_the_tasks_that_hold_every_word() {
     let found = t.ok("GET", "/v1/tasks?q=%25", None, None).await;
     assert_eq!(ids(found), Vec::<String>::new());
 
-    for q in ["%20", &"x".repeat(201), "a%20b%20c%20d%20e%20f%20g%20h%20i"] {
+    // Only ASCII letters fold, as in the stored text: a word in the title's own case matches.
+    let accent = t.task(A, "factory", "Visit the \u{c9}cole").await;
+    let found = t.ok("GET", "/v1/tasks?q=%C3%89COLE", None, None).await;
+    assert_eq!(ids(found), vec![accent]);
+    // A blank q is no search.
+    let found = t.ok("GET", "/v1/tasks?q=%20", None, None).await;
+    assert_eq!(found.as_array().unwrap().len(), 5);
+
+    for q in [&"x".repeat(201), "a%20b%20c%20d%20e%20f%20g%20h%20i"] {
         let (s, code, v) = t.fail("GET", &format!("/v1/tasks?q={q}"), None, None).await;
         assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
     }

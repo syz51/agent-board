@@ -585,8 +585,8 @@ pub struct LsArgs {
     #[arg(long)]
     live: bool,
     /// Only tasks whose id, title, body, acceptance checks or notes hold every one of
-    /// these words, in any letter case: `--search "usage cap"`. Use it instead of listing
-    /// a whole board as JSON to filter it.
+    /// these words (at most 8, 200 characters), in any letter case: `--search "usage cap"`.
+    /// Use it instead of listing a whole board as JSON to filter it.
     #[arg(long, visible_alias = "grep")]
     search: Option<String>,
     /// How many tasks to list at most (default 200, at most 1000).
@@ -902,6 +902,7 @@ impl Command {
             }
             Self::Answer { answer, .. } => check_chars("answer", answer, l.question_chars)?,
             Self::Errors { grep, .. } => check_opt("q", grep, board_proto::ERRORS_Q_CHARS_MAX)?,
+            Self::Ls(a) => check_opt("q", &a.search, board_proto::TASKS_Q_CHARS_MAX)?,
             Self::Feedback {
                 about,
                 signature,

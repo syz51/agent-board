@@ -150,8 +150,9 @@ pub fn task_list(tasks: &[Task]) -> String {
 }
 
 /// Tasks with their bodies and acceptance checks as peer text.
-pub fn task_list_detailed(tasks: &[Task]) -> String {
-    let list = task_list(tasks);
+/// `notice` follows the task lines, before the peers' text.
+pub fn task_list_detailed(tasks: &[Task], notice: &str) -> String {
+    let list = task_list(tasks) + notice;
     let peer: Vec<Value> = tasks
         .iter()
         .filter(|t| !t.body.is_empty() || !t.acceptance.is_empty())

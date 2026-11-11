@@ -905,10 +905,18 @@ fn task_list_sends_a_search_and_says_when_the_limit_cut_the_list() {
     assert_eq!(requests[0].query_pairs()["q"], "usage+cap");
     assert!(!text(&found).contains("listed the first"), "{found}");
 
-    // A list as long as its limit may be cut: the text says so.
-    let cut = mcp.call(3, "task_list", json!({"limit": 2}));
-    assert!(
-        text(&cut).contains("listed the first 2; more may match"),
-        "{cut}"
+    // The call asks for one task more than the limit, so the text says when the list
+    // was cut, before the peers' text.
+    assert_eq!(requests[0].query_pairs()["limit"], "201");
+    let cut = mcp.call(3, "task_list", json!({"limit": 1, "detailed": true}));
+    assert_eq!(
+        stub.requests_to("GET /v1/tasks")[1].query_pairs()["limit"],
+        "2"
     );
+    let cut = text(&cut);
+    let notice = cut.find("listed the first 1; more match").expect(cut);
+    assert_eq!(cut.matches("board-feedback-2 ").count(), 1, "{cut}");
+    if let Some(peers) = cut.find("written by other agents") {
+        assert!(notice < peers, "{cut}");
+    }
 }
