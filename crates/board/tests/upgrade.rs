@@ -145,13 +145,19 @@ esac
     // Linux, unless STUB_OS names another system, so a run on a Mac stays off its keychain.
     ("uname", "#!/bin/sh\necho \"${STUB_OS:-Linux}\"\n"),
     // A keychain is a file, empty until the identity is imported; one that holds only
-    // `certificate` has a certificate but no identity. Unlocking, locking and deleting are logged.
+    // `certificate` has a certificate but no identity. Unlocking, locking and deleting are
+    // logged, and so is the name of the keychain whose partition list is set.
     (
         "security",
         r#"#!/bin/sh
 case "$1" in
 create-keychain) : > "$4" ;;
 import) echo identity > "$4" ;;
+set-key-partition-list)
+    [ -z "${STUB_FAIL_PARTITION:-}" ] || { echo "security: SecItemCopyMatching: failed" >&2; exit 1; }
+    for last; do :; done
+    echo "${STUB_HOST:-local} partition-list ${last##*/}" >> "$STATE/log"
+    ;;
 unlock-keychain)
     [ -z "${STUB_FAIL_UNLOCK:-}" ] || { echo "security: The user name or passphrase you entered is not correct." >&2; exit 51; }
     echo "${STUB_HOST:-local} unlock" >> "$STATE/log"
@@ -916,6 +922,9 @@ fn on_macos_each_device_signs_board_with_one_lasting_identity_before_the_restart
         [
             format!("local install {new} commit={}", &new[..12]),
             "local delete-keychain".into(),
+            // Made beside its place and moved there, then unlocked at its place.
+            "local partition-list making.keychain-db".into(),
+            "local unlock".into(),
             format!("local {sign}"),
             "local lock".into(),
             "local restart".into(),
@@ -1002,6 +1011,75 @@ fn a_signing_identity_left_half_made_is_made_again() {
         log.contains("local sign 0123ABCD dev.agent-board.board"),
         "{log}"
     );
+}
+
+fn signing_files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_run_that_fails_while_making_the_identity_leaves_no_keychain_and_the_next_run_signs() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let out = env.run(
+        &["--yes", new],
+        &[("STUB_OS", "Darwin"), ("STUB_FAIL_PARTITION", "1")],
+    );
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("could not store the signing identity"),
+        "{err}"
+    );
+    assert!(!env.read("log").contains(" sign "));
+    let dir = env
+        .root
+        .join("home/Library/Application Support/agent-board/signing");
+    assert_eq!(signing_files(&dir), [] as [&str; 0]);
+
+    env.clear_log();
+    let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("could not sign"), "{err}");
+    let log = env.read("log");
+    assert!(
+        log.contains("local sign 0123ABCD dev.agent-board.board"),
+        "{log}"
+    );
+    assert_eq!(signing_files(&dir), ["password", "signing.keychain-db"]);
+}
+
+#[test]
+fn a_keychain_a_killed_run_left_unfinished_is_removed_and_the_identity_made_again() {
+    let env = Env::new();
+    let new = &env.main[1];
+    // As a run killed after `security import` leaves it: the certificate is inside, but the
+    // keychain and its password are not yet in place.
+    let dir = env
+        .root
+        .join("home/Library/Application Support/agent-board/signing");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("making.password"), "old\n").unwrap();
+    fs::write(dir.join("making.keychain-db"), "certificate\n").unwrap();
+
+    let out = env.run(&["--yes", new], &[("STUB_OS", "Darwin")]);
+    let (_, err) = text(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("making the code-signing identity"), "{err}");
+    assert!(!err.contains("could not sign"), "{err}");
+    let log = env.read("log");
+    assert!(
+        log.contains("local sign 0123ABCD dev.agent-board.board"),
+        "{log}"
+    );
+    assert_eq!(signing_files(&dir), ["password", "signing.keychain-db"]);
+    assert_ne!(fs::read_to_string(dir.join("password")).unwrap(), "old\n");
 }
 
 #[test]
