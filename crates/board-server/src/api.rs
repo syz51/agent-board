@@ -842,6 +842,7 @@ async fn resolve_feedback(
 struct AsksQuery {
     status: Option<AskStatus>,
     board: Option<BoardSlug>,
+    limit: Option<u32>,
 }
 
 async fn list_asks(
@@ -851,7 +852,11 @@ async fn list_asks(
 ) -> Result<Json<Vec<Ask>>> {
     Ok(Json(
         state
-            .read(move |cx| asks::list(cx, q.status, q.board.as_ref()))
+            .read(move |cx| {
+                // A limit of 0 reads as 1, as for tasks. No upper bound: without a limit
+                // the list holds every ask anyway.
+                asks::list(cx, q.status, q.board.as_ref(), q.limit.map(|n| n.max(1)))
+            })
             .await?,
     ))
 }

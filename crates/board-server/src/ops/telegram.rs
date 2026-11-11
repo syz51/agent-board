@@ -377,7 +377,7 @@ impl Digest {
 /// which are what waits on the user's decision or action.
 pub(crate) fn digest(cx: &Ctx<'_>) -> Result<Digest> {
     let mut digest = Digest::default();
-    for ask in crate::ops::asks::list(cx, Some(AskStatus::Open), None)? {
+    for ask in crate::ops::asks::list(cx, Some(AskStatus::Open), None, None)? {
         digest
             .boards
             .entry(ask.board.to_string())

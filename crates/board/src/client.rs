@@ -940,8 +940,19 @@ impl Client {
         self.with_body(Method::POST, "/v1/asks", body).await
     }
 
-    pub async fn asks(&self, status: Option<&str>, board: Option<&BoardSlug>) -> Result<Vec<Ask>> {
+    /// The asks of `status` and `board`, oldest first; with `limit`, the newest that many.
+    /// A server that predates the limit sends them all.
+    pub async fn asks(
+        &self,
+        status: Option<&str>,
+        board: Option<&BoardSlug>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Ask>> {
+        let limit = limit.map(|n| n.to_string());
         let mut q: Vec<(&str, &str)> = Vec::new();
+        if let Some(limit) = &limit {
+            q.push(("limit", limit));
+        }
         if let Some(status) = status {
             q.push(("status", status));
         }
