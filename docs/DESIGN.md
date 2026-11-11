@@ -900,8 +900,8 @@ Status: partly built (agent-board-308; the user chose it on 2026-11-08). Built: 
 `dispatch` board setting, the `dispatch` agent and judge registration, with their rights
 and records (`docs/API.md`, "Daemon dispatch"); the worker and judge briefs
 (`prompts/worker.md`, `prompts/judges/`); the dispatcher's lease, its worker starts in
-every slot, the lease-overlap skip, and the gone-asker and away-owner steps. Each is
-marked "built" below. Not built yet: the judges, merging and finishing, the switch's last
+every slot, the lease-overlap skip, the gone-asker and away-owner steps, the judge starts,
+and merging and finishing. Each is marked "built" below. Not built yet: the switch's last
 message and the rollout. It replaces the
 coordinator thread above one board at a time. Until a board switches, the previous
 section holds for that board.
@@ -952,15 +952,15 @@ one task and one section of the prompt, not the days before it.
 | Event | Handled by |
 |---|---|
 | A ready `auto` task and a free slot | The dispatcher starts a worker |
-| A task moves to `review` | A review judge, unless one already runs for that task |
-| A pass verdict with the PR still open | The dispatcher merges once the checks pass |
-| PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task |
-| A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals |
+| A task moves to `review` | A review judge, unless one already runs for that task (built) |
+| A pass verdict with the PR still open | The dispatcher merges once the checks pass (built) |
+| PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task (built) |
+| A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals (built) |
 | An ask answered, asker can be woken | The asker, as today |
 | An ask answered, asker gone | The dispatcher: a `decision` note with the answer, then the task back to `open` (built) |
 | An owner away from `doing` | Wake it as today. At the repeat, if it is still away, the dispatcher sets the task `open` with a note naming the old thread and branch (built) |
-| Nothing ready or in progress, goal review due | A goal judge |
-| A ready item on the feedback board | A triage judge |
+| Nothing ready or in progress, goal review due | A goal judge (built) |
+| A ready item on the feedback board | A triage judge (built) |
 | A changed standing prompt | Nothing: each new thread starts with the current briefs |
 
 **Slots**: `parallel_tasks` still limits the tasks in progress: tasks in `doing` that
@@ -1014,11 +1014,41 @@ the work.
   - On fail, it adds a finding note per failed check and sets the task `open`, so a new
     worker starts.
   - After two failed reviews of the same task, it fixes the task itself in its worktree.
-  - It also gives verdicts on proposals filed under the task. It sets priority and
-    blockers on the other tasks filed there.
+  - It gives no verdicts on the proposals filed under the task: their verdict judge
+    does. It sets priority and blockers on the other tasks filed there.
 - **Verdict**: it follows "Proposals and triage" and runs in the project folder, reading
   only. A proposal that needs a second verdict gets it from another judge.
-- **Goal** and **triage**: they follow the goal review and Triage rules above.
+- **Goal** and **triage**: they follow the goal review and Triage rules above. The goal
+  judge's note starts `goal review:`, so a `review: pass` note never marks a goal review
+  as done.
+
+Built: on each reconcile (every minute) the dispatcher reads what the board needs judged
+and starts a judge for each need, the longest wait first, while fewer than 2 run. A judge
+counts as running while the server lists it as running, or the dispatcher started it and
+has not registered it yet.
+
+- **Start**: `t3 thread start` with `judge_brief` on stdin, recorded in `watch.json`
+  before the start so a failed start is found again by title. The dispatcher registers
+  the thread's agent as a judge right after the start, since T3 gives the agent's id only
+  then, and tries again each reconcile for up to 10 minutes. No judge starts while the
+  board is at its usage stop.
+- **Review**: for each task in `review` whose newest `review:` decision note is not a
+  standing pass. A pass stands when another agent than the task's owner wrote it and the
+  task has not moved to `review` again since. The judge's worktree is on branch
+  `review/<task>`, based on the head branch of the newest pull request the task's notes
+  name, once fetched from `origin`; otherwise on the project's default base. The
+  dispatcher notes the thread's link on the task.
+- **Verdict**: the pending proposals are grouped by parent task. A group with a running
+  verdict judge waits. Otherwise the 5 oldest get one judge; the rest follow when it ends.
+- **Triage**: on this device's `feedback_board`, each ready feedback item (a task with a
+  `feedback` field) goes to a triage judge, 5 items a judge. Such an item gets no worker.
+- **Goal**: on a board with a goal, a goal review is due once a task was finished
+  (`task_done`) since the last goal judge started. It starts when nothing is in progress,
+  in review, ready and `auto`, waiting for another judge, or being judged.
+- **Retry**: when a judge ends, its tasks get no other judge of that kind for 30 minutes,
+  unless the task changes (`updated_at`). So a judge that ended without its judgment is
+  not started in a loop. A note does not change a task, so a proposal's second verdict
+  waits out that time.
 
 **Merging and finishing**:
 
@@ -1030,6 +1060,25 @@ the work.
 - Once the PR is merged (or the task has none) and the worker no longer runs, the
   dispatcher hands the task to itself and calls `task_done`. The evidence is the PR, the
   merge commit and the checks the judge recorded. The summary is the judge's.
+
+Built, with these rules:
+
+- **The pass note** ends with one line per check, `check: <command> => <exit code>`, and
+  a line `pr: <PR URL>` or `pr: none` (`prompts/judges/review.md`). Without a `pr:` line,
+  the pull request is the last one the pass note links, else the one in the newest note
+  before it. The summary is the note's text without the verdict and these lines, cut to
+  the server's limit. A pass without check lines and without a PR is closed with the
+  note itself as evidence.
+- **Merge**: `gh pr merge` with a merge commit where the repository allows one, else
+  squashed, else rebased. The dispatcher merges only when GitHub reports the pull request
+  as clean and every check as passed. While checks run, or GitHub holds the merge for
+  another reason, it reads again 2 minutes later.
+- **Failed checks**: the dispatcher adds one `finding` note per head commit and waits. It
+  does not set the task `open`: a check may be run again.
+- **Conflict or closed PR**: the dispatcher adds a `decision` note starting
+  `review: void`, which withdraws the pass, and sets the task `open`. The next park in
+  `review` gets a new review.
+- **Finish**: the worker counts as running only while its agent's state is `running`.
 
 **Rights and records** (built):
 

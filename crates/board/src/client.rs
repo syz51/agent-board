@@ -8,9 +8,10 @@ use board_proto::{
     AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
     BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
     CreateTask, CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
-    JoinBoard, LeaseResult, Note, PutHandoff, RegisterAgent, ReportUsage, ResolveFeedback,
-    Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage, UsageReserve,
+    JoinBoard, Judge, LeaseResult, Note, PutHandoff, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
+    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage,
+    UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -815,6 +816,18 @@ impl Client {
         let path = format!("/v1/boards/{slug}/coordinator");
         self.send(self.request(Method::DELETE, &path), Retry::Never)
             .await
+    }
+
+    /// Registers a judge of the board; only its lease holder may, acting as itself.
+    pub async fn register_judge(&self, slug: &BoardSlug, body: &RegisterJudge) -> Result<Judge> {
+        self.require_agent()?;
+        let path = format!("/v1/boards/{slug}/judges");
+        self.with_body(Method::POST, &path, body).await
+    }
+
+    /// The board's judges that have rights now, oldest first.
+    pub async fn judges(&self, slug: &BoardSlug) -> Result<Vec<Judge>> {
+        self.get(&format!("/v1/boards/{slug}/judges")).await
     }
 
     // Tasks
