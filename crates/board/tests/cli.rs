@@ -292,6 +292,24 @@ fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.starts_with("done factory-12"), "{text}");
+    // The acks of claim, update and done name the owner by its short handle.
+    let mut owned = task_fixture("factory-12", "Do it");
+    owned.owner = Some("t3:thread:a-very-long-agent-id".parse().unwrap());
+    owned.owner_handle = Some("t3:7f3a".into());
+    e.stub.on("POST /v1/tasks/factory-12/claim", owned.clone());
+    e.stub.on("PATCH /v1/tasks/factory-12", owned.clone());
+    e.stub.on("POST /v1/tasks/factory-12/done", owned);
+    for args in [
+        &["claim", "factory-12"][..],
+        &["update", "factory-12", "--priority", "p1"],
+        &["done", "factory-12", "--commit", "4e1c2ab"],
+    ] {
+        let out = e.run(args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let ack = stdout(&out);
+        assert!(ack.contains(" owner t3:7f3a"), "{ack}");
+        assert!(!ack.contains("a-very-long-agent-id"), "{ack}");
+    }
     assert!(
         text.contains("\n1 finding since the claim; the task is done: for each one"),
         "{text}"

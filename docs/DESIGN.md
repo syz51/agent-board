@@ -756,7 +756,8 @@ settings in use, warned once per edit.
   `task_done` lists the findings noted since the task's latest claim in its history (not
   a later handover, so findings noted while a child held the task are included; every
   finding when no claim is there), read after the done so none added meanwhile is
-  missed. The owner then notes how each one the evidence does not cover was addressed,
+  missed. The caller's own findings are listed by note id with their first 80 characters,
+  since it wrote them in the same session; other agents' are in full. The owner then notes how each one the evidence does not cover was addressed,
   or reopens the task. The coordinator prompt says
   to read every note after the claim and to put each finding and decision into a
   delegate's brief.
@@ -1217,7 +1218,7 @@ Notes and bodies: task_show <id>.
 
 Writing conventions, enforced where possible: titles are imperative, at most 80 characters,
 without status or ids; bodies stand alone; acceptance is one observable check per line;
-notes start with their kind and cite evidence; handoff `next` is the first concrete action.
+notes cite evidence, and their kind is a parameter, not a prefix of the text; handoff `next` is the first concrete action.
 
 The format is a starting point: the `json` and `yaml` renderings exist so the formats can be
 benchmarked against each other on real tasks.
