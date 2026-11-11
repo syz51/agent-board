@@ -398,7 +398,7 @@ Reopening a closed board, or any change on it, starts the period again.
   value counts as 1; the list does not say when the limit cut it, so the CLI and MCP ask
   for one task more than their limit and say so in their text, naming the task to
   continue after. The MCP `task_list` asks
-  for 50 tasks when the call names no `limit`, since its text goes into an agent's
+  for 25 tasks when the call names no `limit`, since its text goes into an agent's
   context; the CLI keeps the server's default. The MCP `task_list` also narrows a plain
   call to open work on one board, in the client:
   - It sends `board=<the caller's board>` (the one board the caller joined, else the
