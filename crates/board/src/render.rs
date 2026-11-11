@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, AgentState, Ask, Board, Dispatch, ErrorLog, Event, EventType, Handoff, Lease,
+    Agent, AgentState, Ask, Board, Dispatch, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
     LeaseResult, Note, NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
     TouchResult, Usage,
 };
@@ -216,6 +216,21 @@ fn children(out: &mut String, detail: &TaskDetail) {
     }
 }
 
+/// One piece of evidence: its kind, value, exit code, author and age.
+fn evidence_line(ev: &Evidence, handles: &BTreeMap<String, String>) -> String {
+    let mut line = format!("evidence {} {}", enum_str(&ev.kind), title(&ev.value));
+    if let Some(code) = ev.exit_code {
+        let _ = write!(line, " exit {code}");
+    }
+    let _ = write!(
+        line,
+        " by {} {}",
+        short(handles, ev.agent.as_str()),
+        ago(ev.at)
+    );
+    line
+}
+
 /// Which notes a task's text shows; every finding and decision is always shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Notes {
@@ -274,21 +289,7 @@ fn detail_parts(detail: &TaskDetail, show: Notes) -> (String, Vec<Value>, usize)
     }
     children(&mut out, detail);
     for ev in &detail.evidence {
-        let _ = write!(
-            out,
-            "\nevidence {} {}",
-            enum_str(&ev.kind),
-            title(&ev.value)
-        );
-        if let Some(code) = ev.exit_code {
-            let _ = write!(out, " exit {code}");
-        }
-        let _ = write!(
-            out,
-            " by {} {}",
-            short(handles, ev.agent.as_str()),
-            ago(ev.at)
-        );
+        let _ = write!(out, "\n{}", evidence_line(ev, handles));
     }
     // Every finding and decision, so the agent doing the task misses none; plain notes
     // only the latest few unless detailed.
@@ -313,6 +314,17 @@ fn detail_parts(detail: &TaskDetail, show: Notes) -> (String, Vec<Value>, usize)
             let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
         }
     }
+    let mut peer = field_lines(detail);
+    for note in notes {
+        peer.push(note_line(note, handles));
+    }
+    (out, peer, cut)
+}
+
+/// A task's own agent-written fields as lines of peer text, each naming its `field`.
+fn field_lines(detail: &TaskDetail) -> Vec<Value> {
+    let task = &detail.task;
+    let handles = &detail.handles;
     let mut peer = Vec::new();
     if let Some(reason) = &task.blocked_reason {
         peer.push(json!({"task": task.id, "field": "blocked_reason", "text": reason}));
@@ -339,10 +351,7 @@ fn detail_parts(detail: &TaskDetail, show: Notes) -> (String, Vec<Value>, usize)
     {
         peer.push(json!({"task": task.id, "field": "resolution_reason", "text": reason}));
     }
-    for note in notes {
-        peer.push(note_line(note, handles));
-    }
-    (out, peer, cut)
+    peer
 }
 
 pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
@@ -367,6 +376,104 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
             plural(cut, "older plain note", "older plain notes"),
         );
     }
+    if let Some(last) = detail.history.last() {
+        let _ = write!(out, "\n{NEXT_READ} {}", last.seq);
+    }
+    out
+}
+
+/// Ends a `task_show` of one task: the value that makes the next read show changes only.
+const NEXT_READ: &str = "changes only on the next read: since";
+
+/// The point a repeat `task_show` reads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Since {
+    /// An event sequence number, as a `task_show` names it.
+    Seq(i64),
+    At(Timestamp),
+}
+
+/// What changed on a task after `since`: its line, the later events, evidence and notes,
+/// and the present text of each field a later update changed. One line when no event is
+/// later. The whole task when its history does not reach back to `since` (the task is
+/// newer, or the server cut the history), since the changes cannot be told then.
+pub fn task_changes(detail: &TaskDetail, since: Since) -> String {
+    let later = |e: &Event| match since {
+        Since::Seq(seq) => e.seq > seq,
+        Since::At(at) => e.at > at,
+    };
+    let point = match since {
+        Since::Seq(seq) => format!("#{seq}"),
+        Since::At(at) => at.format("%Y-%m-%d %H:%MZ").to_string(),
+    };
+    let id = &detail.task.id;
+    if detail.history.first().is_none_or(later) {
+        return format!(
+            "the history of {id} starts after {point}; the whole task:\n{}",
+            task_detail(detail, false)
+        );
+    }
+    let handles = &detail.handles;
+    let line = task_line_as(&detail.task, |id| short(handles, id));
+    let events: Vec<&Event> = detail.history.iter().filter(|e| later(e)).collect();
+    let (Some(first), Some(last)) = (events.first(), events.last()) else {
+        return format!("no change since {point}: {line}");
+    };
+    // Evidence has no sequence number: it is later when its time is not before the first
+    // later event's. A note is later when a later event names it.
+    let from = first.at;
+    let noted: Vec<i64> = events
+        .iter()
+        .filter(|e| e.event_type == EventType::NoteAdded)
+        .filter_map(|e| e.payload["note"].as_i64())
+        .collect();
+    let mut out = format!("{line}\nsince {point}:");
+    let mut changed: Vec<&str> = Vec::new();
+    for event in &events {
+        let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
+        let payload = &event.payload;
+        if let (Some(from), Some(to)) = (payload["from"].as_str(), payload["to"].as_str()) {
+            let _ = write!(out, " {from} to {to}");
+        }
+        let fields: Vec<&str> = payload["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !fields.is_empty() {
+            let _ = write!(out, " ({})", fields.join(","));
+        }
+        changed.extend(fields);
+        if event.event_type == EventType::TaskDone {
+            changed.extend(["summary", "resolution_reason"]);
+        }
+    }
+    for ev in detail.evidence.iter().filter(|ev| ev.at >= from) {
+        let _ = write!(out, "\n{}", evidence_line(ev, handles));
+    }
+    let mut peer: Vec<Value> = field_lines(detail)
+        .into_iter()
+        .filter(|l| l["field"].as_str().is_some_and(|f| changed.contains(&f)))
+        .collect();
+    peer.extend(
+        detail
+            .notes
+            .iter()
+            .filter(|n| noted.contains(&n.id))
+            .map(|n| note_line(n, handles)),
+    );
+    for line in &mut peer {
+        if let Some(fields) = line.as_object_mut() {
+            fields.remove("task");
+        }
+    }
+    let block = peer_block(&peer);
+    if !block.is_empty() {
+        out.push('\n');
+        out.push_str(&block);
+    }
+    let _ = write!(out, "\n{NEXT_READ} {}", last.seq);
     out
 }
 
@@ -1042,6 +1149,95 @@ mod tests {
         // Five plain notes or fewer: nothing cut.
         let few = noted(&[("note", "a", 1), ("finding", "b", 2)], &[]);
         assert!(!task_detail(&few, false).contains("older"));
+    }
+
+    #[test]
+    fn task_show_names_the_point_and_a_repeat_read_shows_only_later_changes() {
+        let mut detail = noted(
+            &[("finding", "seen before", 2), ("note", "new one", 6)],
+            &[
+                ("task_created", "t3:me", 0, json!({})),
+                ("task_claimed", "t3:me", 1, json!({})),
+                (
+                    "note_added",
+                    "t3:peer",
+                    2,
+                    json!({"note": 1, "kind": "finding"}),
+                ),
+                (
+                    "task_updated",
+                    "t3:me",
+                    5,
+                    json!({"fields": ["status", "acceptance"], "from": "open", "to": "doing"}),
+                ),
+                (
+                    "note_added",
+                    "t3:peer",
+                    6,
+                    json!({"note": 2, "kind": "note"}),
+                ),
+            ],
+        );
+        detail.task.acceptance = "It passes".into();
+        // A full read ends with the point to pass next time.
+        let full = task_detail(&detail, false);
+        assert!(
+            full.ends_with("\nchanges only on the next read: since 5"),
+            "{full}"
+        );
+        // Nothing later: one line.
+        let same = task_changes(&detail, Since::Seq(5));
+        assert!(
+            same.starts_with("no change since #5: factory-12 doing p2 \"Fix it\""),
+            "{same}"
+        );
+        assert_eq!(same.lines().count(), 1, "{same}");
+        // Later events, the changed field's text and the later note; nothing from before.
+        let changes = task_changes(&detail, Since::Seq(3));
+        assert!(changes.starts_with("factory-12 doing p2"), "{changes}");
+        assert!(changes.contains("\nsince #3:\n#4 "), "{changes}");
+        assert!(
+            changes.contains("task_updated factory-12 open to doing (status,acceptance)"),
+            "{changes}"
+        );
+        assert!(
+            changes.contains(r#"{"field":"acceptance","text":"It passes"}"#),
+            "{changes}"
+        );
+        assert!(changes.contains("new one"), "{changes}");
+        assert!(
+            !changes.contains("seen before") && !changes.contains("\"Body\""),
+            "{changes}"
+        );
+        assert!(
+            changes.ends_with("\nchanges only on the next read: since 5"),
+            "{changes}"
+        );
+        // A note is later by its event, not by its time: one of the same minute as a
+        // later event is not shown again.
+        let tied = task_changes(&detail, Since::Seq(4));
+        assert!(
+            tied.contains("new one") && !tied.contains("It passes"),
+            "{tied}"
+        );
+        // A time works as the point too.
+        let at = "2026-11-07T10:05:30Z".parse().unwrap();
+        let by_time = task_changes(&detail, Since::At(at));
+        assert!(
+            by_time.contains("new one") && !by_time.contains("task_updated"),
+            "{by_time}"
+        );
+        // A history that starts after the point cannot tell the changes: the whole task.
+        detail.history.drain(..3);
+        let whole = task_changes(&detail, Since::Seq(2));
+        assert!(
+            whole.starts_with("the history of factory-12 starts after #2; the whole task:\n"),
+            "{whole}"
+        );
+        assert!(
+            whole.contains("seen before") && whole.contains("\"Body\""),
+            "{whole}"
+        );
     }
 
     #[test]

@@ -1060,6 +1060,22 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   task alone is the full form. `--detailed` takes one task. `--json` prints `{tasks,
   not_shown}`: the `[TaskDetail]` list of the tasks that were read, and `{id, reason}`
   for each that was not.
+  The text of one task ends with `changes only on the next read: since <n>`, the `seq` of
+  the latest event in its `history`. `board show <id> --since <n>` (MCP `task_show` with
+  `since`) reads the same `GET /v1/tasks/{id}` and prints only what came after that
+  event: the task's line, each later event of its `history` (a status change as `<from>
+  to <to>`, with the changed fields' names), the evidence and notes added from the first
+  later event on, the present text of each changed field (`body`, `acceptance`,
+  `blocked_reason`, and `summary` and `resolution_reason` after a done), and the next
+  `since`. A note is later when a later `note_added` event names its id; evidence when
+  its time is not before the first later event's. Other changed fields are named only,
+  and a field that was cleared has no text line. When no event is
+  later it prints one line, `no change since #<n>: <task line>`. `since` also takes an
+  RFC 3339 time, a date or a duration back (`2h`). A change of a child or a blocker is
+  not an event of the task, so read those tasks themselves. When the `history` starts
+  after the point (a newer task, or more than the 200 events a detail holds) the changes
+  cannot be told and the whole task is printed, with a line saying so. `since` takes
+  one task and no `--detailed`; `--json` prints the whole `[TaskDetail]`.
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
