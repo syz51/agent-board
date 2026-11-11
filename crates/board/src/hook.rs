@@ -32,7 +32,9 @@ use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::mcp;
 use crate::render;
-use crate::state::{self, AgentLocal, DoneMark, Filed, SessionLocal, ThreadRead, ToolStart};
+use crate::state::{
+    self, AgentLocal, DoneMark, Filed, FiledMark, SessionLocal, ThreadRead, ToolStart,
+};
 use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
@@ -1431,7 +1433,7 @@ impl Hook<'_> {
         Ok(done_reminder(
             marks,
             self.local.turn_started,
-            &self.local.filed_about,
+            &mut self.local.filed_about,
             filed_this_turn,
             &mut self.local.done_reminded,
         ))
@@ -1455,22 +1457,7 @@ impl Hook<'_> {
                 return false;
             }
         };
-        let turn = self.local.turn_started;
-        let mut this_turn = false;
-        for mark in marks {
-            this_turn |= mark.kind != Filed::SubTask && turn.is_none_or(|t| mark.at >= t);
-            if let Some(about) = mark.about {
-                self.local.filed_about.retain(|id| *id != about);
-                self.local.filed_about.push(about);
-            }
-        }
-        let excess = self
-            .local
-            .filed_about
-            .len()
-            .saturating_sub(FILED_ABOUT_KEPT);
-        self.local.filed_about.drain(..excess);
-        this_turn
+        fold_filed(marks, self.local.turn_started, &mut self.local.filed_about)
     }
 
     /// `SessionStart` context from a board snapshot: a delegated thread's names the route
@@ -2010,24 +1997,46 @@ const DONE_REMINDED_KEPT: usize = 100;
 /// How many tasks the agent filed something about the hook state keeps.
 const FILED_ABOUT_KEPT: usize = 100;
 
+/// Remembers in `filed_about` the tasks `marks` were about, newest last, and returns
+/// whether one is a proposal or an ask of this turn; see [`Hook::take_filed`].
+fn fold_filed(
+    marks: Vec<FiledMark>,
+    turn_started: Option<Timestamp>,
+    filed_about: &mut Vec<TaskId>,
+) -> bool {
+    let mut this_turn = false;
+    for mark in marks {
+        this_turn |= mark.kind != Filed::SubTask && turn_started.is_none_or(|t| mark.at >= t);
+        if let Some(about) = mark.about {
+            filed_about.retain(|id| *id != about);
+            filed_about.push(about);
+        }
+    }
+    let excess = filed_about.len().saturating_sub(FILED_ABOUT_KEPT);
+    filed_about.drain(..excess);
+    this_turn
+}
+
 /// The reminder for tasks marked done this turn (marks at or after `turn_started`, any when
 /// the turn's start is unknown) not reminded about before, which it records in `reminded`.
 /// None when the agent already filed follow-ups: for the tasks in `filed_about`, and for
-/// every task when `filed_this_turn` ([`Hook::take_filed`]).
+/// every task when `filed_this_turn` ([`Hook::take_filed`]). A done task leaves
+/// `filed_about`: what was filed about it answers for this done, not for one after the task
+/// is opened again.
 fn done_reminder(
     marks: Vec<DoneMark>,
     turn_started: Option<Timestamp>,
-    filed_about: &[TaskId],
+    filed_about: &mut Vec<TaskId>,
     filed_this_turn: bool,
     reminded: &mut Vec<TaskId>,
 ) -> Option<String> {
-    if filed_this_turn {
-        return None;
-    }
     let mut ids: Vec<TaskId> = Vec::new();
     for mark in marks {
+        let filed = filed_about.contains(&mark.task);
+        filed_about.retain(|id| *id != mark.task);
         if turn_started.is_none_or(|t| mark.at >= t)
-            && !filed_about.contains(&mark.task)
+            && !filed
+            && !filed_this_turn
             && !reminded.contains(&mark.task)
             && !ids.contains(&mark.task)
         {
@@ -2719,7 +2728,7 @@ mod tests {
         };
         let mut reminded = Vec::new();
         assert_eq!(
-            done_reminder(vec![], Some(t0), &[], false, &mut reminded),
+            done_reminder(vec![], Some(t0), &mut vec![], false, &mut reminded),
             None
         );
         let text = done_reminder(
@@ -2729,7 +2738,7 @@ mod tests {
                 mark("factory-13", 2),
             ],
             Some(t0),
-            &[],
+            &mut vec![],
             false,
             &mut reminded,
         )
@@ -2743,7 +2752,7 @@ mod tests {
             done_reminder(
                 vec![mark("factory-12", 5)],
                 Some(t0),
-                &[],
+                &mut vec![],
                 false,
                 &mut reminded
             ),
@@ -2754,7 +2763,7 @@ mod tests {
             done_reminder(
                 vec![mark("factory-11", -1)],
                 None,
-                &[],
+                &mut vec![],
                 false,
                 &mut reminded
             )
@@ -2765,7 +2774,7 @@ mod tests {
             done_reminder(
                 vec![mark(&format!("other-{}", n + 1), 1)],
                 Some(t0),
-                &[],
+                &mut vec![],
                 false,
                 &mut reminded,
             );
@@ -2781,23 +2790,13 @@ mod tests {
             task: task.parse().unwrap(),
             at: t0,
         };
-        let about: Vec<TaskId> = vec!["factory-12".parse().unwrap()];
+        let mut about: Vec<TaskId> = vec!["factory-12".parse().unwrap()];
         let mut reminded = Vec::new();
         // Something filed about the task itself: quiet for it, not for another task.
-        assert_eq!(
-            done_reminder(
-                vec![mark("factory-12")],
-                Some(t0),
-                &about,
-                false,
-                &mut reminded
-            ),
-            None
-        );
         let text = done_reminder(
             vec![mark("factory-12"), mark("factory-13")],
             Some(t0),
-            &about,
+            &mut about,
             false,
             &mut reminded,
         )
@@ -2806,12 +2805,68 @@ mod tests {
             text.starts_with("board: you marked factory-13 done this turn."),
             "{text}"
         );
+        // That answered for the one done: opened and done again, the task is asked about.
+        assert_eq!(about, vec![]);
+        assert!(
+            done_reminder(
+                vec![mark("factory-12")],
+                Some(t0),
+                &mut about,
+                false,
+                &mut reminded
+            )
+            .is_some()
+        );
         // A proposal or an ask filed this turn: quiet for every task, none recorded.
         assert_eq!(
-            done_reminder(vec![mark("factory-14")], Some(t0), &[], true, &mut reminded),
+            done_reminder(
+                vec![mark("factory-14")],
+                Some(t0),
+                &mut about,
+                true,
+                &mut reminded
+            ),
             None
         );
-        assert_eq!(reminded.len(), 1);
+        assert_eq!(reminded.len(), 2);
+    }
+
+    #[test]
+    fn filed_marks_count_by_kind_turn_and_task() {
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let mark = |kind, about: Option<&str>, mins: i64| FiledMark {
+            kind,
+            about: about.map(|id| id.parse().unwrap()),
+            at: t0 + chrono::Duration::minutes(mins),
+        };
+        let mut about: Vec<TaskId> = Vec::new();
+        // A sub-task counts for its parent only; a proposal of an earlier turn likewise.
+        let earlier = vec![
+            mark(Filed::SubTask, Some("factory-12"), 1),
+            mark(Filed::Proposal, Some("factory-13"), -1),
+            mark(Filed::Ask, None, -1),
+        ];
+        assert!(!fold_filed(earlier.clone(), Some(t0), &mut about));
+        assert_eq!(about.len(), 2);
+        // Unknown turn start: any proposal or ask counts, as any done mark does.
+        assert!(fold_filed(earlier, None, &mut about));
+        assert!(fold_filed(
+            vec![mark(Filed::Ask, Some("factory-12"), 1)],
+            Some(t0),
+            &mut about
+        ));
+        assert_eq!(
+            about.iter().map(TaskId::as_str).collect::<Vec<_>>(),
+            ["factory-13", "factory-12"],
+            "each task once, the newest last"
+        );
+        // Bounded: the oldest fall out.
+        let many = (0..FILED_ABOUT_KEPT)
+            .map(|n| mark(Filed::SubTask, Some(&format!("other-{}", n + 1)), 1))
+            .collect();
+        fold_filed(many, Some(t0), &mut about);
+        assert_eq!(about.len(), FILED_ABOUT_KEPT);
+        assert!(!about.iter().any(|id| id.as_str() == "factory-12"));
     }
 
     #[test]
@@ -2822,7 +2877,7 @@ mod tests {
                 at: Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap(),
             }],
             None,
-            &[],
+            &mut vec![],
             false,
             &mut Vec::new(),
         )

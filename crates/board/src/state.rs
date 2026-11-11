@@ -553,8 +553,10 @@ pub fn take_filed(home: &Home, agent: &AgentId) -> Result<Vec<FiledMark>> {
 /// Removes done and filed marks no `Stop` hook read for `age` (a session that ended
 /// mid-turn), and agents' directories left empty for as long.
 pub fn prune_marks(home: &Home, age: std::time::Duration) -> Result<()> {
-    prune_marks_in(&home.state_dir().join("done"), age)?;
-    prune_marks_in(&home.state_dir().join("filed"), age)
+    // Both, also when the first fails.
+    let done = prune_marks_in(&home.state_dir().join("done"), age);
+    prune_marks_in(&home.state_dir().join("filed"), age)?;
+    done
 }
 
 fn prune_marks_in(dir: &Path, age: std::time::Duration) -> Result<()> {

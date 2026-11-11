@@ -1916,6 +1916,20 @@ fn stop_stays_quiet_about_a_done_task_whose_sub_task_the_agent_filed() {
     mark_done(&e, "factory-12", None);
     assert_eq!(stop(&e), None, "its remaining scope is on the board");
 
+    // What was filed about a task outlives the session; it answers for one done only.
+    add_task(
+        &e,
+        &sub_task("factory-22", "factory-15"),
+        &["--parent", "factory-15"],
+    );
+    session_start(&e, "resume");
+    prompt(&e, "finish that one");
+    mark_done(&e, "factory-15", None);
+    assert_eq!(stop(&e), None, "filed before the session was resumed");
+    prompt(&e, "it was opened again");
+    mark_done(&e, "factory-15", None);
+    assert!(stop(&e).is_some(), "done again with nothing new filed");
+
     // Another task's sub-task says nothing about this one.
     prompt(&e, "the next");
     add_task(
