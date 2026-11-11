@@ -3384,6 +3384,10 @@ fn status_and_asks_list_a_bounded_number_by_default() {
     let sent = e.stub.requests_to("GET /v1/asks");
     assert_eq!(sent.last().unwrap().query_pairs()["limit"], "4");
     e.stub.on("GET /v1/asks", &asks);
+    // The probe stays within the server's u32.
+    e.run(&["asks", "--limit", "4294967295"]);
+    let sent = e.stub.requests_to("GET /v1/asks");
+    assert_eq!(sent.last().unwrap().query_pairs()["limit"], "4294967295");
     let text = stdout(&e.run(&["asks", "--status", "all", "--limit", "100"]));
     assert!(
         text.starts_with("ask #1 ") && !text.contains("listed the newest"),

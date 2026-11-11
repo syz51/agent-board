@@ -853,7 +853,8 @@ async fn list_asks(
     Ok(Json(
         state
             .read(move |cx| {
-                // Like the tasks list, a limit of 0 reads as 1.
+                // A limit of 0 reads as 1, as for tasks. No upper bound: without a limit
+                // the list holds every ask anyway.
                 asks::list(cx, q.status, q.board.as_ref(), q.limit.map(|n| n.max(1)))
             })
             .await?,

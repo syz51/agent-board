@@ -1097,8 +1097,8 @@ pub async fn asks(
     // the caller asks. The answered and withdrawn ones grow without end.
     let limit = limit.or((status != Some("open")).then_some(ASKS_LIMIT_DEFAULT));
     // The server cuts the list at its limit without saying so: ask for one ask more, so
-    // the text can say that the list was cut.
-    let probe = limit.map(|limit| limit.saturating_add(1));
+    // the text can say that the list was cut. The server reads the limit as a u32.
+    let probe = limit.map(|limit| limit.saturating_add(1).min(u32::MAX as usize));
     let mut asks = ctx.client.asks(status, board, probe).await?;
     // Newest last, whatever order the server sends.
     asks.sort_by_key(|a| a.id);
@@ -1108,8 +1108,9 @@ pub async fn asks(
     if let Some(limit) = limit
         && more > 0
     {
-        // One ask over the limit is all a server that cuts the list sends; one that
-        // predates the limit sends every ask, which gives the count.
+        // One ask over the limit is all a server that cuts the list sends, so it gives no
+        // count; one that predates the limit sends every ask, which gives the count when
+        // more than one is over.
         let older = if more == 1 {
             "older ones match".to_owned()
         } else {
