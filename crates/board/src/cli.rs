@@ -197,11 +197,17 @@ pub enum Command {
     /// notes (--detailed for all and the history).
     /// With several ids, shows each task in a compact form in one call: state, evidence,
     /// text, findings and decisions (at most 20; --detailed is for one task).
+    /// The text of one task ends with a number: pass it as --since when you read the task
+    /// again, to see only what changed.
     Show {
         #[arg(required = true)]
         ids: Vec<TaskId>,
         #[arg(long)]
         detailed: bool,
+        /// Only what changed on one task after this: the number the last show ended with,
+        /// a time, or a duration back such as 2h.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Add a task.
     Add(AddArgs),
@@ -1163,7 +1169,16 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             ops::task_list(&ctx, &query, a.detailed, a.fields.as_deref()).await?
         }
-        Command::Show { ids, detailed } => ops::tasks_show(&ctx()?, &ids, detailed).await?,
+        Command::Show {
+            ids,
+            detailed,
+            since,
+        } => {
+            let since = since
+                .map(|s| ops::show_since(&s, chrono::Utc::now()))
+                .transpose()?;
+            ops::tasks_show(&ctx()?, &ids, detailed, since).await?
+        }
         Command::Add(a) => {
             let new = ops::NewTask {
                 board: a.board,

@@ -744,6 +744,11 @@ settings in use, warned once per edit.
   says to read them, with `detailed` when `task_show` would cut some.
   `task_show` with several ids shows each task's findings and decisions and counts its
   plain notes, so the agent doing a task still reads that task alone.
+  A session often shows the same task again to see whether a note or the status changed.
+  `task_show` of one task ends with the number of its latest event, and `since` with that
+  number shows only the later events, notes, evidence and changed fields, or one line when
+  nothing changed. The whole task stays the default, since a compaction can drop what the
+  session read before. The client filters the detail it already reads, so no route changed.
   A note by another agent on a task its owner has open (`doing` and `review` included)
   raises an alert for the owner, `<agent> changed your task <id> (finding)`, naming the
   note's kind. A finding on a `doing` or `review` task whose owner is gone (ended, not

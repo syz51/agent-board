@@ -1054,6 +1054,19 @@ fn task_show_takes_more_ids_and_task_list_takes_since_and_after() {
         json!({"id": "factory-12", "ids": ["factory-13"], "detailed": true}),
     );
     assert_eq!(refused["isError"], true, "{refused}");
+    // since is for one task: with an empty history it shows the whole task.
+    let refused = mcp.call(
+        5,
+        "task_show",
+        json!({"id": "factory-12", "ids": ["factory-13"], "since": "7"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let whole = mcp.call(6, "task_show", json!({"id": "factory-12", "since": "7"}));
+    assert_ne!(whole["isError"], true, "{whole}");
+    assert!(
+        text(&whole).starts_with("the history of factory-12 starts after #7; the whole task:"),
+        "{whole}"
+    );
 
     let listed = mcp.call(
         4,
