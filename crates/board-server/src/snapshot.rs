@@ -258,6 +258,9 @@ struct TaskLine {
     /// Who filed it: shown for proposals, which the filer must not review.
     #[serde(skip_serializing_if = "Option::is_none")]
     by: Option<String>,
+    /// Set on a ready task that is not `auto`: it waits on the user, so no agent starts it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    user: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,14 +585,27 @@ fn usage_line(u: &UsageView) -> String {
     parts.join(" · ")
 }
 
+/// What a held agent does, after the reason for the hold. The user's own request comes
+/// first: the hooks never end a turn the user starts while held, so an agent that reads
+/// only "stop" ends turns the user asked for. The stop covers every other turn, since the
+/// hooks cannot tell a wake-up's prompt from the user's.
+macro_rules! hold_action {
+    ($why:literal) => {
+        concat!(
+            $why,
+            " If the user's own message in this turn asks you to go on, such as \"continue\" \
+             or \"retry\", do that work: the hold does not stop it. In every other turn, such \
+             as a wake-up or a child's report, stop: end this turn now, and start no task, \
+             child thread or wake-up."
+        )
+    };
+}
+
 /// What the `hold:` line tells an agent the hard usage line holds.
-const USAGE_HOLD_ACTION: &str = "the weekly usage reached the user's reserve. Stop: end this \
-turn now, and start no task, child thread or wake-up. Continue only if the user's own \
-message in this turn asks for it.";
+const USAGE_HOLD_ACTION: &str = hold_action!("the weekly usage reached the user's reserve.");
 
 /// What the `hold:` line tells a held agent to do.
-const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
-task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
+const HOLD_ACTION: &str = hold_action!("the user paused this work.");
 
 /// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` active boards too, not
 /// only paused ones (the hard usage line), `?4` now: an active board's coordinator counts
@@ -856,6 +872,10 @@ fn fill_full(
                 .collect(),
         });
     }
+    // Work an agent may start comes first, so tasks that wait on the user never fill the
+    // list; within each group the order stays priority, then number.
+    let mut ready = ready;
+    ready.sort_by_key(|t| !t.auto);
     model.ready = task_list(cx, &ready, false)?;
 
     model.recent = recent(cx, agent, board, model.seq)?;
@@ -863,7 +883,8 @@ fn fill_full(
 }
 
 /// The first `snapshot_ready_items` of `tasks` with the total, or `None` when empty; `by`
-/// adds who filed each.
+/// adds who filed each, and marks no task as the user's; without it, a task that is not
+/// `auto` is marked.
 fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
     if tasks.is_empty() {
         return Ok(None);
@@ -880,6 +901,7 @@ fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
                 by: by
                     .then(|| handle_of(cx, t.created_by.as_str()))
                     .transpose()?,
+                user: !by && !t.auto,
             })
         })
         .collect::<Result<_>>()?;
@@ -909,6 +931,7 @@ fn peer_task(cx: &Ctx<'_>, peer: &AgentId) -> Result<Option<TaskLine>> {
         priority: None,
         title: title(&t.title),
         by: None,
+        user: false,
     }))
 }
 
@@ -1978,10 +2001,11 @@ fn render_lines(m: &Model) -> String {
         for t in &r.items {
             let _ = writeln!(
                 o,
-                "  {} {} {}",
+                "  {} {} {}{}",
                 t.id,
                 t.priority.unwrap_or(""),
-                quote(&t.title)
+                quote(&t.title),
+                if t.user { " (user)" } else { "" }
             );
         }
     }
@@ -2175,10 +2199,11 @@ fn render_yaml(m: &Model) -> String {
         for t in &r.items {
             let _ = writeln!(
                 o,
-                "    - {{id: {}, priority: {}, title: {}}}",
+                "    - {{id: {}, priority: {}, title: {}{}}}",
                 t.id,
                 t.priority.unwrap_or(""),
-                q(&t.title)
+                q(&t.title),
+                if t.user { ", user: true" } else { "" }
             );
         }
     }

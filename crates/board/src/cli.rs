@@ -212,7 +212,8 @@ pub enum Command {
     /// Add a task.
     Add(AddArgs),
     /// Claim a task: it moves to doing with you as owner. Also resumes your own, or
-    /// nobody's, task in review or blocked, unless a blocked reason or an open ask holds it.
+    /// nobody's, task in review or blocked, unless an open ask, or a blocked reason
+    /// someone else set, holds it.
     Claim { id: TaskId },
     /// Release a task you own back to open.
     Release { id: TaskId },
