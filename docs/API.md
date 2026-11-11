@@ -311,8 +311,12 @@ only (403 `forbidden` otherwise), because the server then deletes the board. Eve
 the server sweeps temporary boards that are **idle**: no event on the board (nor change to
 it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
 `review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
-period counts from the server's start at the earliest, so time the server was down is not
-idle time. Nor is a board idle while one of its tasks that is not done blocks an
+server's notices are not activity: a `task_updated` with actor `server` and empty `fields`
+(a quiet review, an owner away, a passed `not_before`) repeats, or comes, while nobody
+uses the board. Time the server was down is not idle time: the server records every
+minute, and at shutdown, that it is alive, and takes each gap between that and its next
+start out of the period. A restart does not start the period again. When that record
+cannot be written, no board is swept until it can. Nor is a board idle while one of its tasks that is not done blocks an
 unfinished task on another board. Each board is swept in its own transaction; one that
 fails is logged and tried again on the next sweep.
 
@@ -514,13 +518,16 @@ Reopening a closed board, or any change on it, starts the period again.
   - owned by the caller or by nobody: the claim resumes it, as `PATCH` with
     `status: doing` would (the same `task_updated` event, not `task_claimed`), after the
     checks above (blockers done, `not_before` passed, the `doing` limit, not an unaccepted
-    proposal). It is refused with 400 `invalid_transition` while the task may wait on the
-    user: a `blocked` task with a `blocked_reason`, or an open ask on the task. For a
-    reason, `next` quotes it and says what to do once it no longer holds: for the caller's
-    own task, resume it with `task_update <id> status=doing` or close it with `task_done`;
-    for nobody's, clear it with `task_update <id> status=open`, then claim it. For an ask,
-    `next` names it and says to wait for its answer, or to withdraw it (`ask_withdraw`, or
-    `board withdraw`), then claim again.
+    proposal). A `blocked_reason` that the caller set on its own task is cleared, as
+    `status: doing` clears it: the owner judges when its reason no longer holds. It is
+    refused with 400 `invalid_transition` while the task may wait on the user: an open ask
+    on the task, or a `blocked_reason` that someone else set (the latest `task_updated`
+    event that lists the field names who), which covers every reason on nobody's task.
+    For a reason, `next` quotes it and says what to do once it no longer holds: for the
+    caller's own task, resume it with `task_update <id> status=doing` or close it with
+    `task_done`; for nobody's, clear it with `task_update <id> status=open`, then claim
+    it. For an ask, `next` names it and says to wait for its answer, or to withdraw it
+    (`ask_withdraw`, or `board withdraw`), then claim again.
   - owned by another live agent: 409 `claim_refused` naming the owner. When the caller
     stands in for an owner whose session ended, 400 `invalid_transition` instead, with
     `next` naming `take=true`, and the claim is not counted in `claims_refused`.
@@ -721,7 +728,12 @@ knows two things for it:
   `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
   `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
   the answer unchanged.
-- `GET /v1/asks?status=open&board=` → `[Ask]` list.
+- `GET /v1/asks?status=open&board=&limit=` → `[Ask]` list, oldest first. `limit` is
+  optional: with it, the list holds only the newest `limit` asks that pass the filters (0
+  reads as 1); without it, every one. The list does not say that it was cut, so a client
+  asks for one ask more than it shows, as `board asks` does: it then says that older ones
+  match. A server that predates `limit` sends every ask, so `board asks` counts the older
+  ones when more than one is over its limit.
 - `GET /v1/asks/{id}` → `[Ask]` in any status (the web view's `/asks/<id>` link).
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
   `cli`, `web` or `telegram`. The `ask_answered` event's payload names the ask (`id`) and

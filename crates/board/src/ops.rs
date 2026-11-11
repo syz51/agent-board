@@ -1068,7 +1068,11 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
     }
     if let Some(task) = &created.task {
         // Advisory: the ask is made either way, so a failed check is reported, not raised.
-        match ctx.client.asks(Some("open"), Some(&created.board)).await {
+        match ctx
+            .client
+            .asks(Some("open"), Some(&created.board), None)
+            .await
+        {
             Ok(open) => {
                 let others: Vec<_> = open
                     .iter()
@@ -1121,20 +1125,31 @@ pub async fn asks(
     board: Option<&BoardSlug>,
     limit: Option<usize>,
 ) -> Result<Output> {
-    let mut asks = ctx.client.asks(status, board).await?;
-    // Newest last, whatever order the server sends.
-    asks.sort_by_key(|a| a.id);
     // Every open ask waits on the user, the oldest the longest, so none is left out unless
     // the caller asks. The answered and withdrawn ones grow without end.
     let limit = limit.or((status != Some("open")).then_some(ASKS_LIMIT_DEFAULT));
+    // The server cuts the list at its limit without saying so: ask for one ask more, so
+    // the text can say that the list was cut. The server reads the limit as a u32.
+    let probe = limit.map(|limit| limit.saturating_add(1).min(u32::MAX as usize));
+    let mut asks = ctx.client.asks(status, board, probe).await?;
+    // Newest last, whatever order the server sends.
+    asks.sort_by_key(|a| a.id);
     let more = limit.map_or(0, |limit| asks.len().saturating_sub(limit));
     asks.drain(..more);
     let mut text = render::ask_list(&asks);
     if let Some(limit) = limit
         && more > 0
     {
+        // One ask over the limit is all a server that cuts the list sends, so it gives no
+        // count; one that predates the limit sends every ask, which gives the count when
+        // more than one is over.
+        let older = if more == 1 {
+            "older ones match".to_owned()
+        } else {
+            format!("{more} older match")
+        };
         text.push_str(&format!(
-            "\nlisted the newest {limit}; {more} older match: narrow it with --status or --board, or raise --limit"
+            "\nlisted the newest {limit}; {older}: narrow it with --status or --board, or raise --limit"
         ));
     }
     Ok(Output::new(text, &asks))

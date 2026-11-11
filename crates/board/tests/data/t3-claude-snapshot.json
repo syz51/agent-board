@@ -1,0 +1,55 @@
+{
+  "displayName": "Claude",
+  "showInteractionModeToggle": true,
+  "reportsContextWindow": true,
+  "enabled": true,
+  "installed": true,
+  "version": "0.0.0",
+  "status": "ready",
+  "auth": {
+    "status": "authenticated",
+    "email": "user@example.com",
+    "workspaceId": "00000000-0000-0000-0000-000000000000",
+    "type": "subscription",
+    "label": "Placeholder plan"
+  },
+  "setup": {},
+  "checkedAt": "2026-11-11T11:22:56.635Z",
+  "models": [],
+  "slashCommands": [],
+  "skills": [],
+  "usageLimits": {
+    "checkedAt": "2026-11-11T11:22:59.448Z",
+    "windows": [
+      {
+        "id": "five_hour",
+        "kind": "session",
+        "label": "Session",
+        "windowDurationMins": 300,
+        "usedPercent": 38,
+        "resetsAt": "2026-11-11T14:20:00.312Z"
+      },
+      {
+        "id": "seven_day",
+        "kind": "weekly",
+        "label": "Weekly",
+        "windowDurationMins": 10080,
+        "usedPercent": 10,
+        "resetsAt": "2026-11-15T01:00:00.312Z"
+      },
+      {
+        "id": "seven_day_placeholder",
+        "kind": "weekly",
+        "label": "Weekly · Placeholder",
+        "windowDurationMins": 10080,
+        "usedPercent": 19,
+        "resetsAt": "2026-11-15T01:00:00.312Z"
+      }
+    ]
+  },
+  "instanceId": "claudeAgent",
+  "driver": "claudeAgent",
+  "continuation": {},
+  "versionAdvisory": {},
+  "compatibilityAdvisory": {}
+}
