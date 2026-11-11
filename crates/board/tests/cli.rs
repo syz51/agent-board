@@ -3137,3 +3137,109 @@ fn show_reads_several_tasks_in_one_call_in_a_compact_form() {
         stderr(&out)
     );
 }
+
+/// `board status` and `board asks` are bounded by default; `--detailed` and `--limit` give
+/// the rest.
+#[test]
+fn status_and_asks_list_a_bounded_number_by_default() {
+    let e = env();
+    e.stub
+        .on("GET /v1/boards/factory", board_fixture("factory", &[]));
+    let agents: Vec<board_proto::Agent> = (0..25)
+        .map(|i| {
+            // The higher the number, the longer ago it was seen. The two seen longest ago
+            // are not ended: one may own a task, so both stay.
+            let state = if i < 23 {
+                board_proto::AgentState::Ended
+            } else {
+                board_proto::AgentState::Idle
+            };
+            let mut agent = agent_fixture(&format!("t3:a{i:02}"), "air", state);
+            agent.last_seen = at() - chrono::TimeDelta::minutes(i);
+            agent
+        })
+        .collect();
+    e.stub.on("GET /v1/agents", &agents);
+    let text = stdout(&e.run(&["status", "--board", "factory"]));
+    assert!(
+        text.contains("t3:a17")
+            && !text.contains("t3:a18")
+            && !text.contains("t3:a22")
+            && text.contains("t3:a23")
+            && text.contains("t3:a24"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "left out 5 ended agents, seen before the ones listed: detailed lists every one\n"
+        ),
+        "{text}"
+    );
+    let json: Value =
+        serde_json::from_str(&stdout(&e.run(&["status", "--board", "factory", "--json"]))).unwrap();
+    assert_eq!(json["agents"].as_array().unwrap().len(), 20);
+    assert_eq!(json["agents_left_out"], 5);
+    let text = stdout(&e.run(&["status", "--board", "factory", "--detailed"]));
+    assert!(
+        text.contains("t3:a22") && !text.contains("left out"),
+        "{text}"
+    );
+    let json: Value = serde_json::from_str(&stdout(&e.run(&[
+        "status",
+        "--board",
+        "factory",
+        "--detailed",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(json["agents"].as_array().unwrap().len(), 25);
+    assert!(json.get("agents_left_out").is_none());
+
+    let asks: Vec<Ask> = (1..=60)
+        .rev()
+        .map(|id| Ask {
+            id,
+            board: "factory".parse().unwrap(),
+            task: None,
+            agent: ME.parse().unwrap(),
+            kind: AskKind::Decision,
+            question: format!("Question {id}?"),
+            options: vec![],
+            status: AskStatus::Answered,
+            answer: Some("yes".into()),
+            answered_via: None,
+            created_at: at(),
+            answered_at: None,
+        })
+        .collect();
+    e.stub.on("GET /v1/asks", &asks);
+    let text = stdout(&e.run(&["asks", "--status", "all"]));
+    assert!(
+        text.starts_with("ask #11 ") && !text.contains("ask #10 ") && text.contains("ask #60 "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "listed the newest 50; 10 older match: narrow it with --status or --board, or raise --limit\n"
+        ),
+        "{text}"
+    );
+    let json: Value =
+        serde_json::from_str(&stdout(&e.run(&["asks", "--status", "all", "--json"]))).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 50);
+    let text = stdout(&e.run(&["asks", "--status", "all", "--limit", "100"]));
+    assert!(
+        text.starts_with("ask #1 ") && !text.contains("listed the newest"),
+        "{text}"
+    );
+    // Every open ask waits on the user, so the default leaves none out.
+    let text = stdout(&e.run(&["asks"]));
+    assert!(
+        text.starts_with("ask #1 ") && !text.contains("listed the newest"),
+        "{text}"
+    );
+    let text = stdout(&e.run(&["asks", "--limit", "5"]));
+    assert!(text.starts_with("ask #56 "), "{text}");
+    let out = e.run(&["asks", "--limit", "0"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+}

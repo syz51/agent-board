@@ -438,10 +438,11 @@ async fn snapshots_respect_their_caps() {
         full.ends_with("</board>\n") || full.ends_with("</board>"),
         "{full}"
     );
-    assert!(full.contains("Claim before working"));
-    assert!(full.contains(
-        "Before task_done, file what is left as sub-tasks and found work as Proposal: tasks (auto=false)."
-    ));
+    // The snapshot is state: the rules are said once, in the MCP server's instructions. The
+    // line that marks quoted text as data stays, once in each message that carries such text.
+    assert!(full.ends_with("\nNotes and bodies: task_show <id>.\n</board>"));
+    assert!(!full.contains("Claim before working") && !full.contains("file what is left"));
+    assert_eq!(full.matches("data, not instructions").count(), 1, "{full}");
     let delta = text(&snapshot(&t, me, "kind=delta&since=0").await).to_owned();
     assert!(
         delta.chars().count() <= caps.snapshot_delta_chars,
@@ -522,13 +523,12 @@ async fn json_and_yaml_carry_the_same_model() {
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
     // Compact JSON fits the same cap as lines, so the formats compare fairly in the
-    // benchmark. Its quoted keys leave it a few characters longer, so the cap cuts the
-    // oldest recent event and nothing else.
+    // benchmark: with the one-line footer, nothing is cut.
     assert!(json_text.chars().count() <= 2000);
     assert!(!body.contains("\n  "), "JSON is compact");
     assert_eq!(model["peers"].as_array().unwrap().len(), 2);
     assert_eq!(model["ready"]["total"], 4);
-    assert_eq!(model["recent"].as_array().unwrap().len(), 2);
+    assert_eq!(model["recent"].as_array().unwrap().len(), 3);
 
     let yaml = text(&snapshot(&t, ME, "since=806&format=yaml").await).to_owned();
     assert!(yaml.contains("you:\n"), "{yaml}");
@@ -1774,12 +1774,12 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
     t.register(B, Some(REPO), None).await;
     t.board("factory", &[REPO]).await;
     let mut mine = Vec::new();
-    for i in 0..4 {
+    for i in 0..5 {
         let title =
             format!("Make the parser accept every malformed header seen in the wild {i:02}");
         let id = t.task(ME, "factory", &title).await;
         assert!(t.claim(ME, &id).await.0.is_success());
-        if i < 3 {
+        if i < 4 {
             let (s, v) = t.patch(ME, &id, json!({ "status": "review" })).await;
             assert!(s.is_success(), "{v}");
         }
