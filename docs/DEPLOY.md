@@ -115,8 +115,41 @@ project on that device. `board watch` finds the project in the device's
 `$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
 A running `board watch` re-reads the file within a minute of an edit and applies these two
-tables and `feedback_board` without a restart; a change to `server`, `device` or `t3_bin`
-needs one, and the daemon's log says so.
+tables and `feedback_board` without a restart; a change to `server`, `device`, `t3_bin`
+or `[thread_model]` needs one, and the daemon's log says so.
+
+`board watch` starts its threads (coordinators, workers and judges) with the project's
+default provider and model, which the user's own chats use too. To give them settings of
+their own, add a provider instance in T3 Code and name it in `config.toml`. This example
+keeps the claude.ai connectors (such as Gmail and Docs) out of agent threads, where their
+tool lists cost tokens at each reconnect, and leaves them in the user's chats:
+
+1. In T3 Code's `settings.json`, add an instance of the Claude driver under
+   `providerInstances`:
+
+   ```json
+   "claude-agents": {
+     "driver": "claudeAgent",
+     "displayName": "Claude (agents)",
+     "environment": [
+       { "name": "ENABLE_CLAUDEAI_MCP_SERVERS", "value": "false", "sensitive": false }
+     ]
+   }
+   ```
+
+2. Restart T3 Code, and check that the instance shows in its provider list as signed in.
+3. Name the instance and a model of it, then restart `board watch`:
+
+   ```toml
+   # config.toml
+   [thread_model]
+   provider = "claude-agents"
+   model = "<model slug>"
+   ```
+
+Both keys are required: T3 Code takes a provider only with a model, so these threads use
+this model and not the project's default. Threads started before the change keep their
+provider.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
