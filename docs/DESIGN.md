@@ -667,7 +667,8 @@ settings in use, warned once per edit.
   adoption newer than the last failed start is tried at once. An adopted thread that T3 no
   longer has, has archived, or whose folder is gone, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
-- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
+- **Its loop**: read the board state (a snapshot in the first loop, then the wake-up's
+  lines and the prompt's delta, and a snapshot again only when those are not enough); take the highest-priority ready task marked `auto`;
   delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
   work is in another repository, a T3 thread launched in that repository's project, since
   `delegate_task` runs only in the coordinator's own project), naming the task
@@ -782,6 +783,17 @@ settings in use, warned once per edit.
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
+  - **Text**: one line per change, naming the board and the task or ask, then the line
+    `Continue from this and the board delta in this prompt, if there is one.` The message
+    asks for no `board_snapshot` call: the `UserPromptSubmit` hook, which every runtime's
+    hooks run, adds the delta (alerts and changed counts) to the same prompt, so a call
+    would cost the agent one more turn for what it already has. An agent whose hook did
+    not run still gets the lines; it calls `board_snapshot` when it needs more, as its
+    instructions say. These messages do name the call, since the delta is not enough for
+    them: the first brief, the adoption brief, the re-brief and a fresh session, which
+    start the loop anew; and the three that follow a time without wake-ups, the line for
+    a board the user resumed, the line for usage that eased, and the message after a
+    usage-limit reset.
   - **Ended is not gone**: T3 closes a Claude session left idle for 30 minutes, and that
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).

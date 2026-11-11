@@ -1196,7 +1196,7 @@ async fn a_ready_task_wakes_the_coordinator_once_with_board_text() {
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+            "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.".to_owned()
         )]
     );
     assert_eq!(e.daemon.state.last_seq, Some(12));
@@ -1231,7 +1231,7 @@ async fn a_task_moved_to_review_wakes_the_coordinator_and_each_send_is_logged() 
         [(
             "coord".to_owned(),
             "board factory: factory-6 moved to review; check it against its acceptance checks, \
-             or note what it still waits on\nRun board_snapshot and continue."
+             or note what it still waits on\nContinue from this and the board delta in this prompt, if there is one."
                 .to_owned()
         )]
     );
@@ -1290,7 +1290,7 @@ async fn the_servers_idle_notice_wakes_the_owner_away_from_its_doing_task() {
                 "board factory: your factory-7 is in doing, and you have been away from it since \
                  {since}. Continue it, or park it by what it waits on: review with a note naming \
                  the PR, blocked with the reason, or open with your handoff\n\
-                 Run board_snapshot and continue."
+                 Continue from this and the board delta in this prompt, if there is one."
             )
         )]
     );
@@ -1410,7 +1410,7 @@ async fn an_idle_notice_for_an_owner_no_device_can_wake_goes_to_the_coordinator(
             format!(
                 "board factory: factory-7 is in doing, and its owner {owner}, which cannot be \
                  woken, has been away from it since {since}. Check it, then continue it, hand it \
-                 over, or park it by what it waits on\nRun board_snapshot and continue."
+                 over, or park it by what it waits on\nContinue from this and the board delta in this prompt, if there is one."
             ),
         )
     };
@@ -1526,7 +1526,7 @@ async fn a_filed_proposal_wakes_the_coordinator_to_review_it() {
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-8 is a proposal to review\nRun board_snapshot and continue."
+            "board factory: factory-8 is a proposal to review\nContinue from this and the board delta in this prompt, if there is one."
                 .to_owned()
         )]
     );
@@ -1565,7 +1565,7 @@ async fn a_passed_not_before_wakes_the_coordinator() {
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-7 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+            "board factory: factory-7 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.".to_owned()
         )]
     );
 }
@@ -1643,12 +1643,12 @@ async fn a_blocker_done_on_another_board_wakes_the_waiting_boards_coordinator_an
         [
             (
                 "coord".to_owned(),
-                "board factory: other-3 is done; its blocker cleared for factory-12\nRun board_snapshot and continue."
+                "board factory: other-3 is done; its blocker cleared for factory-12\nContinue from this and the board delta in this prompt, if there is one."
                     .to_owned()
             ),
             (
                 "worker".to_owned(),
-                "board factory: every blocker of your blocked factory-13 is done; resume it (task_update factory-13 status=doing)\nRun board_snapshot and continue."
+                "board factory: every blocker of your blocked factory-13 is done; resume it (task_update factory-13 status=doing)\nContinue from this and the board delta in this prompt, if there is one."
                     .to_owned()
             ),
         ]
@@ -2108,7 +2108,7 @@ async fn an_ended_agent_whose_thread_t3_still_has_is_woken() {
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+            "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.".to_owned()
         )]
     );
 
@@ -2414,7 +2414,7 @@ async fn a_queued_ready_line_is_checked_again_when_sent() {
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-9 is done; its blocker cleared for factory-4\nRun board_snapshot and continue."
+            "board factory: factory-9 is done; its blocker cleared for factory-4\nContinue from this and the board delta in this prompt, if there is one."
                 .to_owned()
         )]
     );
@@ -2465,7 +2465,7 @@ async fn lines_for_a_running_agent_are_held_and_sent_as_one_message_when_it_goes
         e.t3.sends(),
         [(
             "coord".to_owned(),
-            "board factory: factory-1 is ready (p1)\nboard factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+            "board factory: factory-1 is ready (p1)\nboard factory: factory-2 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
                 .to_owned()
         )]
     );
@@ -2516,7 +2516,7 @@ async fn a_failed_send_backs_off_and_stops_once_the_thread_is_gone() {
     assert_eq!(sends.len(), 2, "{sends:?}");
     assert_eq!(
         sends[1].1,
-        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-2 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
     e.daemon.flush(next).await;
     assert_eq!(e.t3.sends().len(), 2, "sent once");
@@ -2559,7 +2559,7 @@ fn unsure_wakes(e: &Env, agent: &str) -> Option<board::daemon::UnsureWakes> {
 async fn a_timed_out_wake_up_the_thread_never_got_is_sent_again_once() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
-    let line = "board factory: factory-1 is ready (p1)\nRun board_snapshot and continue.";
+    let line = "board factory: factory-1 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.";
     e.daemon.reconcile(at()).await.unwrap();
     queue_ready(&mut e, 10, &["factory-1"], at()).await;
     e.t3.time_out_send.store(true, Ordering::SeqCst);
@@ -2622,7 +2622,7 @@ async fn a_timed_out_wake_up_that_reached_the_thread_is_not_sent_twice() {
     assert_eq!(sends.len(), 2, "{sends:?}");
     assert_eq!(
         sends[1].1,
-        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-2 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
     assert_eq!(unsure_wakes(&e, &agent), None);
     e.daemon.flush(minute(30)).await;
@@ -2676,7 +2676,7 @@ async fn a_timed_out_wake_up_waits_for_a_busy_thread_and_a_failed_check_sends_no
     assert_eq!(sends.len(), 2, "{sends:?}");
     assert_eq!(
         sends[1].1,
-        "board factory: factory-2 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-2 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
     assert_eq!(unsure_wakes(&e, &agent), Some(unsure));
 
@@ -2686,7 +2686,7 @@ async fn a_timed_out_wake_up_waits_for_a_busy_thread_and_a_failed_check_sends_no
     assert_eq!(sends.len(), 3, "{sends:?}");
     assert_eq!(
         sends[2].1,
-        "board factory: factory-1 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-1 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
     assert_eq!(unsure_wakes(&e, &agent), None);
 }
@@ -3773,7 +3773,7 @@ async fn an_adopted_thread_is_briefed_and_named_coordinator_instead_of_a_new_thr
         sends[1],
         (
             ADOPTED.to_owned(),
-            "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.".to_owned()
+            "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.".to_owned()
         )
     );
     assert_eq!(starts(&e.t3), 0, "never a new thread");
@@ -5659,7 +5659,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
 
     // The next wake-up carries it, in front of its lines; a failed send leaves it owed.
     queue_ready(&mut e, 10, &["factory-4"], at()).await;
-    let ready = "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue.";
+    let ready = "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.";
     let expected = format!(
         "{}\n\n{ready}",
         board::daemon::rebrief_message(&slug, false)
@@ -5690,7 +5690,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     assert_eq!(sends.len(), 3, "{sends:?}");
     assert_eq!(
         sends[2].1,
-        "board factory: factory-5 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-5 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
 
     // A send that timed out may have got through: the prompt counts as sent. (It did, so
@@ -5723,7 +5723,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     assert_eq!(
         sends[4].1,
         format!(
-            "{}\n\n{}\n\nboard factory: factory-7 is ready (p1)\nRun board_snapshot and continue.",
+            "{}\n\n{}\n\nboard factory: factory-7 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.",
             board::daemon::rebrief_message(&slug, false),
             board::daemon::rebrief_message(&other, false)
         )
@@ -5769,7 +5769,7 @@ async fn a_board_with_work_or_unknown_ready_work_re_briefs_its_coordinator_at_on
     e.daemon.flush(at()).await;
     assert_eq!(
         e.t3.sends()[5].1,
-        "board factory: factory-4 is ready (p1)\nRun board_snapshot and continue."
+        "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
     );
 }
 
@@ -5789,7 +5789,7 @@ async fn an_idle_coordinator_resumed_at_a_usage_reset_gets_the_new_prompt_with_i
     assert_eq!(
         sends[0].1,
         format!(
-            "{}\n\nboard factory: the usage limit has reset. Run board_snapshot and continue your loop.",
+            "{}\n\nboard factory: the usage limit has reset. Call board_snapshot and continue your loop.",
             board::daemon::rebrief_message(&slug, false)
         )
     );
@@ -5991,7 +5991,7 @@ async fn a_lost_wake_up_with_a_re_brief_is_sent_again_as_one_message() {
         sends[1].1,
         format!(
             "{}\n\nboard factory: factory-5 is ready (p1)\nboard factory: factory-4 is ready (p1)\n\
-             Run board_snapshot and continue.",
+             Continue from this and the board delta in this prompt, if there is one.",
             board::daemon::rebrief_message(&slug, false)
         )
     );
@@ -6006,8 +6006,11 @@ async fn a_lost_wake_up_with_a_re_brief_is_sent_again_as_one_message() {
 #[tokio::test]
 async fn a_second_timeout_before_the_check_keeps_both_messages() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
-    let line =
-        |id: &str| format!("board factory: {id} is ready (p1)\nRun board_snapshot and continue.");
+    let line = |id: &str| {
+        format!(
+            "board factory: {id} is ready (p1)\nContinue from this and the board delta in this prompt, if there is one."
+        )
+    };
     e.daemon.reconcile(at()).await.unwrap();
     queue_ready(&mut e, 10, &["factory-1"], at()).await;
     e.t3.time_out_send.store(true, Ordering::SeqCst);
@@ -6131,7 +6134,7 @@ async fn a_re_brief_sent_with_a_resume_that_timed_out_is_not_repeated_with_each_
     assert_eq!(sends.len(), 2);
     assert_eq!(
         sends[1].1,
-        "board factory: the usage limit has reset. Run board_snapshot and continue your loop."
+        "board factory: the usage limit has reset. Call board_snapshot and continue your loop."
     );
     e.daemon
         .reconcile(later + chrono::Duration::minutes(1))
@@ -6193,7 +6196,7 @@ async fn a_wake_up_says_a_fresh_session_is_due_after_ten_runs_and_again_ten_late
     assert_eq!(
         message,
         format!(
-            "board factory: factory-12 is ready (p1)\nRun board_snapshot and continue.\n{}",
+            "board factory: factory-12 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.\n{}",
             board::daemon::fresh_session_line(&factory())
         )
     );
@@ -7734,4 +7737,62 @@ async fn a_failed_usage_report_keeps_the_last_pace() {
     assert!(e.daemon.state.usage_held.contains(&factory()), "still held");
     e.daemon.flush(later).await;
     assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+}
+
+/// A wake-up asks for no snapshot call: its lines name the change, and the woken agent's
+/// prompt hook adds the board delta to the prompt the message arrives as.
+#[tokio::test]
+async fn a_wake_up_prompt_carries_the_board_change_without_a_snapshot_call() {
+    const SESSION: &str = "00893aaf-19fa-41d2-8238-13269b9b3ca0";
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_ready(&mut e, 10, &["factory-4"], at()).await;
+    e.daemon.flush(at()).await;
+    let (_, message) = e.t3.sends().pop().expect("a wake-up");
+    assert!(message.starts_with("board factory: factory-4 is ready (p1)\n"));
+    assert!(!message.contains("board_snapshot"), "{message}");
+
+    // The thread gets the message as its next prompt, where the hook runs.
+    let dir = e._dir.path().join("hook");
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = home_for(&dir, &e.stub.url);
+    let repo = git_repo(&dir, "git@github.com:syz51/agent-board.git");
+    let delta = "<board>\nalerts: factory-4 is ready\ncounts: ready 1\n</board>";
+    e.stub.on(
+        &format!(
+            "POST /v1/agents/{}/state",
+            enc(&format!("claude:{SESSION}"))
+        ),
+        agent_fixture(&format!("claude:{SESSION}"), DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(board_proto::SnapshotKind::Delta, delta, 11),
+    );
+    let payload = json!({
+        "session_id": SESSION,
+        "cwd": repo,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": message,
+    });
+    let out = tokio::task::spawn_blocking(move || {
+        board(
+            &home,
+            &repo,
+            &[],
+            &["hook", "user-prompt-submit", "--runtime", "claude"],
+            &payload.to_string(),
+        )
+    })
+    .await
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("JSON output");
+    assert_eq!(
+        reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap(),
+        delta
+    );
+    let asked = e.stub.requests_to("GET /v1/snapshot");
+    assert_eq!(asked.last().unwrap().query_pairs()["kind"], "delta");
 }
