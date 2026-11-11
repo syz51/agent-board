@@ -1505,7 +1505,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         (OVERLAP, format!("{}|{touched}", event.actor)),
                         Alert {
                             alert,
-                            action: "re-read before editing".to_owned(),
+                            action: board_proto::EDIT_OVERLAP_ACTION.to_owned(),
                             rank: rank(OVERLAP),
                         },
                     );
@@ -1552,7 +1552,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         (OVERLAP, format!("{}|{glob}", event.actor)),
                         Alert {
                             alert,
-                            action: "coordinate before editing those files".to_owned(),
+                            action: board_proto::LEASE_OVERLAP_ACTION.to_owned(),
                             rank: rank(OVERLAP),
                         },
                     );
