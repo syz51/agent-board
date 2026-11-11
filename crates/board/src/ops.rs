@@ -1596,7 +1596,7 @@ pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
     ))
 }
 
-/// Resolves a feedback item you own (or as the user): it moves to done.
+/// Resolves a feedback item you own or an open one nobody owns (or as the user): it moves to done.
 pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Output> {
     let task = ctx.client.resolve_feedback(id, &req).await?;
     Ok(Output::new(render::task_line(&task), &task))

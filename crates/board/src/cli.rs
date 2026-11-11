@@ -396,7 +396,7 @@ pub enum Command {
         #[arg(help = at_most("The first line becomes the title", limits().body_chars))]
         text: String,
     },
-    /// Resolve a feedback item you own (or as the user); it moves to done.
+    /// Resolve a feedback item you own or an open one nobody owns (or as the user); it moves to done.
     #[command(group(clap::ArgGroup::new("resolution").required(true)))]
     Resolve {
         id: TaskId,
