@@ -750,8 +750,42 @@ async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
     assert!(s.is_success(), "{v}");
     assert_eq!(v["status"], "doing", "{v}");
 
-    // The owner set its own reason and judges when it no longer holds: its claim clears
-    // the reason and resumes the task, as task_update status=doing does.
+    // A reason someone else set on the owner's task may name a wait on the user: the
+    // owner's claim is refused, quoting it, and the task keeps the reason.
+    let told = t.task(A, "factory", "Told to wait").await;
+    assert!(t.claim(A, &told).await.0.is_success());
+    let (s, v) = patch_as(
+        &t,
+        B,
+        true,
+        &told,
+        json!({ "status": "blocked", "blocked_reason": "the user picks the host" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = t.claim(A, &told).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("\"the user picks the host\"")
+            && next.contains(&format!("task_update {told} status=doing"))
+            && next.contains(&format!("task_done {told}"))
+            && !next.contains("status=open"),
+        "{v}"
+    );
+    let kept = t.get_task(&told).await;
+    assert_eq!(
+        (kept["status"].as_str(), kept["blocked_reason"].as_str()),
+        (Some("blocked"), Some("the user picks the host")),
+        "{kept}"
+    );
+
+    // The owner set this reason itself and judges when it no longer holds: its claim
+    // clears the reason and resumes the task, as task_update status=doing does.
     let asked = t.task(A, "factory", "Waits on the user").await;
     assert!(t.claim(A, &asked).await.0.is_success());
     let (s, v) = t
@@ -814,6 +848,33 @@ async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
             })
         ),
         "{events:?}"
+    );
+
+    // The owner's own reason does not skip the other checks: a blocker that is not done
+    // still refuses the claim, and the reason stays.
+    let gate = t.task(A, "factory", "Gate").await;
+    let both = t.task(A, "factory", "Reason and blocker").await;
+    assert!(t.claim(A, &both).await.0.is_success());
+    let (s, v) = t
+        .patch(
+            A,
+            &both,
+            json!({ "status": "blocked", "blocked_reason": "needs the gate", "blockers": [gate] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.claim(A, &both).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains(&gate), "{v}");
+    let kept = t.get_task(&both).await;
+    assert_eq!(
+        (kept["status"].as_str(), kept["blocked_reason"].as_str()),
+        (Some("blocked"), Some("needs the gate")),
+        "{kept}"
     );
 
     // Nobody's task blocked with a reason: the hint names clearing it, then claiming.

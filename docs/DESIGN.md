@@ -137,8 +137,8 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   claim of a task parked in `review` or `blocked` that is the caller's or nobody's resumes
   it, with a claim's checks, so an agent returning to its own work is not sent away. An
   open ask on the task still refuses it, since the task waits on the user, and so does a
-  `blocked_reason` on nobody's task, which may name such a wait; the owner's claim clears
-  its own reason. Another live agent's parked task is refused, naming the owner. After
+  `blocked_reason` that someone else set, which may name such a wait; the owner's claim
+  clears a reason it set itself. Another live agent's parked task is refused, naming the owner. After
   24 hours unseen the owner is stale and another agent may take the task (logged). The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). Once the
