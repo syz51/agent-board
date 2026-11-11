@@ -419,9 +419,14 @@ pub fn task_changes(detail: &TaskDetail, since: Since) -> String {
     let (Some(first), Some(last)) = (events.first(), events.last()) else {
         return format!("no change since {point}: {line}");
     };
-    // A note or evidence has no sequence number: it is later when its time is not before
-    // the first later event's.
+    // Evidence has no sequence number: it is later when its time is not before the first
+    // later event's. A note is later when a later event names it.
     let from = first.at;
+    let noted: Vec<i64> = events
+        .iter()
+        .filter(|e| e.event_type == EventType::NoteAdded)
+        .filter_map(|e| e.payload["note"].as_i64())
+        .collect();
     let mut out = format!("{line}\nsince {point}:");
     let mut changed: Vec<&str> = Vec::new();
     for event in &events {
@@ -441,7 +446,7 @@ pub fn task_changes(detail: &TaskDetail, since: Since) -> String {
         }
         changed.extend(fields);
         if event.event_type == EventType::TaskDone {
-            changed.push("summary");
+            changed.extend(["summary", "resolution_reason"]);
         }
     }
     for ev in detail.evidence.iter().filter(|ev| ev.at >= from) {
@@ -455,7 +460,7 @@ pub fn task_changes(detail: &TaskDetail, since: Since) -> String {
         detail
             .notes
             .iter()
-            .filter(|n| n.at >= from)
+            .filter(|n| noted.contains(&n.id))
             .map(|n| note_line(n, handles)),
     );
     for line in &mut peer {
@@ -1207,6 +1212,13 @@ mod tests {
         assert!(
             changes.ends_with("\nchanges only on the next read: since 5"),
             "{changes}"
+        );
+        // A note is later by its event, not by its time: one of the same minute as a
+        // later event is not shown again.
+        let tied = task_changes(&detail, Since::Seq(4));
+        assert!(
+            tied.contains("new one") && !tied.contains("It passes"),
+            "{tied}"
         );
         // A time works as the point too.
         let at = "2026-11-07T10:05:30Z".parse().unwrap();

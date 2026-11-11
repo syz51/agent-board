@@ -1068,6 +1068,58 @@ fn task_show_takes_more_ids_and_task_list_takes_since_and_after() {
         "{whole}"
     );
 
+    // With a history: only the later note, then one line once nothing is later.
+    let at = "2026-11-07T10:00:00Z";
+    let event = |seq: i64, kind: &str, payload: Value| {
+        json!({
+            "seq": seq, "at": at, "board": "factory", "actor": "t3:thread-1", "type": kind,
+            "task": "factory-12", "payload": payload,
+        })
+    };
+    let note = |id: i64, text: &str| {
+        json!({
+            "id": id, "task": "factory-12", "agent": "t3:thread-1", "kind": "note",
+            "text": text, "at": at,
+        })
+    };
+    stub.on(
+        "GET /v1/tasks/factory-12",
+        json!({
+            "task": task_fixture("factory-12", "Do it"),
+            "notes": [note(1, "read before"), note(2, "added later")],
+            "evidence": [], "blocks": [], "children": [],
+            "history": [
+                event(7, "task_created", json!({})),
+                event(8, "note_added", json!({"note": 1, "kind": "note"})),
+                event(9, "note_added", json!({"note": 2, "kind": "note"})),
+            ],
+        }),
+    );
+    let changes = mcp.call(7, "task_show", json!({"id": "factory-12", "since": "8"}));
+    let changes = text(&changes);
+    assert!(changes.starts_with("factory-12 open"), "{changes}");
+    assert!(
+        changes.contains("added later") && !changes.contains("read before"),
+        "{changes}"
+    );
+    assert!(
+        changes.ends_with("changes only on the next read: since 9"),
+        "{changes}"
+    );
+    let same = mcp.call(8, "task_show", json!({"id": "factory-12", "since": "9"}));
+    let same = text(&same);
+    assert!(
+        same.starts_with("no change since #9: factory-12 open"),
+        "{same}"
+    );
+    assert_eq!(same.lines().count(), 1, "{same}");
+    let refused = mcp.call(
+        9,
+        "task_show",
+        json!({"id": "factory-12", "since": "9", "detailed": true}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+
     let listed = mcp.call(
         4,
         "task_list",

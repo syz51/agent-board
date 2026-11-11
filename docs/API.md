@@ -1066,7 +1066,10 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   event: the task's line, each later event of its `history` (a status change as `<from>
   to <to>`, with the changed fields' names), the evidence and notes added from the first
   later event on, the present text of each changed field (`body`, `acceptance`,
-  `blocked_reason`, and `summary` after a done), and the next `since`. When no event is
+  `blocked_reason`, and `summary` and `resolution_reason` after a done), and the next
+  `since`. A note is later when a later `note_added` event names its id; evidence when
+  its time is not before the first later event's. Other changed fields are named only,
+  and a field that was cleared has no text line. When no event is
   later it prints one line, `no change since #<n>: <task line>`. `since` also takes an
   RFC 3339 time, a date or a duration back (`2h`). A change of a child or a blocker is
   not an event of the task, so read those tasks themselves. When the `history` starts
