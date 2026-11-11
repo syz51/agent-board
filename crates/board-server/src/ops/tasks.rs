@@ -1096,6 +1096,22 @@ fn open_ask(cx: &Ctx<'_>, task: &TaskId) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// Who last set or changed `task`'s `blocked_reason`: the actor of the latest update that
+/// lists the field. `None` when the log no longer holds that event.
+fn reason_set_by(cx: &Ctx<'_>, task: &TaskId) -> Result<Option<String>> {
+    Ok(cx
+        .db
+        .query_row(
+            "SELECT e.actor FROM events e WHERE e.task = ?1 AND e.type = 'task_updated' \
+             AND EXISTS (SELECT 1 FROM json_each(e.payload, '$.fields') f \
+                         WHERE f.value = 'blocked_reason') \
+             ORDER BY e.seq DESC LIMIT 1",
+            [task.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// How the agent that asked `ask` withdraws it, through MCP or the CLI.
 fn withdraw_hint(ask: i64) -> String {
     format!(
@@ -1107,15 +1123,20 @@ fn withdraw_hint(ask: i64) -> String {
 /// Resumes a parked task (review or blocked) that is the caller's or nobody's, for
 /// `claim`: a claim's checks, then `update` with `status: doing`, so the change and its
 /// event are the same as `task_update status=doing` and stats do not count it as a claim
-/// from ready. A `blocked_reason` or an open ask on the task refuses it: it may wait on the
-/// user.
+/// from ready. An open ask on the task refuses it: it waits on the user. So does a
+/// `blocked_reason` that someone else set, which may name such a wait. The reason the
+/// caller set on its own task is its own to judge, so its claim clears it, as
+/// `status: doing` does.
 fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
     let id = &task.id;
+    let owned = task.owner.as_ref() == Some(agent);
     // Stored only on blocked tasks and only when not blank.
-    if let Some(reason) = &task.blocked_reason {
+    if let Some(reason) = &task.blocked_reason
+        && !(owned && reason_set_by(cx, id)?.as_deref() == Some(agent.as_str()))
+    {
         return Err(bad_transition(
             format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
-            if task.owner.as_ref() == Some(agent) {
+            if owned {
                 format!(
                     "once \"{reason}\" no longer holds, resume it ({}), which clears the \
                      reason, or close it with task_done {id} if its work is finished",
