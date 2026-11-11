@@ -561,9 +561,32 @@ const TASK_FIELDS: [&str; 26] = [
     "any_word",
 ];
 
-pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {
+pub async fn task_show(
+    ctx: &Ctx,
+    id: &TaskId,
+    detailed: bool,
+    since: Option<render::Since>,
+) -> Result<Output> {
     let detail = ctx.client.task(id).await?;
-    Ok(Output::new(render::task_detail(&detail, detailed), &detail))
+    let text = match since {
+        Some(since) => render::task_changes(&detail, since),
+        None => render::task_detail(&detail, detailed),
+    };
+    Ok(Output::new(text, &detail))
+}
+
+/// The `since` of a repeat `task_show`: an event sequence number, as the last `task_show`
+/// named it, or a time, date or duration back from `now` ([`parse_since`]).
+pub fn show_since(value: &str, now: Timestamp) -> Result<render::Since> {
+    let value = value.trim();
+    if let Ok(seq) = value.parse::<i64>()
+        && seq >= 0
+    {
+        return Ok(render::Since::Seq(seq));
+    }
+    parse_since(value, now)
+        .map(render::Since::At)
+        .map_err(|e| anyhow!("{e:#}; or send the number the last task_show ended with"))
 }
 
 /// Most tasks one `task_show` reads.
@@ -573,15 +596,28 @@ pub const TASK_SHOW_MAX: usize = 20;
 /// evidence, text, findings and decisions. They are read at the same time; one that cannot
 /// be read is named with the reason and does not fail the others. An id named twice is
 /// read once, so the same id alone is the full form.
-pub async fn tasks_show(ctx: &Ctx, ids: &[TaskId], detailed: bool) -> Result<Output> {
+///
+/// `since` shows one task's changes after that point instead ([`render::task_changes`]).
+pub async fn tasks_show(
+    ctx: &Ctx,
+    ids: &[TaskId],
+    detailed: bool,
+    since: Option<render::Since>,
+) -> Result<Output> {
     let mut unique: Vec<&TaskId> = Vec::with_capacity(ids.len());
     for id in ids {
         if !unique.contains(&id) {
             unique.push(id);
         }
     }
+    if detailed && since.is_some() {
+        bail!("since shows the changes only: drop detailed, or drop since for the whole task");
+    }
     if let [id] = unique.as_slice() {
-        return task_show(ctx, id, detailed).await;
+        return task_show(ctx, id, detailed, since).await;
+    }
+    if since.is_some() {
+        bail!("since shows one task's changes: name one id, or drop since");
     }
     if detailed {
         bail!("detailed shows one task: name one id, or drop detailed");
@@ -1554,6 +1590,24 @@ pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Out
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_since_takes_an_event_number_or_a_time() {
+        let now: Timestamp = "2026-11-07T10:00:00Z".parse().unwrap();
+        assert_eq!(
+            show_since(" 33990 ", now).unwrap(),
+            render::Since::Seq(33990)
+        );
+        assert_eq!(
+            show_since("30m", now).unwrap(),
+            render::Since::At("2026-11-07T09:30:00Z".parse().unwrap())
+        );
+        let err = show_since("latest", now).unwrap_err().to_string();
+        assert!(
+            err.contains("the number the last task_show ended with"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn since_takes_a_time_a_date_or_a_duration_back() {

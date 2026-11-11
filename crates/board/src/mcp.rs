@@ -251,12 +251,20 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "ids",
                     strings(
-                        "More tasks in the same call, at most 20 in all, each in a compact form.",
+                        "More tasks, at most 20 in all, each in a compact form.",
                         TASK_ID_MAX,
                     ),
                     false,
                 ),
                 ("detailed", b(DETAILED_ARG), false),
+                (
+                    "since",
+                    s(
+                        "Repeat read: the number the last read ended with, to show changes only.",
+                        TIME_MAX,
+                    ),
+                    false,
+                ),
             ]
         },
     },
@@ -862,7 +870,11 @@ impl BoardMcp {
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;
                 let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
-                ops::tasks_show(&ctx, &ids, a.detailed).await?
+                let since = a
+                    .since
+                    .map(|s| ops::show_since(&s, chrono::Utc::now()))
+                    .transpose()?;
+                ops::tasks_show(&ctx, &ids, a.detailed, since).await?
             }
             "task_add" => {
                 let a: AddArgs = parse(name, args)?;
@@ -1070,6 +1082,7 @@ struct ShowArgs {
     ids: Vec<TaskId>,
     #[serde(default)]
     detailed: bool,
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
