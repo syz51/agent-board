@@ -292,6 +292,14 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 (
+                    "repo",
+                    s(
+                        "Or a repository URL or key, for its board.",
+                        board_proto::REPO_KEY_MAX,
+                    ),
+                    false,
+                ),
+                (
                     "body",
                     s("Markdown that stands alone.", limits().body_chars),
                     false,
@@ -889,6 +897,7 @@ impl BoardMcp {
                 let a: AddArgs = parse(name, args)?;
                 let new = ops::NewTask {
                     board: a.board,
+                    repo: a.repo,
                     title: a.title,
                     body: a.body,
                     acceptance: a.acceptance,
@@ -1099,6 +1108,7 @@ struct ShowArgs {
 struct AddArgs {
     title: String,
     board: Option<BoardSlug>,
+    repo: Option<String>,
     #[serde(default)]
     body: String,
     #[serde(default)]

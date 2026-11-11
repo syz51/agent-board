@@ -260,6 +260,17 @@ agents otherwise learn only from a refusal):
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,
 `ask_withdraw`, `feedback`, `feedback_resolve`, `board_join`.
 
+Filing on the right board, once. An agent that finds work in another repository names
+the repository, not a board it must first look up: `board boards --repo <URL or key>`
+lists the boards that cover it, and `task_add` (and `board add`) take `repo` in place of
+`board` and file on the one active board that covers it, refusing when none or several
+do. After every add the client searches the target board with the title's words (the
+ranked `q` search, open tasks only) and ends its answer with up to 3 tasks whose titles
+share more than half of those words, as likely duplicates. It is a hint, never a refusal:
+the task is created first, and a failed search only loses the hint. Both are client work
+on existing routes, so they hold with any server; one that predates `q` returns every
+task, which the title comparison then filters.
+
 Every string parameter declares a `maxLength` equal to the server's default limit (title
 80, note 800, handoff `now` 400, handoff `next` and `blockers` 300, question 1,500, done
 summary 800, body 4,000 characters, and so on). The tools that take a title, note,
