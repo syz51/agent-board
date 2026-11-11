@@ -351,6 +351,13 @@ pub async fn snapshot(
     Ok(Output::new(text, &snap))
 }
 
+/// Agents `board status` lists unless `detailed`: the ones seen last.
+pub const STATUS_AGENTS: usize = 20;
+/// Asks `board asks` lists when the call names no limit: the newest.
+pub const ASKS_LIMIT_DEFAULT: usize = 50;
+
+/// Without `detailed`, lists at most [`STATUS_AGENTS`] agents, the ones seen last, and says
+/// how many it left out: a board keeps every agent of the last 7 days.
 pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Result<Output> {
     let mut lines = Vec::new();
     let me = match ctx.client.agent() {
@@ -370,8 +377,22 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
     let json = match board {
         Some(slug) => {
             let b = ctx.client.board(&slug).await?;
-            let agents = ctx.client.agents(Some(&slug)).await?;
+            let mut agents = ctx.client.agents(Some(&slug)).await?;
+            let more = agents.len().saturating_sub(STATUS_AGENTS);
+            if !detailed && more > 0 {
+                let mut seen: Vec<Timestamp> = agents.iter().map(|a| a.last_seen).collect();
+                seen.sort_unstable_by(|a, b| b.cmp(a));
+                let oldest_kept = seen[STATUS_AGENTS - 1];
+                // The server's order (by handle) stays; ties at the cut go by that order.
+                agents.retain(|a| a.last_seen >= oldest_kept);
+                agents.truncate(STATUS_AGENTS);
+            }
             lines.push(render::board_detail(&b, &agents, detailed));
+            if !detailed && more > 0 {
+                lines.push(format!(
+                    "listed the {STATUS_AGENTS} agents seen last; {more} more were seen before them: detailed lists every one"
+                ));
+            }
             json!({"board": b, "agents": agents})
         }
         None => {
@@ -903,9 +924,25 @@ pub async fn ask_withdraw(ctx: &Ctx, id: i64) -> Result<Output> {
     ))
 }
 
-pub async fn asks(ctx: &Ctx, status: Option<&str>, board: Option<&BoardSlug>) -> Result<Output> {
-    let asks = ctx.client.asks(status, board).await?;
-    Ok(Output::new(render::ask_list(&asks), &asks))
+/// Lists the newest `limit` asks that match, oldest first, and says how many it left out.
+pub async fn asks(
+    ctx: &Ctx,
+    status: Option<&str>,
+    board: Option<&BoardSlug>,
+    limit: usize,
+) -> Result<Output> {
+    let mut asks = ctx.client.asks(status, board).await?;
+    // Newest last, whatever order the server sends.
+    asks.sort_by_key(|a| a.id);
+    let more = asks.len().saturating_sub(limit);
+    asks.drain(..more);
+    let mut text = render::ask_list(&asks);
+    if more > 0 {
+        text.push_str(&format!(
+            "\nlisted the newest {limit}; {more} older match: narrow it with --status or --board, or raise --limit"
+        ));
+    }
+    Ok(Output::new(text, &asks))
 }
 
 pub async fn answer(ctx: &Ctx, id: i64, text: &str) -> Result<Output> {

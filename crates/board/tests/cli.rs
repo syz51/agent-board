@@ -2973,3 +2973,81 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
     let out = e.run(&["usage", "--reserve", "100"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
 }
+
+/// `board status` and `board asks` are bounded by default; `--detailed` and `--limit` give
+/// the rest.
+#[test]
+fn status_and_asks_list_a_bounded_number_by_default() {
+    let e = env();
+    e.stub
+        .on("GET /v1/boards/factory", board_fixture("factory", &[]));
+    let agents: Vec<board_proto::Agent> = (0..25)
+        .map(|i| {
+            let mut agent =
+                agent_fixture(&format!("t3:a{i:02}"), "air", board_proto::AgentState::Idle);
+            // The higher the number, the longer ago it was seen.
+            agent.last_seen = at() - chrono::TimeDelta::minutes(i);
+            agent
+        })
+        .collect();
+    e.stub.on("GET /v1/agents", &agents);
+    let text = stdout(&e.run(&["status", "--board", "factory"]));
+    assert!(
+        text.contains("t3:a19") && !text.contains("t3:a20"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "listed the 20 agents seen last; 5 more were seen before them: detailed lists every one\n"
+        ),
+        "{text}"
+    );
+    let json: Value =
+        serde_json::from_str(&stdout(&e.run(&["status", "--board", "factory", "--json"]))).unwrap();
+    assert_eq!(json["agents"].as_array().unwrap().len(), 20);
+    let text = stdout(&e.run(&["status", "--board", "factory", "--detailed"]));
+    assert!(
+        text.contains("t3:a24") && !text.contains("listed the"),
+        "{text}"
+    );
+
+    let asks: Vec<Ask> = (1..=60)
+        .rev()
+        .map(|id| Ask {
+            id,
+            board: "factory".parse().unwrap(),
+            task: None,
+            agent: ME.parse().unwrap(),
+            kind: AskKind::Decision,
+            question: format!("Question {id}?"),
+            options: vec![],
+            status: AskStatus::Answered,
+            answer: Some("yes".into()),
+            answered_via: None,
+            created_at: at(),
+            answered_at: None,
+        })
+        .collect();
+    e.stub.on("GET /v1/asks", &asks);
+    let text = stdout(&e.run(&["asks", "--status", "all"]));
+    assert!(
+        text.starts_with("ask #11 ") && !text.contains("ask #10 ") && text.contains("ask #60 "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "listed the newest 50; 10 older match: narrow it with --status or --board, or raise --limit\n"
+        ),
+        "{text}"
+    );
+    let json: Value =
+        serde_json::from_str(&stdout(&e.run(&["asks", "--status", "all", "--json"]))).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 50);
+    let text = stdout(&e.run(&["asks", "--status", "all", "--limit", "100"]));
+    assert!(
+        text.starts_with("ask #1 ") && !text.contains("listed the newest"),
+        "{text}"
+    );
+    let out = e.run(&["asks", "--limit", "0"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+}
