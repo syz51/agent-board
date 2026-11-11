@@ -10,7 +10,7 @@ use board_proto::{
 use rusqlite::types::ToSql;
 use rusqlite::{OptionalExtension, Row, named_params, params};
 
-use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ready_sql, ts};
+use crate::db::{Ctx, parse_enum, parse_id, parse_json, ready_sql, ts};
 use crate::error::{Result, not_found};
 
 pub(crate) type NamedParams<'a> = Vec<(&'a str, &'a dyn ToSql)>;
@@ -69,7 +69,8 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
-     t.updated_at, t.not_before, t.summary";
+     t.updated_at, t.not_before, t.summary, \
+     (SELECT a.handle FROM agents a WHERE a.id = t.owner)";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -102,6 +103,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         feedback: None,
         summary: r.get(16)?,
         child_count: 0,
+        owner_handle: r.get(17)?,
     })
 }
 
@@ -599,30 +601,50 @@ pub(crate) fn find_handoff(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Hando
     else {
         return Ok(None);
     };
-    handoff.last_change_at = last_change(cx, agent)?;
+    handoff.last_change_at = Some(last_change(cx, agent, handoff.updated_at)?);
     Ok(Some(handoff))
 }
 
-/// Events that are not a change to the board's work: the handoff itself and presence.
-const NOT_CHANGES: [EventType; 3] = [
-    EventType::HandoffUpdated,
-    EventType::AgentRegistered,
-    EventType::AgentStateChanged,
-];
+/// How long file edits may follow a handoff before it is stale: a handoff is written at
+/// the end of a step, and the edits of the next step do not make it wrong at once.
+pub(crate) fn handoff_files_grace() -> chrono::TimeDelta {
+    chrono::TimeDelta::minutes(30)
+}
 
-/// When the agent last changed the board or touched a file: its newest other event.
-fn last_change(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Timestamp>> {
-    let [a, b, c] = NOT_CHANGES.map(|t| enum_str(&t));
-    Ok(cx
-        .db
-        .query_row(
-            "SELECT at FROM events WHERE actor = ?1 AND type NOT IN (?2, ?3, ?4) \
-             ORDER BY seq DESC LIMIT 1",
-            params![agent.as_str(), a, b, c],
-            |r| r.get(0),
-        )
-        .optional()?
-        .map(ts))
+/// When the agent last made a change its handoff must cover, among those after the
+/// handoff: a claim, release, take or completion of a task, an update of a task that is
+/// or was its own, or a file touch more than [`handoff_files_grace`] after the handoff.
+/// A note, a new task, a lease, an ask or an update of another agent's task adds to the
+/// board and leaves the handoff as true as it was. Without such a change, the handoff's
+/// own time. Reads only the agent's events newer than the handoff.
+fn last_change(cx: &Ctx<'_>, agent: &AgentId, handoff_at: Timestamp) -> Result<Timestamp> {
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT e.at, e.type, \
+                json_extract(e.payload, '$.previous_owner') = ?1 \
+                OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task AND t.owner = ?1) \
+         FROM events e WHERE e.actor = ?1 ORDER BY e.seq DESC",
+    )?;
+    let mut rows = stmt.query([agent.as_str()])?;
+    let touch_from = handoff_at + handoff_files_grace();
+    while let Some(row) = rows.next()? {
+        let at = ts(row.get(0)?);
+        if at <= handoff_at {
+            break;
+        }
+        let covers = match parse_enum::<EventType>(&row.get::<_, String>(1)?)? {
+            EventType::TaskClaimed
+            | EventType::TaskReleased
+            | EventType::TaskTaken
+            | EventType::TaskDone => true,
+            EventType::TaskUpdated => row.get::<_, Option<bool>>(2)?.unwrap_or(false),
+            EventType::FilesTouched => at > touch_from,
+            _ => false,
+        };
+        if covers {
+            return Ok(at);
+        }
+    }
+    Ok(handoff_at)
 }
 
 // ---------------------------------------------------------------------------------------

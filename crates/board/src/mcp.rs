@@ -86,6 +86,9 @@ struct ToolSpec {
     params: fn() -> Vec<(&'static str, Value, bool)>,
 }
 
+/// Tasks `task_list` lists when the call names no `limit`.
+const TASK_LIST_LIMIT: u32 = 50;
+
 /// A string parameter of at most `max` characters, the server's limit.
 fn s(description: &str, max: usize) -> Value {
     json!({"type": "string", "maxLength": max, "description": description})
@@ -201,7 +204,7 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "limit",
-                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 200."}),
+                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 50."}),
                     false,
                 ),
                 (
@@ -791,9 +794,10 @@ impl BoardMcp {
                     parent: a.parent,
                     live: a.live.then_some(true),
                     q: a.q,
-                    limit: a.limit,
+                    // Fewer than the CLI lists: the text goes into the agent's context.
+                    limit: Some(a.limit.unwrap_or(TASK_LIST_LIMIT)),
                 };
-                ops::task_list(&ctx, &query, a.detailed).await?
+                ops::task_list(&ctx, &query, a.detailed, None).await?
             }
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;

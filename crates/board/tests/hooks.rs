@@ -1189,7 +1189,7 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
     let reason = reply["reason"].as_str().unwrap();
     assert!(
         reason.contains("factory-12")
-            && reason.contains("predates your last board change")
+            && reason.contains("predates a later change to your tasks")
             && reason.contains("handoff_set"),
         "{reason}"
     );

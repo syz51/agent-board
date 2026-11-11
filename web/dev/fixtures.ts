@@ -28,8 +28,11 @@ export interface BoardFixture {
   updated_at: string;
 }
 
-/** A task as stored: `ready`, `proposal` and `owner_stale` are computed when read. */
-export type TaskFixture = Omit<Task, "ready" | "proposal" | "owner_stale" | "child_count">;
+/** A task as stored: `ready`, `proposal`, `owner_stale` and `owner_handle` are computed when read. */
+export type TaskFixture = Omit<
+  Task,
+  "ready" | "proposal" | "owner_stale" | "child_count" | "owner_handle"
+>;
 
 /** Evidence as stored, with the task it belongs to. */
 export type EvidenceFixture = Evidence & { task: string };

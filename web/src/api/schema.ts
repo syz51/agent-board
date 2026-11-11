@@ -108,6 +108,8 @@ export const task = object({
   summary: nullable(string),
   /** How many tasks name this one as parent, whatever their status; 0 from older servers. */
   child_count: withDefault(integer, 0),
+  /** The owner's short handle, such as `t3:7f3a`. Absent without an owner and from older servers. */
+  owner_handle: nullable(string),
 });
 
 /** A child task as its parent's detail lists it. */

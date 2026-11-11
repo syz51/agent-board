@@ -573,6 +573,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         feedback: None,
         summary: None,
         child_count: 0,
+        owner_handle: None,
         created_at: at(),
         updated_at: at(),
     }

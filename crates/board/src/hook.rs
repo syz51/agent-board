@@ -1822,15 +1822,16 @@ impl Hook<'_> {
         };
         let handoff = self.client.handoff(&self.agent).await?;
         let turn = self.local.turn_started;
-        // The server dates the agent's last board change or file touch on the handoff's own
-        // clock, so a turn that only read or replied leaves the handoff current. A server
+        // The server dates the agent's last change that the handoff must cover (a change to
+        // the state of its tasks, or file edits long after the handoff) on the handoff's own
+        // clock, so a turn that only read, replied or added notes leaves it current. A server
         // without that date falls back to: a handoff older than the turn is stale.
         let (stale_since, why) = match &handoff {
             None => (Some(turn.unwrap_or(self.now)), "you have no handoff"),
             Some(h) => match h.last_change_at {
                 Some(at) => (
                     (at > h.updated_at).then_some(at),
-                    "your handoff predates your last board change or file edit",
+                    "your handoff predates a later change to your tasks or later file edits",
                 ),
                 None => (
                     turn.filter(|&t| h.updated_at < t),

@@ -592,6 +592,10 @@ pub struct LsArgs {
     /// How many tasks to list at most (default 200, at most 1000).
     #[arg(long)]
     limit: Option<u32>,
+    /// With `--json`, print only these fields of each task: `--fields id,title,status`.
+    /// Use it instead of piping whole tasks to a filter.
+    #[arg(long, value_delimiter = ',')]
+    fields: Option<Vec<String>>,
     /// Include bodies and acceptance checks.
     #[arg(long)]
     detailed: bool,
@@ -1124,11 +1128,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 q: a.search,
                 limit: a.limit,
             };
+            if a.fields.is_some() && !json {
+                bail!("--fields picks the fields that --json prints: pass --json with it");
+            }
             let ctx = ctx()?;
             if a.mine {
                 ctx.agent()?;
             }
-            ops::task_list(&ctx, &query, a.detailed).await?
+            ops::task_list(&ctx, &query, a.detailed, a.fields.as_deref()).await?
         }
         Command::Show { id, detailed } => ops::task_show(&ctx()?, &id, detailed).await?,
         Command::Add(a) => {
