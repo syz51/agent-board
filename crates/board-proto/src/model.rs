@@ -275,6 +275,20 @@ impl Usage {
             .max_by(|a, b| a.1.percent.total_cmp(&b.1.percent))
     }
 
+    /// The reset the account's agents wait for, if the reading is fresh: the latest reset
+    /// still to come of a window at or above 100 percent, where every turn stops on the
+    /// limit. A full window without a reset time gives none, since nothing says when it ends.
+    pub fn full_until(&self, now: Timestamp) -> Option<Timestamp> {
+        if !self.fresh(now) {
+            return None;
+        }
+        self.windows()
+            .filter(|(_, w)| w.percent >= 100.0)
+            .filter_map(|(_, w)| w.resets_at)
+            .filter(|at| *at > now)
+            .max()
+    }
+
     /// The pace, if the reading is fresh and its week has not reset by `now`.
     pub fn pace_at(&self, now: Timestamp) -> Option<&UsagePace> {
         let week = self.seven_day?;

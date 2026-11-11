@@ -1183,6 +1183,34 @@ mod tests {
     }
 
     #[test]
+    fn usage_is_full_until_the_latest_reset_of_a_window_at_100_percent() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let hours = chrono::TimeDelta::hours;
+        let with_resets = |five: f64, week: f64, minutes_ago| {
+            let mut u = usage(Some(five), Some(week), minutes_ago);
+            u.five_hour.as_mut().unwrap().resets_at = Some(now + hours(2));
+            u.seven_day.as_mut().unwrap().resets_at = Some(now + hours(50));
+            u
+        };
+        assert_eq!(with_resets(99.9, 95.0, 1).full_until(now), None);
+        assert_eq!(
+            with_resets(100.0, 95.0, 1).full_until(now),
+            Some(now + hours(2))
+        );
+        assert_eq!(
+            with_resets(100.0, 104.0, 1).full_until(now),
+            Some(now + hours(50)),
+            "the later reset"
+        );
+        assert_eq!(with_resets(100.0, 100.0, 31).full_until(now), None, "stale");
+        let full = with_resets(100.0, 95.0, 1);
+        assert_eq!(full.full_until(now + hours(2)), None, "the window reset");
+        let mut unknown = with_resets(100.0, 95.0, 1);
+        unknown.five_hour.as_mut().unwrap().resets_at = None;
+        assert_eq!(unknown.full_until(now), None, "no reset time to wait for");
+    }
+
+    #[test]
     fn a_usage_report_needs_only_the_read_time() {
         let req: ReportUsage =
             serde_json::from_value(serde_json::json!({ "read_at": "2026-11-08T12:00:00Z" }))
