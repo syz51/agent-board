@@ -118,6 +118,15 @@ pub const USAGE_POLL_NEAR: TimeDelta = TimeDelta::minutes(1);
 /// After the usage endpoint refuses a reading for its rate limit, the daemon reads it only
 /// every [`USAGE_POLL_EVERY`] for this long.
 pub const USAGE_REFUSED_BACKOFF: TimeDelta = TimeDelta::minutes(30);
+/// The longest wait the endpoint may ask for with a refusal (`Retry-After`); the shortest
+/// is [`USAGE_POLL_NEAR`].
+pub const USAGE_RETRY_MAX: TimeDelta = TimeDelta::minutes(10);
+/// T3 Code's reading stands in for the daemon's own while it is at most this much older
+/// than the time between two readings: T3 Code takes one every 5 minutes.
+pub const USAGE_SNAPSHOT_SLACK: TimeDelta = TimeDelta::minutes(1);
+/// While T3 Code's readings stand in, the daemon still reads the endpoint this often, to
+/// catch a reading T3 Code dated anew without reading it anew.
+pub const USAGE_CHECK_EVERY: TimeDelta = TimeDelta::minutes(15);
 /// A named coordinator's thread that T3 found live is not asked about again for this long.
 /// Each `t3 thread show` starts a process of about 180 MB, so asking for every coordinator
 /// each minute costs a home device more than the check is worth. A failed send to the
@@ -1518,6 +1527,10 @@ pub struct Daemon<T: T3> {
     usage_polled: Option<Timestamp>,
     /// When the usage endpoint last refused a reading for its rate limit.
     usage_refused: Option<Timestamp>,
+    /// When the endpoint may be read again, after a refusal that said how long to wait.
+    usage_retry_at: Option<Timestamp>,
+    /// The date of the newest reading taken from T3 Code's file.
+    usage_snapshot_at: Option<Timestamp>,
     /// Whether this device's dispatch agent is registered since the daemon started.
     dispatch_registered: bool,
     /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
@@ -1549,6 +1562,8 @@ impl<T: T3> Daemon<T> {
             usage: None,
             usage_polled: None,
             usage_refused: None,
+            usage_retry_at: None,
+            usage_snapshot_at: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
         }
@@ -4638,45 +4653,97 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Takes a new usage reading: from the endpoint, when [`Self::usage_poll_every`] has
-    /// passed since this daemon last read it, reported to the server; else the newest any device
-    /// reported. Then wakes the coordinators of boards the usage no longer holds. A
-    /// failure keeps the last reading, which goes stale and then holds nothing; with no
-    /// reading at all, as after a restart, the boards held stay held.
+    /// Takes a new usage reading and reports it to the server: T3 Code's, while its file
+    /// holds one that is new enough and can follow the reading known here
+    /// ([`crate::usage::follows`]); else the endpoint's, when [`Self::usage_poll_every`] has
+    /// passed since this daemon last read it. While T3 Code's readings stand in, the endpoint
+    /// is read only every [`USAGE_CHECK_EVERY`], unless the pace is near a line. After a
+    /// refusal that says how long to wait, the endpoint is read again then. With no new
+    /// reading, takes the newest any device reported. Then wakes the coordinators of boards
+    /// the usage no longer holds. A failure keeps the last reading, which goes stale and
+    /// then holds nothing; with no reading at all, as after a restart, the boards held stay
+    /// held.
     async fn refresh_usage(&mut self, now: Timestamp) {
-        let mut reported = None;
-        let every = self.usage_poll_every(now);
-        if let UsageSource::ClaudeCode { url, credentials } = &self.usage_source
-            && self.usage_polled.is_none_or(|at| now - at >= every)
+        let mut reading = None;
+        if let UsageSource::ClaudeCode {
+            url,
+            credentials,
+            snapshot,
+        } = &self.usage_source
         {
-            self.usage_polled = Some(now);
-            match crate::usage::read(url, credentials, now).await {
-                Ok(Some(report)) => match self.client().report_usage(&report).await {
-                    Ok(usage) => reported = Some(usage),
+            let every = self.usage_poll_every(now);
+            let snapshot = match snapshot {
+                Some(path) => crate::usage::read_snapshot(path, now).await,
+                None => None,
+            }
+            .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+            .filter(|s| {
+                self.usage
+                    .as_ref()
+                    .is_none_or(|known| crate::usage::follows(s, known))
+            });
+            let wait = if snapshot.is_some() && every > USAGE_POLL_NEAR {
+                USAGE_CHECK_EVERY
+            } else {
+                every
+            };
+            let waited = self.usage_polled.is_none_or(|at| now - at >= wait);
+            let due = match self.usage_retry_at {
+                // The endpoint's own wait replaces the usual one, but a reading that
+                // stands in still saves the call.
+                Some(at) => now >= at && (snapshot.is_none() || waited),
+                None => waited,
+            };
+            if due {
+                self.usage_polled = Some(now);
+                self.usage_retry_at = None;
+                match crate::usage::read(url, credentials, now).await {
+                    Ok(Some(report)) => reading = Some(report),
+                    Ok(None) => tracing::debug!(
+                        "usage: Claude Code is not signed in here or its token has expired"
+                    ),
                     Err(err) => {
-                        tracing::warn!("reporting the usage: {err:#}");
-                        // The server is likely unreachable too: act on the local reading.
-                        reported = Some(Usage {
-                            five_hour: report.five_hour,
-                            seven_day: report.seven_day,
-                            read_at: report.read_at,
-                            device: self.ctx.device.clone(),
-                            // The server computes the pace: keep the last one it gave, so
-                            // a failed report does not lift its hold.
-                            pace: self.usage.as_ref().and_then(|u| u.pace),
-                        });
+                        if let Some(refused) = err.downcast_ref::<crate::usage::Refused>() {
+                            self.usage_refused = Some(now);
+                            self.usage_retry_at = refused.retry_after.map(|wait| {
+                                let wait = TimeDelta::from_std(wait).unwrap_or(USAGE_RETRY_MAX);
+                                now + wait.clamp(USAGE_POLL_NEAR, USAGE_RETRY_MAX)
+                            });
+                        }
+                        tracing::warn!("reading the usage: {err:#}");
                     }
-                },
-                Ok(None) => tracing::debug!(
-                    "usage: Claude Code is not signed in here or its token has expired"
-                ),
-                Err(err) => {
-                    if err.is::<crate::usage::Refused>() {
-                        self.usage_refused = Some(now);
-                    }
-                    tracing::warn!("reading the usage: {err:#}");
                 }
             }
+            // The endpoint's reading is the newer one; T3 Code's is news only once, also
+            // when its report fails and the server's older reading comes back.
+            if reading.is_none()
+                && let Some(snapshot) = snapshot.filter(|s| {
+                    self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                        && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+                })
+            {
+                self.usage_snapshot_at = Some(snapshot.read_at);
+                reading = Some(snapshot);
+            }
+        }
+        let mut reported = None;
+        if let Some(report) = reading {
+            reported = Some(match self.client().report_usage(&report).await {
+                Ok(usage) => usage,
+                Err(err) => {
+                    tracing::warn!("reporting the usage: {err:#}");
+                    // The server is likely unreachable too: act on the local reading.
+                    Usage {
+                        five_hour: report.five_hour,
+                        seven_day: report.seven_day,
+                        read_at: report.read_at,
+                        device: self.ctx.device.clone(),
+                        // The server computes the pace: keep the last one it gave, so
+                        // a failed report does not lift its hold.
+                        pace: self.usage.as_ref().and_then(|u| u.pace),
+                    }
+                }
+            });
         }
         match reported {
             Some(usage) => self.usage = Some(usage),
