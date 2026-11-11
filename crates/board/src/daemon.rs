@@ -72,8 +72,8 @@ use crate::usage::UsageSource;
 pub mod judges;
 
 pub use judges::{
-    JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE, JudgeRetry, JudgeRun,
-    Merge, PR_READ_EVERY,
+    JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
+    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY,
 };
 
 /// The coordinator's standing instructions.

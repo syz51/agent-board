@@ -19,6 +19,8 @@ pub struct PullRequest {
     pub head_ref: String,
     /// The commit its branch is at.
     pub head_oid: String,
+    /// Its branch is in another repository (a fork) than its base.
+    pub cross_repository: bool,
     /// The commit that merged it.
     pub merge_commit: Option<String>,
     pub merge_state: MergeState,
@@ -79,12 +81,18 @@ pub trait Gh: Send + Sync {
     ) -> BoxFuture<'a, Result<Updated>>;
 
     /// Merges the pull request by the repository's rules: with a merge commit where the
-    /// repository allows one, else squashed, else rebased.
-    fn merge<'a>(&'a self, project: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// repository allows one, else squashed, else rebased. Only while its branch is still
+    /// at `head`, the commit whose checks were read.
+    fn merge<'a>(
+        &'a self,
+        project: &'a Path,
+        pr: &'a str,
+        head: &'a str,
+    ) -> BoxFuture<'a, Result<()>>;
 }
 
 /// The fields [`parse_pull_request`] reads.
-const VIEW_FIELDS: &str = "url,state,isDraft,headRefName,headRefOid,mergeCommit,mergeStateStatus,mergeable,statusCheckRollup";
+const VIEW_FIELDS: &str = "url,state,isDraft,headRefName,headRefOid,isCrossRepository,mergeCommit,mergeStateStatus,mergeable,statusCheckRollup";
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -184,10 +192,16 @@ impl Gh for GhCli {
         })
     }
 
-    fn merge<'a>(&'a self, project: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn merge<'a>(
+        &'a self,
+        project: &'a Path,
+        pr: &'a str,
+        head: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let flag = self.merge_flag(project, pr).await?;
-            let (ok, _, stderr) = self.run(project, &["pr", "merge", pr, flag]).await?;
+            let args = ["pr", "merge", pr, flag, "--match-head-commit", head];
+            let (ok, _, stderr) = self.run(project, &args).await?;
             if !ok {
                 bail!("gh pr merge {flag} failed: {}", stderr.trim());
             }
@@ -208,7 +222,7 @@ pub fn merge_flag(repo: &Value) -> &'static str {
 }
 
 /// `owner/repo` with its host, as `gh` takes a repository, from a pull request URL.
-fn repo_of(pr: &str) -> Option<String> {
+pub fn repo_of(pr: &str) -> Option<String> {
     let (repo, _) = pr.strip_prefix("https://")?.split_once("/pull/")?;
     (repo.split('/').count() == 3).then(|| repo.to_owned())
 }
@@ -237,6 +251,7 @@ pub fn parse_pull_request(value: &Value) -> Result<PullRequest> {
         draft,
         head_ref: text("headRefName").to_owned(),
         head_oid: text("headRefOid").to_owned(),
+        cross_repository: value["isCrossRepository"].as_bool().unwrap_or(false),
         merge_commit: value["mergeCommit"]["oid"].as_str().map(str::to_owned),
         merge_state,
         checks: parse_checks(&value["statusCheckRollup"]),

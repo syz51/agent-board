@@ -1030,14 +1030,17 @@ has not registered it yet.
 - **Start**: `t3 thread start` with `judge_brief` on stdin, recorded in `watch.json`
   before the start so a failed start is found again by title. The dispatcher registers
   the thread's agent as a judge right after the start, since T3 gives the agent's id only
-  then, and tries again each reconcile for up to 10 minutes. No judge starts while the
-  board is at its usage stop.
+  then, and tries again each reconcile for up to 10 minutes. A start that made no thread
+  is tried again after 5 minutes, and a start that fails leaves its slot to the next
+  judgment that waits. No judge starts while the board is at its usage stop.
 - **Review**: for each task in `review` whose newest `review:` decision note is not a
-  standing pass. A pass stands when another agent than the task's owner wrote it and the
-  task has not moved to `review` again since. The judge's worktree is on branch
-  `review/<task>`, based on the head branch of the newest pull request the task's notes
-  name, once fetched from `origin`; otherwise on the project's default base. The
-  dispatcher notes the thread's link on the task.
+  standing pass. A pass stands when a review judge the dispatcher started for the task
+  wrote it, and the task has not moved to `review` again since. The dispatcher's own note
+  on the task names that judge: it gives the thread's link and ends with
+  `(agent <the judge's id>)`. A pass by any other agent starts a review. The judge's
+  worktree is on branch `review/<task>`, based on the head branch of the newest pull
+  request the task's notes name, once fetched from `origin`; a pull request from a fork,
+  or none, gives the project's default base.
 - **Verdict**: the pending proposals are grouped by parent task. A group with a running
   verdict judge waits. Otherwise the 5 oldest get one judge; the rest follow when it ends.
 - **Triage**: on this device's `feedback_board`, each ready feedback item (a task with a
@@ -1064,13 +1067,17 @@ has not registered it yet.
 Built, with these rules:
 
 - **The pass note** ends with one line per check, `check: <command> => <exit code>`, and
-  a line `pr: <PR URL>` or `pr: none` (`prompts/judges/review.md`). Without a `pr:` line,
-  the pull request is the last one the pass note links, else the one in the newest note
-  before it. The summary is the note's text without the verdict and these lines, cut to
+  a line `pr: <PR URL>` or `pr: none` (`prompts/judges/review.md`). Without a `pr:` line
+  that holds a URL, the pull request is the last one the pass note links, else the one in
+  the task owner's newest note before it. It must be in one of the board's repositories,
+  when the board lists any. A pull request elsewhere, or a `pr:` line that names one
+  without a URL any note gives, is logged as a warning: the task is neither merged nor
+  finished until a new pass note names it. The summary is the note's text without the verdict and these lines, cut to
   the server's limit. A pass without check lines and without a PR is closed with the
   note itself as evidence.
 - **Merge**: `gh pr merge` with a merge commit where the repository allows one, else
-  squashed, else rebased. The dispatcher merges only when GitHub reports the pull request
+  squashed, else rebased, with `--match-head-commit` set to the head whose checks were
+  read. Nothing is merged while the task's worker still runs, since it may still push. The dispatcher merges only when GitHub reports the pull request
   as clean and every check as passed. While checks run, or GitHub holds the merge for
   another reason, it reads again 2 minutes later.
 - **Failed checks**: the dispatcher adds one `finding` note per head commit and waits. It

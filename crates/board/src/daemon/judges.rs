@@ -22,7 +22,7 @@ use board_proto::{
 };
 
 use super::*;
-use crate::gh::{Checks, MergeState, PrState, PullRequest, Updated, pull_request_url};
+use crate::gh::{Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, repo_of};
 
 /// The most judges of one board at work at once; the rest wait, the oldest need first.
 pub const JUDGES_AT_ONCE: usize = 2;
@@ -33,6 +33,9 @@ pub const JUDGE_TASKS_AT_ONCE: usize = 5;
 /// How long a task whose judge ended waits for another judge of that kind, unless the task
 /// changed since: a judge that ended without its judgment is not started again at once.
 pub const JUDGE_RETRY: TimeDelta = TimeDelta::minutes(30);
+
+/// How long a judgment waits after a start that made no thread.
+pub const JUDGE_START_RETRY: TimeDelta = TimeDelta::minutes(5);
 
 /// How long a started judge may stay unregistered before the dispatcher gives it up.
 pub const JUDGE_REGISTER_WAIT: TimeDelta = TimeDelta::minutes(10);
@@ -226,10 +229,14 @@ enum Reviewed<'a> {
     Waits,
 }
 
+/// The start of the note the dispatcher adds for the review judge it started.
+const JUDGE_NOTE: &str = "note: the dispatcher started a review judge for this task:";
+
 /// The standing review of `detail`'s task: its newest `review:` decision note. A pass
-/// stands only when another agent than the task's owner wrote it, and the task has not
-/// moved to `review` again since.
-fn reviewed(detail: &TaskDetail) -> Reviewed<'_> {
+/// stands only when a review judge that `dispatcher` started for the task wrote it, as
+/// the dispatcher's own note on the task names it, and the task has not moved to `review`
+/// again since.
+fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
     let newest = detail.notes.iter().rev().find_map(|n| {
         (n.kind == NoteKind::Decision)
             .then(|| review_verdict(&n.text))
@@ -245,10 +252,13 @@ fn reviewed(detail: &TaskDetail) -> Reviewed<'_> {
     if parked_again {
         return Reviewed::Waits;
     }
+    let judge = format!("(agent {})", note.agent);
+    let by_judge = detail.task.owner.as_ref() != Some(&note.agent)
+        && detail.notes.iter().any(|n| {
+            n.agent == *dispatcher && n.text.starts_with(JUDGE_NOTE) && n.text.ends_with(&judge)
+        });
     match verdict {
-        ReviewVerdict::Pass if detail.task.owner.as_ref() != Some(&note.agent) => {
-            Reviewed::Passed(note)
-        }
+        ReviewVerdict::Pass if by_judge => Reviewed::Passed(note),
         ReviewVerdict::Void => Reviewed::Withdrawn,
         ReviewVerdict::Pass | ReviewVerdict::Fail => Reviewed::Waits,
     }
@@ -260,20 +270,50 @@ fn tagged<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     Some(line.strip_prefix(name)?.strip_prefix(':')?.trim())
 }
 
+/// The pull request a review passed.
+#[derive(Debug, Clone, PartialEq)]
+enum PassedPr {
+    Url(String),
+    /// The task has none.
+    None,
+    /// The notes name one the dispatcher must not merge, or cannot read: why.
+    Unclear(String),
+}
+
 /// The pull request the review passed: the pass note's `pr:` line, else the last pull
-/// request it links, else the one in the newest note before it. `pr: none` is none.
-fn passed_pr(detail: &TaskDetail, pass: &Note) -> Option<String> {
-    if let Some(named) = pass.text.lines().find_map(|l| tagged(l, "pr")) {
-        return pull_request_url(named);
+/// request it links, else the one in the task owner's newest note before it. `pr: none`
+/// is none. It must be in one of the board's `repos`, when the board lists any.
+fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
+    let named = pass.text.lines().find_map(|l| tagged(l, "pr"));
+    if named.is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case("none")) {
+        return PassedPr::None;
     }
-    pull_request_url(&pass.text).or_else(|| {
-        detail
-            .notes
-            .iter()
-            .rev()
-            .filter(|n| n.id < pass.id)
-            .find_map(|n| pull_request_url(&n.text))
-    })
+    let url = named
+        .and_then(pull_request_url)
+        .or_else(|| pull_request_url(&pass.text))
+        .or_else(|| {
+            detail
+                .notes
+                .iter()
+                .rev()
+                .filter(|n| n.id < pass.id && Some(&n.agent) == detail.task.owner.as_ref())
+                .find_map(|n| pull_request_url(&n.text))
+        });
+    match (url, named) {
+        (Some(url), _) => {
+            let known = repos.is_empty()
+                || repo_of(&url).is_some_and(|r| repos.iter().any(|k| k.eq_ignore_ascii_case(&r)));
+            if known {
+                PassedPr::Url(url)
+            } else {
+                PassedPr::Unclear(format!("{url} is in none of the board's repositories"))
+            }
+        }
+        (None, Some(named)) => PassedPr::Unclear(format!(
+            "its pass note names the pull request `{named}`, not by its URL"
+        )),
+        (None, None) => PassedPr::None,
+    }
 }
 
 /// The pull request the newest note of a task names.
@@ -397,10 +437,10 @@ impl<T: T3> Daemon<T> {
                     continue;
                 }
             };
-            match reviewed(&detail) {
+            match reviewed(&detail, agent) {
                 Reviewed::Passed(pass) => {
                     if let Err(err) = self
-                        .close_reviewed(agent, &client, &project, &detail, pass, now)
+                        .close_reviewed(board, agent, &client, &project, &detail, pass, now)
                         .await
                     {
                         tracing::warn!("closing {}: {err:#}", task.id);
@@ -532,11 +572,17 @@ impl<T: T3> Daemon<T> {
                 wants.len() - free
             );
         }
-        for want in wants.into_iter().take(free) {
+        // A start that fails leaves its slot to the next judgment that waits.
+        let mut started = 0;
+        for want in wants {
+            if started == free {
+                break;
+            }
             let names = want.title.clone();
-            self.start_judge(board, &client, &project, want, now)
-                .await
-                .with_context(|| format!("starting the judge `{names}`"))?;
+            match self.start_judge(board, &client, &project, want, now).await {
+                Ok(()) => started += 1,
+                Err(err) => tracing::warn!("starting the judge `{names}`: {err:#}"),
+            }
         }
         self.save()
     }
@@ -557,11 +603,11 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Forgets `run`, and keeps its tasks from another judge of its kind for
-    /// [`JUDGE_RETRY`] unless they change.
-    async fn end_run(&mut self, run: &JudgeRun, client: &Client, now: Timestamp) {
+    /// Forgets `run`, and keeps its tasks from another judge of its kind for `wait`
+    /// unless they change.
+    async fn end_run(&mut self, run: &JudgeRun, client: &Client, now: Timestamp, wait: TimeDelta) {
         self.state.judges.retain(|r| !r.same(run));
-        let until = now + JUDGE_RETRY;
+        let until = now + wait;
         if run.tasks.is_empty() {
             let retry = JudgeRetry {
                 until,
@@ -605,8 +651,9 @@ impl<T: T3> Daemon<T> {
             if run.thread.is_none() {
                 match self.find_judge_thread(board, project, &run).await {
                     Ok(Some(thread)) => run.thread = Some(thread),
+                    // No judge ran: the start is tried again soon.
                     Ok(None) => {
-                        self.end_run(&run, client, now).await;
+                        self.end_run(&run, client, now, JUDGE_START_RETRY).await;
                         continue;
                     }
                     Err(err) => {
@@ -622,7 +669,7 @@ impl<T: T3> Daemon<T> {
                     run.names()
                 );
                 if now - run.started_at >= JUDGE_REGISTER_WAIT {
-                    self.end_run(&run, client, now).await;
+                    self.end_run(&run, client, now, JUDGE_RETRY).await;
                     continue;
                 }
             }
@@ -695,9 +742,10 @@ impl<T: T3> Daemon<T> {
             let Some(agent) = client.agent() else {
                 return Ok(());
             };
+            // `reviewed` reads the judge's agent id at the end of this note.
+            let judge = thread_agent(&thread)?;
             for task in &run.tasks {
-                let text =
-                    format!("note: the dispatcher started a review judge for this task: {link}");
+                let text = format!("{JUDGE_NOTE} {link} (agent {judge})");
                 match add_note(client, task, agent, NoteKind::Note, text).await {
                     Ok(()) => run.noted = true,
                     Err(err) => tracing::warn!("noting judge thread {thread} on {task}: {err:#}"),
@@ -734,7 +782,7 @@ impl<T: T3> Daemon<T> {
                 run.kind_name(),
                 run.names()
             );
-            self.end_run(&run, client, now).await;
+            self.end_run(&run, client, now, JUDGE_RETRY).await;
         }
     }
 
@@ -754,7 +802,8 @@ impl<T: T3> Daemon<T> {
             (JudgeKind::Review, Some(task)) => {
                 let head = match &want.pr {
                     Some(pr) => match self.gh.view(project, pr).await {
-                        Ok(pr) => Some(pr.head_ref),
+                        // A fork's branch is not on `origin`.
+                        Ok(pr) => (!pr.cross_repository).then_some(pr.head_ref),
                         Err(err) => {
                             tracing::warn!("reading {pr} for the review of {task}: {err:#}");
                             None
@@ -814,8 +863,10 @@ impl<T: T3> Daemon<T> {
 
     /// Closes a task in `review` that a judge passed: merges its pull request once it can
     /// be merged, then finishes the task once its worker no longer runs.
+    #[allow(clippy::too_many_arguments)]
     async fn close_reviewed(
         &mut self,
+        board: &Board,
         agent: &AgentId,
         client: &Client,
         project: &Path,
@@ -824,8 +875,21 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<()> {
         let task = &detail.task;
+        // Its worker may still write its report, or push to the pull request: nothing is
+        // merged or finished while it runs.
+        if let Some(owner) = task.owner.as_ref().filter(|owner| *owner != agent) {
+            let running = match client.agent_info(owner).await {
+                Ok(info) => info.state == AgentState::Running,
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+                Err(err) => return Err(err.context(format!("reading {owner}"))),
+            };
+            if running {
+                return Ok(());
+            }
+        }
         let mut merged = None;
-        if let Some(url) = passed_pr(detail, pass) {
+        let passed = passed_pr(detail, pass, &board.repos);
+        if passed != PassedPr::None {
             let mut merge = match self.state.merges.get(&task.id) {
                 // A clock set back reads at once.
                 Some(merge)
@@ -841,6 +905,17 @@ impl<T: T3> Daemon<T> {
             };
             merge.read_at = now;
             self.state.merges.insert(task.id.clone(), merge.clone());
+            let url = match passed {
+                PassedPr::Url(url) => url,
+                PassedPr::Unclear(why) => {
+                    tracing::warn!(
+                        "{}: passed, but not merged or finished: {why}. Name its pull request in a `pr:` line of a new pass note",
+                        task.id
+                    );
+                    return Ok(());
+                }
+                PassedPr::None => unreachable!("checked above"),
+            };
             let pr = self
                 .gh
                 .view(project, &url)
@@ -852,17 +927,6 @@ impl<T: T3> Daemon<T> {
             {
                 Some(pr) => merged = Some(pr),
                 None => return Ok(()),
-            }
-        }
-        // Its worker may still write its report.
-        if let Some(owner) = task.owner.as_ref().filter(|owner| *owner != agent) {
-            let running = match client.agent_info(owner).await {
-                Ok(info) => info.state == AgentState::Running,
-                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
-                Err(err) => return Err(err.context(format!("reading {owner}"))),
-            };
-            if running {
-                return Ok(());
             }
         }
         let mut evidence = Vec::new();
@@ -987,7 +1051,7 @@ impl<T: T3> Daemon<T> {
             }
             (MergeState::Clean, Checks::Passed) => {
                 self.gh
-                    .merge(project, url)
+                    .merge(project, url, &pr.head_oid)
                     .await
                     .with_context(|| format!("merging {url}"))?;
                 tracing::info!("{}: merged {url}", task.id);
@@ -1095,19 +1159,36 @@ mod tests {
             "review: pass",
             "2026-11-08T12:00:00Z",
         );
+        let me: AgentId = "dispatch:mac".parse().unwrap();
+        let started = |by: &str| {
+            let text = format!("{JUDGE_NOTE} thread j (agent t3:judge)");
+            note(1, by, NoteKind::Note, &text, "2026-11-08T11:30:00Z")
+        };
+        let judge = started("dispatch:mac");
+        let reviewed = |detail: &TaskDetail| match reviewed(detail, &me) {
+            Reviewed::Passed(note) => Some(Some(note.id)),
+            Reviewed::Withdrawn => Some(None),
+            Reviewed::Waits => None,
+        };
         let before = serde_json::json!([parked("2026-11-08T11:00:00Z")]);
-        let passed = detail(vec![pass.clone()], before.clone());
-        assert_eq!(reviewed(&passed), Reviewed::Passed(&pass));
+        let passed = detail(vec![judge.clone(), pass.clone()], before.clone());
+        assert_eq!(reviewed(&passed), Some(Some(2)));
+
+        // A pass by an agent the dispatcher did not start as this task's judge is none,
+        // whoever else names it one.
+        assert_eq!(reviewed(&detail(vec![pass.clone()], before.clone())), None);
+        let claimed = detail(vec![started("t3:other"), pass.clone()], before.clone());
+        assert_eq!(reviewed(&claimed), None);
 
         // Parked again after the pass: a new review.
         let again = detail(
-            vec![pass.clone()],
+            vec![judge.clone(), pass.clone()],
             serde_json::json!([parked("2026-11-08T13:00:00Z")]),
         );
-        assert_eq!(reviewed(&again), Reviewed::Waits);
+        assert_eq!(reviewed(&again), None);
 
         // No verdict, a plain note, the owner's own pass, or a later fail: no pass.
-        assert_eq!(reviewed(&detail(vec![], before.clone())), Reviewed::Waits);
+        assert_eq!(reviewed(&detail(vec![], before.clone())), None);
         let plain = note(
             2,
             "t3:judge",
@@ -1116,8 +1197,8 @@ mod tests {
             "2026-11-08T12:00:00Z",
         );
         assert_eq!(
-            reviewed(&detail(vec![plain], before.clone())),
-            Reviewed::Waits
+            reviewed(&detail(vec![judge.clone(), plain], before.clone())),
+            None
         );
         let own = note(
             2,
@@ -1127,8 +1208,8 @@ mod tests {
             "2026-11-08T12:00:00Z",
         );
         assert_eq!(
-            reviewed(&detail(vec![own], before.clone())),
-            Reviewed::Waits
+            reviewed(&detail(vec![judge.clone(), own], before.clone())),
+            None
         );
         let fail = note(
             3,
@@ -1138,8 +1219,11 @@ mod tests {
             "2026-11-08T12:30:00Z",
         );
         assert_eq!(
-            reviewed(&detail(vec![pass.clone(), fail], before.clone())),
-            Reviewed::Waits
+            reviewed(&detail(
+                vec![judge.clone(), pass.clone(), fail],
+                before.clone()
+            )),
+            None
         );
         let void = note(
             3,
@@ -1149,8 +1233,8 @@ mod tests {
             "2026-11-08T12:30:00Z",
         );
         assert_eq!(
-            reviewed(&detail(vec![pass, void], before)),
-            Reviewed::Withdrawn
+            reviewed(&detail(vec![judge, pass, void], before)),
+            Some(None)
         );
     }
 
@@ -1172,10 +1256,9 @@ mod tests {
             "2026-11-08T11:00:00Z",
         );
         let with = detail(vec![parking.clone(), pass.clone()], serde_json::json!([]));
-        assert_eq!(
-            passed_pr(&with, &pass).as_deref(),
-            Some("https://github.com/o/r/pull/12")
-        );
+        let repos = ["github.com/o/r".to_owned()];
+        let url = |n: u32| PassedPr::Url(format!("https://github.com/o/r/pull/{n}"));
+        assert_eq!(passed_pr(&with, &pass, &repos), url(12));
         let checks = passed_checks(text);
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].value, "cargo test --workspace");
@@ -1195,10 +1278,7 @@ mod tests {
             "2026-11-08T12:00:00Z",
         );
         let with = detail(vec![parking.clone(), linked.clone()], serde_json::json!([]));
-        assert_eq!(
-            passed_pr(&with, &linked).as_deref(),
-            Some("https://github.com/o/r/pull/12")
-        );
+        assert_eq!(passed_pr(&with, &linked, &repos), url(12));
         let bare = note(
             5,
             "t3:judge",
@@ -1207,10 +1287,34 @@ mod tests {
             "2026-11-08T12:00:00Z",
         );
         let with = detail(vec![parking.clone(), bare.clone()], serde_json::json!([]));
-        assert_eq!(
-            passed_pr(&with, &bare).as_deref(),
-            Some("https://github.com/o/r/pull/11")
+        assert_eq!(passed_pr(&with, &bare, &repos), url(11));
+        // A link in another agent's note is not the task's pull request.
+        let mut others = parking.clone();
+        others.agent = "t3:other".parse().unwrap();
+        let with_others = detail(vec![others, bare.clone()], serde_json::json!([]));
+        assert_eq!(passed_pr(&with_others, &bare, &repos), PassedPr::None);
+        // One in a repository the board does not list is not merged.
+        let elsewhere = ["github.com/o/other".to_owned()];
+        assert!(matches!(
+            passed_pr(&with, &bare, &elsewhere),
+            PassedPr::Unclear(_)
+        ));
+        // A `pr:` line that is no URL falls back to the notes, and without one is unclear,
+        // not "no pull request".
+        let short = note(
+            5,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: pass\npr: #12",
+            "2026-11-08T12:00:00Z",
         );
+        let with_short = detail(vec![parking.clone(), short.clone()], serde_json::json!([]));
+        assert_eq!(passed_pr(&with_short, &short, &repos), url(11));
+        let alone = detail(vec![short.clone()], serde_json::json!([]));
+        assert!(matches!(
+            passed_pr(&alone, &short, &repos),
+            PassedPr::Unclear(_)
+        ));
         assert_eq!(passed_summary(&bare.text), "The review passed.");
         // `pr: none` says the task has no pull request, whatever other notes link.
         let none = note(
@@ -1221,7 +1325,7 @@ mod tests {
             "2026-11-08T12:00:00Z",
         );
         let with = detail(vec![parking, none.clone()], serde_json::json!([]));
-        assert_eq!(passed_pr(&with, &none), None);
+        assert_eq!(passed_pr(&with, &none, &repos), PassedPr::None);
     }
 
     #[test]

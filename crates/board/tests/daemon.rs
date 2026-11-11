@@ -169,9 +169,12 @@ impl Gh for FakeGh {
         })
     }
 
-    fn merge<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn merge<'a>(&'a self, _: &'a Path, pr: &'a str, head: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.calls.lock().unwrap().push(format!("merge {pr}"));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("merge {pr} at {head}"));
             let mut prs = self.prs.lock().unwrap();
             let pr = prs.get_mut(pr).unwrap();
             pr.state = PrState::Merged;
@@ -7814,7 +7817,7 @@ async fn a_failed_usage_report_keeps_the_last_pace() {
 
 // Daemon dispatch: judges, merging and finishing.
 
-const PR: &str = "https://github.com/o/r/pull/12";
+const PR: &str = "https://github.com/syz51/agent-board/pull/12";
 const JUDGE: &str = "t3:thread:project:p1:judge";
 const WORKER: &str = "t3:thread:project:p1:worker";
 const J1: &str = "thread:project:p1:j1";
@@ -7844,6 +7847,14 @@ fn pass_note(task: &board_proto::Task, pr: &str) -> Note {
         "decision: review: pass. The limit is now 80 characters.\ncheck: cargo test --workspace => 0\npr: {pr}"
     );
     task_note(2, task, JUDGE, "decision", &text)
+}
+
+/// The dispatcher's note that names the review judge it started for `task`.
+fn judge_note(task: &board_proto::Task) -> Note {
+    let text = format!(
+        "note: the dispatcher started a review judge for this task: thread j (agent {JUDGE})"
+    );
+    task_note(1, task, DISPATCH, "note", &text)
 }
 
 /// What `GET /v1/tasks/{id}` gives for `task`, with `notes`.
@@ -7896,6 +7907,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         draft: false,
         head_ref: "feat/limit".to_owned(),
         head_oid: "9c1e44d0a7b2c3".to_owned(),
+        cross_repository: false,
         merge_commit: None,
         merge_state,
         checks,
@@ -7906,7 +7918,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
 fn passed_env(pr: &str, worker: AgentState) -> Env {
     let task = review_task("factory-4", 0);
     let e = judges_env(std::slice::from_ref(&task));
-    review_detail(&e, &task, vec![pass_note(&task, pr)]);
+    review_detail(&e, &task, vec![judge_note(&task), pass_note(&task, pr)]);
     e.stub.on(
         &format!("GET {}", agent_path(WORKER)),
         agent_fixture(WORKER, DEVICE, worker),
@@ -8402,7 +8414,7 @@ async fn a_pass_the_worker_wrote_or_one_before_the_task_was_parked_again_is_no_p
     let mut parked = event(50, EventType::TaskUpdated, Some("factory-4"), WORKER);
     parked.at = pass.at + chrono::Duration::minutes(5);
     parked.payload = json!({"from": "doing", "to": "review"});
-    d.notes = vec![pass];
+    d.notes = vec![judge_note(&task), pass];
     d.history = vec![parked];
     e.stub.on("GET /v1/tasks/factory-4", d);
     e.daemon.reconcile(at()).await.unwrap();
@@ -8412,4 +8424,143 @@ async fn a_pass_the_worker_wrote_or_one_before_the_task_was_parked_again_is_no_p
             .requests_to("POST /v1/tasks/factory-4/done")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_pass_by_an_agent_the_dispatcher_did_not_start_as_judge_closes_nothing() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    // No note of the dispatcher names the author as this task's judge.
+    review_detail(&e, &task, vec![pass_note(&task, PR)]);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Passed));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert!(finishes(&e).is_empty());
+    assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
+}
+
+#[tokio::test]
+async fn a_passed_pull_request_is_merged_at_the_head_read_and_not_while_its_worker_runs() {
+    let mut e = passed_env(PR, AgentState::Running);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Passed));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.gh.calls().is_empty(), "its worker may still push");
+
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Idle),
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(
+        e.t3.gh
+            .calls()
+            .contains(&format!("merge {PR} at 9c1e44d0a7b2c3")),
+        "{:?}",
+        e.t3.gh.calls()
+    );
+    assert_eq!(finishes(&e).len(), 1);
+}
+
+#[tokio::test]
+async fn a_pull_request_outside_the_boards_repositories_or_named_without_its_url_is_left() {
+    for pr in ["https://github.com/o/other/pull/3", "#12"] {
+        let mut e = passed_env(pr, AgentState::Idle);
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(e.t3.gh.calls().is_empty(), "{pr}: {:?}", e.t3.gh.calls());
+        assert!(finishes(&e).is_empty(), "{pr}: not finished as without one");
+        assert!(worker_starts(&e.t3).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_passed_task_whose_pull_request_was_closed_is_set_open_with_a_note() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    let mut closed = open_pr(MergeState::Waits, Checks::Passed);
+    closed.state = PrState::Closed;
+    e.t3.gh.put(closed);
+    e.daemon.reconcile(at()).await.unwrap();
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 1);
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("decision: review: void") && text.contains("closed"),
+        "{text}"
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+        1
+    );
+    assert!(finishes(&e).is_empty());
+}
+
+#[tokio::test]
+async fn a_board_at_its_usage_stop_gets_no_new_judge() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    review_detail(&e, &task, vec![]);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    e.stub.on("GET /v1/usage", usage_reading(40.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
+}
+
+#[tokio::test]
+async fn a_judge_start_that_made_no_thread_is_tried_again_soon() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    review_detail(&e, &task, vec![]);
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(registered(&e).is_empty());
+    assert_eq!(
+        e.daemon.state.judges.len(),
+        1,
+        "kept until its thread is looked for"
+    );
+
+    // No thread came of it: the start is tried again after the short wait, not the
+    // retry of a judge that ran.
+    e.t3.fail_start.store(false, Ordering::SeqCst);
+    let minute = chrono::Duration::minutes(1);
+    e.daemon.reconcile(at() + minute).await.unwrap();
+    assert!(e.daemon.state.judges.is_empty());
+    assert!(registered(&e).is_empty());
+    e.daemon
+        .reconcile(at() + minute + board::daemon::JUDGE_START_RETRY)
+        .await
+        .unwrap();
+    assert_eq!(registered(&e).len(), 1);
+}
+
+#[tokio::test]
+async fn a_judge_start_the_daemon_did_not_finish_is_registered_with_the_thread_it_made() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    review_detail(&e, &task, vec![]);
+    // T3 made the thread, and the start then timed out.
+    *e.t3.clock.lock().unwrap() = at();
+    *e.t3.die_after_create.lock().unwrap() = Some(true);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(registered(&e).is_empty());
+
+    *e.t3.die_after_create.lock().unwrap() = None;
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        registered(&e),
+        [json!({"agent": format!("t3:{ORPHAN}"), "kind": "review", "tasks": ["factory-4"]})]
+    );
+    assert_eq!(worker_starts(&e.t3).len(), 1, "no second thread");
+    // The judge's agent id ends the dispatcher's note: a pass counts only from it.
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(text.ends_with(&format!("(agent t3:{ORPHAN})")), "{text}");
 }
