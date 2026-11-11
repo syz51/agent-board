@@ -364,9 +364,10 @@ Reopening a closed board, or any change on it, starts the period again.
   ignore it and list every task.
   `since=<point>` lists only the tasks changed after a point: digits alone are an event
   sequence number (`seq` of a snapshot or event, `next_since` of `GET /v1/events`), and
-  anything else is an RFC 3339 time. A task changes with every event that names it: its
-  creation, an update, a claim, a note or a completion. The point itself is not
-  included. Events are kept 365 days, so an older point reads no further back. It
+  anything else is an RFC 3339 time. A task changes with an event that names it: its
+  creation, an update, a claim, a note, an ask or a completion. The server's own notices
+  about a task (a `task_updated` event with no `fields`) and the lease events of a task
+  are not changes. The point itself is not included. Events are kept 365 days, so an older point reads no further back. It
   combines with every other filter. A blank `since` is no filter; a value that is neither
   form is 400 `invalid`. Servers that predate `since` ignore it and list every task.
   `after=<task id>` continues a list: it lists only the tasks that follow that task in
@@ -981,8 +982,9 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 - `board ls --board <slug> --json` → `[Task]` list from `GET /v1/tasks?board=<slug>`, for
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more. When more tasks match than
-  the limit, the text output ends with a line `listed the first <n>; more match: …`; the
-  JSON output has no such sign. With `--json`, `--fields id,title,status` keeps only
+  the limit, the text output ends with a line `listed the first <n>; more match: …`
+  (`the next <n>` after `--after`) that names the task to continue after; the JSON output
+  has no such sign. With `--json`, `--fields id,title,status` keeps only
   those fields of each task; one the task leaves out, such as `summary`, is `null`. A
   name that is no field of `[Task]`, and `--fields` without `--json`, are refused before
   sending. A line names a task's owner by `owner_handle` when the server sends it.
@@ -1014,8 +1016,10 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   notes instead of the notes, then the agent-written text of all of them (bodies,
   acceptance checks, every finding and decision) under one header, each line with its
   `task`. A task that cannot be read is named with the reason and the others are still
-  shown; when none can be read the call fails. `--detailed` takes one task. `--json`
-  prints the `[TaskDetail]` list of the tasks that were read.
+  shown; when none can be read the call fails. An id named twice counts once, and one
+  task alone is the full form. `--detailed` takes one task. `--json` prints `{tasks,
+  not_shown}`: the `[TaskDetail]` list of the tasks that were read, and `{id, reason}`
+  for each that was not.
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |

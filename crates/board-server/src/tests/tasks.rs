@@ -3147,6 +3147,30 @@ async fn since_lists_the_tasks_changed_after_a_time_or_an_event() {
         );
         assert!(!listed(&found).contains(&old));
     }
+    // A lease held for a task and the server's own notice about one are not changes.
+    t.task_with(
+        A,
+        json!({
+            "board": "factory", "title": "Later",
+            "not_before": super::iso(t.state.now() + TimeDelta::minutes(1)),
+        }),
+    )
+    .await;
+    let quiet = t.count("SELECT MAX(seq) FROM events");
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(A),
+        Some(json!({ "agent": A, "repo": REPO, "globs": ["src/**"], "task": old })),
+    )
+    .await;
+    assert_eq!(announce_not_before(&t), 1);
+    assert!(t.count("SELECT MAX(seq) FROM events") >= quiet + 2);
+    let found = t
+        .ok("GET", &format!("/v1/tasks?since={quiet}"), None, None)
+        .await;
+    assert_eq!(listed(&found), Vec::<String>::new());
     // It combines with the other filters, and a time may carry an offset.
     let found = t
         .ok(
@@ -3165,10 +3189,10 @@ async fn since_lists_the_tasks_changed_after_a_time_or_an_event() {
             None,
         )
         .await;
-    assert_eq!(listed(&found).len(), 3, "the three changed after 12:00Z");
+    assert_eq!(listed(&found).len(), 4, "the four changed after 12:00Z");
     // A blank since is no filter; anything else must be a sequence number or a time.
     let found = t.ok("GET", "/v1/tasks?since=", None, None).await;
-    assert_eq!(found.as_array().unwrap().len(), 4);
+    assert_eq!(found.as_array().unwrap().len(), 5);
     for since in ["yesterday", "-1", "99999999999999999999", "2026-11-06"] {
         let (s, code, v) = t
             .fail("GET", &format!("/v1/tasks?since={since}"), None, None)

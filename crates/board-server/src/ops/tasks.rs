@@ -797,15 +797,22 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         );
         params.push((":words", &words));
     }
-    // A task changes with an event that names it (a note, a claim, an update), so the
-    // `events_task` index answers both forms.
+    // A task changes with an event that names it (a note, a claim, an update, an ask). The
+    // server's own notices (an update of no field) and the leases held for it change nothing
+    // an agent wrote. The `events_task` index finds a task's events; the sequence form also
+    // seeks in it, the time form reads that task's events.
     let since = match filter.since {
         Some(Since::Seq(seq)) => Some(("e.seq", seq)),
         Some(Since::At(at)) => Some(("e.at", at.timestamp_millis())),
         None => None,
     };
     let since_sql = since.map(|(column, _)| {
-        format!("EXISTS (SELECT 1 FROM events e WHERE e.task = t.id AND {column} > :since)")
+        format!(
+            "EXISTS (SELECT 1 FROM events e WHERE e.task = t.id AND {column} > :since \
+             AND e.type NOT IN ('lease_created', 'lease_released', 'lease_expired') \
+             AND NOT (e.type = 'task_updated' \
+                      AND json_array_length(e.payload, '$.fields') = 0))"
+        )
     });
     if let (Some(sql), Some((_, value))) = (&since_sql, &since) {
         clauses.push(sql);

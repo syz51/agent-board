@@ -3001,7 +3001,7 @@ fn ls_sends_since_and_after_and_the_cut_notice_names_the_cursor() {
     );
     assert!(
         stdout(&out)
-            .contains("listed the first 1; more match: list the next with after factory-12,"),
+            .contains("listed the next 1; more match: list the next with after factory-12,"),
         "{}",
         stdout(&out)
     );
@@ -3020,7 +3020,7 @@ fn ls_sends_since_and_after_and_the_cut_notice_names_the_cursor() {
     let out = e.run(&["ls", "--since", "last week"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("event sequence number"),
+        stderr(&out).ends_with("or send an event sequence number, such as the snapshot's seq\n"),
         "{}",
         stderr(&out)
     );
@@ -3094,10 +3094,22 @@ fn show_reads_several_tasks_in_one_call_in_a_compact_form() {
         text.contains("\n2 plain notes not shown: task_show factory-12"),
         "{text}"
     );
-    // JSON holds the details that were read.
-    let out = e.run(&["show", "factory-13", "factory-12", "--json"]);
-    let details: Vec<TaskDetail> = serde_json::from_str(&stdout(&out)).unwrap();
+    // JSON holds the details that were read and names the tasks that were not.
+    let out = e.run(&["show", "factory-13", "factory-99", "factory-12", "--json"]);
+    let shown: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let details: Vec<TaskDetail> = serde_json::from_value(shown["tasks"].clone()).unwrap();
     assert_eq!(details.len(), 2);
+    assert_eq!(shown["not_shown"][0]["id"], "factory-99");
+    assert!(
+        shown["not_shown"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist"),
+        "{shown}"
+    );
+    // An id named twice is one task, in the full form.
+    let out = e.run(&["show", "factory-12", "factory-12"]);
+    assert!(stdout(&out).contains("plain one"), "{}", stdout(&out));
 
     // One task keeps the full form, without the task key in its own lines.
     let out = e.run(&["show", "factory-12"]);
@@ -3112,6 +3124,11 @@ fn show_reads_several_tasks_in_one_call_in_a_compact_form() {
     args.extend(many.iter().map(String::as_str));
     let out = e.run(&args);
     assert!(stderr(&out).contains("at most 20"), "{}", stderr(&out));
+    // The limit counts each task once.
+    args.truncate(21);
+    args.push("factory-1");
+    let out = e.run(&args);
+    assert!(!stderr(&out).contains("at most 20"), "{}", stderr(&out));
     let out = e.run(&["show", "factory-99", "factory-98"]);
     assert!(!out.status.success());
     assert!(

@@ -1152,11 +1152,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             ops::task_list(&ctx, &query, a.detailed, a.fields.as_deref()).await?
         }
-        Command::Show { ids, detailed } => match ids.as_slice() {
-            [id] => ops::task_show(&ctx()?, id, detailed).await?,
-            _ if detailed => bail!("--detailed shows one task: name one id, or drop --detailed"),
-            ids => ops::tasks_show(&ctx()?, ids).await?,
-        },
+        Command::Show { ids, detailed } => ops::tasks_show(&ctx()?, &ids, detailed).await?,
         Command::Add(a) => {
             let new = ops::NewTask {
                 board: a.board,

@@ -827,14 +827,8 @@ impl BoardMcp {
             }
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;
-                if a.ids.iter().all(|id| *id == a.id) {
-                    ops::task_show(&ctx, &a.id, a.detailed).await?
-                } else if a.detailed {
-                    anyhow::bail!("detailed shows one task: send id alone, or drop detailed")
-                } else {
-                    let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
-                    ops::tasks_show(&ctx, &ids).await?
-                }
+                let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
+                ops::tasks_show(&ctx, &ids, a.detailed).await?
             }
             "task_add" => {
                 let a: AddArgs = parse(name, args)?;

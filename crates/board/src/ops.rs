@@ -420,12 +420,22 @@ pub async fn task_list(
         tasks.truncate(limit);
         // The last task listed is the cursor of the next page.
         let last = &tasks[limit - 1].id;
+        // A page after a cursor is not the first of the list.
+        let which = if query.after.is_some() {
+            "next"
+        } else {
+            "first"
+        };
         format!(
-            "\nlisted the first {limit}; more match: list the next with after {last}, narrow it with a filter or a search, or raise the limit (at most {TASKS_LIMIT_MAX})"
+            "\nlisted the {which} {limit}; more match: list the next with after {last}, narrow it with a filter or a search, or raise the limit (at most {TASKS_LIMIT_MAX})"
         )
-    } else if tasks.len() == TASKS_LIMIT_MAX as usize {
+    } else if let Some(last) = tasks
+        .last()
+        .filter(|_| tasks.len() == TASKS_LIMIT_MAX as usize)
+    {
         format!(
-            "\nlisted {TASKS_LIMIT_MAX}, the most one call lists; more may match: narrow it with a filter or a search"
+            "\nlisted {TASKS_LIMIT_MAX}, the most one call lists; more may match: list the next with after {}, or narrow it with a filter or a search",
+            last.id
         )
     } else {
         String::new()
@@ -488,21 +498,28 @@ pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output>
 /// Most tasks one `task_show` reads.
 pub const TASK_SHOW_MAX: usize = 20;
 
-/// Several tasks in one call, in a compact form: each task's state, evidence, text,
-/// findings and decisions. The tasks are read at the same time; one that cannot be read
-/// is named with the reason and does not fail the others.
-pub async fn tasks_show(ctx: &Ctx, ids: &[TaskId]) -> Result<Output> {
-    if ids.len() > TASK_SHOW_MAX {
-        bail!(
-            "{} tasks is more than one call shows; name at most {TASK_SHOW_MAX}",
-            ids.len()
-        );
-    }
+/// One task, or several in one call. Several come in a compact form: each task's state,
+/// evidence, text, findings and decisions. They are read at the same time; one that cannot
+/// be read is named with the reason and does not fail the others. An id named twice is
+/// read once, so the same id alone is the full form.
+pub async fn tasks_show(ctx: &Ctx, ids: &[TaskId], detailed: bool) -> Result<Output> {
     let mut unique: Vec<&TaskId> = Vec::with_capacity(ids.len());
     for id in ids {
         if !unique.contains(&id) {
             unique.push(id);
         }
+    }
+    if let [id] = unique.as_slice() {
+        return task_show(ctx, id, detailed).await;
+    }
+    if detailed {
+        bail!("detailed shows one task: name one id, or drop detailed");
+    }
+    if unique.len() > TASK_SHOW_MAX {
+        bail!(
+            "{} tasks is more than one call shows; name at most {TASK_SHOW_MAX}",
+            unique.len()
+        );
     }
     let read = futures_util::future::join_all(unique.iter().map(|id| ctx.client.task(id))).await;
     let tasks: Vec<(TaskId, Result<TaskDetail, String>)> = unique
@@ -516,7 +533,14 @@ pub async fn tasks_show(ctx: &Ctx, ids: &[TaskId]) -> Result<Output> {
         bail!("none of the tasks could be read: {reason}");
     }
     let details: Vec<&TaskDetail> = tasks.iter().filter_map(|(_, r)| r.as_ref().ok()).collect();
-    Ok(Output::new(render::task_details(&tasks), &details))
+    let not_shown: Vec<serde_json::Value> = tasks
+        .iter()
+        .filter_map(|(id, r)| Some(serde_json::json!({ "id": id, "reason": r.as_ref().err()? })))
+        .collect();
+    Ok(Output::new(
+        render::task_details(&tasks),
+        &serde_json::json!({ "tasks": details, "not_shown": not_shown }),
+    ))
 }
 
 /// A `since` filter of the task list as the server takes it: an event sequence number as
@@ -528,7 +552,7 @@ pub fn list_since(value: &str, now: Timestamp) -> Result<String> {
     }
     parse_since(value, now)
         .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .with_context(|| "or send an event sequence number, such as the snapshot's seq")
+        .map_err(|e| anyhow!("{e:#}; or send an event sequence number, such as the snapshot's seq"))
 }
 
 #[derive(Debug, Clone, Default)]
