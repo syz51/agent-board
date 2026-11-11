@@ -311,8 +311,12 @@ only (403 `forbidden` otherwise), because the server then deletes the board. Eve
 the server sweeps temporary boards that are **idle**: no event on the board (nor change to
 it) for the period, no open ask, and no task in `doing` whose owner is live. Tasks in
 `review` or `blocked` do not keep a board; ask the user to keep one waiting on them. The
-period counts from the server's start at the earliest, so time the server was down is not
-idle time. Nor is a board idle while one of its tasks that is not done blocks an
+server's notices are not activity: a `task_updated` with actor `server` and empty `fields`
+(a quiet review, an owner away, a passed `not_before`) repeats, or comes, while nobody
+uses the board. Time the server was down is not idle time: the server records every
+minute, and at shutdown, that it is alive, and takes each gap between that and its next
+start out of the period. A restart does not start the period again. When that record
+cannot be written, no board is swept until it can. Nor is a board idle while one of its tasks that is not done blocks an
 unfinished task on another board. Each board is swept in its own transaction; one that
 fails is logged and tried again on the next sweep.
 
