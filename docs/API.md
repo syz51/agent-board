@@ -728,7 +728,12 @@ knows two things for it:
   `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
   `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
   the answer unchanged.
-- `GET /v1/asks?status=open&board=` → `[Ask]` list.
+- `GET /v1/asks?status=open&board=&limit=` → `[Ask]` list, oldest first. `limit` is
+  optional: with it, the list holds only the newest `limit` asks that pass the filters (0
+  reads as 1); without it, every one. The list does not say that it was cut, so a client
+  asks for one ask more than it shows, as `board asks` does: it then says that older ones
+  match. A server that predates `limit` sends every ask, so `board asks` counts the older
+  ones when more than one is over its limit.
 - `GET /v1/asks/{id}` → `[Ask]` in any status (the web view's `/asks/<id>` link).
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
   `cli`, `web` or `telegram`. The `ask_answered` event's payload names the ask (`id`) and
@@ -804,8 +809,10 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   forwarded or fixed, or it was closed without a resolution), the new item's `recurs` names
   it: the fix did not hold, or it came back.
 - `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
-  The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
-  next step. `kind` is one of:
+  The item's owner or the user only; 403 `forbidden` otherwise, with the next step. An agent
+  that resolves an `open`, unowned item claims it in the same transaction (a `task_claimed`
+  event before `task_done`; the doing limit does not apply); a caller with no agent id is
+  still refused. `kind` is one of:
   - `routed`: `task` (any board) does the work. Reports go to this item until that task is
     done or dropped; then a report opens a new item that `recurs` this one.
   - `duplicate`: `task` is the original item, which takes later reports. The original must

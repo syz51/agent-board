@@ -620,7 +620,7 @@ pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
 }
 
 /// Refuses to start a task whose `not_before` has not passed.
-fn check_not_before(cx: &Ctx<'_>, task: &Task) -> Result<()> {
+pub(crate) fn check_not_before(cx: &Ctx<'_>, task: &Task) -> Result<()> {
     match task.not_before {
         Some(at) if at > cx.now => Err(bad_transition(
             format!("{} waits until {}", task.id, at.format("%Y-%m-%d %H:%MZ")),
@@ -985,7 +985,7 @@ fn open_blockers(cx: &Ctx<'_>, task: &TaskId) -> Result<Vec<(String, String)>> {
 }
 
 /// Refuses to start `task` while a blocker is not done.
-fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
+pub(crate) fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
     let waiting = open_blockers(cx, task)?;
     if waiting.is_empty() {
         return Ok(());
@@ -1494,7 +1494,7 @@ fn check_handover(
 
 /// The refusal of an unaccepted proposal moving to doing. The hint keeps the claimant,
 /// who may be the proposer, from accepting it itself.
-fn unaccepted_proposal(id: &TaskId) -> Error {
+pub(crate) fn unaccepted_proposal(id: &TaskId) -> Error {
     bad_transition(
         format!(
             "{id} is a proposal not yet accepted: it becomes work only once another agent accepts it"

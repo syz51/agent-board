@@ -82,6 +82,32 @@ pub struct Config {
     /// `projects` (such as a feedback board with no repo).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub board_projects: BTreeMap<BoardSlug, PathBuf>,
+    /// The T3 provider instance and model for the threads `board watch` starts; without
+    /// it they get the project's defaults.
+    pub thread_model: Option<ThreadModel>,
+}
+
+/// A T3 provider instance and a model of it: `t3 thread start` takes them only together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadModel {
+    /// The provider instance's id in T3's settings.
+    #[serde(deserialize_with = "non_empty")]
+    pub provider: String,
+    /// The model's slug.
+    #[serde(deserialize_with = "non_empty")]
+    pub model: String,
+}
+
+/// A string with text in it: an empty one would fail every thread start.
+fn non_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    if text.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "is empty: give the T3 provider instance's id and a model slug",
+        ));
+    }
+    Ok(text)
 }
 
 impl Config {
@@ -415,6 +441,28 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_model_needs_its_provider_and_its_model() {
+        let config: Config =
+            toml::from_str("[thread_model]\nprovider = \"claude-agents\"\nmodel = \"a-model\"\n")
+                .unwrap();
+        let model = ThreadModel {
+            provider: "claude-agents".into(),
+            model: "a-model".into(),
+        };
+        assert_eq!(config.thread_model, Some(model));
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+
+        assert_eq!(toml::from_str::<Config>("").unwrap().thread_model, None);
+        let err =
+            toml::from_str::<Config>("[thread_model]\nprovider = \"claude-agents\"\n").unwrap_err();
+        assert!(err.to_string().contains("model"), "{err}");
+        let err = toml::from_str::<Config>("[thread_model]\nprovider = \"\"\nmodel = \"m\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
+    }
 
     #[test]
     fn config_round_trips_and_defaults_feedback_board() {
