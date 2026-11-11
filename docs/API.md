@@ -328,7 +328,7 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&q=&since=&after=&limit=` →
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&closed=&q=&since=&after=&limit=` â
   `[Task]` list, sorted by priority, then id number, then board. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
@@ -342,6 +342,9 @@ Reopening a closed board, or any change on it, starts the period again.
   agent id is; it is absent without an owner, and from servers that predate it.
   `proposal=true` lists only
   pending proposals, `false` leaves them out (see "Pending proposals" below).
+  `closed=false` leaves out the `done` and `dropped` tasks, `true` lists only those; it
+  combines with every other filter, so `status=done&closed=false` is an empty list.
+  Servers that predate `closed` ignore it and list tasks of every status.
   `live=true` lists only the feedback items a new report with their signature would add
   to, whatever their status, by the rule reports follow (see "Feedback" below): the newest
   item with each signature, when it is unresolved and not done or dropped, declined,
@@ -381,7 +384,22 @@ Reopening a closed board, or any change on it, starts the period again.
   for one task more than their limit and say so in their text, naming the task to
   continue after. The MCP `task_list` asks
   for 50 tasks when the call names no `limit`, since its text goes into an agent's
-  context; the CLI keeps the server's default.
+  context; the CLI keeps the server's default. The MCP `task_list` also narrows a plain
+  call to open work on one board, in the client:
+  - It sends `board=<the caller's board>` (the one board the caller joined, else the
+    one active board of its repository) unless the call names `board`,
+    `all_boards=true`, `mine`, `owner`, `parent` or `live`. When no single board covers
+    the repository, it lists every board.
+  - It sends `closed=false` unless the call names `include_closed=true`, `status`,
+    `parent`, `live` or `q`: a search finds done work too, such as an earlier report of
+    the same problem. `include_closed` differs from the wire's `closed=true`, which lists
+    only the closed tasks.
+  - A list that `closed=false` left empty says so in its text. When a server that
+    predates `closed` cut its list, the client refuses the list instead of trimming it.
+  - `all_boards=true` with `include_closed=true` gives the list of every board and every status
+    back. `board` with `all_boards` is refused before sending.
+  - A list that names no board and no parent ends its text with
+    `boards listed: <slugs>; name a board to narrow it`.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -996,6 +1014,11 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `--search <words>` (alias `--grep`) sends `q=<words>`, at most 8 words and 200
   characters, refused before sending when longer. A server that predates `q` ignores it
   and lists every task, so upgrade the server first.
+  `board ls` without `--board` lists the tasks of every board, as before; unless
+  `--parent` is given, its text then ends with `boards listed: <slugs>; name a board to
+  narrow it`, the boards of the tasks it listed. The JSON output has no such line.
+  `--open` sends `closed=false`, which leaves out the done and dropped tasks; it cannot
+  go with `--status`. Without it the CLI lists tasks of every status.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
   with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every
   feedback item that still takes reports, such as declined ones and ones routed to open

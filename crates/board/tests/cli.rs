@@ -67,14 +67,19 @@ fn ls_sends_a_search_and_says_when_the_limit_cut_the_list() {
     // One more task than the limit came back: the list is cut, and the text says so.
     let out = e.run(&["ls", "--grep", "key", "--limit", "1"]);
     let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
-    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    // No board was named, so the list says which boards it holds.
+    assert_eq!(
+        lines[2],
+        "boards listed: factory; name a board to narrow it"
+    );
     assert!(
         lines[1].starts_with("listed the first 1; more match"),
         "{lines:?}"
     );
     // A limit of 0 counts as 1, as on the server.
     let out = e.run(&["ls", "--limit", "0"]);
-    assert_eq!(stdout(&out).lines().count(), 2);
+    assert_eq!(stdout(&out).lines().count(), 3);
 
     // `--fields` keeps only the named fields in the JSON; one a task lacks is null.
     let out = e.run(&["ls", "--json", "--fields", "id,title,owner"]);
@@ -2972,6 +2977,67 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
     assert_eq!(put.last().unwrap().body, json!({ "reserve": null }));
     let out = e.run(&["usage", "--reserve", "100"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+}
+
+#[test]
+fn ls_without_a_board_names_the_boards_and_open_leaves_closed_tasks_out() {
+    let e = env();
+    let mut done = task_fixture("web-3", "Ship the page");
+    done.board = "web".parse().unwrap();
+    done.status = board_proto::TaskStatus::Done;
+    let mut other = task_fixture("web-4", "Fix the footer");
+    other.board = "web".parse().unwrap();
+    e.stub.on(
+        "GET /v1/tasks",
+        [task_fixture("factory-12", "Rotate the key"), done, other],
+    );
+    let text = stdout(&e.run(&["ls"]));
+    assert!(
+        text.ends_with("\nboards listed: factory, web; name a board to narrow it\n"),
+        "{text}"
+    );
+    assert!(text.contains("web-3 done"), "{text}");
+    assert!(
+        !e.stub.requests_to("GET /v1/tasks")[0]
+            .query_pairs()
+            .contains_key("closed")
+    );
+    // A named board needs no such line, and JSON stays the bare list.
+    let text = stdout(&e.run(&["ls", "--board", "factory"]));
+    assert!(!text.contains("boards listed"), "{text}");
+    let json: Value = serde_json::from_str(&stdout(&e.run(&["ls", "--json"]))).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 3);
+
+    // --open asks the server for open work, and drops closed tasks an older server sends.
+    let text = stdout(&e.run(&["ls", "--open"]));
+    assert_eq!(
+        e.stub
+            .requests_to("GET /v1/tasks")
+            .last()
+            .unwrap()
+            .query_pairs()["closed"],
+        "false"
+    );
+    assert!(!text.contains("web-3") && text.contains("web-4"), "{text}");
+    let out = e.run(&["ls", "--open", "--status", "done"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+
+    // An older server's limit counted the closed tasks: a full list is refused, since
+    // trimming it would hide open tasks past the cut.
+    let out = e.run(&["ls", "--open", "--limit", "2"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("does not filter closed tasks yet"), "{err}");
+
+    // An empty list of open work says what it left out.
+    let mut done = task_fixture("factory-3", "Ship the page");
+    done.status = board_proto::TaskStatus::Done;
+    e.stub.on("GET /v1/tasks", [done]);
+    let text = stdout(&e.run(&["ls", "--open", "--board", "factory"]));
+    assert_eq!(
+        text,
+        "no tasks\nlooked on board factory at open tasks only: done and dropped ones are left out\n"
+    );
 }
 
 #[test]
