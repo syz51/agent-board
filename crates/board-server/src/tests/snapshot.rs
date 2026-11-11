@@ -84,8 +84,8 @@ async fn design_scenario(t: &T) {
     ];
     for (i, (title, priority)) in titles.iter().enumerate() {
         let n = i + 1;
-        // Every task but one is work a coordinator may start; that one waits on the user.
-        let auto = n != 17;
+        // Two tasks wait on the user; the rest is work a coordinator may start.
+        let auto = ![16, 17].contains(&n);
         let mut body =
             json!({ "board": "factory", "title": title, "priority": priority, "auto": auto });
         if [3, 4, 5, 6, 7, 8, 10, 11, 13, 19].contains(&n) {
@@ -190,7 +190,7 @@ async fn delta_and_alerts_render_the_same_alerts() {
     let delta = snapshot(&t, ME, "kind=delta&since=806").await;
     let expected = "\
 <board agent=\"t3:7f3a\" board=\"factory\" src=\"board server\" seq=\"812\">
-counts: open 14 · doing 3 · blocked 1 · ready 4 (auto 3)
+counts: open 14 · doing 3 · blocked 1 · ready 4 (auto 2)
 alerts:
   ! factory-9 done: your blocker is cleared -> task_update factory-12 blockers=[]
   ! t3:a91c edited claude/tests/lib/stream.js 3m ago; you edited it 25m ago -> re-read before editing
@@ -519,7 +519,7 @@ async fn json_and_yaml_carry_the_same_model() {
     assert_eq!(model["you"]["doing"], json!(["factory-12"]));
     assert_eq!(model["you"]["doing_limit"], 1);
     assert_eq!(model["counts"]["ready"], 4);
-    assert_eq!(model["counts"]["auto"], 3);
+    assert_eq!(model["counts"]["auto"], 2);
     assert_eq!(model["mine"][0]["id"], "factory-12");
     assert_eq!(model["alerts"].as_array().unwrap().len(), 2);
     // Compact JSON fits the same cap as lines, so the formats compare fairly in the
@@ -1554,6 +1554,49 @@ async fn snapshots_list_pending_proposals_apart_from_ready_work() {
         yaml.contains(&format!("proposals:\n  total: 1\n  items:\n    - {{id: factory-2, priority: p2, title: \"Cache builds\", by: \"{handle}\"}}")),
         "{yaml}"
     );
+}
+
+#[tokio::test]
+async fn ready_lists_auto_tasks_first_and_marks_the_users() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    for (title, priority, auto) in [
+        ("Decide the name", "p2", false),
+        ("Pick the colour", "p2", false),
+        ("Choose the host", "p2", false),
+        ("Fix the parser", "p3", true),
+    ] {
+        t.task_with(
+            "t3:alpha",
+            json!({ "board": "factory", "title": title, "priority": priority, "auto": auto }),
+        )
+        .await;
+    }
+    let full = snapshot(&t, "t3:alpha", "").await;
+    let text = text(&full);
+    // The cap of 3 holds; the p3 auto task leads, and the others say whom they wait on.
+    assert!(
+        text.contains(
+            "ready (3 of 4):\n  factory-4 p3 \"Fix the parser\"\n  \
+             factory-1 p2 \"Decide the name\" (user)\n  \
+             factory-2 p2 \"Pick the colour\" (user)\n"
+        ),
+        "{text}"
+    );
+    let yaml = snapshot(&t, "t3:alpha", "format=yaml").await;
+    let yaml = yaml["text"].as_str().unwrap();
+    assert!(
+        yaml.contains(
+            "    - {id: factory-4, priority: p3, title: \"Fix the parser\"}\n    \
+             - {id: factory-1, priority: p2, title: \"Decide the name\", user: true}\n"
+        ),
+        "{yaml}"
+    );
+    let json = snapshot(&t, "t3:alpha", "format=json").await;
+    let json = json["text"].as_str().unwrap();
+    assert!(json.contains("\"user\":true"), "{json}");
+    assert!(!json.contains("\"user\":false"), "{json}");
 }
 
 #[tokio::test]

@@ -343,7 +343,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_claim",
-        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless a blocked reason or an open ask holds it. Refused when another live agent owns it. take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
+        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless an open ask, or a blocked reason someone else set, holds it. Refused when another live agent owns it. take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -1307,8 +1307,8 @@ mod tests {
             "Hold no more than your doing limit (the snapshot's you: line shows it, usually 1)",
             "finish or park (review, blocked) the current task first",
             "claim one at a time, never in a parallel batch",
-            "Also resumes your own, or nobody's, task in review or blocked, unless a blocked \
-             reason or an open ask holds it",
+            "Also resumes your own, or nobody's, task in review or blocked, unless an open \
+             ask, or a blocked reason someone else set, holds it",
             "Refused when another live agent owns it",
             "take=true takes a task whose owner is stale, or ended when you created the task \
              or delegated the owner",

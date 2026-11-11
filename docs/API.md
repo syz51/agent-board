@@ -518,13 +518,16 @@ Reopening a closed board, or any change on it, starts the period again.
   - owned by the caller or by nobody: the claim resumes it, as `PATCH` with
     `status: doing` would (the same `task_updated` event, not `task_claimed`), after the
     checks above (blockers done, `not_before` passed, the `doing` limit, not an unaccepted
-    proposal). It is refused with 400 `invalid_transition` while the task may wait on the
-    user: a `blocked` task with a `blocked_reason`, or an open ask on the task. For a
-    reason, `next` quotes it and says what to do once it no longer holds: for the caller's
-    own task, resume it with `task_update <id> status=doing` or close it with `task_done`;
-    for nobody's, clear it with `task_update <id> status=open`, then claim it. For an ask,
-    `next` names it and says to wait for its answer, or to withdraw it (`ask_withdraw`, or
-    `board withdraw`), then claim again.
+    proposal). A `blocked_reason` that the caller set on its own task is cleared, as
+    `status: doing` clears it: the owner judges when its reason no longer holds. It is
+    refused with 400 `invalid_transition` while the task may wait on the user: an open ask
+    on the task, or a `blocked_reason` that someone else set (the latest `task_updated`
+    event that lists the field names who), which covers every reason on nobody's task.
+    For a reason, `next` quotes it and says what to do once it no longer holds: for the
+    caller's own task, resume it with `task_update <id> status=doing` or close it with
+    `task_done`; for nobody's, clear it with `task_update <id> status=open`, then claim
+    it. For an ask, `next` names it and says to wait for its answer, or to withdraw it
+    (`ask_withdraw`, or `board withdraw`), then claim again.
   - owned by another live agent: 409 `claim_refused` naming the owner. When the caller
     stands in for an owner whose session ended, 400 `invalid_transition` instead, with
     `next` naming `take=true`, and the claim is not counted in `claims_refused`.
