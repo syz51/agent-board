@@ -234,6 +234,15 @@ pub struct WatchState {
     /// found again: the next start adopts the thread it created instead of adding another.
     #[serde(default)]
     pub pending_starts: BTreeMap<BoardSlug, Timestamp>,
+    /// The coordinator thread each board last had on this device, once it stopped being the
+    /// coordinator while its thread lived on (see [`StoodDown`]). Read leniently like
+    /// `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_stood_down",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub stood_down: BTreeMap<BoardSlug, StoodDown>,
     /// Wake-ups not sent yet, by agent: held while the agent runs or is paused, or kept
     /// after a failed send. Saved so a restart does not lose them; an entry this version
     /// cannot read is skipped rather than resetting the rest of the state.
@@ -650,6 +659,16 @@ fn lenient_unsure<'de, D: serde::Deserializer<'de>>(
     );
     unsure.retain(|_, u| !u.messages.is_empty());
     Ok(unsure)
+}
+
+/// Each stood-down coordinator read on its own, like [`lenient_queues`].
+fn lenient_stood_down<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<BoardSlug, StoodDown>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the stood-down coordinator",
+    ))
 }
 
 /// Each worker read on its own, like [`lenient_queues`].
@@ -1373,6 +1392,33 @@ impl Coordinator {
     }
 }
 
+/// A coordinator thread that stopped being its board's coordinator while the thread itself
+/// lived on: autopilot went off, this device stopped being a home, the board went to daemon
+/// dispatch, or another coordinator took the board. The thread is told once, with
+/// [`stand_down_message`]. When this device next has to start a coordinator for the board,
+/// it takes this thread again if T3 still runs it, instead of starting a second one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoodDown {
+    pub coordinator: Coordinator,
+    /// Why, as the thread is told.
+    pub reason: String,
+    /// Whether [`stand_down_message`] was sent, or needs no send. Set and saved before the
+    /// send, so a daemon killed in between does not send it twice; a send that failed
+    /// clears it, and one that timed out leaves it set.
+    #[serde(default)]
+    pub told: bool,
+    /// How many sends of [`stand_down_message`] failed: after [`STAND_DOWN_TRIES`] it is
+    /// given up.
+    #[serde(default)]
+    pub tries: u32,
+    /// Whether [`resume_message`] was sent, set and saved before the send like `told`.
+    #[serde(default)]
+    pub resuming: bool,
+}
+
+/// A stand-down message is sent at most this many times when its sends fail.
+pub const STAND_DOWN_TRIES: u32 = 3;
+
 /// Records written before this field existed were registered before they were saved.
 fn registered_default() -> bool {
     true
@@ -1679,13 +1725,22 @@ impl<T: T3> Daemon<T> {
             .collect();
         for board in replaced {
             if let Some(local) = self.state.coordinators.remove(&board.slug) {
-                tracing::info!(
-                    "{} is set to daemon dispatch: coordinator thread {} is no longer its coordinator",
-                    board.slug,
-                    local.thread
-                );
+                let reason =
+                    "the board is set to daemon dispatch, so the daemon starts its workers";
+                self.stand_down(&board.slug, local, reason.to_owned()).await;
             }
             self.state.pending_starts.remove(&board.slug);
+        }
+        // A stand-down message whose send failed on an earlier reconcile is tried again.
+        let untold: Vec<BoardSlug> = self
+            .state
+            .stood_down
+            .iter()
+            .filter(|(_, stood)| !stood.told)
+            .map(|(slug, _)| slug.clone())
+            .collect();
+        for slug in untold {
+            self.tell_stood_down(&slug).await;
         }
         let mut checks = self.check_threads(&boards, now, checks_until).await;
         // After the thread checks, so a slow usage read never takes their time.
@@ -1713,8 +1768,21 @@ impl<T: T3> Daemon<T> {
                     continue;
                 }
                 let dispatching = board.coordinator.as_ref() == Some(&self.dispatch_agent());
-                if self.state.coordinators.remove(&board.slug).is_some() || dispatching {
+                let local = self.state.coordinators.remove(&board.slug);
+                if local.is_some() || dispatching {
                     self.release(&board.slug).await;
+                }
+                // The thread lives on: it is told to stop dispatching, and kept on record
+                // so the board gets it back instead of a second thread.
+                if let Some(local) = local {
+                    let reason = if !board.autopilot {
+                        "autopilot was switched off".to_owned()
+                    } else if !board.home_devices.contains(&self.ctx.device) {
+                        "this device is no longer one of the board's home devices".to_owned()
+                    } else {
+                        "the board is closed".to_owned()
+                    };
+                    self.stand_down(&board.slug, local, reason).await;
                 }
                 continue;
             }
@@ -1744,6 +1812,9 @@ impl<T: T3> Daemon<T> {
         let boards = &self.boards;
         self.state
             .coordinators
+            .retain(|slug, _| boards.contains_key(slug));
+        self.state
+            .stood_down
             .retain(|slug, _| boards.contains_key(slug));
         self.failures.retain(|slug, _| boards.contains_key(slug));
         self.checks_failing
@@ -1918,6 +1989,12 @@ impl<T: T3> Daemon<T> {
     ) -> Result<()> {
         let slug = &board.slug;
         let project = self.project_for(board).map(|(_, project)| project);
+        // Why a thread starts, should this reconcile start one: logged with the start.
+        let mut reason = String::from(
+            "the board names no coordinator and this device has no coordinator thread for it",
+        );
+        // Our own coordinator thread when the board names another coordinator, and why.
+        let mut replaced: Option<(Coordinator, String)> = None;
         // Our own coordinator whose thread is gone: replace it whatever its agent record says.
         let mut ours_gone = false;
         if let Some(local) = self.state.coordinators.get(slug).cloned() {
@@ -1987,21 +2064,34 @@ impl<T: T3> Daemon<T> {
                 );
                 self.thread_gone(&local.agent);
                 ours_gone = board.coordinator.is_some();
+                reason = format!(
+                    "its coordinator thread {} is gone, archived or its folder is missing",
+                    local.thread
+                );
+                self.state.coordinators.remove(slug);
+            } else if let Some(other) = &board.coordinator {
+                // The board names someone else. Our thread is told it was replaced once
+                // that coordinator is known to stand; one that does not stand is replaced
+                // below, by our thread when it is live.
+                let why = format!("the board names {other} as its coordinator");
+                replaced = Some((local, why));
             }
-            // The board names someone else, or the thread is gone.
-            self.state.coordinators.remove(slug);
             self.checks_failing.remove(slug);
         }
         if ours_gone || board.coordinator.as_ref() == Some(&self.dispatch_agent()) {
             // A renewal keeps the coordinator named, so the gone thread would stay named
             // until its replacement claims; releasing first means no one is named meanwhile.
             // A board switched back from daemon dispatch drops its dispatcher the same way.
+            if !ours_gone {
+                reason = "the board was switched back from daemon dispatch".to_owned();
+            }
             self.release(slug).await;
         } else if let Some(agent) = &board.coordinator {
             match self.client().agent_info(agent).await {
                 // Another coordinator runs the board: a start that failed here no longer waits.
                 Ok(info) if info.state != AgentState::Ended => {
                     self.failures.remove(slug);
+                    self.stand_down_replaced(slug, replaced.take()).await;
                     return Ok(());
                 }
                 // T3 ends a session left idle while its thread lives on, and the server keeps
@@ -2009,6 +2099,7 @@ impl<T: T3> Daemon<T> {
                 // it expires.
                 Ok(info) if info.device != self.ctx.device => {
                     self.failures.remove(slug);
+                    self.stand_down_replaced(slug, replaced.take()).await;
                     return Ok(());
                 }
                 // Ours, and unknown to this daemon's state. A pending adoption replaces it;
@@ -2021,18 +2112,44 @@ impl<T: T3> Daemon<T> {
                     if let Some(live) = self.thread_runs_in(&thread, project.as_deref()).await? {
                         self.last_checks
                             .insert(thread.clone(), (LastCheck::Live(live.folder), now));
+                        self.stand_down_replaced(slug, replaced.take()).await;
                         // What it was briefed with is unknown: briefed again, once.
                         let local = Coordinator::new(thread, agent.clone(), now, true, None);
                         return self.adopt(board, local, now).await;
                     }
                     self.thread_gone(agent);
+                    reason = format!(
+                        "the thread of its coordinator {agent} is gone, archived or its folder is missing"
+                    );
                     // A renewal keeps it named: released first, as for a gone thread above.
                     self.release(slug).await;
                 }
-                Ok(_) => self.release(slug).await,
-                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {}
+                Ok(_) => {
+                    reason = format!("the session of its coordinator {agent} ended");
+                    self.release(slug).await;
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    reason = format!("the server does not know its coordinator {agent}");
+                }
                 Err(err) => return Err(err),
             }
+        }
+        // The coordinator the board named does not stand, so the board needs one: our
+        // thread is kept without a message, and taken again below when T3 still runs it.
+        if let Some((local, why)) = replaced {
+            tracing::info!(
+                "coordinator of {slug}: {why}, which does not stand; thread {} is kept for it",
+                local.thread
+            );
+            self.state.coordinators.remove(slug);
+            let stood = StoodDown {
+                coordinator: local,
+                reason: why,
+                told: true,
+                tries: 0,
+                resuming: false,
+            };
+            self.state.stood_down.insert(slug.clone(), stood);
         }
         let adoption = match load_adoption(&self.ctx.home, slug) {
             Some(adoption) if now - adoption.requested_at >= ADOPTION_TTL => {
@@ -2067,7 +2184,7 @@ impl<T: T3> Daemon<T> {
         let start = async {
             match adoption {
                 Some(adoption) => self.adopt_thread(board, adoption, now).await,
-                None => self.start_coordinator(board, now).await,
+                None => self.resume_or_start(board, now, &reason).await,
             }
         };
         let started = match tokio::time::timeout(limit, start).await {
@@ -2146,6 +2263,8 @@ impl<T: T3> Daemon<T> {
                 // Another device took the lease over: the coordinator is no longer ours to run.
                 Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => {
                     self.state.coordinators.remove(&board.slug);
+                    let reason = "another device took the board's coordinator lease";
+                    self.stand_down(&board.slug, local, reason.to_owned()).await;
                     return Ok(());
                 }
                 // Retried on the next reconcile; resuming below does not depend on it.
@@ -2574,18 +2693,108 @@ impl<T: T3> Daemon<T> {
                 self.boards.insert(slug.clone(), updated);
                 local.renewed_at = now;
                 tracing::info!("{} coordinates {slug}", local.agent);
+                // The board has its coordinator: an older thread is not taken again.
+                if let Some(old) = self.state.stood_down.remove(slug)
+                    && old.coordinator.thread != local.thread
+                {
+                    tracing::info!(
+                        "coordinator of {slug}: thread {}, which stood down, is no longer kept for it",
+                        old.coordinator.thread
+                    );
+                }
                 self.state.coordinators.insert(slug.clone(), local);
                 Ok(())
             }
             Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => {
-                tracing::warn!(
-                    "another device took the coordinator lease of {slug}; thread {} is no longer its coordinator",
-                    local.thread
-                );
                 self.state.coordinators.remove(slug);
+                let reason = "another device took the board's coordinator lease";
+                self.stand_down(slug, local, reason.to_owned()).await;
                 Ok(())
             }
             Err(err) => Err(err),
+        }
+    }
+
+    /// Records that `local`'s thread is no longer the coordinator of `slug`, for `reason`,
+    /// and tells the thread so, once: it stops dispatching. The record is what
+    /// [`Self::resume_or_start`] takes the thread back from.
+    async fn stand_down(&mut self, slug: &BoardSlug, local: Coordinator, reason: String) {
+        tracing::info!(
+            "coordinator thread {} of {slug} stood down: {reason}",
+            local.thread
+        );
+        let stood = StoodDown {
+            coordinator: local,
+            reason,
+            told: false,
+            tries: 0,
+            resuming: false,
+        };
+        self.state.stood_down.insert(slug.clone(), stood);
+        self.tell_stood_down(slug).await;
+    }
+
+    /// [`Self::stand_down`] for our thread that the board replaced with a coordinator that
+    /// stands, if there is one.
+    async fn stand_down_replaced(
+        &mut self,
+        slug: &BoardSlug,
+        replaced: Option<(Coordinator, String)>,
+    ) {
+        if let Some((local, why)) = replaced {
+            self.state.coordinators.remove(slug);
+            self.stand_down(slug, local, why).await;
+        }
+    }
+
+    /// Sends the stood-down coordinator thread of `slug` its [`stand_down_message`], unless
+    /// it was sent. A send that timed out may have arrived, so it is not repeated; one that
+    /// failed is, on the next reconcile. A thread T3 no longer has needs no message and
+    /// cannot be taken again: its record goes.
+    async fn tell_stood_down(&mut self, slug: &BoardSlug) {
+        let Some(stood) = self.state.stood_down.get_mut(slug).filter(|s| !s.told) else {
+            return;
+        };
+        // On disk before the send, with the coordinator's record gone: a daemon killed
+        // after the send does not send it again.
+        stood.told = true;
+        let (agent, thread) = (
+            stood.coordinator.agent.clone(),
+            stood.coordinator.thread.clone(),
+        );
+        let message = stand_down_message(slug, &stood.reason);
+        if let Err(err) = self.save() {
+            tracing::warn!("saving the stood-down coordinator of {slug}: {err:#}");
+        }
+        match self.send_wake(&agent, &message).await {
+            Sent::Delivered => {}
+            Sent::MaybeDelivered(err) => {
+                tracing::warn!(
+                    "telling thread {thread} it no longer coordinates {slug}: {err:#}; not sent again"
+                );
+            }
+            Sent::Gone(_) => {
+                tracing::info!(
+                    "coordinator of {slug}: thread {thread}, which stood down, is gone; nothing to tell"
+                );
+                self.state.stood_down.remove(slug);
+            }
+            Sent::Failed(err) => {
+                let Some(stood) = self.state.stood_down.get_mut(slug) else {
+                    return;
+                };
+                stood.tries += 1;
+                if stood.tries < STAND_DOWN_TRIES {
+                    stood.told = false;
+                    tracing::warn!(
+                        "telling thread {thread} it no longer coordinates {slug}: {err:#}; tried again on the next reconcile"
+                    );
+                } else {
+                    tracing::warn!(
+                        "telling thread {thread} it no longer coordinates {slug}: {err:#}; given up after {STAND_DOWN_TRIES} sends"
+                    );
+                }
+            }
         }
     }
 
@@ -3220,7 +3429,93 @@ impl<T: T3> Daemon<T> {
         *slug == self.ctx.config.feedback_board()
     }
 
-    async fn start_coordinator(&mut self, board: &Board, now: Timestamp) -> Result<()> {
+    /// Gives `board` a coordinator when nothing names one and no adoption waits: the thread
+    /// that last coordinated it on this device and stood down, when T3 still runs it, else
+    /// a new thread. So a board whose autopilot went off and on again keeps one coordinator
+    /// thread. `reason` is why a coordinator is needed, logged with the start.
+    async fn resume_or_start(&mut self, board: &Board, now: Timestamp, reason: &str) -> Result<()> {
+        let slug = &board.slug;
+        let Some(stood) = self.state.stood_down.get(slug).cloned() else {
+            return self.start_coordinator(board, now, reason).await;
+        };
+        let thread = stood.coordinator.thread.clone();
+        let project = self.host_folder(board)?;
+        // Claimed before asking T3, which is slow: meanwhile no other device starts a thread.
+        match self.claim(slug, None).await {
+            Ok(updated) => {
+                self.boards.insert(slug.clone(), updated);
+            }
+            // Another device holds the lease; the thread stays on record.
+            Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => return Ok(()),
+            Err(err) => return Err(err),
+        }
+        let live = match self.thread_runs_in(&thread, Some(&project)).await {
+            Ok(live) => live,
+            Err(err) => {
+                self.release(slug).await;
+                return Err(err.context(format!(
+                    "checking thread {thread}, which last coordinated {slug}"
+                )));
+            }
+        };
+        let Some(live) = live else {
+            self.state.stood_down.remove(slug);
+            self.thread_gone(&stood.coordinator.agent);
+            let reason = format!(
+                "{reason}; thread {thread}, which last coordinated it, is gone, archived or its folder is missing"
+            );
+            return self.start_coordinator(board, now, &reason).await;
+        };
+        self.last_checks
+            .insert(thread.clone(), (LastCheck::Live(live.folder), now));
+        // Marked on disk before the send: a start cut short or a daemon killed after it
+        // does not send the message again.
+        if !stood.resuming {
+            if let Some(stood) = self.state.stood_down.get_mut(slug) {
+                stood.resuming = true;
+            }
+            self.save()?;
+            match self
+                .send_wake(&stood.coordinator.agent, &resume_message(slug))
+                .await
+            {
+                Sent::Delivered => {}
+                // It may have arrived: not sent again, and the board's wake-ups reach the
+                // thread once it is named.
+                Sent::MaybeDelivered(err) => tracing::warn!(
+                    "telling thread {thread} it coordinates {slug} again: {err:#}; not sent again"
+                ),
+                Sent::Gone(err) | Sent::Failed(err) => {
+                    if let Some(stood) = self.state.stood_down.get_mut(slug) {
+                        stood.resuming = false;
+                    }
+                    self.release(slug).await;
+                    return Err(err.context(format!(
+                        "telling thread {thread} it coordinates {slug} again"
+                    )));
+                }
+            }
+        }
+        tracing::info!(
+            "thread {thread} coordinates {slug} again, so no new thread starts: {reason}"
+        );
+        let mut local = stood.coordinator;
+        local.renewed_at = now;
+        // Recorded before the stood-down record goes, so the message is sent only once.
+        self.state.coordinators.insert(slug.clone(), local.clone());
+        self.state.stood_down.remove(slug);
+        self.state.pending_starts.remove(slug);
+        self.save()?;
+        self.adopt(board, local, now).await
+    }
+
+    /// Starts a new coordinator thread for `board`; `reason` is why, for `watch.log`.
+    async fn start_coordinator(
+        &mut self,
+        board: &Board,
+        now: Timestamp,
+        reason: &str,
+    ) -> Result<()> {
         let slug = &board.slug;
         let project = self.host_folder(board)?;
         match self.claim(slug, None).await {
@@ -3246,7 +3541,7 @@ impl<T: T3> Daemon<T> {
                 return Err(err.context(format!("t3 started thread {thread:?}; archive it in T3")));
             }
         };
-        tracing::info!("started coordinator thread {thread} for {slug}");
+        tracing::info!("started coordinator thread {thread} for {slug}: {reason}");
         // A thread an earlier start launched may hold another prompt: re-brief it.
         let briefed = briefed.then(|| prompt_digest(self.triages(slug)).to_owned());
         let local = Coordinator::new(thread, agent, now, false, briefed);
@@ -3372,7 +3667,11 @@ impl<T: T3> Daemon<T> {
                     adoption.thread
                 );
                 drop_adoption(&self.ctx.home, slug, &adoption)?;
-                return self.start_coordinator(board, now).await;
+                let reason = format!(
+                    "thread {} to adopt is gone, archived or its folder is missing",
+                    adoption.thread
+                );
+                return self.resume_or_start(board, now, &reason).await;
             }
             Err(err) => {
                 self.release(slug).await;
@@ -5313,6 +5612,21 @@ pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
     let prompt = standing_prompt(triage);
     format!(
         "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, a task moves to review, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
+    )
+}
+
+/// The one message that tells a coordinator thread it is no longer the coordinator of
+/// `slug`, and why: it stops dispatching.
+pub fn stand_down_message(slug: &BoardSlug, reason: &str) -> String {
+    format!(
+        "board {slug}: this thread is no longer its coordinator: {reason}. Stop dispatching now: claim no task, start no child and no review, and close no task as its coordinator. Children already at work finish on their own. For each task you own, add a note that says where it stands, then stop. You get one message here if this thread becomes the board's coordinator again."
+    )
+}
+
+/// The one message that tells a stood-down coordinator thread it coordinates `slug` again.
+pub fn resume_message(slug: &BoardSlug) -> String {
+    format!(
+        "board {slug}: this thread is its coordinator again: the board is on autopilot, this device runs it and no other coordinator is named. Keep what you know about the work. Continue your loop: call board_snapshot."
     )
 }
 
