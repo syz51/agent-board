@@ -497,7 +497,9 @@ settings in use, warned once per edit.
   only when there is none, or when briefing it failed. Older threads with that title are
   never taken. Each start writes its reason to `watch.log` ("started coordinator thread
   … for <board>: <reason>"): no coordinator named and no thread on record, the thread
-  gone, the named coordinator's session ended, or a switch back from daemon dispatch.
+  gone, the named coordinator's session ended or its thread gone, a named coordinator
+  the server does not know, a thread to adopt that is gone, or a switch back from daemon
+  dispatch; when a stood-down thread (below) was gone too, the reason ends by naming it.
 - **Where it runs**: never in the project root, which the user's and other threads share.
   When the project folder is the top of a git repository, the daemon starts the thread
   with `t3 thread start --worktree <base> --branch <branch>`: T3 creates the branch from
@@ -560,15 +562,20 @@ settings in use, warned once per edit.
   coordinator, why, and to stop dispatching (claim no task, start no child or review,
   close no task as coordinator). Without it the thread would keep dispatching beside the
   board's limit. The daemon keeps the thread's record in `watch.json` (`stood_down`), so
-  it survives a daemon restart. A send that failed is tried again on the next reconcile;
-  one that timed out may have arrived and is not repeated; a thread T3 no longer has
-  drops the record. When this device next has to start a coordinator for the board (for
-  example autopilot goes on again) and no adoption waits, it takes the lease, asks T3
-  about that thread, and when T3 can still run it, names it coordinator again with one
-  message instead of starting a second thread; its briefed prompt is kept, so a re-brief
+  it survives a daemon restart, and saves it before the send, so a daemon killed in
+  between does not send twice. A send that failed is tried again on the next reconcile,
+  three sends at most; one that timed out may have arrived and is not repeated; a thread
+  T3 no longer has drops the record. A thread the board replaced is told only once the
+  named coordinator is known to stand (at work, or another device's); when it does not
+  (unknown to the server, or ended here with its thread gone), our thread is kept without
+  a message and taken again. When this device next has to start a coordinator for the
+  board (for example autopilot goes on again) and no adoption waits, or the thread to
+  adopt is gone, it takes the lease, asks T3 about that thread, and when T3 can still run
+  it, names it coordinator again with one message instead of starting a second thread;
+  that message is marked before its send too. Its briefed prompt is kept, so a re-brief
   follows only when the prompt changed. A thread that is gone is replaced by a new one,
   and the start's reason says so. The record goes once the board has a coordinator on
-  this device again; a pending adoption wins over it. Rejected: looking for any older
+  this device again; a pending adoption of a live thread wins over it. Rejected: looking for any older
   `<board> coordinator` thread by title, since threads replaced long ago keep that title.
 - **A paused board**: the daemon starts, wakes and re-briefs nothing on it, but its
   coordinator's home device keeps the coordinator in `watch.json` and does not release

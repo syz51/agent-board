@@ -7418,12 +7418,138 @@ async fn a_stand_down_message_that_failed_is_sent_again_and_one_that_timed_out_i
     e.t3.time_out_send.store(true, Ordering::SeqCst);
     e.daemon.reconcile(at()).await.unwrap();
     assert!(e.daemon.state.stood_down[&factory()].told);
+    assert_eq!(e.t3.sends().len(), 1, "sent: {:?}", e.t3.sends());
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     e.daemon.reconcile(at()).await.unwrap();
-    assert!(
-        e.t3.sends().len() <= 1,
-        "not sent twice: {:?}",
+    assert_eq!(e.t3.sends().len(), 1, "not sent twice: {:?}", e.t3.sends());
+
+    // Sends that keep failing stop after three.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/boards", [autopilot_off()]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", autopilot_off());
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    for _ in 0..5 {
+        e.daemon.reconcile(at()).await.unwrap();
+    }
+    assert_eq!(e.t3.sends().len(), 3, "{:?}", e.t3.sends());
+    assert!(e.daemon.state.stood_down[&factory()].told, "given up");
+}
+
+#[tokio::test]
+async fn a_daemon_killed_after_the_stand_down_message_does_not_send_it_again() {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.daemon.save().unwrap();
+    e.stub.on("GET /v1/boards", [autopilot_off()]);
+    e.stub
+        .on("DELETE /v1/boards/factory/coordinator", autopilot_off());
+    e.daemon.reconcile(at()).await.unwrap();
+    // What the send left on disk is all a killed daemon keeps: put the state the reconcile
+    // saved at its end out of reach by reading what a restart reads.
+    let saved = saved_state(&e);
+    assert!(saved.coordinators.is_empty());
+    assert!(saved.stood_down[&factory()].told);
+    e.daemon = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn a_resume_message_that_failed_keeps_the_thread_on_record() {
+    let (mut e, agent) = stood_down_env().await;
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.coordinators.is_empty());
+    let stood = &e.daemon.state.stood_down[&factory()];
+    assert_eq!(stood.coordinator.thread, "coord");
+    assert!(!stood.resuming, "the message is still owed");
+    assert_eq!(releases(&e), 2, "the lease taken for it is released");
+    assert_eq!(starts(&e.t3), 0);
+
+    e.t3.fail_send.store(false, Ordering::SeqCst);
+    let later = at() + chrono::Duration::hours(2);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
+    assert_eq!(starts(&e.t3), 0);
+    let again =
         e.t3.sends()
+            .iter()
+            .filter(|(_, text)| text.contains("its coordinator again"))
+            .count();
+    assert_eq!(again, 2, "one failed and one sent: {:?}", e.t3.sends());
+
+    // One that timed out may have arrived: the thread is named, and nothing is sent again.
+    let (mut e, agent) = stood_down_env().await;
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
+    assert!(e.daemon.state.stood_down.is_empty());
+    assert_eq!(e.t3.sends().len(), 2, "{:?}", e.t3.sends());
+}
+
+#[tokio::test]
+async fn a_gone_thread_to_adopt_gives_way_to_the_live_stood_down_thread() {
+    let (mut e, agent) = stood_down_env().await;
+    save_adoption(
+        &home_of(&e),
+        &factory(),
+        &Adoption {
+            thread: "archived".into(),
+            requested_at: at(),
+        },
+    )
+    .unwrap();
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(load_adoption(&home_of(&e), &factory()), None, "dropped");
+    assert_eq!(starts(&e.t3), 0, "no second coordinator thread");
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
+}
+
+#[tokio::test]
+async fn a_named_coordinator_that_does_not_stand_leaves_the_live_thread_untold() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    // The board names an agent the server does not know.
+    e.stub
+        .on("GET /v1/boards", [autopilot(Some("t3:ghost"), &[DEVICE])]);
+    e.stub.on_error(
+        &format!("GET {}", agent_path("t3:ghost")),
+        404,
+        "not_found",
+        "no such agent",
+        "check the id",
+    );
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&agent), &[DEVICE]),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(starts(&e.t3), 0);
+    assert_eq!(e.daemon.state.coordinators[&factory()].thread, "coord");
+    assert!(e.daemon.state.stood_down.is_empty());
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("one message, not a stop and a start: {sends:?}");
+    };
+    assert_eq!(thread, "coord");
+    assert!(
+        text.contains("this thread is its coordinator again"),
+        "{text}"
     );
 }
 

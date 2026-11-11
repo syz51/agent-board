@@ -1393,11 +1393,22 @@ pub struct StoodDown {
     pub coordinator: Coordinator,
     /// Why, as the thread is told.
     pub reason: String,
-    /// Whether [`stand_down_message`] was sent: a send that failed is tried again on the
-    /// next reconcile, and one that timed out counts as sent.
+    /// Whether [`stand_down_message`] was sent, or needs no send. Set and saved before the
+    /// send, so a daemon killed in between does not send it twice; a send that failed
+    /// clears it, and one that timed out leaves it set.
     #[serde(default)]
     pub told: bool,
+    /// How many sends of [`stand_down_message`] failed: after [`STAND_DOWN_TRIES`] it is
+    /// given up.
+    #[serde(default)]
+    pub tries: u32,
+    /// Whether [`resume_message`] was sent, set and saved before the send like `told`.
+    #[serde(default)]
+    pub resuming: bool,
 }
+
+/// A stand-down message is sent at most this many times when its sends fail.
+pub const STAND_DOWN_TRIES: u32 = 3;
 
 /// Records written before this field existed were registered before they were saved.
 fn registered_default() -> bool {
@@ -1961,6 +1972,8 @@ impl<T: T3> Daemon<T> {
         let mut reason = String::from(
             "the board names no coordinator and this device has no coordinator thread for it",
         );
+        // Our own coordinator thread when the board names another coordinator, and why.
+        let mut replaced: Option<(Coordinator, String)> = None;
         // Our own coordinator whose thread is gone: replace it whatever its agent record says.
         let mut ours_gone = false;
         if let Some(local) = self.state.coordinators.get(slug).cloned() {
@@ -2036,10 +2049,11 @@ impl<T: T3> Daemon<T> {
                 );
                 self.state.coordinators.remove(slug);
             } else if let Some(other) = &board.coordinator {
-                // The board names someone else: our thread is told it was replaced.
-                self.state.coordinators.remove(slug);
+                // The board names someone else. Our thread is told it was replaced once
+                // that coordinator is known to stand; one that does not stand is replaced
+                // below, by our thread when it is live.
                 let why = format!("the board names {other} as its coordinator");
-                self.stand_down(slug, local, why).await;
+                replaced = Some((local, why));
             }
             self.checks_failing.remove(slug);
         }
@@ -2056,6 +2070,7 @@ impl<T: T3> Daemon<T> {
                 // Another coordinator runs the board: a start that failed here no longer waits.
                 Ok(info) if info.state != AgentState::Ended => {
                     self.failures.remove(slug);
+                    self.stand_down_replaced(slug, replaced.take()).await;
                     return Ok(());
                 }
                 // T3 ends a session left idle while its thread lives on, and the server keeps
@@ -2063,6 +2078,7 @@ impl<T: T3> Daemon<T> {
                 // it expires.
                 Ok(info) if info.device != self.ctx.device => {
                     self.failures.remove(slug);
+                    self.stand_down_replaced(slug, replaced.take()).await;
                     return Ok(());
                 }
                 // Ours, and unknown to this daemon's state. A pending adoption replaces it;
@@ -2075,6 +2091,7 @@ impl<T: T3> Daemon<T> {
                     if let Some(live) = self.thread_runs_in(&thread, project.as_deref()).await? {
                         self.last_checks
                             .insert(thread.clone(), (LastCheck::Live(live.folder), now));
+                        self.stand_down_replaced(slug, replaced.take()).await;
                         // What it was briefed with is unknown: briefed again, once.
                         let local = Coordinator::new(thread, agent.clone(), now, true, None);
                         return self.adopt(board, local, now).await;
@@ -2095,6 +2112,23 @@ impl<T: T3> Daemon<T> {
                 }
                 Err(err) => return Err(err),
             }
+        }
+        // The coordinator the board named does not stand, so the board needs one: our
+        // thread is kept without a message, and taken again below when T3 still runs it.
+        if let Some((local, why)) = replaced {
+            tracing::info!(
+                "coordinator of {slug}: {why}, which does not stand; thread {} is kept for it",
+                local.thread
+            );
+            self.state.coordinators.remove(slug);
+            let stood = StoodDown {
+                coordinator: local,
+                reason: why,
+                told: true,
+                tries: 0,
+                resuming: false,
+            };
+            self.state.stood_down.insert(slug.clone(), stood);
         }
         let adoption = match load_adoption(&self.ctx.home, slug) {
             Some(adoption) if now - adoption.requested_at >= ADOPTION_TTL => {
@@ -2672,9 +2706,24 @@ impl<T: T3> Daemon<T> {
             coordinator: local,
             reason,
             told: false,
+            tries: 0,
+            resuming: false,
         };
         self.state.stood_down.insert(slug.clone(), stood);
         self.tell_stood_down(slug).await;
+    }
+
+    /// [`Self::stand_down`] for our thread that the board replaced with a coordinator that
+    /// stands, if there is one.
+    async fn stand_down_replaced(
+        &mut self,
+        slug: &BoardSlug,
+        replaced: Option<(Coordinator, String)>,
+    ) {
+        if let Some((local, why)) = replaced {
+            self.state.coordinators.remove(slug);
+            self.stand_down(slug, local, why).await;
+        }
     }
 
     /// Sends the stood-down coordinator thread of `slug` its [`stand_down_message`], unless
@@ -2682,38 +2731,49 @@ impl<T: T3> Daemon<T> {
     /// failed is, on the next reconcile. A thread T3 no longer has needs no message and
     /// cannot be taken again: its record goes.
     async fn tell_stood_down(&mut self, slug: &BoardSlug) {
-        let Some(stood) = self.state.stood_down.get(slug).filter(|s| !s.told) else {
+        let Some(stood) = self.state.stood_down.get_mut(slug).filter(|s| !s.told) else {
             return;
         };
+        // On disk before the send, with the coordinator's record gone: a daemon killed
+        // after the send does not send it again.
+        stood.told = true;
         let (agent, thread) = (
             stood.coordinator.agent.clone(),
             stood.coordinator.thread.clone(),
         );
         let message = stand_down_message(slug, &stood.reason);
-        let told = match self.send_wake(&agent, &message).await {
-            Sent::Delivered => true,
+        if let Err(err) = self.save() {
+            tracing::warn!("saving the stood-down coordinator of {slug}: {err:#}");
+        }
+        match self.send_wake(&agent, &message).await {
+            Sent::Delivered => {}
             Sent::MaybeDelivered(err) => {
                 tracing::warn!(
                     "telling thread {thread} it no longer coordinates {slug}: {err:#}; not sent again"
                 );
-                true
             }
             Sent::Gone(_) => {
                 tracing::info!(
                     "coordinator of {slug}: thread {thread}, which stood down, is gone; nothing to tell"
                 );
                 self.state.stood_down.remove(slug);
-                return;
             }
             Sent::Failed(err) => {
-                tracing::warn!(
-                    "telling thread {thread} it no longer coordinates {slug}: {err:#}; tried again on the next reconcile"
-                );
-                false
+                let Some(stood) = self.state.stood_down.get_mut(slug) else {
+                    return;
+                };
+                stood.tries += 1;
+                if stood.tries < STAND_DOWN_TRIES {
+                    stood.told = false;
+                    tracing::warn!(
+                        "telling thread {thread} it no longer coordinates {slug}: {err:#}; tried again on the next reconcile"
+                    );
+                } else {
+                    tracing::warn!(
+                        "telling thread {thread} it no longer coordinates {slug}: {err:#}; given up after {STAND_DOWN_TRIES} sends"
+                    );
+                }
             }
-        };
-        if told && let Some(stood) = self.state.stood_down.get_mut(slug) {
-            stood.told = true;
         }
     }
 
@@ -3387,18 +3447,33 @@ impl<T: T3> Daemon<T> {
         };
         self.last_checks
             .insert(thread.clone(), (LastCheck::Live(live.folder), now));
-        if let Err(err) = self.t3.send(&thread, &resume_message(slug)).await {
-            // A send that timed out may have arrived: not sent again, and the board's
-            // wake-ups reach the thread once it is named.
-            if err.downcast_ref::<TimedOut>().is_none() {
-                self.release(slug).await;
-                return Err(err.context(format!(
-                    "telling thread {thread} it coordinates {slug} again"
-                )));
+        // Marked on disk before the send: a start cut short or a daemon killed after it
+        // does not send the message again.
+        if !stood.resuming {
+            if let Some(stood) = self.state.stood_down.get_mut(slug) {
+                stood.resuming = true;
             }
-            tracing::warn!(
-                "telling thread {thread} it coordinates {slug} again: {err:#}; not sent again"
-            );
+            self.save()?;
+            match self
+                .send_wake(&stood.coordinator.agent, &resume_message(slug))
+                .await
+            {
+                Sent::Delivered => {}
+                // It may have arrived: not sent again, and the board's wake-ups reach the
+                // thread once it is named.
+                Sent::MaybeDelivered(err) => tracing::warn!(
+                    "telling thread {thread} it coordinates {slug} again: {err:#}; not sent again"
+                ),
+                Sent::Gone(err) | Sent::Failed(err) => {
+                    if let Some(stood) = self.state.stood_down.get_mut(slug) {
+                        stood.resuming = false;
+                    }
+                    self.release(slug).await;
+                    return Err(err.context(format!(
+                        "telling thread {thread} it coordinates {slug} again"
+                    )));
+                }
+            }
         }
         tracing::info!(
             "thread {thread} coordinates {slug} again, so no new thread starts: {reason}"
@@ -3575,7 +3650,7 @@ impl<T: T3> Daemon<T> {
                     "thread {} to adopt is gone, archived or its folder is missing",
                     adoption.thread
                 );
-                return self.start_coordinator(board, now, &reason).await;
+                return self.resume_or_start(board, now, &reason).await;
             }
             Err(err) => {
                 self.release(slug).await;
