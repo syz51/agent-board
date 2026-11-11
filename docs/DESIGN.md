@@ -330,8 +330,8 @@ kind, also when nothing else changed. The hooks act on it:
   server did not answer, or a turn with no prompt), a held turn is ended unless its
   prompt's snapshot showed the hold. The turn's time and that mark are cleared at each
   prompt and when the turn ends.
-- `UserPromptSubmit` while held injects the `hold:` line (end the turn unless the user's
-  own message asks for the work) and does not stop the turn, since the hook cannot tell
+- `UserPromptSubmit` while held injects the `hold:` line (do the work when the user's
+  own message asks for it; in every other turn, end the turn) and does not stop the turn, since the hook cannot tell
   the user's message from a T3 notification. That turn is not stopped later either. One
   notification is recognized: a pull request watch's wake-up, whose prompt starts with
   `Update on pull request`. T3 sends one at every check or review change, so a held

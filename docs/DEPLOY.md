@@ -266,8 +266,9 @@ cargo's `install.root` setting is not followed, so set the variable instead.
 `codesign -d -r- ~/.cargo/bin/board` then shows `certificate leaf`. macOS asks once more
 for the first signed build; allow it, or turn on `board` under System Settings > Privacy
 & Security > Files and Folders. A failed signing step only prints a warning that says
-which part failed. A run cut short leaves the keychain missing, or a keychain without
-the certificate; the next run makes the keychain and its password again. A keychain that
+which part failed. The keychain and its password are made as `making.keychain-db` and
+`making.password` and moved into place when complete, so a run cut short leaves no
+keychain in place; the next run removes what it left and makes both again. A keychain that
 holds the certificate is never replaced, since a new key loses the grants: when its
 password file is gone, it does not unlock, `security` cannot search it, or codesign
 cannot use it, the warning says so and you fix or remove it. Only

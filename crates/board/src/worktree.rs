@@ -123,9 +123,10 @@ async fn new_worktree(
 
 /// Whether `project` is the top folder of a git work tree. A folder that does not exist is
 /// not (T3 then reports the missing project), nor is one nested in another repository.
-/// git alone answers, with a link followed as git follows it, so a folder macOS holds
-/// for a prompt or refused fails here with the privacy hint instead of passing as no
-/// repository, and nothing is left waiting on it once the command is stopped.
+/// git answers, with a link followed as git follows it, so a folder macOS holds for a
+/// prompt or refused fails here with the privacy hint instead of passing as no
+/// repository, and nothing is left waiting on it once the command is stopped. Only where
+/// git finds no repository is `.git` read as well.
 async fn is_repo_top(project: &Path) -> Result<bool> {
     let out = git(
         project,
@@ -134,10 +135,22 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
     )
     .await?;
     if !out.ok {
-        if out.stderr.contains("not a git repository")
-            || out.stderr.contains("No such file or directory")
-        {
+        if folder_missing(&out.stderr) {
             return Ok(false);
+        }
+        if out.stderr.contains("not a git repository") {
+            // git says the same when macOS refuses it `.git`: it then looks in the folders
+            // above and finds no repository.
+            let git_dir = project.join(".git");
+            let probe = tokio::time::timeout(PROBE, tokio::fs::metadata(&git_dir)).await;
+            let Some(refused) = git_dir_refused(probe) else {
+                return Ok(false);
+            };
+            bail!(
+                "cannot read {}: {refused}{}",
+                git_dir.display(),
+                privacy_hint_for(project).await
+            );
         }
         bail!(
             "git rev-parse failed in {}: {}",
@@ -148,6 +161,27 @@ async fn is_repo_top(project: &Path) -> Result<bool> {
     // `true` and an empty prefix at the top; `false` inside `.git`.
     let mut lines = out.stdout.lines();
     Ok(lines.next() == Some("true") && lines.next().is_none_or(str::is_empty))
+}
+
+/// How long the read of `.git` may take; macOS holds it with no end while a prompt is open.
+const PROBE: Duration = Duration::from_secs(1);
+
+/// Whether git failed because the folder it was sent to does not exist. Both parts are
+/// needed: other failures name a missing file too.
+fn folder_missing(stderr: &str) -> bool {
+    stderr.contains("cannot change to") && stderr.contains("No such file or directory")
+}
+
+/// Why the read of `.git` shows a folder kept from board, from that read's result under
+/// its timeout; `None` when `.git` is not there or is something git does not take.
+fn git_dir_refused(
+    probe: Result<std::io::Result<std::fs::Metadata>, tokio::time::error::Elapsed>,
+) -> Option<String> {
+    match probe {
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => Some(err.to_string()),
+        Ok(_) => None,
+        Err(_) => Some(format!("no answer in {}s", PROBE.as_secs())),
+    }
 }
 
 /// The ref new worktrees start from, fetched first when it is a remote branch:
@@ -246,7 +280,7 @@ async fn git(project: &Path, args: &[&str], wait: Wait) -> Result<GitOutput> {
     let out = out.context("running git")?;
     let ok = out.status.success();
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if denied(ok, &stderr) {
+    if denied(wait, ok, &stderr) {
         stderr = format!("{}{}", stderr.trim_end(), privacy_hint_for(project).await);
     }
     Ok(GitOutput {
@@ -257,9 +291,10 @@ async fn git(project: &Path, args: &[&str], wait: Wait) -> Result<GitOutput> {
 }
 
 /// Whether git failed on a folder macOS denied it, as it does once the user refused the
-/// privacy prompt.
-fn denied(ok: bool, stderr: &str) -> bool {
-    !ok && stderr.contains("Operation not permitted")
+/// privacy prompt. Not for a fetch: the commands before it read the folder, so there the
+/// message is about something else, such as the network.
+fn denied(wait: Wait, ok: bool, stderr: &str) -> bool {
+    wait.on_folder && !ok && stderr.contains("Operation not permitted")
 }
 
 /// [`privacy_hint`] for `project` on this Mac.
@@ -409,9 +444,53 @@ mod tests {
     #[test]
     fn only_a_failure_macos_denied_counts_as_denied() {
         let refused = "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted\n";
-        assert!(denied(false, refused));
-        assert!(!denied(false, "fatal: not a git repository\n"));
-        assert!(!denied(true, refused), "not on success");
+        assert!(denied(LOCAL, false, refused));
+        assert!(!denied(LOCAL, false, "fatal: not a git repository\n"));
+        assert!(!denied(LOCAL, true, refused), "not on success");
+        assert!(!denied(FETCH, false, refused), "not for a fetch");
+    }
+
+    #[test]
+    fn only_a_folder_git_could_not_change_to_counts_as_missing() {
+        assert!(folder_missing(
+            "fatal: cannot change to '/Users/u/gone': No such file or directory\n"
+        ));
+        assert!(!folder_missing(
+            "fatal: unable to access '.git/config': No such file or directory\n"
+        ));
+        assert!(!folder_missing(
+            "fatal: cannot change to '/Users/u/file': Not a directory\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_git_folder_that_cannot_be_read_is_an_error_not_a_folder_outside_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        // No repository, so git answers "not a git repository" and `.git` is read: absent.
+        assert!(!is_repo_top(&project).await.unwrap());
+        // The read of `.git` as macOS refuses it; without search permission on the folder
+        // git itself cannot enter, so the result of the read is tested apart from git.
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let read = std::fs::metadata(project.join(".git"));
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // root reads it anyway.
+        if read
+            .as_ref()
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            assert!(
+                git_dir_refused(Ok(read))
+                    .unwrap()
+                    .contains("Permission denied")
+            );
+        }
+        let absent = std::fs::metadata(project.join(".git"));
+        assert_eq!(git_dir_refused(Ok(absent)), None);
+        let slow = tokio::time::timeout(Duration::ZERO, std::future::pending()).await;
+        assert_eq!(git_dir_refused(slow).unwrap(), "no answer in 1s");
     }
 
     #[tokio::test]
