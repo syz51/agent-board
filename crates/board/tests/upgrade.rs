@@ -160,7 +160,8 @@ set-key-partition-list)
     ;;
 unlock-keychain)
     [ -z "${STUB_FAIL_UNLOCK:-}" ] || { echo "security: The user name or passphrase you entered is not correct." >&2; exit 51; }
-    echo "${STUB_HOST:-local} unlock" >> "$STATE/log"
+    for last; do :; done
+    echo "${STUB_HOST:-local} unlock ${last##*/}" >> "$STATE/log"
     ;;
 lock-keychain) echo "${STUB_HOST:-local} lock" >> "$STATE/log" ;;
 delete-keychain)
@@ -924,13 +925,13 @@ fn on_macos_each_device_signs_board_with_one_lasting_identity_before_the_restart
             "local delete-keychain".into(),
             // Made beside its place and moved there, then unlocked at its place.
             "local partition-list making.keychain-db".into(),
-            "local unlock".into(),
+            "local unlock signing.keychain-db".into(),
             format!("local {sign}"),
             "local lock".into(),
             "local restart".into(),
             "laptop device-upgrade".into(),
             format!("laptop install {new} commit={}", &new[..12]),
-            "laptop unlock".into(),
+            "laptop unlock signing.keychain-db".into(),
             format!("laptop {sign}"),
             "laptop lock".into(),
             "laptop restart".into(),
