@@ -6616,6 +6616,41 @@ async fn a_full_usage_window_keeps_claude_agents_wake_ups_and_sends_them_once_at
 }
 
 #[tokio::test]
+async fn a_full_usage_hold_that_ends_before_its_reset_sends_what_it_kept_and_expires_later_lines() {
+    let reset = at() + chrono::Duration::days(2);
+    let mut e = wakes_under_usage(five_hour_reading(100.0, reset, at()), at()).await;
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+
+    // Two hours later the reading is below 100%: what was kept is still sent.
+    let eased = at() + board::daemon::WAKE_TTL * 2;
+    e.stub
+        .on("GET /v1/usage", five_hour_reading(40.0, reset, eased));
+    e.daemon.reconcile(eased).await.unwrap();
+    e.daemon.flush(eased).await;
+    assert_eq!(e.daemon.state.usage_full_until, Some(eased));
+    let sent = threads(&e.t3);
+    assert!(sent.contains(&"worker".to_owned()), "{sent:?}");
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // A later wake-up that cannot be sent expires an hour after it was queued, not after
+    // the reset the hold waited for.
+    let later = eased + chrono::Duration::minutes(10);
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:late")),
+        agent_fixture("t3:late", DEVICE, AgentState::Idle),
+    );
+    e.t3.live("late");
+    e.t3.fail_send.store(true, Ordering::SeqCst);
+    let ev = answered(&e, 40, 5, "t3:late");
+    e.daemon.on_event(&ev, later).await.unwrap();
+    e.daemon.flush(later).await;
+    assert_eq!(e.daemon.state.wakes.len(), 1, "kept for a retry");
+    e.daemon.flush(later + board::daemon::WAKE_TTL).await;
+    assert!(e.daemon.state.wakes.is_empty(), "expired");
+}
+
+#[tokio::test]
 async fn a_usage_window_below_100_percent_keeps_no_wake_up() {
     let reset = at() + chrono::Duration::hours(2);
     let mut e = wakes_under_usage(five_hour_reading(99.0, reset, at()), at()).await;

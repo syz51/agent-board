@@ -437,8 +437,8 @@ high for it. There is no total cap.
   whole, also the ready and cleared wake-ups, past their usual hour to live. At the reset
   it checks each kept wake-up again and sends those that still hold, once; they live one
   hour from the reset. That message is the resume: no other one is sent. With two full
-  windows the later reset counts. A reading that falls below 100% before the reset ends
-  the hold at once. A stale reading keeps nothing back, and neither does a full window
+  windows the later reset counts. A reading that falls below 100% before the reset, or
+  goes stale, ends the hold at once, and the kept wake-ups live one hour from then. A stale reading keeps nothing back, and neither does a full window
   with no reset time, since nothing says when it ends. Codex and opencode agents are
   woken as before. An agent that stopped on the limit itself waits for its own reset
   first, as before. A daemon with no reading at all keeps waiting for the reset it last

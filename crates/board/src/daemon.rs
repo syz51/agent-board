@@ -264,7 +264,8 @@ pub struct WatchState {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub usage_held: BTreeSet<BoardSlug>,
     /// The reset the Claude agents' wake-ups last waited for while a usage window was full
-    /// ([`Usage::full_until`]): those wake-ups live from it on.
+    /// ([`Usage::full_until`]), or when that hold ended, if before its reset: those
+    /// wake-ups live from it on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_full_until: Option<Timestamp>,
     /// Worker threads this device's dispatcher started on daemon-dispatch boards, by task,
@@ -4303,8 +4304,14 @@ impl<T: T3> Daemon<T> {
     /// never got it (see [`UnsureWakes`]).
     pub async fn flush(&mut self, now: Timestamp) {
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
-        if let Some(until) = self.usage_full_until(now) {
-            self.state.usage_full_until = Some(until);
+        match self.usage.as_ref().map(|usage| usage.full_until(now)) {
+            Some(Some(until)) => self.state.usage_full_until = Some(until),
+            // The hold ended before its reset (the reading fell below 100 percent or went
+            // stale): what it kept lives from now on, not from a reset days ahead.
+            Some(None) if self.state.usage_full_until.is_some_and(|until| until > now) => {
+                self.state.usage_full_until = Some(now);
+            }
+            Some(None) | None => {}
         }
         for (agent, unsure) in &mut self.state.unsure_wakes {
             unsure.messages.retain(|m| {
@@ -4585,7 +4592,8 @@ impl<T: T3> Daemon<T> {
         match self.reach(&seen, now) {
             Reach::Now => {}
             // Kept whole for the agent going idle, or for the reset of the full usage
-            // window: the coordinator waits for that reset too, so nothing is passed to it.
+            // window: a coordinator this daemon runs is a Claude agent and waits for that
+            // reset too, so nothing is passed to it.
             Reach::Held | Reach::Full => {
                 self.requeue(agent.clone(), queue);
                 return None;
