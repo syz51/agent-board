@@ -7377,6 +7377,17 @@ async fn autopilot_off_and_on_again_keeps_the_one_live_coordinator_thread() {
         json!({"device": DEVICE, "agent": agent}),
         "the same thread is named"
     );
+    // The lease comes first, then a claim that names the thread before the message: the
+    // server holds a stood-down thread until it is named again.
+    let bodies: Vec<_> = claims[claims.len() - 3..].iter().map(|c| &c.body).collect();
+    assert_eq!(
+        bodies,
+        [
+            &json!({"device": DEVICE, "agent": null}),
+            &json!({"device": DEVICE, "agent": agent}),
+            &json!({"device": DEVICE, "agent": agent}),
+        ]
+    );
     assert!(
         e.stub.requests_to("POST /v1/agents").is_empty(),
         "already registered"

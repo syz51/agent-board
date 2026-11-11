@@ -40,6 +40,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0023_usage_pace.sql"),
     include_str!("../migrations/0024_task_search.sql"),
     include_str!("../migrations/0025_server_runs.sql"),
+    include_str!("../migrations/0026_stood_down.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -497,6 +498,77 @@ mod tests {
         .unwrap();
         migrate(&conn).unwrap();
         assert_eq!(runs(&conn), [(3000, 3000)]);
+    }
+
+    #[test]
+    fn migration_stands_down_the_last_coordinator_of_boards_that_no_longer_run_it() {
+        let conn = migrated_to(25);
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+                 coordinator, coordinator_device, coordinator_expires_at, created_at, updated_at) \
+             VALUES ('off', 'Off', '', 'active', '[]', 0, '[]', NULL, NULL, NULL, 1, 5000), \
+                    ('on', 'On', '', 'active', '[]', 1, '[]', 't3:b', 'mac', 9000, 1, 5000), \
+                    ('daemon', 'D', '', 'active', '[]', 1, '[]', 'dispatch:mac', 'mac', 9000, 1, 7000), \
+                    ('never', 'N', '', 'active', '[]', 0, '[]', NULL, NULL, NULL, 1, 5000); \
+             UPDATE boards SET dispatch = 'daemon' WHERE slug = 'daemon'; \
+             INSERT INTO events (at, actor, type, board, payload) VALUES \
+             (1000, 'mac', 'board_updated', 'off', \
+              '{\"fields\":[\"coordinator\"],\"coordinator\":\"t3:old\",\"device\":\"air\"}'), \
+             (1500, 'mac', 'board_updated', 'off', \
+              '{\"fields\":[\"coordinator\"],\"coordinator\":\"t3:a\",\"device\":\"mac\"}'), \
+             (2000, 'user', 'board_updated', 'off', '{\"fields\":[\"autopilot\"],\"autopilot\":false}'), \
+             (2001, 'mac', 'board_updated', 'off', \
+              '{\"fields\":[\"coordinator\"],\"coordinator\":null,\"device\":\"mac\"}'), \
+             (3000, 'mac', 'board_updated', 'daemon', \
+              '{\"fields\":[\"coordinator\"],\"coordinator\":\"t3:c\",\"device\":\"mac\"}'), \
+             (4000, 'mac', 'board_updated', 'daemon', \
+              '{\"fields\":[\"coordinator\"],\"coordinator\":\"dispatch:mac\",\"device\":\"mac\"}');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let last: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT slug, last_coordinator, last_coordinator_device FROM boards ORDER BY slug",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            last,
+            [
+                ("daemon".to_owned(), some("t3:c"), some("mac")),
+                ("never".to_owned(), None, None),
+                ("off".to_owned(), some("t3:a"), some("mac")),
+                ("on".to_owned(), some("t3:b"), some("mac")),
+            ]
+        );
+        let stood: Vec<(String, String, i64, String)> = conn
+            .prepare("SELECT board, agent, since, reason FROM stood_down ORDER BY board")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            stood,
+            [
+                (
+                    "daemon".to_owned(),
+                    "t3:c".to_owned(),
+                    7000,
+                    "the board is set to daemon dispatch".to_owned()
+                ),
+                (
+                    "off".to_owned(),
+                    "t3:a".to_owned(),
+                    2000,
+                    "autopilot was switched off".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

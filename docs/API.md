@@ -925,7 +925,17 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   for in the same way (as coordinator only while its lease runs), only for an agent with
   runtime `claude`, since the usage is the Claude account's: `held_since` is then
   the later of the line's time and the latest pause, and `held_for_usage` is `true` (left
-  out otherwise, and by servers that predate it). The `hold:` line then reads `hold:
+  out otherwise, and by servers that predate it). A board that stopped running the
+  agent as its coordinator thread (autopilot off, closed, daemon dispatch, its device no
+  longer a home device, or another thread named) holds that agent alone, until a
+  coordinator claim names it again: the board is in `held_by` and in `stood_down`
+  (`[{"board", "reason"}]`, left out when empty and by servers that predate it), and
+  `held_since` is the latest of the stand-down's time and the other holds. Its line reads
+  `hold: factory stood down: autopilot was switched off -> this thread no longer
+  coordinates the board: children already at work finish on their own. If the user's own
+  message in this turn asks you to go on, …`, one per board after any paused one; `yaml`
+  adds `stood_down` with `board`, `reason` and `action` under `hold`. At the weekly hard
+  line, the `hold:` line reads `hold:
   factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) -> the
   weekly usage reached the user's reserve. If the user's own message in this turn asks you
   to go on, … In every other turn, …, stop: …`; `yaml` adds `usage` with that reason
