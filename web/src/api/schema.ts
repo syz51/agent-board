@@ -110,6 +110,10 @@ export const task = object({
   child_count: withDefault(integer, 0),
   /** The owner's short handle, such as `t3:7f3a`. Absent without an owner and from older servers. */
   owner_handle: nullable(string),
+  /** In a search result: text around the words found, marked with `[` and `]`; untrusted. */
+  snippet: nullable(string),
+  /** In a search result: no task holds every word, and this one holds at least one. */
+  any_word: withDefault(boolean, false),
 });
 
 /** A child task as its parent's detail lists it. */

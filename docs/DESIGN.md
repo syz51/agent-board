@@ -731,6 +731,12 @@ settings in use, warned once per edit.
   reviewer child before any becomes `auto`; work that needs the user's decision gets an ask
   and waits `blocked`. When every proposal of a review is declined or merged, the next
   review waits for the next finished task.
+- **Search**: agents search with exact ids, file names and terms, so the task search is
+  a full-text index (SQLite FTS5, stemmed), not a fuzzy or embedding search: those return
+  more rows, which costs context. The index holds one document for each task (id, title,
+  own text, notes) and triggers on `tasks` and `notes` keep it equal to the tables, so no
+  write path can miss it. A result carries a short snippet, so the agent sees why a task
+  matched without reading the task.
 - **Reading every note**: the agent doing a task must not miss a finding captured on it;
   some duplicate reading is the price. `task_show` shows every `finding` and `decision`
   note; without `detailed`, only plain and `feedback` notes are cut to the latest five,

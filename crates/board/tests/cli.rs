@@ -119,6 +119,53 @@ fn ls_sends_a_search_and_says_when_the_limit_cut_the_list() {
 }
 
 #[test]
+fn ls_shows_the_text_a_search_found_and_says_when_no_task_holds_every_word() {
+    let e = env();
+    let mut found = task_fixture("factory-12", "Rotate the key");
+    found.snippet = Some("the [signing] key \"k1\" expires".into());
+    e.stub.on(
+        "GET /v1/tasks",
+        [found.clone(), task_fixture("factory-13", "Signing")],
+    );
+
+    // The snippet stands below its task, quoted; a task without one has no such line.
+    // A named board keeps the line that names the boards of a list out.
+    let out = e.run(&["ls", "--board", "factory", "--search", "signing"]);
+    let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[1], r#"  "the [signing] key \"k1\" expires""#);
+    assert!(!stdout(&out).contains("no task holds every word"));
+
+    // `--fields` can pick the two search fields.
+    let out = e.run(&[
+        "ls",
+        "--search",
+        "signing",
+        "--json",
+        "--fields",
+        "id,snippet,any_word",
+    ]);
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        listed[0],
+        serde_json::json!({
+            "id": "factory-12",
+            "snippet": "the [signing] key \"k1\" expires",
+            "any_word": null,
+        })
+    );
+
+    // The server marks the tasks of a search that fell back to any word.
+    found.any_word = true;
+    e.stub.on("GET /v1/tasks", [found]);
+    let out = e.run(&["ls", "--board", "factory", "--search", "signing lantern"]);
+    assert_eq!(
+        stdout(&out).lines().last(),
+        Some("no task holds every word of the search; these hold at least one")
+    );
+}
+
+#[test]
 fn ls_sends_filters_and_prints_concise_lines_or_json() {
     let e = env();
     let mut task = task_fixture("factory-12", "Inject <board> delta");

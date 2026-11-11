@@ -3054,12 +3054,7 @@ async fn q_lists_the_tasks_that_hold_every_word() {
     .await;
     let other = t.task(A, "factory", "Signing without the other word").await;
     let ids = |v: Value| -> Vec<String> {
-        let mut ids: Vec<String> = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|task| task["id"].as_str().unwrap().to_owned())
-            .collect();
+        let mut ids = listed(&v);
         ids.sort();
         ids
     };
@@ -3068,33 +3063,330 @@ async fn q_lists_the_tasks_that_hold_every_word() {
     let found = t.ok("GET", "/v1/tasks?q=KEY%20signing", None, None).await;
     let mut want = vec![title.clone(), body.clone(), noted.clone()];
     want.sort();
+    assert!(
+        found
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task.get("any_word").is_none())
+    );
     assert_eq!(ids(found), want);
-    // A task id finds its task, and q combines with the other filters.
+    // A task id finds its task first, and q combines with the other filters.
     let found = t
         .ok("GET", &format!("/v1/tasks?q={other}"), None, None)
         .await;
-    assert_eq!(ids(found), vec![other.clone()]);
+    assert_eq!(listed(&found)[0], other);
     assert!(t.claim(A, &title).await.0.is_success());
     let found = t
         .ok("GET", "/v1/tasks?q=rotate+signing&status=doing", None, None)
         .await;
-    assert_eq!(ids(found), vec![title]);
-    // LIKE wildcards are plain text.
+    assert_eq!(ids(found), vec![title.clone()]);
+    // A word goes on (a prefix), and words are stemmed in both directions.
+    for q in ["sign", "signed", "rotat", "rotation"] {
+        let found = t.ok("GET", &format!("/v1/tasks?q={q}"), None, None).await;
+        assert!(listed(&found).contains(&title), "{q}: {found}");
+    }
+    // The middle of a word is no match, and a word of signs alone finds nothing. Query
+    // syntax is plain text.
+    for q in ["otate", "%25", "-%3E", "%22", "title%3Asigning"] {
+        let found = t.ok("GET", &format!("/v1/tasks?q={q}"), None, None).await;
+        assert!(!listed(&found).contains(&other), "{q}: {found}");
+    }
     let found = t.ok("GET", "/v1/tasks?q=%25", None, None).await;
-    assert_eq!(ids(found), Vec::<String>::new());
+    assert_eq!(found, json!([]));
+    // Signs around a word are left out; the parts of a word stand in a row.
+    let named = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Fourth", "body": "see `crates/board/src/mcp.rs`" }),
+        )
+        .await;
+    for q in ["mcp.rs", "(mcp.rs)", "%22mcp.rs%22", "-%3E%20mcp.rs"] {
+        let found = t.ok("GET", &format!("/v1/tasks?q={q}"), None, None).await;
+        assert_eq!(listed(&found), vec![named.clone()], "{q}");
+    }
+    let found = t.ok("GET", "/v1/tasks?q=rs.mcp", None, None).await;
+    assert_eq!(found, json!([]));
 
-    // Only ASCII letters fold, as in the stored text: a word in the title's own case matches.
+    // Letters fold in every script.
     let accent = t.task(A, "factory", "Visit the \u{c9}cole").await;
-    let found = t.ok("GET", "/v1/tasks?q=%C3%89COLE", None, None).await;
+    let found = t.ok("GET", "/v1/tasks?q=%C3%A9cole", None, None).await;
     assert_eq!(ids(found), vec![accent]);
     // A blank q is no search.
     let found = t.ok("GET", "/v1/tasks?q=%20", None, None).await;
-    assert_eq!(found.as_array().unwrap().len(), 5);
+    assert_eq!(found.as_array().unwrap().len(), 6);
 
     for q in [&"x".repeat(201), "a%20b%20c%20d%20e%20f%20g%20h%20i"] {
         let (s, code, v) = t.fail("GET", &format!("/v1/tasks?q={q}"), None, None).await;
         assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
     }
+}
+
+#[tokio::test]
+async fn q_finds_an_id_whole_and_ranks_a_title_above_text_however_long_the_task() {
+    let t = setup().await;
+    let mut ids = Vec::new();
+    for n in 1..=12 {
+        ids.push(t.task(A, "factory", &format!("Item {n}")).await);
+    }
+    let (one, twelve) = (ids[0].clone(), ids[11].clone());
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{twelve}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": format!("follows {one}") })),
+    )
+    .await;
+    // An id is no prefix of another id: the task itself first, then the one that names it.
+    let found = t.ok("GET", &format!("/v1/tasks?q={one}"), None, None).await;
+    assert_eq!(listed(&found), vec![one.clone(), twelve.clone()], "{found}");
+    // A part of an id, such as the board's slug, does not find each task of the board.
+    // It finds only the task whose note names an id of that board.
+    let found = t.ok("GET", "/v1/tasks?q=factory", None, None).await;
+    assert_eq!(listed(&found), vec![twelve.clone()]);
+
+    // A long task with the word in its title stays above a short one with it in its body.
+    let long = t.task(A, "factory", "Lantern upkeep").await;
+    for n in 0..30 {
+        let text = format!(
+            "report {n}: {}",
+            "nothing of note happened on this run ".repeat(15)
+        );
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{long}/notes"),
+            Some(A),
+            Some(json!({ "agent": A, "kind": "note", "text": text })),
+        )
+        .await;
+    }
+    let short = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Short", "body": "lantern" }),
+        )
+        .await;
+    let found = t.ok("GET", "/v1/tasks?q=lantern", None, None).await;
+    assert_eq!(listed(&found), vec![long, short]);
+}
+
+#[tokio::test]
+async fn q_lists_the_best_match_first_with_the_text_found() {
+    let t = setup().await;
+    // Made in the reverse of their relevance, at one priority.
+    let in_note = t.task(A, "factory", "Third").await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{in_note}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": "the daemon\nwas restarted here" })),
+    )
+    .await;
+    let in_body = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Second",
+                    "body": "Long text before the word. Then restart the daemon on each device, and more text after the word that the snippet leaves out because it is far away from it." }),
+        )
+        .await;
+    let in_title = t.task(A, "factory", "Restart the daemon").await;
+    t.task(A, "factory", "No word of the search").await;
+
+    let found = t.ok("GET", "/v1/tasks?q=restart+daemon", None, None).await;
+    assert_eq!(
+        listed(&found),
+        vec![in_title.clone(), in_body.clone(), in_note.clone()],
+        "title, then body, then notes"
+    );
+    // The title needs no snippet; the others carry a short one line with the words marked.
+    assert_eq!(found[0].get("snippet"), None, "{found}");
+    let snippet = found[1]["snippet"].as_str().unwrap();
+    assert!(snippet.contains("[restart] the [daemon]"), "{snippet}");
+    assert!(snippet.chars().count() < 120, "{snippet}");
+    assert!(!snippet.contains("far away"), "{snippet}");
+    assert_eq!(found[2]["snippet"], "the [daemon] was [restarted] here");
+    // Priority orders the list only among equal matches.
+    let urgent = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Urgent", "priority": "p1",
+                    "body": "restart the daemon" }),
+        )
+        .await;
+    let found = t.ok("GET", "/v1/tasks?q=restart+daemon", None, None).await;
+    assert_eq!(listed(&found)[0], in_title);
+    assert!(listed(&found).contains(&urgent));
+    // Without a search there is no snippet.
+    let all = t.ok("GET", "/v1/tasks", None, None).await;
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task.get("snippet").is_none())
+    );
+
+    // A page continues after a task by its rank.
+    let first = t
+        .ok("GET", "/v1/tasks?q=restart+daemon&limit=2", None, None)
+        .await;
+    let rest = t
+        .ok(
+            "GET",
+            &format!("/v1/tasks?q=restart+daemon&after={}", listed(&first)[1]),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        [listed(&first), listed(&rest)].concat(),
+        listed(&found),
+        "the pages are the list"
+    );
+    let last = listed(&found).pop().unwrap();
+    let end = t
+        .ok(
+            "GET",
+            &format!("/v1/tasks?q=restart+daemon&after={last}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        end,
+        json!([]),
+        "the end of the list is no reason for any word"
+    );
+    // A cursor the search does not list is refused.
+    let unlisted = t.task(A, "factory", "Elsewhere").await;
+    let (s, code, v) = t
+        .fail(
+            "GET",
+            &format!("/v1/tasks?q=restart+daemon&after={unlisted}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
+}
+
+#[tokio::test]
+async fn q_without_a_task_of_every_word_lists_the_tasks_of_any_word() {
+    let t = setup().await;
+    let both = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "One", "body": "the backup of the keychain" }),
+        )
+        .await;
+    let one = t.task(A, "factory", "Backup the database").await;
+    t.task(A, "factory", "Neither").await;
+
+    // No task holds all three words: each task with one of them is listed and marked.
+    let found = t
+        .ok("GET", "/v1/tasks?q=backup+keychain+zebra", None, None)
+        .await;
+    assert_eq!(
+        listed(&found),
+        vec![both.clone(), one.clone()],
+        "more words first"
+    );
+    assert!(
+        found
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["any_word"] == true)
+    );
+    // It pages as the full search does.
+    let rest = t
+        .ok(
+            "GET",
+            &format!("/v1/tasks?q=backup+keychain+zebra&after={both}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(listed(&rest), vec![one.clone()]);
+    assert_eq!(rest[0]["any_word"], true);
+    // A task of every word ends the fallback, and no word at all lists nothing.
+    let found = t.ok("GET", "/v1/tasks?q=backup+keychain", None, None).await;
+    assert_eq!(listed(&found), vec![both]);
+    assert_eq!(found[0].get("any_word"), None);
+    let found = t.ok("GET", "/v1/tasks?q=zebra+quagga", None, None).await;
+    assert_eq!(found, json!([]));
+    // The other filters hold in the fallback too.
+    let found = t
+        .ok("GET", "/v1/tasks?q=backup+zebra&status=doing", None, None)
+        .await;
+    assert_eq!(found, json!([]));
+}
+
+#[tokio::test]
+async fn the_search_follows_every_write() {
+    let t = setup().await;
+    let task = t.task(A, "factory", "Plain").await;
+    let find = async |q: &str| listed(&t.ok("GET", &format!("/v1/tasks?q={q}"), None, None).await);
+    assert_eq!(find("walrus").await, Vec::<String>::new());
+
+    // An edit of the text, and the text it replaced.
+    let version = t.get_task(&task).await["version"].clone();
+    t.ok(
+        "PATCH",
+        &format!("/v1/tasks/{task}"),
+        Some(A),
+        Some(
+            json!({ "agent": A, "version": version, "title": "Feed the walrus",
+                     "body": "with herring", "acceptance": "the bucket is empty" }),
+        ),
+    )
+    .await;
+    for q in ["walrus", "herring", "bucket"] {
+        assert_eq!(find(q).await, vec![task.clone()], "{q}");
+    }
+    assert_eq!(find("plain").await, Vec::<String>::new());
+    // Each note, and the summary of a done task.
+    for text in ["first the otter", "then the narwhal"] {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{task}/notes"),
+            Some(A),
+            Some(json!({ "agent": A, "kind": "note", "text": text })),
+        )
+        .await;
+    }
+    assert_eq!(find("otter+narwhal").await, vec![task.clone()]);
+    assert!(t.claim(A, &task).await.0.is_success());
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task}/done"),
+        Some(A),
+        Some(
+            json!({ "agent": A, "version": t.get_task(&task).await["version"],
+                     "summary": "the pelican is fed", "evidence": check(0) }),
+        ),
+    )
+    .await;
+    assert_eq!(find("pelican").await, vec![task.clone()]);
+    // A board deleted with its tasks and notes takes their documents with it.
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "status": "closed" })),
+    )
+    .await;
+    let (s, v) = t.as_user("DELETE", "/v1/boards/factory", None).await;
+    assert_eq!(s.as_u16(), 204, "{v}");
+    assert_eq!(t.count("SELECT COUNT(*) FROM tasks"), 0);
+    // One document for each task, equal to the tables.
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM task_search"),
+        t.count("SELECT COUNT(*) FROM tasks")
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM task_search_docs"),
+        t.count("SELECT COUNT(*) FROM tasks")
+    );
 }
 
 #[tokio::test]

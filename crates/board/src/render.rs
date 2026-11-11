@@ -143,6 +143,10 @@ pub fn task_list(tasks: &[Task]) -> String {
             if task.child_count > 0 {
                 let _ = write!(line, " children {}", task.child_count);
             }
+            // A search result: the text around the words found, quoted as a peer's text is.
+            if let Some(snippet) = &task.snippet {
+                let _ = write!(line, "\n  {}", json_line(&Value::String(snippet.clone())));
+            }
             line
         })
         .collect::<Vec<_>>()

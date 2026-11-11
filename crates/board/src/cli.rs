@@ -597,7 +597,8 @@ pub struct LsArgs {
     #[arg(long)]
     live: bool,
     /// Only tasks whose id, title, body, acceptance checks or notes hold every one of
-    /// these words (at most 8, 200 characters), in any letter case: `--search "usage cap"`.
+    /// these words (at most 8, 200 characters), in any letter case, best match first:
+    /// `--search "usage cap"`. When no task holds every word, lists those with any.
     /// Use it instead of listing a whole board as JSON to filter it.
     #[arg(long, visible_alias = "grep")]
     search: Option<String>,

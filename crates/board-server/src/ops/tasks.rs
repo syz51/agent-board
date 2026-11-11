@@ -16,7 +16,8 @@ use crate::error::{
 use crate::ops::feedback::{DUPLICATE_DEPTH_MAX, LIVE_ITEMS};
 use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
-    NamedParams, find_agent, get_board, get_task, handle_of, is_live, load_tasks_up_to, seen,
+    NamedParams, SEARCH_RANK, SEARCH_RANK_ANY, find_agent, get_board, get_task, handle_of, is_live,
+    load_tasks_found, load_tasks_up_to, seen,
 };
 use crate::text::{ago, check_line, check_text};
 
@@ -652,7 +653,7 @@ pub(crate) struct TaskFilter {
     pub live: Option<bool>,
     /// Only done and dropped tasks (true), or none of them (false).
     pub closed: Option<bool>,
-    /// Only tasks that hold every one of these words ([`search_words`]); none is no search.
+    /// A search for these words ([`search_words`]), best match first; none is no search.
     pub words: Vec<String>,
     /// Only tasks with an event after this point.
     pub since: Option<Since>,
@@ -690,24 +691,47 @@ pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<Since>> {
     })
 }
 
-/// The words of a `q` search: split at white space, with ASCII letters lowercased as
-/// SQLite's `lower` folds the stored text. A blank `q` is no search, as on `/v1/errors`.
+/// The words of a `q` search: split at white space. A blank `q` is no search, as on
+/// `/v1/errors`.
 pub(crate) fn search_words(q: Option<&str>) -> Result<Vec<String>> {
     let Some(q) = q.filter(|q| !q.trim().is_empty()) else {
         return Ok(Vec::new());
     };
     check_line("q", q, TASKS_Q_CHARS_MAX)?;
-    let words: Vec<String> = q.split_whitespace().map(str::to_ascii_lowercase).collect();
+    let words: Vec<String> = q.split_whitespace().map(str::to_owned).collect();
     if words.len() > TASKS_Q_WORDS_MAX {
         return Err(invalid(
             format!(
                 "q has {} words; the limit is {TASKS_Q_WORDS_MAX}",
                 words.len()
             ),
-            "search for fewer, more specific words; a task must hold every one",
+            "search for fewer, more specific words",
         ));
     }
     Ok(words)
+}
+
+/// The FTS5 query of search words: each word is a phrase (its parts in a row, such as
+/// `mcp` and `rs` of `mcp.rs`) that may go on (`snap` finds `snapshot`), and the index
+/// stems both sides. Every word must match, or with `any` at least one.
+/// A task id is searched whole and in the id column too: `factory-12` does not find
+/// `factory-120`. Other words skip the id column, where a board's slug would match each
+/// of its tasks.
+/// A word without a letter or digit holds nothing the index stores: it is left out, and
+/// a search of such words alone is None, which finds nothing.
+fn search_query(words: &[String], any: bool) -> Option<String> {
+    let terms: Vec<String> = words
+        .iter()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .map(|w| {
+            if w.parse::<TaskId>().is_ok() {
+                format!("\"{w}\"")
+            } else {
+                format!("{{title body notes}} : \"{}\"*", w.replace('"', "\"\""))
+            }
+        })
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(if any { " OR " } else { " AND " }))
 }
 
 pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
@@ -787,23 +811,6 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         clauses.push(live);
         params.push((":live_depth", &live_depth));
     }
-    // No word may be missing from the task's id, own text and notes: one statement
-    // whatever the word count. `lower` folds ASCII letters only, as the words are.
-    let words = serde_json::to_string(&filter.words).expect("strings serialize");
-    if !filter.words.is_empty() {
-        clauses.push(
-            "NOT EXISTS (SELECT 1 FROM json_each(:words) w WHERE NOT (
-                 t.id = w.value
-                 OR instr(lower(t.title), w.value) > 0
-                 OR instr(lower(t.body), w.value) > 0
-                 OR instr(lower(t.acceptance), w.value) > 0
-                 OR instr(lower(coalesce(t.summary, '')), w.value) > 0
-                 OR instr(lower(coalesce(t.blocked_reason, '')), w.value) > 0
-                 OR EXISTS (SELECT 1 FROM notes n WHERE n.task = t.id
-                            AND instr(lower(n.text), w.value) > 0)))",
-        );
-        params.push((":words", &words));
-    }
     // A task changes with an event that names it (a note, a claim, an update, an ask). The
     // server's own notices (an update of no field) and the leases held for it change nothing
     // an agent wrote. The `events_task` index finds a task's events; the sequence form also
@@ -825,22 +832,105 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         clauses.push(sql);
         params.push((":since", value));
     }
-    // The cursor's place is read as the list is, so a page follows the task's place now.
     let after = filter.after.as_ref().map(TaskId::as_str);
-    if let Some(after) = &after {
-        if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [after])? {
-            return Err(not_found(
-                format!("after names {after}, which is not a task"),
-                "send after=<the id of the last task of the list you continue>",
-            ));
+    if let Some(after) = &after
+        && !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [after])?
+    {
+        return Err(not_found(
+            format!("after names {after}, which is not a task"),
+            "send after=<the id of the last task of the list you continue>",
+        ));
+    }
+    if filter.words.is_empty() {
+        // The cursor's place is read as the list is, so a page follows the task's place now.
+        if let Some(after) = &after {
+            clauses.push(AFTER_IN_LIST_ORDER);
+            params.push((":after", after));
         }
-        clauses.push(
-            "(t.priority, t.number, t.board) > \
-             (SELECT c.priority, c.number, c.board FROM tasks c WHERE c.id = :after)",
-        );
+        return load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit));
+    }
+
+    // A search lists the best match first. No task with every word: list the tasks with
+    // any of them, and mark each so the reader knows.
+    let (Some(every), Some(any)) = (
+        search_query(&filter.words, false),
+        search_query(&filter.words, true),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let found = |query: &str, rank: &str, after: Option<&str>, limit: usize| {
+        found_page(cx, &clauses, &params, query, rank, after, limit)
+    };
+    let not_listed = || {
+        invalid(
+            format!(
+                "after names {}, which this search does not list",
+                after.unwrap_or_default()
+            ),
+            "send after=<the id of the last task of the page before> with the same q and \
+             filters",
+        )
+    };
+    let page = found(&every, SEARCH_RANK, after, filter.limit)?;
+    // One word: both searches are the same.
+    if every == any || page.as_ref().is_some_and(|tasks| !tasks.is_empty()) {
+        return page.ok_or_else(not_listed);
+    }
+    // An empty page after a cursor is the end of a list that has tasks with every word.
+    if after.is_some()
+        && found(&every, SEARCH_RANK, None, 1)?.is_some_and(|tasks| !tasks.is_empty())
+    {
+        return page.ok_or_else(not_listed);
+    }
+    let mut some = found(&any, SEARCH_RANK_ANY, after, filter.limit)?.ok_or_else(not_listed)?;
+    for task in &mut some {
+        task.any_word = true;
+    }
+    Ok(some)
+}
+
+/// The cursor clause of a list in list order; expects `:after`.
+const AFTER_IN_LIST_ORDER: &str = "(t.priority, t.number, t.board) > \
+     (SELECT c.priority, c.number, c.board FROM tasks c WHERE c.id = :after)";
+
+/// One page of a search with the FTS5 query `query`, after the task `after` when given.
+/// None when the search does not list that task: its place is its rank by `rank_sql`.
+fn found_page(
+    cx: &Ctx<'_>,
+    clauses: &[&str],
+    params: &NamedParams<'_>,
+    query: &str,
+    rank_sql: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Option<Vec<Task>>> {
+    let mut clauses = clauses.to_vec();
+    let mut params = params.clone();
+    params.push((":match", &query));
+    let rank: Option<f64> = match after {
+        Some(after) => {
+            let rank = cx
+                .db
+                .prepare_cached(&format!(
+                    "SELECT {rank_sql} FROM task_search WHERE task_search MATCH ?1 \
+                     AND rowid = (SELECT doc FROM task_search_docs WHERE task = ?2)"
+                ))?
+                .query_row(params![query, after], |r| r.get(0))
+                .optional()?;
+            if rank.is_none() {
+                return Ok(None);
+            }
+            rank
+        }
+        None => None,
+    };
+    let cursor = format!("({rank_sql} > :rank OR ({rank_sql} = :rank AND {AFTER_IN_LIST_ORDER}))");
+    if let (Some(rank), Some(after)) = (&rank, &after) {
+        clauses.push(&cursor);
+        params.push((":rank", rank));
         params.push((":after", after));
     }
-    load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
+    load_tasks_found(cx, rank_sql, &clauses.join(" AND "), &params, limit).map(Some)
 }
 
 /// The tasks the agent has in `doing`, other than `except`.

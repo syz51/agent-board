@@ -211,7 +211,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "q",
                     s(
-                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words (at most 8), in any letter case.",
+                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words (at most 8), best match first; when none does, those with any.",
                         board_proto::TASKS_Q_CHARS_MAX,
                     ),
                     false,

@@ -38,6 +38,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0021_usage.sql"),
     include_str!("../migrations/0022_board_paused_at.sql"),
     include_str!("../migrations/0023_usage_pace.sql"),
+    include_str!("../migrations/0024_task_search.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -790,5 +791,67 @@ mod tests {
                 ("q".to_owned(), Some(9))
             ]
         );
+    }
+
+    #[test]
+    fn the_search_index_takes_the_tasks_and_notes_stored_before_it() {
+        let conn = migrated_to(23);
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('f', 't', '', 'active', '[]', 0, '[]', 0, 0); \
+             INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+             auto, created_by, version, created_at, updated_at, summary, blocked_reason) VALUES \
+             ('f-1', 'f', 1, 'Rotate the key', 'the body', 'the check', 'done', 'p2', 0, \
+              't3:a', 2, 0, 20, 'the summary', NULL), \
+             ('f-2', 'f', 2, 'Second', '', '', 'blocked', 'p2', 0, 't3:a', 2, 0, 5, NULL, \
+              'the reason'), \
+             ('f-3', 'f', 3, 'Third', '', '', 'open', 'p2', 0, 't3:a', 1, 0, 0, NULL, NULL); \
+             INSERT INTO notes (task, agent, kind, text, at) VALUES \
+             ('f-2', 't3:a', 'note', 'first deployed', 1), \
+             ('f-2', 't3:a', 'finding', 'then verified', 2);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let find = |query: &str| -> Vec<String> {
+            conn.prepare(
+                "SELECT d.task FROM task_search JOIN task_search_docs d \
+                 ON d.doc = task_search.rowid WHERE task_search MATCH ?1 ORDER BY d.task",
+            )
+            .unwrap()
+            .query_map([query], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        // Each stored task has its document: id, title, own text and notes, stemmed.
+        for (query, tasks) in [
+            ("key", vec!["f-1"]),
+            ("body AND check AND summary", vec!["f-1"]),
+            ("reason", vec!["f-2"]),
+            ("deploy AND verify", vec!["f-2"]),
+            ("third", vec!["f-3"]),
+            ("\"f-3\"", vec!["f-3"]),
+        ] {
+            assert_eq!(find(query), tasks, "{query}");
+        }
+        // The triggers carry on from there.
+        conn.execute_batch(
+            "INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+             auto, created_by, version, created_at, updated_at) VALUES \
+             ('f-4', 'f', 4, 'Fourth', 'new text', '', 'open', 'p2', 0, 't3:a', 1, 0, 0); \
+             UPDATE notes SET text = 'now rewritten' WHERE text = 'first deployed'; \
+             DELETE FROM notes WHERE text = 'then verified'; \
+             UPDATE tasks SET status = 'doing' WHERE id = 'f-3'; \
+             DELETE FROM tasks WHERE id = 'f-1';",
+        )
+        .unwrap();
+        assert_eq!(find("fourth AND text"), vec!["f-4"]);
+        assert_eq!(find("rewritten"), vec!["f-2"]);
+        assert_eq!(find("deployed OR verified OR key"), Vec::<String>::new());
+        assert_eq!(find("third"), vec!["f-3"]);
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_search", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 3);
     }
 }

@@ -521,6 +521,8 @@ export class DevState {
       owner_handle: owner?.handle ?? null,
       proposal,
       child_count: this.data.tasks.filter((item) => item.parent === task.id).length,
+      snippet: null,
+      any_word: false,
       ready:
         task.status === "open" &&
         !proposal &&
