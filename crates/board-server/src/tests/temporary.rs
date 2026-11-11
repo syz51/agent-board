@@ -21,6 +21,15 @@ async fn sweep(t: &T) -> TemporarySweep {
     crate::sweep_temporary(&t.state).await
 }
 
+/// Records that the server is alive, as its sweeper does every minute and at shutdown.
+async fn alive(t: &T) {
+    let started = t.state.started().timestamp_millis();
+    t.state
+        .write(move |cx| crate::ops::boards::mark_alive(cx, started))
+        .await
+        .unwrap();
+}
+
 fn slugs(list: &[board_proto::BoardSlug]) -> Vec<&str> {
     list.iter().map(|s| s.as_str()).collect()
 }
@@ -572,22 +581,70 @@ async fn time_the_server_was_down_does_not_count_as_idle() {
         Some(json!({ "status": "closed" })),
     )
     .await;
+    alive(&t).await;
     t.advance(TimeDelta::hours(1));
+    alive(&t).await;
     t.state.shutdown();
 
     // Down far longer than both windows; the first sweep after the restart, at once, finds
     // nothing idle.
     t.advance((close_after() + delete_after()) * 3);
     let up = t.restart(crate::Db::open(&path).unwrap());
+    alive(&up).await;
     assert_eq!(sweep(&up).await, TemporarySweep::default());
 
-    // Idle time counts from the restart.
-    up.advance(close_after() - TimeDelta::seconds(1));
+    // A second time down, two hours later, is taken out as well.
+    up.advance(TimeDelta::hours(2));
+    alive(&up).await;
+    up.state.shutdown();
+    up.advance(delete_after() * 2);
+    let up = up.restart(crate::Db::open(&path).unwrap());
+    alive(&up).await;
+    assert_eq!(sweep(&up).await, TemporarySweep::default());
+
+    // The three hours the server was up before count: a restart does not start the period
+    // again.
+    up.advance(close_after() - TimeDelta::hours(3) - TimeDelta::seconds(1));
     assert_eq!(sweep(&up).await, TemporarySweep::default());
     up.advance(TimeDelta::seconds(1));
     assert_eq!(slugs(&sweep(&up).await.closed), vec!["scratch"]);
-    up.advance(delete_after() - close_after());
+    up.advance(delete_after() - close_after() - TimeDelta::seconds(1));
+    assert_eq!(sweep(&up).await, TemporarySweep::default());
+    up.advance(TimeDelta::seconds(1));
     assert_eq!(slugs(&sweep(&up).await.deleted), vec!["closed"]);
+}
+
+#[tokio::test]
+async fn the_servers_own_notices_do_not_keep_a_temporary_board() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    temporary_board(&t, "scratch").await;
+    let task = t.task(A, "scratch", "Parked").await;
+    let (s, v) = t.claim(A, &task).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.patch(A, &task, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+
+    // The task stays in review, so the server announces it again every day, the period
+    // after which the board is closed and a seventh of the one after which it is deleted.
+    assert_eq!(
+        defaults().review_quiet_secs,
+        defaults().temporary_close_after_secs
+    );
+    let mut swept = Vec::new();
+    for _ in 0..8 {
+        t.advance(close_after());
+        let announced = t
+            .state
+            .write(crate::ops::tasks::announce_quiet_reviews)
+            .await
+            .unwrap();
+        assert_eq!(announced, 1);
+        swept.push(sweep(&t).await);
+    }
+    assert_eq!(slugs(&swept[0].closed), vec!["scratch"]);
+    assert!(swept[1..7].iter().all(|s| *s == TemporarySweep::default()));
+    assert_eq!(slugs(&swept[7].deleted), vec!["scratch"]);
 }
 
 #[tokio::test]
@@ -632,12 +689,7 @@ async fn a_board_used_after_it_was_found_due_is_kept() {
     )
     .await;
     t.advance(delete_after());
-    let since = t.state.started().timestamp_millis();
-    let due = t
-        .state
-        .read(move |cx| temporary_due(cx, since))
-        .await
-        .unwrap();
+    let due = t.state.read(temporary_due).await.unwrap();
     assert_eq!(slugs(&due), vec!["closed", "scratch"]);
 
     // Between finding them due and sweeping each: one is claimed, the other reopened.
@@ -653,7 +705,7 @@ async fn a_board_used_after_it_was_found_due_is_kept() {
     for slug in due {
         let swept = t
             .state
-            .write(move |cx| sweep_temporary(cx, &slug, since))
+            .write(move |cx| sweep_temporary(cx, &slug))
             .await
             .unwrap();
         assert_eq!(swept, None::<Swept>);

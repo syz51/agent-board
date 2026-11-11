@@ -39,6 +39,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0022_board_paused_at.sql"),
     include_str!("../migrations/0023_usage_pace.sql"),
     include_str!("../migrations/0024_task_search.sql"),
+    include_str!("../migrations/0025_server_runs.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
