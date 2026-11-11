@@ -100,7 +100,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
-  when the owner is gone. Stats count dones that spent under a minute in `doing`, takeovers
+  when the owner is gone. When the owner is stale or its session ended, and nobody runs the
+  active board (no coordinator, and no daemon dispatch, which closes reviewed tasks
+  itself), the alert goes
+  to the agents that may take the task at once: its creator and the threads that delegated
+  its owner. When they are gone too, it goes to every agent on one of the board's
+  repositories, once the owner is stale, so that the take is not refused. That alert says
+  to check the PR and, once it merged, to take the task (`task_claim <id> take=true`) and
+  mark it done. Stats count dones that spent under a minute in `doing`, takeovers
   and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
@@ -425,6 +432,21 @@ high for it. There is no total cap.
   board leaves the over state, the daemon wakes its coordinator once to read its snapshot
   and start ready tasks. A daemon with no reading at all, as after a restart while the
   server is unreachable, keeps the boards it held.
+- **Full**: a window at or above 100% stops every turn of the account on the limit at
+  once. T3 Code still accepts a message, so a wake-up sent then counts as delivered and
+  is lost. While a window of a fresh reading is at or above 100% and its reset time is
+  still to come, the daemon sends no wake-up to an agent with runtime `claude` on its
+  device, whatever the board's stop and whatever the agent's state. It keeps each queue
+  whole, also the ready and cleared wake-ups, past their usual hour to live. At the reset
+  it checks each kept wake-up again and sends those that still hold, once; they live one
+  hour from the reset. That message is the resume: no other one is sent. With two full
+  windows the later reset counts. A reading that falls below 100% before the reset, or
+  goes stale, ends the hold at once, and the kept wake-ups live one hour from then. A stale reading keeps nothing back, and neither does a full window
+  with no reset time, since nothing says when it ends. Codex and opencode agents are
+  woken as before. An agent that stopped on the limit itself waits for its own reset
+  first, as before. A daemon with no reading at all keeps waiting for the reset it last
+  knew. The hold covers the wake-up queue only: the coordinator's start, its re-brief and
+  its own resume message, and a worker's start, are sent as before.
 - **Pace**: the stop alone lets agents spend the whole week early. A weekly reserve,
   account-wide and off by default, paces the week instead. `board usage --reserve 5.5`
   turns it on; anyone may raise it, only the user may lower it or turn it off
@@ -879,7 +901,8 @@ apart from the user's chats, such as environment variables.
     on the first flush after it stops running, or after 3 minutes held, since T3 gives a
     busy thread the message as its next turn and a turn that ended on an API error, an
     interrupt or a Codex error leaves the thread marked running. Lines for an agent paused
-    on a usage limit are kept until its reset. Held lines are saved with the daemon's
+    on a usage limit are kept until its reset, and so are every Claude agent's lines
+    while a usage window is full (see "Usage", Full). Held lines are saved with the daemon's
     state, so a restart keeps them; one entry a version cannot read is skipped, never the
     whole state.
   - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
@@ -913,7 +936,7 @@ apart from the user's chats, such as environment variables.
     agent's new lines are not held. A message not settled within an hour is dropped
     like an expired line.
   - **Expiry**: a line not delivered within an hour of being queued, or of the reset its
-    paused agent waited for, is dropped before any send.
+    paused agent or a full usage window waited for, is dropped before any send.
   - **Staying responsive**: each server request gets 20 seconds (the MCP server's too). A
     reconcile gets 90 seconds and a flush's checks 30, eight queues at a time, and a stop
     request cuts any step short. Every step is safe to cut: checks only read, queues and
