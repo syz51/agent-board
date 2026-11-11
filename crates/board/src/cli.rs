@@ -228,7 +228,7 @@ pub enum Command {
     Note {
         id: TaskId,
         #[arg(help = at_most(
-            "The note: start with its kind and cite evidence. Split longer text across notes, \
+            "The note: cite evidence. Split longer text across notes, \
              or put it in the task body or task_done evidence",
             limits().note_chars,
         ))]

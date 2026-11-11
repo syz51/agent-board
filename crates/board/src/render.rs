@@ -561,8 +561,9 @@ pub fn claim_notes(detail: &TaskDetail) -> String {
 /// What `task_done` adds below the task line: the finding notes added since the task's
 /// latest claim (every finding when no claim is in the history), so the agent can confirm
 /// each is addressed. The window starts at the claim, not at a later handover, so a
-/// finding noted while a child held the task is listed when it is handed back. Empty when
-/// there are none.
+/// finding noted while a child held the task is listed when it is handed back. The
+/// caller's own findings are named by note id with their start, since it wrote them in
+/// this session; other agents' are in full. Empty when there are none.
 pub fn done_findings(detail: &TaskDetail, agent: &str) -> String {
     let handles = &detail.handles;
     let claimed = detail
@@ -592,7 +593,7 @@ pub fn done_findings(detail: &TaskDetail, agent: &str) -> String {
         detail.task.id,
     );
     for note in own {
-        let _ = write!(out, "\nyours: {}", json_line(&note_line(note, handles)));
+        let _ = write!(out, "\nyours: #{} {}", note.id, title(&note.text));
     }
     let peers: Vec<Value> = peers.iter().map(|n| note_line(n, handles)).collect();
     let block = peer_block(&peers);
@@ -1320,8 +1321,14 @@ mod tests {
         // My own findings are listed as mine, not under the peer header.
         let mut own = noted(&[("finding", "my own", 7)], std::slice::from_ref(&claimed));
         own.notes[0].agent = serde_json::from_value(json!("t3:me")).unwrap();
+        own.notes[0].text = format!("my own {}", "x".repeat(100));
         let done = done_findings(&own, "t3:me");
-        assert!(done.contains("\nyours: {"), "{done}");
+        // By note id, with its start, cut to 80 characters.
+        let start = format!("my own {}", "x".repeat(72));
+        assert!(
+            done.ends_with(&format!("\nyours: #1 \"{start}…\"")),
+            "{done}"
+        );
         assert!(!done.contains(PEER_HEADER), "{done}");
         // No claim in the history: every finding.
         let unknown = noted(&[("finding", "a", 1), ("finding", "b", 7)], &[]);

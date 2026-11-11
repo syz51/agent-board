@@ -474,7 +474,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_note",
-        description: "Add a note (at most 800 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision.",
+        description: "Add a note (at most 800 characters) to a task. Cite evidence. Kinds: note, finding, decision.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -1334,6 +1334,11 @@ mod tests {
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
         assert!(schemas < 16_500, "tool list: {schemas}");
+        // `kind` is a parameter, which every reader shows: no text asks to repeat it.
+        for tool in &tools {
+            let text = tool.description.as_deref().unwrap_or_default();
+            assert!(!text.contains("with its kind"), "{}", tool.name);
+        }
         for rule in [
             "Call board_snapshot when",
             "Claim a task before working on it",

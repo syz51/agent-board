@@ -253,6 +253,29 @@ fn noted_detail(notes: &[(&str, &str, u32)]) -> Value {
 }
 
 #[test]
+fn the_acks_of_claim_update_and_done_name_the_owner_by_its_short_handle() {
+    let e = env();
+    e.stub.on("GET /v1/tasks/factory-12", noted_detail(&[]));
+    let mut owned = task_fixture("factory-12", "Do it");
+    owned.owner = Some("t3:thread:a-very-long-agent-id".parse().unwrap());
+    owned.owner_handle = Some("t3:7f3a".into());
+    e.stub.on("POST /v1/tasks/factory-12/claim", owned.clone());
+    e.stub.on("PATCH /v1/tasks/factory-12", owned.clone());
+    e.stub.on("POST /v1/tasks/factory-12/done", owned);
+    for args in [
+        &["claim", "factory-12"][..],
+        &["update", "factory-12", "--priority", "p1"],
+        &["done", "factory-12", "--commit", "4e1c2ab"],
+    ] {
+        let out = e.run(args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let ack = stdout(&out);
+        assert!(ack.contains(" owner t3:7f3a"), "{ack}");
+        assert!(!ack.contains("a-very-long-agent-id"), "{ack}");
+    }
+}
+
+#[test]
 fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
     let e = env();
     e.stub.on(
@@ -277,13 +300,13 @@ fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
         "{text}"
     );
 
-    e.stub.on(
-        "GET /v1/tasks/factory-12",
-        noted_detail(&[
-            ("finding", "checked before the claim", 1),
-            ("finding", "found after the claim", 7),
-        ]),
-    );
+    let mut detail = noted_detail(&[
+        ("finding", "checked before the claim", 1),
+        ("finding", "found after the claim", 7),
+        ("finding", "my own finding", 8),
+    ]);
+    detail["notes"][2]["agent"] = json!(ME);
+    e.stub.on("GET /v1/tasks/factory-12", detail);
     e.stub.on(
         "POST /v1/tasks/factory-12/done",
         task_fixture("factory-12", "Do it"),
@@ -293,9 +316,11 @@ fn claim_names_the_notes_and_done_lists_findings_since_the_claim() {
     let text = stdout(&out);
     assert!(text.starts_with("done factory-12"), "{text}");
     assert!(
-        text.contains("\n1 finding since the claim; the task is done: for each one"),
+        text.contains("\n2 findings since the claim; the task is done: for each one"),
         "{text}"
     );
+    // The caller's own finding by note id; the peer's in full.
+    assert!(text.contains("\nyours: #3 \"my own finding\""), "{text}");
     assert!(text.contains("found after the claim"), "{text}");
     assert!(!text.contains("checked before the claim"), "{text}");
 }
