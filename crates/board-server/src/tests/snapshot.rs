@@ -2133,7 +2133,7 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         "POST",
         "/v1/boards",
         None,
-        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO], "home_devices": ["mac"] })),
     )
     .await;
     let claim = |agent: Option<&str>| json!({ "device": "mac", "agent": agent });
@@ -2298,7 +2298,46 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
     );
     assert_eq!(held(&snapshot(&t, next, "kind=alerts").await), Value::Null);
 
-    // Closing the board, or moving it to daemon dispatch, holds the thread that runs it.
+    // Its device no longer a home holds it, and a renewal by a daemon that has not yet seen
+    // the change keeps the hold.
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "home_devices": ["air"] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        None,
+        Some(claim(None)),
+    )
+    .await;
+    assert_eq!(
+        snapshot(&t, next, "kind=alerts").await["stood_down"],
+        json!([{
+            "board": "auto",
+            "reason": "its device is no longer one of the board's home devices"
+        }])
+    );
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "home_devices": ["mac"] })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(next),
+        Some(claim(Some(next))),
+    )
+    .await;
+    assert_eq!(held(&snapshot(&t, next, "kind=alerts").await), Value::Null);
+
+    // Moving it to daemon dispatch holds the thread that runs it, through a renewal too.
     t.ok(
         "PATCH",
         "/v1/boards/auto",
@@ -2306,10 +2345,35 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         Some(json!({ "dispatch": "daemon" })),
     )
     .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        None,
+        Some(claim(None)),
+    )
+    .await;
     assert_eq!(
         snapshot(&t, next, "kind=alerts").await["stood_down"],
         json!([{ "board": "auto", "reason": "the board is set to daemon dispatch" }])
     );
+
+    // Paused too, while the lease still names it: the pause alone shows.
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+    let snap = snapshot(&t, next, "kind=alerts").await;
+    assert_eq!(held(&snap), json!(["auto"]));
+    assert_eq!(snap["stood_down"], Value::Null);
+    assert!(
+        text(&snap).contains("hold: auto paused -> "),
+        "{}",
+        text(&snap)
+    );
+    assert!(!text(&snap).contains("stood down"), "{}", text(&snap));
 }
 
 #[tokio::test]

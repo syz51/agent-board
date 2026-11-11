@@ -690,11 +690,14 @@ fn held_by(cx: &Ctx<'_>, agent: &AgentId, hard: Option<Timestamp>) -> Result<Hol
     Ok(Hold {
         boards: all,
         since,
-        paused: boards,
+        // A board that also holds the agent as paused or over the usage line shows that
+        // hold alone, so `held_by` less `stood_down` is what holds it in other ways.
         stood_down: stood
             .into_iter()
+            .filter(|(board, _, _)| !boards.contains(board))
             .map(|(board, _, reason)| StoodDownHold { board, reason })
             .collect(),
+        paused: boards,
     })
 }
 

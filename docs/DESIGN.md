@@ -655,9 +655,12 @@ apart from the user's chats, such as environment variables.
   every other prompt gets a `hold:` line that lets only the user's own request go on.
   Only that thread is held; the threads it started and the owners of its tasks finish
   their work. A claim that names the thread coordinator, or a renewal that keeps it
-  named, deletes the record; a live lease alone does not, since the server refuses
-  renewals while the board does not run a coordinator, so a lease left live by a daemon
-  that is down still holds. The daemon therefore names a stood-down thread with a claim
+  named, deletes the record, but only on a board with thread dispatch that has the
+  claiming device among its homes: the server takes renewals on a board moved to daemon
+  dispatch or away from the device, from a daemon that has not yet seen the change. A
+  live lease alone does not lift the hold either, so a lease left live by a daemon that
+  is down still holds (the server refuses renewals while autopilot is off or the board
+  is not active). The daemon therefore names a stood-down thread with a claim
   before it sends the message that it coordinates again. The migration that added the
   record (0026) recorded a stand-down for each board that had already stopped running its
   last coordinator, from the last change of its autopilot, dispatch or status. Rejected:

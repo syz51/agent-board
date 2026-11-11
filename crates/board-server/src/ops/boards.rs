@@ -664,8 +664,20 @@ pub(crate) fn claim_coordinator(
     };
     // A thread the claim names coordinator, or keeps named, is no longer stood down, and
     // the thread it replaces is. The daemon's dispatch agent is not a thread: a switch to
-    // daemon dispatch already stood the last thread down.
-    if let Some(agent) = agent.as_deref().filter(|a| !a.starts_with("dispatch:")) {
+    // daemon dispatch already stood the last thread down. A claim on a board that runs no
+    // coordinator thread on this device changes neither: a daemon that has not yet seen
+    // the switch to daemon dispatch, or that its device is no longer a home, still renews.
+    let runs_thread: bool = cx.db.query_row(
+        "SELECT dispatch = 'thread' \
+                AND EXISTS (SELECT 1 FROM json_each(home_devices) WHERE value = ?2) \
+         FROM boards WHERE slug = ?1",
+        params![slug.as_str(), req.device.as_str()],
+        |r| r.get(0),
+    )?;
+    if let Some(agent) = agent
+        .as_deref()
+        .filter(|a| runs_thread && !a.starts_with("dispatch:"))
+    {
         if let Some((last, _)) = last_coordinator(cx, slug)?
             && last != agent
         {

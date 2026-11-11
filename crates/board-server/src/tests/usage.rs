@@ -515,15 +515,7 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
     let other = t
         .ok("GET", "/v1/snapshot?kind=alerts", Some("t3:other"), None)
         .await;
-    // The usage does not hold it; the closed board holds it alone, as its coordinator that
-    // stood down.
-    assert_eq!(other["held_by"], json!(["old"]), "{other}");
-    assert_eq!(other["held_for_usage"], Value::Null, "{other}");
-    assert_eq!(
-        other["stood_down"],
-        json!([{ "board": "old", "reason": "the board is closed" }]),
-        "{other}"
-    );
+    assert_eq!(other["held_by"], Value::Null, "{other}");
     // A later reading keeps the time the line was reached.
     t.ok(
         "PUT",
