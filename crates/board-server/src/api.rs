@@ -603,6 +603,7 @@ struct TasksQuery {
     mine: Option<bool>,
     parent: Option<TaskId>,
     live: Option<bool>,
+    closed: Option<bool>,
     q: Option<String>,
     limit: Option<usize>,
 }
@@ -632,6 +633,7 @@ async fn list_tasks(
         proposal: q.proposal,
         parent: q.parent,
         live: q.live,
+        closed: q.closed,
         words: tasks::search_words(q.q.as_deref())?,
         limit: q
             .limit

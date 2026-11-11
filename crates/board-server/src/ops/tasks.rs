@@ -650,6 +650,8 @@ pub(crate) struct TaskFilter {
     pub parent: Option<TaskId>,
     /// Only feedback items that take reports (true), or none of them (false).
     pub live: Option<bool>,
+    /// Only done and dropped tasks (true), or none of them (false).
+    pub closed: Option<bool>,
     /// Only tasks that hold every one of these words ([`search_words`]); none is no search.
     pub words: Vec<String>,
     pub limit: usize,
@@ -719,6 +721,11 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     };
     if let Some(proposal) = &proposal {
         clauses.push(proposal);
+    }
+    match filter.closed {
+        Some(true) => clauses.push("t.status IN ('done', 'dropped')"),
+        Some(false) => clauses.push("t.status NOT IN ('done', 'dropped')"),
+        None => {}
     }
     // Feedback items are filed on the feedback board. On a board without any, `live=true`
     // can only be a mistake, so say where they are rather than answer with an empty list.

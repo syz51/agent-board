@@ -428,6 +428,17 @@ pub async fn task_list(
     } else {
         String::new()
     };
+    // A list across boards says which ones it holds; a parent's children are on its board.
+    let notice = if query.board.is_none() && query.parent.is_none() && !tasks.is_empty() {
+        let boards: BTreeSet<&str> = tasks.iter().map(|t| t.board.as_str()).collect();
+        let boards: Vec<&str> = boards.into_iter().collect();
+        format!(
+            "{notice}\nboards listed: {}; name a board to narrow it",
+            boards.join(", ")
+        )
+    } else {
+        notice
+    };
     let text = if detailed {
         render::task_list_detailed(&tasks, &notice)
     } else {

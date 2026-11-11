@@ -157,11 +157,29 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_list",
-        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children), live (feedback items that take reports) or q (a text search: use it to find tasks about a subject).",
+        description: "List tasks, sorted by priority: by default this repo's board, without done and dropped tasks. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children), live (feedback items that take reports) or q (a text search: use it to find tasks about a subject).",
         params: || {
             vec![
-                ("board", board_arg("Board slug."), false),
-                ("status", one_of(STATUSES, "Only this status."), false),
+                (
+                    "board",
+                    board_arg(
+                        "Board slug. Default: this repo's board, or every board with mine, owner, parent or live.",
+                    ),
+                    false,
+                ),
+                ("all_boards", b("List every board."), false),
+                (
+                    "status",
+                    one_of(STATUSES, "Only this status, done and dropped too."),
+                    false,
+                ),
+                (
+                    "closed",
+                    b(
+                        "Include done and dropped tasks. Lists by status, parent or live include them without it.",
+                    ),
+                    false,
+                ),
                 (
                     "owner",
                     s("Only tasks this agent owns.", AGENT_ID_MAX),
@@ -784,8 +802,23 @@ impl BoardMcp {
             }
             "task_list" => {
                 let a: ListArgs = parse(name, args)?;
+                if a.all_boards && a.board.is_some() {
+                    anyhow::bail!("board and all_boards name different lists: send one of them");
+                }
+                // The default list is this repo's open work. A filter that names its own
+                // scope keeps it: the caller's tasks and a parent's children are on any
+                // board, feedback items on the feedback board, and a status, a parent or
+                // live asks for closed tasks too. Without a board for this repo, the list
+                // covers every board and names them.
+                let scoped =
+                    !a.all_boards && a.owner.is_none() && !a.mine && a.parent.is_none() && !a.live;
+                let board = match a.board {
+                    None if scoped => ctx.resolve_board(None).await.ok(),
+                    board => board,
+                };
+                let open = !a.closed && a.status.is_none() && a.parent.is_none() && !a.live;
                 let query = TaskQuery {
-                    board: a.board,
+                    board,
                     status: a.status,
                     owner: a.owner,
                     ready: a.ready.then_some(true),
@@ -793,6 +826,7 @@ impl BoardMcp {
                     mine: a.mine.then_some(true),
                     parent: a.parent,
                     live: a.live.then_some(true),
+                    closed: open.then_some(false),
                     q: a.q,
                     // Fewer than the CLI lists: the text goes into the agent's context.
                     limit: Some(a.limit.unwrap_or(TASK_LIST_LIMIT)),
@@ -978,7 +1012,11 @@ struct JoinArgs {
 #[serde(deny_unknown_fields)]
 struct ListArgs {
     board: Option<BoardSlug>,
+    #[serde(default)]
+    all_boards: bool,
     status: Option<TaskStatus>,
+    #[serde(default)]
+    closed: bool,
     owner: Option<AgentId>,
     #[serde(default)]
     ready: bool,

@@ -921,3 +921,87 @@ fn task_list_sends_a_search_and_says_when_the_limit_cut_the_list() {
         assert!(notice < peers, "{cut}");
     }
 }
+
+/// A plain `task_list` is this repo's open work; a filter that names its own scope, or an
+/// explicit argument, gives the wider list back.
+#[test]
+fn task_list_defaults_to_this_repos_board_and_open_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let mut me = agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running);
+    me.boards = vec!["factory".parse().unwrap()];
+    stub.on(&format!("GET /v1/agents/{}", enc("t3:thread-1")), me);
+    stub.on(
+        "GET /v1/boards",
+        [board_fixture("factory", &[]), board_fixture("web", &[])],
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut done = task_fixture("factory-3", "Ship the page");
+    done.status = board_proto::TaskStatus::Done;
+    stub.on(
+        "GET /v1/tasks",
+        [task_fixture("factory-12", "Rotate the key"), done],
+    );
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let mut id = 1;
+    let mut list = |args: Value| {
+        id += 1;
+        let result = mcp.call(id, "task_list", args);
+        let query = stub
+            .requests_to("GET /v1/tasks")
+            .last()
+            .unwrap()
+            .query_pairs();
+        (result, query)
+    };
+    let scope = |q: &std::collections::BTreeMap<String, String>| {
+        (
+            q.get("board").map(String::as_str).map(str::to_owned),
+            q.get("closed").map(String::as_str).map(str::to_owned),
+        )
+    };
+    let (factory, open) = (Some("factory".to_owned()), Some("false".to_owned()));
+
+    // The default: this repo's board, no done or dropped task, also from a server that
+    // predates the filter. A named board needs no line that names the boards.
+    let (plain, q) = list(json!({}));
+    assert_eq!(scope(&q), (factory.clone(), open.clone()));
+    assert_eq!(
+        text(&plain),
+        "factory-12 open p1 \"Rotate the key\" ready auto"
+    );
+    let (_, q) = list(json!({"q": "key", "ready": true}));
+    assert_eq!(scope(&q), (factory.clone(), open.clone()));
+
+    // The old result, asked for explicitly.
+    let (all, q) = list(json!({"all_boards": true, "closed": true}));
+    assert_eq!(scope(&q), (None, None));
+    assert!(text(&all).contains("factory-3 done"), "{all}");
+    assert!(
+        text(&all).ends_with("boards listed: factory; name a board to narrow it"),
+        "{all}"
+    );
+    let (_, q) = list(json!({"board": "web"}));
+    assert_eq!(scope(&q), (Some("web".to_owned()), open.clone()));
+
+    // A status asks for closed tasks itself; the caller's own tasks are on any board.
+    let (_, q) = list(json!({"status": "done"}));
+    assert_eq!(scope(&q), (factory.clone(), None));
+    let (_, q) = list(json!({"mine": true}));
+    assert_eq!(scope(&q), (None, open.clone()));
+    let (_, q) = list(json!({"owner": "t3:thread-2"}));
+    assert_eq!(scope(&q), (None, open));
+
+    let (both, _) = list(json!({"board": "web", "all_boards": true}));
+    assert_eq!(both["isError"], true, "{both}");
+    assert!(text(&both).contains("send one of them"), "{both}");
+}

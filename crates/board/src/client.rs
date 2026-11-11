@@ -375,6 +375,10 @@ pub struct TaskQuery {
     /// before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<bool>,
+    /// Only done and dropped tasks (true), or none of them (false); servers before it
+    /// ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<bool>,
     /// Only tasks whose id, title, body, acceptance or notes hold every word; servers
     /// before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,6 +817,10 @@ impl Client {
         // Servers that predate the `proposal` filter ignore it and return every task.
         if let Some(want) = q.proposal {
             tasks.retain(|t| t.is_pending_proposal() == want);
+        }
+        // So do servers that predate the `closed` filter.
+        if let Some(want) = q.closed {
+            tasks.retain(|t| matches!(t.status, TaskStatus::Done | TaskStatus::Dropped) == want);
         }
         // Servers that predate the `parent` filter ignore it. Trimming their list here would
         // miss children past its limit, so say so instead.

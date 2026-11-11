@@ -580,6 +580,9 @@ pub struct LsArgs {
     /// Only the direct children of this task.
     #[arg(long)]
     parent: Option<TaskId>,
+    /// Leave out the done and dropped tasks.
+    #[arg(long, conflicts_with = "status")]
+    open: bool,
     /// Only feedback items that still take reports, whatever their status: unresolved and
     /// not closed, declined, or routed to (or a duplicate of) work that is not closed.
     #[arg(long)]
@@ -1125,6 +1128,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 mine: a.mine.then_some(true),
                 parent: a.parent,
                 live: a.live.then_some(true),
+                closed: a.open.then_some(false),
                 q: a.search,
                 limit: a.limit,
             };
