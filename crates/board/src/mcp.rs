@@ -82,7 +82,8 @@ struct ToolSpec {
     params: fn() -> Vec<(&'static str, Value, bool)>,
 }
 
-/// Tasks `task_list` lists when the call names no `limit`.
+/// Tasks `task_list` lists when the call names no `limit`: about 3,000 characters of text
+/// at the usual line length, a size picked by measurement, not a bound on the text.
 const TASK_LIST_LIMIT: u32 = 25;
 
 /// A string parameter of at most `max` characters, the server's limit.
