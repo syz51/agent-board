@@ -16,7 +16,7 @@ use crate::error::{
 use crate::ops::feedback::{DUPLICATE_DEPTH_MAX, LIVE_ITEMS};
 use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
-    NamedParams, SEARCH_RANK, find_agent, get_board, get_task, handle_of, is_live,
+    NamedParams, SEARCH_RANK, SEARCH_RANK_ANY, find_agent, get_board, get_task, handle_of, is_live,
     load_tasks_found, load_tasks_up_to, seen,
 };
 use crate::text::{ago, check_line, check_text};
@@ -712,13 +712,22 @@ pub(crate) fn search_words(q: Option<&str>) -> Result<Vec<String>> {
 /// The FTS5 query of search words: each word is a phrase (its parts in a row, such as
 /// `mcp` and `rs` of `mcp.rs`) that may go on (`snap` finds `snapshot`), and the index
 /// stems both sides. Every word must match, or with `any` at least one.
+/// A task id is searched whole and in the id column too: `factory-12` does not find
+/// `factory-120`. Other words skip the id column, where a board's slug would match each
+/// of its tasks.
 /// A word without a letter or digit holds nothing the index stores: it is left out, and
 /// a search of such words alone is None, which finds nothing.
 fn search_query(words: &[String], any: bool) -> Option<String> {
     let terms: Vec<String> = words
         .iter()
         .filter(|w| w.chars().any(char::is_alphanumeric))
-        .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+        .map(|w| {
+            if w.parse::<TaskId>().is_ok() {
+                format!("\"{w}\"")
+            } else {
+                format!("{{title body notes}} : \"{}\"*", w.replace('"', "\"\""))
+            }
+        })
         .collect();
     (!terms.is_empty()).then(|| terms.join(if any { " OR " } else { " AND " }))
 }
@@ -842,8 +851,8 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     ) else {
         return Ok(Vec::new());
     };
-    let found = |query: &str, after: Option<&str>, limit: usize| {
-        found_page(cx, &clauses, &params, query, after, limit)
+    let found = |query: &str, rank: &str, after: Option<&str>, limit: usize| {
+        found_page(cx, &clauses, &params, query, rank, after, limit)
     };
     let not_listed = || {
         invalid(
@@ -855,16 +864,18 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
              filters",
         )
     };
-    let page = found(&every, after, filter.limit)?;
+    let page = found(&every, SEARCH_RANK, after, filter.limit)?;
     // One word: both searches are the same.
     if every == any || page.as_ref().is_some_and(|tasks| !tasks.is_empty()) {
         return page.ok_or_else(not_listed);
     }
     // An empty page after a cursor is the end of a list that has tasks with every word.
-    if after.is_some() && found(&every, None, 1)?.is_some_and(|tasks| !tasks.is_empty()) {
+    if after.is_some()
+        && found(&every, SEARCH_RANK, None, 1)?.is_some_and(|tasks| !tasks.is_empty())
+    {
         return page.ok_or_else(not_listed);
     }
-    let mut some = found(&any, after, filter.limit)?.ok_or_else(not_listed)?;
+    let mut some = found(&any, SEARCH_RANK_ANY, after, filter.limit)?.ok_or_else(not_listed)?;
     for task in &mut some {
         task.any_word = true;
     }
@@ -876,12 +887,13 @@ const AFTER_IN_LIST_ORDER: &str = "(t.priority, t.number, t.board) > \
      (SELECT c.priority, c.number, c.board FROM tasks c WHERE c.id = :after)";
 
 /// One page of a search with the FTS5 query `query`, after the task `after` when given.
-/// None when the search does not list that task: its place is its rank.
+/// None when the search does not list that task: its place is its rank by `rank_sql`.
 fn found_page(
     cx: &Ctx<'_>,
     clauses: &[&str],
     params: &NamedParams<'_>,
     query: &str,
+    rank_sql: &str,
     after: Option<&str>,
     limit: usize,
 ) -> Result<Option<Vec<Task>>> {
@@ -893,7 +905,7 @@ fn found_page(
             let rank = cx
                 .db
                 .prepare_cached(&format!(
-                    "SELECT {SEARCH_RANK} FROM task_search WHERE task_search MATCH ?1 \
+                    "SELECT {rank_sql} FROM task_search WHERE task_search MATCH ?1 \
                      AND rowid = (SELECT doc FROM task_search_docs WHERE task = ?2)"
                 ))?
                 .query_row(params![query, after], |r| r.get(0))
@@ -905,14 +917,13 @@ fn found_page(
         }
         None => None,
     };
-    let cursor =
-        format!("({SEARCH_RANK} > :rank OR ({SEARCH_RANK} = :rank AND {AFTER_IN_LIST_ORDER}))");
+    let cursor = format!("({rank_sql} > :rank OR ({rank_sql} = :rank AND {AFTER_IN_LIST_ORDER}))");
     if let (Some(rank), Some(after)) = (&rank, &after) {
         clauses.push(&cursor);
         params.push((":rank", rank));
         params.push((":after", after));
     }
-    load_tasks_found(cx, &clauses.join(" AND "), &params, limit).map(Some)
+    load_tasks_found(cx, rank_sql, &clauses.join(" AND "), &params, limit).map(Some)
 }
 
 /// The tasks the agent has in `doing`, other than `except`.

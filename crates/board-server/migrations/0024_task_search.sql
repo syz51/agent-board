@@ -30,7 +30,11 @@ CREATE TRIGGER task_search_task_insert AFTER INSERT ON tasks BEGIN
 END;
 
 CREATE TRIGGER task_search_task_update
-AFTER UPDATE OF title, body, acceptance, summary, blocked_reason ON tasks BEGIN
+AFTER UPDATE OF title, body, acceptance, summary, blocked_reason ON tasks
+WHEN old.title IS NOT new.title OR old.body IS NOT new.body
+    OR old.acceptance IS NOT new.acceptance OR old.summary IS NOT new.summary
+    OR old.blocked_reason IS NOT new.blocked_reason
+BEGIN
     UPDATE task_search
     SET title = new.title,
         body = concat_ws(char(10), new.body, new.acceptance, new.summary, new.blocked_reason)

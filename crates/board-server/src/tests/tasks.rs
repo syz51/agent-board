@@ -3123,6 +3123,54 @@ async fn q_lists_the_tasks_that_hold_every_word() {
 }
 
 #[tokio::test]
+async fn q_finds_an_id_whole_and_ranks_a_title_above_text_however_long_the_task() {
+    let t = setup().await;
+    let mut ids = Vec::new();
+    for n in 1..=12 {
+        ids.push(t.task(A, "factory", &format!("Item {n}")).await);
+    }
+    let (one, twelve) = (ids[0].clone(), ids[11].clone());
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{twelve}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": format!("follows {one}") })),
+    )
+    .await;
+    // An id is no prefix of another id: the task itself first, then the one that names it.
+    let found = t.ok("GET", &format!("/v1/tasks?q={one}"), None, None).await;
+    assert_eq!(listed(&found), vec![one.clone(), twelve.clone()], "{found}");
+    // A part of an id, such as the board's slug, does not find each task of the board.
+    // It finds only the task whose note names an id of that board.
+    let found = t.ok("GET", "/v1/tasks?q=factory", None, None).await;
+    assert_eq!(listed(&found), vec![twelve.clone()]);
+
+    // A long task with the word in its title stays above a short one with it in its body.
+    let long = t.task(A, "factory", "Lantern upkeep").await;
+    for n in 0..30 {
+        let text = format!(
+            "report {n}: {}",
+            "nothing of note happened on this run ".repeat(15)
+        );
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{long}/notes"),
+            Some(A),
+            Some(json!({ "agent": A, "kind": "note", "text": text })),
+        )
+        .await;
+    }
+    let short = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Short", "body": "lantern" }),
+        )
+        .await;
+    let found = t.ok("GET", "/v1/tasks?q=lantern", None, None).await;
+    assert_eq!(listed(&found), vec![long, short]);
+}
+
+#[tokio::test]
 async fn q_lists_the_best_match_first_with_the_text_found() {
     let t = setup().await;
     // Made in the reverse of their relevance, at one priority.

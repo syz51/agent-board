@@ -124,16 +124,27 @@ fn found_task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         let text: String = r.get(column)?;
         if text.contains(FOUND_START) {
             let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            task.snippet = Some(
-                line.chars()
-                    .take(SNIPPET_CHARS_MAX)
-                    .map(|c| match c {
-                        FOUND_START => '[',
-                        FOUND_END => ']',
-                        c => c,
-                    })
-                    .collect(),
-            );
+            let mut open = false;
+            let mut snippet: String = line
+                .chars()
+                .take(SNIPPET_CHARS_MAX)
+                .map(|c| match c {
+                    FOUND_START => {
+                        open = true;
+                        '['
+                    }
+                    FOUND_END => {
+                        open = false;
+                        ']'
+                    }
+                    c => c,
+                })
+                .collect();
+            // The cut fell inside a found word: close its mark.
+            if open {
+                snippet.push(']');
+            }
+            task.snippet = Some(snippet);
             break;
         }
     }
@@ -142,11 +153,19 @@ fn found_task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
 
 /// How well a task's search document matches: lower is better. A word in the id or title
 /// outweighs one in the task's own text, which outweighs one in its notes. Column weights
-/// within one `bm25` do not do that: a word's score levels off, so a short note would pass
-/// a long body. Each part is scored alone and the parts are scaled apart.
-pub(crate) const SEARCH_RANK: &str = "(25.0 * bm25(task_search, 2.0, 1.0, 0.0, 0.0) \
-     + 5.0 * bm25(task_search, 0.0, 0.0, 1.0, 0.0) \
-     + bm25(task_search, 0.0, 0.0, 0.0, 1.0))";
+/// within one `bm25` do not do that: a score levels off with the word count and falls with
+/// the document's length, so a short note would pass a long body. The place of the best
+/// column sets a step (a `bm25` of columns that hold no word is 0, of others below 0), far
+/// larger than any score, and the score orders the tasks of one step.
+pub(crate) const SEARCH_RANK: &str = "(CASE \
+     WHEN bm25(task_search, 1.0, 1.0, 0.0, 0.0) < 0 THEN -2000000.0 \
+     WHEN bm25(task_search, 0.0, 0.0, 1.0, 0.0) < 0 THEN -1000000.0 \
+     ELSE 0.0 END \
+     + bm25(task_search, 4.0, 4.0, 2.0, 1.0))";
+
+/// The rank among tasks that hold only some of the words: the words a task holds, rare
+/// ones above all, count before the column they are in, so there is no step.
+pub(crate) const SEARCH_RANK_ANY: &str = "bm25(task_search, 4.0, 4.0, 2.0, 1.0)";
 
 /// Loads tasks matching `filter` (SQL over alias `t`, may use `:now` and `:cutoff`), in
 /// list order: priority, then id number.
@@ -169,9 +188,10 @@ pub(crate) fn load_tasks_up_to(
 }
 
 /// The tasks matching `filter` whose search document matches the FTS5 query bound as
-/// `:match`, best match first and then in list order, each with its snippet.
+/// `:match`, best match by `rank` first and then in list order, each with its snippet.
 pub(crate) fn load_tasks_found(
     cx: &Ctx<'_>,
+    rank: &str,
     filter: &str,
     extra: &NamedParams<'_>,
     limit: usize,
@@ -184,7 +204,7 @@ pub(crate) fn load_tasks_found(
          JOIN task_search_docs d ON d.doc = task_search.rowid \
          JOIN tasks t ON t.id = d.task \
          WHERE task_search MATCH :match AND {filter} \
-         ORDER BY {SEARCH_RANK}, t.priority, t.number, t.board LIMIT :limit"
+         ORDER BY {rank}, t.priority, t.number, t.board LIMIT :limit"
     );
     query_tasks(cx, &sql, filter, extra, Some(limit), found_task_row)
 }

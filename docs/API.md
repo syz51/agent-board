@@ -361,7 +361,10 @@ Reopening a closed board, or any change on it, starts the period again.
   or title counts above one in the task's own text, which counts above one in its notes;
   equal matches keep the list's order. A word matches in any letter case, in its stemmed
   form (`deploy` finds `deployed`, and the reverse) and as the start of a longer word
-  (`snap` finds `snapshot`), not in the middle of one. The parts of a word, such as
+  (`snap` finds `snapshot`), not in the middle of one. Text without spaces between its
+  words, such as Chinese or Japanese, matches only from the start of a run. A task id
+  is searched whole: `factory-12` finds that task and the tasks that name it, not
+  `factory-120`; the parts of an id, such as a board's slug, match in the text only. The parts of a word, such as
   `mcp` and `rs` of `mcp.rs`, must stand in a row. Signs are no part of a word and query
   syntax is plain text; a `q` without a letter or digit finds nothing.
   Each `Task` of a search has `snippet` when a word is in its own text or notes: at most
