@@ -195,8 +195,11 @@ pub enum Command {
     Ls(LsArgs),
     /// Show a task with its evidence, every finding and decision note, and the latest plain
     /// notes (--detailed for all and the history).
+    /// With several ids, shows each task in a compact form in one call: state, evidence,
+    /// text, findings and decisions (at most 20; --detailed is for one task).
     Show {
-        id: TaskId,
+        #[arg(required = true)]
+        ids: Vec<TaskId>,
         #[arg(long)]
         detailed: bool,
     },
@@ -598,6 +601,13 @@ pub struct LsArgs {
     /// Use it instead of listing a whole board as JSON to filter it.
     #[arg(long, visible_alias = "grep")]
     search: Option<String>,
+    /// Only tasks changed after this point: an event sequence number (the snapshot's
+    /// `seq`), an RFC 3339 time, a date, or a duration back from now (`30m`, `12h`, `2d`).
+    #[arg(long)]
+    since: Option<String>,
+    /// Continue a cut list: only the tasks that follow this one in list order.
+    #[arg(long)]
+    after: Option<TaskId>,
     /// How many tasks to list at most (default 200, at most 1000).
     #[arg(long)]
     limit: Option<u32>,
@@ -1136,6 +1146,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 live: a.live.then_some(true),
                 closed: a.open.then_some(false),
                 q: a.search,
+                since: a
+                    .since
+                    .map(|s| ops::list_since(&s, chrono::Utc::now()))
+                    .transpose()?,
+                after: a.after,
                 limit: a.limit,
             };
             if a.fields.is_some() && !json {
@@ -1147,7 +1162,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             ops::task_list(&ctx, &query, a.detailed, a.fields.as_deref()).await?
         }
-        Command::Show { id, detailed } => ops::task_show(&ctx()?, &id, detailed).await?,
+        Command::Show { ids, detailed } => ops::tasks_show(&ctx()?, &ids, detailed).await?,
         Command::Add(a) => {
             let new = ops::NewTask {
                 board: a.board,

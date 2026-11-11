@@ -1008,3 +1008,62 @@ fn task_list_defaults_to_this_repos_board_and_open_work() {
     assert_eq!(both["isError"], true, "{both}");
     assert!(text(&both).contains("send one of them"), "{both}");
 }
+
+#[test]
+fn task_show_takes_more_ids_and_task_list_takes_since_and_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let detail = |id: &str| {
+        json!({
+            "task": task_fixture(id, "Do it"),
+            "notes": [], "evidence": [], "blocks": [], "children": [], "history": [],
+        })
+    };
+    stub.on("GET /v1/tasks/factory-12", detail("factory-12"));
+    stub.on("GET /v1/tasks/factory-13", detail("factory-13"));
+    stub.on("GET /v1/tasks", [task_fixture("factory-14", "Later")]);
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let shown = mcp.call(
+        2,
+        "task_show",
+        json!({"id": "factory-12", "ids": ["factory-13"]}),
+    );
+    assert_ne!(shown["isError"], true, "{shown}");
+    let shown = text(&shown);
+    assert!(shown.starts_with("factory-12 open"), "{shown}");
+    assert!(shown.contains("\nfactory-13 open"), "{shown}");
+    // detailed is for one task.
+    let refused = mcp.call(
+        3,
+        "task_show",
+        json!({"id": "factory-12", "ids": ["factory-13"], "detailed": true}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+
+    let listed = mcp.call(
+        4,
+        "task_list",
+        json!({"since": "33400", "after": "factory-13"}),
+    );
+    assert_ne!(listed["isError"], true, "{listed}");
+    let q = stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    assert_eq!(
+        (q["since"].as_str(), q["after"].as_str()),
+        ("33400", "factory-13")
+    );
+}

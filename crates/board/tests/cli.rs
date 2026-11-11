@@ -3040,6 +3040,170 @@ fn ls_without_a_board_names_the_boards_and_open_leaves_closed_tasks_out() {
     );
 }
 
+#[test]
+fn ls_sends_since_and_after_and_the_cut_notice_names_the_cursor() {
+    let e = env();
+    let listed = [
+        task_fixture("factory-12", "First"),
+        task_fixture("factory-13", "Second"),
+    ];
+    e.stub.on("GET /v1/tasks", &listed);
+
+    // An event sequence number goes as it is; a cut list names the task to continue after.
+    let out = e.run(&[
+        "ls",
+        "--since",
+        "33400",
+        "--after",
+        "factory-11",
+        "--limit",
+        "1",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let q = e.stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    assert_eq!(
+        (q["since"].as_str(), q["after"].as_str()),
+        ("33400", "factory-11")
+    );
+    assert!(
+        stdout(&out)
+            .contains("listed the next 1; more match: list the next with after factory-12,"),
+        "{}",
+        stdout(&out)
+    );
+
+    // A duration back from now, a date and a time go as an RFC 3339 time.
+    for since in ["2h", "2026-11-07", "2026-11-07T10:00:00+09:00"] {
+        let out = e.run(&["ls", "--since", since]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let requests = e.stub.requests_to("GET /v1/tasks");
+        let sent = requests.last().unwrap().query_pairs()["since"].replace("%3A", ":");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&sent).is_ok(),
+            "{since} went as {sent}"
+        );
+    }
+    let out = e.run(&["ls", "--since", "last week"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).ends_with("or send an event sequence number, such as the snapshot's seq\n"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A server that predates `after` lists from the start, cursor included: refused.
+    let out = e.run(&["ls", "--after", "factory-12"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("does not continue a list after a task yet"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn show_reads_several_tasks_in_one_call_in_a_compact_form() {
+    let e = env();
+    e.stub.on(
+        "GET /v1/tasks/factory-12",
+        noted_detail(&[
+            ("decision", "use the list call", 1),
+            ("note", "plain one", 2),
+            ("note", "plain two", 3),
+        ]),
+    );
+    let mut other: Value = noted_detail(&[]);
+    other["task"] = serde_json::to_value({
+        let mut task = task_fixture("factory-13", "Other");
+        task.body = "The other body".into();
+        task
+    })
+    .unwrap();
+    e.stub.on("GET /v1/tasks/factory-13", other);
+    e.stub.on_error(
+        "GET /v1/tasks/factory-99",
+        404,
+        "not_found",
+        "factory-99 does not exist",
+        "list tasks with task_list",
+    );
+
+    let out = e.run(&[
+        "show",
+        "factory-13",
+        "factory-12",
+        "factory-99",
+        "factory-13",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    // In the order asked for, each once; a task that cannot be read is named.
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    assert!(at("factory-13 open") < at("factory-12 open"), "{text}");
+    assert!(
+        at("factory-12 open") < at("factory-99 not shown: "),
+        "{text}"
+    );
+    assert_eq!(text.matches("factory-13 open").count(), 1, "{text}");
+    assert!(text.contains("does not exist"), "{text}");
+    // One header for the peer text of all; lines name their task; decisions are shown and
+    // plain notes are counted.
+    assert_eq!(text.matches("written by other agents").count(), 1, "{text}");
+    assert!(text.contains("\"task\":\"factory-13\""), "{text}");
+    assert!(text.contains("The other body"), "{text}");
+    assert!(text.contains("use the list call"), "{text}");
+    assert!(!text.contains("plain one"), "{text}");
+    assert!(
+        text.contains("\n2 plain notes not shown: task_show factory-12"),
+        "{text}"
+    );
+    // JSON holds the details that were read and names the tasks that were not.
+    let out = e.run(&["show", "factory-13", "factory-99", "factory-12", "--json"]);
+    let shown: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let details: Vec<TaskDetail> = serde_json::from_value(shown["tasks"].clone()).unwrap();
+    assert_eq!(details.len(), 2);
+    assert_eq!(shown["not_shown"][0]["id"], "factory-99");
+    assert!(
+        shown["not_shown"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist"),
+        "{shown}"
+    );
+    // An id named twice is one task, in the full form.
+    let out = e.run(&["show", "factory-12", "factory-12"]);
+    assert!(stdout(&out).contains("plain one"), "{}", stdout(&out));
+
+    // One task keeps the full form, without the task key in its own lines.
+    let out = e.run(&["show", "factory-12"]);
+    let text = stdout(&out);
+    assert!(text.contains("plain one"), "{text}");
+    assert!(!text.contains("\"task\":"), "{text}");
+    // --detailed is for one task, more than 20 is refused, and nothing readable fails.
+    let out = e.run(&["show", "factory-12", "factory-13", "--detailed"]);
+    assert!(!out.status.success());
+    let many: Vec<String> = (1..=21).map(|n| format!("factory-{n}")).collect();
+    let mut args = vec!["show"];
+    args.extend(many.iter().map(String::as_str));
+    let out = e.run(&args);
+    assert!(stderr(&out).contains("at most 20"), "{}", stderr(&out));
+    // The limit counts each task once.
+    args.truncate(21);
+    args.push("factory-1");
+    let out = e.run(&args);
+    assert!(!stderr(&out).contains("at most 20"), "{}", stderr(&out));
+    let out = e.run(&["show", "factory-99", "factory-98"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("none of the tasks could be read"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// `board status` and `board asks` are bounded by default; `--detailed` and `--limit` give
 /// the rest.
 #[test]

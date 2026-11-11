@@ -605,6 +605,8 @@ struct TasksQuery {
     live: Option<bool>,
     closed: Option<bool>,
     q: Option<String>,
+    since: Option<String>,
+    after: Option<TaskId>,
     limit: Option<usize>,
 }
 
@@ -635,6 +637,8 @@ async fn list_tasks(
         live: q.live,
         closed: q.closed,
         words: tasks::search_words(q.q.as_deref())?,
+        since: tasks::parse_since(q.since.as_deref())?,
+        after: q.after,
         limit: q
             .limit
             .unwrap_or(board_proto::TASKS_LIMIT_DEFAULT as usize)
