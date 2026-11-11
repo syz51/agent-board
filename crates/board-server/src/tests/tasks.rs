@@ -1061,6 +1061,13 @@ async fn done_take(t: &T, agent: &str, task: &str, evidence: Value) -> (u16, Val
 async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limit() {
     let t = setup_with(|c| c.defaults.max_doing_per_agent = 1).await;
     let reviewed = task_in(&t, TaskStatus::Review).await;
+    let parked = task_in(&t, TaskStatus::Blocked).await;
+    let closed = task_in(&t, TaskStatus::Done).await;
+    // A task that B created, so B stands in for its owner once the owner's session ends.
+    let created = t.task(B, "factory", "Created by the closer").await;
+    assert!(t.claim(A, &created).await.0.is_success());
+    let (s, v) = t.patch(A, &created, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
     let working = task_in(&t, TaskStatus::Doing).await;
     let pr = json!([{ "kind": "pr", "value": "https://example.com/pull/1" }]);
 
@@ -1072,6 +1079,7 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
         "{v}"
     );
 
+    end_session(&t, A).await;
     t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), Some("main")).await;
     let umbrella = t.task(B, "factory", "Umbrella").await;
@@ -1081,6 +1089,12 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
     let (s, v) = take(&t, B, &reviewed).await;
     assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
     assert!(v["message"].as_str().unwrap().contains(&umbrella), "{v}");
+    // The refusal names the one-step close, for a task in review only.
+    let one_step = format!("task_done {reviewed} take=true");
+    assert!(v["next"].as_str().unwrap().contains(&one_step), "{v}");
+    let (s, v) = take(&t, B, &working).await;
+    assert_eq!(s, 409, "{v}");
+    assert!(!v["next"].as_str().unwrap().contains("take=true"), "{v}");
 
     // Without take, done is the owner's; with it, the closer shows the work landed.
     let (s, v) = t.done(B, &reviewed, pr.clone()).await;
@@ -1089,13 +1103,16 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
         (403, Some("forbidden")),
         "{v}"
     );
+    assert!(v["next"].as_str().unwrap().contains(&one_step), "{v}");
     let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
-    let (s, v) = done_take(&t, B, &reviewed, commit).await;
-    assert_eq!(
-        (s, v["code"].as_str()),
-        (400, Some("evidence_required")),
-        "{v}"
-    );
+    for evidence in [commit.clone(), check(1)] {
+        let (s, v) = done_take(&t, B, &reviewed, evidence).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (400, Some("evidence_required")),
+            "{v}"
+        );
+    }
     assert_eq!(t.get_task(&reviewed).await["status"], "review");
 
     // Only a task in review closes this way: one in progress is taken first.
@@ -1107,6 +1124,31 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
     );
     assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
     assert_eq!(t.get_task(&working).await["owner"], A);
+    for (task, status) in [(&parked, "blocked"), (&closed, "done")] {
+        let (s, v) = done_take(&t, B, task, pr.clone()).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (400, Some("invalid_transition")),
+            "{v}"
+        );
+        let now = t.get_task(task).await;
+        assert_eq!(
+            (now["status"].as_str(), now["owner"].as_str()),
+            (Some(status), Some(A))
+        );
+    }
+
+    // A stand-in closes the task as its owner may, stale or not: no take is logged, the
+    // owner stays, and any evidence does.
+    let (s, v) = done_take(&t, B, &created, commit).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(A)),
+        "{v}"
+    );
+    let events = events_of(&t, &created).await;
+    assert!(events.iter().all(|(k, _)| k != "task_taken"), "{events:?}");
 
     // One call closes it, with the closer as owner, while its own task stays in doing.
     let (s, v) = done_take(&t, B, &reviewed, pr.clone()).await;

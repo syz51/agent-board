@@ -64,6 +64,7 @@ pub const CORE_TOOLS: &[&str] = &[
 ];
 
 /// Arguments every tool accepts.
+// On every tool, so each word here counts many times against the tool list's size limit.
 const AGENT_ARG: &str = "Agent id to act as. Default: yourself.";
 const DETAILED_ARG: &str = "Include full text and history.";
 

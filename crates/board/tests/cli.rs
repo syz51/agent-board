@@ -363,6 +363,20 @@ fn done_reads_the_version_and_sends_paired_evidence() {
         ]})
     );
 
+    // --take reaches the request; without it the field is left out, as above.
+    let out = e.run(&[
+        "done",
+        "factory-12",
+        "--take",
+        "--pr",
+        "https://example.com/pull/4",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-12/done")[1].body["take"],
+        true
+    );
+
     e.stub.clear();
     let out = e.run(&["done", "factory-12", "--check", "cargo test"]);
     assert_eq!(out.status.code(), Some(1));

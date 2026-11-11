@@ -417,6 +417,17 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let sent = &stub.requests_to("POST /v1/tasks/factory-12/done")[0].body;
     assert_eq!(sent["summary"], "Parser fixed; PR #4 is open.");
     assert_eq!(sent["evidence"][0]["value"], "4e1c2ab");
+    assert!(sent.get("take").is_none(), "{sent}");
+    let done = mcp.call(
+        10,
+        "task_done",
+        json!({"id": "factory-12", "prs": ["https://example.com/pull/4"], "take": true}),
+    );
+    assert_ne!(done["isError"], true, "{done}");
+    assert_eq!(
+        stub.requests_to("POST /v1/tasks/factory-12/done")[1].body["take"],
+        true
+    );
 
     // task_list proposals=true asks for proposals, and keeps only them from a server that
     // predates the filter.

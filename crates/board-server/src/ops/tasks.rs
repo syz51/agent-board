@@ -1241,7 +1241,18 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
         check_not_before(cx, &task)?;
     }
     if status == TaskStatus::Doing {
-        check_doing_limit(cx, agent, id)?;
+        // A stale owner's review task whose work is finished needs no take, and no room.
+        check_doing_limit(cx, agent, id).map_err(|e| match e {
+            Error::Api(mut e) if task.status == TaskStatus::Review && task.owner_stale => {
+                e.next = Some(format!(
+                    "{}; or, if its work is finished, close it without taking it: {}",
+                    e.next.unwrap_or_default(),
+                    done_take_hint(id)
+                ));
+                Error::Api(e)
+            }
+            e => e,
+        })?;
     }
     let now = cx.now_ms();
     cx.db.execute(
@@ -1341,7 +1352,12 @@ fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Re
                 "only the owner {owner} may {action} {} while its session runs",
                 task.id
             ),
-            if task.owner_stale {
+            if task.owner_stale && action == "complete" && task.status == TaskStatus::Review {
+                format!(
+                    "the owner is stale: close it in one step with {}",
+                    done_take_hint(&task.id)
+                )
+            } else if task.owner_stale {
                 format!(
                     "the owner is stale: take it first with {}",
                     take_hint(&task.id)
@@ -1507,6 +1523,11 @@ fn unaccepted_proposal(id: &TaskId) -> Error {
 /// How to take a stale owner's task, through MCP or the CLI.
 fn take_hint(id: &TaskId) -> String {
     format!("task_claim {id} take=true, or board take {id}")
+}
+
+/// How to close a stale owner's review task in one step, through MCP or the CLI.
+fn done_take_hint(id: &TaskId) -> String {
+    format!("task_done {id} take=true and a pr or a passed check, or board done {id} --take")
 }
 
 /// How to move a parked task back to doing.
@@ -1870,10 +1891,11 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
     let Some(owner) = task.owner.as_ref().filter(|o| *o != agent) else {
         return Ok(None);
     };
+    // A stand-in closes the task as its owner may, whether or not the owner is stale too.
+    if acts_for_ended_owner(cx, task, agent)? {
+        return Ok(None);
+    }
     if !task.owner_stale {
-        if acts_for_ended_owner(cx, task, agent)? {
-            return Ok(None);
-        }
         let hours = cx.s.owner_stale_after_secs / 3600;
         return Err(refused(
             format!(
@@ -1917,16 +1939,16 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     };
     if taken_from.is_none() {
         require_owner(cx, &task, &req.agent, "complete")?;
-    } else if !req
-        .evidence
-        .iter()
-        .any(|e| matches!(e.kind, EvidenceKind::Check | EvidenceKind::Pr))
-    {
+    } else if !req.evidence.iter().any(|e| match e.kind {
+        EvidenceKind::Pr => true,
+        EvidenceKind::Check => e.exit_code == Some(0),
+        _ => false,
+    }) {
         // The closer did not do the work, so it shows that the work landed.
         return Err(Error::api(
             ErrorCode::EvidenceRequired,
-            format!("closing {id} for its stale owner needs a pr or a check as evidence"),
-            "send the merged pull request, or a check you ran with its exit_code",
+            format!("closing {id} for its stale owner needs a pr or a passed check as evidence"),
+            "send the merged pull request, or a check you ran that exited with 0",
         ));
     }
     // The owner closes its blocked task directly: the wait often ends off the board, and
@@ -2001,6 +2023,11 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
             serde_json::json!({ "from": from, "status": task.status }),
         )?;
     }
+    let new_owner = if taken_from.is_some() {
+        Some(&req.agent)
+    } else {
+        task.owner.as_ref()
+    };
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
          owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
@@ -2008,10 +2035,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
             id.as_str(),
             now,
             req.summary,
-            taken_from
-                .as_ref()
-                .map_or(task.owner.as_ref(), |_| Some(&req.agent))
-                .map(AgentId::as_str)
+            new_owner.map(AgentId::as_str)
         ],
     )?;
     crate::ops::leases::release_for_task(cx, id, &task.board, req.agent.as_str())?;
