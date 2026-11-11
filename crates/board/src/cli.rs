@@ -187,7 +187,7 @@ pub enum Command {
     Status {
         #[arg(long)]
         board: Option<BoardSlug>,
-        /// Also the goal, and every agent of the last 7 days instead of the 20 seen last.
+        /// Also the goal, and every ended agent of the last 7 days instead of the ones seen last.
         #[arg(long)]
         detailed: bool,
     },
@@ -275,9 +275,10 @@ pub enum Command {
         status: String,
         #[arg(long)]
         board: Option<BoardSlug>,
-        /// The most asks to list.
-        #[arg(long, default_value_t = ops::ASKS_LIMIT_DEFAULT, value_parser = clap::value_parser!(u32).range(1..).map(|n| n as usize))]
-        limit: usize,
+        /// The most asks to list, the newest. Default: every open ask, or 50 of another
+        /// status; --json then holds the same cut list.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..).map(|n| n as usize))]
+        limit: Option<usize>,
     },
     /// Withdraw an open ask you made, such as a duplicate or one you no longer need.
     Withdraw { id: i64 },

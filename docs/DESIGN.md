@@ -285,7 +285,7 @@ other agents says so itself, once: the snapshot's first line, a delta that quote
 the header of peer text in a tool result. And the `ask_user` description names the reasons
 for an ask, where the agent reads them as it asks. The instructions ask for `board_snapshot`
 only when the context holds no board state, since `SessionStart` injects the snapshot at
-start-up and after compaction. Tests pin the sizes: the instructions under 1,400
+start-up and after compaction. Tests pin the sizes: the instructions under 1,440
 characters, the tool list under 15,800.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same

@@ -351,13 +351,16 @@ pub async fn snapshot(
     Ok(Output::new(text, &snap))
 }
 
-/// Agents `board status` lists unless `detailed`: the ones seen last.
+/// Agents `board status` lists unless `detailed`: every live one, then the ended ones seen
+/// last, up to this many together.
 pub const STATUS_AGENTS: usize = 20;
-/// Asks `board asks` lists when the call names no limit: the newest.
+/// Asks `board asks` lists when the call names no limit and the asks are not the open ones:
+/// the newest.
 pub const ASKS_LIMIT_DEFAULT: usize = 50;
 
-/// Without `detailed`, lists at most [`STATUS_AGENTS`] agents, the ones seen last, and says
-/// how many it left out: a board keeps every agent of the last 7 days.
+/// Without `detailed`, leaves out the ended agents past [`STATUS_AGENTS`] agents, the ones
+/// seen longest ago, and says how many: a board keeps every agent of the last 7 days, most
+/// of them ended child threads. An agent that is not ended may own work, so it always shows.
 pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Result<Output> {
     let mut lines = Vec::new();
     let me = match ctx.client.agent() {
@@ -378,22 +381,39 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
         Some(slug) => {
             let b = ctx.client.board(&slug).await?;
             let mut agents = ctx.client.agents(Some(&slug)).await?;
-            let more = agents.len().saturating_sub(STATUS_AGENTS);
-            if !detailed && more > 0 {
-                let mut seen: Vec<Timestamp> = agents.iter().map(|a| a.last_seen).collect();
-                seen.sort_unstable_by(|a, b| b.cmp(a));
-                let oldest_kept = seen[STATUS_AGENTS - 1];
-                // The server's order (by handle) stays; ties at the cut go by that order.
-                agents.retain(|a| a.last_seen >= oldest_kept);
-                agents.truncate(STATUS_AGENTS);
+            let mut more = 0;
+            if !detailed {
+                let mut ended: Vec<Timestamp> = agents
+                    .iter()
+                    .filter(|a| a.state == AgentState::Ended)
+                    .map(|a| a.last_seen)
+                    .collect();
+                let keep = STATUS_AGENTS.saturating_sub(agents.len() - ended.len());
+                more = ended.len().saturating_sub(keep);
+                if more > 0 {
+                    ended.sort_unstable_by(|a, b| b.cmp(a));
+                    // The server's order (by handle) stays; ties at the cut go by that order.
+                    let oldest_kept = keep.checked_sub(1).map(|i| ended[i]);
+                    let mut left = keep;
+                    agents.retain(|a| {
+                        if a.state != AgentState::Ended {
+                            return true;
+                        }
+                        let kept = left > 0 && oldest_kept.is_some_and(|at| a.last_seen >= at);
+                        left -= usize::from(kept);
+                        kept
+                    });
+                }
             }
             lines.push(render::board_detail(&b, &agents, detailed));
-            if !detailed && more > 0 {
+            let mut json = json!({"board": b, "agents": agents});
+            if more > 0 {
                 lines.push(format!(
-                    "listed the {STATUS_AGENTS} agents seen last; {more} more were seen before them: detailed lists every one"
+                    "left out {more} ended agents, seen before the ones listed: detailed lists every one"
                 ));
+                json["agents_left_out"] = json!(more);
             }
-            json!({"board": b, "agents": agents})
+            json
         }
         None => {
             let boards = ctx.client.boards().await?;
@@ -929,15 +949,20 @@ pub async fn asks(
     ctx: &Ctx,
     status: Option<&str>,
     board: Option<&BoardSlug>,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<Output> {
     let mut asks = ctx.client.asks(status, board).await?;
     // Newest last, whatever order the server sends.
     asks.sort_by_key(|a| a.id);
-    let more = asks.len().saturating_sub(limit);
+    // Every open ask waits on the user, the oldest the longest, so none is left out unless
+    // the caller asks. The answered and withdrawn ones grow without end.
+    let limit = limit.or((status != Some("open")).then_some(ASKS_LIMIT_DEFAULT));
+    let more = limit.map_or(0, |limit| asks.len().saturating_sub(limit));
     asks.drain(..more);
     let mut text = render::ask_list(&asks);
-    if more > 0 {
+    if let Some(limit) = limit
+        && more > 0
+    {
         text.push_str(&format!(
             "\nlisted the newest {limit}; {more} older match: narrow it with --status or --board, or raise --limit"
         ));

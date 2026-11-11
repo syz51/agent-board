@@ -2983,9 +2983,14 @@ fn status_and_asks_list_a_bounded_number_by_default() {
         .on("GET /v1/boards/factory", board_fixture("factory", &[]));
     let agents: Vec<board_proto::Agent> = (0..25)
         .map(|i| {
-            let mut agent =
-                agent_fixture(&format!("t3:a{i:02}"), "air", board_proto::AgentState::Idle);
-            // The higher the number, the longer ago it was seen.
+            // The higher the number, the longer ago it was seen. The two seen longest ago
+            // are not ended: one may own a task, so both stay.
+            let state = if i < 23 {
+                board_proto::AgentState::Ended
+            } else {
+                board_proto::AgentState::Idle
+            };
+            let mut agent = agent_fixture(&format!("t3:a{i:02}"), "air", state);
             agent.last_seen = at() - chrono::TimeDelta::minutes(i);
             agent
         })
@@ -2993,23 +2998,38 @@ fn status_and_asks_list_a_bounded_number_by_default() {
     e.stub.on("GET /v1/agents", &agents);
     let text = stdout(&e.run(&["status", "--board", "factory"]));
     assert!(
-        text.contains("t3:a19") && !text.contains("t3:a20"),
+        text.contains("t3:a17")
+            && !text.contains("t3:a18")
+            && !text.contains("t3:a22")
+            && text.contains("t3:a23")
+            && text.contains("t3:a24"),
         "{text}"
     );
     assert!(
         text.ends_with(
-            "listed the 20 agents seen last; 5 more were seen before them: detailed lists every one\n"
+            "left out 5 ended agents, seen before the ones listed: detailed lists every one\n"
         ),
         "{text}"
     );
     let json: Value =
         serde_json::from_str(&stdout(&e.run(&["status", "--board", "factory", "--json"]))).unwrap();
     assert_eq!(json["agents"].as_array().unwrap().len(), 20);
+    assert_eq!(json["agents_left_out"], 5);
     let text = stdout(&e.run(&["status", "--board", "factory", "--detailed"]));
     assert!(
-        text.contains("t3:a24") && !text.contains("listed the"),
+        text.contains("t3:a22") && !text.contains("left out"),
         "{text}"
     );
+    let json: Value = serde_json::from_str(&stdout(&e.run(&[
+        "status",
+        "--board",
+        "factory",
+        "--detailed",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(json["agents"].as_array().unwrap().len(), 25);
+    assert!(json.get("agents_left_out").is_none());
 
     let asks: Vec<Ask> = (1..=60)
         .rev()
@@ -3048,6 +3068,14 @@ fn status_and_asks_list_a_bounded_number_by_default() {
         text.starts_with("ask #1 ") && !text.contains("listed the newest"),
         "{text}"
     );
+    // Every open ask waits on the user, so the default leaves none out.
+    let text = stdout(&e.run(&["asks"]));
+    assert!(
+        text.starts_with("ask #1 ") && !text.contains("listed the newest"),
+        "{text}"
+    );
+    let text = stdout(&e.run(&["asks", "--limit", "5"]));
+    assert!(text.starts_with("ask #56 "), "{text}");
     let out = e.run(&["asks", "--limit", "0"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
 }
