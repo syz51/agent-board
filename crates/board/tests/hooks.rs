@@ -17,7 +17,7 @@ const CLAUDE_AGENT: &str = "claude:00893aaf-19fa-41d2-8238-13269b9b3ca0";
 const SNAPSHOT: &str =
     "<board agent=\"claude:0089\" board=\"factory\" seq=\"812\">\nyou: claude:0089\n</board>";
 /// What Claude's `SessionStart` adds after the snapshot: Claude Code defers MCP tool schemas.
-const TOOL_SEARCH: &str = "If the board tools show by name only, load them in one call before the first board call: ToolSearch query \"select:mcp__board__board_snapshot,mcp__board__task_claim,mcp__board__task_add,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_update,mcp__board__task_done,mcp__board__task_show,mcp__board__lease_paths,mcp__board__feedback,mcp__board__ask_user\" max_results 11";
+const TOOL_SEARCH: &str = "If the board tools show by name only, load these with your first board work, and any other the same way (mcp__board__<tool>) when you need it: ToolSearch query \"select:mcp__board__board_snapshot,mcp__board__task_claim,mcp__board__task_show,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_done\" max_results 6";
 
 /// Claude's `SessionStart` context for [`SNAPSHOT`].
 fn started() -> String {
@@ -179,7 +179,7 @@ fn codex_session_start_injects_the_snapshot_without_tool_search() {
     assert_eq!(
         context(&reply, "SessionStart"),
         SNAPSHOT,
-        "Codex has no ToolSearch; the MCP instructions name the tools"
+        "Codex has no ToolSearch and loads every tool schema itself"
     );
 }
 
@@ -247,7 +247,7 @@ fn session_start_without_a_board_hints_only_when_the_repo_has_one() {
         load,
         TOOL_SEARCH
             .replace("select:", "select:mcp__board__board_join,")
-            .replace("max_results 11", "max_results 12"),
+            .replace("max_results 6", "max_results 7"),
         "board_join is loaded first"
     );
 }
@@ -1925,6 +1925,10 @@ fn pre_compact_keeps_the_agent_and_task_ids() {
     assert!(
         serde_json::from_str::<Value>(&text).is_err(),
         "plain stdout becomes compaction instructions"
+    );
+    assert!(
+        !text.contains("board_snapshot"),
+        "SessionStart(compact) injects the snapshot: {text}"
     );
 
     let codex = json!({"session_id": "thr_1", "cwd": e.repo, "hook_event_name": "PreCompact", "trigger": "auto"});

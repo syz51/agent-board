@@ -1398,8 +1398,9 @@ impl Hook<'_> {
     }
 
     /// Ends `SessionStart` board context with the `ToolSearch` call that loads `first` and
-    /// the board tools most calls need. Claude Code may show MCP tools by name only, so an
-    /// agent that calls one before loading it guesses its arguments and fails once.
+    /// the board tools a session calls first, and says how to load any other. Claude Code
+    /// may show MCP tools by name only, so an agent that calls one before loading it guesses
+    /// its arguments and fails once. This is the one place that names the tools to load.
     fn with_tool_search(&self, context: String, first: &[&str]) -> String {
         match self.runtime {
             Runtime::Claude => {
@@ -1409,12 +1410,13 @@ impl Hook<'_> {
                     .map(|tool| format!("mcp__{}__{tool}", mcp::SERVER_NAME))
                     .collect();
                 format!(
-                    "{context}\nIf the board tools show by name only, load them in one call before the first board call: ToolSearch query \"select:{}\" max_results {}",
+                    "{context}\nIf the board tools show by name only, load these with your first board work, and any other the same way (mcp__{}__<tool>) when you need it: ToolSearch query \"select:{}\" max_results {}",
+                    mcp::SERVER_NAME,
                     tools.join(","),
                     tools.len()
                 )
             }
-            // Neither has `ToolSearch`; the MCP server's instructions name the tools.
+            // Neither has `ToolSearch`: both load every tool schema themselves.
             Runtime::Codex | Runtime::Opencode => context,
         }
     }
@@ -1894,7 +1896,7 @@ impl Hook<'_> {
             None => String::new(),
         };
         Reply::Plain(format!(
-            "Keep in the summary, verbatim: the board agent id {}{task}. After compaction, call board_snapshot before continuing.",
+            "Keep in the summary, verbatim: the board agent id {}{task}.",
             self.agent
         ))
     }
