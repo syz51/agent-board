@@ -6540,6 +6540,7 @@ async fn the_daemon_reads_the_usage_endpoint_at_most_every_five_minutes_and_repo
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds.clone()),
+        snapshot: None,
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -6614,6 +6615,7 @@ async fn an_empty_usage_answer_is_not_reported_and_a_failed_report_keeps_the_loc
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
+        snapshot: None,
     };
     e.stub
         .on("GET /v1/usage", usage_reading(95.0, at()))
@@ -7710,6 +7712,7 @@ async fn the_daemon_reads_the_usage_every_minute_near_a_pace_line_until_refused(
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
+        snapshot: None,
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -7803,6 +7806,7 @@ async fn a_failed_usage_report_keeps_the_last_pace() {
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
+        snapshot: None,
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -7816,6 +7820,214 @@ async fn a_failed_usage_report_keeps_the_last_pace() {
     assert!(e.daemon.state.usage_held.contains(&factory()), "still held");
     e.daemon.flush(later).await;
     assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+}
+
+/// A usage source that reads the stub's endpoint with a valid sign-in, and T3 Code's
+/// snapshot at the path returned (not written yet).
+fn usage_source_with_snapshot(e: &mut Env, url: String) -> std::path::PathBuf {
+    use board::usage::{Credentials, UsageSource};
+
+    let creds = e._dir.path().join("credentials.json");
+    std::fs::write(
+        &creds,
+        json!({ "claudeAiOauth": {
+            "accessToken": "tok-123",
+            "expiresAt": (at() + chrono::Duration::hours(8)).timestamp_millis(),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let snapshot = e._dir.path().join("claudeAgent.json");
+    e.daemon.usage_source = UsageSource::ClaudeCode {
+        url,
+        credentials: Credentials::File(creds),
+        snapshot: Some(snapshot.clone()),
+    };
+    snapshot
+}
+
+/// Writes T3 Code's snapshot: the weekly window at `week` percent, read at `checked`.
+fn write_snapshot(path: &std::path::Path, week: f64, resets: Timestamp, checked: Timestamp) {
+    let file = json!({
+        "auth": { "email": "user@example.com" },
+        "usageLimits": { "checkedAt": checked, "windows": [
+            { "id": "five_hour", "kind": "session", "usedPercent": 20 },
+            { "id": "seven_day", "kind": "weekly", "usedPercent": week, "resetsAt": resets },
+        ]},
+    });
+    std::fs::write(path, file.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn a_new_t3_snapshot_is_reported_and_stands_in_for_the_endpoint() {
+    use board::daemon::{USAGE_CHECK_EVERY, USAGE_POLL_EVERY};
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let url = format!("{}/api/oauth/usage", e.stub.url);
+    let snapshot = usage_source_with_snapshot(&mut e, url);
+    let minutes = chrono::Duration::minutes;
+    let resets = at() + chrono::Duration::days(2);
+    let reads = |e: &Env| e.stub.requests_to("GET /api/oauth/usage").len();
+    let reports = |e: &Env| e.stub.requests_to("PUT /v1/usage");
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 50.0, "resets_at": resets } }),
+    );
+
+    // No file yet: the endpoint, as before.
+    e.stub.on("PUT /v1/usage", usage_reading(50.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 1));
+
+    // T3 Code takes a reading: it is reported at the next reconcile, with no endpoint call.
+    let t = at() + minutes(1);
+    write_snapshot(&snapshot, 51.0, resets, t);
+    e.stub.on("PUT /v1/usage", usage_reading(51.0, t));
+    e.daemon.reconcile(t).await.unwrap();
+    assert_eq!(reads(&e), 1);
+    assert_eq!(
+        reports(&e)[1].body,
+        json!({
+            "five_hour": { "percent": 20.0 },
+            "seven_day": { "percent": 51.0, "resets_at": resets },
+            "read_at": t,
+        })
+    );
+    assert!(
+        !reports(&e)[1].body.to_string().contains("example.com"),
+        "only the usage leaves the file"
+    );
+
+    // The same reading is reported once, and still stands in when the endpoint is due.
+    e.daemon.reconcile(at() + USAGE_POLL_EVERY).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 2));
+
+    // T3 Code stopped: its reading is too old, so the endpoint is read again.
+    let stopped = at() + minutes(8);
+    e.stub.on("PUT /v1/usage", usage_reading(52.0, stopped));
+    e.daemon.reconcile(stopped).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (2, 3));
+
+    // While T3 Code's readings stand in, the endpoint is still read now and then.
+    let back = stopped + minutes(5);
+    write_snapshot(&snapshot, 53.0, resets, back);
+    e.stub.on("PUT /v1/usage", usage_reading(53.0, back));
+    e.daemon.reconcile(back).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (2, 4));
+    let check = stopped + USAGE_CHECK_EVERY;
+    write_snapshot(&snapshot, 53.0, resets, check);
+    e.daemon.reconcile(check).await.unwrap();
+    assert_eq!(reads(&e), 3);
+}
+
+#[tokio::test]
+async fn a_t3_snapshot_with_an_old_reading_under_a_new_date_is_not_taken() {
+    use board::daemon::USAGE_POLL_EVERY;
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let url = format!("{}/api/oauth/usage", e.stub.url);
+    let snapshot = usage_source_with_snapshot(&mut e, url);
+    let minutes = chrono::Duration::minutes;
+    // The reset time `usage_reading` gives the reading the daemon knows.
+    let resets = at() + chrono::Duration::days(2);
+    let reads = |e: &Env| e.stub.requests_to("GET /api/oauth/usage").len();
+    let reports = |e: &Env| e.stub.requests_to("PUT /v1/usage");
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 95.0, "resets_at": resets } }),
+    );
+    e.stub.on("PUT /v1/usage", usage_reading(95.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+
+    // Lower in the same window: T3 Code dated an older reading anew. It is not reported,
+    // and the endpoint is read when due, as without the file.
+    write_snapshot(&snapshot, 80.0, resets, at() + minutes(1));
+    e.daemon.reconcile(at() + minutes(1)).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 1));
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+    write_snapshot(&snapshot, 80.0, resets, at() + USAGE_POLL_EVERY);
+    e.daemon.reconcile(at() + USAGE_POLL_EVERY).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (2, 2));
+
+    // Lower in a later window: the limit was reset. The board is free within the minute.
+    let reset = at() + USAGE_POLL_EVERY + minutes(1);
+    write_snapshot(&snapshot, 3.0, resets + chrono::Duration::days(7), reset);
+    e.stub.on("PUT /v1/usage", usage_reading(3.0, reset));
+    e.daemon.reconcile(reset).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (2, 3));
+    assert_eq!(reports(&e)[2].body["seven_day"]["percent"], 3.0);
+    assert!(!e.daemon.state.usage_held.contains(&factory()));
+}
+
+#[tokio::test]
+async fn a_refused_usage_reading_is_tried_again_when_the_endpoint_says() {
+    use board::daemon::{USAGE_POLL_NEAR, USAGE_RETRY_MAX};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The stub sends no headers of its own: an endpoint that answers 429 with Retry-After.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/oauth/usage", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let retry_after = Arc::new(AtomicU64::new(120));
+    let (counted, wait) = (hits.clone(), retry_after.clone());
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            let answer = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                wait.load(Ordering::SeqCst)
+            );
+            socket.write_all(answer.as_bytes()).await.unwrap();
+        }
+    });
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let snapshot = usage_source_with_snapshot(&mut e, url);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    let hits = || hits.load(Ordering::SeqCst);
+    let minutes = chrono::Duration::minutes;
+
+    // Refused for 2 minutes: read again then, not 5 minutes later.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(hits(), 1);
+    assert!(e.daemon.state.usage_held.contains(&factory()));
+    e.daemon.reconcile(at() + USAGE_POLL_NEAR).await.unwrap();
+    assert_eq!(hits(), 1);
+    retry_after.store(86_400, Ordering::SeqCst);
+    let again = at() + minutes(2);
+    e.daemon.reconcile(again).await.unwrap();
+    assert_eq!(hits(), 2);
+
+    // A longer wait than the daemon accepts: read again after the longest it does.
+    e.daemon
+        .reconcile(again + USAGE_RETRY_MAX - minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(hits(), 2);
+
+    // While the endpoint refuses, a reset T3 Code read still frees the board.
+    let reset = again + minutes(3);
+    write_snapshot(&snapshot, 3.0, at() + chrono::Duration::days(9), reset);
+    e.stub.on("PUT /v1/usage", usage_reading(3.0, reset));
+    e.daemon.reconcile(reset).await.unwrap();
+    assert_eq!(hits(), 2);
+    assert_eq!(e.stub.requests_to("PUT /v1/usage").len(), 1);
+    assert!(!e.daemon.state.usage_held.contains(&factory()));
+
+    e.daemon.reconcile(again + USAGE_RETRY_MAX).await.unwrap();
+    assert_eq!(hits(), 3);
 }
 
 // Daemon dispatch: judges, merging and finishing.
