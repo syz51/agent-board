@@ -984,6 +984,7 @@ impl<T: T3> Daemon<T> {
                     version,
                     evidence,
                     summary: Some(passed_summary(&pass.text)),
+                    take: false,
                 },
             )
             .await

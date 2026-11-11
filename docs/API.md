@@ -562,7 +562,15 @@ Reopening a closed board, or any change on it, starts the period again.
   characters, `SUMMARY_CHARS_MAX`) tells the user what changed and what they should know;
   it is stored on the task (`Task.summary`, absent without one) and listed in "Updates".
   It is not in the event; `task_show` shows it among the text written by other agents.
-  Reopening the task clears it.
+  Reopening the task clears it. An optional `take: true` closes a task in `review` whose
+  owner is stale (`owner_stale`) in the same step: the caller becomes its owner, a
+  `task_taken` event (`status: review`) comes before `task_done`, and the task never
+  moves to `doing`, so the caller's `doing` limit does not apply. The evidence must then
+  hold a `pr` or a `check` (400 `evidence_required` otherwise). With `take`, a live
+  owner's task is refused with 409 `claim_refused`, and a stale owner's task in another
+  status with 400 `invalid_transition`, since `/take` starts such work and keeps the
+  limit. `take` changes nothing for the task's owner or an agent standing in for it.
+  Servers that predate it ignore it.
 - `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`. Kind `feedback` is still accepted;
   agents report feedback through `POST /v1/feedback` instead.
 - A task filed through `POST /v1/feedback` carries `feedback` (see "Feedback"); other tasks

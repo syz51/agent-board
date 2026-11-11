@@ -858,6 +858,7 @@ pub async fn task_done(
     id: &TaskId,
     evidence: Evidence,
     summary: Option<String>,
+    take: bool,
 ) -> Result<Output> {
     let evidence = evidence.into_wire();
     if evidence.is_empty() {
@@ -875,6 +876,7 @@ pub async fn task_done(
                 version: detail.task.version,
                 evidence,
                 summary,
+                take,
             },
         )
         .await?;

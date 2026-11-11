@@ -146,8 +146,11 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   it, with a claim's checks, so an agent returning to its own work is not sent away. An
   open ask on the task still refuses it, since the task waits on the user, and so does a
   `blocked_reason` that someone else set, which may name such a wait; the owner's claim
-  clears a reason it set itself. Another live agent's parked task is refused, naming the owner. After
-  24 hours unseen the owner is stale and another agent may take the task (logged). The
+  clears a reason it set itself. Another live agent's parked task is refused, naming the
+  owner. After 24 hours unseen the owner is stale and another agent may take the task
+  (logged). A stale owner's task in `review` can be closed in one step (`task_done` with
+  `take`, and a PR or a check as evidence), outside the closer's `doing` limit, since it
+  starts no work. The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). Once the
   owner's session has ended, the task's creator and the threads that delegated the owner
