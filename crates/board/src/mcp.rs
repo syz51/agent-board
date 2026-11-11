@@ -203,6 +203,19 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 (
+                    "since",
+                    s(
+                        "Only tasks changed after this: an event seq (the snapshot's seq), an RFC 3339 time, or a duration back such as 2h.",
+                        TIME_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "after",
+                    task_arg("Continue a cut list: only the tasks after this one in list order."),
+                    false,
+                ),
+                (
                     "limit",
                     json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 50."}),
                     false,
@@ -221,6 +234,14 @@ const TOOLS: &[ToolSpec] = &[
         params: || {
             vec![
                 ("id", task_arg("Task id, such as factory-12."), true),
+                (
+                    "ids",
+                    strings(
+                        "More tasks to show in the same call (at most 20 in all); each then comes in a compact form: state, evidence, text, findings and decisions.",
+                        TASK_ID_MAX,
+                    ),
+                    false,
+                ),
                 ("detailed", b(DETAILED_ARG), false),
             ]
         },
@@ -794,6 +815,11 @@ impl BoardMcp {
                     parent: a.parent,
                     live: a.live.then_some(true),
                     q: a.q,
+                    since: a
+                        .since
+                        .map(|s| ops::list_since(&s, chrono::Utc::now()))
+                        .transpose()?,
+                    after: a.after,
                     // Fewer than the CLI lists: the text goes into the agent's context.
                     limit: Some(a.limit.unwrap_or(TASK_LIST_LIMIT)),
                 };
@@ -801,7 +827,14 @@ impl BoardMcp {
             }
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;
-                ops::task_show(&ctx, &a.id, a.detailed).await?
+                if a.ids.iter().all(|id| *id == a.id) {
+                    ops::task_show(&ctx, &a.id, a.detailed).await?
+                } else if a.detailed {
+                    anyhow::bail!("detailed shows one task: send id alone, or drop detailed")
+                } else {
+                    let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
+                    ops::tasks_show(&ctx, &ids).await?
+                }
             }
             "task_add" => {
                 let a: AddArgs = parse(name, args)?;
@@ -990,6 +1023,8 @@ struct ListArgs {
     #[serde(default)]
     live: bool,
     q: Option<String>,
+    since: Option<String>,
+    after: Option<TaskId>,
     limit: Option<u32>,
     #[serde(default)]
     detailed: bool,
@@ -999,6 +1034,8 @@ struct ListArgs {
 #[serde(deny_unknown_fields)]
 struct ShowArgs {
     id: TaskId,
+    #[serde(default)]
+    ids: Vec<TaskId>,
     #[serde(default)]
     detailed: bool,
 }

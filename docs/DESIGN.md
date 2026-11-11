@@ -722,6 +722,8 @@ settings in use, warned once per edit.
   note; without `detailed`, only plain and `feedback` notes are cut to the latest five,
   with the count cut. A claim or take answers with the task's note count, by kind, and
   says to read them, with `detailed` when `task_show` would cut some.
+  `task_show` with several ids shows each task's findings and decisions and counts its
+  plain notes, so the agent doing a task still reads that task alone.
   A note by another agent on a task its owner has open (`doing` and `review` included)
   raises an alert for the owner, `<agent> changed your task <id> (finding)`, naming the
   note's kind. A finding on a `doing` or `review` task whose owner is gone (ended, not

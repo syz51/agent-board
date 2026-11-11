@@ -212,20 +212,33 @@ fn children(out: &mut String, detail: &TaskDetail) {
     }
 }
 
-pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
+/// Which notes a task's text shows; every finding and decision is always shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Notes {
+    /// The latest few plain notes.
+    Latest,
+    /// Every note, and the history.
+    All,
+    /// No plain note: the form for several tasks at once.
+    Compact,
+}
+
+/// A task's own lines, its peer text as lines that name the task, and how many plain
+/// notes were left out.
+fn detail_parts(detail: &TaskDetail, show: Notes) -> (String, Vec<Value>, usize) {
     let task = &detail.task;
     // Agents by their short handle, so long delegated ids stay readable.
     let handles = &detail.handles;
     let mut out = task_line_as(task, |id| short(handles, id));
-    let _ = write!(out, "\nboard {} · version {}", task.board, task.version);
+    // The id names the board, and no call takes the version: neither is printed.
+    let _ = write!(
+        out,
+        "\ncreated by {}",
+        short(handles, task.created_by.as_str())
+    );
     if let Some(parent) = &task.parent {
         let _ = write!(out, " · parent {parent}");
     }
-    let _ = write!(
-        out,
-        " · created by {}",
-        short(handles, task.created_by.as_str())
-    );
     if let Some(fb) = &task.feedback {
         // `about` is a validated slug; the signature is agent-written, so quoted.
         let _ = write!(
@@ -276,10 +289,10 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     // Every finding and decision, so the agent doing the task misses none; plain notes
     // only the latest few unless detailed.
     let plain = detail.notes.iter().filter(|n| is_plain(n.kind)).count();
-    let cut = if detailed {
-        0
-    } else {
-        plain.saturating_sub(PLAIN_NOTES)
+    let cut = match show {
+        Notes::All => 0,
+        Notes::Latest => plain.saturating_sub(PLAIN_NOTES),
+        Notes::Compact => plain,
     };
     let mut skipped = 0;
     let notes: Vec<&Note> = detail
@@ -291,7 +304,7 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
             !skip
         })
         .collect();
-    if detailed {
+    if show == Notes::All {
         for event in &detail.history {
             let _ = write!(out, "\n{}", event_line_as(event, |id| short(handles, id)));
         }
@@ -325,6 +338,18 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
     for note in notes {
         peer.push(note_line(note, handles));
     }
+    (out, peer, cut)
+}
+
+pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
+    let show = if detailed { Notes::All } else { Notes::Latest };
+    let (mut out, mut peer, cut) = detail_parts(detail, show);
+    // The first line names the task, so its peer lines need not.
+    for line in &mut peer {
+        if let Some(fields) = line.as_object_mut() {
+            fields.remove("task");
+        }
+    }
     let block = peer_block(&peer);
     if !block.is_empty() {
         out.push('\n');
@@ -337,6 +362,38 @@ pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
              history)",
             plural(cut, "older plain note", "older plain notes"),
         );
+    }
+    out
+}
+
+/// Several tasks in one text, in the order asked for: each task's own lines, then the
+/// peer text of all of them under one header. Plain notes are counted, not shown. A task
+/// that could not be read (`Err`, the reason) has one line saying so.
+pub fn task_details(tasks: &[(TaskId, Result<TaskDetail, String>)]) -> String {
+    let mut heads = Vec::with_capacity(tasks.len());
+    let mut peer = Vec::new();
+    for (id, detail) in tasks {
+        match detail {
+            Ok(detail) => {
+                let (mut head, lines, cut) = detail_parts(detail, Notes::Compact);
+                if cut > 0 {
+                    let _ = write!(
+                        head,
+                        "\n{} not shown: task_show {id}",
+                        plural(cut, "plain note", "plain notes")
+                    );
+                }
+                heads.push(head);
+                peer.extend(lines);
+            }
+            Err(reason) => heads.push(format!("{id} not shown: {reason}")),
+        }
+    }
+    let mut out = heads.join("\n");
+    let block = peer_block(&peer);
+    if !block.is_empty() {
+        out.push('\n');
+        out.push_str(&block);
     }
     out
 }
@@ -1102,7 +1159,12 @@ mod tests {
         let text = task_detail(&detail, true);
         assert!(!text.contains("delegated-task"), "{text}");
         assert!(text.contains(" owner t3:1a2b"), "{text}");
-        assert!(text.contains(" · created by t3:1a2b"), "{text}");
+        assert!(text.contains("\ncreated by t3:1a2b\n"), "{text}");
+        // The id names the board, the first line names the task, and no call takes the
+        // version: none of them is repeated.
+        assert!(!text.contains("board factory"), "{text}");
+        assert!(!text.contains("version"), "{text}");
+        assert!(!text.contains("\"task\":"), "{text}");
         assert!(text.contains("t3:1a2b task_claimed"), "{text}");
         assert!(text.contains("\"by\":\"t3:1a2b\""), "{text}");
 

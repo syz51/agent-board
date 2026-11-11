@@ -10,7 +10,7 @@ use board_proto::{
     ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
     DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
     RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT,
-    TASKS_LIMIT_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -418,8 +418,10 @@ pub async fn task_list(
     let limit = limit as usize;
     let notice = if tasks.len() > limit {
         tasks.truncate(limit);
+        // The last task listed is the cursor of the next page.
+        let last = &tasks[limit - 1].id;
         format!(
-            "\nlisted the first {limit}; more match: narrow it with a filter or a search, or raise the limit (at most {TASKS_LIMIT_MAX})"
+            "\nlisted the first {limit}; more match: list the next with after {last}, narrow it with a filter or a search, or raise the limit (at most {TASKS_LIMIT_MAX})"
         )
     } else if tasks.len() == TASKS_LIMIT_MAX as usize {
         format!(
@@ -481,6 +483,52 @@ const TASK_FIELDS: [&str; 24] = [
 pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {
     let detail = ctx.client.task(id).await?;
     Ok(Output::new(render::task_detail(&detail, detailed), &detail))
+}
+
+/// Most tasks one `task_show` reads.
+pub const TASK_SHOW_MAX: usize = 20;
+
+/// Several tasks in one call, in a compact form: each task's state, evidence, text,
+/// findings and decisions. The tasks are read at the same time; one that cannot be read
+/// is named with the reason and does not fail the others.
+pub async fn tasks_show(ctx: &Ctx, ids: &[TaskId]) -> Result<Output> {
+    if ids.len() > TASK_SHOW_MAX {
+        bail!(
+            "{} tasks is more than one call shows; name at most {TASK_SHOW_MAX}",
+            ids.len()
+        );
+    }
+    let mut unique: Vec<&TaskId> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
+    }
+    let read = futures_util::future::join_all(unique.iter().map(|id| ctx.client.task(id))).await;
+    let tasks: Vec<(TaskId, Result<TaskDetail, String>)> = unique
+        .into_iter()
+        .cloned()
+        .zip(read.into_iter().map(|r| r.map_err(|e| format!("{e:#}"))))
+        .collect();
+    if let Some((_, Err(reason))) = tasks.first()
+        && tasks.iter().all(|(_, read)| read.is_err())
+    {
+        bail!("none of the tasks could be read: {reason}");
+    }
+    let details: Vec<&TaskDetail> = tasks.iter().filter_map(|(_, r)| r.as_ref().ok()).collect();
+    Ok(Output::new(render::task_details(&tasks), &details))
+}
+
+/// A `since` filter of the task list as the server takes it: an event sequence number as
+/// it is, and a time, date or duration back from `now` ([`parse_since`]) as a time.
+pub fn list_since(value: &str, now: Timestamp) -> Result<String> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(value.to_owned());
+    }
+    parse_since(value, now)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .with_context(|| "or send an event sequence number, such as the snapshot's seq")
 }
 
 #[derive(Debug, Clone, Default)]

@@ -328,8 +328,8 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&q=&limit=` →
-  `[Task]` list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&q=&since=&after=&limit=` →
+  `[Task]` list, sorted by priority, then id number, then board. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
@@ -361,9 +361,24 @@ Reopening a closed board, or any change on it, starts the period again.
   matches as a substring, whatever the case of ASCII letters; other letters match only
   in the same case, and `%` and `_` are plain text. It combines with every other filter.
   A blank `q` is no search; a too long one is 400 `invalid`. Servers that predate `q`
-  ignore it and list every task. `limit` defaults to 200, at most 1,000, and a smaller
+  ignore it and list every task.
+  `since=<point>` lists only the tasks changed after a point: digits alone are an event
+  sequence number (`seq` of a snapshot or event, `next_since` of `GET /v1/events`), and
+  anything else is an RFC 3339 time. A task changes with every event that names it: its
+  creation, an update, a claim, a note or a completion. The point itself is not
+  included. Events are kept 365 days, so an older point reads no further back. It
+  combines with every other filter. A blank `since` is no filter; a value that is neither
+  form is 400 `invalid`. Servers that predate `since` ignore it and list every task.
+  `after=<task id>` continues a list: it lists only the tasks that follow that task in
+  the list's order, so a list cut at its limit goes on with `after=<id of its last
+  task>` and the same filters. The task's place is read at the request, by its priority
+  now, and it need not pass the other filters. A task that does not exist is 404
+  `not_found`, a malformed id 400 `invalid`. Servers that predate `after` ignore it and
+  list from the start; the CLI and MCP then refuse, since that list holds the cursor
+  task. `limit` defaults to 200, at most 1,000, and a smaller
   value counts as 1; the list does not say when the limit cut it, so the CLI and MCP ask
-  for one task more than their limit and say so in their text. The MCP `task_list` asks
+  for one task more than their limit and say so in their text, naming the task to
+  continue after. The MCP `task_list` asks
   for 50 tasks when the call names no `limit`, since its text goes into an agent's
   context; the CLI keeps the server's default.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
@@ -971,6 +986,11 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   those fields of each task; one the task leaves out, such as `summary`, is `null`. A
   name that is no field of `[Task]`, and `--fields` without `--json`, are refused before
   sending. A line names a task's owner by `owner_handle` when the server sends it.
+  `--since <point>` sends `since`: an event sequence number as it is, and an RFC 3339
+  time, a date (`YYYY-MM-DD`, midnight UTC) or a duration back from now (`30m`, `12h`,
+  `2d`) as a time; the MCP `task_list` takes the same forms. `--after <id>` sends
+  `after=<id>`, and the cut line names the id to pass: `board ls --limit 50 --after
+  factory-62`.
   `--search <words>` (alias `--grep`) sends `q=<words>`, at most 8 words and 200
   characters, refused before sending when longer. A server that predates `q` ignores it
   and lists every task, so upgrade the server first.
@@ -986,6 +1006,16 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   followed by one indented line per status with its child ids. A task without children
   has no such line. From a server that predates `child_tasks` the line is
   `children <ids>`.
+  The text names neither the board (the id holds it) nor the version, and its lines of
+  agent-written text carry no `task` key, since the first line names the task.
+  `board show <id> <id>…` (MCP `task_show` with `ids` beside `id`) reads several tasks in
+  one call, at most 20, each from `GET /v1/tasks/{id}` at the same time, and prints them
+  in the order given in a compact form: each task's own lines, with a count of its plain
+  notes instead of the notes, then the agent-written text of all of them (bodies,
+  acceptance checks, every finding and decision) under one header, each line with its
+  `task`. A task that cannot be read is named with the reason and the others are still
+  shown; when none can be read the call fails. `--detailed` takes one task. `--json`
+  prints the `[TaskDetail]` list of the tasks that were read.
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |

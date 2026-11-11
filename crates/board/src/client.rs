@@ -379,6 +379,13 @@ pub struct TaskQuery {
     /// before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
+    /// Only tasks changed after this event sequence number or RFC 3339 time; servers
+    /// before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Only the tasks that follow this one in list order; servers before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -830,6 +837,15 @@ impl Client {
         if q.live == Some(true) && tasks.iter().any(|t| !t.may_be_live()) {
             anyhow::bail!(
                 "the server does not filter live feedback items yet; upgrade it, then list them again"
+            );
+        }
+        // Servers that predate `after` ignore it and list from the start again, which
+        // holds the cursor task: the last one of the page before.
+        if let Some(after) = &q.after
+            && tasks.iter().any(|t| t.id == *after)
+        {
+            anyhow::bail!(
+                "the server does not continue a list after a task yet; upgrade it, or narrow the list with a filter or a search"
             );
         }
         Ok(tasks)

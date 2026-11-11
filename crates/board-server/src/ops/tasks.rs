@@ -652,7 +652,40 @@ pub(crate) struct TaskFilter {
     pub live: Option<bool>,
     /// Only tasks that hold every one of these words ([`search_words`]); none is no search.
     pub words: Vec<String>,
+    /// Only tasks with an event after this point.
+    pub since: Option<Since>,
+    /// Only the tasks that follow this one in list order: the cursor of a cut list.
+    pub after: Option<TaskId>,
     pub limit: usize,
+}
+
+/// The point a `since` filter starts after: an event sequence number or a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Since {
+    Seq(i64),
+    At(Timestamp),
+}
+
+/// Reads `since`: digits alone are an event sequence number, anything else an RFC 3339
+/// time. A blank value is no filter, as a blank `q` is.
+pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<Since>> {
+    let Some(since) = since.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = if since.bytes().all(|b| b.is_ascii_digit()) {
+        since.parse().ok().map(Since::Seq)
+    } else {
+        chrono::DateTime::parse_from_rfc3339(since)
+            .ok()
+            .map(|at| Since::At(at.to_utc()))
+    };
+    parsed.map(Some).ok_or_else(|| {
+        invalid(
+            "since is neither an event sequence number nor an RFC 3339 time",
+            "send since=<seq> (the snapshot's seq, or an event's) or a time such as \
+             since=2026-01-02T03:04:05Z",
+        )
+    })
 }
 
 /// The words of a `q` search: split at white space, with ASCII letters lowercased as
@@ -763,6 +796,35 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
                             AND instr(lower(n.text), w.value) > 0)))",
         );
         params.push((":words", &words));
+    }
+    // A task changes with an event that names it (a note, a claim, an update), so the
+    // `events_task` index answers both forms.
+    let since = match filter.since {
+        Some(Since::Seq(seq)) => Some(("e.seq", seq)),
+        Some(Since::At(at)) => Some(("e.at", at.timestamp_millis())),
+        None => None,
+    };
+    let since_sql = since.map(|(column, _)| {
+        format!("EXISTS (SELECT 1 FROM events e WHERE e.task = t.id AND {column} > :since)")
+    });
+    if let (Some(sql), Some((_, value))) = (&since_sql, &since) {
+        clauses.push(sql);
+        params.push((":since", value));
+    }
+    // The cursor's place is read as the list is, so a page follows the task's place now.
+    let after = filter.after.as_ref().map(TaskId::as_str);
+    if let Some(after) = &after {
+        if !cx.exists("SELECT 1 FROM tasks WHERE id = ?1", [after])? {
+            return Err(not_found(
+                format!("after names {after}, which is not a task"),
+                "send after=<the id of the last task of the list you continue>",
+            ));
+        }
+        clauses.push(
+            "(t.priority, t.number, t.board) > \
+             (SELECT c.priority, c.number, c.board FROM tasks c WHERE c.id = :after)",
+        );
+        params.push((":after", after));
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }
