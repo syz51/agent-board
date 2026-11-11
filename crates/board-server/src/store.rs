@@ -104,8 +104,49 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         summary: r.get(16)?,
         child_count: 0,
         owner_handle: r.get(17)?,
+        snippet: None,
+        any_word: false,
     })
 }
+
+/// Marks around a found word in the text SQLite's `snippet` returns; stored text holds no
+/// control characters.
+const FOUND_START: char = '\u{1}';
+const FOUND_END: char = '\u{2}';
+/// Longest snippet of a search result, in characters.
+const SNIPPET_CHARS_MAX: usize = 200;
+
+/// A search result: the task, with the piece of its own text, or else of its notes, that
+/// holds a found word. Words found only in the id or title need none: the line shows them.
+fn found_task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = task_row(r)?;
+    for column in [18, 19] {
+        let text: String = r.get(column)?;
+        if text.contains(FOUND_START) {
+            let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            task.snippet = Some(
+                line.chars()
+                    .take(SNIPPET_CHARS_MAX)
+                    .map(|c| match c {
+                        FOUND_START => '[',
+                        FOUND_END => ']',
+                        c => c,
+                    })
+                    .collect(),
+            );
+            break;
+        }
+    }
+    Ok(task)
+}
+
+/// How well a task's search document matches: lower is better. A word in the id or title
+/// outweighs one in the task's own text, which outweighs one in its notes. Column weights
+/// within one `bm25` do not do that: a word's score levels off, so a short note would pass
+/// a long body. Each part is scored alone and the parts are scaled apart.
+pub(crate) const SEARCH_RANK: &str = "(25.0 * bm25(task_search, 2.0, 1.0, 0.0, 0.0) \
+     + 5.0 * bm25(task_search, 0.0, 0.0, 1.0, 0.0) \
+     + bm25(task_search, 0.0, 0.0, 0.0, 1.0))";
 
 /// Loads tasks matching `filter` (SQL over alias `t`, may use `:now` and `:cutoff`), in
 /// list order: priority, then id number.
@@ -124,6 +165,38 @@ pub(crate) fn load_tasks_up_to(
         "SELECT {TASK_COLUMNS} FROM tasks t WHERE {filter} \
          ORDER BY t.priority, t.number, t.board LIMIT :limit"
     );
+    query_tasks(cx, &sql, filter, extra, limit, task_row)
+}
+
+/// The tasks matching `filter` whose search document matches the FTS5 query bound as
+/// `:match`, best match first and then in list order, each with its snippet.
+pub(crate) fn load_tasks_found(
+    cx: &Ctx<'_>,
+    filter: &str,
+    extra: &NamedParams<'_>,
+    limit: usize,
+) -> Result<Vec<Task>> {
+    let sql = format!(
+        "SELECT {TASK_COLUMNS}, \
+                snippet(task_search, 2, char(1), char(2), '…', 12), \
+                snippet(task_search, 3, char(1), char(2), '…', 12) \
+         FROM task_search \
+         JOIN task_search_docs d ON d.doc = task_search.rowid \
+         JOIN tasks t ON t.id = d.task \
+         WHERE task_search MATCH :match AND {filter} \
+         ORDER BY {SEARCH_RANK}, t.priority, t.number, t.board LIMIT :limit"
+    );
+    query_tasks(cx, &sql, filter, extra, Some(limit), found_task_row)
+}
+
+fn query_tasks(
+    cx: &Ctx<'_>,
+    sql: &str,
+    filter: &str,
+    extra: &NamedParams<'_>,
+    limit: Option<usize>,
+    row: fn(&Row<'_>) -> rusqlite::Result<Task>,
+) -> Result<Vec<Task>> {
     let now = cx.now_ms();
     let cutoff = cx.stale_cutoff();
     // A negative limit is no limit.
@@ -137,9 +210,9 @@ pub(crate) fn load_tasks_up_to(
         params.push((":cutoff", &cutoff));
     }
     params.extend(extra.iter().copied());
-    let mut stmt = cx.db.prepare_cached(&sql)?;
+    let mut stmt = cx.db.prepare_cached(sql)?;
     let tasks = stmt
-        .query_map(params.as_slice(), task_row)?
+        .query_map(params.as_slice(), row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     complete_tasks(cx, tasks)

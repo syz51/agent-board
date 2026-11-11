@@ -429,6 +429,16 @@ pub struct Task {
     /// Absent without an owner, and from servers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_handle: Option<String>,
+    /// In the result of a search (`q` of `GET /v1/tasks`): a short piece of the task's
+    /// text or notes around the words found, which stand in `[` and `]`; untrusted for
+    /// readers. Absent when the words are in the id or title only, outside a search, and
+    /// from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// In the result of a search: no task holds every word, so this one holds at least
+    /// one of them. Absent otherwise, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_word: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
