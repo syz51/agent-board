@@ -474,6 +474,32 @@ mod tests {
     }
 
     #[test]
+    fn migration_records_the_run_before_it_from_the_newest_event() {
+        let runs = |conn: &Connection| -> Vec<(i64, i64)> {
+            conn.prepare("SELECT started_at, alive_at FROM server_runs")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // A database without events has no run before this one.
+        let conn = migrated_to(24);
+        migrate(&conn).unwrap();
+        assert_eq!(runs(&conn), []);
+
+        let conn = migrated_to(24);
+        conn.execute_batch(
+            "INSERT INTO events (at, actor, type, payload) VALUES \
+             (1000, 'user', 'board_created', '{}'), (3000, 'user', 'board_updated', '{}'), \
+             (2000, 'user', 'board_updated', '{}');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(runs(&conn), [(3000, 3000)]);
+    }
+
+    #[test]
     fn migrations_run_once_and_set_user_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("board.db");

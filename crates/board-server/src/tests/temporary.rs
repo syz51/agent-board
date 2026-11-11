@@ -581,7 +581,6 @@ async fn time_the_server_was_down_does_not_count_as_idle() {
         Some(json!({ "status": "closed" })),
     )
     .await;
-    alive(&t).await;
     t.advance(TimeDelta::hours(1));
     alive(&t).await;
     t.state.shutdown();
@@ -590,7 +589,6 @@ async fn time_the_server_was_down_does_not_count_as_idle() {
     // nothing idle.
     t.advance((close_after() + delete_after()) * 3);
     let up = t.restart(crate::Db::open(&path).unwrap());
-    alive(&up).await;
     assert_eq!(sweep(&up).await, TemporarySweep::default());
 
     // A second time down, two hours later, is taken out as well.
@@ -599,7 +597,6 @@ async fn time_the_server_was_down_does_not_count_as_idle() {
     up.state.shutdown();
     up.advance(delete_after() * 2);
     let up = up.restart(crate::Db::open(&path).unwrap());
-    alive(&up).await;
     assert_eq!(sweep(&up).await, TemporarySweep::default());
 
     // The three hours the server was up before count: a restart does not start the period
@@ -608,10 +605,52 @@ async fn time_the_server_was_down_does_not_count_as_idle() {
     assert_eq!(sweep(&up).await, TemporarySweep::default());
     up.advance(TimeDelta::seconds(1));
     assert_eq!(slugs(&sweep(&up).await.closed), vec!["scratch"]);
+
+    // A crash an hour later records no shutdown: the server was last known alive at its
+    // last sweep, so that hour counts as time down too, which keeps a board for longer.
+    up.advance(TimeDelta::hours(1));
+    up.state.shutdown();
+    up.advance(delete_after());
+    let up = up.restart(crate::Db::open(&path).unwrap());
+    assert_eq!(sweep(&up).await, TemporarySweep::default());
     up.advance(delete_after() - close_after() - TimeDelta::seconds(1));
     assert_eq!(sweep(&up).await, TemporarySweep::default());
     up.advance(TimeDelta::seconds(1));
     assert_eq!(slugs(&sweep(&up).await.deleted), vec!["closed"]);
+}
+
+#[tokio::test]
+async fn only_time_down_after_a_boards_last_change_is_taken_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.db");
+    let t = T::over(crate::Db::open(&path).unwrap(), |_| {});
+    temporary_board(&t, "scratch").await;
+    t.advance(TimeDelta::hours(1));
+    alive(&t).await;
+    t.state.shutdown();
+    t.advance(delete_after() * 3);
+    let up = t.restart(crate::Db::open(&path).unwrap());
+    assert_eq!(sweep(&up).await, TemporarySweep::default());
+
+    // A change after the long time down, then an hour up and five hours down.
+    up.ok(
+        "PATCH",
+        "/v1/boards/scratch",
+        None,
+        Some(json!({ "goal": "Still in use" })),
+    )
+    .await;
+    up.advance(TimeDelta::hours(1));
+    alive(&up).await;
+    up.state.shutdown();
+    up.advance(TimeDelta::hours(5));
+    let up = up.restart(crate::Db::open(&path).unwrap());
+
+    // Only the five hours come out of the time since the change.
+    up.advance(close_after() - TimeDelta::hours(1) - TimeDelta::seconds(1));
+    assert_eq!(sweep(&up).await, TemporarySweep::default());
+    up.advance(TimeDelta::seconds(1));
+    assert_eq!(slugs(&sweep(&up).await.closed), vec!["scratch"]);
 }
 
 #[tokio::test]
@@ -728,8 +767,14 @@ async fn the_sweeper_task_closes_idle_temporary_boards() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(status(&t, "scratch").await, "closed");
+    // The sweep recorded this run of the server, and the shutdown records when it ended.
+    const RUNS: &str = "SELECT CAST(alive_at - started_at AS TEXT) FROM server_runs";
+    let up = close_after().num_milliseconds();
+    assert_eq!(t.strings(RUNS), [up.to_string()]);
+    t.advance(TimeDelta::seconds(5));
     t.state.shutdown();
     task.await.unwrap();
+    assert_eq!(t.strings(RUNS), [(up + 5000).to_string()]);
 }
 
 async fn close_and_delete(t: &T, slug: &str) {

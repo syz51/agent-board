@@ -390,16 +390,18 @@ pub(crate) enum Swept {
 /// task on another board waits on (deleting the board would let that task start without its
 /// prerequisite). Each comes
 /// with whether it is closed and how long it has been idle: the time since the newer of its
-/// own change and its newest event, less the time the server was down since then. Events
-/// the server records do not count: its notices (a quiet review, an owner away) repeat for
-/// as long as the board is left alone, and its own change to a board, closing it, is in
-/// the board's `updated_at`.
+/// own change and its newest event, less the time the server was down since then. The
+/// server's notices (a `task_updated` of its own that changes no field: a quiet review, an
+/// owner away, a passed `not_before`) do not count: they repeat, or come, while the board
+/// is left alone.
 fn idle_temporary(cx: &Ctx<'_>, only: Option<&BoardSlug>) -> Result<Vec<(BoardSlug, bool, i64)>> {
     let rows: Vec<(String, String, i64)> = cx
         .db
         .prepare_cached(&format!(
             "SELECT b.slug, b.status, MAX(b.updated_at, COALESCE( \
-                 (SELECT e.at FROM events e WHERE e.board = b.slug AND e.actor != 'server' \
+                 (SELECT e.at FROM events e WHERE e.board = b.slug \
+                  AND NOT (e.actor = 'server' AND e.type = 'task_updated' \
+                           AND json_extract(e.payload, '$.fields') = '[]') \
                   ORDER BY e.seq DESC LIMIT 1), \
                  0)) \
              FROM boards b \
@@ -438,7 +440,8 @@ fn idle_temporary(cx: &Ctx<'_>, only: Option<&BoardSlug>) -> Result<Vec<(BoardSl
 }
 
 /// Records that the server run started at `started` is alive now. The sweeper calls it
-/// every minute and at shutdown, so the next run knows how long the server was down.
+/// every minute, before it sweeps temporary boards, and at shutdown, so the next run knows
+/// how long the server was down.
 pub(crate) fn mark_alive(cx: &mut Ctx<'_>, started: i64) -> Result<()> {
     cx.db
         .prepare_cached(

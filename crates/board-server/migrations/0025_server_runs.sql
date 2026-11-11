@@ -6,3 +6,9 @@ CREATE TABLE server_runs (
     started_at INTEGER PRIMARY KEY,
     alive_at INTEGER NOT NULL
 );
+
+-- The server that ran before this table existed was alive at its newest event at the
+-- latest, so the first run with the table takes the time since then as time down, which
+-- keeps a board rather than deletes it. A database without events has no boards.
+INSERT INTO server_runs (started_at, alive_at)
+SELECT MAX(at), MAX(at) FROM events HAVING MAX(at) IS NOT NULL;
