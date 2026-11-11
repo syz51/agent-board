@@ -2097,7 +2097,7 @@ impl<T: T3> Daemon<T> {
             let digest = prompt_digest(triage);
             let owed = local.briefed.as_deref() != Some(digest);
             let resume = format!(
-                "board {}: the usage limit has reset. Continue your loop.",
+                "board {}: the usage limit has reset. Call board_snapshot and continue your loop.",
                 board.slug
             );
             let message = if owed {
@@ -4813,8 +4813,8 @@ impl<T: T3> Daemon<T> {
                 })
             }
             WakeAbout::Resumed if coordinator => Some(format!(
-                "board {slug}: the user resumed this board after a pause. Read your board \
-                 snapshot and handoff, then continue. The pause stopped the threads on its \
+                "board {slug}: the user resumed this board after a pause. Call \
+                 board_snapshot and read your handoff, then continue. The pause stopped the threads on its \
                  tasks in doing: send each owner thread a message to continue its task, and \
                  restart a task only when its owner thread is gone. Updates on the pull \
                  requests of this board's tasks were not handled while paused: check each \
@@ -4838,7 +4838,7 @@ impl<T: T3> Daemon<T> {
                 };
                 Some(format!(
                     "board {slug}: the account usage no longer stops new work on this board \
-                     (stop at {stop_at}%{pace}). Read your board snapshot, then start ready \
+                     (stop at {stop_at}%{pace}). Call board_snapshot, then start ready \
                      tasks up to the limit on its you: line"
                 ))
             }
@@ -5128,7 +5128,7 @@ pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
     let brief = brief(slug, triage);
     let marker = rebrief_marker(slug, triage);
     format!(
-        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop.\n{marker}"
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop: call board_snapshot.\n{marker}"
     )
 }
 

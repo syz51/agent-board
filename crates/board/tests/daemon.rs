@@ -5789,7 +5789,7 @@ async fn an_idle_coordinator_resumed_at_a_usage_reset_gets_the_new_prompt_with_i
     assert_eq!(
         sends[0].1,
         format!(
-            "{}\n\nboard factory: the usage limit has reset. Continue your loop.",
+            "{}\n\nboard factory: the usage limit has reset. Call board_snapshot and continue your loop.",
             board::daemon::rebrief_message(&slug, false)
         )
     );
@@ -6134,7 +6134,7 @@ async fn a_re_brief_sent_with_a_resume_that_timed_out_is_not_repeated_with_each_
     assert_eq!(sends.len(), 2);
     assert_eq!(
         sends[1].1,
-        "board factory: the usage limit has reset. Continue your loop."
+        "board factory: the usage limit has reset. Call board_snapshot and continue your loop."
     );
     e.daemon
         .reconcile(later + chrono::Duration::minutes(1))
