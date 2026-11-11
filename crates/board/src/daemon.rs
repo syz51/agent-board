@@ -17,6 +17,8 @@
 //!   [`FRESH_SESSION_RUNS`] times since the last notice and no user message is recent
 //!   (see [`FreshSession`]);
 //! - never wakes a paused agent before its `paused_until`;
+//! - wakes no Claude agent while a window of a fresh usage reading is at 100 percent: their
+//!   wake-ups are kept and sent once at that window's reset;
 //! - wakes an ended agent like an idle one while T3 still has its thread: T3 closes a
 //!   session left idle, which marks its agent ended, and a message resumes the thread. One
 //!   whose session closed while it waited for a usage-limit reset keeps that reset, and
@@ -252,6 +254,10 @@ pub struct WatchState {
     /// coordinator is woken to start work again.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub usage_held: BTreeSet<BoardSlug>,
+    /// The reset the Claude agents' wake-ups last waited for while a usage window was full
+    /// ([`Usage::full_until`]): those wake-ups live from it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_full_until: Option<Timestamp>,
     /// Worker threads this device's dispatcher started on daemon-dispatch boards, by task,
     /// while each holds a slot. Saved before `t3 thread start` runs, as `pending_starts`.
     /// Read leniently like `wakes`.
@@ -807,6 +813,9 @@ enum Reach {
     Held,
     /// Paused until a usage-limit reset still to come.
     Paused,
+    /// A Claude agent while a usage window of the account is full: a turn would stop on
+    /// the limit at once, so its wake-ups wait for that window's reset.
+    Full,
     /// Not to be woken by this daemon.
     Never(Unreachable),
 }
@@ -845,7 +854,22 @@ impl std::fmt::Display for Unreachable {
 }
 
 impl Reach {
-    fn of(seen: &Seen, device: &DeviceName, now: Timestamp) -> Self {
+    /// `full_until` is the reset a full usage window of the Claude account waits for
+    /// ([`Daemon::usage_full_until`]).
+    fn of(seen: &Seen, device: &DeviceName, full_until: Option<Timestamp>, now: Timestamp) -> Self {
+        match Self::alone(seen, device, now) {
+            // Codex and opencode agents spend other limits.
+            Self::Now | Self::Held
+                if full_until.is_some() && seen.agent.runtime == Runtime::Claude =>
+            {
+                Self::Full
+            }
+            reach => reach,
+        }
+    }
+
+    /// By the agent's own state, whatever the account's usage.
+    fn alone(seen: &Seen, device: &DeviceName, now: Timestamp) -> Self {
         let agent = &seen.agent;
         if &agent.device != device {
             return Self::Never(Unreachable::Elsewhere);
@@ -1057,10 +1081,10 @@ enum Checked {
     },
 }
 
-/// When a wake-up for an agent paused until `paused_until` is still worth sending: a
-/// paused agent's wake-ups live from the reset on.
-fn is_fresh(wake: &Wake, paused_until: Option<Timestamp>, now: Timestamp) -> bool {
-    let from = paused_until.map_or(wake.queued_at, |until| until.max(wake.queued_at));
+/// When a wake-up for an agent that waited for the reset `waited_until`
+/// ([`Daemon::waited_until`]) is still worth sending: its wake-ups live from the reset on.
+fn is_fresh(wake: &Wake, waited_until: Option<Timestamp>, now: Timestamp) -> bool {
+    let from = waited_until.map_or(wake.queued_at, |until| until.max(wake.queued_at));
     now - from < WAKE_TTL
 }
 
@@ -3980,6 +4004,9 @@ impl<T: T3> Daemon<T> {
     /// never got it (see [`UnsureWakes`]).
     pub async fn flush(&mut self, now: Timestamp) {
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
+        if let Some(until) = self.usage_full_until(now) {
+            self.state.usage_full_until = Some(until);
+        }
         for (agent, unsure) in &mut self.state.unsure_wakes {
             unsure.messages.retain(|m| {
                 let live = now - m.since < WAKE_TTL;
@@ -4151,15 +4178,14 @@ impl<T: T3> Daemon<T> {
             };
             read = true;
         }
-        let due =
-            backing_off.is_none() && matches!(Reach::of(&seen, &self.ctx.device, now), Reach::Now);
+        let due = backing_off.is_none() && matches!(self.reach(&seen, now), Reach::Now);
         let rechecks = if due {
-            let paused_until = paused_until(&seen);
+            let waited_until = self.waited_until(&seen);
             let mut lines = Vec::new();
             for wake in queue
                 .wakes
                 .iter()
-                .filter(|w| is_fresh(w, paused_until, now))
+                .filter(|w| is_fresh(w, waited_until, now))
             {
                 lines.push(self.recheck(agent, wake, now).await);
             }
@@ -4249,17 +4275,19 @@ impl<T: T3> Daemon<T> {
                 (*seen, rechecks)
             }
         };
-        let paused_until = paused_until(&seen);
+        let waited_until = self.waited_until(&seen);
         queue.wakes.retain(|w| {
-            let fresh = is_fresh(w, paused_until, now);
+            let fresh = is_fresh(w, waited_until, now);
             if !fresh {
                 tracing::warn!("waking {agent}: not delivered in time; dropped");
             }
             fresh
         });
-        match Reach::of(&seen, &self.ctx.device, now) {
+        match self.reach(&seen, now) {
             Reach::Now => {}
-            Reach::Held => {
+            // Kept whole for the agent going idle, or for the reset of the full usage
+            // window: the coordinator waits for that reset too, so nothing is passed to it.
+            Reach::Held | Reach::Full => {
                 self.requeue(agent.clone(), queue);
                 return None;
             }
@@ -4625,6 +4653,31 @@ impl<T: T3> Daemon<T> {
                 self.requeue(agent, queue);
             }
         }
+    }
+
+    /// The reset every Claude agent's wake-ups wait for at `now`: that of a full window of
+    /// a fresh reading ([`Usage::full_until`]). A daemon with no reading at all keeps the
+    /// reset it last waited for, as [`Self::usage_holds`] keeps its boards.
+    fn usage_full_until(&self, now: Timestamp) -> Option<Timestamp> {
+        match &self.usage {
+            Some(usage) => usage.full_until(now),
+            None => self.state.usage_full_until.filter(|until| *until > now),
+        }
+    }
+
+    /// Whether `seen`'s wake-ups can be sent at `now`.
+    fn reach(&self, seen: &Seen, now: Timestamp) -> Reach {
+        Reach::of(seen, &self.ctx.device, self.usage_full_until(now), now)
+    }
+
+    /// The reset `seen`'s wake-ups last waited for, from which they live: its own
+    /// ([`paused_until`]), or for a Claude agent that of a full usage window, the later one.
+    fn waited_until(&self, seen: &Seen) -> Option<Timestamp> {
+        let full = self
+            .state
+            .usage_full_until
+            .filter(|_| seen.agent.runtime == Runtime::Claude);
+        paused_until(seen).max(full)
     }
 
     /// Whether the usage holds `slug` from new work at `now`: a window of a fresh reading

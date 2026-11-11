@@ -6522,6 +6522,126 @@ async fn a_stale_usage_reading_holds_nothing() {
     assert_eq!(threads(&e.t3), ["coord"]);
 }
 
+/// A reading the server would return: the 5-hour window at `five` percent until `reset`,
+/// read at `read`.
+fn five_hour_reading(five: f64, reset: Timestamp, read: Timestamp) -> serde_json::Value {
+    json!({
+        "five_hour": { "percent": five, "resets_at": reset },
+        "seven_day": { "percent": 40.0, "resets_at": read + chrono::Duration::days(2) },
+        "read_at": read,
+        "device": DEVICE,
+    })
+}
+
+/// A coordinator and an idle Claude worker, with the usage as `reading` says: queues a
+/// ready task for the coordinator and an answer for the worker at `now`.
+async fn wakes_under_usage(reading: serde_json::Value, now: Timestamp) -> Env {
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    e.stub.on("GET /v1/usage", reading);
+    e.daemon.reconcile(now).await.unwrap();
+    e.stub.on(
+        &format!("GET {}", agent_path("t3:worker")),
+        agent_fixture("t3:worker", DEVICE, AgentState::Idle),
+    );
+    e.stub
+        .on("GET /v1/tasks/factory-4", detail("factory-4", true, &[]));
+    e.daemon
+        .on_event(
+            &event(10, EventType::TaskCreated, Some("factory-4"), "user"),
+            now,
+        )
+        .await
+        .unwrap();
+    let ev = answered(&e, 30, 3, "t3:worker");
+    e.daemon.on_event(&ev, now).await.unwrap();
+    e
+}
+
+#[tokio::test]
+async fn a_full_usage_window_keeps_claude_agents_wake_ups_and_sends_them_once_at_its_reset() {
+    // A reset well after the wake-ups' time to live.
+    let reset = at() + board::daemon::WAKE_TTL * 2;
+    let mut e = wakes_under_usage(five_hour_reading(100.0, reset, at()), at()).await;
+    e.daemon.flush(at()).await;
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    let kept = |d: &Daemon<FakeT3>| {
+        d.state
+            .wakes
+            .iter()
+            .map(|(agent, queue)| (agent.to_string(), queue.wakes.len()))
+            .collect::<Vec<_>>()
+    };
+    let both = [("t3:coord".to_owned(), 1), ("t3:worker".to_owned(), 1)];
+    assert_eq!(kept(&e.daemon), both, "kept, also the ready task");
+
+    // Kept after a restart, also before the daemon has a reading again.
+    e.daemon.save().unwrap();
+    let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    restarted.flush(at() + chrono::Duration::minutes(1)).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    // Kept past the time to live while a fresh reading still shows the window full.
+    let before = reset - chrono::Duration::minutes(1);
+    e.stub
+        .on("GET /v1/usage", five_hour_reading(100.0, reset, before));
+    restarted.reconcile(before).await.unwrap();
+    restarted.flush(before).await;
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    assert_eq!(kept(&restarted), both);
+
+    // At the reset both get what was kept, once.
+    restarted.flush(reset).await;
+    let sends = e.t3.sends();
+    let [(first, ready), (second, answer)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!((first.as_str(), second.as_str()), ("coord", "worker"));
+    assert!(ready.contains("factory-4 is ready"), "{ready}");
+    assert!(
+        answer.starts_with("the user answered ask #3 about factory-7"),
+        "{answer}"
+    );
+    assert!(restarted.state.wakes.is_empty());
+    restarted.flush(reset + chrono::Duration::minutes(1)).await;
+    assert_eq!(e.t3.sends().len(), 2, "once");
+}
+
+#[tokio::test]
+async fn a_usage_window_below_100_percent_keeps_no_wake_up() {
+    let reset = at() + chrono::Duration::hours(2);
+    let mut e = wakes_under_usage(five_hour_reading(99.0, reset, at()), at()).await;
+    e.daemon.flush(at()).await;
+    // Over the board's stop the ready task is dropped; the answer still goes.
+    assert_eq!(threads(&e.t3), ["worker"]);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_reading_of_a_full_usage_window_keeps_no_wake_up() {
+    let reset = at() + chrono::Duration::hours(2);
+    let stale = at() + chrono::Duration::minutes(board_proto::USAGE_FRESH_MINUTES + 1);
+    let mut e = wakes_under_usage(five_hour_reading(100.0, reset, at()), stale).await;
+    e.daemon.flush(stale).await;
+    assert_eq!(threads(&e.t3), ["coord", "worker"]);
+    assert!(e.daemon.state.wakes.is_empty());
+}
+
+#[tokio::test]
+async fn a_full_usage_window_does_not_keep_a_codex_agents_wake_up() {
+    let reset = at() + chrono::Duration::hours(2);
+    let mut e = wakes_under_usage(five_hour_reading(100.0, reset, at()), at()).await;
+    let mut codex = agent_fixture("t3:codex", DEVICE, AgentState::Idle);
+    codex.runtime = Runtime::Codex;
+    e.stub
+        .on(&format!("GET {}", agent_path("t3:codex")), &codex);
+    let ev = answered(&e, 31, 4, "t3:codex");
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    e.daemon.flush(at()).await;
+    assert_eq!(threads(&e.t3), ["codex"], "it spends another limit");
+    assert!(e.t3.sends()[0].1.contains("ask #4"));
+    assert_eq!(e.daemon.state.wakes.len(), 2, "the Claude agents' are kept");
+}
+
 #[tokio::test]
 async fn the_daemon_reads_the_usage_endpoint_at_most_every_five_minutes_and_reports_it() {
     use board::daemon::USAGE_POLL_EVERY;
