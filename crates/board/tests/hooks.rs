@@ -1858,7 +1858,7 @@ fn stop_reminds_once_per_task_marked_done_this_turn() {
     assert_eq!(reply["decision"], "block");
     assert_eq!(
         reply["reason"],
-        "board: you marked factory-12 done this turn. Before you stop, file anything still to do: sub-tasks for its scope, Proposal: tasks for found work, a blocked task with an ask for the user's part; name them in your reply."
+        "board: you marked factory-12 done this turn. Is any work left that is not on the board? If yes, file it now and name it in your reply: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. If no, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
     );
     assert_eq!(stop(&e), None, "once per task");
 
@@ -1871,6 +1871,137 @@ fn stop_reminds_once_per_task_marked_done_this_turn() {
         reason.starts_with("board: you marked factory-13 done this turn."),
         "{reason}"
     );
+}
+
+/// Files a task as the agent would from its shell (`board add`); the server answers `task`.
+fn add_task(e: &Env, task: &board_proto::Task, args: &[&str]) {
+    e.stub.on(
+        &format!("GET /v1/agents/{}", enc(CLAUDE_AGENT)),
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on("POST /v1/tasks", task);
+    let mut all = vec!["add", "Follow up", "--board", "factory"];
+    all.extend(args);
+    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
+    let out = board(&e.home, &e.repo, &env, &all, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+fn sub_task(id: &str, parent: &str) -> board_proto::Task {
+    let mut task = task_fixture(id, "Follow up");
+    task.parent = Some(parent.parse().unwrap());
+    task
+}
+
+fn proposal(id: &str) -> board_proto::Task {
+    let mut task = task_fixture(id, "Follow up");
+    task.body = "Proposal: cache the builds.".to_owned();
+    task.auto = false;
+    task
+}
+
+#[test]
+fn stop_stays_quiet_about_a_done_task_whose_sub_task_the_agent_filed() {
+    let e = env();
+    nothing_doing(&e);
+    // Filed in an earlier turn, before the done: it still counts for its parent.
+    prompt(&e, "go");
+    add_task(
+        &e,
+        &sub_task("factory-20", "factory-12"),
+        &["--parent", "factory-12"],
+    );
+    assert_eq!(stop(&e), None);
+    prompt(&e, "finish it");
+    mark_done(&e, "factory-12", None);
+    assert_eq!(stop(&e), None, "its remaining scope is on the board");
+
+    // What was filed about a task outlives the session; it answers for one done only.
+    add_task(
+        &e,
+        &sub_task("factory-22", "factory-15"),
+        &["--parent", "factory-15"],
+    );
+    session_start(&e, "resume");
+    prompt(&e, "finish that one");
+    mark_done(&e, "factory-15", None);
+    assert_eq!(stop(&e), None, "filed before the session was resumed");
+    prompt(&e, "it was opened again");
+    mark_done(&e, "factory-15", None);
+    assert!(stop(&e).is_some(), "done again with nothing new filed");
+
+    // Another task's sub-task says nothing about this one.
+    prompt(&e, "the next");
+    add_task(
+        &e,
+        &sub_task("factory-21", "factory-12"),
+        &["--parent", "factory-12"],
+    );
+    mark_done(&e, "factory-13", None);
+    let reason = stop(&e).expect("nothing filed for factory-13")["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        reason.starts_with("board: you marked factory-13 done this turn."),
+        "{reason}"
+    );
+}
+
+#[test]
+fn stop_stays_quiet_about_dones_in_a_turn_that_filed_a_proposal_or_an_ask() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "go");
+    assert!(proposal("factory-30").is_pending_proposal());
+    add_task(
+        &e,
+        &proposal("factory-30"),
+        &["--body", "Proposal: cache the builds."],
+    );
+    mark_done(&e, "factory-12", None);
+    assert_eq!(stop(&e), None, "found work is on the board");
+
+    prompt(&e, "the next");
+    let ask = board_proto::Ask {
+        id: 7,
+        board: "factory".parse().unwrap(),
+        agent: CLAUDE_AGENT.parse().unwrap(),
+        task: None,
+        kind: board_proto::AskKind::Decision,
+        question: "Which db?".into(),
+        options: vec![],
+        status: board_proto::AskStatus::Open,
+        answer: None,
+        answered_via: None,
+        created_at: chrono::Utc::now(),
+        answered_at: None,
+    };
+    e.stub.on("POST /v1/asks", &ask);
+    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
+    let out = board(
+        &e.home,
+        &e.repo,
+        &env,
+        &["ask", "Which db?", "--board", "factory"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    mark_done(&e, "factory-13", None);
+    assert_eq!(stop(&e), None, "the user's part is on the board");
+
+    // A later turn that files nothing is reminded again: the filing was the earlier turn's.
+    prompt(&e, "and another");
+    mark_done(&e, "factory-14", None);
+    let reason = stop(&e).expect("nothing filed this turn")["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        reason.starts_with("board: you marked factory-14 done this turn."),
+        "{reason}"
+    );
+    assert_eq!(stop(&e), None, "and only once");
 }
 
 #[test]
