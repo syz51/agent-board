@@ -1042,12 +1042,18 @@ pub(crate) fn resolve(
                     format!("add a note instead (task_note {id}), or ask the user"),
                 ));
             }
-            // Any agent may claim an open, unowned item, so the resolve claims it for the
-            // caller and goes on, in the same transaction. Without the doing limit: the
-            // item closes at once.
-            (None, Some(me)) if task.status == TaskStatus::Open && !task.proposal => {
+            // An unaccepted proposal cannot be claimed, so it cannot be resolved this way.
+            (None, Some(_)) if task.proposal => {
+                return Err(crate::ops::tasks::unaccepted_proposal(id));
+            }
+            // An open, unowned item is claimed for the caller in the same transaction,
+            // with task_claim's checks but the doing limit: the item closes at once.
+            (None, Some(me)) if task.status == TaskStatus::Open => {
+                crate::ops::tasks::check_blockers_done(cx, id)?;
+                crate::ops::tasks::check_not_before(cx, &task)?;
                 claim_to_resolve(cx, &task, me)?;
             }
+            // A parked (review or blocked) item: task_claim resumes it.
             (None, _) => {
                 return Err(forbidden(
                     format!("nobody owns {id}, so you may not resolve it"),
@@ -1183,11 +1189,17 @@ pub(crate) fn resolve(
 /// shows who claimed it before the resolve.
 fn claim_to_resolve(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<()> {
     let now = cx.now_ms();
-    cx.db.execute(
+    let updated = cx.db.execute(
         "UPDATE tasks SET status = 'doing', owner = ?2, doing_since = ?3, version = version + 1, \
-         updated_at = ?3 WHERE id = ?1",
-        params![task.id.as_str(), agent.as_str(), now],
+         updated_at = ?3 WHERE id = ?1 AND status = 'open' AND owner IS NULL AND version = ?4",
+        params![task.id.as_str(), agent.as_str(), now, task.version],
     )?;
+    if updated != 1 {
+        return Err(crate::error::refused(
+            format!("resolve refused: {} changed while claiming it", task.id),
+            format!("re-read it (task_show {}) and resolve it again", task.id),
+        ));
+    }
     crate::ops::join_board(cx, &task.board, agent)?;
     cx.emit(
         Some(&task.board),

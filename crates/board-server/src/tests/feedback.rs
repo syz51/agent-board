@@ -836,6 +836,36 @@ async fn resolving_an_unowned_item_claims_it_for_the_caller() {
     let mine = t.task(B, "factory", "Own work").await;
     assert!(t.claim(B, &mine).await.0.is_success());
 
+    // A resolve refused after the claim leaves the item open and unowned.
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &item,
+        json!({ "kind": "routed", "task": "nowhere-4" }),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    let task = t.get_task(&item).await;
+    assert_eq!(
+        (&task["status"], &task["owner"]),
+        (&json!("open"), &Value::Null)
+    );
+
+    // An item task_claim would refuse (here: an open blocker) is refused too.
+    let (s, v) = t.patch(A, &item, json!({ "blockers": [mine] })).await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = resolve(
+        &t,
+        Some(B),
+        &item,
+        json!({ "kind": "declined", "reason": "x" }),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("waits on"), "{v}");
+    let (s, v) = t.patch(A, &item, json!({ "blockers": [] })).await;
+    assert!(s.is_success(), "{v}");
+
     let (s, done) = resolve(
         &t,
         Some(B),
