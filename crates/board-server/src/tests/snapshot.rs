@@ -1908,8 +1908,16 @@ async fn a_paused_board_holds_its_coordinator_its_threads_and_its_workers() {
         for kind in ["full", "delta", "alerts"] {
             let snap = snapshot(&t, agent, &format!("kind={kind}")).await;
             assert_eq!(held(&snap), json!(["auto"]), "{agent} {kind}");
+            // The user's own request comes before the stop, and the stop keeps its force
+            // for every other turn.
             assert!(
-                text(&snap).contains("hold: auto paused -> the user paused this work."),
+                text(&snap).contains(
+                    "hold: auto paused -> the user paused this work. If the user's own message \
+                     in this turn asks you to go on, such as \"continue\" or \"retry\", do that \
+                     work: the hold does not stop it. In every other turn, such as a wake-up or \
+                     a child's report, stop: end this turn now, and start no task, child thread \
+                     or wake-up.\n"
+                ),
                 "{agent} {kind}: {}",
                 text(&snap)
             );
