@@ -495,8 +495,6 @@ async fn handle(
         HookEvent::SessionStart if input["source"] != "compact" => {
             hook.local.turn_started = None;
             hook.local.end_turn_hold();
-            // The subagents of an earlier session are gone, and their cursor with them.
-            hook.local.subagent_seq = None;
             if let Err(err) = state::take_done(&hook.home, &hook.agent) {
                 tracing::debug!("dropping done marks: {err:#}");
             }
@@ -1503,8 +1501,14 @@ impl Hook<'_> {
 
     async fn fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
         let since = match (kind, &self.subagent) {
-            (SnapshotKind::Full, _) => None,
-            (_, Some(_)) => self.local.subagent_seq.or(self.local.seq),
+            // A full snapshot's alerts start from the server's cursor for the agent, which
+            // a subagent's fetch moved too: from the agent's own while that one is behind.
+            (SnapshotKind::Full, _) => self
+                .local
+                .seq
+                .filter(|seq| self.local.subagent_seq.is_some_and(|sub| sub > *seq)),
+            // Never behind the agent's, so a cursor an earlier subagent left costs no scan.
+            (_, Some(_)) => self.local.subagent_seq.max(self.local.seq),
             (_, None) => self.local.seq,
         };
         self.client

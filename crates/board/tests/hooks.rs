@@ -1508,6 +1508,7 @@ fn a_subagents_tool_call_gets_only_overlaps_and_leaves_the_agents_alerts_to_it()
     heartbeat_due_again(&e);
     read_tool(&e);
     assert_eq!(snapshot_since(&e).last().unwrap(), "20");
+    // (The stub answered seq 25 to both: the agent is at 25 now, as the subagents are.)
 
     // Alerts with nothing for a subagent add no context.
     e.stub.on(
@@ -1521,15 +1522,69 @@ fn a_subagents_tool_call_gets_only_overlaps_and_leaves_the_agents_alerts_to_it()
     heartbeat_due_again(&e);
     assert_eq!(subagent_read(&e, "a-tests"), None);
 
-    // A new session's subagents start from the agent's cursor again.
-    session_start(&e, "startup");
+    // The server moved its own cursor for the agent with the subagent's fetch, and a full
+    // snapshot's alerts start there: a compaction before the agent's next heartbeat asks
+    // from the agent's cursor instead.
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
     e.stub.on(
         "GET /v1/snapshot",
-        snapshot_fixture(SnapshotKind::Alerts, "", 40),
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 45),
+    );
+    let payload = e.with("SessionStart", json!({"source": "compact"}));
+    e.hook("session-start", "claude", payload.clone());
+    assert_eq!(snapshot_since(&e).last().unwrap(), "25");
+    // Once the agent is past the subagents, the server's cursor serves again.
+    e.hook("session-start", "claude", payload);
+    assert_eq!(snapshot_since(&e).last().unwrap(), "");
+
+    // A subagent never asks from behind the agent.
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 50),
     );
     heartbeat_due_again(&e);
     subagent_read(&e, "a-later");
-    assert_eq!(snapshot_since(&e).last().unwrap(), "1");
+    assert_eq!(snapshot_since(&e).last().unwrap(), "45");
+}
+
+#[test]
+fn a_held_subagent_gets_the_hold_line_without_the_agents_alerts() {
+    let e = env();
+    quiet_stops(&e);
+    let held = |e: &Env, at: &str| {
+        let mut snap = snapshot_fixture(SnapshotKind::Alerts, "", 2);
+        snap.at = at.parse().unwrap();
+        snap.text = "<board>\nhold: factory paused -> stop\nusage: week 7%\n\
+                     ! ask 7 answered by the user -> read the answer (board_status) and act on it\n\
+                     ! t3:a91c edited \"src/lib.rs\" 3m ago; you edited it 5m ago -> re-read before editing\n\
+                     </board>"
+            .into();
+        snap.held_by = vec!["factory".parse().unwrap()];
+        snap.held_since = Some("2030-01-01T09:00:00Z".parse().unwrap());
+        e.stub.on("GET /v1/snapshot", snap);
+    };
+    // The user's message starts a turn on the paused board, so its subagent works on.
+    held(&e, "2030-01-01T10:00:00Z");
+    prompt(&e, "fix this properly");
+    heartbeat_due_again(&e);
+    let text = context(&subagent_read(&e, "a-review"), "PostToolUse");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("<board>"));
+    let hold = lines.next().unwrap();
+    assert!(
+        hold.starts_with("hold: factory paused -> the turn that launched you"),
+        "{hold}"
+    );
+    assert_eq!(
+        lines.collect::<Vec<_>>(),
+        [
+            "! t3:a91c edited \"src/lib.rs\" 3m ago; you edited it 5m ago -> re-read before editing",
+            "</board>"
+        ]
+    );
 }
 
 #[test]

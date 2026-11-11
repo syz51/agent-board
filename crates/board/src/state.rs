@@ -52,8 +52,7 @@ pub struct AgentLocal {
     pub subagent_heartbeat: Option<Timestamp>,
     /// Event sequence of the last alerts a subagent's `PostToolUse` fetched: the subagents'
     /// cursor, apart from the agent's own (`seq`), so the alerts a subagent's tool call
-    /// fetched still reach the agent. Unset until a session's first such fetch, which
-    /// starts from `seq`.
+    /// fetched still reach the agent. A subagent asks from the later of the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_seq: Option<i64>,
 }
