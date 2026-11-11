@@ -979,11 +979,14 @@ fn task_list_defaults_to_this_repos_board_and_open_work() {
         text(&plain),
         "factory-12 open p1 \"Rotate the key\" ready auto"
     );
-    let (_, q) = list(json!({"q": "key", "ready": true}));
+    let (_, q) = list(json!({"ready": true}));
     assert_eq!(scope(&q), (factory.clone(), open.clone()));
+    // A search stays on the board and finds done work too.
+    let (_, q) = list(json!({"q": "key"}));
+    assert_eq!(scope(&q), (factory.clone(), None));
 
     // The old result, asked for explicitly.
-    let (all, q) = list(json!({"all_boards": true, "closed": true}));
+    let (all, q) = list(json!({"all_boards": true, "include_closed": true}));
     assert_eq!(scope(&q), (None, None));
     assert!(text(&all).contains("factory-3 done"), "{all}");
     assert!(

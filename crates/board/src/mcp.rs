@@ -170,8 +170,10 @@ const TOOLS: &[ToolSpec] = &[
                 ("all_boards", b("List every board."), false),
                 ("status", one_of(STATUSES, "Only this status."), false),
                 (
-                    "closed",
-                    b("Include done and dropped tasks; status, parent and live do so themselves."),
+                    "include_closed",
+                    b(
+                        "Include done and dropped tasks; status, parent, live and q do so themselves.",
+                    ),
                     false,
                 ),
                 (
@@ -801,8 +803,8 @@ impl BoardMcp {
                 }
                 // The default list is this repo's open work. A filter that names its own
                 // scope keeps it: the caller's tasks and a parent's children are on any
-                // board, feedback items on the feedback board, and a status, a parent or
-                // live asks for closed tasks too. Without a board for this repo, the list
+                // board, feedback items on the feedback board, and a status, a parent,
+                // live or a search asks for closed tasks too. Without a board for this repo, the list
                 // covers every board and names them.
                 let scoped =
                     !a.all_boards && a.owner.is_none() && !a.mine && a.parent.is_none() && !a.live;
@@ -810,7 +812,11 @@ impl BoardMcp {
                     None if scoped => ctx.resolve_board(None).await.ok(),
                     board => board,
                 };
-                let open = !a.closed && a.status.is_none() && a.parent.is_none() && !a.live;
+                let open = !a.include_closed
+                    && a.status.is_none()
+                    && a.parent.is_none()
+                    && !a.live
+                    && a.q.is_none();
                 let query = TaskQuery {
                     board,
                     status: a.status,
@@ -1010,7 +1016,7 @@ struct ListArgs {
     all_boards: bool,
     status: Option<TaskStatus>,
     #[serde(default)]
-    closed: bool,
+    include_closed: bool,
     owner: Option<AgentId>,
     #[serde(default)]
     ready: bool,

@@ -477,6 +477,17 @@ pub async fn task_list(
             "{notice}\nboards listed: {}; name a board to narrow it",
             boards.join(", ")
         )
+    } else if tasks.is_empty() && query.closed == Some(false) {
+        // An empty list says what it left out, so nobody reads it as an empty board.
+        let board = query
+            .board
+            .as_ref()
+            .map(|b| format!(" on board {b}"))
+            .unwrap_or_default();
+        format!(
+            "{notice}
+looked{board} at open tasks only: done and dropped ones are left out"
+        )
     } else {
         notice
     };

@@ -814,13 +814,21 @@ impl Client {
 
     pub async fn tasks(&self, q: &TaskQuery) -> Result<Vec<Task>> {
         let mut tasks: Vec<Task> = self.get_query("/v1/tasks", q).await?;
+        let listed = tasks.len();
         // Servers that predate the `proposal` filter ignore it and return every task.
         if let Some(want) = q.proposal {
             tasks.retain(|t| t.is_pending_proposal() == want);
         }
-        // So do servers that predate the `closed` filter.
+        // So do servers that predate the `closed` filter. Their limit counted the tasks
+        // trimmed here, so a full list may have cut matching ones: say so instead.
         if let Some(want) = q.closed {
             tasks.retain(|t| matches!(t.status, TaskStatus::Done | TaskStatus::Dropped) == want);
+            let limit = q.limit.unwrap_or(board_proto::TASKS_LIMIT_DEFAULT) as usize;
+            if tasks.len() < listed && listed >= limit {
+                anyhow::bail!(
+                    "the server does not filter closed tasks yet and its list was cut; upgrade it, or name a status (`--status`, MCP: status) or a search"
+                );
+            }
         }
         // Servers that predate the `parent` filter ignore it. Trimming their list here would
         // miss children past its limit, so say so instead.

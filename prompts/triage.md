@@ -17,7 +17,7 @@ only for a cause that is already gone.
 ## Resolutions
 
 - **duplicate**: the same problem as another item that still takes reports. `task_list` the
-  board with `closed=true` (done items too) to find it. `feedback_resolve` with kind `duplicate` and `task` the
+  board with `include_closed=true` (done items too) to find it. `feedback_resolve` with kind `duplicate` and `task` the
   original's id. A recurring item is never a duplicate of a closed item (its routed task
   done or dropped, or it was fixed or forwarded): the server refuses it, because the next
   report would open yet another item. Route it as the Rules below and the refusal's hint

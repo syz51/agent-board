@@ -370,12 +370,17 @@ Reopening a closed board, or any change on it, starts the period again.
   for 50 tasks when the call names no `limit`, since its text goes into an agent's
   context; the CLI keeps the server's default. The MCP `task_list` also narrows a plain
   call to open work on one board, in the client:
-  - It sends `board=<the board of the caller's repository>` unless the call names `board`,
+  - It sends `board=<the caller's board>` (the one board the caller joined, else the
+    one active board of its repository) unless the call names `board`,
     `all_boards=true`, `mine`, `owner`, `parent` or `live`. When no single board covers
     the repository, it lists every board.
-  - It sends `closed=false` unless the call names `closed=true`, `status`, `parent` or
-    `live`.
-  - `all_boards=true` with `closed=true` gives the list of every board and every status
+  - It sends `closed=false` unless the call names `include_closed=true`, `status`,
+    `parent`, `live` or `q`: a search finds done work too, such as an earlier report of
+    the same problem. `include_closed` differs from the wire's `closed=true`, which lists
+    only the closed tasks.
+  - A list that `closed=false` left empty says so in its text. When a server that
+    predates `closed` cut its list, the client refuses the list instead of trimming it.
+  - `all_boards=true` with `include_closed=true` gives the list of every board and every status
     back. `board` with `all_boards` is refused before sending.
   - A list that names no board and no parent ends its text with
     `boards listed: <slugs>; name a board to narrow it`.

@@ -3021,6 +3021,23 @@ fn ls_without_a_board_names_the_boards_and_open_leaves_closed_tasks_out() {
     assert!(!text.contains("web-3") && text.contains("web-4"), "{text}");
     let out = e.run(&["ls", "--open", "--status", "done"]);
     assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+
+    // An older server's limit counted the closed tasks: a full list is refused, since
+    // trimming it would hide open tasks past the cut.
+    let out = e.run(&["ls", "--open", "--limit", "2"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("does not filter closed tasks yet"), "{err}");
+
+    // An empty list of open work says what it left out.
+    let mut done = task_fixture("factory-3", "Ship the page");
+    done.status = board_proto::TaskStatus::Done;
+    e.stub.on("GET /v1/tasks", [done]);
+    let text = stdout(&e.run(&["ls", "--open", "--board", "factory"]));
+    assert_eq!(
+        text,
+        "no tasks\nlooked on board factory at open tasks only: done and dropped ones are left out\n"
+    );
 }
 
 /// `board status` and `board asks` are bounded by default; `--detailed` and `--limit` give
