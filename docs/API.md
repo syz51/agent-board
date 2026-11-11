@@ -880,7 +880,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   cursor to the returned `seq`. One request checks at most 1,000 events that can concern the
   agent for alerts; past that, `seq` is the last one checked and the first alert says how
   many wait for the next request. Alerts read only the last 10,000 events; an alert names
-  the older ones skipped. `json` is
+  the older ones skipped. An alert about a peer's edit or lease that overlaps the agent's
+  ends with the action `re-read before editing` or `coordinate before editing those files`
+  (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
+  subagent only the `lines` alerts that end so. `json` is
   compact, so all three formats share the same size caps.
   `held_by` lists the held boards the agent works for: paused ones, and at the weekly hard
   line active ones too (as their coordinator, a thread it
