@@ -546,6 +546,8 @@ fn brief(home: &Home, board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> R
 pub enum RuntimeArg {
     Claude,
     Codex,
+    /// The opencode board plugin, which sends and reads Claude Code's hook JSON.
+    Opencode,
 }
 
 impl From<RuntimeArg> for board_proto::Runtime {
@@ -553,6 +555,7 @@ impl From<RuntimeArg> for board_proto::Runtime {
         match value {
             RuntimeArg::Claude => Self::Claude,
             RuntimeArg::Codex => Self::Codex,
+            RuntimeArg::Opencode => Self::Opencode,
         }
     }
 }

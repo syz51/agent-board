@@ -105,6 +105,7 @@ pub enum AgentSource {
     T3,
     Claude,
     Codex,
+    Opencode,
     /// A device daemon dispatching a board's work (`docs/API.md`, "Daemon dispatch").
     Dispatch,
 }
@@ -115,6 +116,7 @@ impl AgentId {
             Some("t3") => AgentSource::T3,
             Some("claude") => AgentSource::Claude,
             Some("dispatch") => AgentSource::Dispatch,
+            Some("opencode") => AgentSource::Opencode,
             _ => AgentSource::Codex,
         }
     }
@@ -189,8 +191,8 @@ fn check_agent_id(value: &str) -> Result<(), &'static str> {
     let (source, native) = value
         .split_once(':')
         .ok_or("must be <source>:<native id>")?;
-    if !matches!(source, "t3" | "claude" | "codex" | "dispatch") {
-        return Err("source must be t3, claude, codex or dispatch");
+    if !matches!(source, "t3" | "claude" | "codex" | "opencode" | "dispatch") {
+        return Err("source must be t3, claude, codex, opencode or dispatch");
     }
     if source == "dispatch" {
         return check_slug(native)
@@ -249,6 +251,13 @@ mod tests {
             .unwrap();
         assert_eq!(id.source(), AgentSource::T3);
         assert_eq!(id.native(), "thread:delegated-task:command%3Amcp%3A47f9");
+    }
+
+    #[test]
+    fn opencode_agent_ids_have_their_own_source() {
+        let id: AgentId = "opencode:ses_abc123".parse().unwrap();
+        assert_eq!(id.source(), AgentSource::Opencode);
+        assert_eq!(id.native(), "ses_abc123");
     }
 
     #[test]

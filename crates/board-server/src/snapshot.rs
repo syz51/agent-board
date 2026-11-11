@@ -314,7 +314,8 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
-    let latest = crate::ops::usage::latest(cx)?;
+    // The usage is the Claude account's, so its hold and lines reach only Claude agents.
+    let latest = crate::ops::usage::latest(cx)?.filter(|_| agent.runtime == Runtime::Claude);
     let hard = latest.as_ref().and_then(|u| u.hard_since(cx.now));
     let (held, held_since) = held_by(cx, &agent.id, hard)?;
     let hold_usage = (hard.is_some() && !held.is_empty())
@@ -674,6 +675,7 @@ fn runtime_str(runtime: Runtime) -> &'static str {
     match runtime {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
+        Runtime::Opencode => "opencode",
     }
 }
 

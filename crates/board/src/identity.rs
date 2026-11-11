@@ -10,12 +10,14 @@ use board_proto::{AgentId, Runtime, normalize_repo};
 pub const T3_THREAD_ENV: &str = "T3CODE_THREAD_ID";
 /// Environment variable Claude Code sets in its sessions.
 pub const CLAUDE_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+/// Environment variable the opencode board plugin sets in its sessions.
+pub const OPENCODE_SESSION_ENV: &str = "OPENCODE_SESSION_ID";
 
 /// Resolves the calling agent's id.
 ///
 /// An explicit id wins; then `T3CODE_THREAD_ID` (`t3:<id>`) unless `nested`,
-/// `CLAUDE_CODE_SESSION_ID` (`claude:<id>`), and last the session id from a hook's input
-/// (`codex:<id>` or `claude:<id>` by the hook's runtime). A `nested` session (see
+/// `CLAUDE_CODE_SESSION_ID` (`claude:<id>`), `OPENCODE_SESSION_ID` (`opencode:<id>`), and
+/// last the session id from a hook's input (`<runtime>:<id>` by the hook's runtime). A `nested` session (see
 /// [`is_nested`]) inherited the T3 thread id from the thread it runs inside, so it is
 /// identified as it would be outside T3, and the hook's own session id comes before
 /// `CLAUDE_CODE_SESSION_ID`, which a Codex session inherits from a Claude Code parent.
@@ -29,7 +31,11 @@ pub fn resolve_agent(
         return Ok(Some(id.parse().context("--agent")?));
     }
     let non_empty = |name: &str| env(name).filter(|v| !v.trim().is_empty());
-    let claude = || non_empty(CLAUDE_SESSION_ENV).map(|s| format!("claude:{}", s.trim()));
+    let claude = || {
+        non_empty(CLAUDE_SESSION_ENV)
+            .map(|s| format!("claude:{}", s.trim()))
+            .or_else(|| non_empty(OPENCODE_SESSION_ENV).map(|s| format!("opencode:{}", s.trim())))
+    };
     let hook = || {
         hook_session
             .filter(|(_, s)| !s.is_empty())
@@ -37,6 +43,7 @@ pub fn resolve_agent(
                 let source = match runtime {
                     Runtime::Claude => "claude",
                     Runtime::Codex => "codex",
+                    Runtime::Opencode => "opencode",
                 };
                 format!("{source}:{session}")
             })
@@ -349,6 +356,28 @@ mod tests {
             Some("claude:abc")
         );
         assert_eq!(agent(None, &[(T3_THREAD_ENV, " ")], None), None);
+    }
+
+    #[test]
+    fn opencode_session_comes_after_claude_and_before_the_hook_session() {
+        let hook = Some((Runtime::Opencode, "hook-sess"));
+        let open = (OPENCODE_SESSION_ENV, " ses_1 ");
+        assert_eq!(
+            agent(None, &[open], hook).as_deref(),
+            Some("opencode:ses_1")
+        );
+        assert_eq!(
+            agent(None, &[(CLAUDE_SESSION_ENV, "c"), open], hook).as_deref(),
+            Some("claude:c")
+        );
+        assert_eq!(
+            agent(None, &[(T3_THREAD_ENV, "t"), open], hook).as_deref(),
+            Some("t3:t")
+        );
+        assert_eq!(
+            agent(None, &[], hook).as_deref(),
+            Some("opencode:hook-sess")
+        );
     }
 
     #[test]

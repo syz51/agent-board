@@ -560,3 +560,63 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
     assert_eq!(snap["held_by"], Value::Null, "{snap}");
     assert!(snap.get("held_for_usage").is_none(), "{snap}");
 }
+
+#[tokio::test]
+async fn the_usage_holds_and_stops_only_claude_agents() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    let others = ["opencode:ses_1", "codex:c1"];
+    t.register(ME, Some(REPO), None).await;
+    t.register_as(others[0], "opencode", Some(REPO), None).await;
+    t.register_as(others[1], "codex", Some(REPO), None).await;
+    for agent in [ME].iter().chain(&others) {
+        let id = t.task(agent, "factory", "Work").await;
+        assert!(t.claim(agent, &id).await.0.is_success());
+    }
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.5 })))
+        .await;
+    assert!(s.is_success(), "{v}");
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(week_reading(0, 95.0, 3 * 24 * 60)),
+    )
+    .await;
+
+    let t = &t;
+    let full = |agent: &'static str| async move {
+        t.ok("GET", "/v1/snapshot?kind=full", Some(agent), None)
+            .await
+    };
+    let claude = full(ME).await;
+    assert_eq!(claude["held_by"], json!(["factory"]), "{claude}");
+    assert_eq!(claude["held_for_usage"], true);
+    assert!(
+        usage_line(claude["text"].as_str().unwrap()).is_some(),
+        "{claude}"
+    );
+    for agent in others {
+        let snap = full(agent).await;
+        assert_eq!(snap["held_by"], Value::Null, "{agent}: {snap}");
+        let text = snap["text"].as_str().unwrap();
+        assert!(!text.contains("hold:"), "{agent}: {text}");
+        assert_eq!(usage_line(text), None, "{agent}: {text}");
+    }
+
+    // A paused board still holds every runtime.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "status": "paused" })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    for agent in others {
+        let snap = full(agent).await;
+        assert_eq!(snap["held_by"], json!(["factory"]), "{agent}: {snap}");
+        assert_eq!(snap["held_for_usage"], Value::Null, "{agent}: {snap}");
+    }
+}
