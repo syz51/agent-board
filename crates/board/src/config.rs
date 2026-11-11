@@ -92,9 +92,22 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ThreadModel {
     /// The provider instance's id in T3's settings.
+    #[serde(deserialize_with = "non_empty")]
     pub provider: String,
     /// The model's slug.
+    #[serde(deserialize_with = "non_empty")]
     pub model: String,
+}
+
+/// A string with text in it: an empty one would fail every thread start.
+fn non_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    if text.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "is empty: give the T3 provider instance's id and a model slug",
+        ));
+    }
+    Ok(text)
 }
 
 impl Config {
@@ -446,6 +459,9 @@ mod tests {
         let err =
             toml::from_str::<Config>("[thread_model]\nprovider = \"claude-agents\"\n").unwrap_err();
         assert!(err.to_string().contains("model"), "{err}");
+        let err = toml::from_str::<Config>("[thread_model]\nprovider = \"\"\nmodel = \"m\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
     }
 
     #[test]
