@@ -111,13 +111,21 @@ async fn shutdown_signal() {
 /// resumes a paused feedback board, announces passed `not_before` times, quiet reviews and
 /// owners away from their `doing` tasks in one transaction, then closes or
 /// deletes idle temporary boards, one transaction per board, then prunes history past the
-/// stats window in batches.
+/// stats window in batches. The sweep of temporary boards, and the shutdown, record that the
+/// server is alive, so the next run knows how long the server was down.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let started = state.started().timestamp_millis();
         let mut tick = tokio::time::interval(SWEEP_EVERY);
         loop {
             tokio::select! {
-                () = state.stopped() => return,
+                () = state.stopped() => {
+                    let alive = state.write(move |cx| ops::boards::mark_alive(cx, started));
+                    if let Err(error) = alive.await {
+                        tracing::error!(%error, "recording the shutdown time failed");
+                    }
+                    return;
+                }
                 _ = tick.tick() => {
                     let swept = state
                         .write(|cx| {
@@ -174,15 +182,22 @@ pub(crate) struct TemporarySweep {
     pub failed: Vec<BoardSlug>,
 }
 
-/// Closes or deletes the temporary boards that are due, each in its own transaction.
+/// Closes or deletes the temporary boards that are due, each in its own transaction. First
+/// records, in a transaction of its own, that this run of the server is alive: idle time is
+/// counted less the time the server was down, which is known only once this run is
+/// recorded, so when that fails nothing is swept.
 pub(crate) async fn sweep_temporary(state: &AppState) -> TemporarySweep {
     use ops::boards::Swept;
-    let since = state.started().timestamp_millis();
     let mut out = TemporarySweep::default();
-    let due = match state
-        .read(move |cx| ops::boards::temporary_due(cx, since))
+    let started = state.started().timestamp_millis();
+    if let Err(error) = state
+        .write(move |cx| ops::boards::mark_alive(cx, started))
         .await
     {
+        tracing::error!(%error, "recording that the server is alive failed; no temporary board swept");
+        return out;
+    }
+    let due = match state.read(ops::boards::temporary_due).await {
         Ok(due) => due,
         Err(error) => {
             tracing::error!(%error, "temporary board sweep failed");
@@ -192,7 +207,7 @@ pub(crate) async fn sweep_temporary(state: &AppState) -> TemporarySweep {
     for slug in due {
         let board = slug.clone();
         match state
-            .write(move |cx| ops::boards::sweep_temporary(cx, &board, since))
+            .write(move |cx| ops::boards::sweep_temporary(cx, &board))
             .await
         {
             Ok(Some(Swept::Closed)) => {

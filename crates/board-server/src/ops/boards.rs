@@ -389,19 +389,20 @@ pub(crate) enum Swept {
 /// open ask, no task in `doing` with a live owner, and no task not done that an unfinished
 /// task on another board waits on (deleting the board would let that task start without its
 /// prerequisite). Each comes
-/// with whether it is closed and when it was last active: the newest of its own change, its
-/// newest event and `since`, the server's start, so time the server was down does not
-/// count as idle.
-fn idle_temporary(
-    cx: &Ctx<'_>,
-    since: i64,
-    only: Option<&BoardSlug>,
-) -> Result<Vec<(BoardSlug, bool, i64)>> {
+/// with whether it is closed and how long it has been idle: the time since the newer of its
+/// own change and its newest event, less the time the server was down since then. The
+/// server's notices (a `task_updated` of its own that changes no field: a quiet review, an
+/// owner away, a passed `not_before`) do not count: they repeat, or come, while the board
+/// is left alone.
+fn idle_temporary(cx: &Ctx<'_>, only: Option<&BoardSlug>) -> Result<Vec<(BoardSlug, bool, i64)>> {
     let rows: Vec<(String, String, i64)> = cx
         .db
         .prepare_cached(&format!(
-            "SELECT b.slug, b.status, MAX(:since, b.updated_at, COALESCE( \
-                 (SELECT e.at FROM events e WHERE e.board = b.slug ORDER BY e.seq DESC LIMIT 1), \
+            "SELECT b.slug, b.status, MAX(b.updated_at, COALESCE( \
+                 (SELECT e.at FROM events e WHERE e.board = b.slug \
+                  AND NOT (e.actor = 'server' AND e.type = 'task_updated' \
+                           AND json_extract(e.payload, '$.fields') = '[]') \
+                  ORDER BY e.seq DESC LIMIT 1), \
                  0)) \
              FROM boards b \
              WHERE b.temporary = 1 AND b.status != 'paused' \
@@ -422,7 +423,6 @@ fn idle_temporary(
             rusqlite::named_params! {
                 ":now": cx.now_ms(),
                 ":cutoff": cx.stale_cutoff(),
-                ":since": since,
                 ":only": only.map(BoardSlug::as_str),
             },
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -433,17 +433,43 @@ fn idle_temporary(
             Ok((
                 parse_id(&slug)?,
                 status == enum_str(&BoardStatus::Closed),
-                last,
+                cx.now_ms() - last - downtime_since(cx, last)?,
             ))
         })
         .collect()
 }
 
-/// What is due for a board last active at `last`: closing once idle for
+/// Records that the server run started at `started` is alive now. The sweeper calls it
+/// every minute, before it sweeps temporary boards, and at shutdown, so the next run knows
+/// how long the server was down.
+pub(crate) fn mark_alive(cx: &mut Ctx<'_>, started: i64) -> Result<()> {
+    cx.db
+        .prepare_cached(
+            "INSERT INTO server_runs (started_at, alive_at) VALUES (?1, ?2) \
+             ON CONFLICT (started_at) DO UPDATE SET alive_at = excluded.alive_at",
+        )?
+        .execute(params![started, cx.now_ms()])?;
+    Ok(())
+}
+
+/// How long the server was down after `last`: of each run that started after it, the time
+/// from the later of `last` and the run before's last sign of life to its start.
+fn downtime_since(cx: &Ctx<'_>, last: i64) -> Result<i64> {
+    Ok(cx
+        .db
+        .prepare_cached(
+            "SELECT COALESCE(SUM(MAX(0, started_at - MAX(before_alive, ?1))), 0) FROM ( \
+               SELECT started_at, LAG(alive_at) OVER (ORDER BY started_at) AS before_alive \
+               FROM server_runs) \
+             WHERE before_alive IS NOT NULL AND started_at > ?1",
+        )?
+        .query_row([last], |r| r.get(0))?)
+}
+
+/// What is due for a board idle for `idle`: closing once idle for
 /// `temporary_close_after_secs`, deleting once closed and idle for
 /// `temporary_delete_after_secs`.
-fn due(cx: &Ctx<'_>, closed: bool, last: i64) -> Option<Swept> {
-    let idle = cx.now_ms() - last;
+fn due(cx: &Ctx<'_>, closed: bool, idle: i64) -> Option<Swept> {
     if closed {
         (idle >= cx.s.temporary_delete_ms()).then_some(Swept::Deleted)
     } else {
@@ -451,26 +477,22 @@ fn due(cx: &Ctx<'_>, closed: bool, last: i64) -> Option<Swept> {
     }
 }
 
-/// Temporary boards due to be closed or deleted, given the server started at `since`.
-pub(crate) fn temporary_due(cx: &Ctx<'_>, since: i64) -> Result<Vec<BoardSlug>> {
-    Ok(idle_temporary(cx, since, None)?
+/// Temporary boards due to be closed or deleted.
+pub(crate) fn temporary_due(cx: &Ctx<'_>) -> Result<Vec<BoardSlug>> {
+    Ok(idle_temporary(cx, None)?
         .into_iter()
-        .filter(|&(_, closed, last)| due(cx, closed, last).is_some())
+        .filter(|&(_, closed, idle)| due(cx, closed, idle).is_some())
         .map(|(slug, _, _)| slug)
         .collect())
 }
 
 /// Closes or deletes one temporary board if that is still due. The sweep runs one
 /// transaction per board, so a failure on one does not hold up the others.
-pub(crate) fn sweep_temporary(
-    cx: &mut Ctx<'_>,
-    slug: &BoardSlug,
-    since: i64,
-) -> Result<Option<Swept>> {
-    let Some((_, closed, last)) = idle_temporary(cx, since, Some(slug))?.pop() else {
+pub(crate) fn sweep_temporary(cx: &mut Ctx<'_>, slug: &BoardSlug) -> Result<Option<Swept>> {
+    let Some((_, closed, idle)) = idle_temporary(cx, Some(slug))?.pop() else {
         return Ok(None);
     };
-    let swept = due(cx, closed, last);
+    let swept = due(cx, closed, idle);
     match swept {
         Some(Swept::Deleted) => delete(cx, "server", slug)?,
         Some(Swept::Closed) => {

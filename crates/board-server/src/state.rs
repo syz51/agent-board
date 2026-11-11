@@ -19,7 +19,8 @@ pub struct AppState {
 struct Inner {
     db: Db,
     clock: Arc<dyn Clock>,
-    /// When this server started: the temporary-board sweep counts no idle time before it.
+    /// When this server started: it names this run in `server_runs`, from which the
+    /// temporary-board sweep knows how long the server was down.
     started: Timestamp,
     settings: Settings,
     users: Vec<String>,
