@@ -668,10 +668,11 @@ pub struct Handoff {
     pub version: i64,
     pub updated_at: Timestamp,
     /// When the agent last made a change this handoff must cover, on the server's clock:
-    /// its newest claim, release, take, update or completion of a task, or its newest file
-    /// touch when that came more than 30 minutes after the handoff. A handoff older than
-    /// this is stale. It is `updated_at` when there is no such change. Absent from servers
-    /// that predate the field.
+    /// after the handoff, its newest claim, release, take or completion of a task, its
+    /// newest update of a task that is or was its own, or its newest file touch when that
+    /// came more than 30 minutes after the handoff. A handoff older than this is stale. It
+    /// is `updated_at` when there is no such change. Absent from servers that predate the
+    /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<Timestamp>,
 }

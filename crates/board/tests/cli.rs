@@ -83,6 +83,19 @@ fn ls_sends_a_search_and_says_when_the_limit_cut_the_list() {
         listed[0],
         serde_json::json!({"id": "factory-12", "title": "Rotate the key", "owner": null})
     );
+    // A name that is no field of a task, and `--fields` without `--json`, are refused
+    // before any request.
+    let out = e.run(&["ls", "--json", "--fields", "id,titel"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no field \"titel\""),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("owner_handle"), "{}", stderr(&out));
+    let out = e.run(&["ls", "--fields", "id"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("pass --json"), "{}", stderr(&out));
     // A line names the owner by its short handle when the server sends one.
     let mut owned = task_fixture("factory-13", "Owned");
     owned.owner = Some("t3:thread:a-very-long-agent-id".parse().unwrap());

@@ -86,10 +86,10 @@ struct ToolSpec {
     params: fn() -> Vec<(&'static str, Value, bool)>,
 }
 
-/// A string parameter of at most `max` characters, the server's limit.
 /// Tasks `task_list` lists when the call names no `limit`.
 const TASK_LIST_LIMIT: u32 = 50;
 
+/// A string parameter of at most `max` characters, the server's limit.
 fn s(description: &str, max: usize) -> Value {
     json!({"type": "string", "maxLength": max, "description": description})
 }

@@ -394,6 +394,16 @@ pub async fn task_list(
     detailed: bool,
     fields: Option<&[String]>,
 ) -> Result<Output> {
+    if let Some(unknown) = fields
+        .into_iter()
+        .flatten()
+        .find(|f| !TASK_FIELDS.contains(&f.as_str()))
+    {
+        bail!(
+            "--fields: a task has no field {unknown:?}; its fields are {}",
+            TASK_FIELDS.join(", ")
+        );
+    }
     // The server cuts a list at its limit without saying so: ask for one task more, so
     // the text can say that the list was cut. At the server's maximum that is a guess.
     let limit = query
@@ -439,6 +449,34 @@ pub async fn task_list(
         .collect::<Result<_>>()?;
     Ok(Output::new(text, &picked))
 }
+
+/// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
+const TASK_FIELDS: [&str; 24] = [
+    "id",
+    "board",
+    "parent",
+    "title",
+    "body",
+    "acceptance",
+    "status",
+    "priority",
+    "blocked_reason",
+    "owner",
+    "owner_handle",
+    "owner_stale",
+    "blockers",
+    "ready",
+    "proposal",
+    "not_before",
+    "auto",
+    "created_by",
+    "version",
+    "created_at",
+    "updated_at",
+    "feedback",
+    "summary",
+    "child_count",
+];
 
 pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {
     let detail = ctx.client.task(id).await?;

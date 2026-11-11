@@ -200,12 +200,13 @@ server's minute sweep deletes older ones.
   the state did not change; otherwise it is dropped. The newest 50 per agent and board are
   kept.
 - `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
-  last made a change the handoff must cover, on the same clock as `updated_at`: its newest
-  claim, release, take, update or completion of a task, or its newest file touch when that
-  came more than 30 minutes after the handoff. A handoff older than it is stale. The
-  agent's notes, new tasks, leases and asks, and file touches within those 30 minutes, do
-  not count: they leave the handoff as true as it was. Without such a change it equals
-  `updated_at`.
+  last made a change the handoff must cover, on the same clock as `updated_at`: after the
+  handoff, its newest claim, release, take or completion of a task, its newest update of a
+  task that is or was its own, or its newest file touch when that came more than 30
+  minutes after the handoff. A handoff older than it is stale. The agent's notes, new
+  tasks, leases, asks and updates of other tasks, and file touches within those 30
+  minutes, do not count: they leave the handoff as true as it was. Without such a change
+  after the handoff it equals `updated_at`.
 - `PUT /v1/agents/{id}/handoff` `[PutHandoff]` → `[Handoff]`; 409 on a version mismatch.
 - `GET /v1/agents/{id}/said?limit=` → `[Said]` list: the agent's kept turn endings,
   newest first, `limit` 1 to 50 (default 20). User only: agents never read what another
@@ -966,11 +967,13 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more. When more tasks match than
   the limit, the text output ends with a line `listed the first <n>; more match: …`; the
-  JSON output has no such sign. `--fields id,title,status` keeps only those fields of
-  each task in the JSON output; one a task does not have is `null`. A line names a task's
-  owner by `owner_handle` when the server sends it. `--search <words>` (alias `--grep`) sends `q=<words>`, at
-  most 8 words and 200 characters, refused before sending when longer. A server that
-  predates `q` ignores it and lists every task, so upgrade the server first.
+  JSON output has no such sign. With `--json`, `--fields id,title,status` keeps only
+  those fields of each task; one the task leaves out, such as `summary`, is `null`. A
+  name that is no field of `[Task]`, and `--fields` without `--json`, are refused before
+  sending. A line names a task's owner by `owner_handle` when the server sends it.
+  `--search <words>` (alias `--grep`) sends `q=<words>`, at most 8 words and 200
+  characters, refused before sending when longer. A server that predates `q` ignores it
+  and lists every task, so upgrade the server first.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
   with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every
   feedback item that still takes reports, such as declined ones and ones routed to open

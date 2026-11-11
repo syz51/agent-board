@@ -518,6 +518,7 @@ export class DevState {
     return {
       ...task,
       owner_stale: owner !== undefined && this.stale(owner),
+      owner_handle: owner?.handle ?? null,
       proposal,
       child_count: this.data.tasks.filter((item) => item.parent === task.id).length,
       ready:

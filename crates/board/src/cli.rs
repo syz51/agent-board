@@ -1128,6 +1128,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 q: a.search,
                 limit: a.limit,
             };
+            if a.fields.is_some() && !json {
+                bail!("--fields picks the fields that --json prints: pass --json with it");
+            }
             let ctx = ctx()?;
             if a.mine {
                 ctx.agent()?;

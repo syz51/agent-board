@@ -175,12 +175,12 @@ async fn handoffs_carry_the_agents_last_change() {
     let put = |now: &str| json!({ "now": now, "next": "y" });
     t.advance(TimeDelta::minutes(1));
     let h = t.ok("PUT", &path, Some(a), Some(put("claimed"))).await;
-    let claimed_at = super::iso(super::start());
-    assert_eq!(h["last_change_at"], claimed_at.as_str(), "{h}");
-    assert!(h["updated_at"].as_str() > h["last_change_at"].as_str());
+    // Changes older than the handoff are covered by it.
+    let written_at = h["updated_at"].clone();
+    assert_eq!(h["last_change_at"], written_at, "{h}");
 
-    // Presence, other agents' changes, and the agent's own notes, new tasks and leases
-    // leave the handoff as true as it was.
+    // Presence, other agents' changes, and the agent's own notes, new tasks, leases and
+    // updates of tasks that are not its own leave the handoff as true as it was.
     t.advance(TimeDelta::minutes(1));
     t.ok(
         "POST",
@@ -199,9 +199,11 @@ async fn handoffs_carry_the_agents_last_change() {
         )
         .await;
     }
-    t.task(a, "factory", "Found work").await;
+    let found = t.task(a, "factory", "Found work").await;
+    let (s, v) = t.patch(a, &found, json!({ "priority": "p3" })).await;
+    assert!(s.is_success(), "{v}");
     let h = t.ok("GET", &path, None, None).await;
-    assert_eq!(h["last_change_at"], claimed_at.as_str());
+    assert_eq!(h["last_change_at"], written_at);
 
     // File edits soon after the handoff belong to the next step: it stays current.
     let touch = || {
@@ -215,7 +217,7 @@ async fn handoffs_carry_the_agents_last_change() {
     t.advance(crate::store::handoff_files_grace() - TimeDelta::minutes(2));
     touch().await;
     let h = t.ok("GET", &path, None, None).await;
-    assert_eq!(h["last_change_at"], claimed_at.as_str());
+    assert_eq!(h["last_change_at"], written_at);
     // Edits later than that make it stale, dated on the server's clock.
     t.advance(TimeDelta::minutes(2));
     touch().await;
@@ -234,7 +236,22 @@ async fn handoffs_carry_the_agents_last_change() {
             Some(json!({ "now": "edited", "next": "y", "version": 1 })),
         )
         .await;
-    assert!(h["updated_at"].as_str() >= h["last_change_at"].as_str());
+    assert_eq!(h["last_change_at"], h["updated_at"]);
+    t.advance(TimeDelta::minutes(1));
+    let (s, v) = t.patch(a, &task, json!({ "priority": "p3" })).await;
+    assert!(s.is_success(), "{v}");
+    let h = t.ok("GET", &path, None, None).await;
+    assert!(h["last_change_at"].as_str() > h["updated_at"].as_str());
+    let version = h["version"].clone();
+    let h = t
+        .ok(
+            "PUT",
+            &path,
+            Some(a),
+            Some(json!({ "now": "updated", "next": "y", "version": version })),
+        )
+        .await;
+    assert_eq!(h["last_change_at"], h["updated_at"]);
     t.advance(TimeDelta::minutes(1));
     let (s, v) = t.done(a, &task, super::check(0)).await;
     assert!(s.is_success(), "{v}");
