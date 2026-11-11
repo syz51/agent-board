@@ -891,7 +891,7 @@ async fn try_pair(
     .await?;
     // Open asks, including those created while no chat was paired, go to the new chat.
     let open = state
-        .read(|cx| asks::list(cx, Some(board_proto::AskStatus::Open), None))
+        .read(|cx| asks::list(cx, Some(board_proto::AskStatus::Open), None, None))
         .await?;
     // One failed ask does not keep the others from the new chat.
     for ask in open {
