@@ -800,8 +800,10 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   forwarded or fixed, or it was closed without a resolution), the new item's `recurs` names
   it: the fix did not hold, or it came back.
 - `POST /v1/feedback/{id}/resolve` `[ResolveFeedback]` `{kind, task?, reason?}` → `[Task]`.
-  The item's owner (claim it first) or the user only; 403 `forbidden` otherwise, with the
-  next step. `kind` is one of:
+  The item's owner or the user only; 403 `forbidden` otherwise, with the next step. An agent
+  that resolves an `open`, unowned item claims it in the same transaction (a `task_claimed`
+  event before `task_done`; the doing limit does not apply); a caller with no agent id is
+  still refused. `kind` is one of:
   - `routed`: `task` (any board) does the work. Reports go to this item until that task is
     done or dropped; then a report opens a new item that `recurs` this one.
   - `duplicate`: `task` is the original item, which takes later reports. The original must

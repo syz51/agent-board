@@ -1042,6 +1042,12 @@ pub(crate) fn resolve(
                     format!("add a note instead (task_note {id}), or ask the user"),
                 ));
             }
+            // Any agent may claim an open, unowned item, so the resolve claims it for the
+            // caller and goes on, in the same transaction. Without the doing limit: the
+            // item closes at once.
+            (None, Some(me)) if task.status == TaskStatus::Open && !task.proposal => {
+                claim_to_resolve(cx, &task, me)?;
+            }
             (None, _) => {
                 return Err(forbidden(
                     format!("nobody owns {id}, so you may not resolve it"),
@@ -1171,6 +1177,26 @@ pub(crate) fn resolve(
         reopen_declined(cx, &live, &author, &by)?;
     }
     get_task(cx, id)
+}
+
+/// Claims an open, unowned item for `agent` as `task_claim` records it, so its history
+/// shows who claimed it before the resolve.
+fn claim_to_resolve(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<()> {
+    let now = cx.now_ms();
+    cx.db.execute(
+        "UPDATE tasks SET status = 'doing', owner = ?2, doing_since = ?3, version = version + 1, \
+         updated_at = ?3 WHERE id = ?1",
+        params![task.id.as_str(), agent.as_str(), now],
+    )?;
+    crate::ops::join_board(cx, &task.board, agent)?;
+    cx.emit(
+        Some(&task.board),
+        agent.as_str(),
+        EventType::TaskClaimed,
+        Some(&task.id),
+        serde_json::json!({ "previous_owner": null }),
+    )?;
+    Ok(())
 }
 
 /// Makes a plain task on the feedback board (filed with `task_add`, or before feedback items
