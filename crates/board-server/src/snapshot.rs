@@ -11,8 +11,9 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, BoardSlug, Dispatch, Event, EventType, Runtime,
-    Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, BoardStatus, Dispatch, Event, EventType,
+    Runtime, Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus,
+    Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -22,7 +23,7 @@ use crate::db::{Ctx, parse_enum, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
-use crate::ops::tasks::{priority_str, status_str};
+use crate::ops::tasks::{owner_session_ended, priority_str, status_str};
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
     get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
@@ -1701,12 +1702,14 @@ const DELEGATORS: &str = concat!(
 );
 
 /// Whether `agent` is told of `task`'s quiet review because nobody runs its board, and
-/// then the call that makes the task the agent's. The task is in `review`, its owner is
-/// gone, and its board has neither a live coordinator nor a daemon dispatcher, which
-/// closes such tasks itself. The task's creator (a feedback item's is only its reporter)
-/// and the threads that delegated the owner are told, as they may take the task at once.
-/// When all of them are gone too, the agents on the board's repositories are told, once
-/// the owner is stale (or the task has none), so that their take is not refused.
+/// then the call that makes the task the agent's. The task is in `review` on an active
+/// board that has neither a coordinator (the server drops one whose lease ran out) nor a
+/// daemon dispatcher, which closes such tasks itself, and a take of it is allowed: its
+/// owner is stale, or its session ended with nothing of it left to come back. The task's
+/// creator (a feedback item's is only its reporter) and the threads that delegated the
+/// owner are told, as they may take the task once the owner's session has ended. When all
+/// of them are gone too, the agents on the board's repositories are told, once the owner
+/// is stale, so that their take is not refused.
 fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<String>> {
     let id = task.as_str();
     let Some(task) = load_tasks(cx, "t.id = :id", &vec![(":id", &id)])?
@@ -1715,27 +1718,25 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
     else {
         return Ok(None);
     };
-    if task.status != TaskStatus::Review {
+    // A task in review has an owner.
+    let Some(owner) = task
+        .owner
+        .as_ref()
+        .filter(|_| task.status == TaskStatus::Review)
+    else {
+        return Ok(None);
+    };
+    let board = get_board(cx, &task.board)?;
+    if board.status != BoardStatus::Active
+        || board.coordinator.is_some()
+        || (board.dispatch == Dispatch::Daemon && board.autopilot)
+    {
         return Ok(None);
     }
-    let board = get_board(cx, &task.board)?;
-    let run = (board.dispatch == Dispatch::Daemon && board.autopilot)
-        || match &board.coordinator {
-            Some(coordinator) => !agent_gone(cx, coordinator.as_str())?,
-            None => false,
-        };
-    if run {
+    if !task.owner_stale && !owner_session_ended(cx, owner)? {
         return Ok(None);
     }
     let me = agent.id.as_str();
-    let Some(owner) = &task.owner else {
-        // Nobody to stand in for: a plain claim resumes it.
-        let on_repo = agent.repo.as_ref().is_some_and(|r| board.repos.contains(r));
-        return Ok(on_repo.then(|| format!("task_claim {id}")));
-    };
-    if !agent_gone(cx, owner.as_str())? {
-        return Ok(None);
-    }
     let mut near: Vec<String> = cx
         .db
         .prepare_cached(DELEGATORS)?
@@ -1752,9 +1753,10 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(Some(take));
     }
     for other in &near {
-        if !agent_gone(cx, other)? {
-            return Ok(None);
+        if agent_gone(cx, other)? {
+            continue;
         }
+        return Ok(None);
     }
     let on_repo = agent.repo.as_ref().is_some_and(|r| board.repos.contains(r));
     Ok((task.owner_stale && on_repo).then_some(take))

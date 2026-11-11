@@ -1020,6 +1020,138 @@ async fn a_quiet_review_on_a_board_nobody_runs_goes_to_who_can_finish_it() {
     assert_eq!(taken["owner"], peer);
 }
 
+#[tokio::test]
+async fn a_quiet_review_is_not_passed_on_while_the_board_is_run_or_paused() {
+    let t = T::new();
+    let (maker, child, coordinator) = ("t3:maker", "t3:child", "t3:coord");
+    for agent in [maker, child, coordinator] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    let lease = || async {
+        t.ok(
+            "POST",
+            "/v1/boards/auto/coordinator",
+            Some(coordinator),
+            Some(json!({ "device": "mac", "agent": coordinator })),
+        )
+        .await;
+    };
+    let id = t.task(maker, "auto", "Wait on the merge").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(child, &id, review).await.0.is_success());
+    let told = || async {
+        t.register(maker, Some(REPO), None).await;
+        assert_eq!(sweep_quiet_reviews(&t), 1);
+        let delta = snapshot(&t, maker, "kind=delta").await;
+        text(&delta).contains(&format!("{id} has sat in review"))
+    };
+    told_nothing_yet(&t, maker).await;
+    set_state(&t, child, "ended").await;
+
+    // A coordinator holds the board: the notice is its own, even when its thread ended.
+    t.advance(TimeDelta::hours(25));
+    lease().await;
+    set_state(&t, coordinator, "ended").await;
+    assert!(!told().await);
+
+    // Its lease ran out, but the board is paused: nobody is to work on it.
+    let t = &t;
+    let status = |status: &'static str| async move {
+        t.ok(
+            "PATCH",
+            "/v1/boards/auto",
+            None,
+            Some(json!({ "status": status })),
+        )
+        .await;
+    };
+    status("paused").await;
+    t.advance(TimeDelta::hours(25));
+    assert!(!told().await);
+
+    // Active again and still without a coordinator: the creator is told, and may take it.
+    status("active").await;
+    t.advance(TimeDelta::hours(25));
+    assert!(told().await);
+    let taken = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{id}/take"),
+            Some(maker),
+            Some(json!({ "agent": maker })),
+        )
+        .await;
+    assert_eq!(taken["owner"], maker);
+}
+
+async fn told_nothing_yet(t: &T, agent: &str) {
+    snapshot(t, agent, "kind=delta").await;
+}
+
+#[tokio::test]
+async fn a_creator_is_told_of_a_quiet_review_only_once_it_may_take_it() {
+    let t = T::new();
+    let (maker, child) = ("t3:maker", "t3:child");
+    for agent in [maker, child] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.board("factory", &[REPO]).await;
+    let id = t.task(maker, "factory", "Wait on the merge").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(child, &id, review).await.0.is_success());
+    told_nothing_yet(&t, maker).await;
+    let take = || async {
+        let body = json!({ "agent": maker });
+        t.call(
+            "POST",
+            &format!("/v1/tasks/{id}/take"),
+            Some(maker),
+            Some(body),
+        )
+        .await
+    };
+
+    // The owner stopped a moment ago, and is neither ended nor stale: a take is refused,
+    // so the creator is not sent to one.
+    t.advance(TimeDelta::hours(25));
+    for agent in [maker, child] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    set_state(&t, child, "idle").await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, maker, "kind=delta").await;
+    assert!(
+        !text(&delta).contains("has sat in review"),
+        "{}",
+        text(&delta)
+    );
+    assert!(!take().await.0.is_success());
+
+    // Ended, and not yet stale: the creator is told at once, and the take works.
+    t.advance(TimeDelta::hours(25));
+    for agent in [maker, child] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    set_state(&t, child, "ended").await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, maker, "kind=delta").await;
+    assert!(
+        text(&delta).contains(&format!("task_claim {id} take=true")),
+        "{}",
+        text(&delta)
+    );
+    assert!(take().await.0.is_success());
+}
+
 fn sweep_quiet_reviews(t: &T) -> usize {
     t.state
         .db()

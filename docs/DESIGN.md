@@ -99,8 +99,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
-  when the owner is gone. When the owner is gone and nobody runs the board (no live
-  coordinator, and no daemon dispatch, which closes reviewed tasks itself), the alert goes
+  when the owner is gone. When the owner is stale or its session ended, and nobody runs the
+  active board (no coordinator, and no daemon dispatch, which closes reviewed tasks
+  itself), the alert goes
   to the agents that may take the task at once: its creator and the threads that delegated
   its owner. When they are gone too, it goes to every agent on one of the board's
   repositories, once the owner is stale, so that the take is not refused. That alert says
