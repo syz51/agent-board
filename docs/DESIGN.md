@@ -507,9 +507,15 @@ of the board's repos; a board none of whose repos is mapped there, such as a fee
 with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
 registers without a repo). Each reconcile first re-reads `config.toml` when its text
 changed: new `[projects]`, `[board_projects]` and `feedback_board` apply at once and clear
-the start back-offs, since a missing project may be what failed; `server`, `device` and
-`t3_bin` stay as started, with a warning to restart; a file gone or invalid keeps the
-settings in use, warned once per edit.
+the start back-offs, since a missing project may be what failed; `server`, `device`,
+`t3_bin` and `[thread_model]` stay as started, with a warning to restart; a file gone or
+invalid keeps the settings in use, warned once per edit.
+
+With `[thread_model]` (`provider`, `model`) in `config.toml`, the daemon starts each
+thread (coordinators, workers and judges) on that T3 provider instance and model
+(`t3 thread start --provider --model`); without it, on the project's defaults. T3 gives a
+thread nothing else of its own to set, so the instance carries what agent threads need
+apart from the user's chats, such as environment variables.
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
