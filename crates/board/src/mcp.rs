@@ -203,6 +203,19 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 (
+                    "since",
+                    s(
+                        "Only tasks changed after this: an event seq, a time, or a duration back such as 2h.",
+                        TIME_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "after",
+                    task_arg("Continue a cut list after this task."),
+                    false,
+                ),
+                (
                     "limit",
                     json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 50."}),
                     false,
@@ -221,6 +234,14 @@ const TOOLS: &[ToolSpec] = &[
         params: || {
             vec![
                 ("id", task_arg("Task id, such as factory-12."), true),
+                (
+                    "ids",
+                    strings(
+                        "More tasks in the same call, at most 20 in all, each in a compact form.",
+                        TASK_ID_MAX,
+                    ),
+                    false,
+                ),
                 ("detailed", b(DETAILED_ARG), false),
             ]
         },
@@ -794,6 +815,11 @@ impl BoardMcp {
                     parent: a.parent,
                     live: a.live.then_some(true),
                     q: a.q,
+                    since: a
+                        .since
+                        .map(|s| ops::list_since(&s, chrono::Utc::now()))
+                        .transpose()?,
+                    after: a.after,
                     // Fewer than the CLI lists: the text goes into the agent's context.
                     limit: Some(a.limit.unwrap_or(TASK_LIST_LIMIT)),
                 };
@@ -801,7 +827,8 @@ impl BoardMcp {
             }
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;
-                ops::task_show(&ctx, &a.id, a.detailed).await?
+                let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
+                ops::tasks_show(&ctx, &ids, a.detailed).await?
             }
             "task_add" => {
                 let a: AddArgs = parse(name, args)?;
@@ -990,6 +1017,8 @@ struct ListArgs {
     #[serde(default)]
     live: bool,
     q: Option<String>,
+    since: Option<String>,
+    after: Option<TaskId>,
     limit: Option<u32>,
     #[serde(default)]
     detailed: bool,
@@ -999,6 +1028,8 @@ struct ListArgs {
 #[serde(deny_unknown_fields)]
 struct ShowArgs {
     id: TaskId,
+    #[serde(default)]
+    ids: Vec<TaskId>,
     #[serde(default)]
     detailed: bool,
 }
@@ -1250,7 +1281,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 15_800, "tool list: {schemas}");
+        assert!(schemas < 16_100, "tool list: {schemas}");
         for rule in [
             "Call board_snapshot when",
             "Claim a task before working on it",

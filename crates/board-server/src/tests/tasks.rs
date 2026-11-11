@@ -3096,3 +3096,177 @@ async fn q_lists_the_tasks_that_hold_every_word() {
         assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
     }
 }
+
+/// The ids of a task list, in the order the server gave them.
+fn listed(v: &Value) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn since_lists_the_tasks_changed_after_a_time_or_an_event() {
+    let t = setup().await;
+    let old = t.task(A, "factory", "Old").await;
+    let noted = t.task(A, "factory", "Noted").await;
+    let claimed = t.task(A, "factory", "Claimed").await;
+    let seq = t.ok("GET", "/v1/events?since=0", None, None).await["next_since"]
+        .as_i64()
+        .unwrap();
+    let before = super::iso(t.state.now());
+    t.advance(TimeDelta::minutes(5));
+
+    // Nothing changed after either point yet.
+    for since in [seq.to_string(), before.clone()] {
+        let found = t
+            .ok("GET", &format!("/v1/tasks?since={since}"), None, None)
+            .await;
+        assert_eq!(listed(&found), Vec::<String>::new(), "since={since}");
+    }
+
+    // A note, a claim and a new task are changes; the untouched task stays out.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{noted}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": "seen" })),
+    )
+    .await;
+    assert!(t.claim(A, &claimed).await.0.is_success());
+    let new = t.task(B, "factory", "New").await;
+    for since in [seq.to_string(), before.clone()] {
+        let found = t
+            .ok("GET", &format!("/v1/tasks?since={since}"), None, None)
+            .await;
+        assert_eq!(
+            listed(&found),
+            vec![noted.clone(), claimed.clone(), new.clone()],
+            "since={since}"
+        );
+        assert!(!listed(&found).contains(&old));
+    }
+    // A lease held for a task and the server's own notice about one are not changes.
+    t.task_with(
+        A,
+        json!({
+            "board": "factory", "title": "Later",
+            "not_before": super::iso(t.state.now() + TimeDelta::minutes(1)),
+        }),
+    )
+    .await;
+    let quiet = t.count("SELECT MAX(seq) FROM events");
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(A),
+        Some(json!({ "agent": A, "repo": REPO, "globs": ["src/**"], "task": old })),
+    )
+    .await;
+    assert_eq!(announce_not_before(&t), 1);
+    assert!(t.count("SELECT MAX(seq) FROM events") >= quiet + 2);
+    let found = t
+        .ok("GET", &format!("/v1/tasks?since={quiet}"), None, None)
+        .await;
+    assert_eq!(listed(&found), Vec::<String>::new());
+    // It combines with the other filters, and a time may carry an offset.
+    let found = t
+        .ok(
+            "GET",
+            &format!("/v1/tasks?since={seq}&status=doing"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(listed(&found), vec![claimed]);
+    let found = t
+        .ok(
+            "GET",
+            "/v1/tasks?since=2026-11-06T21:00:00%2B09:00",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(listed(&found).len(), 4, "the four changed after 12:00Z");
+    // A blank since is no filter; anything else must be a sequence number or a time.
+    let found = t.ok("GET", "/v1/tasks?since=", None, None).await;
+    assert_eq!(found.as_array().unwrap().len(), 5);
+    for since in ["yesterday", "-1", "99999999999999999999", "2026-11-06"] {
+        let (s, code, v) = t
+            .fail("GET", &format!("/v1/tasks?since={since}"), None, None)
+            .await;
+        assert_eq!((s, code.as_str()), (400, "invalid"), "{since}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn after_continues_a_cut_list_in_list_order() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let mut all = Vec::new();
+    for (board, title, priority) in [
+        ("factory", "Low one", "p3"),
+        ("factory", "High one", "p1"),
+        ("other", "Other board, same number", "p3"),
+        ("factory", "Middle", "p2"),
+        ("factory", "High two", "p1"),
+        ("factory", "Low two", "p3"),
+    ] {
+        all.push(
+            t.task_with(
+                A,
+                json!({ "board": board, "title": title, "priority": priority }),
+            )
+            .await,
+        );
+    }
+    let whole = listed(&t.ok("GET", "/v1/tasks", None, None).await);
+    assert_eq!(whole.len(), all.len());
+
+    // Pages of two, each continued from the last task of the one before, give the whole
+    // list once: priority, then id number, then board.
+    let mut paged: Vec<String> = Vec::new();
+    loop {
+        let after = paged
+            .last()
+            .map(|id| format!("&after={id}"))
+            .unwrap_or_default();
+        let page = listed(
+            &t.ok("GET", &format!("/v1/tasks?limit=2{after}"), None, None)
+                .await,
+        );
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2);
+        paged.extend(page);
+    }
+    assert_eq!(paged, whole);
+
+    // The cursor need not pass the filters of the list it continues.
+    let p3 = listed(
+        &t.ok(
+            "GET",
+            &format!("/v1/tasks?board=factory&after={}", whole[1]),
+            None,
+            None,
+        )
+        .await,
+    );
+    assert_eq!(p3, vec![all[3].clone(), all[0].clone(), all[5].clone()]);
+    // After the last task nothing follows.
+    let last = whole.last().unwrap();
+    let found = t
+        .ok("GET", &format!("/v1/tasks?after={last}"), None, None)
+        .await;
+    assert_eq!(listed(&found), Vec::<String>::new());
+
+    let (s, code, v) = t
+        .fail("GET", "/v1/tasks?after=factory-999", None, None)
+        .await;
+    assert_eq!((s, code.as_str()), (404, "not_found"), "{v}");
+    let (s, _, v) = t.fail("GET", "/v1/tasks?after=nope", None, None).await;
+    assert_eq!(s, 400, "{v}");
+}
