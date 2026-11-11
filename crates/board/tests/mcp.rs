@@ -907,8 +907,8 @@ fn task_list_sends_a_search_and_says_when_the_limit_cut_the_list() {
 
     // The call asks for one task more than the limit, so the text says when the list
     // was cut, before the peers' text.
-    // An MCP list is 50 tasks unless the call names a limit.
-    assert_eq!(requests[0].query_pairs()["limit"], "51");
+    // An MCP list is 25 tasks unless the call names a limit.
+    assert_eq!(requests[0].query_pairs()["limit"], "26");
     let cut = mcp.call(3, "task_list", json!({"limit": 1, "detailed": true}));
     assert_eq!(
         stub.requests_to("GET /v1/tasks")[1].query_pairs()["limit"],

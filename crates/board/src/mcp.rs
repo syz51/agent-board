@@ -83,7 +83,7 @@ struct ToolSpec {
 }
 
 /// Tasks `task_list` lists when the call names no `limit`.
-const TASK_LIST_LIMIT: u32 = 50;
+const TASK_LIST_LIMIT: u32 = 25;
 
 /// A string parameter of at most `max` characters, the server's limit.
 fn s(description: &str, max: usize) -> Value {
@@ -231,7 +231,7 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "limit",
-                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 50."}),
+                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 25."}),
                     false,
                 ),
                 (
