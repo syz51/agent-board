@@ -480,7 +480,12 @@ Reopening a closed board, or any change on it, starts the period again.
   move. The task is unchanged. While it stays quiet the event repeats every
   `review_quiet_secs`; a note from the owner or a new move to `review` restarts the clock.
   The snapshot shows it as an alert to the owner, or to the board's coordinator when the
-  owner has ended or is not live.
+  owner has ended or is not live. When the owner is gone and the board has neither a live
+  coordinator nor daemon dispatch, the alert goes to the task's creator (not a feedback
+  item's reporter) and the threads that delegated its owner, those that are live; when none
+  is, to the agents registered on one of the board's repositories, once the owner is stale
+  (or the task has no owner). It then names the task and the action: check its PR, and
+  once it merged, `task_claim <id> take=true`, then `task_done <id>`.
 - Within a minute of a task in `doing`, on an active board, passing `doing_idle_secs` with
   its owner away, the server records one `task_updated` event by actor `server` with
   payload `{"fields": [], "idle_doing": <time>, "away": <agent id>}`: `idle_doing` is when

@@ -923,6 +923,103 @@ async fn a_quiet_review_whose_owner_ended_goes_to_the_coordinator() {
     assert!(quiet(&delta), "{}", text(&delta));
 }
 
+#[tokio::test]
+async fn a_quiet_review_on_a_board_nobody_runs_goes_to_who_can_finish_it() {
+    let t = T::new();
+    let (maker, parent, child, peer, far) =
+        ("t3:maker", "t3:parent", "t3:child", "t3:peer", "t3:far");
+    for agent in [maker, parent, peer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    t.register(far, Some("github.com/example/other"), None)
+        .await;
+    let register_child = || async {
+        t.ok(
+            "POST",
+            "/v1/agents",
+            Some(child),
+            Some(json!({
+                "id": child, "runtime": "claude", "device": "mac", "repo": REPO,
+                "native_ids": {"t3_thread": "child", "t3_parent": "parent"},
+            })),
+        )
+        .await;
+    };
+    register_child().await;
+    // No autopilot, so no coordinator.
+    t.board("factory", &[REPO]).await;
+    let id = t.task(maker, "factory", "Wait on the merge").await;
+    assert!(t.claim(child, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(child, &id, review).await.0.is_success());
+    let everyone = [maker, parent, peer, far];
+    let told = |agent: &'static str| async {
+        let delta = snapshot(&t, agent, "kind=delta").await;
+        text(&delta).to_owned()
+    };
+    for agent in everyone {
+        told(agent).await;
+    }
+    let orphan = format!(
+        "{id} has sat in review for 25h; its owner is gone and its board has no coordinator \
+         -> check its PR; once merged, task_claim {id} take=true, then task_done {id}"
+    );
+
+    // While the owner lives, the reminder is the owner's alone.
+    t.advance(TimeDelta::hours(23));
+    for agent in everyone {
+        t.register(agent, None, None).await;
+    }
+    register_child().await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    for agent in everyone {
+        let text = told(agent).await;
+        assert!(!text.contains("has sat in review"), "{agent}: {text}");
+    }
+
+    // The owner ended: its creator and the thread that delegated it may take it at once,
+    // so they are told, and nobody else.
+    set_state(&t, child, "ended").await;
+    t.advance(TimeDelta::hours(25));
+    for agent in everyone {
+        t.register(agent, None, None).await;
+    }
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    for agent in [maker, parent] {
+        let text = told(agent).await;
+        assert!(
+            text.contains(&orphan.replace("25h", "2d")),
+            "{agent}: {text}"
+        );
+    }
+    for agent in [peer, far] {
+        let text = told(agent).await;
+        assert!(!text.contains("has sat in review"), "{agent}: {text}");
+    }
+
+    // Both gone too: an agent on the board's repository is told, and may take the task
+    // of an owner now stale. An agent on another repository is not.
+    t.advance(TimeDelta::hours(25));
+    t.register(peer, Some(REPO), None).await;
+    t.register(far, Some("github.com/example/other"), None)
+        .await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let text = told(peer).await;
+    assert!(text.contains(&orphan.replace("25h", "3d")), "{text}");
+    let text = told(far).await;
+    assert!(!text.contains("has sat in review"), "{text}");
+    let taken = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{id}/take"),
+            Some(peer),
+            Some(json!({ "agent": peer })),
+        )
+        .await;
+    assert_eq!(taken["owner"], peer);
+}
+
 fn sweep_quiet_reviews(t: &T) -> usize {
     t.state
         .db()
