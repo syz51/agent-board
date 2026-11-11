@@ -1578,8 +1578,9 @@ impl<T: T3> Daemon<T> {
 
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
-    /// since a missing project may be what failed. `server`, `device` and `t3_bin` are
-    /// fixed while the daemon runs, so changing them asks for a restart. A file gone or
+    /// since a missing project may be what failed. `server`, `device`, `t3_bin` and
+    /// `[thread_model]` are fixed while the daemon runs, so changing them asks for a
+    /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
     fn reload_config(&mut self) {
         let path = self.ctx.home.config_path();
@@ -1611,11 +1612,16 @@ impl<T: T3> Daemon<T> {
             }
         };
         let current = &mut self.ctx.config;
-        if (&new.server, &new.device, &new.t3_bin)
-            != (&current.server, &current.device, &current.t3_bin)
+        if (&new.server, &new.device, &new.t3_bin, &new.thread_model)
+            != (
+                &current.server,
+                &current.device,
+                &current.t3_bin,
+                &current.thread_model,
+            )
         {
             tracing::warn!(
-                "{} changes server, device or t3_bin: restart board watch to apply them",
+                "{} changes server, device, t3_bin or thread_model: restart board watch to apply them",
                 path.display()
             );
         }
@@ -5364,7 +5370,8 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
-    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
+    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref())
+        .with_thread_model(ctx.config.thread_model.clone());
     tracing::info!(
         "watching as device {} with {}",
         ctx.device,

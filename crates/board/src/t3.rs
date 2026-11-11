@@ -35,6 +35,8 @@ pub const PULL_REQUEST_UPDATE: &str = "Update on pull request";
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
+use crate::config::ThreadModel;
+
 /// What the daemon needs to know about a thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadInfo {
@@ -156,6 +158,9 @@ pub trait T3: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct T3Cli {
     pub bin: PathBuf,
+    /// The provider instance and model new threads start with; `None` leaves the
+    /// project's defaults.
+    pub thread_model: Option<ThreadModel>,
 }
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -182,7 +187,16 @@ impl T3Cli {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from("t3"))
         });
-        Self { bin }
+        Self {
+            bin,
+            thread_model: None,
+        }
+    }
+
+    /// Starts new threads with `thread_model` when one is given.
+    pub fn with_thread_model(mut self, thread_model: Option<ThreadModel>) -> Self {
+        self.thread_model = thread_model;
+        self
     }
 
     /// What T3 says of `thread`: its parent, title and link; `None` when T3 does not know
@@ -258,6 +272,9 @@ impl T3 for T3Cli {
         let mut args = vec!["thread", "start", "--json", "--title", title];
         if let Some(worktree) = worktree {
             args.extend(["--worktree", &worktree.base, "--branch", &worktree.branch]);
+        }
+        if let Some(ThreadModel { provider, model }) = &self.thread_model {
+            args.extend(["--provider", provider, "--model", model]);
         }
         args.extend([&*project, "-"]);
         let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
@@ -482,7 +499,7 @@ mod tests {
                 log.display()
             ),
         );
-        (T3Cli { bin }, log)
+        (T3Cli::locate(Some(&bin)), log)
     }
 
     #[cfg(unix)]
@@ -518,6 +535,25 @@ mod tests {
         assert_eq!(
             args(),
             "thread\nstart\n--json\n--title\nfactory coordinator\n/src/p\n-\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn threads_start_on_the_configured_provider_instance_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t3, log) = recording_t3(dir.path());
+        let t3 = t3.with_thread_model(Some(ThreadModel {
+            provider: "claude-agents".into(),
+            model: "a-model".into(),
+        }));
+
+        t3.start_thread(Path::new("/src/p"), "factory coordinator", "hi", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "thread\nstart\n--json\n--title\nfactory coordinator\n--provider\nclaude-agents\n\
+             --model\na-model\n/src/p\n-\n"
         );
     }
 
