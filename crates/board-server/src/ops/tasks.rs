@@ -1107,26 +1107,22 @@ fn withdraw_hint(ask: i64) -> String {
 /// Resumes a parked task (review or blocked) that is the caller's or nobody's, for
 /// `claim`: a claim's checks, then `update` with `status: doing`, so the change and its
 /// event are the same as `task_update status=doing` and stats do not count it as a claim
-/// from ready. A `blocked_reason` or an open ask on the task refuses it: it may wait on the
-/// user.
+/// from ready. An open ask on the task refuses it: it waits on the user. So does a
+/// `blocked_reason` on nobody's task, which may name such a wait; the owner set its own
+/// reason and judges when it no longer holds, so its claim clears it, as `status: doing`
+/// does.
 fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
     let id = &task.id;
     // Stored only on blocked tasks and only when not blank.
-    if let Some(reason) = &task.blocked_reason {
+    if let Some(reason) = &task.blocked_reason
+        && task.owner.as_ref() != Some(agent)
+    {
         return Err(bad_transition(
             format!("{id} is blocked for \"{reason}\", so claiming does not resume it"),
-            if task.owner.as_ref() == Some(agent) {
-                format!(
-                    "once \"{reason}\" no longer holds, resume it ({}), which clears the \
-                     reason, or close it with task_done {id} if its work is finished",
-                    resume_hint(id)
-                )
-            } else {
-                format!(
-                    "once \"{reason}\" no longer holds, clear the reason with task_update {id} \
-                     status=open, then task_claim {id}"
-                )
-            },
+            format!(
+                "once \"{reason}\" no longer holds, clear the reason with task_update {id} \
+                 status=open, then task_claim {id}"
+            ),
         ));
     }
     if let Some(ask) = open_ask(cx, id)? {

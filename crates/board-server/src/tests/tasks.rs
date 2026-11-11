@@ -750,7 +750,8 @@ async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
     assert!(s.is_success(), "{v}");
     assert_eq!(v["status"], "doing", "{v}");
 
-    // A blocked reason may name a wait on the user: refused, quoting it.
+    // The owner set its own reason and judges when it no longer holds: its claim clears
+    // the reason and resumes the task, as task_update status=doing does.
     let asked = t.task(A, "factory", "Waits on the user").await;
     assert!(t.claim(A, &asked).await.0.is_success());
     let (s, v) = t
@@ -761,22 +762,59 @@ async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
         )
         .await;
     assert!(s.is_success(), "{v}");
+    // While its ask is open, the task waits on the user: refused, naming the ask.
+    let ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "task": asked, "kind": "decision",
+                "question": "Go ahead?", "options": ["yes", "no"],
+            })),
+        )
+        .await;
     let (s, v) = t.claim(A, &asked).await;
     assert_eq!(
         (s.as_u16(), v["code"].as_str()),
         (400, Some("invalid_transition")),
         "{v}"
     );
-    // The owner keeps its task: it resumes it, or closes it if the work is finished.
-    let next = v["next"].as_str().unwrap();
     assert!(
-        next.contains("\"waiting on ask #12\"")
-            && next.contains(&format!("task_update {asked} status=doing"))
-            && next.contains(&format!("task_done {asked}"))
-            && !next.contains("status=open"),
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("waits on ask #{}", ask["id"])),
         "{v}"
     );
     assert_eq!(t.get_task(&asked).await["status"], "blocked", "{v}");
+    // Once the ask is closed, the same claim resumes the task.
+    t.ok(
+        "POST",
+        &format!("/v1/asks/{}/withdraw", ask["id"]),
+        Some(A),
+        Some(json!({ "agent": A })),
+    )
+    .await;
+    let (s, v) = t.claim(A, &asked).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(A)),
+        "{v}"
+    );
+    assert_eq!(v["blocked_reason"], Value::Null, "{v}");
+    let events = events_of(&t, &asked).await;
+    assert_eq!(
+        events.last().unwrap(),
+        &(
+            "task_updated".to_owned(),
+            json!({
+                "fields": ["status", "blocked_reason"], "from": "blocked", "to": "doing"
+            })
+        ),
+        "{events:?}"
+    );
 
     // Nobody's task blocked with a reason: the hint names clearing it, then claiming.
     let held = t.task(A, "factory", "Held for the user").await;
