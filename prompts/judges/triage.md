@@ -12,7 +12,7 @@ reports and reporters, and `recurs`), choose one resolution, carry it out, then
 **Resolutions**:
 
 - **duplicate**: the same problem as another item that still takes reports. `task_list`
-  the board, done items too. Resolve with `task` the original's id.
+  board {board} with `include_closed=true`, done items too. Resolve with `task` the original's id.
 - **routed**: the owner should change something. `task_add` on the owner's board with
   `auto=false`: an imperative title; a priority by the scale above; a body that starts
   `Proposal:`, stands alone, says what is wrong and what to change, and cites this item's

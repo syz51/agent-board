@@ -286,7 +286,7 @@ the header of peer text in a tool result. And the `ask_user` description names t
 for an ask, where the agent reads them as it asks. The instructions ask for `board_snapshot`
 only when the context holds no board state, since `SessionStart` injects the snapshot at
 start-up and after compaction. Tests pin the sizes: the instructions under 1,440
-characters, the tool list under 16,100.
+characters, the tool list under 16,500.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.

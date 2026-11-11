@@ -3389,6 +3389,48 @@ async fn the_search_follows_every_write() {
     );
 }
 
+#[tokio::test]
+async fn the_closed_filter_splits_done_and_dropped_from_the_rest() {
+    let t = setup().await;
+    let open = task_in(&t, TaskStatus::Open).await;
+    let done = task_in(&t, TaskStatus::Done).await;
+    let dropped = task_in(&t, TaskStatus::Dropped).await;
+    let review = task_in(&t, TaskStatus::Review).await;
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let all = t.ok("GET", "/v1/tasks?board=factory", None, None).await;
+    assert_eq!(ids(&all).len(), 4);
+    let live = t
+        .ok("GET", "/v1/tasks?board=factory&closed=false", None, None)
+        .await;
+    assert_eq!(ids(&live), [open.clone(), review.clone()]);
+    let closed = t
+        .ok("GET", "/v1/tasks?board=factory&closed=true", None, None)
+        .await;
+    assert_eq!(ids(&closed), [done.clone(), dropped]);
+    // It combines with the other filters.
+    let none = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=factory&status=done&closed=false",
+            None,
+            None,
+        )
+        .await;
+    assert!(ids(&none).is_empty());
+    let (s, v) = t.call("GET", "/v1/tasks?closed=maybe", None, None).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+}
+
 /// The ids of a task list, in the order the server gave them.
 fn listed(v: &Value) -> Vec<String> {
     v.as_array()
