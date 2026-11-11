@@ -77,8 +77,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   removes its tasks and history: by the user at any time, or by the server for a board
   marked `temporary` (for a test or a one-off; only the user marks an existing board). The
   server closes a temporary board after a day idle and deletes it a week after that. Idle
-  means no event on the board, no open ask and no live owner of a task in `doing`; time
-  the server was down does not count. A task in `review` or `blocked` does not keep a
+  means no event on the board but the server's own notices, no open ask and no live owner
+  of a task in `doing`; time the server was down does not count, and a restart does not
+  start the period again. A task in `review` or `blocked` does not keep a
   temporary board: an open ask is how a board waits on the user. Only the flag decides,
   never the title, so a real board is never removed by accident. Ids are never reused: a
   slug created again continues its task numbering, and ask ids are not handed out again.
