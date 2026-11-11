@@ -474,6 +474,11 @@ pub struct DoneTask {
     /// characters. Shown in the web view's updates; servers that predate it ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Close a task in `review` whose owner is stale, taking it in the same step, without
+    /// a move to `doing`. Servers that predate it ignore it and refuse the caller as not
+    /// the owner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub take: bool,
 }
 
 /// Longest `DoneTask.summary`, in characters.
@@ -1068,6 +1073,20 @@ mod tests {
         let set: UpdateBoard =
             serde_json::from_value(serde_json::json!({ "dispatch": "daemon" })).unwrap();
         assert_eq!(set.dispatch, Some(Dispatch::Daemon));
+    }
+
+    #[test]
+    fn done_task_take_is_false_when_absent_and_left_out_when_false() {
+        let req: DoneTask = serde_json::from_value(serde_json::json!({
+            "agent": "t3:a", "version": 3,
+            "evidence": [{ "kind": "pr", "value": "https://example.com/pull/1" }],
+        }))
+        .unwrap();
+        assert!(!req.take);
+        // Clients that do not take send what servers before the field accept.
+        assert!(serde_json::to_value(&req).unwrap().get("take").is_none());
+        let taking = DoneTask { take: true, ..req };
+        assert_eq!(serde_json::to_value(&taking).unwrap()["take"], true);
     }
 
     #[test]

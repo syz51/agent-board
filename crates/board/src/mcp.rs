@@ -64,7 +64,7 @@ pub const CORE_TOOLS: &[&str] = &[
 ];
 
 /// Arguments every tool accepts.
-const AGENT_ARG: &str = "Agent id to act as; leave it out to act as yourself.";
+const AGENT_ARG: &str = "Agent id to act as. Default: yourself.";
 const DETAILED_ARG: &str = "Include full text and history.";
 
 /// Longest board slug and task id (`<slug>-<number>`, a `u64`).
@@ -466,6 +466,13 @@ const TOOLS: &[ToolSpec] = &[
                             "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone. At most {SUMMARY_CHARS_MAX} characters."
                         ),
                         SUMMARY_CHARS_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "take",
+                    b(
+                        "Close a stale owner's review task, outside your doing limit; needs a PR or check.",
                     ),
                     false,
                 ),
@@ -926,7 +933,7 @@ impl BoardMcp {
                     prs: a.prs,
                     artifacts: a.artifacts,
                 };
-                ops::task_done(&ctx, &a.id, evidence, a.summary).await?
+                ops::task_done(&ctx, &a.id, evidence, a.summary, a.take).await?
             }
             "task_note" => {
                 let a: NoteArgs = parse(name, args)?;
@@ -1158,6 +1165,8 @@ struct DoneArgs {
     #[serde(default)]
     artifacts: Vec<String>,
     summary: Option<String>,
+    #[serde(default)]
+    take: bool,
 }
 
 #[derive(Deserialize)]

@@ -1043,6 +1043,100 @@ async fn claim_of_a_parked_task_keeps_the_doing_limit_and_stale_owners() {
     assert!(v["message"].as_str().unwrap().contains("stale"), "{v}");
 }
 
+/// `POST /done` as `agent` with `take`.
+async fn done_take(t: &T, agent: &str, task: &str, evidence: Value) -> (u16, Value) {
+    let version = t.get_task(task).await["version"].clone();
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{task}/done"),
+            Some(agent),
+            Some(json!({ "agent": agent, "version": version, "evidence": evidence, "take": true })),
+        )
+        .await;
+    (s.as_u16(), v)
+}
+
+#[tokio::test]
+async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limit() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 1).await;
+    let reviewed = task_in(&t, TaskStatus::Review).await;
+    let working = task_in(&t, TaskStatus::Doing).await;
+    let pr = json!([{ "kind": "pr", "value": "https://example.com/pull/1" }]);
+
+    // While the owner is live, take does not pass it by.
+    let (s, v) = done_take(&t, B, &reviewed, pr.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("take refused"),
+        "{v}"
+    );
+
+    t.advance(stale_after() + TimeDelta::hours(1));
+    t.register(B, Some(REPO), Some("main")).await;
+    let umbrella = t.task(B, "factory", "Umbrella").await;
+    assert!(t.claim(B, &umbrella).await.0.is_success());
+
+    // A claim that starts work keeps the doing limit, also as a take.
+    let (s, v) = take(&t, B, &reviewed).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&umbrella), "{v}");
+
+    // Without take, done is the owner's; with it, the closer shows the work landed.
+    let (s, v) = t.done(B, &reviewed, pr.clone()).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    let (s, v) = done_take(&t, B, &reviewed, commit).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("evidence_required")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&reviewed).await["status"], "review");
+
+    // Only a task in review closes this way: one in progress is taken first.
+    let (s, v) = done_take(&t, B, &working, pr.clone()).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+    assert_eq!(t.get_task(&working).await["owner"], A);
+
+    // One call closes it, with the closer as owner, while its own task stays in doing.
+    let (s, v) = done_take(&t, B, &reviewed, pr.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(B)),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&umbrella).await["status"], "doing");
+    let events = events_of(&t, &reviewed).await;
+    let kinds: Vec<&str> = events
+        .iter()
+        .rev()
+        .take(2)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(kinds, ["task_done", "task_taken"], "{events:?}");
+    assert_eq!(
+        events[events.len() - 2].1,
+        json!({ "from": A, "status": "review" }),
+        "{events:?}"
+    );
+
+    // On the caller's own task, take changes nothing.
+    let (s, v) = done_take(&t, B, &umbrella, check(0)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "done", "{v}");
+}
+
 #[tokio::test]
 async fn fifty_concurrent_claims_have_one_winner() {
     let t = T::new();

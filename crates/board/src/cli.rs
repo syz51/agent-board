@@ -722,6 +722,10 @@ pub struct DoneArgs {
         SUMMARY_CHARS_MAX,
     ))]
     summary: Option<String>,
+    /// Close a task in review whose owner is stale, in one step and outside your doing
+    /// limit. Needs a --pr or a --check.
+    #[arg(long)]
+    take: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1224,7 +1228,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 prs: a.prs,
                 artifacts: a.artifacts,
             };
-            ops::task_done(&ctx()?, &a.id, evidence, a.summary).await?
+            ops::task_done(&ctx()?, &a.id, evidence, a.summary, a.take).await?
         }
         Command::Note { id, text, kind } => ops::task_note(&ctx()?, &id, kind, text).await?,
         Command::Handoff {
