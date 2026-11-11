@@ -154,7 +154,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_list",
-        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children) or live (feedback items that take reports).",
+        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children), live (feedback items that take reports) or q (a text search: use it to find tasks about a subject).",
         params: || {
             vec![
                 ("board", board_arg("Board slug."), false),
@@ -191,7 +191,19 @@ const TOOLS: &[ToolSpec] = &[
                     ),
                     false,
                 ),
-                ("limit", json!({"type": "integer", "minimum": 1}), false),
+                (
+                    "q",
+                    s(
+                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words (at most 8), in any letter case.",
+                        board_proto::TASKS_Q_CHARS_MAX,
+                    ),
+                    false,
+                ),
+                (
+                    "limit",
+                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 200."}),
+                    false,
+                ),
                 (
                     "detailed",
                     b("Include bodies and acceptance checks."),
@@ -778,6 +790,7 @@ impl BoardMcp {
                     mine: a.mine.then_some(true),
                     parent: a.parent,
                     live: a.live.then_some(true),
+                    q: a.q,
                     limit: a.limit,
                 };
                 ops::task_list(&ctx, &query, a.detailed).await?
@@ -972,6 +985,7 @@ struct ListArgs {
     parent: Option<TaskId>,
     #[serde(default)]
     live: bool,
+    q: Option<String>,
     limit: Option<u32>,
     #[serde(default)]
     detailed: bool,

@@ -375,6 +375,10 @@ pub struct TaskQuery {
     /// before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<bool>,
+    /// Only tasks whose id, title, body, acceptance or notes hold every word; servers
+    /// before it ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }

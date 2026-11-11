@@ -49,6 +49,41 @@ impl Env {
 }
 
 #[test]
+fn ls_sends_a_search_and_says_when_the_limit_cut_the_list() {
+    let e = env();
+    let task = task_fixture("factory-12", "Rotate the key");
+    e.stub.on("GET /v1/tasks", [task.clone(), task]);
+
+    let out = e.run(&["ls", "--search", "Rotate key"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let q = e.stub.requests_to("GET /v1/tasks")[0].query_pairs();
+    // The stub leaves the form encoding of the space in place.
+    assert_eq!(
+        (q["q"].as_str(), q["limit"].as_str()),
+        ("Rotate+key", "201")
+    );
+    assert!(!stdout(&out).contains("listed the first"));
+
+    // One more task than the limit came back: the list is cut, and the text says so.
+    let out = e.run(&["ls", "--grep", "key", "--limit", "1"]);
+    let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].starts_with("listed the first 1; more match"),
+        "{lines:?}"
+    );
+    // A limit of 0 counts as 1, as on the server.
+    let out = e.run(&["ls", "--limit", "0"]);
+    assert_eq!(stdout(&out).lines().count(), 2);
+
+    // Over-long text is refused before it is sent.
+    let long = "x".repeat(201);
+    let out = e.run(&["ls", "--search", &long]);
+    assert!(!out.status.success());
+    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 3);
+}
+
+#[test]
 fn ls_sends_filters_and_prints_concise_lines_or_json() {
     let e = env();
     let mut task = task_fixture("factory-12", "Inject <board> delta");

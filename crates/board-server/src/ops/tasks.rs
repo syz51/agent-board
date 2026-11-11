@@ -2,8 +2,8 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, AgentState, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType,
-    EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, Task, TaskId, TaskStatus, Timestamp,
-    UpdateTask,
+    EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task,
+    TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -650,7 +650,29 @@ pub(crate) struct TaskFilter {
     pub parent: Option<TaskId>,
     /// Only feedback items that take reports (true), or none of them (false).
     pub live: Option<bool>,
+    /// Only tasks that hold every one of these words ([`search_words`]); none is no search.
+    pub words: Vec<String>,
     pub limit: usize,
+}
+
+/// The words of a `q` search: split at white space, with ASCII letters lowercased as
+/// SQLite's `lower` folds the stored text. A blank `q` is no search, as on `/v1/errors`.
+pub(crate) fn search_words(q: Option<&str>) -> Result<Vec<String>> {
+    let Some(q) = q.filter(|q| !q.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    check_line("q", q, TASKS_Q_CHARS_MAX)?;
+    let words: Vec<String> = q.split_whitespace().map(str::to_ascii_lowercase).collect();
+    if words.len() > TASKS_Q_WORDS_MAX {
+        return Err(invalid(
+            format!(
+                "q has {} words; the limit is {TASKS_Q_WORDS_MAX}",
+                words.len()
+            ),
+            "search for fewer, more specific words; a task must hold every one",
+        ));
+    }
+    Ok(words)
 }
 
 pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
@@ -724,6 +746,23 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     if let Some(live) = &live {
         clauses.push(live);
         params.push((":live_depth", &live_depth));
+    }
+    // No word may be missing from the task's id, own text and notes: one statement
+    // whatever the word count. `lower` folds ASCII letters only, as the words are.
+    let words = serde_json::to_string(&filter.words).expect("strings serialize");
+    if !filter.words.is_empty() {
+        clauses.push(
+            "NOT EXISTS (SELECT 1 FROM json_each(:words) w WHERE NOT (
+                 t.id = w.value
+                 OR instr(lower(t.title), w.value) > 0
+                 OR instr(lower(t.body), w.value) > 0
+                 OR instr(lower(t.acceptance), w.value) > 0
+                 OR instr(lower(coalesce(t.summary, '')), w.value) > 0
+                 OR instr(lower(coalesce(t.blocked_reason, '')), w.value) > 0
+                 OR EXISTS (SELECT 1 FROM notes n WHERE n.task = t.id
+                            AND instr(lower(n.text), w.value) > 0)))",
+        );
+        params.push((":words", &words));
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }

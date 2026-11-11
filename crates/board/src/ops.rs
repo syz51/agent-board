@@ -9,8 +9,8 @@ use board_proto::{
     AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
     DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
-    RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, Task, TaskId,
-    TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT,
+    TASKS_LIMIT_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -387,11 +387,34 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
 }
 
 pub async fn task_list(ctx: &Ctx, query: &TaskQuery, detailed: bool) -> Result<Output> {
-    let tasks = ctx.client.tasks(query).await?;
-    let text = if detailed {
-        render::task_list_detailed(&tasks)
+    // The server cuts a list at its limit without saying so: ask for one task more, so
+    // the text can say that the list was cut. At the server's maximum that is a guess.
+    let limit = query
+        .limit
+        .unwrap_or(TASKS_LIMIT_DEFAULT)
+        .clamp(1, TASKS_LIMIT_MAX);
+    let probe = TaskQuery {
+        limit: Some((limit + 1).min(TASKS_LIMIT_MAX)),
+        ..query.clone()
+    };
+    let mut tasks = ctx.client.tasks(&probe).await?;
+    let limit = limit as usize;
+    let notice = if tasks.len() > limit {
+        tasks.truncate(limit);
+        format!(
+            "\nlisted the first {limit}; more match: narrow it with a filter or a search, or raise the limit (at most {TASKS_LIMIT_MAX})"
+        )
+    } else if tasks.len() == TASKS_LIMIT_MAX as usize {
+        format!(
+            "\nlisted {TASKS_LIMIT_MAX}, the most one call lists; more may match: narrow it with a filter or a search"
+        )
     } else {
-        render::task_list(&tasks)
+        String::new()
+    };
+    let text = if detailed {
+        render::task_list_detailed(&tasks, &notice)
+    } else {
+        render::task_list(&tasks) + &notice
     };
     Ok(Output::new(text, &tasks))
 }
