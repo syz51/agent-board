@@ -21,6 +21,7 @@ use crate::config::{Config, Home, load_token};
 use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
 use crate::render;
+use crate::state::{Filed, FiledMark};
 use crate::t3::T3;
 
 /// How an agent other than the environment's own was named, which decides how the
@@ -698,6 +699,16 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             claim: new.claim,
         })
         .await?;
+    // For the Stop hook, which does not remind an agent that filed follow-ups to file them
+    // (`hook::done_reminder`). The task exists either way, so a failed write costs only that.
+    let kind = if task.is_pending_proposal() {
+        Some(Filed::Proposal)
+    } else {
+        task.parent.as_ref().map(|_| Filed::SubTask)
+    };
+    if let Some(kind) = kind {
+        record_filed(ctx, task.id.as_str(), kind, task.parent.clone());
+    }
     if !new.claim {
         let mut text = format!("added {}", render::task_line(&task));
         if task.is_pending_proposal() {
@@ -892,6 +903,21 @@ pub async fn task_done(
     Ok(Output::new(text, &task))
 }
 
+/// Leaves a mark of what the agent filed for its next `Stop` hook; see [`task_add`].
+fn record_filed(ctx: &Ctx, name: &str, kind: Filed, about: Option<TaskId>) {
+    let mark = FiledMark {
+        kind,
+        about,
+        at: chrono::Utc::now(),
+    };
+    let recorded = ctx
+        .agent()
+        .and_then(|agent| crate::state::record_filed(&ctx.home, agent, name, &mark));
+    if let Err(err) = recorded {
+        tracing::warn!("recording {name} filed for the Stop hook: {err:#}");
+    }
+}
+
 pub async fn task_note(ctx: &Ctx, id: &TaskId, kind: NoteKind, text: String) -> Result<Output> {
     let note = ctx
         .client
@@ -1026,6 +1052,12 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         })
         .await?;
     let created = &answer.ask;
+    record_filed(
+        ctx,
+        &format!("ask-{}", created.id),
+        Filed::Ask,
+        created.task.clone(),
+    );
     let mut text = format!(
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
         render::ask_line(created)
