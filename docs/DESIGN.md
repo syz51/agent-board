@@ -57,7 +57,7 @@ the binary at compile time.
 Measured on an Apple Silicon Mac (2026-11-06): a trivial hook-style program starts in about
 2 ms as a Rust binary and 6 ms under Bun, so start-up does not decide it. What does:
 
-- **Distribution**: a 0.4 MB static binary per platform (`cargo install`, release archives,
+- **Distribution**: a 27 MB static binary per platform (`cargo install`, release archives,
   Homebrew) against about 90 MB for a compiled Bun program. For an open-source tool that
   every device and the server run, small binaries matter.
 - **Footprint on a shared host**: the server runs beside other services on a small VPS.
@@ -240,7 +240,7 @@ host.
 
 The MCP server (`board mcp`) runs over stdio as a child of the agent runtime, so it inherits
 the thread's environment and knows the calling agent. Tools (sixteen, with fixed
-descriptions under 300 characters; `task_claim`'s runs to 560, since it also states the
+descriptions under 300 characters; `task_claim`'s may run to 620, since it also states the
 doing limit, to claim one task at a time, and that a claim resumes a parked task, which
 agents otherwise learn only from a refusal):
 

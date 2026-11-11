@@ -179,7 +179,8 @@ async fn handoffs_carry_the_agents_last_change() {
     assert_eq!(h["last_change_at"], claimed_at.as_str(), "{h}");
     assert!(h["updated_at"].as_str() > h["last_change_at"].as_str());
 
-    // Presence, a newer handoff and other agents' changes are not this agent's work.
+    // Presence, other agents' changes, and the agent's own notes, new tasks and leases
+    // leave the handoff as true as it was.
     t.advance(TimeDelta::minutes(1));
     t.ok(
         "POST",
@@ -189,29 +190,61 @@ async fn handoffs_carry_the_agents_last_change() {
     )
     .await;
     t.register(a, Some(REPO), None).await;
-    t.ok(
-        "POST",
-        &format!("/v1/tasks/{task}/notes"),
-        Some(b),
-        Some(json!({ "agent": b, "kind": "note", "text": "note: from b" })),
-    )
-    .await;
+    for agent in [a, b] {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{task}/notes"),
+            Some(agent),
+            Some(json!({ "agent": agent, "kind": "note", "text": "note: more" })),
+        )
+        .await;
+    }
+    t.task(a, "factory", "Found work").await;
     let h = t.ok("GET", &path, None, None).await;
     assert_eq!(h["last_change_at"], claimed_at.as_str());
 
-    // A note or a file touch is a change, dated on the server's clock.
-    t.advance(TimeDelta::minutes(1));
-    t.ok(
-        "POST",
-        "/v1/touches",
-        Some(a),
-        Some(json!({ "agent": a, "repo": REPO, "paths": ["src/lib.rs"] })),
-    )
-    .await;
+    // File edits soon after the handoff belong to the next step: it stays current.
+    let touch = || {
+        t.ok(
+            "POST",
+            "/v1/touches",
+            Some(a),
+            Some(json!({ "agent": a, "repo": REPO, "paths": ["src/lib.rs"] })),
+        )
+    };
+    t.advance(crate::store::handoff_files_grace() - TimeDelta::minutes(2));
+    touch().await;
     let h = t.ok("GET", &path, None, None).await;
-    let touched_at = super::iso(super::start() + TimeDelta::minutes(3));
+    assert_eq!(h["last_change_at"], claimed_at.as_str());
+    // Edits later than that make it stale, dated on the server's clock.
+    t.advance(TimeDelta::minutes(2));
+    touch().await;
+    let h = t.ok("GET", &path, None, None).await;
+    let touched_at =
+        super::iso(super::start() + TimeDelta::minutes(2) + crate::store::handoff_files_grace());
     assert_eq!(h["last_change_at"], touched_at.as_str());
     assert!(h["last_change_at"].as_str() > h["updated_at"].as_str());
+
+    // A change to the state of the agent's work makes a new handoff stale at once.
+    let h = t
+        .ok(
+            "PUT",
+            &path,
+            Some(a),
+            Some(json!({ "now": "edited", "next": "y", "version": 1 })),
+        )
+        .await;
+    assert!(h["updated_at"].as_str() >= h["last_change_at"].as_str());
+    t.advance(TimeDelta::minutes(1));
+    let (s, v) = t.done(a, &task, super::check(0)).await;
+    assert!(s.is_success(), "{v}");
+    let h = t.ok("GET", &path, None, None).await;
+    assert!(h["last_change_at"].as_str() > h["updated_at"].as_str());
+
+    // An agent that changed nothing has a current handoff, dated as the handoff is.
+    let path = format!("/v1/agents/{b}/handoff");
+    let h = t.ok("PUT", &path, Some(b), Some(put("idle"))).await;
+    assert_eq!(h["last_change_at"], h["updated_at"]);
 }
 
 #[tokio::test]
@@ -777,6 +810,8 @@ async fn task_detail_names_each_agent_it_mentions_by_handle() {
         .ok("GET", &format!("/v1/tasks?owner={handle}"), None, None)
         .await;
     assert_eq!(listed[0]["id"], task.as_str(), "{listed}");
+    // A listed task names its owner's handle.
+    assert_eq!(listed[0]["owner_handle"], registered["handle"], "{listed}");
     let peer = "t3:peer";
     let peer_handle = t.register(peer, Some(REPO), None).await["handle"].clone();
     let (status, v) = t.patch(long, &task, json!({ "owner": peer_handle })).await;

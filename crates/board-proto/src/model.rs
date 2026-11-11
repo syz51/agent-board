@@ -425,6 +425,10 @@ pub struct Task {
     /// none does, and from servers that predate it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub child_count: u32,
+    /// The owner's short handle, such as `t3:7f3a`, accepted wherever an agent id is.
+    /// Absent without an owner, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_handle: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -663,10 +667,11 @@ pub struct Handoff {
     pub blockers: String,
     pub version: i64,
     pub updated_at: Timestamp,
-    /// When the agent last changed the board or touched a file, on the server's clock: its
-    /// newest event other than a handoff, registration or state change. A handoff older
-    /// than this is stale. Absent when the agent has changed nothing, and from servers that
-    /// predate the field.
+    /// When the agent last made a change this handoff must cover, on the server's clock:
+    /// its newest claim, release, take, update or completion of a task, or its newest file
+    /// touch when that came more than 30 minutes after the handoff. A handoff older than
+    /// this is stale. It is `updated_at` when there is no such change. Absent from servers
+    /// that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<Timestamp>,
 }

@@ -76,11 +76,28 @@ fn ls_sends_a_search_and_says_when_the_limit_cut_the_list() {
     let out = e.run(&["ls", "--limit", "0"]);
     assert_eq!(stdout(&out).lines().count(), 2);
 
+    // `--fields` keeps only the named fields in the JSON; one a task lacks is null.
+    let out = e.run(&["ls", "--json", "--fields", "id,title,owner"]);
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        listed[0],
+        serde_json::json!({"id": "factory-12", "title": "Rotate the key", "owner": null})
+    );
+    // A line names the owner by its short handle when the server sends one.
+    let mut owned = task_fixture("factory-13", "Owned");
+    owned.owner = Some("t3:thread:a-very-long-agent-id".parse().unwrap());
+    owned.owner_handle = Some("t3:7f3a".into());
+    e.stub.on("GET /v1/tasks", [owned]);
+    let out = e.run(&["ls"]);
+    assert!(stdout(&out).contains(" owner t3:7f3a"), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("a-very-long-agent-id"));
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+
     // Over-long text is refused before it is sent.
     let long = "x".repeat(201);
     let out = e.run(&["ls", "--search", &long]);
     assert!(!out.status.success());
-    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 3);
+    assert_eq!(e.stub.requests_to("GET /v1/tasks").len(), 5);
 }
 
 #[test]

@@ -386,7 +386,14 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
     })
 }
 
-pub async fn task_list(ctx: &Ctx, query: &TaskQuery, detailed: bool) -> Result<Output> {
+/// `fields`, when given, are the only fields of each task in the JSON output; one a task
+/// does not have is null.
+pub async fn task_list(
+    ctx: &Ctx,
+    query: &TaskQuery,
+    detailed: bool,
+    fields: Option<&[String]>,
+) -> Result<Output> {
     // The server cuts a list at its limit without saying so: ask for one task more, so
     // the text can say that the list was cut. At the server's maximum that is a guess.
     let limit = query
@@ -416,7 +423,21 @@ pub async fn task_list(ctx: &Ctx, query: &TaskQuery, detailed: bool) -> Result<O
     } else {
         render::task_list(&tasks) + &notice
     };
-    Ok(Output::new(text, &tasks))
+    let Some(fields) = fields else {
+        return Ok(Output::new(text, &tasks));
+    };
+    let picked: Vec<Value> = tasks
+        .iter()
+        .map(|task| {
+            let whole = serde_json::to_value(task)?;
+            Ok(fields
+                .iter()
+                .map(|f| (f.clone(), whole.get(f).cloned().unwrap_or(Value::Null)))
+                .collect::<serde_json::Map<_, _>>()
+                .into())
+        })
+        .collect::<Result<_>>()?;
+    Ok(Output::new(text, &picked))
 }
 
 pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {

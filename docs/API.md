@@ -200,9 +200,12 @@ server's minute sweep deletes older ones.
   the state did not change; otherwise it is dropped. The newest 50 per agent and board are
   kept.
 - `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
-  last changed the board or touched a file (its newest event other than a handoff,
-  registration or state change), on the same clock as `updated_at`; a handoff older than it
-  is stale. It is absent when the agent has made no change.
+  last made a change the handoff must cover, on the same clock as `updated_at`: its newest
+  claim, release, take, update or completion of a task, or its newest file touch when that
+  came more than 30 minutes after the handoff. A handoff older than it is stale. The
+  agent's notes, new tasks, leases and asks, and file touches within those 30 minutes, do
+  not count: they leave the handoff as true as it was. Without such a change it equals
+  `updated_at`.
 - `PUT /v1/agents/{id}/handoff` `[PutHandoff]` → `[Handoff]`; 409 on a version mismatch.
 - `GET /v1/agents/{id}/said?limit=` → `[Said]` list: the agent's kept turn endings,
   newest first, `limit` 1 to 50 (default 20). User only: agents never read what another
@@ -333,7 +336,10 @@ Reopening a closed board, or any change on it, starts the period again.
   the CLI and MCP then refuse and point to `board show <id>`, whose detail lists every
   child. Every `Task` has `child_count`, how many tasks name it as parent whatever
   their status; it is absent when none does, and from servers that predate it. The counts
-  of a list come from one query, along the parent index. `proposal=true` lists only
+  of a list come from one query, along the parent index. A `Task` with an owner has
+  `owner_handle`, the owner's short handle (such as `t3:7f3a`), accepted wherever an
+  agent id is; it is absent without an owner, and from servers that predate it.
+  `proposal=true` lists only
   pending proposals, `false` leaves them out (see "Pending proposals" below).
   `live=true` lists only the feedback items a new report with their signature would add
   to, whatever their status, by the rule reports follow (see "Feedback" below): the newest
@@ -356,7 +362,9 @@ Reopening a closed board, or any change on it, starts the period again.
   A blank `q` is no search; a too long one is 400 `invalid`. Servers that predate `q`
   ignore it and list every task. `limit` defaults to 200, at most 1,000, and a smaller
   value counts as 1; the list does not say when the limit cut it, so the CLI and MCP ask
-  for one task more than their limit and say so in their text.
+  for one task more than their limit and say so in their text. The MCP `task_list` asks
+  for 50 tasks when the call names no `limit`, since its text goes into an agent's
+  context; the CLI keeps the server's default.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`
@@ -958,7 +966,9 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   example `board ls --board board-feedback --json` for the feedback items. It returns at
   most 200 tasks; pass `--limit <n>` (up to 1,000) for more. When more tasks match than
   the limit, the text output ends with a line `listed the first <n>; more match: …`; the
-  JSON output has no such sign. `--search <words>` (alias `--grep`) sends `q=<words>`, at
+  JSON output has no such sign. `--fields id,title,status` keeps only those fields of
+  each task in the JSON output; one a task does not have is `null`. A line names a task's
+  owner by `owner_handle` when the server sends it. `--search <words>` (alias `--grep`) sends `q=<words>`, at
   most 8 words and 200 characters, refused before sending when longer. A server that
   predates `q` ignores it and lists every task, so upgrade the server first.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line

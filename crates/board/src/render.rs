@@ -90,7 +90,7 @@ pub fn enum_str<T: serde::Serialize>(value: &T) -> String {
 }
 
 pub fn task_line(task: &Task) -> String {
-    task_line_as(task, |id| id)
+    task_line_as(task, |id| task.owner_handle.as_deref().unwrap_or(id))
 }
 
 /// [`task_line`], naming the owner as `who` gives it.

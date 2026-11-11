@@ -69,7 +69,8 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
-     t.updated_at, t.not_before, t.summary";
+     t.updated_at, t.not_before, t.summary, \
+     (SELECT a.handle FROM agents a WHERE a.id = t.owner)";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -102,6 +103,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         feedback: None,
         summary: r.get(16)?,
         child_count: 0,
+        owner_handle: r.get(17)?,
     })
 }
 
@@ -599,30 +601,49 @@ pub(crate) fn find_handoff(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Hando
     else {
         return Ok(None);
     };
-    handoff.last_change_at = last_change(cx, agent)?;
+    handoff.last_change_at = Some(last_change(cx, agent, handoff.updated_at)?);
     Ok(Some(handoff))
 }
 
-/// Events that are not a change to the board's work: the handoff itself and presence.
-const NOT_CHANGES: [EventType; 3] = [
-    EventType::HandoffUpdated,
-    EventType::AgentRegistered,
-    EventType::AgentStateChanged,
+/// Events that change the state of an agent's work, which its handoff describes. A note, a
+/// new task, a lease or an ask adds to the board and leaves the handoff as true as it was.
+const WORK_CHANGES: [EventType; 5] = [
+    EventType::TaskClaimed,
+    EventType::TaskReleased,
+    EventType::TaskTaken,
+    EventType::TaskUpdated,
+    EventType::TaskDone,
 ];
 
-/// When the agent last changed the board or touched a file: its newest other event.
-fn last_change(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<Timestamp>> {
-    let [a, b, c] = NOT_CHANGES.map(|t| enum_str(&t));
-    Ok(cx
-        .db
-        .query_row(
-            "SELECT at FROM events WHERE actor = ?1 AND type NOT IN (?2, ?3, ?4) \
-             ORDER BY seq DESC LIMIT 1",
-            params![agent.as_str(), a, b, c],
-            |r| r.get(0),
-        )
-        .optional()?
-        .map(ts))
+/// How long file edits may follow a handoff before it is stale: a handoff is written at
+/// the end of a step, and the edits of the next step do not make it wrong at once.
+pub(crate) fn handoff_files_grace() -> chrono::TimeDelta {
+    chrono::TimeDelta::minutes(30)
+}
+
+/// When the agent last made a change its handoff must cover: its newest change to the
+/// state of its work, or its newest file touch when that came more than
+/// [`handoff_files_grace`] after the handoff. Without either, the handoff's own time.
+fn last_change(cx: &Ctx<'_>, agent: &AgentId, handoff_at: Timestamp) -> Result<Timestamp> {
+    let [a, b, c, d, e] = WORK_CHANGES.map(|t| enum_str(&t));
+    let newest = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<Option<Timestamp>> {
+        Ok(cx
+            .db
+            .query_row(sql, params, |r| r.get(0))
+            .optional()?
+            .map(ts))
+    };
+    let work = newest(
+        "SELECT at FROM events WHERE actor = ?1 AND type IN (?2, ?3, ?4, ?5, ?6) \
+         ORDER BY seq DESC LIMIT 1",
+        params![agent.as_str(), a, b, c, d, e],
+    )?;
+    let touched = newest(
+        "SELECT at FROM events WHERE actor = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+        params![agent.as_str(), enum_str(&EventType::FilesTouched)],
+    )?
+    .filter(|&at| at > handoff_at + handoff_files_grace());
+    Ok(work.max(touched).unwrap_or(handoff_at))
 }
 
 // ---------------------------------------------------------------------------------------
