@@ -875,3 +875,40 @@ fn task_list_live_sends_the_filter() {
     assert_eq!(q["live"], "true");
     assert!(text(&live).starts_with("board-feedback-2 done"), "{live}");
 }
+
+#[test]
+fn task_list_sends_a_search_and_says_when_the_limit_cut_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let item = feedback_fixture("board-feedback-2", None);
+    stub.on("GET /v1/tasks", [item.clone(), item]);
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let found = mcp.call(2, "task_list", json!({"q": "usage cap"}));
+    assert_ne!(found["isError"], true, "{found}");
+    let requests = stub.requests_to("GET /v1/tasks");
+    // The stub leaves the form encoding of the space in place.
+    assert_eq!(requests[0].query_pairs()["q"], "usage+cap");
+    assert!(!text(&found).contains("listed the first"), "{found}");
+
+    // A list as long as its limit may be cut: the text says so.
+    let cut = mcp.call(3, "task_list", json!({"limit": 2}));
+    assert!(
+        text(&cut).contains("listed the first 2; more may match"),
+        "{cut}"
+    );
+}

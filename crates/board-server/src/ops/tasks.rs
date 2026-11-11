@@ -650,7 +650,38 @@ pub(crate) struct TaskFilter {
     pub parent: Option<TaskId>,
     /// Only feedback items that take reports (true), or none of them (false).
     pub live: Option<bool>,
+    /// Only tasks that hold every one of these lowercase words ([`search_words`]).
+    pub words: Option<Vec<String>>,
     pub limit: usize,
+}
+
+/// The most words one search takes.
+const SEARCH_WORDS_MAX: usize = 8;
+/// The longest search text, in characters.
+const SEARCH_CHARS_MAX: usize = 200;
+/// One parameter name per search word.
+const SEARCH_PARAMS: [&str; SEARCH_WORDS_MAX] =
+    [":q0", ":q1", ":q2", ":q3", ":q4", ":q5", ":q6", ":q7"];
+
+/// The words of a `q` search: split at white space and lowercased, as the list matches
+/// them.
+pub(crate) fn search_words(q: &str) -> Result<Vec<String>> {
+    let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return Err(invalid(
+            "q is empty",
+            "send at least one word to search for, or leave q out",
+        ));
+    }
+    if q.chars().count() > SEARCH_CHARS_MAX || words.len() > SEARCH_WORDS_MAX {
+        return Err(invalid(
+            format!(
+                "q is too long; the limit is {SEARCH_WORDS_MAX} words and {SEARCH_CHARS_MAX} characters"
+            ),
+            "search for fewer, more specific words",
+        ));
+    }
+    Ok(words)
 }
 
 pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
@@ -724,6 +755,25 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
     if let Some(live) = &live {
         clauses.push(live);
         params.push((":live_depth", &live_depth));
+    }
+    // Each word must be in the task's own text or in one of its notes. `lower` folds ASCII
+    // only, which the lowercased word matches for ASCII text.
+    let words = filter.words.unwrap_or_default();
+    let word_clauses: Vec<String> = SEARCH_PARAMS
+        .iter()
+        .take(words.len())
+        .map(|p| {
+            format!(
+                "(lower(t.id) = {p} OR instr(lower(t.title), {p}) > 0 \
+                 OR instr(lower(t.body), {p}) > 0 OR instr(lower(t.acceptance), {p}) > 0 \
+                 OR EXISTS (SELECT 1 FROM notes n WHERE n.task = t.id \
+                 AND instr(lower(n.text), {p}) > 0))"
+            )
+        })
+        .collect();
+    for (i, clause) in word_clauses.iter().enumerate() {
+        clauses.push(clause);
+        params.push((SEARCH_PARAMS[i], &words[i]));
     }
     load_tasks_up_to(cx, &clauses.join(" AND "), &params, Some(filter.limit))
 }

@@ -324,7 +324,7 @@ Reopening a closed board, or any change on it, starts the period again.
 
 ### Tasks
 
-- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&limit=` →
+- `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&q=&limit=` →
   `[Task]` list, sorted by priority, then id number. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
@@ -347,8 +347,15 @@ Reopening a closed board, or any change on it, starts the period again.
   ignore it and list every task, so upgrade the server before relying on it. The CLI and
   MCP catch most such servers: they refuse, saying to upgrade it, when the list holds a
   task that can never be live (not a feedback item, forwarded, fixed, or closed
-  unresolved). An old server that has only live-looking items passes that check. `limit`
-  defaults to 200, at most 1,000.
+  unresolved). An old server that has only live-looking items passes that check.
+  `q=<words>` is a text search: it lists only the tasks that hold every word, split at
+  white space (at most 8 words and 200 characters), in their title, body, acceptance
+  checks or one of their notes, or whose id is the word. A word matches as a substring,
+  whatever the case of ASCII letters; `%` and `_` are plain text. It combines with every
+  other filter. An empty or too long `q` is 400 `invalid`. Servers that predate `q`
+  ignore it and list every task. `limit` defaults to 200, at most 1,000; the list does
+  not say when the limit cut it, so the CLI and MCP add a line to their text when the
+  list is as long as its limit.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
   the server's clock passes it, and a time already passed is ignored. The `task_created`

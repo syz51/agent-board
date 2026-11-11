@@ -3032,3 +3032,59 @@ async fn nobody_stands_in_while_the_owner_may_come_back() {
     let (s, v) = take(&t, A, &limited).await;
     assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
 }
+
+#[tokio::test]
+async fn q_lists_the_tasks_that_hold_every_word() {
+    let t = setup().await;
+    let title = t.task(A, "factory", "Rotate the Signing key").await;
+    let body = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Second", "body": "the signing step fails",
+                    "acceptance": "the KEY is rotated" }),
+        )
+        .await;
+    let noted = t.task(A, "factory", "Third").await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{noted}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "finding", "text": "Signing needs a new key" })),
+    )
+    .await;
+    let other = t.task(A, "factory", "Signing without the other word").await;
+    let ids = |v: Value| -> Vec<String> {
+        let mut ids: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // Every word must be there, in the title, body, acceptance or a note, in any case.
+    let found = t.ok("GET", "/v1/tasks?q=KEY%20signing", None, None).await;
+    let mut want = vec![title.clone(), body.clone(), noted.clone()];
+    want.sort();
+    assert_eq!(ids(found), want);
+    // A task id finds its task, and q combines with the other filters.
+    let found = t
+        .ok("GET", &format!("/v1/tasks?q={other}"), None, None)
+        .await;
+    assert_eq!(ids(found), vec![other.clone()]);
+    assert!(t.claim(A, &title).await.0.is_success());
+    let found = t
+        .ok("GET", "/v1/tasks?q=rotate+signing&status=doing", None, None)
+        .await;
+    assert_eq!(ids(found), vec![title]);
+    // LIKE wildcards are plain text.
+    let found = t.ok("GET", "/v1/tasks?q=%25", None, None).await;
+    assert_eq!(ids(found), Vec::<String>::new());
+
+    for q in ["%20", &"x".repeat(201), "a%20b%20c%20d%20e%20f%20g%20h%20i"] {
+        let (s, code, v) = t.fail("GET", &format!("/v1/tasks?q={q}"), None, None).await;
+        assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
+    }
+}

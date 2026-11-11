@@ -603,6 +603,7 @@ struct TasksQuery {
     mine: Option<bool>,
     parent: Option<TaskId>,
     live: Option<bool>,
+    q: Option<String>,
     limit: Option<usize>,
 }
 
@@ -631,6 +632,7 @@ async fn list_tasks(
         proposal: q.proposal,
         parent: q.parent,
         live: q.live,
+        words: q.q.as_deref().map(tasks::search_words).transpose()?,
         limit: q.limit.unwrap_or(200).clamp(1, 1000),
     };
     Ok(Json(state.read(move |cx| tasks::list(cx, filter)).await?))

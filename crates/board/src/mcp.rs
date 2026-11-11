@@ -154,7 +154,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_list",
-        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children) or live (feedback items that take reports).",
+        description: "List tasks, sorted by priority. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children), live (feedback items that take reports) or q (a text search: use it to find tasks about a subject).",
         params: || {
             vec![
                 ("board", board_arg("Board slug."), false),
@@ -188,6 +188,14 @@ const TOOLS: &[ToolSpec] = &[
                     "live",
                     b(
                         "Only feedback items that still take reports, whatever their status: the newest item per signature that is unresolved and not done or dropped, declined, or routed to (or a duplicate whose chain ends at) work that is not done or dropped.",
+                    ),
+                    false,
+                ),
+                (
+                    "q",
+                    s(
+                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words, in any letter case.",
+                        200,
                     ),
                     false,
                 ),
@@ -778,6 +786,7 @@ impl BoardMcp {
                     mine: a.mine.then_some(true),
                     parent: a.parent,
                     live: a.live.then_some(true),
+                    q: a.q,
                     limit: a.limit,
                 };
                 ops::task_list(&ctx, &query, a.detailed).await?
@@ -972,6 +981,7 @@ struct ListArgs {
     parent: Option<TaskId>,
     #[serde(default)]
     live: bool,
+    q: Option<String>,
     limit: Option<u32>,
     #[serde(default)]
     detailed: bool,

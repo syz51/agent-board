@@ -388,11 +388,22 @@ pub async fn status(ctx: &Ctx, board: Option<BoardSlug>, detailed: bool) -> Resu
 
 pub async fn task_list(ctx: &Ctx, query: &TaskQuery, detailed: bool) -> Result<Output> {
     let tasks = ctx.client.tasks(query).await?;
-    let text = if detailed {
+    let mut text = if detailed {
         render::task_list_detailed(&tasks)
     } else {
         render::task_list(&tasks)
     };
+    // The server cuts the list at the limit without saying so.
+    let limit = query.limit.unwrap_or(200).min(1000) as usize;
+    if tasks.len() >= limit {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "listed the first {}; more may match: narrow it with a filter or a search, or raise the limit (at most 1000)",
+            tasks.len()
+        ));
+    }
     Ok(Output::new(text, &tasks))
 }
 
