@@ -1275,7 +1275,7 @@ pub(crate) const DELEGATED_BY: &str = concat!(
 /// Whether `owner`'s session has ended with nothing of it left to come back: its state is
 /// `ended`, with no usage-limit reset ahead, and no thread it delegated (at any depth) is
 /// at work, as [`DELEGATE_AT_WORK`] judges for the idle sweep.
-fn owner_session_ended(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+pub(crate) fn owner_session_ended(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
     let now = cx.now_ms();
     let ended = cx
         .db

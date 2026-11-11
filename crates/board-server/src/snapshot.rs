@@ -11,8 +11,9 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, BoardSlug, Dispatch, Event, EventType, Runtime,
-    Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus, Timestamp,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, BoardStatus, Dispatch, Event, EventType,
+    Runtime, Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, Task, TaskId, TaskStatus,
+    Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -22,7 +23,7 @@ use crate::db::{Ctx, parse_enum, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
-use crate::ops::tasks::{priority_str, status_str};
+use crate::ops::tasks::{owner_session_ended, priority_str, status_str};
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
     get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
@@ -49,7 +50,8 @@ const ALERT_WINDOW: i64 = 10_000;
 /// The events that can raise one of the agent's alerts (the `match` in `alerts` decides),
 /// so traffic about other agents' work, on any board, does not use up the scan. Quiet-review
 /// reminders (at most one per task a day) all pass, as a coordinator gets those of its
-/// board's tasks whose owner is gone; idle-owner notices pass for the agent's own tasks and
+/// board's tasks whose owner is gone, and other agents those of a board nobody runs
+/// ([`unrun_review`]); idle-owner notices pass for the agent's own tasks and
 /// the boards it coordinates.
 pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
@@ -1346,7 +1348,13 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 // the board's coordinator is, so the wait is not lost.
                 let to_me =
                     mine_ids.contains(task) || stands_in_for_owner(cx, task, me, &["review"])?;
-                if !to_me {
+                // On a board nobody runs, someone who can finish it is told instead.
+                let unrun = if to_me {
+                    None
+                } else {
+                    unrun_review(cx, task, agent)?
+                };
+                if !to_me && unrun.is_none() {
                     continue;
                 }
                 let age = |key: &str| {
@@ -1357,9 +1365,18 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
                         .map_or_else(|| "a day".to_owned(), |at| ago(cx.now - at))
                 };
-                out.insert(
-                    (QUIET_REVIEW, task.to_string()),
-                    Alert {
+                let alert = match unrun {
+                    Some(claim) => Alert {
+                        alert: format!(
+                            "{task} has sat in review for {}; its owner is gone and its board has no coordinator",
+                            age("in_review_since")
+                        ),
+                        action: format!(
+                            "check its PR; once merged, {claim}, then task_done {task}"
+                        ),
+                        rank: rank(QUIET_REVIEW),
+                    },
+                    None => Alert {
                         alert: format!(
                             "{task} has sat in review for {} with no note from its owner for {}",
                             age("in_review_since"),
@@ -1370,7 +1387,8 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         ),
                         rank: rank(QUIET_REVIEW),
                     },
-                );
+                };
+                out.insert((QUIET_REVIEW, task.to_string()), alert);
             }
             EventType::TaskUpdated if event.payload.get("idle_doing").is_some() => {
                 let Some(task) = &event.task else { continue };
@@ -1671,6 +1689,87 @@ fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str])
         && get_board(cx, &board)?
             .coordinator
             .is_some_and(|c| c.as_str() == me))
+}
+
+/// Whether `agent` is gone: unknown, ended, or not live.
+fn agent_gone(cx: &Ctx<'_>, agent: &str) -> Result<bool> {
+    let ended: Option<bool> = cx
+        .db
+        .query_row(
+            "SELECT state = 'ended' FROM agents WHERE id = ?1",
+            [agent],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(ended.unwrap_or(true) || !is_live(cx, agent)?)
+}
+
+/// The T3 threads that delegated `?1`, up the chain to depth `?2`.
+const DELEGATORS: &str = concat!(
+    "WITH RECURSIVE ",
+    crate::ops::leases::delegated_up_cte!(),
+    " SELECT id FROM up WHERE depth > 0"
+);
+
+/// Whether `agent` is told of `task`'s quiet review because nobody runs its board, and
+/// then the call that makes the task the agent's. The task is in `review` on an active
+/// board that has neither a coordinator (the server drops one whose lease ran out) nor a
+/// daemon dispatcher, which closes such tasks itself, and a take of it is allowed: its
+/// owner is stale, or its session ended with nothing of it left to come back. The task's
+/// creator (a feedback item's is only its reporter) and the threads that delegated the
+/// owner are told, as they may take the task once the owner's session has ended. When all
+/// of them are gone too, the agents on the board's repositories are told, once the owner
+/// is stale, so that their take is not refused.
+fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<String>> {
+    let id = task.as_str();
+    let Some(task) = load_tasks(cx, "t.id = :id", &vec![(":id", &id)])?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    // A task in review has an owner.
+    let Some(owner) = task
+        .owner
+        .as_ref()
+        .filter(|_| task.status == TaskStatus::Review)
+    else {
+        return Ok(None);
+    };
+    let board = get_board(cx, &task.board)?;
+    if board.status != BoardStatus::Active
+        || board.coordinator.is_some()
+        || (board.dispatch == Dispatch::Daemon && board.autopilot)
+    {
+        return Ok(None);
+    }
+    if !task.owner_stale && !owner_session_ended(cx, owner)? {
+        return Ok(None);
+    }
+    let me = agent.id.as_str();
+    let mut near: Vec<String> = cx
+        .db
+        .prepare_cached(DELEGATORS)?
+        .query_map(
+            params![owner.as_str(), crate::ops::leases::DELEGATION_DEPTH],
+            |r| r.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    if task.feedback.is_none() && task.created_by != *owner {
+        near.push(task.created_by.to_string());
+    }
+    let take = format!("task_claim {id} take=true");
+    if near.iter().any(|a| a == me) {
+        return Ok(Some(take));
+    }
+    for other in &near {
+        if agent_gone(cx, other)? {
+            continue;
+        }
+        return Ok(None);
+    }
+    let on_repo = agent.repo.as_ref().is_some_and(|r| board.repos.contains(r));
+    Ok((task.owner_stale && on_repo).then_some(take))
 }
 
 /// Whether `me` is told of the server's notice that `away` has been away from `task` since
