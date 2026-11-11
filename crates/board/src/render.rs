@@ -1323,7 +1323,7 @@ mod tests {
         own.notes[0].agent = serde_json::from_value(json!("t3:me")).unwrap();
         own.notes[0].text = format!("my own {}", "x".repeat(100));
         let done = done_findings(&own, "t3:me");
-        // By note id, with the first 80 characters.
+        // By note id, with its start, cut to 80 characters.
         let start = format!("my own {}", "x".repeat(72));
         assert!(
             done.ends_with(&format!("\nyours: #1 \"{start}…\"")),
