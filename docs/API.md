@@ -29,7 +29,9 @@ clients have been restarted on a version that reads it.
 Agent id sources are closed too. The `dispatch` source (see "Daemon dispatch") is new:
 clients before it fail to read an answer that carries a `dispatch:` id, such as a board
 whose coordinator it is or a task it owns. Upgrade and restart every client (`board mcp`,
-daemons) before a board's dispatch agent takes its coordinator lease.
+daemons) before a board's dispatch agent takes its coordinator lease. The `opencode`
+source (`opencode:<session id>`) and the `Runtime` value `opencode` are new in the same
+way: upgrade and restart every client before an opencode session registers.
 
 ## Authentication
 
@@ -824,13 +826,14 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   latest of those boards was paused: a board keeps the time while it stays paused. The
   hooks end only a turn that began before it. Left out when not held, and by servers that
   predate it. The weekly hard line (see "Usage") holds every active board the agent works
-  for in the same way (as coordinator only while its lease runs): `held_since` is then
+  for in the same way (as coordinator only while its lease runs), only for an agent with
+  runtime `claude`, since the usage is the Claude account's: `held_since` is then
   the later of the line's time and the latest pause, and `held_for_usage` is `true` (left
   out otherwise, and by servers that predate it). The `hold:` line then reads `hold:
   factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) -> the
   weekly usage reached the user's reserve. Stop: …`; `yaml` adds `usage` with that reason
   under `hold`, `json` has it as `hold_usage`.
-  For an agent with a board, when a usage reading exists, a `usage:` line follows the
+  For a `claude` agent with a board, when a usage reading exists, a `usage:` line follows the
   `hold:` line: in full snapshots always, in `delta` only while the board is over its
   `usage_stop_at` or its pace limit is 0 (it then has text even when nothing else
   changed), never in `alerts`. With a pace (see "Usage"), the line ends

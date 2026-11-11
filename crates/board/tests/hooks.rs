@@ -184,6 +184,33 @@ fn codex_session_start_injects_the_snapshot_without_tool_search() {
 }
 
 #[test]
+fn opencode_session_start_reads_claude_json_and_registers_an_opencode_agent() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("opencode:ses_7", DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    let mut payload = e.with("SessionStart", json!({"source": "startup"}));
+    payload["session_id"] = json!("ses_7");
+    let (reply, _) = e.hook("session-start", "opencode", payload);
+    assert_eq!(
+        context(&reply, "SessionStart"),
+        SNAPSHOT,
+        "no ToolSearch hint"
+    );
+
+    let register = &e.stub.requests_to("POST /v1/agents")[0];
+    assert_eq!(register.agent.as_deref(), Some("opencode:ses_7"));
+    assert_eq!(register.body["id"], "opencode:ses_7");
+    assert_eq!(register.body["runtime"], "opencode");
+    assert_eq!(register.body["native_ids"]["opencode_session"], "ses_7");
+}
+
+#[test]
 fn session_start_without_a_board_hints_only_when_the_repo_has_one() {
     let e = env();
     e.stub.on(
@@ -2974,6 +3001,7 @@ fn nested_hook(e: &Env, thread: &str, event: &str, payload: &Value) -> String {
         .env("BOARD_KEYCHAIN", "0")
         .env("T3CODE_THREAD_ID", thread)
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OPENCODE_SESSION_ID")
         .env_remove("BOARD_LOG")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

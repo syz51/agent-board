@@ -234,6 +234,7 @@ pub fn runtime_name(runtime: Runtime) -> &'static str {
     match runtime {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
+        Runtime::Opencode => "opencode",
     }
 }
 

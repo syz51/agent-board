@@ -589,6 +589,7 @@ pub struct ChildTask {
 pub enum Runtime {
     Claude,
     Codex,
+    Opencode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

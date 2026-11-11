@@ -1399,8 +1399,7 @@ impl Hook<'_> {
 
     /// Ends `SessionStart` board context with the `ToolSearch` call that loads `first` and
     /// the board tools most calls need. Claude Code may show MCP tools by name only, so an
-    /// agent that calls one before loading it guesses its arguments and fails once. Codex
-    /// has no `ToolSearch`; the MCP server's instructions name the tools for it.
+    /// agent that calls one before loading it guesses its arguments and fails once.
     fn with_tool_search(&self, context: String, first: &[&str]) -> String {
         match self.runtime {
             Runtime::Claude => {
@@ -1415,7 +1414,8 @@ impl Hook<'_> {
                     tools.len()
                 )
             }
-            Runtime::Codex => context,
+            // Neither has `ToolSearch`; the MCP server's instructions name the tools.
+            Runtime::Codex | Runtime::Opencode => context,
         }
     }
 
@@ -1513,6 +1513,7 @@ impl Hook<'_> {
             let key = match self.runtime {
                 Runtime::Claude => "claude_session",
                 Runtime::Codex => "codex_session",
+                Runtime::Opencode => "opencode_session",
             };
             native.insert(key.to_owned(), session.to_owned());
         }

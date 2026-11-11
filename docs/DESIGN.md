@@ -106,7 +106,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
   the coordinator never sees it ready and the two never both start it.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
-  otherwise `claude:<session id>` or `codex:<session id>`. A resume keeps the id; a fork gets
+  otherwise `claude:<session id>`, `codex:<session id>` or `opencode:<session id>`
+  (from `OPENCODE_SESSION_ID`, which comes after `CLAUDE_CODE_SESSION_ID`, or the
+  opencode plugin's hook input). A resume keeps the id; a fork gets
   a new id with `forked_from`. A short `handle` (`t3:7f3a`) is shown in snapshots. A T3
   thread's `title` is its T3 title, and native id `t3_link` its `https://` link in the T3
   app, both read by the hooks from `t3 thread show`, or by a background read they start
@@ -367,6 +369,9 @@ high for it. There is no total cap.
 - **Over**: a reading is fresh for 30 minutes. A board is over when a window of a fresh
   reading is at or above its stop and has not reset yet. A stale reading, or none, holds
   nothing: a device that cannot read the usage never stops work.
+- **Runtime**: the reading is the Claude account's, so only agents with runtime `claude`
+  get the hard-line hold and the `usage:` line. Codex and opencode agents spend other
+  accounts and never see them; a paused board still holds every runtime.
 - **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
   it when there is a reading: `5h 12% · week 74% · read 3m ago · this board starts no new
   task at 90%`. While the board is over, deltas (one per prompt) show it too, also when
@@ -418,8 +423,8 @@ high for it. There is no total cap.
 
 ## Runtime integration
 
-All hooks call `board hook <event> --runtime claude|codex`, which reads the hook's JSON from
-stdin, answers within 1.5 seconds and never fails the turn. An event the binary does not know
+All hooks call `board hook <event> --runtime claude|codex|opencode`, which reads the hook's
+JSON from stdin (`opencode` reads and writes the same JSON as `claude`), answers within 1.5 seconds and never fails the turn. An event the binary does not know
 exits 0 without output, so a configuration newer than the binary never blocks a tool call.
 
 | Event (Claude Code; Codex equivalent) | Action |

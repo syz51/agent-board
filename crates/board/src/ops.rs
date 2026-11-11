@@ -134,6 +134,7 @@ impl Ctx {
                 }
                 let runtime = match agent.source() {
                     AgentSource::Codex => Runtime::Codex,
+                    AgentSource::Opencode => Runtime::Opencode,
                     // A dispatch agent runs no model: it names the runtime of the threads
                     // it starts, Claude.
                     AgentSource::T3 | AgentSource::Claude | AgentSource::Dispatch => {
