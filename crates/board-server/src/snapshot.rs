@@ -585,14 +585,27 @@ fn usage_line(u: &UsageView) -> String {
     parts.join(" · ")
 }
 
+/// What a held agent does, after the reason for the hold. The user's own request comes
+/// first: the hooks never end a turn the user starts while held, so an agent that reads
+/// only "stop" ends turns the user asked for. The stop covers every other turn, since the
+/// hooks cannot tell a wake-up's prompt from the user's.
+macro_rules! hold_action {
+    ($why:literal) => {
+        concat!(
+            $why,
+            " If the user's own message in this turn asks you to go on, such as \"continue\" \
+             or \"retry\", do that work: the hold does not stop it. In every other turn, such \
+             as a wake-up or a child's report, stop: end this turn now, and start no task, \
+             child thread or wake-up."
+        )
+    };
+}
+
 /// What the `hold:` line tells an agent the hard usage line holds.
-const USAGE_HOLD_ACTION: &str = "the weekly usage reached the user's reserve. Stop: end this \
-turn now, and start no task, child thread or wake-up. Continue only if the user's own \
-message in this turn asks for it.";
+const USAGE_HOLD_ACTION: &str = hold_action!("the weekly usage reached the user's reserve.");
 
 /// What the `hold:` line tells a held agent to do.
-const HOLD_ACTION: &str = "the user paused this work. Stop: end this turn now, and start no \
-task, child thread or wake-up. Continue only if the user's own message in this turn asks for it.";
+const HOLD_ACTION: &str = hold_action!("the user paused this work.");
 
 /// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` active boards too, not
 /// only paused ones (the hard usage line), `?4` now: an active board's coordinator counts
