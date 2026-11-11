@@ -258,6 +258,9 @@ struct TaskLine {
     /// Who filed it: shown for proposals, which the filer must not review.
     #[serde(skip_serializing_if = "Option::is_none")]
     by: Option<String>,
+    /// Set on a ready task that is not `auto`: it waits on the user, so no agent starts it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    user: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -856,6 +859,10 @@ fn fill_full(
                 .collect(),
         });
     }
+    // Work an agent may start comes first, so tasks that wait on the user never fill the
+    // list; within each group the order stays priority, then number.
+    let mut ready = ready;
+    ready.sort_by_key(|t| !t.auto);
     model.ready = task_list(cx, &ready, false)?;
 
     model.recent = recent(cx, agent, board, model.seq)?;
@@ -863,7 +870,8 @@ fn fill_full(
 }
 
 /// The first `snapshot_ready_items` of `tasks` with the total, or `None` when empty; `by`
-/// adds who filed each.
+/// adds who filed each, and marks no task as the user's; without it, a task that is not
+/// `auto` is marked.
 fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
     if tasks.is_empty() {
         return Ok(None);
@@ -880,6 +888,7 @@ fn task_list(cx: &Ctx<'_>, tasks: &[Task], by: bool) -> Result<Option<Ready>> {
                 by: by
                     .then(|| handle_of(cx, t.created_by.as_str()))
                     .transpose()?,
+                user: !by && !t.auto,
             })
         })
         .collect::<Result<_>>()?;
@@ -909,6 +918,7 @@ fn peer_task(cx: &Ctx<'_>, peer: &AgentId) -> Result<Option<TaskLine>> {
         priority: None,
         title: title(&t.title),
         by: None,
+        user: false,
     }))
 }
 
@@ -1978,10 +1988,11 @@ fn render_lines(m: &Model) -> String {
         for t in &r.items {
             let _ = writeln!(
                 o,
-                "  {} {} {}",
+                "  {} {} {}{}",
                 t.id,
                 t.priority.unwrap_or(""),
-                quote(&t.title)
+                quote(&t.title),
+                if t.user { " (user)" } else { "" }
             );
         }
     }
@@ -2175,10 +2186,11 @@ fn render_yaml(m: &Model) -> String {
         for t in &r.items {
             let _ = writeln!(
                 o,
-                "    - {{id: {}, priority: {}, title: {}}}",
+                "    - {{id: {}, priority: {}, title: {}{}}}",
                 t.id,
                 t.priority.unwrap_or(""),
-                q(&t.title)
+                q(&t.title),
+                if t.user { ", user: true" } else { "" }
             );
         }
     }
