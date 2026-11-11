@@ -43,6 +43,8 @@
 //! Its agents get the wake-ups above as before, but no coordinator is woken or re-briefed:
 //! what would go to it for an agent no device can wake (an answer to a gone asker, an owner
 //! still away at the repeat idle notice) the dispatcher does itself (see [`Owed`]).
+//! It also starts the board's judges (review, verdict, goal and triage), merges the pull
+//! request of a task whose review passed and finishes that task (see [`judges`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -61,10 +63,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
+use crate::gh::{Gh, GhCli};
 use crate::ops::Ctx;
 use crate::state;
 use crate::t3::{PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
+
+pub mod judges;
+
+pub use judges::{
+    JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
+    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY,
+};
 
 /// The coordinator's standing instructions.
 pub const COORDINATOR_PROMPT: &str = include_str!("../../../prompts/coordinator.md");
@@ -285,6 +295,35 @@ pub struct WatchState {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub owed: Vec<Owed>,
+    /// The judge threads the dispatcher started, until their judge ends. Those this
+    /// version cannot read are skipped.
+    #[serde(
+        default,
+        deserialize_with = "judges::lenient_judges",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub judges: Vec<JudgeRun>,
+    /// Tasks whose judge ended, by `<kind>:<task>` (`goal:<board>` for a goal review): no
+    /// judge of that kind starts for them again until the retry passes or the task
+    /// changes. Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "judges::lenient_judge_retry",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub judge_retry: BTreeMap<String, JudgeRetry>,
+    /// The pull requests of the reviewed tasks the dispatcher closes, by task. Read
+    /// leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "judges::lenient_merges",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub merges: BTreeMap<TaskId, Merge>,
+    /// Boards this device dispatches where a task was finished since the last goal
+    /// review: their goal review is due once nothing is ready or in progress.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub goal_due: BTreeSet<BoardSlug>,
 }
 
 /// The server's first notice that a task's owner is away from it.
@@ -1445,6 +1484,8 @@ enum LastCheck {
 pub struct Daemon<T: T3> {
     ctx: Ctx,
     t3: T,
+    /// How the dispatcher reads, updates and merges pull requests.
+    gh: Box<dyn Gh>,
     pub state: WatchState,
     boards: BTreeMap<BoardSlug, Board>,
     /// Boards whose coordinator failed to start here, by board.
@@ -1492,6 +1533,7 @@ impl<T: T3> Daemon<T> {
         Self {
             ctx,
             t3,
+            gh: Box::new(GhCli::locate()),
             state,
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
@@ -1510,6 +1552,13 @@ impl<T: T3> Daemon<T> {
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
         }
+    }
+
+    /// Reads, updates and merges pull requests through `gh` instead of the `gh` CLI.
+    #[must_use]
+    pub fn with_gh(mut self, gh: impl Gh + 'static) -> Self {
+        self.gh = Box::new(gh);
+        self
     }
 
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
@@ -2699,6 +2748,14 @@ impl<T: T3> Daemon<T> {
             .idle_notices
             .retain(|task, _| task.board() != *slug || in_progress.contains_key(task));
         self.save()?;
+        // A failure here leaves the workers their turn.
+        if let Err(err) = self
+            .judge_and_close(board, &agent, in_progress.len(), now)
+            .await
+        {
+            tracing::warn!("the judges and reviewed tasks of {slug}: {err:#}");
+        }
+        self.save()?;
         let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
         if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
@@ -3059,7 +3116,8 @@ impl<T: T3> Daemon<T> {
             .await?;
         let mut tasks: Vec<Task> = tasks
             .into_iter()
-            .filter(|t| t.ready && t.auto && !is_proposal(t))
+            // A feedback item goes to a triage judge, not to a worker.
+            .filter(|t| t.ready && t.auto && !is_proposal(t) && t.feedback.is_none())
             .filter(|t| !self.state.workers.contains_key(&t.id))
             .filter(|t| !self.state.worker_skips.contains_key(&t.id))
             .filter(|t| {
@@ -3438,6 +3496,11 @@ impl<T: T3> Daemon<T> {
                     noted: false,
                     at: now,
                 })
+            }
+            // A finished task may complete the goal: its review is due once the board rests.
+            EventType::TaskDone => {
+                self.state.goal_due.insert(slug.clone());
+                false
             }
             _ => false,
         }

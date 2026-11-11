@@ -17,7 +17,9 @@ request.
 
 - Add a `decision` note starting `review: pass`, with the checks you ran and a summary for
   the user: what changed and what they should know or decide, with links, in plain words.
-  The dispatcher closes the task with that summary.
+  The dispatcher closes the task with that summary. End the note with one line per check,
+  `check: <command> => <exit code>`, then `pr: <PR URL>`, or `pr: none` for a task
+  without a pull request: the dispatcher reads these lines.
 - Turn on auto-merge (`gh pr merge <N> --merge --auto`) only where the base branch
   requires status checks or reviews: `gh api repos/<owner>/<repo>/branches/<base>/protection`
   or `gh api repos/<owner>/<repo>/rules/branches/<base>` shows them. Elsewhere leave the

@@ -505,7 +505,10 @@ async fn the_reserve_paces_each_day_and_the_hard_line_holds_working_agents() {
     assert!(
         snap["text"].as_str().unwrap().contains(
             "hold: factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) \
-             -> the weekly usage reached the user's reserve. Stop:"
+             -> the weekly usage reached the user's reserve. If the user's own message in this \
+             turn asks you to go on, such as \"continue\" or \"retry\", do that work: the hold \
+             does not stop it. In every other turn, such as a wake-up or a child's report, \
+             stop: end this turn now, and start no task, child thread or wake-up.\n"
         ),
         "{snap}"
     );

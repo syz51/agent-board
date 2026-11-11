@@ -900,7 +900,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   the later of the line's time and the latest pause, and `held_for_usage` is `true` (left
   out otherwise, and by servers that predate it). The `hold:` line then reads `hold:
   factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) -> the
-  weekly usage reached the user's reserve. Stop: …`; `yaml` adds `usage` with that reason
+  weekly usage reached the user's reserve. If the user's own message in this turn asks you
+  to go on, … In every other turn, …, stop: …`; `yaml` adds `usage` with that reason
   under `hold`, `json` has it as `hold_usage`.
   For a `claude` agent with a board, when a usage reading exists, a `usage:` line follows the
   `hold:` line: in full snapshots always, in `delta` only while the board is over its
