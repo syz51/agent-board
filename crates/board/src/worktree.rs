@@ -67,6 +67,43 @@ pub async fn worker_worktree(
     new_worktree(project, worker_branch(task), now).await
 }
 
+/// The branch the review judge of `task` runs on when it is free.
+pub fn review_branch(task: &TaskId) -> String {
+    format!("review/{task}")
+}
+
+/// The worktree to start the review judge of `task` in, as [`coordinator_worktree`]: on
+/// `head`, the branch of the task's pull request, fetched first. Without a pull request,
+/// or when its branch cannot be fetched (a fork's), it starts from the default branch.
+pub async fn review_worktree(
+    project: &Path,
+    task: &TaskId,
+    head: Option<&str>,
+    now: Timestamp,
+) -> Result<Option<NewWorktree>> {
+    let Some(mut worktree) = new_worktree(project, review_branch(task), now).await? else {
+        return Ok(None);
+    };
+    // A name git would read as an option is no branch.
+    if let Some(head) = head.filter(|h| !h.is_empty() && !h.starts_with('-')) {
+        match git(project, &["fetch", "--quiet", "origin", head], FETCH).await {
+            Ok(out) if out.ok => worktree.base = format!("origin/{head}"),
+            Ok(out) => tracing::warn!(
+                "fetching {head} in {}: {}; the review of {task} starts from {}",
+                project.display(),
+                out.stderr.trim(),
+                worktree.base
+            ),
+            Err(err) => tracing::warn!(
+                "fetching {head} in {}: {err:#}; the review of {task} starts from {}",
+                project.display(),
+                worktree.base
+            ),
+        }
+    }
+    Ok(Some(worktree))
+}
+
 /// A worktree on `branch`, or on `branch` with the time when that one exists, from the
 /// default branch; `None` when `project` is not the top of a git repository.
 async fn new_worktree(
@@ -491,6 +528,35 @@ mod tests {
         run(&repo, &["branch", "task/factory-7", "origin/main"]);
         let again = worker_worktree(&repo, &task, at()).await.unwrap().unwrap();
         assert_eq!(again.branch, "task/factory-7-20261108-132005");
+    }
+
+    #[tokio::test]
+    async fn a_review_starts_on_the_pull_requests_branch_once_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = clone(dir.path(), "main");
+        let task: TaskId = "factory-7".parse().unwrap();
+        // The branch exists on the remote only: the clone has not fetched it.
+        run(
+            &dir.path().join("origin"),
+            &["branch", "task/factory-7", "main"],
+        );
+        let on_head = review_worktree(&repo, &task, Some("task/factory-7"), at())
+            .await
+            .unwrap();
+        assert_eq!(
+            on_head,
+            Some(NewWorktree {
+                base: "origin/task/factory-7".into(),
+                branch: "review/factory-7".into()
+            })
+        );
+        run(&repo, &["rev-parse", "--verify", "origin/task/factory-7"]);
+        // No pull request, a branch the remote lacks, or a name that is an option: the
+        // default branch.
+        for head in [None, Some("task/gone"), Some("--upload-pack=x")] {
+            let worktree = review_worktree(&repo, &task, head, at()).await.unwrap();
+            assert_eq!(worktree.unwrap().base, "origin/main", "{head:?}");
+        }
     }
 
     #[tokio::test]
