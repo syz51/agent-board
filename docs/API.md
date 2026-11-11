@@ -356,12 +356,24 @@ Reopening a closed board, or any change on it, starts the period again.
   task that can never be live (not a feedback item, forwarded, fixed, or closed
   unresolved). An old server that has only live-looking items passes that check.
   `q=<words>` is a text search: it lists only the tasks that hold every word, split at
-  white space (at most 8 words and 200 characters), in their title, body, acceptance
-  checks, summary, blocked reason or one of their notes, or whose id is the word. A word
-  matches as a substring, whatever the case of ASCII letters; other letters match only
-  in the same case, and `%` and `_` are plain text. It combines with every other filter.
+  white space (at most 8 words and 200 characters), in their id, title, body, acceptance
+  checks, summary, blocked reason or notes. The best match comes first: a word in the id
+  or title counts above one in the task's own text, which counts above one in its notes;
+  equal matches keep the list's order. A word matches in any letter case, in its stemmed
+  form (`deploy` finds `deployed`, and the reverse) and as the start of a longer word
+  (`snap` finds `snapshot`), not in the middle of one. The parts of a word, such as
+  `mcp` and `rs` of `mcp.rs`, must stand in a row. Signs are no part of a word and query
+  syntax is plain text; a `q` without a letter or digit finds nothing.
+  Each `Task` of a search has `snippet` when a word is in its own text or notes: at most
+  200 characters around the words found, on one line, with each found word in `[` and
+  `]`. It is absent when the words are in the id or title only.
+  When no task holds every word, the search lists the tasks that hold at least one, and
+  each of them has `any_word: true`.
+  `q` combines with every other filter. With `after`, the cursor's place is its rank in
+  the same search; a task that the search does not list is 400 `invalid`.
   A blank `q` is no search; a too long one is 400 `invalid`. Servers that predate `q`
-  ignore it and list every task.
+  ignore it and list every task; servers that predate the ranking match a word anywhere
+  in a word, list by priority and send no `snippet`.
   `since=<point>` lists only the tasks changed after a point: digits alone are an event
   sequence number (`seq` of a snapshot or event, `next_since` of `GET /v1/events`), and
   anything else is an RFC 3339 time. A task changes with an event that names it: its
@@ -994,7 +1006,9 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   `after=<id>`, and the cut line names the id to pass: `board ls --limit 50 --after
   factory-62`.
   `--search <words>` (alias `--grep`) sends `q=<words>`, at most 8 words and 200
-  characters, refused before sending when longer. A server that predates `q` ignores it
+  characters, refused before sending when longer. The text output shows a task's
+  `snippet` on an indented line below it, quoted, and ends with the line `no task holds
+  every word of the search; these hold at least one` when the tasks have `any_word`. A server that predates `q` ignores it
   and lists every task, so upgrade the server first.
   `--parent <id>` sends `parent=<id>`. Without `--json`, a task with children ends its line
   with `children <n>`. `--live` sends `live=true`: `board ls --live --json` lists every

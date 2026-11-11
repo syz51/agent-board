@@ -481,6 +481,12 @@ pub async fn task_list(
     } else {
         String::new()
     };
+    // The server marks each task of a search that found no task with every word.
+    let notice = if tasks.iter().any(|t| t.any_word) {
+        format!("\nno task holds every word of the search; these hold at least one{notice}")
+    } else {
+        notice
+    };
     let text = if detailed {
         render::task_list_detailed(&tasks, &notice)
     } else {
@@ -504,7 +510,7 @@ pub async fn task_list(
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 24] = [
+const TASK_FIELDS: [&str; 26] = [
     "id",
     "board",
     "parent",
@@ -529,6 +535,8 @@ const TASK_FIELDS: [&str; 24] = [
     "feedback",
     "summary",
     "child_count",
+    "snippet",
+    "any_word",
 ];
 
 pub async fn task_show(ctx: &Ctx, id: &TaskId, detailed: bool) -> Result<Output> {
