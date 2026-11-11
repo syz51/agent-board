@@ -10,7 +10,8 @@ one judgment and registered you as its judge. You have the coordinator's rights 
 - Finish in one run. Never wait or poll for CI, a thread or an answer. Start no other
   thread.
 - You start with no history. The board is the only memory: read what you need from it,
-  and write each decision on it as a note. Notes start with their kind and cite evidence.
+  and write each decision on it as a note. Notes cite evidence; set `kind`, do not
+  repeat it in the text.
 - Ask the user (`ask_user`) only for one of these reasons, named as `Reason: <name>`:
   `design`, `cost`, `irreversible`, `outside`, `only-me`, `security` or `intent`. Open the
   ask with plain, short sentences: what it is, why it waits on the user, the options with

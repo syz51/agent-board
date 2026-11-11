@@ -449,7 +449,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
-| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts; end a turn that began before a pause that holds the agent (`continue: false`, see "Pausing work"); in a T3 thread, register a finished background read of it (see above). A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup) |
+| `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts; end a turn that began before a pause that holds the agent (`continue: false`, see "Pausing work"); in a T3 thread, register a finished background read of it (see above). A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup). Claude Code runs this hook for a subagent's tool calls too, with the agent's session and an `agent_id`. Such a call gets only the lines a subagent can use: the `hold:` line and the overlaps with a peer's edit or lease. It asks for alerts from a cursor the agent's subagents share (or the agent's, when that is later) and leaves the cursor the agent's hooks keep, so the agent's own next heartbeat or prompt still brings its other alerts (an answered ask, a change to its task, a new peer). The server's own cursor for the agent does move with a subagent's request; a `SessionStart` snapshot therefore asks from the hooks' cursor while the subagents' is ahead of it. A request without `since` in between, such as the `board_snapshot` tool, starts after those alerts. A `SessionStart` with an `agent_id` gets no snapshot, which describes the agent, not the subagent. Claude Code 2.1.322 sends none there: after a subagent's compaction it runs `SessionStart` (source `compact`) with the same input as for the agent's own, so that subagent still gets the agent's snapshot |
 | `Stop` | Mark idle; in a turn the hold halted, nothing more. Otherwise, when a task is in `doing`, remind once if there is no handoff, or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: after the handoff, its newest change to the state of its tasks, or a file touch more than 30 minutes later, from MCP or the CLI). A turn that only read, replied or added notes stops quietly. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. When the agent marked a task done this turn, remind once per task to file what is still to do (sub-tasks for its scope, `Proposal:` tasks for found work, a blocked task with an ask for the user's part) and to name them in the reply. The signal is local: `board done` and the `task_done` tool, the only ways an agent marks a task done, leave a mark in `$BOARD_HOME/state/done/` once the server accepts it; each `Stop` takes the marks, dropping those older than the turn's `UserPromptSubmit`, and a new or resumed session (not compaction) drops what is left, so it needs no server and holds offline. Both reminders go in one block, done first, since the `Stop` after a block has `stop_hook_active` and every reminder stays quiet then. The idle update goes first and carries the turn's last message (`last_assistant_message`, cleaned and cut to 4,000 characters) as `said`, also when a reminder then blocks, since that is the message the turn ended on; the Stop that ends the turn answering the reminder sends none. The server keeps it only for a live coordinator (see Reporting to the user). In a T3 thread, the session's first `Stop`, then one at most an hour after the last check, asks T3 for the thread's title and link (the same `t3 thread show`, at most 0.4 seconds, else a background read), since T3 renames a thread after its first turn; not while the server is skipped. The check asks T3 first, since a waiting read may predate a rename; a `Stop` with no check due, or one whose check started a background read, registers a finished read instead. Only a title or link other than the registered one is sent: after the idle update and the reminders, the hook registers the agent again (where it runs now, so a `git` read of the work tree too, and a delegated thread's parent if T3 now gives it) and, since registering marks it running, marks it idle again, in what is left of the hook's budget. A check that finds no change or gets no answer counts as done; a change counts once the server takes it, so a failed registration is tried again at the next `Stop`. One cut off between the two requests leaves the agent marked running until its next hook |
 | `StopFailure` with a usage-limit error | Mark paused until the reset time |
 | `SessionEnd` | Mark ended; release file leases. A coordinator lease runs on: T3 ends idle sessions while the thread lives on, and the daemon of the lease's device renews it while the thread is live, or releases it |
@@ -667,7 +667,8 @@ settings in use, warned once per edit.
   adoption newer than the last failed start is tried at once. An adopted thread that T3 no
   longer has, has archived, or whose folder is gone, is dropped, and a new thread is started. So is an adoption
   not acted on within an hour, so an old request never replaces a thread later.
-- **Its loop**: read the snapshot; take the highest-priority ready task marked `auto`;
+- **Its loop**: read the board state (a snapshot in the first loop, then the wake-up's
+  lines and the prompt's delta, and a snapshot again only when those are not enough); take the highest-priority ready task marked `auto`;
   delegate it to a child thread (T3 `delegate_task`, in its own worktree; for a task whose
   work is in another repository, a T3 thread launched in that repository's project, since
   `delegate_task` runs only in the coordinator's own project), naming the task
@@ -744,6 +745,11 @@ settings in use, warned once per edit.
   says to read them, with `detailed` when `task_show` would cut some.
   `task_show` with several ids shows each task's findings and decisions and counts its
   plain notes, so the agent doing a task still reads that task alone.
+  A session often shows the same task again to see whether a note or the status changed.
+  `task_show` of one task ends with the number of its latest event, and `since` with that
+  number shows only the later events, notes, evidence and changed fields, or one line when
+  nothing changed. The whole task stays the default, since a compaction can drop what the
+  session read before. The client filters the detail it already reads, so no route changed.
   A note by another agent on a task its owner has open (`doing` and `review` included)
   raises an alert for the owner, `<agent> changed your task <id> (finding)`, naming the
   note's kind. A finding on a `doing` or `review` task whose owner is gone (ended, not
@@ -751,8 +757,10 @@ settings in use, warned once per edit.
   `task_done` lists the findings noted since the task's latest claim in its history (not
   a later handover, so findings noted while a child held the task are included; every
   finding when no claim is there), read after the done so none added meanwhile is
-  missed. The owner then notes how each one the evidence does not cover was addressed,
-  or reopens the task. The coordinator prompt says
+  missed. The caller's own findings are listed by note id with their start, cut to 80
+  characters, since it wrote them in the same session; other agents' are in full. The
+  owner then notes how each one the evidence does not cover was addressed, or reopens
+  the task. The coordinator prompt says
   to read every note after the claim and to put each finding and decision into a
   delegate's brief.
 - **Waking it**: the daemon follows the event stream and sends the coordinator a short,
@@ -775,6 +783,17 @@ settings in use, warned once per edit.
   be woken (no T3 thread on this device, unknown, gone from T3 or archived, or paused with
   no reset time), and as well while the asker waits for a usage-limit reset. Wake-ups are
   queued as what they are about and sent every few seconds, one message per agent:
+  - **Text**: one line per change, naming the board and the task or ask, then the line
+    `Continue from this and the board delta in this prompt, if there is one.` The message
+    asks for no `board_snapshot` call: the `UserPromptSubmit` hook, which every runtime's
+    hooks run, adds the delta (alerts and changed counts) to the same prompt, so a call
+    would cost the agent one more turn for what it already has. An agent whose hook did
+    not run still gets the lines; it calls `board_snapshot` when it needs more, as its
+    instructions say. These messages do name the call, since the delta is not enough for
+    them: the first brief, the adoption brief, the re-brief and a fresh session, which
+    start the loop anew; and the three that follow a time without wake-ups, the line for
+    a board the user resumed, the line for usage that eased, and the message after a
+    usage-limit reset.
   - **Ended is not gone**: T3 closes a Claude session left idle for 30 minutes, and that
     session's end marks the agent `ended`, but the thread lives on and a message resumes
     it (its session-start hook registers it running again, which the server announces).
@@ -1268,7 +1287,8 @@ Notes and bodies: task_show <id>.
 
 Writing conventions, enforced where possible: titles are imperative, at most 80 characters,
 without status or ids; bodies stand alone; acceptance is one observable check per line;
-notes start with their kind and cite evidence; handoff `next` is the first concrete action.
+notes cite evidence, and their kind is a parameter, not a prefix of the text; handoff
+`next` is the first concrete action.
 
 The format is a starting point: the `json` and `yaml` renderings exist so the formats can be
 benchmarked against each other on real tasks.

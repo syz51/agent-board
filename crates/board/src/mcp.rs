@@ -82,8 +82,9 @@ struct ToolSpec {
     params: fn() -> Vec<(&'static str, Value, bool)>,
 }
 
-/// Tasks `task_list` lists when the call names no `limit`.
-const TASK_LIST_LIMIT: u32 = 50;
+/// Tasks `task_list` lists when the call names no `limit`: about 3,000 characters of text
+/// at the usual line length, a size picked by measurement, not a bound on the text.
+const TASK_LIST_LIMIT: u32 = 25;
 
 /// A string parameter of at most `max` characters, the server's limit.
 fn s(description: &str, max: usize) -> Value {
@@ -231,7 +232,7 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "limit",
-                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 50."}),
+                    json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 25."}),
                     false,
                 ),
                 (
@@ -251,12 +252,20 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "ids",
                     strings(
-                        "More tasks in the same call, at most 20 in all, each in a compact form.",
+                        "More tasks, at most 20 in all, each in a compact form.",
                         TASK_ID_MAX,
                     ),
                     false,
                 ),
                 ("detailed", b(DETAILED_ARG), false),
+                (
+                    "since",
+                    s(
+                        "Repeat read: the number the last read ended with, to show changes only.",
+                        TIME_MAX,
+                    ),
+                    false,
+                ),
             ]
         },
     },
@@ -465,7 +474,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_note",
-        description: "Add a note (at most 800 characters) to a task. Start with its kind and cite evidence. Kinds: note, finding, decision.",
+        description: "Add a note (at most 800 characters) to a task. Cite evidence. Kinds: note, finding, decision.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -862,7 +871,11 @@ impl BoardMcp {
             "task_show" => {
                 let a: ShowArgs = parse(name, args)?;
                 let ids: Vec<TaskId> = std::iter::once(a.id).chain(a.ids).collect();
-                ops::tasks_show(&ctx, &ids, a.detailed).await?
+                let since = a
+                    .since
+                    .map(|s| ops::show_since(&s, chrono::Utc::now()))
+                    .transpose()?;
+                ops::tasks_show(&ctx, &ids, a.detailed, since).await?
             }
             "task_add" => {
                 let a: AddArgs = parse(name, args)?;
@@ -1070,6 +1083,7 @@ struct ShowArgs {
     ids: Vec<TaskId>,
     #[serde(default)]
     detailed: bool,
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1320,6 +1334,11 @@ mod tests {
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
         assert!(schemas < 16_500, "tool list: {schemas}");
+        // `kind` is a parameter, which every reader shows: no text asks to repeat it.
+        for tool in &tools {
+            let text = tool.description.as_deref().unwrap_or_default();
+            assert!(!text.contains("with its kind"), "{}", tool.name);
+        }
         for rule in [
             "Call board_snapshot when",
             "Claim a task before working on it",

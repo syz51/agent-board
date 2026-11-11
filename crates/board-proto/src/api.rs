@@ -733,6 +733,13 @@ pub struct Snapshot {
     pub held_for_usage: bool,
 }
 
+/// What ends the alert line (`! <alert> -> <action>`) of a peer's edit that overlaps the
+/// agent's lease or edit. The hooks give a subagent only the alert lines that end with this
+/// or [`LEASE_OVERLAP_ACTION`].
+pub const EDIT_OVERLAP_ACTION: &str = "re-read before editing";
+/// What ends the alert line of a peer's lease that overlaps the agent's lease or edit.
+pub const LEASE_OVERLAP_ACTION: &str = "coordinate before editing those files";
+
 /// Answer to `GET /v1/events?since=&board=&limit=`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventsPage {

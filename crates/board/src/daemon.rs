@@ -1319,6 +1319,12 @@ pub fn is_user_message(text: &str) -> bool {
         && text.trim() != "/compact"
 }
 
+/// The last line of a wake-up message, before its marker. The lines above it name what
+/// changed, and the agent's prompt hook adds the board delta (alerts and changed counts) to
+/// the same prompt, so the message asks for no snapshot: that call would cost the agent one
+/// more turn for what the prompt already holds.
+const WAKE_END: &str = "Continue from this and the board delta in this prompt, if there is one.";
+
 /// The line that tells the coordinator of `slug` that a fresh session is due.
 pub fn fresh_session_line(slug: &BoardSlug) -> String {
     format!(
@@ -2140,7 +2146,7 @@ impl<T: T3> Daemon<T> {
             let digest = prompt_digest(triage);
             let owed = local.briefed.as_deref() != Some(digest);
             let resume = format!(
-                "board {}: the usage limit has reset. Run board_snapshot and continue your loop.",
+                "board {}: the usage limit has reset. Call board_snapshot and continue your loop.",
                 board.slug
             );
             let message = if owed {
@@ -4304,7 +4310,7 @@ impl<T: T3> Daemon<T> {
         }
         Some(Outgoing {
             agent: agent.clone(),
-            message: format!("{}\nRun board_snapshot and continue.", lines.join("\n")),
+            message: format!("{}\n{WAKE_END}", lines.join("\n")),
             wakes: sent,
             backoff,
             rebriefs: Vec::new(),
@@ -4870,8 +4876,8 @@ impl<T: T3> Daemon<T> {
                 })
             }
             WakeAbout::Resumed if coordinator => Some(format!(
-                "board {slug}: the user resumed this board after a pause. Read your board \
-                 snapshot and handoff, then continue. The pause stopped the threads on its \
+                "board {slug}: the user resumed this board after a pause. Call \
+                 board_snapshot and read your handoff, then continue. The pause stopped the threads on its \
                  tasks in doing: send each owner thread a message to continue its task, and \
                  restart a task only when its owner thread is gone. Updates on the pull \
                  requests of this board's tasks were not handled while paused: check each \
@@ -4895,7 +4901,7 @@ impl<T: T3> Daemon<T> {
                 };
                 Some(format!(
                     "board {slug}: the account usage no longer stops new work on this board \
-                     (stop at {stop_at}%{pace}). Read your board snapshot, then start ready \
+                     (stop at {stop_at}%{pace}). Call board_snapshot, then start ready \
                      tasks up to the limit on its you: line"
                 ))
             }

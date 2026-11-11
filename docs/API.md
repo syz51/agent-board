@@ -398,7 +398,7 @@ Reopening a closed board, or any change on it, starts the period again.
   value counts as 1; the list does not say when the limit cut it, so the CLI and MCP ask
   for one task more than their limit and say so in their text, naming the task to
   continue after. The MCP `task_list` asks
-  for 50 tasks when the call names no `limit`, since its text goes into an agent's
+  for 25 tasks when the call names no `limit`, since its text goes into an agent's
   context; the CLI keeps the server's default. The MCP `task_list` also narrows a plain
   call to open work on one board, in the client:
   - It sends `board=<the caller's board>` (the one board the caller joined, else the
@@ -880,7 +880,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   cursor to the returned `seq`. One request checks at most 1,000 events that can concern the
   agent for alerts; past that, `seq` is the last one checked and the first alert says how
   many wait for the next request. Alerts read only the last 10,000 events; an alert names
-  the older ones skipped. `json` is
+  the older ones skipped. An alert about a peer's edit or lease that overlaps the agent's
+  ends with the action `re-read before editing` or `coordinate before editing those files`
+  (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
+  subagent only the `lines` alerts that end so. `json` is
   compact, so all three formats share the same size caps.
   `held_by` lists the held boards the agent works for: paused ones, and at the weekly hard
   line active ones too (as their coordinator, a thread it
@@ -1060,6 +1063,22 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   task alone is the full form. `--detailed` takes one task. `--json` prints `{tasks,
   not_shown}`: the `[TaskDetail]` list of the tasks that were read, and `{id, reason}`
   for each that was not.
+  The text of one task ends with `changes only on the next read: since <n>`, the `seq` of
+  the latest event in its `history`. `board show <id> --since <n>` (MCP `task_show` with
+  `since`) reads the same `GET /v1/tasks/{id}` and prints only what came after that
+  event: the task's line, each later event of its `history` (a status change as `<from>
+  to <to>`, with the changed fields' names), the evidence and notes added from the first
+  later event on, the present text of each changed field (`body`, `acceptance`,
+  `blocked_reason`, and `summary` and `resolution_reason` after a done), and the next
+  `since`. A note is later when a later `note_added` event names its id; evidence when
+  its time is not before the first later event's. Other changed fields are named only,
+  and a field that was cleared has no text line. When no event is
+  later it prints one line, `no change since #<n>: <task line>`. `since` also takes an
+  RFC 3339 time, a date or a duration back (`2h`). A change of a child or a blocker is
+  not an event of the task, so read those tasks themselves. When the `history` starts
+  after the point (a newer task, or more than the 200 events a detail holds) the changes
+  cannot be told and the whole task is printed, with a line saying so. `since` takes
+  one task and no `--detailed`; `--json` prints the whole `[TaskDetail]`.
 - `board feedback [--about A] [--activity X] [--source agent|capture] [--signature S] <text>
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
