@@ -721,7 +721,11 @@ knows two things for it:
   `warning` is absent otherwise; clients that predate it read the answer as an `[Ask]`.
   `ask_user` (MCP) and `board ask` print it as a `warning:` line; `board ask --json` prints
   the answer unchanged.
-- `GET /v1/asks?status=open&board=` → `[Ask]` list.
+- `GET /v1/asks?status=open&board=&limit=` → `[Ask]` list, oldest first. `limit` is
+  optional: with it, the list holds only the newest `limit` asks that pass the filters (0
+  reads as 1); without it, every one. The list does not say that it was cut, so a client
+  asks for one ask more than it shows, as `board asks` does: it then says that older ones
+  match, and counts them against a server that predates `limit` and sends every ask.
 - `GET /v1/asks/{id}` → `[Ask]` in any status (the web view's `/asks/<id>` link).
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
   `cli`, `web` or `telegram`. The `ask_answered` event's payload names the ask (`id`) and
