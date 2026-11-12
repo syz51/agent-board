@@ -1055,7 +1055,9 @@ async fn a_quiet_review_of_a_left_owner_names_the_one_step_close() {
     let want = format!(
         "{id} has sat in review for 25h; its owner is gone and its board has no coordinator \
          -> check its PR; once merged, close it with task_done {id} take=true and a pr or a \
-         passed check, or board done {id} --take"
+         passed check, or board done {id} --take; if it will not merge, drop it with \
+         task_update {id} status=dropped reason=<why>, or board update {id} --status dropped \
+         --reason <why>"
     );
     assert!(text(&delta).contains(&want), "{}", text(&delta));
     let delta = snapshot(&t, far, "kind=delta").await;
@@ -1522,6 +1524,24 @@ async fn an_owner_left_running_then_ended_is_one_spell() {
     set_state(&t, owner, "idle").await;
     t.advance(TimeDelta::minutes(31));
     assert_eq!(sweep_idle_doing(&t), 1);
+}
+
+#[tokio::test]
+async fn an_owner_the_sweep_ended_is_away_since_it_was_last_seen() {
+    // Notices at two hours away, so the sweep ends the owner first.
+    let t = T::with(|c| c.defaults.doing_idle_secs = 2 * 3600);
+    let owner = "t3:alpha";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Cut short").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    t.advance(TimeDelta::minutes(61));
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(sweep_idle_doing(&t), 0);
+    // Two hours after it was last seen, not after the sweep ended it.
+    t.advance(TimeDelta::minutes(60));
+    assert_eq!(sweep_idle_doing(&t), 1);
+    assert_eq!(idle_notices(&t), [format!("{id} {owner}")]);
 }
 
 #[tokio::test]

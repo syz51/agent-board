@@ -894,6 +894,8 @@ pub struct TaskChanges {
     pub not_before: Option<Option<Timestamp>>,
     /// Hand the task to this agent.
     pub owner: Option<AgentId>,
+    /// Why the task is dropped, with `status: dropped`.
+    pub reason: Option<String>,
 }
 
 /// Reads the task's version, then applies the changes.
@@ -917,6 +919,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 auto: changes.auto,
                 not_before: changes.not_before,
                 owner: changes.owner,
+                reason: changes.reason,
             },
         )
         .await?;

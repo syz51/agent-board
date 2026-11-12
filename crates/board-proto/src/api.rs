@@ -452,6 +452,12 @@ pub struct UpdateTask {
     /// and answers with the owner unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<AgentId>,
+    /// Why the task is dropped: only with `status: dropped`, stored as a `decision` note by
+    /// the caller. Required for a drop on a board nobody runs by an agent that does not own
+    /// the task and whose owner has left. Sent only when set; a server that predates it
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
@@ -911,6 +917,30 @@ mod tests {
         let mut bad = serde_json::json!({ "agent": "t3:a", "version": 1 });
         bad["owner"] = serde_json::json!("");
         assert!(serde_json::from_value::<UpdateTask>(bad).is_err());
+    }
+
+    /// A drop's `reason` is optional and sent only when set, so older peers see the same
+    /// requests.
+    #[test]
+    fn update_task_reason_is_sent_only_when_set() {
+        let base = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        let absent: UpdateTask = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.reason, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("reason")
+                .is_none()
+        );
+        let mut set = base;
+        set["status"] = serde_json::json!("dropped");
+        set["reason"] = serde_json::json!("the runtime was removed");
+        let set: UpdateTask = serde_json::from_value(set.clone()).unwrap();
+        assert_eq!(set.reason.as_deref(), Some("the runtime was removed"));
+        assert_eq!(
+            serde_json::to_value(&set).unwrap()["reason"],
+            "the runtime was removed"
+        );
     }
 
     /// Stats and tasks from servers that predate feedback items still parse.

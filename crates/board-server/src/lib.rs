@@ -109,9 +109,10 @@ async fn shutdown_signal() {
 
 /// Every minute until shutdown: sweeps expired leases, prunes old API error records,
 /// resumes a paused feedback board, announces passed `not_before` times, quiet reviews and
-/// owners away from their `doing` tasks in one transaction, then closes or
-/// deletes idle temporary boards, one transaction per board, then prunes history past the
-/// stats window in batches. The sweep of temporary boards, and the shutdown, record that the
+/// owners away from their `doing` tasks, then ends sessions marked running but long
+/// unseen, in one transaction; the notices come first, so a notice due as a session is
+/// ended still goes out. Then it closes or deletes idle temporary boards, one transaction
+/// per board, then prunes history past the stats window in batches. The sweep of temporary boards, and the shutdown, record that the
 /// server is alive, so the next run knows how long the server was down.
 pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -134,7 +135,8 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                             ops::boards::resume_feedback_board(cx)?;
                             ops::tasks::announce_not_before(cx)?;
                             ops::tasks::announce_quiet_reviews(cx)?;
-                            ops::tasks::announce_idle_doing(cx)
+                            ops::tasks::announce_idle_doing(cx)?;
+                            ops::agents::end_unseen(cx)
                         })
                         .await;
                     if let Err(error) = swept {

@@ -107,7 +107,7 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   board's repositories. That alert says to check the PR and, once it merged, names the
   call that is not refused: take the task (`task_claim <id> take=true`) and mark it done,
   or, while the owner is not stale yet, close it in one step (`task_done <id>
-  take=true`). The sweeper's event reaches only sessions that run then, so a full snapshot
+  take=true`), or drop it with a reason if it will not merge. The sweeper's event reaches only sessions that run then, so a full snapshot
   (session start, compaction) also names up to five such tasks from the board's state, as
   soon as their owner has left: whoever works on the board next closes what has merged.
   Stats count dones that spent under a minute in `doing`, takeovers
@@ -151,16 +151,19 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `blocked_reason` that someone else set, which may name such a wait; the owner's claim
   clears a reason it set itself. Another live agent's parked task is refused, naming the
   owner. After 24 hours unseen the owner is stale and another agent may take the task
-  (logged). On a board that nobody runs, no coordinator closes a finished task for an
-  owner that is gone, so there a task in `review` does not wait those 24 hours: an agent
-  on one of the board's repositories may close it once its owner has left. An owner has
-  left when its session has ended, or still counts as `running` and has been unseen for
-  twice `doing_idle_secs` (it stopped without an end hook), with no usage-limit reset
-  ahead and no delegated thread at work. An idle owner waits, on CI or on the user, and
-  keeps its task. A take that starts work keeps the 24 hours. A stale owner's task in
-  `review`, or such a left owner's, can be closed in one step (`task_done` with `take`,
-  and a PR or a check as evidence), outside the closer's `doing` limit, since it starts
-  no work. The
+  (logged). On a board that nobody runs, no coordinator closes or drops a task for an
+  owner that is gone, so there a task does not wait those 24 hours: once its owner has
+  left, an agent on one of the board's repositories may close it, in any status before
+  `done` or `dropped`, or drop it with a reason, which the server keeps as a `decision`
+  note; a drop without one is refused with the call that gives it. An owner has left
+  when its session has ended, or still counts as `running` and has been unseen for
+  `owner_left_secs` (an hour; it stopped without an end hook, and the sweeper marks it
+  `ended` then, see Coordination), with no usage-limit reset ahead and no delegated
+  thread at work. An idle owner waits, on CI or on the user, and keeps its task. A take
+  that starts work (a claim, a take, a move to `doing`) keeps the 24 hours. A stale
+  owner's task in `review`, or such a left owner's, can be closed in one step
+  (`task_done` with `take`, and a PR or a check as evidence), outside the closer's `doing`
+  limit, since it starts no work. The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). Once the
   owner's session has ended, the task's creator and the threads that delegated the owner
@@ -625,6 +628,20 @@ apart from the user's chats, such as environment variables.
   between the two passes the first notice without it. It also reaches a coordinator on
   another device, which the daemon's forwarding cannot. The owner's device daemon wakes a
   T3 owner at each notice, so at most once more at the repeat.
+- **A session that stops without its end hook**: a crash or a closed terminal leaves the
+  agent marked `running`. The server's sweeper marks such an agent `ended` once it has
+  been unseen for `owner_left_secs` (an hour), with the usual `agent_state_changed`
+  event, whose `unseen_since` names when it was last seen. It skips an agent waiting for
+  a usage-limit reset still ahead, one with a delegated thread at work (as above), a
+  board's coordinator while its lease is live (the daemon renews the lease without the
+  agent being seen), a live judge, and a device's dispatch agent, which is no session.
+  It leaves `last_seen` alone, so an idle notice's spell still starts at the stop, and it
+  releases the agent's file leases, as any end does; the agent's next call marks it
+  running again. The heartbeat comes at most once a minute while tools run, so a session
+  that is working is seen well within the hour. One exception: no hook fires while a
+  single tool call waits, such as a permission prompt or a question to the user, so a
+  session left waiting there for over an hour is marked `ended` and loses its file leases
+  until its next call.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another

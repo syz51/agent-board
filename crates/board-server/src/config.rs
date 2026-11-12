@@ -332,6 +332,10 @@ pub struct Settings {
     /// A task in doing whose owner has been away this long, with no thread it delegated
     /// still at work, is announced once per spell away.
     pub doing_idle_secs: u64,
+    /// A session still marked `running` and unseen this long stopped without an end hook:
+    /// the sweeper marks it `ended`, and on a board nobody runs an agent on its
+    /// repositories may drop or close its tasks.
+    pub owner_left_secs: u64,
 }
 
 impl Default for Settings {
@@ -368,6 +372,7 @@ impl Default for Settings {
             duplicate_ask_window_secs: 30 * 60,
             review_quiet_secs: 24 * 3600,
             doing_idle_secs: 30 * 60,
+            owner_left_secs: 3600,
         }
     }
 }
@@ -413,6 +418,7 @@ impl Settings {
             ("duplicate_ask_window_secs", self.duplicate_ask_window_secs),
             ("review_quiet_secs", self.review_quiet_secs),
             ("doing_idle_secs", self.doing_idle_secs),
+            ("owner_left_secs", self.owner_left_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -467,6 +473,10 @@ impl Settings {
 
     pub(crate) fn doing_idle_ms(&self) -> i64 {
         secs_ms(self.doing_idle_secs)
+    }
+
+    pub(crate) fn owner_left_ms(&self) -> i64 {
+        secs_ms(self.owner_left_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

@@ -691,8 +691,13 @@ pub struct UpdateArgs {
     /// Comma-separated blockers; an empty value clears them.
     #[arg(long)]
     blockers: Option<String>,
-    #[arg(long = "reason", help = at_most("Why it is blocked", limits().note_chars))]
-    blocked_reason: Option<String>,
+    // With `--status dropped`, why it is dropped, kept as a decision note (required to drop
+    // a task whose owner has left, on a board nobody runs); otherwise why it is blocked.
+    #[arg(long, help = at_most(
+        "Why it is blocked, or with --status dropped why it is dropped",
+        limits().note_chars,
+    ))]
+    reason: Option<String>,
     /// May the coordinator start it? Set false only when the user must act or decide, or for
     /// a pending proposal; set a proposal true only on an accept verdict.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
@@ -920,7 +925,13 @@ impl Command {
                 check_opt("title", &a.title, l.title_chars)?;
                 check_opt("body", &a.body, l.body_chars)?;
                 check_opt("acceptance", &a.acceptance, l.body_chars)?;
-                check_opt("blocked_reason", &a.blocked_reason, l.note_chars)?;
+                // Named as sent: a drop's reason, otherwise the blocked reason.
+                let reason = if a.status == Some(TaskStatus::Dropped) {
+                    "reason"
+                } else {
+                    "blocked_reason"
+                };
+                check_opt(reason, &a.reason, l.note_chars)?;
             }
             Self::Done(a) => {
                 for values in [&a.checks, &a.commits, &a.prs, &a.artifacts] {
@@ -1215,6 +1226,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Take { id } => ops::task_action(&ctx()?, &id, "take").await?,
         Command::Update(a) => {
             let blockers = a.blockers.map(|list| parse_task_list(&list)).transpose()?;
+            let (reason, blocked_reason) = if a.status == Some(TaskStatus::Dropped) {
+                (a.reason, None)
+            } else {
+                (None, a.reason)
+            };
             let changes = ops::TaskChanges {
                 status: a.status,
                 title: a.title,
@@ -1222,10 +1238,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 acceptance: a.acceptance,
                 priority: a.priority,
                 blockers,
-                blocked_reason: a.blocked_reason,
+                blocked_reason,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?,
                 owner: a.owner,
+                reason,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }

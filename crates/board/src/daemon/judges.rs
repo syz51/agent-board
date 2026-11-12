@@ -970,6 +970,7 @@ impl<T: T3> Daemon<T> {
                         auto: None,
                         not_before: None,
                         owner: Some(agent.clone()),
+                        reason: None,
                     },
                 )
                 .await

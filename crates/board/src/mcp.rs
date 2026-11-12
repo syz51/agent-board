@@ -427,6 +427,14 @@ const TOOLS: &[ToolSpec] = &[
                     ),
                     false,
                 ),
+                (
+                    "reason",
+                    s(
+                        "Why it is dropped (status dropped), kept as a decision note; required for a left owner's task.",
+                        limits().note_chars,
+                    ),
+                    false,
+                ),
             ]
         },
     },
@@ -928,6 +936,7 @@ impl BoardMcp {
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?,
                     owner: a.owner,
+                    reason: a.reason,
                 };
                 ops::task_update(&ctx, &a.id, changes).await?
             }
@@ -1147,6 +1156,7 @@ struct UpdateArgs {
     #[serde(default, deserialize_with = "null_as_none")]
     not_before: Option<String>,
     owner: Option<AgentId>,
+    reason: Option<String>,
 }
 
 /// Reads a present `null` as the string `none`, so it clears like the CLI's `none`.
@@ -1363,7 +1373,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 16_660, "tool list: {schemas}");
+        assert!(schemas < 16_820, "tool list: {schemas}");
         // `kind` is a parameter, which every reader shows: no text asks to repeat it.
         for tool in &tools {
             let text = tool.description.as_deref().unwrap_or_default();

@@ -2,10 +2,10 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, Dispatch, DoneTask,
-    ErrorCode, EventType, EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
-    TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, SUMMARY_CHARS_MAX,
+    TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
 
 use crate::config::Settings;
@@ -94,6 +94,18 @@ pub(crate) fn validate_update(mut req: UpdateTask, s: &Settings) -> Result<Updat
     req.blocked_reason = req.blocked_reason.filter(|r| !r.trim().is_empty());
     if let Some(reason) = &req.blocked_reason {
         check_line("blocked_reason", reason, s.note_chars)?;
+    }
+    // A blank reason is read as absent, so a drop that needs one is refused for want of it.
+    req.reason = req.reason.filter(|r| !r.trim().is_empty());
+    if let Some(reason) = &req.reason {
+        if req.status != Some(TaskStatus::Dropped) {
+            return Err(invalid(
+                "reason applies only to a drop",
+                "send status=dropped with the reason; for a blocked task send it as \
+                 blocked_reason; else add the text as a note (task_note)",
+            ));
+        }
+        check_text("reason", reason, s.note_chars)?;
     }
     if req.blockers.as_ref().is_some_and(|b| b.len() > 20) {
         return Err(invalid(
@@ -478,8 +490,12 @@ pub(crate) const LAST_RUN: &str = "SELECT COALESCE((SELECT seq FROM events \
 
 /// When `?1` stopped running: its first state change to anything but `running` after seq
 /// `?2`, its last change to `running`. A turn ending, a usage-limit pause and the session's
-/// end all follow the same stop, so the spell away starts at the first of them.
-pub(crate) const AWAY_SINCE: &str = "SELECT at FROM events \
+/// end all follow the same stop, so the spell away starts at the first of them. Its second
+/// column is the `unseen_since` of a session the sweeper ended ([`end_unseen`]), which
+/// stopped then, not when it was ended.
+///
+/// [`end_unseen`]: crate::ops::agents::end_unseen
+pub(crate) const AWAY_SINCE: &str = "SELECT at, json_extract(payload, '$.unseen_since') FROM events \
      WHERE actor = ?1 AND seq > ?2 AND type = 'agent_state_changed' \
        AND json_extract(payload, '$.to') <> 'running' \
      ORDER BY seq LIMIT 1";
@@ -559,11 +575,19 @@ pub(crate) fn announce_idle_doing(cx: &mut Ctx<'_>) -> Result<usize> {
         let since = if running {
             *last_seen
         } else {
-            cx.db
+            let stop: Option<(i64, Option<String>)> = cx
+                .db
                 .prepare_cached(AWAY_SINCE)?
-                .query_row(params![owner, last_run], |r| r.get(0))
-                .optional()?
-                .unwrap_or(*last_seen)
+                .query_row(params![owner, last_run], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            match stop {
+                Some((at, None)) => at,
+                Some((at, Some(unseen))) => DateTime::parse_from_rfc3339(&unseen)
+                    .map_err(|e| Error::Internal(format!("unseen_since {unseen}: {e}")))?
+                    .timestamp_millis()
+                    .min(at),
+                None => *last_seen,
+            }
         };
         if since > cutoff {
             continue;
@@ -1027,7 +1051,14 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         }
         return Err(refused(
             format!("claim refused: {} owns {id}", owner_desc(cx, owner)?),
-            "pick another task from ready (task_list ready=true)",
+            if left_unrun(cx, &task, owner, agent)? {
+                format!(
+                    "pick another task from ready (task_list ready=true); {}",
+                    left_owner_hint(id)
+                )
+            } else {
+                "pick another task from ready (task_list ready=true)".to_owned()
+            },
         ));
     }
     if matches!(task.status, TaskStatus::Review | TaskStatus::Blocked)
@@ -1187,6 +1218,7 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             auto: None,
             not_before: None,
             owner: None,
+            reason: None,
         },
         false,
     )
@@ -1229,7 +1261,15 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
                 "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
                 owner_desc(cx, &owner)?
             ),
-            format!("pick another task from ready (task_list ready=true); {STAND_IN_RULE}"),
+            // A take starts work, so it waits even when the owner has left.
+            if left_unrun(cx, &task, &owner, agent)? {
+                format!(
+                    "{}; to work on it yourself, take it once the owner is stale",
+                    left_owner_hint(id)
+                )
+            } else {
+                format!("pick another task from ready (task_list ready=true); {STAND_IN_RULE}")
+            },
         ));
     }
     let status = match task.status {
@@ -1303,7 +1343,7 @@ pub(crate) fn owner_session_ended(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool>
 
 /// Whether a thread that `owner` delegated (at any depth) is at work, as
 /// [`DELEGATE_AT_WORK`] judges for the idle sweep.
-fn delegate_at_work(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+pub(crate) fn delegate_at_work(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
     let now = cx.now_ms();
     Ok(cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
         params![
@@ -1344,48 +1384,91 @@ fn acts_for_ended_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<bo
 const STAND_IN_RULE: &str = "the task's creator and the agents that \
      delegated its owner may take, move or close it once the owner's session has ended";
 
+/// Why `owner` still holds its task against a caller that does not stand in for it, for
+/// refusals: the state of its session, and what of it is left to come back.
+fn owner_session_desc(cx: &Ctx<'_>, owner: &AgentId) -> Result<String> {
+    let now = cx.now_ms();
+    let Some((state, paused_until)) = cx
+        .db
+        .query_row(
+            "SELECT state, paused_until FROM agents WHERE id = ?1",
+            [owner.as_str()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok("it is not registered".to_owned());
+    };
+    if state != "ended" {
+        return Ok(format!("its session is {state}"));
+    }
+    Ok(match paused_until.filter(|&p| p > now) {
+        Some(until) => format!(
+            "its session ended while a usage limit holds it, and it comes back after the reset \
+             at {}",
+            ts(until).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None if delegate_at_work(cx, owner)? => {
+            "its session ended, but a thread it delegated is still at work".to_owned()
+        }
+        None => "its session has ended".to_owned(),
+    })
+}
+
 /// The owner of `task`, or an agent standing in for it ([`acts_for_ended_owner`]), may go
 /// on; anyone else is refused, with the step that fits the caller.
 fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Result<()> {
+    let id = &task.id;
     match &task.owner {
         Some(owner) if owner == agent => Ok(()),
         Some(_) if acts_for_ended_owner(cx, task, agent)? => Ok(()),
-        Some(owner) => Err(forbidden(
-            format!(
-                "only the owner {owner} may {action} {} while its session runs",
-                task.id
-            ),
-            if action == "complete"
-                && task.status == TaskStatus::Review
-                && (task.owner_stale || left_unrun_review(cx, task, owner, agent)?)
-            {
+        Some(owner) => {
+            let ended = owner_session_ended(cx, owner)?;
+            let message = if ended {
                 format!(
-                    "the owner is stale or has left: close it in one step with {}",
-                    done_take_hint(&task.id)
-                )
-            } else if task.owner_stale {
-                format!(
-                    "the owner is stale: take it first with {}",
-                    take_hint(&task.id)
-                )
-            } else if owner_session_ended(cx, owner)?
-                && crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
-            {
-                format!(
-                    "the owner's session has ended; with the board's coordinator rights, hand \
-                     it to yourself first (task_update {} owner={agent}), then {action} it",
-                    task.id
+                    "{owner} owns {id} and its session has ended, but you do not stand in \
+                     for it, so you may not {action} it"
                 )
             } else {
                 format!(
-                    "ask the owner in a note (task_note {}); {STAND_IN_RULE}",
-                    task.id
+                    "only the owner {owner} may {action} {id}: {}",
+                    owner_session_desc(cx, owner)?
                 )
-            },
-        )),
+            };
+            let left = left_unrun(cx, task, owner, agent)?;
+            let next = if action == "complete"
+                && (left || (task.status == TaskStatus::Review && task.owner_stale))
+            {
+                format!(
+                    "the owner is stale or has left: close it in one step with {}",
+                    done_take_hint(id)
+                )
+            } else if task.owner_stale {
+                let take = format!("the owner is stale: take it first with {}", take_hint(id));
+                if left {
+                    format!("{take}; also, {}", left_owner_hint(id))
+                } else {
+                    take
+                }
+            } else if left {
+                left_owner_hint(id)
+            } else if ended && crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)? {
+                format!(
+                    "the owner's session has ended; with the board's coordinator rights, hand \
+                     it to yourself first (task_update {id} owner={agent}), then {action} it"
+                )
+            } else {
+                let hours = cx.s.owner_stale_after_secs / 3600;
+                format!(
+                    "ask the owner in a note (task_note {id}); {STAND_IN_RULE}, and anyone may \
+                     take it once the owner is stale ({hours}h unseen)"
+                )
+            };
+            Err(forbidden(message, next))
+        }
         None => Err(forbidden(
-            format!("nobody owns {}, so it cannot be {action}d by you", task.id),
-            format!("claim it first with task_claim {}", task.id),
+            format!("nobody owns {id}, so it cannot be {action}d by you"),
+            format!("claim it first with task_claim {id}"),
         )),
     }
 }
@@ -1432,8 +1515,9 @@ fn check_handover(
         return Err(match &task.owner {
             Some(owner) => forbidden(
                 format!(
-                    "only the owner {owner}, the board's coordinator or the user may hand {id} \
-                     over while the owner's session runs"
+                    "only the owner {owner}, the board's coordinator or the user may hand \
+                     {id} over, and a stand-in once the owner's session has ended: {}",
+                    owner_session_desc(cx, owner)?
                 ),
                 if task.owner_stale {
                     format!(
@@ -1670,6 +1754,8 @@ pub(crate) fn update(
     let to = req.status.unwrap_or(from);
     let mut owner = task.owner.clone();
     let mut fields: Vec<&str> = Vec::new();
+    // The owner that left the task this drop is for, when the caller does not own it.
+    let mut left_owner: Option<AgentId> = None;
 
     if to != from {
         if !transition_allowed(from, to) {
@@ -1693,7 +1779,25 @@ pub(crate) fn update(
                 next,
             ));
         }
-        require_status_rights(cx, &task, agent, by_user, "move")?;
+        // On a board nobody runs, an agent on its repositories drops a task whose owner has
+        // left ([`left_unrun`]), and says why.
+        if let Err(refusal) = require_status_rights(cx, &task, agent, by_user, "move") {
+            match task.owner.as_ref().filter(|_| to == TaskStatus::Dropped) {
+                Some(owner) if left_unrun(cx, &task, owner, agent)? => {
+                    if req.reason.is_none() {
+                        return Err(invalid(
+                            format!(
+                                "dropping {id} for its owner {}, who has left, needs a reason",
+                                handle_of(cx, owner.as_str())?
+                            ),
+                            format!("send why with the drop: {}", drop_hint(id)),
+                        ));
+                    }
+                    left_owner = Some(owner.clone());
+                }
+                _ => return Err(refusal),
+            }
+        }
         // The proposal gate holds on every way into doing, not only claim: a proposal
         // moved to blocked and on to doing is still unaccepted.
         if to == TaskStatus::Doing
@@ -1819,6 +1923,11 @@ pub(crate) fn update(
     {
         check_owner_doing_limit(cx, worker, agent, id)?;
     }
+    // Validation let a reason through only with a drop. It is kept even when the task was
+    // already dropped and nothing else changes, so a reason sent late is not lost.
+    if let Some(reason) = req.reason {
+        insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
+    }
     if fields.is_empty() {
         return Ok(task);
     }
@@ -1863,6 +1972,9 @@ pub(crate) fn update(
         join_board(cx, &task.board, new_owner)?;
     }
     let mut payload = serde_json::json!({ "fields": fields });
+    if let Some(left) = &left_owner {
+        payload["left_owner"] = serde_json::json!(left);
+    }
     if to != from {
         payload["from"] = serde_json::json!(from);
         payload["to"] = serde_json::json!(to);
@@ -1895,19 +2007,20 @@ pub(crate) fn nobody_runs(board: &Board) -> bool {
         && !(board.dispatch == Dispatch::Daemon && board.autopilot)
 }
 
-/// How long unseen an owner counts as having left its task in review on a board nobody
-/// runs: twice `doing_idle_secs`, the span after which the idle notice stops waiting for
-/// the owner's own turn.
-fn owner_left_ms(cx: &Ctx<'_>) -> i64 {
-    2 * cx.s.doing_idle_ms()
+/// How long unseen a session still marked `running` counts as having stopped without an
+/// end hook (`owner_left_secs`): the sweeper marks it `ended` then
+/// ([`crate::ops::agents::end_unseen`]), and an owner unseen that long has left its task
+/// ([`owner_left`]) even before the sweep runs.
+pub(crate) fn owner_left_ms(cx: &Ctx<'_>) -> i64 {
+    cx.s.owner_left_ms()
 }
 
-/// Whether `owner` has left its task in review: its session ended with nothing of it left
-/// to come back ([`owner_session_ended`]), or it stopped without an end hook. A running
-/// session marks itself seen at each hook, so one that is still `running` and unseen for
+/// Whether `owner` has left its task: its session ended with nothing of it left to come
+/// back ([`owner_session_ended`]), or it stopped without an end hook. A running session
+/// marks itself seen at each hook, so one that is still `running` and unseen for
 /// [`owner_left_ms`], with no usage-limit reset ahead and no delegated thread at work,
 /// has stopped. An idle session waits, on CI or on the user, and has not left.
-pub(crate) fn owner_left_review(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+pub(crate) fn owner_left(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
     if owner_session_ended(cx, owner)? {
         return Ok(true);
     }
@@ -1925,27 +2038,51 @@ pub(crate) fn owner_left_review(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
     Ok(stopped && !delegate_at_work(cx, owner)?)
 }
 
-/// Whether `agent` may close `task` for an `owner` that is not stale: the task is in
-/// `review` on a board nobody runs ([`nobody_runs`]), where no coordinator closes a
-/// finished task for an owner that left ([`owner_left_review`]), and `agent` works on one
-/// of the board's repositories, as the agents told of such a task do.
-fn left_unrun_review(cx: &Ctx<'_>, task: &Task, owner: &AgentId, agent: &AgentId) -> Result<bool> {
-    if task.status != TaskStatus::Review {
+/// Whether `agent` may drop `task`, or close it in one step, for an `owner` that is not
+/// stale: the task is not closed, nobody runs its board ([`nobody_runs`]), so no
+/// coordinator finishes or drops a task for an owner that left ([`owner_left`]), and
+/// `agent` works on one of the board's repositories, as the agents told of such a task do.
+/// A take that starts work still waits until the owner is stale.
+fn left_unrun(cx: &Ctx<'_>, task: &Task, owner: &AgentId, agent: &AgentId) -> Result<bool> {
+    if task.status.is_closed() {
         return Ok(false);
     }
     let board = get_board(cx, &task.board)?;
+    if !nobody_runs(&board) {
+        return Ok(false);
+    }
     let on_repo = find_agent(cx, agent)?
         .and_then(|a| a.repo)
         .is_some_and(|r| board.repos.contains(&r));
-    Ok(nobody_runs(&board) && on_repo && owner_left_review(cx, owner)?)
+    Ok(on_repo && owner_left(cx, owner)?)
 }
 
-/// `take` on done: the owner that `agent` takes `task` from as it closes it (a stale one,
-/// or one that left its task in review on a board nobody runs, [`owner_left_review`]), or
-/// `None` when `agent` needs no take (its own task, nobody's, or one it stands in for),
-/// which leaves the caller to [`require_owner`]. Only a task in `review` is closed this
-/// way: its work is finished, so the take never moves it to `doing` and the doing limit
-/// does not apply. A task still in progress is taken with [`take`], which keeps the limit.
+/// The call that drops `id` with the reason it needs.
+pub(crate) fn drop_hint(id: &TaskId) -> String {
+    format!(
+        "task_update {id} status=dropped reason=<why>, or board update {id} --status dropped \
+         --reason <why>"
+    )
+}
+
+/// What an agent may do with a left owner's task on a board nobody runs ([`left_unrun`]),
+/// for refusals that name another step.
+fn left_owner_hint(id: &TaskId) -> String {
+    format!(
+        "nobody runs this board and the owner has left, so you may drop {id} with a reason \
+         ({}), or close it once its work has landed ({})",
+        drop_hint(id),
+        done_take_hint(id)
+    )
+}
+
+/// `take` on done: the owner that `agent` takes `task` from as it closes it, or `None` when
+/// `agent` needs no take (its own task, nobody's, or one it stands in for), which leaves
+/// the caller to [`require_owner`]. A left owner's task on a board nobody runs
+/// ([`left_unrun`]) is closed this way from `doing`, `review` or `blocked`; a stale owner's
+/// only from `review`, whose work is finished. The take never moves the task to `doing`, so
+/// the doing limit does not apply. A task still in progress whose owner is only stale is
+/// taken with [`take`], which keeps the limit.
 fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentId>> {
     let id = &task.id;
     let Some(owner) = task.owner.as_ref().filter(|o| *o != agent) else {
@@ -1955,7 +2092,10 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
     if acts_for_ended_owner(cx, task, agent)? {
         return Ok(None);
     }
-    if !task.owner_stale && !left_unrun_review(cx, task, owner, agent)? {
+    if left_unrun(cx, task, owner, agent)? {
+        return Ok(Some(owner.clone()));
+    }
+    if !task.owner_stale {
         let hours = cx.s.owner_stale_after_secs / 3600;
         let ask = format!("ask the owner in a note (task_note {id}); {STAND_IN_RULE}");
         return Err(refused(
@@ -1963,11 +2103,11 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
                 "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
                 owner_desc(cx, owner)?
             ),
-            if task.status == TaskStatus::Review && nobody_runs(&get_board(cx, &task.board)?) {
+            if !task.status.is_closed() && nobody_runs(&get_board(cx, &task.board)?) {
                 format!(
                     "{ask}; nobody runs this board, so an agent on one of its repositories \
-                     may close it with take once the owner's session has ended, or has \
-                     stayed running for {} unseen",
+                     may drop it with a reason, or close it with take, once the owner's \
+                     session has ended, or has stayed running for {} unseen",
                     ago(TimeDelta::milliseconds(owner_left_ms(cx)))
                 )
             } else {
@@ -1978,7 +2118,7 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
     if task.status != TaskStatus::Review {
         return Err(bad_transition(
             format!(
-                "{id} is {}; take on done closes only a task in review",
+                "{id} is {}; take on done closes a stale owner's task only in review",
                 status_str(task.status)
             ),
             if task.status.is_closed() {
@@ -2130,31 +2270,43 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
 pub(crate) fn add_note(cx: &mut Ctx<'_>, id: &TaskId, req: AddNote) -> Result<Note> {
     touch_agent(cx, &req.agent)?;
     let task = get_task(cx, id)?;
-    let now = cx.now_ms();
+    insert_note(cx, &task.board, id, &req.agent, req.kind, req.text)
+}
+
+/// Stores a note on the task and records its `note_added` event: the one path for notes
+/// an agent adds and for the reason a drop keeps.
+fn insert_note(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    id: &TaskId,
+    agent: &AgentId,
+    kind: NoteKind,
+    text: String,
+) -> Result<Note> {
     cx.db.execute(
         "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             id.as_str(),
-            req.agent.as_str(),
-            enum_str(&req.kind),
-            req.text,
-            now
+            agent.as_str(),
+            enum_str(&kind),
+            text,
+            cx.now_ms()
         ],
     )?;
     let note_id = cx.db.last_insert_rowid();
     cx.emit(
-        Some(&task.board),
-        req.agent.as_str(),
+        Some(board),
+        agent.as_str(),
         EventType::NoteAdded,
         Some(id),
-        serde_json::json!({ "note": note_id, "kind": req.kind }),
+        serde_json::json!({ "note": note_id, "kind": kind }),
     )?;
     Ok(Note {
         id: note_id,
         task: id.clone(),
-        agent: req.agent,
-        kind: req.kind,
-        text: req.text,
+        agent: agent.clone(),
+        kind,
+        text,
         at: cx.now,
     })
 }
