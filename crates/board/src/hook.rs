@@ -32,9 +32,7 @@ use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::mcp;
 use crate::render;
-use crate::state::{
-    self, AgentLocal, DoneMark, Filed, FiledMark, SessionLocal, ThreadRead, ToolStart,
-};
+use crate::state::{self, AgentLocal, DoneMark, FiledMark, SessionLocal, ThreadRead, ToolStart};
 use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
@@ -1483,7 +1481,7 @@ impl Hook<'_> {
     /// A task the agent already filed follow-ups for gets no reminder ([`Hook::take_filed`]).
     fn take_done_reminder(&mut self) -> Result<Option<String>> {
         let marks = state::take_done(&self.home, &self.agent)?;
-        let filed_this_turn = self.take_filed();
+        self.take_filed();
         if self.stop_continued() {
             return Ok(None);
         }
@@ -1491,7 +1489,6 @@ impl Hook<'_> {
             marks,
             self.local.turn_started,
             &mut self.local.filed_about,
-            filed_this_turn,
             &mut self.local.done_reminded,
         ))
     }
@@ -1499,22 +1496,17 @@ impl Hook<'_> {
     /// Takes the marks of what this agent filed since the last `Stop` (`ops::task_add` and
     /// `ops::ask_user` write them, as `ops::task_done` writes the done marks, so the signal
     /// is as local and as complete). Remembers the tasks they were about in `filed_about`,
-    /// across turns, and returns whether the agent filed a proposal or an ask this turn
-    /// (marks at or after `turn_started`, any when the turn's start is unknown).
+    /// across turns.
     ///
-    /// A done task then needs no reminder in two cases. The agent filed something about it,
-    /// in any turn: a sub-task, a proposal under it, an ask on it. Or the agent filed a
-    /// proposal or an ask in the turn that marked it done, about any task: found work and
-    /// the user's part often belong to no task. Marks that cannot be read count as none.
-    fn take_filed(&mut self) -> bool {
-        let marks = match state::take_filed(&self.home, &self.agent) {
-            Ok(marks) => marks,
-            Err(err) => {
-                tracing::debug!("reading filed marks: {err:#}");
-                return false;
-            }
-        };
-        fold_filed(marks, self.local.turn_started, &mut self.local.filed_about)
+    /// A done task then needs no reminder when the agent filed something about it, in any
+    /// turn: a sub-task, a proposal under it, an ask on it. A filing about another task, or
+    /// about none, does not answer for it: an agent that filed one item of found work has
+    /// left others only in its reply. Marks that cannot be read count as none.
+    fn take_filed(&mut self) {
+        match state::take_filed(&self.home, &self.agent) {
+            Ok(marks) => fold_filed(marks, &mut self.local.filed_about),
+            Err(err) => tracing::debug!("reading filed marks: {err:#}"),
+        }
     }
 
     /// `SessionStart` context from a board snapshot: a delegated thread's names the route
@@ -2053,16 +2045,10 @@ const DONE_REMINDED_KEPT: usize = 100;
 /// How many tasks the agent filed something about the hook state keeps.
 const FILED_ABOUT_KEPT: usize = 100;
 
-/// Remembers in `filed_about` the tasks `marks` were about, newest last, and returns
-/// whether one is a proposal or an ask of this turn; see [`Hook::take_filed`].
-fn fold_filed(
-    marks: Vec<FiledMark>,
-    turn_started: Option<Timestamp>,
-    filed_about: &mut Vec<TaskId>,
-) -> bool {
-    let mut this_turn = false;
+/// Remembers in `filed_about` the tasks `marks` were about, newest last; see
+/// [`Hook::take_filed`].
+fn fold_filed(marks: Vec<FiledMark>, filed_about: &mut Vec<TaskId>) {
     for mark in marks {
-        this_turn |= mark.kind != Filed::SubTask && turn_started.is_none_or(|t| mark.at >= t);
         if let Some(about) = mark.about {
             filed_about.retain(|id| *id != about);
             filed_about.push(about);
@@ -2070,20 +2056,17 @@ fn fold_filed(
     }
     let excess = filed_about.len().saturating_sub(FILED_ABOUT_KEPT);
     filed_about.drain(..excess);
-    this_turn
 }
 
 /// The reminder for tasks marked done this turn (marks at or after `turn_started`, any when
 /// the turn's start is unknown) not reminded about before, which it records in `reminded`.
-/// None when the agent already filed follow-ups: for the tasks in `filed_about`, and for
-/// every task when `filed_this_turn` ([`Hook::take_filed`]). A done task leaves
-/// `filed_about`: what was filed about it answers for this done, not for one after the task
-/// is opened again.
+/// None for the tasks in `filed_about`, which the agent already filed follow-ups about
+/// ([`Hook::take_filed`]). A done task leaves `filed_about`: what was filed about it answers
+/// for this done, not for one after the task is opened again.
 fn done_reminder(
     marks: Vec<DoneMark>,
     turn_started: Option<Timestamp>,
     filed_about: &mut Vec<TaskId>,
-    filed_this_turn: bool,
     reminded: &mut Vec<TaskId>,
 ) -> Option<String> {
     let mut ids: Vec<TaskId> = Vec::new();
@@ -2092,7 +2075,6 @@ fn done_reminder(
         filed_about.retain(|id| *id != mark.task);
         if turn_started.is_none_or(|t| mark.at >= t)
             && !filed
-            && !filed_this_turn
             && !reminded.contains(&mark.task)
             && !ids.contains(&mark.task)
         {
@@ -2113,9 +2095,11 @@ fn done_reminder(
 }
 
 /// What the done reminder asks for, after it names the tasks. The kinds of task are those of
-/// the MCP server's instructions (`mcp::INSTRUCTIONS`). It says that a one-line reply is a
-/// complete answer, so an agent with nothing to file spends no more than that line.
-const DONE_REMINDER_ASK: &str = "Is any work left that is not on the board? If yes, file it now and name it in your reply: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. If no, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task.";
+/// the MCP server's instructions (`mcp::INSTRUCTIONS`). It asks for the id of each open
+/// item's task or ask, not for a yes or a no: an agent that filed one item answered "no"
+/// with others still only in its reply. It says that a one-line reply is a complete answer,
+/// so an agent with nothing to file spends no more than that line.
+const DONE_REMINDER_ASK: &str = "Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task.";
 
 /// Looks up the device token off the async threads: the Keychain lookup runs `security`.
 fn spawn_token(home: &Home) -> tokio::task::JoinHandle<Result<Option<String>>> {
@@ -2567,6 +2551,7 @@ pub fn current_exe() -> PathBuf {
 mod tests {
 
     use super::*;
+    use crate::state::Filed;
 
     #[tokio::test(start_paused = true)]
     async fn the_server_deadline_counts_all_time_since_the_hook_started() {
@@ -2784,7 +2769,7 @@ mod tests {
         };
         let mut reminded = Vec::new();
         assert_eq!(
-            done_reminder(vec![], Some(t0), &mut vec![], false, &mut reminded),
+            done_reminder(vec![], Some(t0), &mut vec![], &mut reminded),
             None
         );
         let text = done_reminder(
@@ -2795,7 +2780,6 @@ mod tests {
             ],
             Some(t0),
             &mut vec![],
-            false,
             &mut reminded,
         )
         .unwrap();
@@ -2809,7 +2793,6 @@ mod tests {
                 vec![mark("factory-12", 5)],
                 Some(t0),
                 &mut vec![],
-                false,
                 &mut reminded
             ),
             None
@@ -2820,7 +2803,6 @@ mod tests {
                 vec![mark("factory-11", -1)],
                 None,
                 &mut vec![],
-                false,
                 &mut reminded
             )
             .is_some()
@@ -2831,7 +2813,6 @@ mod tests {
                 vec![mark(&format!("other-{}", n + 1), 1)],
                 Some(t0),
                 &mut vec![],
-                false,
                 &mut reminded,
             );
         }
@@ -2853,7 +2834,6 @@ mod tests {
             vec![mark("factory-12"), mark("factory-13")],
             Some(t0),
             &mut about,
-            false,
             &mut reminded,
         )
         .unwrap();
@@ -2868,49 +2848,46 @@ mod tests {
                 vec![mark("factory-12")],
                 Some(t0),
                 &mut about,
-                false,
                 &mut reminded
             )
             .is_some()
         );
-        // A proposal or an ask filed this turn: quiet for every task, none recorded.
-        assert_eq!(
-            done_reminder(
-                vec![mark("factory-14")],
-                Some(t0),
-                &mut about,
-                true,
-                &mut reminded
-            ),
-            None
+        // Something filed about another task this turn does not answer for this one.
+        about.push("factory-15".parse().unwrap());
+        let text = done_reminder(
+            vec![mark("factory-14")],
+            Some(t0),
+            &mut about,
+            &mut reminded,
+        )
+        .unwrap();
+        assert!(
+            text.starts_with("board: you marked factory-14 done this turn."),
+            "{text}"
         );
-        assert_eq!(reminded.len(), 2);
+        assert_eq!(reminded.len(), 3);
     }
 
     #[test]
-    fn filed_marks_count_by_kind_turn_and_task() {
+    fn filed_marks_count_for_the_task_they_are_about() {
         let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
-        let mark = |kind, about: Option<&str>, mins: i64| FiledMark {
+        let mark = |kind, about: Option<&str>| FiledMark {
             kind,
             about: about.map(|id| id.parse().unwrap()),
-            at: t0 + chrono::Duration::minutes(mins),
+            at: t0,
         };
         let mut about: Vec<TaskId> = Vec::new();
-        // A sub-task counts for its parent only; a proposal of an earlier turn likewise.
-        let earlier = vec![
-            mark(Filed::SubTask, Some("factory-12"), 1),
-            mark(Filed::Proposal, Some("factory-13"), -1),
-            mark(Filed::Ask, None, -1),
-        ];
-        assert!(!fold_filed(earlier.clone(), Some(t0), &mut about));
+        // Every kind counts for its task; a filing about no task counts for none.
+        fold_filed(
+            vec![
+                mark(Filed::SubTask, Some("factory-12")),
+                mark(Filed::Proposal, Some("factory-13")),
+                mark(Filed::Ask, None),
+            ],
+            &mut about,
+        );
         assert_eq!(about.len(), 2);
-        // Unknown turn start: any proposal or ask counts, as any done mark does.
-        assert!(fold_filed(earlier, None, &mut about));
-        assert!(fold_filed(
-            vec![mark(Filed::Ask, Some("factory-12"), 1)],
-            Some(t0),
-            &mut about
-        ));
+        fold_filed(vec![mark(Filed::Ask, Some("factory-12"))], &mut about);
         assert_eq!(
             about.iter().map(TaskId::as_str).collect::<Vec<_>>(),
             ["factory-13", "factory-12"],
@@ -2918,9 +2895,9 @@ mod tests {
         );
         // Bounded: the oldest fall out.
         let many = (0..FILED_ABOUT_KEPT)
-            .map(|n| mark(Filed::SubTask, Some(&format!("other-{}", n + 1)), 1))
+            .map(|n| mark(Filed::SubTask, Some(&format!("other-{}", n + 1))))
             .collect();
-        fold_filed(many, Some(t0), &mut about);
+        fold_filed(many, &mut about);
         assert_eq!(about.len(), FILED_ABOUT_KEPT);
         assert!(!about.iter().any(|id| id.as_str() == "factory-12"));
     }
@@ -2934,7 +2911,6 @@ mod tests {
             }],
             None,
             &mut vec![],
-            false,
             &mut Vec::new(),
         )
         .unwrap();
@@ -2942,6 +2918,15 @@ mod tests {
         for placeholder in ["Proposal:", "<", "{", "...", "TODO"] {
             assert!(!text.contains(placeholder), "{placeholder} in {text}");
         }
+        // It asks for the id of each open item, not for a yes or a no.
+        assert!(
+            text.contains("Each one needs the id of its task or ask."),
+            "{text}"
+        );
+        assert!(
+            text.contains("name each open item with its id in your reply"),
+            "{text}"
+        );
         // An agent with nothing to file is told that one line answers it.
         assert!(
             text.contains("reply \"nothing left to file\" and stop"),

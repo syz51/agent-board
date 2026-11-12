@@ -1858,7 +1858,7 @@ fn stop_reminds_once_per_task_marked_done_this_turn() {
     assert_eq!(reply["decision"], "block");
     assert_eq!(
         reply["reason"],
-        "board: you marked factory-12 done this turn. Is any work left that is not on the board? If yes, file it now and name it in your reply: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. If no, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
+        "board: you marked factory-12 done this turn. Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
     );
     assert_eq!(stop(&e), None, "once per task");
 
@@ -1948,26 +1948,13 @@ fn stop_stays_quiet_about_a_done_task_whose_sub_task_the_agent_filed() {
     );
 }
 
-#[test]
-fn stop_stays_quiet_about_dones_in_a_turn_that_filed_a_proposal_or_an_ask() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    assert!(proposal("factory-30").is_pending_proposal());
-    add_task(
-        &e,
-        &proposal("factory-30"),
-        &["--body", "Proposal: cache the builds."],
-    );
-    mark_done(&e, "factory-12", None);
-    assert_eq!(stop(&e), None, "found work is on the board");
-
-    prompt(&e, "the next");
+/// Asks the user as the agent would from its shell (`board ask`), about `task` if given.
+fn ask_user(e: &Env, id: i64, task: Option<&str>) {
     let ask = board_proto::Ask {
-        id: 7,
+        id,
         board: "factory".parse().unwrap(),
         agent: CLAUDE_AGENT.parse().unwrap(),
-        task: None,
+        task: task.map(|id| id.parse().unwrap()),
         kind: board_proto::AskKind::Decision,
         question: "Which db?".into(),
         options: vec![],
@@ -1978,30 +1965,84 @@ fn stop_stays_quiet_about_dones_in_a_turn_that_filed_a_proposal_or_an_ask() {
         answered_at: None,
     };
     e.stub.on("POST /v1/asks", &ask);
+    let mut all = vec!["ask", "Which db?", "--board", "factory"];
+    if let Some(task) = task {
+        all.extend(["--task", task]);
+    }
     let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
-    let out = board(
-        &e.home,
-        &e.repo,
-        &env,
-        &["ask", "Which db?", "--board", "factory"],
-        "",
-    );
+    let out = board(&e.home, &e.repo, &env, &all, "");
     assert!(out.status.success(), "{}", stderr(&out));
-    mark_done(&e, "factory-13", None);
-    assert_eq!(stop(&e), None, "the user's part is on the board");
+}
 
-    // A later turn that files nothing is reminded again: the filing was the earlier turn's.
-    prompt(&e, "and another");
-    mark_done(&e, "factory-14", None);
-    let reason = stop(&e).expect("nothing filed this turn")["reason"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+fn done_reminder_for(e: &Env, task: &str) {
+    let reply = stop(e).unwrap_or_else(|| panic!("a reminder for {task}"));
+    assert_eq!(reply["decision"], "block");
+    let reason = reply["reason"].as_str().unwrap();
     assert!(
-        reason.starts_with("board: you marked factory-14 done this turn."),
+        reason.starts_with(&format!("board: you marked {task} done this turn.")),
         "{reason}"
     );
-    assert_eq!(stop(&e), None, "and only once");
+}
+
+#[test]
+fn stop_reminds_once_about_a_done_task_when_the_turn_filed_only_unrelated_items() {
+    let e = env();
+    nothing_doing(&e);
+    // A proposal with no parent: one item of found work is on the board, and the reply may
+    // hold more.
+    prompt(&e, "go");
+    assert!(proposal("factory-30").is_pending_proposal());
+    add_task(
+        &e,
+        &proposal("factory-30"),
+        &["--body", "Proposal: cache the builds."],
+    );
+    mark_done(&e, "factory-12", None);
+    done_reminder_for(&e, "factory-12");
+    assert_eq!(stop(&e), None, "once");
+
+    // An ask on no task, and one on another task.
+    prompt(&e, "the next");
+    ask_user(&e, 7, None);
+    mark_done(&e, "factory-13", None);
+    done_reminder_for(&e, "factory-13");
+    assert_eq!(stop(&e), None, "once");
+    prompt(&e, "and another");
+    ask_user(&e, 8, Some("factory-15"));
+    mark_done(&e, "factory-14", None);
+    done_reminder_for(&e, "factory-14");
+    assert_eq!(stop(&e), None, "once");
+}
+
+#[test]
+fn stop_stays_quiet_about_a_done_task_the_agent_filed_a_proposal_under_or_an_ask_on() {
+    let e = env();
+    nothing_doing(&e);
+    prompt(&e, "go");
+    let mut under = proposal("factory-30");
+    under.parent = Some("factory-12".parse().unwrap());
+    assert!(under.is_pending_proposal());
+    add_task(
+        &e,
+        &under,
+        &[
+            "--body",
+            "Proposal: cache the builds.",
+            "--parent",
+            "factory-12",
+        ],
+    );
+    mark_done(&e, "factory-12", None);
+    assert_eq!(stop(&e), None, "found work is on the board, under the task");
+
+    prompt(&e, "the next");
+    ask_user(&e, 7, Some("factory-13"));
+    mark_done(&e, "factory-13", None);
+    assert_eq!(
+        stop(&e),
+        None,
+        "the user's part is on the board, on the task"
+    );
 }
 
 #[test]
