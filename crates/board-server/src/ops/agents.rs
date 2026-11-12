@@ -348,6 +348,66 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
     get_agent(cx, id)
 }
 
+/// Ends each session marked `running` but not seen for `owner_left_secs`, as a session
+/// that stops without its end hook leaves itself (a crash, a closed terminal), and returns
+/// how many it ended. Skipped: an agent waiting for a usage-limit reset still ahead, one
+/// with a thread it delegated at work ([`DELEGATE_AT_WORK`]), a board's coordinator while
+/// its lease is live, a live judge, and a device's dispatch agent, which is no session.
+/// `last_seen` stays as it was, and the state-change event names it as `unseen_since`, so
+/// the spell away starts when the session stopped. Its file leases are released, as an end
+/// releases them; its judge registrations stay, as its next call marks it running again.
+/// Run by the sweeper.
+///
+/// [`DELEGATE_AT_WORK`]: crate::ops::tasks::DELEGATE_AT_WORK
+pub(crate) fn end_unseen(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let cutoff = now - cx.s.owner_left_ms();
+    let sql = format!(
+        "SELECT a.id, a.last_seen FROM agents a \
+         WHERE a.state = 'running' AND a.last_seen <= :cutoff \
+           AND (a.paused_until IS NULL OR a.paused_until <= :now) \
+           AND a.id NOT LIKE 'dispatch:%' \
+           AND NOT EXISTS (SELECT 1 FROM boards b \
+                           WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
+           AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
+         ORDER BY a.id",
+        crate::ops::judges::LIVE
+    );
+    let unseen: Vec<(AgentId, i64)> = cx
+        .db
+        .prepare_cached(&sql)?
+        .query_map(
+            rusqlite::named_params! { ":cutoff": cutoff, ":now": now },
+            |r| Ok((parse_id(&r.get::<_, String>(0)?)?, r.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut ended = 0;
+    for (id, last_seen) in unseen {
+        if crate::ops::tasks::delegate_at_work(cx, &id)? {
+            continue;
+        }
+        cx.db.execute(
+            "UPDATE agents SET state = 'ended', paused_until = NULL WHERE id = ?1",
+            [id.as_str()],
+        )?;
+        release_leases(cx, &id)?;
+        cx.emit(
+            None,
+            id.as_str(),
+            EventType::AgentStateChanged,
+            None,
+            serde_json::json!({
+                "from": AgentState::Running,
+                "to": AgentState::Ended,
+                "paused_until": null,
+                "unseen_since": ts(last_seen),
+            }),
+        )?;
+        ended += 1;
+    }
+    Ok(ended)
+}
+
 /// Releases the agent's file leases.
 fn release_leases(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
     let leases: Vec<(i64, String, String)> = cx

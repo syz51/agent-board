@@ -835,3 +835,118 @@ async fn task_detail_names_each_agent_it_mentions_by_handle() {
     assert!(status.is_success(), "{v}");
     assert_eq!(v["owner"], peer, "{v}");
 }
+
+#[tokio::test]
+async fn the_sweep_ends_a_session_left_marked_running_for_an_hour_unseen() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    let (gone, idle) = ("t3:gone", "t3:idle");
+    t.register(gone, Some(REPO), Some("main")).await;
+    t.register(idle, Some(REPO), Some("main")).await;
+    let started = t.state.now();
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(gone),
+        Some(json!({ "agent": gone, "repo": REPO, "globs": ["src/**"] })),
+    )
+    .await;
+    let path = format!("/v1/agents/{idle}/state");
+    t.ok("POST", &path, Some(idle), Some(json!({ "state": "idle" })))
+        .await;
+
+    // Not yet: an hour unseen is the span.
+    t.advance(TimeDelta::minutes(59));
+    assert_eq!(t.end_unseen(), 0);
+    assert_eq!(t.state_of(gone), "running");
+
+    // Its session stopped without the end hook: it ends, and an idle one is left alone.
+    t.advance(TimeDelta::minutes(2));
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!([gone, idle].map(|a| t.state_of(a)), ["ended", "idle"]);
+    let leases = format!("SELECT COUNT(*) FROM leases WHERE agent = '{gone}'");
+    assert_eq!(t.count(&leases), 0);
+    let ended: Vec<serde_json::Value> = t
+        .strings(&format!(
+            "SELECT payload FROM events WHERE type = 'agent_state_changed' AND actor = '{gone}'"
+        ))
+        .iter()
+        .map(|p| serde_json::from_str(p).unwrap())
+        .collect();
+    assert_eq!(
+        ended,
+        [json!({
+            "from": "running", "to": "ended", "paused_until": null,
+            "unseen_since": started,
+        })]
+    );
+    // Last seen stays when it was, and the next sweep has nothing to do.
+    let agent = t.ok("GET", &format!("/v1/agents/{gone}"), None, None).await;
+    assert_eq!(agent["last_seen"], json!(started), "{agent}");
+    assert_eq!(t.end_unseen(), 0);
+
+    // Its next call marks it running again.
+    t.task(gone, "factory", "Back at work").await;
+    assert_eq!(t.state_of(gone), "running");
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_a_session_that_waits_for_a_reset_works_through_a_delegate_or_coordinates()
+{
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    let (limited, parent, coordinator) = ("t3:limited", "t3:parent", "t3:coord");
+    let child = "t3:child";
+    for agent in [limited, parent, coordinator] {
+        t.register(agent, Some(REPO), Some("main")).await;
+    }
+    let delegated = json!({
+        "id": child, "runtime": "claude", "device": "mac", "repo": REPO, "branch": "main",
+        "native_ids": { "t3_thread": "child", "t3_parent": "parent" },
+    });
+    t.ok("POST", "/v1/agents", Some(child), Some(delegated.clone()))
+        .await;
+    // Waiting for a usage-limit reset two hours ahead.
+    let reset = t.state.now() + TimeDelta::hours(2);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{limited}/state"),
+        Some(limited),
+        Some(json!({ "state": "paused", "paused_until": reset })),
+    )
+    .await;
+    let lease_until = (t.state.now() + TimeDelta::days(1)).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET coordinator = '{coordinator}', coordinator_device = 'mac', \
+         coordinator_expires_at = {lease_until} WHERE slug = 'factory'"
+    ));
+
+    // An hour later the child still works; the parent and the coordinator are unseen.
+    t.advance(TimeDelta::minutes(61));
+    t.ok("POST", "/v1/agents", Some(child), Some(delegated))
+        .await;
+    assert_eq!(t.end_unseen(), 0);
+    assert_eq!(
+        [limited, parent, coordinator].map(|a| t.state_of(a)),
+        ["paused", "running", "running"]
+    );
+    // A running session that keeps a reset ahead waits for it too.
+    t.exec(&format!(
+        "UPDATE agents SET state = 'running' WHERE id = '{limited}'"
+    ));
+    assert_eq!(t.end_unseen(), 0);
+    assert_eq!(t.state_of(limited), "running");
+
+    // The child has stopped too, and the reset has passed: only the coordinator stays.
+    t.advance(TimeDelta::minutes(61));
+    assert_eq!(t.end_unseen(), 3);
+    assert_eq!(
+        [limited, parent, child, coordinator].map(|a| t.state_of(a)),
+        ["ended", "ended", "ended", "running"]
+    );
+
+    // Once its lease lapses, the coordinator's session ends as well.
+    t.exec("UPDATE boards SET coordinator_expires_at = 0 WHERE slug = 'factory'");
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(t.state_of(coordinator), "ended");
+}

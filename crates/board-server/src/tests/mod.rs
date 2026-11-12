@@ -349,6 +349,24 @@ impl T {
             .unwrap()
     }
 
+    /// Runs the sweeper's step that ends sessions marked running but long unseen.
+    pub fn end_unseen(&self) -> usize {
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                crate::ops::agents::end_unseen,
+            )
+            .unwrap()
+    }
+
+    /// The agent's state as stored.
+    pub fn state_of(&self, agent: &str) -> String {
+        self.strings(&format!("SELECT state FROM agents WHERE id = '{agent}'"))
+            .remove(0)
+    }
+
     pub fn count(&self, sql: &str) -> i64 {
         self.state
             .db()

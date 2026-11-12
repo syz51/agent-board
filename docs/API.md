@@ -190,6 +190,16 @@ server's minute sweep deletes older ones.
   keeps that `paused_until` when it is marked `ended` (T3 closes an idle session, but the
   usage limit holds until its reset), and the `agent_state_changed` event carries it; any
   other state, a registration or a call that revives the agent clears it.
+- Within a minute of an agent marked `running` going unseen for `owner_left_secs` (an
+  hour by default), the server marks it `ended`: its session stopped without an end hook.
+  It skips an agent with `paused_until` ahead, one with a thread it delegated at work (as
+  the idle `doing` notice judges), the coordinator of a board whose lease is live, a live
+  judge, and the daemon's own `dispatch:` agents. Like an `ended` update, this releases the
+  agent's file leases and keeps its tasks and coordinator lease; it keeps a judge's rights
+  too. The `agent_state_changed` event, by the agent, carries `from` `running`, `to`
+  `ended`, `paused_until` `null` and `unseen_since` (when it was last seen); `last_seen` is
+  unchanged. An agent that acts again is `running`, as above. (Servers before this change
+  left such an agent `running`.)
   `said`, optional, is the last message of the turn that just ended: the hooks send it
   with the `Stop` update. It is advisory and never fails the update: the server removes
   terminal escape sequences and control characters other than line breaks and tabs, trims
@@ -453,6 +463,13 @@ Reopening a closed board, or any change on it, starts the period again.
   it is absent when none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
+- `reason` in `[UpdateTask]` says why the task is dropped: it applies only with `status:
+  dropped` (400 `invalid` otherwise), at most `note_chars` characters, and a blank one counts
+  as absent. The server keeps it as a `decision` note by the caller (with its `note_added`
+  event). It is required when the caller drops, under the rule below, the task of an owner
+  that has left (400 `invalid`, `next` showing how to send it). That `task_updated` event
+  carries `left_owner` (the owner's id). `reason` is sent only when set; a server that
+  predates it ignores it and keeps no note.
 - `owner` in `[UpdateTask]` hands the task over: the named agent owns it from then on, so
   its `task_done` succeeds and the previous owner's is refused. The owner is worked out
   after the request's status change (`open` clears it, `doing` sets the caller), and
@@ -489,7 +506,8 @@ Reopening a closed board, or any change on it, starts the period again.
   alert goes to the task's creator (not a feedback item's reporter) and the threads that
   delegated its owner, those that are live; when none is, to the agents registered on one
   of the board's repositories, once the owner is stale. It then names the task and the action: check its PR, and
-  once it merged, `task_claim <id> take=true`, then `task_done <id>`.
+  once it merged, `task_claim <id> take=true`, then `task_done <id>`; if it will not merge,
+  drop it with a reason.
 - Within a minute of a task in `doing`, on an active board, passing `doing_idle_secs` with
   its owner away, the server records one `task_updated` event by actor `server` with
   payload `{"fields": [], "idle_doing": <time>, "away": <agent id>}`: `idle_doing` is when
@@ -506,7 +524,8 @@ Reopening a closed board, or any change on it, starts the period again.
   session ending later is the same spell. The first is recorded once the owner has been
   away `doing_idle_secs`. A second, with the same payload, is recorded once it has been
   away twice `doing_idle_secs`, unless the first was recorded that late; no third. A running owner's spell starts when it was last seen, so
-  one seen again starts a new one. The snapshot shows it as an alert while the task is
+  one seen again starts a new one; one the server later marks `ended` as unseen (see
+  "Agents") keeps that start. The snapshot shows it as an alert while the task is
   still in `doing` and still that owner's: to the owner, and to the board's coordinator
   when the owner is no T3 thread or has been away at least twice `doing_idle_secs`.
   `board watch` on the owner's device wakes a T3 owner. It wakes the board's coordinator
@@ -565,19 +584,17 @@ Reopening a closed board, or any change on it, starts the period again.
   Reopening the task clears it. An optional `take: true` closes a task in `review` whose
   owner is stale (`owner_stale`) in the same step. On an active board that nobody runs
   (no coordinator, and no daemon dispatch with autopilot on), an agent on one of the
-  board's repositories also closes one whose owner has left. An owner has left when its
-  session ended with nothing of it left to come back, or when its session still counts
-  as `running` and has been unseen for twice `doing_idle_secs`, with no usage-limit
-  reset ahead and no delegated thread at work: it stopped without an end hook. An `idle`
-  owner waits and has not left. The caller becomes the task's owner, a `task_taken` event
-  (`status: review`) comes before `task_done`, and the task never moves to `doing`, so
-  the caller's `doing` limit does not apply. The evidence must then hold a `pr` or a
+  board's repositories also closes one whose owner has left, in any status before `done`
+  (see "Left owners" below). The caller becomes the task's owner, a `task_taken` event
+  (with the task's status) comes before `task_done`, and the task never moves to `doing`,
+  so the caller's `doing` limit does not apply. The evidence must then hold a `pr` or a
   `check` (400 `evidence_required` otherwise). With `take`, the task of an owner that
-  is not stale is refused with 409 `claim_refused`, unless it is in `review` and that
-  owner has left as above. A stale owner's task in another status is refused with 400
+  is not stale is refused with 409 `claim_refused`, unless that owner has left as above.
+  A stale owner's task in another status than `review` is refused with 400
   `invalid_transition`, since `/take` starts such work and keeps the limit. `take`
   changes nothing for the task's owner or an agent standing in for it. Servers that
-  predate it ignore it.
+  predate it ignore it. (Servers before the left-owner drop closed a left owner's task
+  only in `review`, and judged it left after twice `doing_idle_secs`.)
 - `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`. Kind `feedback` is still accepted;
   agents report feedback through `POST /v1/feedback` instead.
 - A task filed through `POST /v1/feedback` carries `feedback` (see "Feedback"); other tasks
@@ -600,7 +617,8 @@ Who may change the status: anyone while the task has no owner or is `done` or `d
 otherwise only its owner, the board's coordinator (or a live judge of the board) or the
 user (a `--user` token or the browser), else 403 `forbidden`. Another agent takes a stale owner's task first
 (`/take`, which is logged); an agent standing in for an owner whose session ended may change
-it as its owner may. Moving a task to `open`, from any status, clears its owner.
+it as its owner may; on a board nobody runs, an agent on one of its repositories may drop the
+task of an owner that has left, with a `reason` (see "Left owners" below). Moving a task to `open`, from any status, clears its owner.
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
 `owner` and `previous_owner`. Like a claim, a move to `doing` (from `blocked` or
@@ -624,6 +642,21 @@ the caller the owner, within its `doing` limit; moving it to `review` or `blocke
 marking it done, leaves the owner as it is. An owner that acts again is `running`, and the
 task is its own again. Others are refused as before, and the refusal's `next` names this
 rule. (Servers before this change made them wait until the owner was stale.)
+
+Left owners: an owner has left when its session ended with nothing of it left to come
+back, or when its session still counts as `running` and has been unseen for
+`owner_left_secs` (an hour by default): it stopped without an end hook. Either way no
+usage-limit reset is ahead (`paused_until` not after now) and no thread it delegated is at
+work. An `idle` owner waits and has not left. On an active board that nobody runs (no
+coordinator, and no daemon dispatch with autopilot on), an agent on one of the board's
+repositories may drop such an owner's task in any status before `done` or `dropped`, and
+must give `reason` with the drop (see `PATCH` above), or close it with `/done` and `take`
+once its work has landed. It changes nothing else of the task: a take or a move to `doing`
+starts work and still waits until the owner is stale (`owner_stale_after_secs`, 24 hours).
+On a board with a live coordinator or daemon dispatch, the coordinator decides instead.
+The refusals for other agents name the rule that applies: an ended owner's refusal says
+the session has ended, and on a board nobody runs `next` shows how to drop with a reason
+or close once the owner has left.
 
 Pending proposals: a task is one while it is `open`, not `auto`, not a feedback item (whose
 body is a reporter's text, triaged instead), and its body starts `Proposal:` after leading
@@ -1172,5 +1205,6 @@ no nonce.
 | Other open asks on the board a new ask warns of (`duplicate_ask_window_secs`) | younger than 30 minutes |
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
+| Agent marked `running` but unseen that has left, and is marked `ended` (`owner_left_secs`) | 1 hour |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

@@ -24,7 +24,8 @@ use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{
-    done_take_hint, nobody_runs, owner_left_review, owner_session_ended, priority_str, status_str,
+    done_take_hint, drop_hint, nobody_runs, owner_left, owner_session_ended, priority_str,
+    status_str,
 };
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
@@ -1792,8 +1793,8 @@ const DELEGATORS: &str = concat!(
 /// creator (a feedback item's is only its reporter) and the threads that delegated the
 /// owner are told, as they may take the task once the owner's session has ended. When all
 /// of them are gone too, the agents on the board's repositories are told: they may close
-/// the task in one step once its owner has left (`owner_left_review`), and take it once
-/// the owner is stale. Each is told the call that is not refused.
+/// the task in one step once its owner has left (`owner_left`), or drop it with a reason,
+/// and take it once the owner is stale. Each is told the call that is not refused.
 fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<String>> {
     let id = task.as_str();
     let Some(task) = load_tasks(cx, "t.id = :id", &vec![(":id", &id)])?
@@ -1815,7 +1816,7 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(None);
     }
     let ended = owner_session_ended(cx, owner)?;
-    if !task.owner_stale && !ended && !owner_left_review(cx, owner)? {
+    if !task.owner_stale && !ended && !owner_left(cx, owner)? {
         return Ok(None);
     }
     let me = agent.id.as_str();
@@ -1832,7 +1833,11 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
     }
     let on_repo = agent.repo.as_ref().is_some_and(|r| board.repos.contains(r));
     let take = format!("task_claim {id} take=true, then task_done {id}");
-    let close = format!("close it with {}", done_take_hint(&task.id));
+    let close = format!(
+        "close it with {}; if it will not merge, drop it with {}",
+        done_take_hint(&task.id),
+        drop_hint(&task.id)
+    );
     if near.iter().any(|a| a == me) {
         // A stand-in takes the task once its owner's session has ended; before that it
         // closes the task as any agent on the board's repositories may.

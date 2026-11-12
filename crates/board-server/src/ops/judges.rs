@@ -19,7 +19,7 @@ const JUDGE_MS: i64 = JUDGE_HOURS_MAX * 3_600_000;
 
 /// A registration `j` that gives rights at `:now`: its agent has not ended, it has not
 /// expired, and the agent that registered it still holds the board's coordinator lease.
-const LIVE: &str = "j.ended_at IS NULL AND j.expires_at > :now \
+pub(crate) const LIVE: &str = "j.ended_at IS NULL AND j.expires_at > :now \
      AND EXISTS (SELECT 1 FROM boards jb WHERE jb.slug = j.board \
                  AND jb.coordinator = j.registered_by AND jb.coordinator_expires_at > :now)";
 

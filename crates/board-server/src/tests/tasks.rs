@@ -317,13 +317,18 @@ async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
     let (s, v) = move_as(&t, U, true, &doing, "review").await;
     assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
 
-    // A stale owner's task is taken first, which is logged.
+    // A stale owner's task is taken first, which is logged. Nobody runs the board now, and
+    // the owner has left, so a drop with a reason needs no take.
     let doing = task_in(&t, TaskStatus::Doing).await;
     t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), None).await;
-    let (s, v) = move_as(&t, B, false, &doing, "dropped").await;
+    let (s, v) = move_as(&t, B, false, &doing, "review").await;
     assert_eq!(s, 403, "{v}");
-    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(next.starts_with("the owner is stale: take it first"), "{v}");
+    assert!(next.contains("reason=<why>"), "{v}");
+    let (s, v) = move_as(&t, B, false, &doing, "dropped").await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
 }
 
 #[tokio::test]
@@ -1082,6 +1087,13 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
     end_session(&t, A).await;
     t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), Some("main")).await;
+    // A coordinator runs the board, so only staleness lets B close A's task.
+    t.register(C, Some(REPO), Some("main")).await;
+    let lease_until = (t.state.now() + TimeDelta::days(1)).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET coordinator = '{C}', coordinator_device = 'mac', \
+         coordinator_expires_at = {lease_until} WHERE slug = 'factory'"
+    ));
     let umbrella = t.task(B, "factory", "Umbrella").await;
     assert!(t.claim(B, &umbrella).await.0.is_success());
 
@@ -1222,8 +1234,6 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
         (400, Some("evidence_required")),
         "{v}"
     );
-    let (s, v) = done_take(&t, B, &working, pr.clone()).await;
-    refused(s, &v);
     // A take that starts work keeps the wait until the owner is stale.
     let (s, v) = take(&t, B, &unseen).await;
     refused(s, &v);
@@ -1232,6 +1242,11 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
     assert_eq!(t.get_task(&umbrella).await["status"], "doing");
     let events = events_of(&t, &unseen).await;
     assert!(events.iter().any(|(k, _)| k == "task_taken"), "{events:?}");
+    // A task still in doing closes the same way, once its work has landed.
+    let (s, v) = take(&t, B, &working).await;
+    refused(s, &v);
+    let (s, v) = done_take(&t, B, &working, pr.clone()).await;
+    closed_by_b(s, &v);
 
     // An idle owner waits, on CI or on the user: it has not left.
     t.register(A, Some(REPO), Some("main")).await;
@@ -1311,6 +1326,156 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
     .await;
     let (s, v) = done_take(&t, "claude:other", &run, pr).await;
     assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn a_left_owners_task_is_dropped_with_a_reason_on_a_board_nobody_runs() {
+    let t = setup().await;
+    let drop = |reason: Option<&str>| match reason {
+        Some(reason) => json!({ "status": "dropped", "reason": reason }),
+        None => json!({ "status": "dropped" }),
+    };
+    let forbidden = |s: u16, v: &Value| {
+        assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+        assert!(
+            !v["message"]
+                .as_str()
+                .unwrap()
+                .contains("while its session runs"),
+            "{v}"
+        );
+    };
+    let parked = task_in(&t, TaskStatus::Blocked).await;
+    let why = "superseded by the new design";
+
+    // The owner's session runs: the task is its own.
+    let (s, v) = patch_as(&t, B, false, &parked, drop(Some(why))).await;
+    forbidden(s, &v);
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is running"),
+        "{v}"
+    );
+
+    // An idle owner waits, on CI or on the user: it has not left.
+    let state = format!("/v1/agents/{A}/state");
+    t.ok("POST", &state, Some(A), Some(json!({ "state": "idle" })))
+        .await;
+    t.advance(TimeDelta::hours(2));
+    t.register(B, Some(REPO), Some("main")).await;
+    let (s, v) = patch_as(&t, B, false, &parked, drop(Some(why))).await;
+    forbidden(s, &v);
+
+    // Its session ended: it has left, long before it is stale.
+    t.register(A, Some(REPO), Some("main")).await;
+    end_session(&t, A).await;
+    t.advance(TimeDelta::minutes(5));
+    t.register(B, Some(REPO), Some("main")).await;
+    assert_eq!(t.get_task(&parked).await["owner_stale"], false);
+
+    // An agent off the board's repositories may not drop it.
+    let far = "claude:far";
+    t.register(far, Some("github.com/example/other"), Some("main"))
+        .await;
+    let (s, v) = patch_as(&t, far, false, &parked, drop(Some(why))).await;
+    forbidden(s, &v);
+    assert!(v["message"].as_str().unwrap().contains("has ended"), "{v}");
+
+    // On a board that a coordinator runs, the coordinator drops it: others wait.
+    let lease_until = (t.state.now() + TimeDelta::days(1)).timestamp_millis();
+    t.register("t3:coord", Some(REPO), Some("main")).await;
+    t.exec(&format!(
+        "UPDATE boards SET coordinator = 't3:coord', coordinator_device = 'mac', \
+         coordinator_expires_at = {lease_until} WHERE slug = 'factory'"
+    ));
+    let (s, v) = patch_as(&t, B, false, &parked, drop(Some(why))).await;
+    forbidden(s, &v);
+    assert!(!v["next"].as_str().unwrap().contains("nobody runs"), "{v}");
+    t.exec(
+        "UPDATE boards SET coordinator = NULL, coordinator_device = NULL, \
+         coordinator_expires_at = NULL WHERE slug = 'factory'",
+    );
+
+    // A take or a move that starts work still waits until the owner is stale, and the
+    // refusals name the drop.
+    let (s, v) = take(&t, B, &parked).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("reason=<why>"), "{v}");
+    let (s, v) = patch_as(&t, B, false, &parked, json!({ "status": "doing" })).await;
+    forbidden(s, &v);
+    assert!(v["next"].as_str().unwrap().contains("reason=<why>"), "{v}");
+
+    // The drop needs a reason, and a blank one counts as none.
+    for reason in [None, Some("  ")] {
+        let (s, v) = patch_as(&t, B, false, &parked, drop(reason)).await;
+        assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+        let hint = format!("task_update {parked} status=dropped reason=<why>");
+        assert!(v["next"].as_str().unwrap().contains(&hint), "{v}");
+    }
+    // A reason is only for a drop.
+    let (s, v) = patch_as(
+        &t,
+        B,
+        false,
+        &parked,
+        json!({ "status": "review", "reason": why }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert_eq!(t.get_task(&parked).await["status"], "blocked");
+
+    // With the reason, the drop goes through and records why.
+    let (s, v) = patch_as(&t, B, false, &parked, drop(Some(why))).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "dropped", "{v}");
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{parked}"), None, None)
+        .await;
+    let notes = detail["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["kind"] == "decision" && n["text"] == why && n["agent"] == B),
+        "{notes:?}"
+    );
+    let events = events_of(&t, &parked).await;
+    let dropped = events
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "task_updated")
+        .unwrap();
+    assert_eq!(dropped.1["left_owner"], A, "{events:?}");
+    assert_eq!(dropped.1["to"], "dropped", "{events:?}");
+}
+
+#[tokio::test]
+async fn the_owner_drops_its_task_with_a_reason_kept_as_a_note() {
+    let t = setup().await;
+    let id = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &id,
+        json!({ "status": "dropped", "reason": "done elsewhere" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let notes = detail["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["kind"] == "decision" && n["text"] == "done elsewhere"),
+        "{notes:?}"
+    );
+    let events = events_of(&t, &id).await;
+    assert!(
+        events.iter().all(|(_, p)| p.get("left_owner").is_none()),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -3235,7 +3400,15 @@ async fn a_delegating_parent_closes_moves_or_hands_back_an_ended_childs_task() {
     assert_eq!((s.as_u16(), v["code"].as_str()), (403, Some("forbidden")));
     let one_step = format!("task_done {closed} take=true");
     assert!(v["next"].as_str().unwrap().contains(&one_step), "{v}");
+    // An agent on the board's repositories drops it only with a reason, and one elsewhere
+    // not at all.
     let (s, v) = patch_as(&t, B, false, &moved, json!({ "status": "dropped" })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("reason=<why>"), "{v}");
+    let far = "claude:far";
+    t.register(far, Some("github.com/example/other"), Some("main"))
+        .await;
+    let (s, v) = patch_as(&t, far, false, &moved, json!({ "status": "dropped" })).await;
     assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
     assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
     let (s, v) = patch_as(&t, B, false, &handed, json!({ "owner": B })).await;
@@ -3325,7 +3498,7 @@ async fn the_creator_releases_hands_over_or_closes_an_ended_owners_task() {
         v["message"]
             .as_str()
             .unwrap()
-            .contains("while its session runs"),
+            .contains("its session is running"),
         "{v}"
     );
     assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
@@ -3358,6 +3531,10 @@ async fn the_creator_releases_hands_over_or_closes_an_ended_owners_task() {
         (403, Some("forbidden")),
         "{v}"
     );
+    // The refusal says the session ended, and why that is not enough.
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("its session has ended"), "{v}");
+    assert!(!message.contains("while its session runs"), "{v}");
     // The parent that delegated its owner still stands in.
     let (s, v) = take(&t, PARENT, &item).await;
     assert_eq!((s, v["owner"].as_str()), (200, Some(PARENT)), "{v}");

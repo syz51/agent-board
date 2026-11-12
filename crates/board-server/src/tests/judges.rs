@@ -511,3 +511,35 @@ async fn the_list_says_which_judges_still_run_and_drops_ended_ones() {
         0
     );
 }
+
+#[tokio::test]
+async fn the_sweep_leaves_the_dispatch_agent_and_a_live_judge_running() {
+    let t = dispatched().await;
+    let id = parked(&t, "factory").await;
+    let (s, v) = register_judge(
+        &t,
+        DISPATCH,
+        json!({ "agent": JUDGE, "kind": "review", "tasks": [id] }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    // An hour unseen: the worker's session stopped without its end hook, the judge still
+    // has its rights.
+    t.advance(TimeDelta::minutes(61));
+    claim_lease(&t).await;
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(
+        [WORKER, JUDGE, DISPATCH].map(|a| t.state_of(a)),
+        ["ended", "running", "running"]
+    );
+
+    // The registration and the lease have lapsed: the judge's session ends too, while the
+    // dispatch agent, which is no session, is left alone.
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(
+        [JUDGE, DISPATCH].map(|a| t.state_of(a)),
+        ["ended", "running"]
+    );
+}

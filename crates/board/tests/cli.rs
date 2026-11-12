@@ -2217,7 +2217,7 @@ fn an_unknown_enum_value_lists_the_accepted_ones() {
 fn other_over_long_text_fails_before_any_request() {
     let e = env();
     let long = |n: usize| "x".repeat(n);
-    let cases: [(Vec<String>, &str, &str); 5] = [
+    let cases: [(Vec<String>, &str, &str); 6] = [
         (
             vec!["done".into(), "factory-12".into(), "--pr".into(), long(501)],
             "evidence value is 501 characters; the limit is 500",
@@ -2232,6 +2232,18 @@ fn other_over_long_text_fails_before_any_request() {
             ],
             "blocked_reason is 801 characters; the limit is 800",
             "split it across notes",
+        ),
+        (
+            vec![
+                "update".into(),
+                "factory-12".into(),
+                "--status".into(),
+                "dropped".into(),
+                "--reason".into(),
+                long(801),
+            ],
+            "reason is 801 characters; the limit is 800",
+            "put the detail in a note",
         ),
         (
             vec!["feedback".into(), long(4001)],
