@@ -5,9 +5,9 @@
 //! logged or sent anywhere but the usage endpoint. An expired token skips the reading until
 //! Claude Code refreshes it.
 //!
-//! T3 Code reads the same endpoint for the same account and keeps its newest reading in a
-//! file. The daemon takes that reading first ([`read_snapshot`]), so the two do not spend
-//! the endpoint's rate limit twice.
+//! T3 Code reads the same endpoint for the same account and keeps each Claude instance's
+//! newest reading in a file. The daemon takes the newest of those readings first
+//! ([`read_snapshot`]), so the two do not spend the endpoint's rate limit twice.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,8 +27,11 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Reading the sign-in and the endpoint each get this long.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The file T3 Code keeps its Claude instance's state in, under the home directory.
-const T3_SNAPSHOT: &str = ".t3/caches/claudeAgent.json";
+/// The folder T3 Code keeps each provider instance's state in, as `<instance>.json`, under
+/// the home directory.
+const T3_CACHES: &str = ".t3/caches";
+/// T3 Code's default Claude instance, which the user's own chats run on.
+const T3_CLAUDE_INSTANCE: &str = "claudeAgent";
 /// A snapshot dated further ahead of this device's clock than this is not believed.
 const SNAPSHOT_SKEW: TimeDelta = TimeDelta::minutes(1);
 /// A window whose reset time moved later by more than this is a new window.
@@ -55,12 +58,13 @@ impl std::error::Error for Refused {}
 pub enum UsageSource {
     /// Reads nothing itself; uses the readings other devices report to the server.
     Server,
-    /// Reads `url` with the token from `credentials`, and reports the reading. While T3
-    /// Code's `snapshot` file holds a reading that is new enough, takes that one instead.
+    /// Reads `url` with the token from `credentials`, and reports the reading. While one of
+    /// T3 Code's `snapshots` files holds a reading that is new enough, takes the newest such
+    /// reading instead.
     ClaudeCode {
         url: String,
         credentials: Credentials,
-        snapshot: Option<PathBuf>,
+        snapshots: Vec<PathBuf>,
     },
 }
 
@@ -75,8 +79,11 @@ pub enum Credentials {
 
 impl UsageSource {
     /// Claude Code's endpoint and this platform's sign-in store; [`UsageSource::Server`]
-    /// without a home directory to find it in.
-    pub fn claude_code() -> Self {
+    /// without a home directory to find it in. T3 Code's readings come from its default
+    /// Claude instance and from `thread_instance`, the instance the daemon starts its
+    /// threads on (`[thread_model]`): readings taken during those threads' turns go to that
+    /// instance's file.
+    pub fn claude_code(thread_instance: Option<&str>) -> Self {
         let home = dirs::home_dir();
         let credentials = if cfg!(target_os = "macos") {
             Credentials::Keychain
@@ -89,7 +96,17 @@ impl UsageSource {
         Self::ClaudeCode {
             url: USAGE_URL.to_owned(),
             credentials,
-            snapshot: home.map(|home| home.join(T3_SNAPSHOT)),
+            snapshots: home
+                .map(|home| {
+                    let caches = home.join(T3_CACHES);
+                    let mut instances = vec![T3_CLAUDE_INSTANCE];
+                    instances.extend(thread_instance.filter(|i| *i != T3_CLAUDE_INSTANCE));
+                    instances
+                        .into_iter()
+                        .map(|instance| caches.join(format!("{instance}.json")))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }

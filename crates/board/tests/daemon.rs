@@ -6704,7 +6704,7 @@ async fn the_daemon_reads_the_usage_endpoint_at_most_every_five_minutes_and_repo
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds.clone()),
-        snapshot: None,
+        snapshots: Vec::new(),
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -6779,7 +6779,7 @@ async fn an_empty_usage_answer_is_not_reported_and_a_failed_report_keeps_the_loc
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
-        snapshot: None,
+        snapshots: Vec::new(),
     };
     e.stub
         .on("GET /v1/usage", usage_reading(95.0, at()))
@@ -8332,7 +8332,7 @@ async fn the_daemon_reads_the_usage_every_minute_near_a_pace_line_until_refused(
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
-        snapshot: None,
+        snapshots: Vec::new(),
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -8426,7 +8426,7 @@ async fn a_failed_usage_report_keeps_the_last_pace() {
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url: format!("{}/api/oauth/usage", e.stub.url),
         credentials: Credentials::File(creds),
-        snapshot: None,
+        snapshots: Vec::new(),
     };
     e.stub.on(
         "GET /api/oauth/usage",
@@ -8461,7 +8461,7 @@ fn usage_source_with_snapshot(e: &mut Env, url: String) -> std::path::PathBuf {
     e.daemon.usage_source = UsageSource::ClaudeCode {
         url,
         credentials: Credentials::File(creds),
-        snapshot: Some(snapshot.clone()),
+        snapshots: vec![snapshot.clone()],
     };
     snapshot
 }
@@ -8538,6 +8538,49 @@ async fn a_new_t3_snapshot_is_reported_and_stands_in_for_the_endpoint() {
     write_snapshot(&snapshot, 53.0, resets, check);
     e.daemon.reconcile(check).await.unwrap();
     assert_eq!(reads(&e), 3);
+}
+
+#[tokio::test]
+async fn the_newest_reading_of_t3_codes_claude_instances_is_reported() {
+    use board::usage::UsageSource;
+
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let url = format!("{}/api/oauth/usage", e.stub.url);
+    let chats = usage_source_with_snapshot(&mut e, url);
+    // The daemon's threads run on a second instance, which T3 Code keeps a file for too.
+    let agents = e._dir.path().join("claude-agents.json");
+    if let UsageSource::ClaudeCode { snapshots, .. } = &mut e.daemon.usage_source {
+        snapshots.push(agents.clone());
+    }
+    let minutes = chrono::Duration::minutes;
+    let resets = at() + chrono::Duration::days(2);
+    let reads = |e: &Env| e.stub.requests_to("GET /api/oauth/usage").len();
+    let reports = |e: &Env| e.stub.requests_to("PUT /v1/usage");
+    e.stub.on(
+        "GET /api/oauth/usage",
+        json!({ "seven_day": { "utilization": 50.0, "resets_at": resets } }),
+    );
+    e.stub.on("PUT /v1/usage", usage_reading(50.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 1));
+
+    // The agents' instance read last: its reading is reported, with no endpoint call.
+    let t = at() + minutes(2);
+    write_snapshot(&chats, 51.0, resets, at() + minutes(1));
+    write_snapshot(&agents, 52.0, resets, t);
+    e.stub.on("PUT /v1/usage", usage_reading(52.0, t));
+    e.daemon.reconcile(t).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 2));
+    assert_eq!(reports(&e)[1].body["read_at"], json!(t));
+    assert_eq!(reports(&e)[1].body["seven_day"]["percent"], json!(52.0));
+
+    // Then the chats' instance reads newer: that reading is reported.
+    let later = t + minutes(1);
+    write_snapshot(&chats, 53.0, resets, later);
+    e.stub.on("PUT /v1/usage", usage_reading(53.0, later));
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!((reads(&e), reports(&e).len()), (1, 3));
+    assert_eq!(reports(&e)[2].body["read_at"], json!(later));
 }
 
 #[tokio::test]
