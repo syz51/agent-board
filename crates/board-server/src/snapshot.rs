@@ -11,9 +11,9 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, BoardSlug, BoardStatus, Dispatch, Event, EventType,
-    Runtime, Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, StoodDownHold, Task, TaskId,
-    TaskStatus, Timestamp,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, Dispatch, Event, EventType, Runtime,
+    Snapshot, SnapshotFormat, SnapshotKind, StatusCounts, StoodDownHold, Task, TaskId, TaskStatus,
+    Timestamp,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -23,7 +23,7 @@ use crate::db::{Ctx, parse_enum, parse_id, parse_json};
 use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
-use crate::ops::tasks::{owner_session_ended, priority_str, status_str};
+use crate::ops::tasks::{nobody_runs, owner_session_ended, priority_str, status_str};
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
     get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
@@ -1809,10 +1809,7 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(None);
     };
     let board = get_board(cx, &task.board)?;
-    if board.status != BoardStatus::Active
-        || board.coordinator.is_some()
-        || (board.dispatch == Dispatch::Daemon && board.autopilot)
-    {
+    if !nobody_runs(&board) {
         return Ok(None);
     }
     if !task.owner_stale && !owner_session_ended(cx, owner)? {

@@ -1,9 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
-    AddNote, AgentId, AgentState, BoardSlug, CreateTask, DoneTask, ErrorCode, EventType,
-    EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task,
-    TaskId, TaskStatus, Timestamp, UpdateTask,
+    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, Dispatch, DoneTask,
+    ErrorCode, EventType, EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
+    TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -1352,9 +1352,13 @@ fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Re
                 "only the owner {owner} may {action} {} while its session runs",
                 task.id
             ),
-            if task.owner_stale && action == "complete" && task.status == TaskStatus::Review {
+            if action == "complete"
+                && task.status == TaskStatus::Review
+                && (task.owner_stale
+                    || (nobody_runs(&get_board(cx, &task.board)?) && owner_left_review(cx, owner)?))
+            {
                 format!(
-                    "the owner is stale: close it in one step with {}",
+                    "the owner is stale or has left: close it in one step with {}",
                     done_take_hint(&task.id)
                 )
             } else if task.owner_stale {
@@ -1881,7 +1885,43 @@ pub(crate) fn update(
     get_task(cx, id)
 }
 
-/// `take` on done: the stale owner that `agent` takes `task` from as it closes it, or
+/// Whether nobody runs `board`: it is active with neither a coordinator (the server drops
+/// one whose lease ran out) nor a daemon dispatcher, which closes reviewed tasks itself.
+pub(crate) fn nobody_runs(board: &Board) -> bool {
+    board.status == BoardStatus::Active
+        && board.coordinator.is_none()
+        && !(board.dispatch == Dispatch::Daemon && board.autopilot)
+}
+
+/// How long unseen an owner counts as having left its task in review on a board nobody
+/// runs: twice `doing_idle_secs`, the span after which the idle notice stops waiting for
+/// the owner's own turn.
+fn owner_left_ms(cx: &Ctx<'_>) -> i64 {
+    2 * cx.s.doing_idle_ms()
+}
+
+/// Whether `owner` has left its task in review: its session ended with nothing of it left
+/// to come back ([`owner_session_ended`]), or it has been unseen for [`owner_left_ms`]
+/// with no usage-limit reset ahead, such as a session that stopped without an end hook.
+fn owner_left_review(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+    if owner_session_ended(cx, owner)? {
+        return Ok(true);
+    }
+    let now = cx.now_ms();
+    Ok(cx
+        .db
+        .query_row(
+            "SELECT last_seen <= ?2 AND (paused_until IS NULL OR paused_until <= ?3) \
+             FROM agents WHERE id = ?1",
+            params![owner.as_str(), now - owner_left_ms(cx), now],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(true))
+}
+
+/// `take` on done: the owner that `agent` takes `task` from as it closes it (a stale one,
+/// or one that left its task in review on a board nobody runs, [`owner_left_review`]), or
 /// `None` when `agent` needs no take (its own task, nobody's, or one it stands in for),
 /// which leaves the caller to [`require_owner`]. Only a task in `review` is closed this
 /// way: its work is finished, so the take never moves it to `doing` and the doing limit
@@ -1895,14 +1935,24 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
     if acts_for_ended_owner(cx, task, agent)? {
         return Ok(None);
     }
-    if !task.owner_stale {
+    // On a board nobody runs, no coordinator closes a finished task for an owner that left,
+    // so any agent may, without the wait until the owner is stale.
+    let left = task.status == TaskStatus::Review
+        && nobody_runs(&get_board(cx, &task.board)?)
+        && owner_left_review(cx, owner)?;
+    if !task.owner_stale && !left {
         let hours = cx.s.owner_stale_after_secs / 3600;
         return Err(refused(
             format!(
                 "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
                 owner_desc(cx, owner)?
             ),
-            format!("ask the owner in a note (task_note {id}); {STAND_IN_RULE}"),
+            format!(
+                "ask the owner in a note (task_note {id}); {STAND_IN_RULE}; on a board with \
+                 no coordinator and no daemon dispatch, any agent may close a task in review \
+                 once its owner's session has ended or the owner is {} unseen",
+                ago(TimeDelta::milliseconds(owner_left_ms(cx)))
+            ),
         ));
     }
     if task.status != TaskStatus::Review {

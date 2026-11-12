@@ -730,8 +730,9 @@ pub struct DoneArgs {
         SUMMARY_CHARS_MAX,
     ))]
     summary: Option<String>,
-    /// Close a task in review whose owner is stale, in one step and outside your doing
-    /// limit. Needs a --pr or a --check.
+    /// Close a task in review whose owner is stale, or has left a board that nobody runs
+    /// (session ended, or an hour unseen), in one step and outside your doing limit. Needs
+    /// a --pr or a --check.
     #[arg(long)]
     take: bool,
 }

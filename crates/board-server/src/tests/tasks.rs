@@ -1180,6 +1180,102 @@ async fn done_with_take_closes_a_stale_owners_review_task_outside_the_doing_limi
 }
 
 #[tokio::test]
+async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 3).await;
+    let pr = json!([{ "kind": "pr", "value": "https://example.com/pull/1" }]);
+    let refused = |s: u16, v: &Value| {
+        assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    };
+    let closed_by_b = |s: u16, v: &Value| {
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(
+            (v["status"].as_str(), v["owner"].as_str()),
+            (Some("done"), Some(B)),
+            "{v}"
+        );
+    };
+    let ended = task_in(&t, TaskStatus::Review).await;
+    let unseen = task_in(&t, TaskStatus::Review).await;
+    let working = task_in(&t, TaskStatus::Doing).await;
+    let umbrella = t.task(B, "factory", "Umbrella").await;
+    assert!(t.claim(B, &umbrella).await.0.is_success());
+
+    // The owner was seen a moment ago and its session runs: the task stays its own.
+    let (s, v) = done_take(&t, B, &ended, pr.clone()).await;
+    refused(s, &v);
+    assert!(v["next"].as_str().unwrap().contains("1h unseen"), "{v}");
+
+    // An hour unseen, with no end hook: the owner left, long before it is stale.
+    t.advance(TimeDelta::minutes(61));
+    t.register(B, Some(REPO), Some("main")).await;
+    assert_eq!(t.get_task(&unseen).await["owner_stale"], false);
+    // Done without take names the one-step close.
+    let (s, v) = t.done(B, &unseen, pr.clone()).await;
+    assert_eq!(s.as_u16(), 403, "{v}");
+    let one_step = format!("task_done {unseen} take=true");
+    assert!(v["next"].as_str().unwrap().contains(&one_step), "{v}");
+    // The closer still shows that the work landed, and a task in progress is not closed.
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    let (s, v) = done_take(&t, B, &unseen, commit).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("evidence_required")),
+        "{v}"
+    );
+    let (s, v) = done_take(&t, B, &working, pr.clone()).await;
+    refused(s, &v);
+    // A take that starts work keeps the wait until the owner is stale.
+    let (s, v) = take(&t, B, &unseen).await;
+    refused(s, &v);
+    let (s, v) = done_take(&t, B, &unseen, pr.clone()).await;
+    closed_by_b(s, &v);
+    assert_eq!(t.get_task(&umbrella).await["status"], "doing");
+    let events = events_of(&t, &unseen).await;
+    assert!(events.iter().any(|(k, _)| k == "task_taken"), "{events:?}");
+
+    // An owner held by a usage limit comes back at the reset, so it has not left.
+    let held = t.task(B, "factory", "Held by the limit").await;
+    t.register(A, Some(REPO), Some("main")).await;
+    assert!(t.claim(A, &held).await.0.is_success());
+    let (s, v) = t.patch(A, &held, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    let reset = (t.state.now() + TimeDelta::hours(4)).to_rfc3339();
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "paused", "paused_until": reset })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(61));
+    t.register(B, Some(REPO), Some("main")).await;
+    let (s, v) = done_take(&t, B, &held, pr.clone()).await;
+    refused(s, &v);
+
+    // An ended session has left at once.
+    t.register(A, Some(REPO), Some("main")).await;
+    end_session(&t, A).await;
+    let (s, v) = done_take(&t, B, &ended, pr.clone()).await;
+    closed_by_b(s, &v);
+
+    // On a board that a coordinator runs, the coordinator closes it: others wait.
+    let run = t.task(A, "factory", "On a board with a coordinator").await;
+    t.register(A, Some(REPO), Some("main")).await;
+    assert!(t.claim(A, &run).await.0.is_success());
+    let (s, v) = t.patch(A, &run, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    end_session(&t, A).await;
+    t.register("claude:other", Some(REPO), Some("main")).await;
+    let lease_until = (t.state.now() + TimeDelta::days(1)).timestamp_millis();
+    t.exec(&format!(
+        "UPDATE boards SET coordinator = '{B}', coordinator_device = 'mac', \
+         coordinator_expires_at = {lease_until} WHERE slug = 'factory'"
+    ));
+    let (s, v) = done_take(&t, "claude:other", &run, pr.clone()).await;
+    refused(s, &v);
+}
+
+#[tokio::test]
 async fn fifty_concurrent_claims_have_one_winner() {
     let t = T::new();
     t.board("factory", &[]).await;
@@ -3095,10 +3191,12 @@ async fn a_delegating_parent_closes_moves_or_hands_back_an_ended_childs_task() {
     ];
     end_session(&t, CHILD).await;
 
-    // An unrelated agent is refused on every route, with a hint naming who may act.
+    // An unrelated agent is refused on every route, with a hint naming who may act. Nobody
+    // runs this board, so for the task in review that is the one-step close.
     let (s, v) = t.done(B, &closed, check(0)).await;
     assert_eq!((s.as_u16(), v["code"].as_str()), (403, Some("forbidden")));
-    assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");
+    let one_step = format!("task_done {closed} take=true");
+    assert!(v["next"].as_str().unwrap().contains(&one_step), "{v}");
     let (s, v) = patch_as(&t, B, false, &moved, json!({ "status": "dropped" })).await;
     assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
     assert!(v["next"].as_str().unwrap().contains(STAND_IN), "{v}");

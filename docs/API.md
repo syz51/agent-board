@@ -563,12 +563,15 @@ Reopening a closed board, or any change on it, starts the period again.
   it is stored on the task (`Task.summary`, absent without one) and listed in "Updates".
   It is not in the event; `task_show` shows it among the text written by other agents.
   Reopening the task clears it. An optional `take: true` closes a task in `review` whose
-  owner is stale (`owner_stale`) in the same step: the caller becomes its owner, a
+  owner is stale (`owner_stale`) in the same step, or, on an active board that nobody
+  runs (no coordinator, and no daemon dispatch with autopilot on), whose owner has left:
+  its session ended with nothing of it left to come back, or it has been unseen for twice
+  `doing_idle_secs` with no usage-limit reset ahead. The caller becomes its owner, a
   `task_taken` event (`status: review`) comes before `task_done`, and the task never
   moves to `doing`, so the caller's `doing` limit does not apply. The evidence must then
-  hold a `pr` or a `check` (400 `evidence_required` otherwise). With `take`, a live
-  owner's task is refused with 409 `claim_refused`, and a stale owner's task in another
-  status with 400 `invalid_transition`, since `/take` starts such work and keeps the
+  hold a `pr` or a `check` (400 `evidence_required` otherwise). With `take`, the task
+  of an owner that is neither stale nor left so is refused with 409 `claim_refused`, and
+  a stale owner's task in another status with 400 `invalid_transition`, since `/take` starts such work and keeps the
   limit. `take` changes nothing for the task's owner or an agent standing in for it.
   Servers that predate it ignore it.
 - `POST /v1/tasks/{id}/notes` `[AddNote]` → `[Note]`. Kind `feedback` is still accepted;

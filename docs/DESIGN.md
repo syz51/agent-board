@@ -148,7 +148,12 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `blocked_reason` that someone else set, which may name such a wait; the owner's claim
   clears a reason it set itself. Another live agent's parked task is refused, naming the
   owner. After 24 hours unseen the owner is stale and another agent may take the task
-  (logged). A stale owner's task in `review` can be closed in one step (`task_done` with
+  (logged). On a board that nobody runs, no coordinator closes a finished task for a child that
+  is gone, so there a task in `review` does not wait those 24 hours: any agent may close
+  it once its owner's session has ended, or the owner has been unseen for twice
+  `doing_idle_secs` (a session that stopped without an end hook), and no usage-limit
+  reset will bring it back. A take that starts work keeps the 24 hours.
+  A stale owner's task in `review`, or such a left owner's, can be closed in one step (`task_done` with
   `take`, and a PR or a check as evidence), outside the closer's `doing` limit, since it
   starts no work. The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
