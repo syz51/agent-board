@@ -42,8 +42,13 @@ pub struct AgentLocal {
     /// last, so each is reminded about once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_reminded: Vec<TaskId>,
+    /// Tasks the `Stop` hook already reminded the agent about after it released them to
+    /// `open`, newest last, so each is reminded about once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_reminded: Vec<TaskId>,
     /// Tasks the agent filed something about (a sub-task, a proposal under it, an ask on
-    /// it), newest last: the `Stop` hook does not remind about these when they are done.
+    /// it), newest last: the `Stop` hook does not remind about these when they are done
+    /// or released.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filed_about: Vec<TaskId>,
     /// Overlap alerts shown after tool calls, newest last: see [`AgentLocal::first_sight`].
@@ -457,8 +462,8 @@ fn prune_dir(dir: &Path, age: std::time::Duration) -> Result<()> {
     Ok(())
 }
 
-/// A task the agent marked done through `board done` or the `task_done` tool, kept until
-/// the agent's next `Stop` hook reads it.
+/// A task the agent marked done through `board done` or the `task_done` tool, or released
+/// to `open` ([`record_released`]), kept until the agent's next `Stop` hook reads it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoneMark {
     pub task: TaskId,
@@ -486,6 +491,36 @@ pub fn record_done(home: &Home, agent: &AgentId, task: &TaskId, at: Timestamp) -
 /// mark that cannot be removed is still returned, and read again by the next call.
 pub fn take_done(home: &Home, agent: &AgentId) -> Result<Vec<DoneMark>> {
     let mut marks: Vec<DoneMark> = take_marks(&done_dir(home, agent))?;
+    marks.sort_by_key(|m| m.at);
+    Ok(marks)
+}
+
+fn released_dir(home: &Home, agent: &AgentId) -> PathBuf {
+    home.state_dir().join("released").join(file_stem(agent))
+}
+
+/// Records that `agent` released `task`, which it owned in `doing`, back to `open`; as
+/// [`record_done`], in a directory of its own, so a done of the same task keeps its mark.
+pub fn record_released(home: &Home, agent: &AgentId, task: &TaskId, at: Timestamp) -> Result<()> {
+    let mark = DoneMark {
+        task: task.clone(),
+        at,
+    };
+    write_json(
+        &released_dir(home, agent).join(format!("{}.json", safe_stem(task.as_str()))),
+        &mark,
+    )
+}
+
+/// Forgets that `agent` released `task`: it claimed the task again.
+pub fn forget_released(home: &Home, agent: &AgentId, task: &TaskId) -> Result<()> {
+    remove_if_exists(&released_dir(home, agent).join(format!("{}.json", safe_stem(task.as_str()))))
+}
+
+/// The tasks `agent` released since the last call, oldest first, forgetting them; as
+/// [`take_done`].
+pub fn take_released(home: &Home, agent: &AgentId) -> Result<Vec<DoneMark>> {
+    let mut marks: Vec<DoneMark> = take_marks(&released_dir(home, agent))?;
     marks.sort_by_key(|m| m.at);
     Ok(marks)
 }
@@ -552,12 +587,14 @@ pub fn take_filed(home: &Home, agent: &AgentId) -> Result<Vec<FiledMark>> {
     take_marks(&filed_dir(home, agent))
 }
 
-/// Removes done and filed marks no `Stop` hook read for `age` (a session that ended
-/// mid-turn), and agents' directories left empty for as long.
+/// Removes done, released and filed marks no `Stop` hook read for `age` (a session that
+/// ended mid-turn), and agents' directories left empty for as long.
 pub fn prune_marks(home: &Home, age: std::time::Duration) -> Result<()> {
-    // Both, also when the first fails.
+    // All three, also when an earlier one fails.
     let done = prune_marks_in(&home.state_dir().join("done"), age);
+    let released = prune_marks_in(&home.state_dir().join("released"), age);
     prune_marks_in(&home.state_dir().join("filed"), age)?;
+    released?;
     done
 }
 
@@ -879,6 +916,47 @@ mod tests {
         prune_marks(&home, std::time::Duration::from_secs(60)).unwrap();
         assert!(!done_dir(&home, &peer).exists());
         assert!(!done_dir(&home, &me).exists());
+    }
+
+    #[test]
+    fn released_marks_are_kept_apart_from_done_marks_forgotten_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let me: AgentId = "t3:thread-1".parse().unwrap();
+        let peer: AgentId = "t3:thread-2".parse().unwrap();
+        let t0 = chrono::Utc::now();
+        let (a, b): (TaskId, TaskId) =
+            ("factory-12".parse().unwrap(), "factory-9".parse().unwrap());
+        assert_eq!(take_released(&home, &me).unwrap(), vec![]);
+        // Nothing to forget is fine.
+        forget_released(&home, &me, &a).unwrap();
+
+        record_released(&home, &me, &a, t0 + chrono::Duration::seconds(1)).unwrap();
+        record_released(&home, &me, &b, t0).unwrap();
+        record_released(&home, &peer, &a, t0).unwrap();
+        record_done(&home, &me, &a, t0).unwrap();
+        forget_released(&home, &me, &b).unwrap();
+        let taken = take_released(&home, &me).unwrap();
+        assert_eq!(
+            taken.iter().map(|m| m.task.as_str()).collect::<Vec<_>>(),
+            ["factory-12"],
+            "the claimed one is forgotten"
+        );
+        assert_eq!(take_released(&home, &me).unwrap(), vec![], "taken once");
+        assert_eq!(take_done(&home, &me).unwrap().len(), 1, "a done mark stays");
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        for path in [
+            released_dir(&home, &peer).join("factory-12.json"),
+            released_dir(&home, &peer),
+        ] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        prune_marks(&home, std::time::Duration::from_secs(60)).unwrap();
+        assert!(!released_dir(&home, &peer).exists());
     }
 
     #[test]
