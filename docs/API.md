@@ -198,8 +198,10 @@ server's minute sweep deletes older ones.
   agent's file leases and keeps its tasks and coordinator lease; it keeps a judge's rights
   too. The `agent_state_changed` event, by the agent, carries `from` `running`, `to`
   `ended`, `paused_until` `null` and `unseen_since` (when it was last seen); `last_seen` is
-  unchanged. An agent that acts again is `running`, as above. (Servers before this change
-  left such an agent `running`.)
+  unchanged. An agent that acts again is `running`, as above. A session that waits over
+  `owner_left_secs` inside one tool call (a permission prompt, a question to the user)
+  sends no hook meanwhile, so it is marked `ended` too. (Servers before this change left
+  such an agent `running`.)
   `said`, optional, is the last message of the turn that just ended: the hooks send it
   with the `Stop` update. It is advisory and never fails the update: the server removes
   terminal escape sequences and control characters other than line breaks and tabs, trims
@@ -466,7 +468,7 @@ Reopening a closed board, or any change on it, starts the period again.
 - `reason` in `[UpdateTask]` says why the task is dropped: it applies only with `status:
   dropped` (400 `invalid` otherwise), at most `note_chars` characters, and a blank one counts
   as absent. The server keeps it as a `decision` note by the caller (with its `note_added`
-  event). It is required when the caller drops, under the rule below, the task of an owner
+  event), also when the task was already `dropped` and nothing else changes. It is required when the caller drops, under the rule below, the task of an owner
   that has left (400 `invalid`, `next` showing how to send it). That `task_updated` event
   carries `left_owner` (the owner's id). `reason` is sent only when set; a server that
   predates it ignores it and keeps no note.

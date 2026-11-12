@@ -1476,6 +1476,47 @@ async fn the_owner_drops_its_task_with_a_reason_kept_as_a_note() {
         events.iter().all(|(_, p)| p.get("left_owner").is_none()),
         "{events:?}"
     );
+
+    // A reason sent again for the task already dropped changes nothing else, but is kept.
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &id,
+        json!({ "status": "dropped", "reason": "superseded by the new plan" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let decisions: Vec<_> = detail["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "decision")
+        .map(|n| n["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        decisions,
+        ["done elsewhere", "superseded by the new plan"],
+        "{detail}"
+    );
+
+    // A reason meant for a block is pointed at blocked_reason.
+    let other = task_in(&t, TaskStatus::Doing).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &other,
+        json!({ "status": "blocked", "reason": "waits on CI" }),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(v["code"], "invalid", "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("blocked_reason"),
+        "{v}"
+    );
 }
 
 #[tokio::test]

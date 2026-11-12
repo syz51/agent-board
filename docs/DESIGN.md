@@ -638,7 +638,10 @@ apart from the user's chats, such as environment variables.
   It leaves `last_seen` alone, so an idle notice's spell still starts at the stop, and it
   releases the agent's file leases, as any end does; the agent's next call marks it
   running again. The heartbeat comes at most once a minute while tools run, so a session
-  that is working is seen well within the hour.
+  that is working is seen well within the hour. One exception: no hook fires while a
+  single tool call waits, such as a permission prompt or a question to the user, so a
+  session left waiting there for over an hour is marked `ended` and loses its file leases
+  until its next call.
 - **A coordinator whose session ended**: T3 ends a Claude session left idle for 30 minutes
   while its thread lives on, and the server keeps the coordinator lease (only file leases
   go). The daemon of the lease's device renews it while T3 finds the thread live. Another

@@ -2,8 +2,8 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, Dispatch, DoneTask,
-    ErrorCode, EventType, EvidenceKind, Note, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
-    TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, SUMMARY_CHARS_MAX,
+    TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -101,7 +101,8 @@ pub(crate) fn validate_update(mut req: UpdateTask, s: &Settings) -> Result<Updat
         if req.status != Some(TaskStatus::Dropped) {
             return Err(invalid(
                 "reason applies only to a drop",
-                "send status=dropped with the reason, or add the text as a note (task_note)",
+                "send status=dropped with the reason; for a blocked task send it as \
+                 blocked_reason; else add the text as a note (task_note)",
             ));
         }
         check_text("reason", reason, s.note_chars)?;
@@ -1922,6 +1923,11 @@ pub(crate) fn update(
     {
         check_owner_doing_limit(cx, worker, agent, id)?;
     }
+    // Validation let a reason through only with a drop. It is kept even when the task was
+    // already dropped and nothing else changes, so a reason sent late is not lost.
+    if let Some(reason) = req.reason {
+        insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
+    }
     if fields.is_empty() {
         return Ok(task);
     }
@@ -1964,21 +1970,6 @@ pub(crate) fn update(
     }
     if let Some(new_owner) = owner.as_ref().filter(|o| task.owner.as_ref() != Some(*o)) {
         join_board(cx, &task.board, new_owner)?;
-    }
-    // Validation let a reason through only with a drop.
-    if let Some(reason) = &req.reason {
-        cx.db.execute(
-            "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'decision', ?3, ?4)",
-            params![id.as_str(), agent.as_str(), reason, now],
-        )?;
-        let note = cx.db.last_insert_rowid();
-        cx.emit(
-            Some(&task.board),
-            agent.as_str(),
-            EventType::NoteAdded,
-            Some(id),
-            serde_json::json!({ "note": note, "kind": "decision" }),
-        )?;
     }
     let mut payload = serde_json::json!({ "fields": fields });
     if let Some(left) = &left_owner {
@@ -2279,31 +2270,43 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
 pub(crate) fn add_note(cx: &mut Ctx<'_>, id: &TaskId, req: AddNote) -> Result<Note> {
     touch_agent(cx, &req.agent)?;
     let task = get_task(cx, id)?;
-    let now = cx.now_ms();
+    insert_note(cx, &task.board, id, &req.agent, req.kind, req.text)
+}
+
+/// Stores a note on the task and records its `note_added` event: the one path for notes
+/// an agent adds and for the reason a drop keeps.
+fn insert_note(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    id: &TaskId,
+    agent: &AgentId,
+    kind: NoteKind,
+    text: String,
+) -> Result<Note> {
     cx.db.execute(
         "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             id.as_str(),
-            req.agent.as_str(),
-            enum_str(&req.kind),
-            req.text,
-            now
+            agent.as_str(),
+            enum_str(&kind),
+            text,
+            cx.now_ms()
         ],
     )?;
     let note_id = cx.db.last_insert_rowid();
     cx.emit(
-        Some(&task.board),
-        req.agent.as_str(),
+        Some(board),
+        agent.as_str(),
         EventType::NoteAdded,
         Some(id),
-        serde_json::json!({ "note": note_id, "kind": req.kind }),
+        serde_json::json!({ "note": note_id, "kind": kind }),
     )?;
     Ok(Note {
         id: note_id,
         task: id.clone(),
-        agent: req.agent,
-        kind: req.kind,
-        text: req.text,
+        agent: agent.clone(),
+        kind,
+        text,
         at: cx.now,
     })
 }
