@@ -64,7 +64,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
-use crate::config::{Config, Home};
+use crate::config::{Config, Home, ThreadModel};
 use crate::gh::{Gh, GhCli};
 use crate::ops::Ctx;
 use crate::state;
@@ -2308,14 +2308,17 @@ impl<T: T3> Daemon<T> {
         {
             // A re-brief held while the board was idle goes in front.
             let triage = self.triages(&board.slug);
-            let digest = prompt_digest(triage);
-            let owed = local.briefed.as_deref() != Some(digest);
+            let digest = prompt_digest(triage, self.children());
+            let owed = local.briefed.as_deref() != Some(digest.as_str());
             let resume = format!(
                 "board {}: the usage limit has reset. Call board_snapshot and continue your loop.",
                 board.slug
             );
             let message = if owed {
-                format!("{}\n\n{resume}", rebrief_message(&board.slug, triage))
+                format!(
+                    "{}\n\n{resume}",
+                    rebrief_message(&board.slug, triage, self.children())
+                )
             } else {
                 resume
             };
@@ -2324,14 +2327,14 @@ impl<T: T3> Daemon<T> {
                 // a send that timed out is looked for in the thread instead of resent.
                 if owed && err.downcast_ref::<TimedOut>().is_some() {
                     let sent = Sent::MaybeDelivered(anyhow::anyhow!("{err:#}"));
-                    settle_rebrief(&mut local, &board.slug, digest, &sent, now);
+                    settle_rebrief(&mut local, &board.slug, &digest, &sent, now);
                     self.state.coordinators.insert(board.slug.clone(), local);
                 }
                 return Err(err);
             }
             local.resumed_after = Some(until);
             if owed {
-                settle_rebrief(&mut local, &board.slug, digest, &Sent::Delivered, now);
+                settle_rebrief(&mut local, &board.slug, &digest, &Sent::Delivered, now);
             }
         }
         self.rebrief(board, &mut local, &info, now).await;
@@ -2431,7 +2434,8 @@ impl<T: T3> Daemon<T> {
     ) {
         let slug = &board.slug;
         let triage = self.triages(slug);
-        let digest = prompt_digest(triage);
+        let digest = prompt_digest(triage, self.children());
+        let digest = digest.as_str();
         let held = match info.state {
             AgentState::Paused => true,
             AgentState::Running => now - info.last_seen < WAKE_HOLD_MAX,
@@ -2513,7 +2517,10 @@ impl<T: T3> Daemon<T> {
             return;
         }
         let sent = self
-            .send_wake(&local.agent, &rebrief_message(slug, triage))
+            .send_wake(
+                &local.agent,
+                &rebrief_message(slug, triage, self.children()),
+            )
             .await;
         self.forget_thread_check(local.agent.native(), &sent);
         settle_rebrief(local, slug, digest, &sent, now);
@@ -2525,7 +2532,7 @@ impl<T: T3> Daemon<T> {
     /// missing only when T3 has no run of the thread active or queued, which might still
     /// take the message.
     async fn rebrief_arrival(&self, thread: &str, slug: &BoardSlug, triage: bool) -> Arrival {
-        let marker = rebrief_marker(slug, triage);
+        let marker = rebrief_marker(slug, triage, self.children());
         let any_marker = format!(" of board {slug})");
         self.arrival(thread, |user| {
             user.iter()
@@ -2667,19 +2674,20 @@ impl<T: T3> Daemon<T> {
     /// short while sending leaves them to be looked for in the thread.
     fn take_owed_rebriefs(&mut self, agent: &AgentId, now: Timestamp) -> Vec<HeldRebrief> {
         let feedback = self.ctx.config.feedback_board();
+        let children = self.ctx.config.thread_model.as_ref();
         self.state
             .coordinators
             .iter_mut()
             .filter(|(_, local)| local.agent == *agent)
             .filter_map(|(slug, local)| {
                 let triage = *slug == feedback;
-                let digest = prompt_digest(triage);
-                (local.briefed.as_deref() != Some(digest)).then(|| {
-                    let resent = unsure_after(local, digest, now).is_none();
+                let digest = prompt_digest(triage, children);
+                (local.briefed.as_deref() != Some(digest.as_str())).then(|| {
+                    let resent = unsure_after(local, &digest, now).is_none();
                     HeldRebrief {
                         slug: slug.clone(),
                         triage,
-                        before: local.briefed.replace(digest.to_owned()),
+                        before: local.briefed.replace(digest),
                         unsure_before: local.rebrief_unsure.take(),
                         resent,
                     }
@@ -3454,6 +3462,11 @@ impl<T: T3> Daemon<T> {
         *slug == self.ctx.config.feedback_board()
     }
 
+    /// The device's `[thread_model]`, which coordinators start their children on.
+    fn children(&self) -> Option<&ThreadModel> {
+        self.ctx.config.thread_model.as_ref()
+    }
+
     /// Gives `board` a coordinator when nothing names one and no adoption waits: the thread
     /// that last coordinated it on this device and stood down, when T3 still runs it, else
     /// a new thread. So a board whose autopilot went off and on again keeps one coordinator
@@ -3579,7 +3592,7 @@ impl<T: T3> Daemon<T> {
         };
         tracing::info!("started coordinator thread {thread} for {slug}: {reason}");
         // A thread an earlier start launched may hold another prompt: re-brief it.
-        let briefed = briefed.then(|| prompt_digest(self.triages(slug)).to_owned());
+        let briefed = briefed.then(|| prompt_digest(self.triages(slug), self.children()));
         let local = Coordinator::new(thread, agent, now, false, briefed);
         // Recorded before anything else can fail, so a retry reuses this thread.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -3602,7 +3615,7 @@ impl<T: T3> Daemon<T> {
         now: Timestamp,
     ) -> Result<(String, bool)> {
         let title = coordinator_title(slug);
-        let message = coordinator_message(slug, self.triages(slug));
+        let message = coordinator_message(slug, self.triages(slug), self.children());
         if let Some(&since) = self.state.pending_starts.get(slug) {
             let found = self
                 .t3
@@ -3718,7 +3731,7 @@ impl<T: T3> Daemon<T> {
             .t3
             .send(
                 &adoption.thread,
-                &adoption_message(slug, self.triages(slug)),
+                &adoption_message(slug, self.triages(slug), self.children()),
             )
             .await
         {
@@ -3729,7 +3742,7 @@ impl<T: T3> Daemon<T> {
             "adopted thread {} as coordinator of {slug}",
             adoption.thread
         );
-        let briefed = Some(prompt_digest(self.triages(slug)).to_owned());
+        let briefed = Some(prompt_digest(self.triages(slug), self.children()));
         let local = Coordinator::new(adoption.thread.clone(), agent, now, registered, briefed);
         // Recorded before the adoption is dropped, so the brief is sent only once.
         self.state.coordinators.insert(slug.clone(), local.clone());
@@ -4422,7 +4435,7 @@ impl<T: T3> Daemon<T> {
                 for held in out.rebriefs.iter().rev() {
                     out.message = format!(
                         "{}\n\n{}",
-                        rebrief_message(&held.slug, held.triage),
+                        rebrief_message(&held.slug, held.triage, self.children()),
                         out.message
                     );
                 }
@@ -4795,7 +4808,7 @@ impl<T: T3> Daemon<T> {
                 .filter(|held| !held.resent)
                 .map(|held| RebriefMark {
                     slug: held.slug.clone(),
-                    digest: prompt_digest(held.triage).to_owned(),
+                    digest: prompt_digest(held.triage, self.children()),
                 })
                 .collect(),
             fresh: out.fresh.clone(),
@@ -4878,7 +4891,8 @@ impl<T: T3> Daemon<T> {
             else {
                 continue;
             };
-            let digest = prompt_digest(held.triage);
+            let digest = prompt_digest(held.triage, self.ctx.config.thread_model.as_ref());
+            let digest = digest.as_str();
             match &sent {
                 Sent::Delivered => {
                     settle_rebrief(local, &held.slug, digest, &sent, now);
@@ -5610,41 +5624,51 @@ pub fn coordinator_title(slug: &BoardSlug) -> String {
 }
 
 /// The coordinator's standing instructions: [`COORDINATOR_PROMPT`], followed by
-/// [`TRIAGE_PROMPT`] when the board is the feedback board.
-fn standing_prompt(triage: bool) -> String {
+/// [`TRIAGE_PROMPT`] when the board is the feedback board, then by the rule that starts its
+/// children on `children`, the device's `[thread_model]`, when one is set.
+fn standing_prompt(triage: bool, children: Option<&ThreadModel>) -> String {
+    let mut prompt = COORDINATOR_PROMPT.to_owned();
     if triage {
-        format!("{COORDINATOR_PROMPT}\n{TRIAGE_PROMPT}")
-    } else {
-        COORDINATOR_PROMPT.to_owned()
+        prompt = format!("{prompt}\n{TRIAGE_PROMPT}");
     }
+    if let Some(model) = children {
+        prompt = format!("{prompt}\n{}", child_model_rule(model));
+    }
+    prompt
 }
 
-/// A digest of the standing prompt for `triage`, as hex: a coordinator briefed with another
-/// one gets [`rebrief_message`]. Both prompts are compiled in, so each is hashed once.
-pub fn prompt_digest(triage: bool) -> &'static str {
+/// A T3 child inherits its parent's provider instance, so a coordinator started before
+/// `[thread_model]` was set would start its children on its own instance, not this one.
+fn child_model_rule(model: &ThreadModel) -> String {
+    let ThreadModel { provider, model } = model;
+    format!(
+        "Start each child on this device's thread model: pass `target: {{\"providerInstanceId\": \"{provider}\", \"model\": \"{model}\"}}` to `delegate_task`, and `modelSelection: {{\"instanceId\": \"{provider}\", \"model\": \"{model}\"}}` to `t3_thread_launch`. Use another provider or model only when the task asks for one."
+    )
+}
+
+/// A digest of the standing prompt for `triage` and `children`, as hex: a coordinator
+/// briefed with another one gets [`rebrief_message`].
+pub fn prompt_digest(triage: bool, children: Option<&ThreadModel>) -> String {
     use sha2::{Digest as _, Sha256};
-    static DIGESTS: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
-        [false, true].map(|triage| crate::config::hex(&Sha256::digest(standing_prompt(triage))))
-    });
-    &DIGESTS[usize::from(triage)]
+    crate::config::hex(&Sha256::digest(standing_prompt(triage, children)))
 }
 
 /// The message that gives a running coordinator its changed standing prompt in full,
 /// ending with its [`rebrief_marker`].
-pub fn rebrief_message(slug: &BoardSlug, triage: bool) -> String {
-    let brief = brief(slug, triage);
-    let marker = rebrief_marker(slug, triage);
+pub fn rebrief_message(slug: &BoardSlug, triage: bool, children: Option<&ThreadModel>) -> String {
+    let brief = brief(slug, triage, children);
+    let marker = rebrief_marker(slug, triage, children);
     format!(
-        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop: call board_snapshot.\n{marker}"
+        "board {slug}: your standing instructions changed (board was upgraded, or this device's feedback_board or thread_model changed). The text below replaces the instructions you were briefed with; keep your task in progress and what you know about the work.\n\n{brief} Continue your loop: call board_snapshot.\n{marker}"
     )
 }
 
 /// The last line of [`rebrief_message`]: it names the board and the prompt's digest, so a
 /// reconcile finds the message among a thread's messages after its send timed out.
-pub fn rebrief_marker(slug: &BoardSlug, triage: bool) -> String {
+pub fn rebrief_marker(slug: &BoardSlug, triage: bool, children: Option<&ThreadModel>) -> String {
     format!(
         "(re-brief {} of board {slug})",
-        &prompt_digest(triage)[..16]
+        &prompt_digest(triage, children)[..16]
     )
 }
 
@@ -5668,20 +5692,27 @@ pub fn wake_marker(digest: &str) -> String {
 /// The standing prompt the coordinator of `slug` is briefed with, naming the board;
 /// `triage` for the device's feedback board. `board brief <slug>` prints it, for a fresh
 /// session in the same thread.
-pub fn brief(slug: &BoardSlug, triage: bool) -> String {
-    let prompt = standing_prompt(triage);
+pub fn brief(slug: &BoardSlug, triage: bool, children: Option<&ThreadModel>) -> String {
+    let prompt = standing_prompt(triage, children);
     format!("{prompt}\nYou are the coordinator of board {slug}.")
 }
 
 /// The first message of a coordinator thread; `triage` for the device's feedback board.
-pub fn coordinator_message(slug: &BoardSlug, triage: bool) -> String {
-    format!("{} Start now: call board_snapshot.", brief(slug, triage))
+pub fn coordinator_message(
+    slug: &BoardSlug,
+    triage: bool,
+    children: Option<&ThreadModel>,
+) -> String {
+    format!(
+        "{} Start now: call board_snapshot.",
+        brief(slug, triage, children)
+    )
 }
 
 /// The message that briefs an existing thread adopted as a board's coordinator; `triage`
 /// for the device's feedback board.
-pub fn adoption_message(slug: &BoardSlug, triage: bool) -> String {
-    let prompt = standing_prompt(triage);
+pub fn adoption_message(slug: &BoardSlug, triage: bool, children: Option<&ThreadModel>) -> String {
+    let prompt = standing_prompt(triage, children);
     format!(
         "{prompt}\nThis thread is now also the coordinator of board {slug}: `board board adopt` named it, so the board's ready work comes to you from here on, and the board wakes you when work becomes ready, a task moves to review, one of your asks is answered, or an ask is answered whose asker it cannot wake. Keep what you already know about this work. A board task you already own counts as the board's task in progress: finish it first. Start now: call board_snapshot."
     )

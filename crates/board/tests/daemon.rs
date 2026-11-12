@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board::client::Client;
-use board::config::{Config, Home};
+use board::config::{Config, Home, ThreadModel};
 use board::daemon::{Adoption, Coordinator, Daemon, RELEASE_GRACE, load_adoption, save_adoption};
 use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
 use board::identity::RepoInfo;
@@ -481,6 +481,17 @@ fn daemon_timed(
         projects,
         ..Config::default()
     };
+    daemon_configured(dir, stub, t3, timeout, config)
+}
+
+/// A daemon whose home is under `dir`, with `config`.
+fn daemon_configured(
+    dir: &Path,
+    stub: &Stub,
+    t3: &FakeT3,
+    timeout: Option<Duration>,
+    config: Config,
+) -> Daemon<FakeT3> {
     let ctx = Ctx {
         home: Home::at(dir.join("home")),
         device: DEVICE.parse().unwrap(),
@@ -952,7 +963,7 @@ fn coordinator_in(project: &Path) -> Env {
             renewed_at: at(),
             resumed_after: None,
             registered: true,
-            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            briefed: Some(board::daemon::prompt_digest(false, None)),
             rebrief_backoff: None,
             rebrief_unsure: None,
             fresh: Default::default(),
@@ -1199,7 +1210,7 @@ fn coordinator_env(
             renewed_at: at(),
             resumed_after: None,
             registered: true,
-            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            briefed: Some(board::daemon::prompt_digest(false, None)),
             rebrief_backoff: None,
             rebrief_unsure: None,
             fresh: Default::default(),
@@ -3400,7 +3411,7 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
     assert_eq!(thread, ORPHAN);
     assert_eq!(
         message,
-        &board::daemon::coordinator_message(&factory(), false)
+        &board::daemon::coordinator_message(&factory(), false, None)
     );
     assert!(
         e.t3.listed
@@ -3414,7 +3425,7 @@ async fn a_start_killed_after_creating_its_thread_briefs_that_thread_after_a_res
     // This binary briefed it.
     assert_eq!(
         e.daemon.state.coordinators[&factory()].briefed.as_deref(),
-        Some(board::daemon::prompt_digest(false))
+        Some(board::daemon::prompt_digest(false, None).as_str())
     );
     assert!(saved_state(&e).pending_starts.is_empty());
     let claims = e.stub.requests_to("POST /v1/boards/factory/coordinator");
@@ -4078,7 +4089,7 @@ async fn a_device_without_the_project_keeps_the_adoption_and_never_claims() {
 #[test]
 fn the_coordinator_prompt_says_how_to_run_a_climb() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = board::daemon::coordinator_message(&factory(), false);
+    let prompt = board::daemon::coordinator_message(&factory(), false, None);
     for rule in [
         "A climb is a task whose acceptance is a score command",
         "note starting `score:`",
@@ -4100,7 +4111,7 @@ fn the_coordinator_prompt_says_how_to_run_a_climb() {
 #[test]
 fn the_coordinator_prompt_says_when_to_declare_a_revisit_and_how_to_run_it() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         // When to declare one, at the finish of the fixed task.
         "File its revisit too when Revisits below calls for one",
@@ -4187,7 +4198,7 @@ fn the_triage_prompt_routes_repeats_to_an_open_revisit() {
 #[test]
 fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "with evidence (each check with its exit code, the commit, the PR) and a `summary` for the user",
         "end with a report of its evidence that names the tasks it filed",
@@ -4204,7 +4215,7 @@ fn the_coordinator_prompt_reports_to_the_user_apart_from_chat() {
 fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     // Compare on words, so rewrapping the Markdown or CRLF checkouts change nothing.
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "give a verdict on each pending proposal on this board that you did not propose",
         "file work it finds but won't do as a proposal",
@@ -4237,7 +4248,7 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
     assert!(!prompt.contains("File new tasks without `auto=false` otherwise"));
 
     // Routed feedback reaches the owner as a proposal, not as work.
-    let triage = words(&board::daemon::coordinator_message(&factory(), true));
+    let triage = words(&board::daemon::coordinator_message(&factory(), true, None));
     assert!(triage.contains("(`board` set, `auto=false`): an imperative title;"));
     assert!(triage.contains("a body that starts `Proposal:`"));
     assert!(triage.contains("You are not its reviewer"));
@@ -4246,7 +4257,7 @@ fn the_coordinator_prompt_gates_proposals_behind_an_independent_review() {
 #[test]
 fn the_coordinator_prompt_parks_waits_in_review_or_blocked() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "Park a task by what it waits on, and `task_note` what that is:",
         "- CI or a review: `review`, with a note naming the PR.",
@@ -4262,8 +4273,8 @@ fn the_coordinator_prompt_parks_waits_in_review_or_blocked() {
 #[test]
 fn triage_and_owners_read_one_priority_scale() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let owner = words(&board::daemon::coordinator_message(&factory(), false));
-    let triage = words(&board::daemon::coordinator_message(&factory(), true));
+    let owner = words(&board::daemon::coordinator_message(&factory(), false, None));
+    let triage = words(&board::daemon::coordinator_message(&factory(), true, None));
     // The triage brief starts with the coordinator prompt, so the scale is defined once.
     assert_eq!(triage.matches("## Priority").count(), 1);
     for rule in [
@@ -4293,7 +4304,7 @@ fn triage_and_owners_read_one_priority_scale() {
 #[test]
 fn the_coordinator_prompt_files_what_remains_before_task_done() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "6. File what the task still needs as sub-tasks first (`task_add`, parent set).",
         "Call `task_done` only when every acceptance check passes, with evidence",
@@ -4305,7 +4316,7 @@ fn the_coordinator_prompt_files_what_remains_before_task_done() {
 #[test]
 fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "Never change files, switch branches or merge in the project root",
         "Do any file work yourself in a worktree of your own, on a new branch per task",
@@ -4318,7 +4329,7 @@ fn the_coordinator_prompt_keeps_it_out_of_the_project_root() {
 #[test]
 fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_there() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "for a task whose work is in another repository start a T3 thread in that repository's project instead",
         "(`t3_thread_launch` with its `projectId` and `workspaceStrategy: \"worktree\"`)",
@@ -4337,7 +4348,7 @@ fn the_coordinator_prompt_delegates_a_task_in_another_repository_to_a_thread_the
 #[test]
 fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "open its PR, turn on auto-merge only where the base branch requires status checks or reviews",
         "`gh api repos/<owner>/<repo>/branches/<base>/protection`",
@@ -4359,7 +4370,7 @@ fn the_coordinator_prompt_merges_after_ci_while_children_park_and_end() {
 #[test]
 fn the_coordinator_prompt_names_the_closer_and_parks_a_task_without_a_pr() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prompt = words(&board::daemon::coordinator_message(&factory(), false));
+    let prompt = words(&board::daemon::coordinator_message(&factory(), false, None));
     for rule in [
         "Write each brief as yourself, never in the user's voice",
         "name who closes the task by role and agent id, such as \"the coordinator (t3:1a2b) reviews and closes it\"",
@@ -4625,7 +4636,7 @@ async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
     ));
     assert_eq!(
         message,
-        board::daemon::coordinator_message(&"board-feedback".parse().unwrap(), true)
+        board::daemon::coordinator_message(&"board-feedback".parse().unwrap(), true, None)
     );
 
     // Another board is not; nor is `board-feedback` when the device names another one.
@@ -4653,9 +4664,9 @@ async fn only_the_feedback_boards_coordinator_is_briefed_to_triage() {
     assert!(started(&t3).1.contains(triage));
 
     // An adopted thread is briefed the same way.
-    let adopted = board::daemon::adoption_message(&"fb".parse().unwrap(), true);
+    let adopted = board::daemon::adoption_message(&"fb".parse().unwrap(), true, None);
     assert!(adopted.contains(triage));
-    assert!(!board::daemon::adoption_message(&factory(), false).contains("# Triage"));
+    assert!(!board::daemon::adoption_message(&factory(), false, None).contains("# Triage"));
 }
 
 /// An env whose daemon follows the stub's event stream after seq 5, with a client that
@@ -4930,7 +4941,7 @@ fn named_coordinators(e: &mut Env, slugs: &[&str]) {
                 renewed_at: at(),
                 resumed_after: None,
                 registered: true,
-                briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+                briefed: Some(board::daemon::prompt_digest(false, None)),
                 rebrief_backoff: None,
                 rebrief_unsure: None,
                 fresh: Default::default(),
@@ -5556,7 +5567,7 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
             renewed_at: at(),
             resumed_after: None,
             registered: true,
-            briefed: Some(board::daemon::prompt_digest(false).to_owned()),
+            briefed: Some(board::daemon::prompt_digest(false, None)),
             rebrief_backoff: None,
             rebrief_unsure: None,
             fresh: Default::default(),
@@ -5590,6 +5601,83 @@ async fn coordinators_are_kept_while_the_event_stream_cannot_open() {
     );
 }
 
+/// Restarts `e`'s daemon with `[thread_model]` set to `model`, keeping its state.
+fn set_thread_model(e: &mut Env, model: &ThreadModel) {
+    let config = Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        thread_model: Some(model.clone()),
+        ..Config::default()
+    };
+    let state = std::mem::take(&mut e.daemon.state);
+    e.daemon =
+        daemon_configured(e._dir.path(), &e.stub, &e.t3, None, config).with_gh(e.t3.gh.clone());
+    e.daemon.state = state;
+}
+
+#[tokio::test]
+async fn a_thread_model_reaches_a_running_coordinator_as_the_model_of_its_children() {
+    use sha2::{Digest as _, Sha256};
+    // Without [thread_model] the prompt hashes as before, so no coordinator is re-briefed.
+    let unchanged: String = Sha256::digest(board::daemon::COORDINATOR_PROMPT)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(board::daemon::prompt_digest(false, None), unchanged);
+    assert!(!board::daemon::coordinator_message(&factory(), false, None).contains("thread model"));
+
+    // coordinator_env briefed its coordinator without a thread model.
+    let (mut e, _) = coordinator_env(AgentState::Idle, None);
+    let model = ThreadModel {
+        provider: "agents".into(),
+        model: "a-model".into(),
+    };
+    set_thread_model(&mut e, &model);
+    let slug = factory();
+    let before = e.t3.sends().len();
+    e.daemon.reconcile(at()).await.unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), before + 1);
+    let (thread, text) = sends.last().unwrap();
+    assert_eq!(thread, "coord");
+    assert_eq!(
+        *text,
+        board::daemon::rebrief_message(&slug, false, Some(&model))
+    );
+    assert!(text.contains(
+        r#"pass `target: {"providerInstanceId": "agents", "model": "a-model"}` to `delegate_task`"#
+    ));
+    assert!(text.contains(
+        r#"`modelSelection: {"instanceId": "agents", "model": "a-model"}` to `t3_thread_launch`"#
+    ));
+    assert_eq!(
+        e.daemon.state.coordinators[&slug].briefed,
+        Some(board::daemon::prompt_digest(false, Some(&model)))
+    );
+    // Once.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.sends().len(), before + 1);
+
+    // A coordinator the daemon starts gets the rule in its first message.
+    let mut e = env();
+    set_thread_model(&mut e, &model);
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(None, &[DEVICE]),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:x", DEVICE, AgentState::Running),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started(&e.t3).1,
+        board::daemon::coordinator_message(&slug, false, Some(&model))
+    );
+}
+
 #[tokio::test]
 async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
@@ -5603,18 +5691,18 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
         assert_eq!(sends.len(), before + 1);
         let (thread, text) = sends.last().unwrap();
         assert_eq!(thread, "coord");
-        assert_eq!(*text, board::daemon::rebrief_message(&slug, false));
+        assert_eq!(*text, board::daemon::rebrief_message(&slug, false, None));
         assert!(text.contains(board::daemon::COORDINATOR_PROMPT));
         assert!(!text.contains("# Triage"));
         assert_eq!(
             e.daemon.state.coordinators[&slug].briefed,
-            Some(board::daemon::prompt_digest(false).to_owned())
+            Some(board::daemon::prompt_digest(false, None))
         );
         // Saved, so a restart does not send it again.
         let home = Home::at(e._dir.path().join("home"));
         assert_eq!(
             board::daemon::load_watch_state(&home).coordinators[&slug].briefed,
-            Some(board::daemon::prompt_digest(false).to_owned())
+            Some(board::daemon::prompt_digest(false, None))
         );
         // Briefed with the current prompt: later reconciles send nothing.
         e.daemon.reconcile(at()).await.unwrap();
@@ -5623,7 +5711,7 @@ async fn a_coordinator_briefed_with_an_older_prompt_gets_the_new_one_once() {
 
     // Held while the coordinator is paused, or runs and was seen lately.
     let briefed = |e: &Env| e.daemon.state.coordinators[&slug].briefed.clone();
-    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let current = Some(board::daemon::prompt_digest(false, None));
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
     for held in [AgentState::Running, AgentState::Paused] {
         let mut info = agent_fixture(&agent, DEVICE, held);
@@ -5689,15 +5777,18 @@ async fn the_feedback_boards_coordinator_is_re_briefed_with_the_triage_prompt() 
     e.daemon.reconcile(at()).await.unwrap();
     let sends = e.t3.sends();
     assert_eq!(sends.len(), 1);
-    assert_eq!(sends[0].1, board::daemon::rebrief_message(&slug, true));
+    assert_eq!(
+        sends[0].1,
+        board::daemon::rebrief_message(&slug, true, None)
+    );
     assert!(sends[0].1.contains(board::daemon::TRIAGE_PROMPT));
     assert_eq!(
         e.daemon.state.coordinators[&slug].briefed,
-        Some(board::daemon::prompt_digest(true).to_owned())
+        Some(board::daemon::prompt_digest(true, None))
     );
     assert_ne!(
-        board::daemon::prompt_digest(true),
-        board::daemon::prompt_digest(false)
+        board::daemon::prompt_digest(true, None),
+        board::daemon::prompt_digest(false, None)
     );
 }
 
@@ -5713,7 +5804,7 @@ async fn a_started_coordinator_is_recorded_as_briefed_with_the_current_prompt() 
     .await;
     assert_eq!(
         daemon.state.coordinators[&factory()].briefed,
-        Some(board::daemon::prompt_digest(false).to_owned())
+        Some(board::daemon::prompt_digest(false, None))
     );
 }
 
@@ -5732,7 +5823,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     use board::daemon::WAKE_RETRY_FIRST;
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
-    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let current = Some(board::daemon::prompt_digest(false, None));
     let briefed = |e: &Env| e.daemon.state.coordinators[&slug].briefed.clone();
     let old = Some("0123".to_owned());
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = old.clone();
@@ -5750,7 +5841,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
     let ready = "board factory: factory-4 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.";
     let expected = format!(
         "{}\n\n{ready}",
-        board::daemon::rebrief_message(&slug, false)
+        board::daemon::rebrief_message(&slug, false, None)
     );
     e.t3.fail_send.store(true, Ordering::SeqCst);
     e.daemon.flush(at()).await;
@@ -5812,8 +5903,8 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
         sends[4].1,
         format!(
             "{}\n\n{}\n\nboard factory: factory-7 is ready (p1)\nContinue from this and the board delta in this prompt, if there is one.",
-            board::daemon::rebrief_message(&slug, false),
-            board::daemon::rebrief_message(&other, false)
+            board::daemon::rebrief_message(&slug, false, None),
+            board::daemon::rebrief_message(&other, false, None)
         )
     );
     assert_eq!(e.daemon.state.coordinators[&other].briefed, current);
@@ -5824,7 +5915,7 @@ async fn an_idle_boards_coordinator_gets_the_new_prompt_with_its_next_wake_up() 
 async fn a_board_with_work_or_unknown_ready_work_re_briefs_its_coordinator_at_once() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
-    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let current = Some(board::daemon::prompt_digest(false, None));
     let mut in_review = counted(&agent, 0, Some(0), 0);
     in_review.counts.review = 1;
     for (n, board) in [
@@ -5847,7 +5938,7 @@ async fn a_board_with_work_or_unknown_ready_work_re_briefs_its_coordinator_at_on
             sends[n],
             (
                 "coord".to_owned(),
-                board::daemon::rebrief_message(&slug, false)
+                board::daemon::rebrief_message(&slug, false, None)
             )
         );
         assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
@@ -5878,12 +5969,12 @@ async fn an_idle_coordinator_resumed_at_a_usage_reset_gets_the_new_prompt_with_i
         sends[0].1,
         format!(
             "{}\n\nboard factory: the usage limit has reset. Call board_snapshot and continue your loop.",
-            board::daemon::rebrief_message(&slug, false)
+            board::daemon::rebrief_message(&slug, false, None)
         )
     );
     assert_eq!(
         e.daemon.state.coordinators[&slug].briefed,
-        Some(board::daemon::prompt_digest(false).to_owned())
+        Some(board::daemon::prompt_digest(false, None))
     );
 }
 
@@ -5902,13 +5993,13 @@ fn minute(n: i64) -> Timestamp {
 async fn a_timed_out_re_brief_is_sent_again_only_when_the_thread_never_got_it() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
-    let current = Some(board::daemon::prompt_digest(false).to_owned());
-    let message = board::daemon::rebrief_message(&slug, false);
+    let current = Some(board::daemon::prompt_digest(false, None));
+    let message = board::daemon::rebrief_message(&slug, false, None);
     let reads = |e: &Env| e.t3.message_reads.load(Ordering::SeqCst);
     let agent_is = |e: &Env, info: &board_proto::Agent| {
         e.stub.on(&format!("GET {}", agent_path(&agent)), info);
     };
-    assert!(message.ends_with(&board::daemon::rebrief_marker(&slug, false)));
+    assert!(message.ends_with(&board::daemon::rebrief_marker(&slug, false, None)));
 
     // The send times out and T3 drops it: counted as sent for now, and saved as unsure.
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
@@ -6008,7 +6099,7 @@ async fn a_timed_out_re_brief_that_reached_the_thread_is_not_sent_twice() {
     assert_eq!((reads(&e), e.t3.sends().len()), (2, 1));
     assert_eq!(
         e.daemon.state.coordinators[&slug].briefed,
-        Some(board::daemon::prompt_digest(false).to_owned())
+        Some(board::daemon::prompt_digest(false, None))
     );
 }
 
@@ -6016,8 +6107,8 @@ async fn a_timed_out_re_brief_that_reached_the_thread_is_not_sent_twice() {
 async fn only_the_newest_re_brief_of_the_board_in_the_thread_counts() {
     let (mut e, _) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
-    let digest = board::daemon::prompt_digest(false).to_owned();
-    let message = board::daemon::rebrief_message(&slug, false);
+    let digest = board::daemon::prompt_digest(false, None);
+    let message = board::daemon::rebrief_message(&slug, false, None);
     let look = |e: &mut Env, newer: &str| {
         e.t3.received
             .lock()
@@ -6046,7 +6137,7 @@ async fn only_the_newest_re_brief_of_the_board_in_the_thread_counts() {
 async fn a_lost_wake_up_with_a_re_brief_is_sent_again_as_one_message() {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     let slug = factory();
-    let current = Some(board::daemon::prompt_digest(false).to_owned());
+    let current = Some(board::daemon::prompt_digest(false, None));
     e.daemon.state.coordinators.get_mut(&slug).unwrap().briefed = None;
     e.stub
         .on("GET /v1/boards", [counted(&agent, 0, Some(0), 0)]);
@@ -6080,7 +6171,7 @@ async fn a_lost_wake_up_with_a_re_brief_is_sent_again_as_one_message() {
         format!(
             "{}\n\nboard factory: factory-5 is ready (p1)\nboard factory: factory-4 is ready (p1)\n\
              Continue from this and the board delta in this prompt, if there is one.",
-            board::daemon::rebrief_message(&slug, false)
+            board::daemon::rebrief_message(&slug, false, None)
         )
     );
     assert_eq!(e.daemon.state.coordinators[&slug].briefed, current);
@@ -6372,8 +6463,8 @@ fn only_messages_not_from_the_board_children_or_pull_requests_are_the_users() {
         "Update on pull request #4",
         "/compact",
         "Background task completed.",
-        &board::daemon::coordinator_message(&factory(), false),
-        &board::daemon::adoption_message(&factory(), true),
+        &board::daemon::coordinator_message(&factory(), false, None),
+        &board::daemon::adoption_message(&factory(), true, None),
     ] {
         assert!(!is_user_message(text), "{text}");
     }
@@ -6398,12 +6489,13 @@ fn the_coordinator_prompt_carries_the_fresh_session_message() {
 #[test]
 fn every_brief_starts_with_what_board_brief_prints() {
     for triage in [false, true] {
-        let brief = board::daemon::brief(&factory(), triage);
+        let brief = board::daemon::brief(&factory(), triage, None);
         assert!(brief.contains(board::daemon::COORDINATOR_PROMPT));
         assert_eq!(brief.contains(board::daemon::TRIAGE_PROMPT), triage);
-        assert!(board::daemon::coordinator_message(&factory(), triage).starts_with(&brief));
+        assert!(board::daemon::coordinator_message(&factory(), triage, None).starts_with(&brief));
         assert!(
-            board::daemon::rebrief_message(&factory(), triage).contains(&format!("\n\n{brief} "))
+            board::daemon::rebrief_message(&factory(), triage, None)
+                .contains(&format!("\n\n{brief} "))
         );
     }
 }

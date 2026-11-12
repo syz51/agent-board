@@ -2789,10 +2789,10 @@ fn brief_prints_what_the_daemon_briefs_the_coordinator_with() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
-        format!("{}\n", board::daemon::brief(&factory, false))
+        format!("{}\n", board::daemon::brief(&factory, false, None))
     );
     assert!(
-        board::daemon::coordinator_message(&factory, false)
+        board::daemon::coordinator_message(&factory, false, None)
             .starts_with(stdout(&out).trim_end_matches('\n'))
     );
     assert!(e.stub.requests().is_empty(), "no server needed");
@@ -2805,7 +2805,7 @@ fn brief_prints_what_the_daemon_briefs_the_coordinator_with() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
-        format!("{}\n", board::daemon::brief(&factory, true))
+        format!("{}\n", board::daemon::brief(&factory, true, None))
     );
     assert!(stdout(&out).contains(board::daemon::TRIAGE_PROMPT));
 }

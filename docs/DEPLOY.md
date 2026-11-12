@@ -154,8 +154,9 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
 
 Both keys are required: T3 Code takes a provider only with a model, so these threads use
 this model and not the project's default. Threads started before the change keep their
-provider. T3 Code keeps this instance's usage readings in its own file, and the daemon
-reads it next to the default instance's.
+provider, but the daemon re-briefs running coordinators, so the children they start from
+then on use this instance. T3 Code keeps this instance's usage readings in its own file,
+and the daemon reads it next to the default instance's.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a

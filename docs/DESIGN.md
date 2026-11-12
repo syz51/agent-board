@@ -565,6 +565,11 @@ thread (coordinators, workers and judges) on that T3 provider instance and model
 (`t3 thread start --provider --model`); without it, on the project's defaults. T3 gives a
 thread nothing else of its own to set, so the instance carries what agent threads need
 apart from the user's chats, such as environment variables.
+A T3 child inherits its parent's instance, and a coordinator started before the setting
+keeps its own, so the coordinator's standing prompt ends with a rule naming the instance and
+model for `delegate_task` (`target`) and `t3_thread_launch` (`modelSelection`). The rule is
+part of the prompt digest, so setting or changing `[thread_model]` re-briefs running
+coordinators after the restart; without it the prompt and its digest are unchanged.
 
 - **Starting it**: the device daemon (`board watch`) on a home device that sees no live
   coordinator takes the board's coordinator lease (one device wins), starts a T3 thread
