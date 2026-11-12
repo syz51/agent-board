@@ -5632,7 +5632,10 @@ fn standing_prompt(triage: bool, children: Option<&ThreadModel>) -> String {
         prompt = format!("{prompt}\n{TRIAGE_PROMPT}");
     }
     if let Some(model) = children {
-        prompt = format!("{prompt}\n{}", child_model_rule(model));
+        prompt = format!(
+            "{prompt}\n## Child threads\n\n{}\n",
+            child_model_rule(model)
+        );
     }
     prompt
 }
