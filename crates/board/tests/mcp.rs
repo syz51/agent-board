@@ -208,10 +208,11 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     for tool in tools {
         // task_claim also states the doing limit, the resume path (DESIGN.md) and who may
         // take a task.
-        let cap = if tool["name"] == "task_claim" {
-            620
-        } else {
-            300
+        // task_update also says what to file before a release to open.
+        let cap = match tool["name"].as_str() {
+            Some("task_claim") => 620,
+            Some("task_update") => 380,
+            _ => 300,
         };
         assert!(tool["description"].as_str().unwrap().chars().count() < cap);
         assert!(tool.get("outputSchema").is_none());

@@ -215,7 +215,8 @@ pub enum Command {
     /// nobody's, task in review or blocked, unless an open ask, or a blocked reason
     /// someone else set, holds it.
     Claim { id: TaskId },
-    /// Release a task you own back to open.
+    /// Release a task you own back to open. First add a note that says which steps are
+    /// done, and file what is not in the task (follow-up tasks, proposals).
     Release { id: TaskId },
     /// Take a task whose owner is stale, or whose owner's session ended when you created
     /// the task or delegated that owner.

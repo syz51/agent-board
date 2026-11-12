@@ -845,7 +845,24 @@ async fn board_of_repo(ctx: &Ctx, raw: &str) -> Result<BoardSlug> {
 
 /// `claim`, `release` or `take`.
 pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output> {
+    // A release reads the task first, to know whether the agent gives up work in `doing`.
+    let before = match action {
+        "release" => Some(ctx.client.task(id).await?.task),
+        _ => None,
+    };
     let task = ctx.client.task_action(id, action).await?;
+    match &before {
+        Some(before) => record_released(ctx, before, &task),
+        // The agent's again: nothing was given up.
+        None => {
+            let forgotten = ctx
+                .agent()
+                .and_then(|agent| crate::state::forget_released(&ctx.home, agent, &task.id));
+            if let Err(err) = forgotten {
+                tracing::warn!("forgetting the release of {}: {err:#}", task.id);
+            }
+        }
+    }
     let verb = match action {
         "claim" => "claimed",
         "release" => "released",
@@ -885,7 +902,7 @@ pub struct TaskChanges {
 
 /// Reads the task's version, then applies the changes.
 pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result<Output> {
-    let version = ctx.client.task(id).await?.task.version;
+    let before = ctx.client.task(id).await?.task;
     let wanted_owner = changes.owner.clone();
     let task = ctx
         .client
@@ -893,7 +910,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
             id,
             &UpdateTask {
                 agent: ctx.agent()?.clone(),
-                version,
+                version: before.version,
                 status: changes.status,
                 title: changes.title,
                 body: changes.body,
@@ -907,6 +924,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
             },
         )
         .await?;
+    record_released(ctx, &before, &task);
     if let Some(wanted) = &wanted_owner {
         check_owner(ctx, &task, wanted).await?;
     }
@@ -1006,6 +1024,25 @@ pub async fn task_done(
         text.push_str(&findings);
     }
     Ok(Output::new(text, &task))
+}
+
+/// Leaves a mark for the agent's next `Stop` hook when the change from `before` to `after`
+/// released a task the agent owned in `doing` back to `open`: the hook reminds it to file
+/// what is not in the task (`hook::release_reminder`). Only that move: a task set `blocked`
+/// or `review` stays the agent's, and so does what the agent knows about it. The server has
+/// the change either way, so a failed write costs only the reminder.
+fn record_released(ctx: &Ctx, before: &Task, after: &Task) {
+    let Ok(agent) = ctx.agent() else { return };
+    let released = before.status == TaskStatus::Doing
+        && before.owner.as_ref() == Some(agent)
+        && after.status == TaskStatus::Open;
+    if !released {
+        return;
+    }
+    if let Err(err) = crate::state::record_released(&ctx.home, agent, &after.id, chrono::Utc::now())
+    {
+        tracing::warn!("recording {} released for the Stop hook: {err:#}", after.id);
+    }
 }
 
 /// Leaves a mark of what the agent filed for its next `Stop` hook; see [`task_add`].
@@ -1721,7 +1758,9 @@ pub async fn stats(ctx: &Ctx, days: u32, now: Timestamp) -> Result<Output> {
 }
 
 /// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a
-/// feedback item, or adds the report to the live item with the same signature.
+/// feedback item, or adds the report to the live item with the same signature. It leaves no
+/// filed mark: a report on a setup is not the task's remaining work, so the `Stop` hook's
+/// reminders still ask for that.
 pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
     if req.text.trim().is_empty() {
         bail!("feedback is empty: say what cost you a step");

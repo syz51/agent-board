@@ -368,7 +368,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_update",
-        description: "Change a task: status (blocked, review, open, dropped...), title (at most 80 characters), body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done.",
+        description: "Change a task: status (blocked, review, open, dropped...), title (at most 80 characters), body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done. Before a release (status open), note the steps done and file what is not in the task: a follow-up task a check requires, found work, the user's part.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -1312,7 +1312,12 @@ mod tests {
             let description = tool.description.as_deref().unwrap();
             // task_claim also states the doing limit, the resume path (DESIGN.md) and who
             // may take a task.
-            let cap = if tool.name == "task_claim" { 620 } else { 300 };
+            // task_update also says what to file before a release to open.
+            let cap = match tool.name.as_ref() {
+                "task_claim" => 620,
+                "task_update" => 380,
+                _ => 300,
+            };
             assert!(description.chars().count() < cap, "{}", tool.name);
             assert!(
                 tool.input_schema["properties"]["agent"].is_object(),
@@ -1336,6 +1341,11 @@ mod tests {
         ] {
             assert!(claim.contains(fact), "{fact}");
         }
+        let update = tools.iter().find(|t| t.name == "task_update").unwrap();
+        assert!(update.description.as_deref().unwrap().contains(
+            "Before a release (status open), note the steps done and file what is not in \
+             the task: a follow-up task a check requires, found work, the user's part."
+        ));
         let done = tools.iter().find(|t| t.name == "task_done").unwrap();
         assert!(
             done.description
@@ -1353,7 +1363,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 16_500, "tool list: {schemas}");
+        assert!(schemas < 16_660, "tool list: {schemas}");
         // `kind` is a parameter, which every reader shows: no text asks to repeat it.
         for tool in &tools {
             let text = tool.description.as_deref().unwrap_or_default();

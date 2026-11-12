@@ -501,6 +501,9 @@ async fn handle(
             if let Err(err) = state::take_done(&hook.home, &hook.agent) {
                 tracing::debug!("dropping done marks: {err:#}");
             }
+            if let Err(err) = state::take_released(&hook.home, &hook.agent) {
+                tracing::debug!("dropping released marks: {err:#}");
+            }
             // What those turns filed still counts for the tasks it was about.
             hook.take_filed();
         }
@@ -1447,7 +1450,8 @@ impl Hook<'_> {
         }
     }
 
-    /// At `Stop` without the server's answer: the done reminder, which needs no server.
+    /// At `Stop` without the server's answer: the done and release reminder, which needs no
+    /// server.
     fn local_stop(&mut self) -> Reply {
         if self.event != HookEvent::Stop {
             return Reply::Nothing;
@@ -1481,19 +1485,36 @@ impl Hook<'_> {
     /// than the turn (`UserPromptSubmit`) are from a turn whose `Stop` never ran.
     ///
     /// A task the agent already filed follow-ups for gets no reminder ([`Hook::take_filed`]).
+    ///
+    /// The tasks the agent released to `open` this turn (`ops::record_released` marks them
+    /// the same way) are named in the same text, after the done ones: [`release_reminder`].
     fn take_done_reminder(&mut self) -> Result<Option<String>> {
         let marks = state::take_done(&self.home, &self.agent)?;
+        // Read apart, so marks that cannot be read cost only their own part.
+        let released = state::take_released(&self.home, &self.agent).unwrap_or_else(|err| {
+            tracing::debug!("reading released marks: {err:#}");
+            Vec::new()
+        });
         let filed_this_turn = self.take_filed();
         if self.stop_continued() {
             return Ok(None);
         }
-        Ok(done_reminder(
+        let released = released_to_remind(
+            released,
+            &marks,
+            self.local.turn_started,
+            &self.local.filed_about,
+            filed_this_turn,
+            &mut self.local.release_reminded,
+        );
+        let done = done_reminder(
             marks,
             self.local.turn_started,
             &mut self.local.filed_about,
             filed_this_turn,
             &mut self.local.done_reminded,
-        ))
+        );
+        Ok(release_reminder(done, &released))
     }
 
     /// Takes the marks of what this agent filed since the last `Stop` (`ops::task_add` and
@@ -2111,6 +2132,66 @@ fn done_reminder(
         ids.join(", ")
     ))
 }
+
+/// The tasks released to `open` this turn (marks at or after `turn_started`, any when the
+/// turn's start is unknown) to remind about, which it records in `reminded`: each once. None
+/// that the agent filed something about, in any turn, and none when `filed_this_turn`, as
+/// for a done task ([`Hook::take_filed`]). None the agent also marked done (`done`): the
+/// done reminder asks about that one. A released task stays in `filed_about`, so a later
+/// done of it is judged as before.
+fn released_to_remind(
+    marks: Vec<DoneMark>,
+    done: &[DoneMark],
+    turn_started: Option<Timestamp>,
+    filed_about: &[TaskId],
+    filed_this_turn: bool,
+    reminded: &mut Vec<TaskId>,
+) -> Vec<TaskId> {
+    let mut ids: Vec<TaskId> = Vec::new();
+    for mark in marks {
+        if turn_started.is_none_or(|t| mark.at >= t)
+            && !filed_this_turn
+            && !filed_about.contains(&mark.task)
+            && !done.iter().any(|d| d.task == mark.task)
+            && !reminded.contains(&mark.task)
+            && !ids.contains(&mark.task)
+        {
+            ids.push(mark.task);
+        }
+    }
+    reminded.extend(ids.iter().cloned());
+    let excess = reminded.len().saturating_sub(DONE_REMINDED_KEPT);
+    reminded.drain(..excess);
+    ids
+}
+
+/// The `Stop` reminder for the turn: the done reminder (`done`), then the tasks the agent
+/// released to `open` unfinished, in one text, since a turn gets one block.
+fn release_reminder(done: Option<String>, released: &[TaskId]) -> Option<String> {
+    if released.is_empty() {
+        return done;
+    }
+    let ids: Vec<&str> = released.iter().map(TaskId::as_str).collect();
+    let ids = ids.join(", ");
+    Some(match done {
+        Some(done) => format!(
+            "{done}\nYou also released {ids} to open this turn, unfinished. {RELEASE_REMINDER_ALSO}"
+        ),
+        None => format!(
+            "board: you released {ids} to open this turn, unfinished. {RELEASE_REMINDER_ASK}"
+        ),
+    })
+}
+
+/// What the release reminder asks for, after it names the tasks: as [`DONE_REMINDER_ASK`],
+/// but what remains of a released task's own steps stays in it, so it asks for a note of
+/// the steps done and for the tasks that are not the task itself. A feedback report is
+/// named because agents took one for filed work.
+const RELEASE_REMINDER_ASK: &str = "Is any work left that is not on the board? What remains of the task's own steps stays in the task: add a note there that says which steps are done, unless one says it. File the rest now and name it in your reply: a follow-up task that one of its acceptance checks requires, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. A feedback report is not such a task. If nothing is left, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each released task.";
+
+/// The release reminder's part after a done reminder, which has asked the question and
+/// said how to answer it.
+const RELEASE_REMINDER_ALSO: &str = "What remains of its own steps stays in that task, not in a sub-task: add a note there that says which steps are done, unless one says it. File a follow-up task that one of its acceptance checks requires, too. A feedback report is not such a task. This reminder comes once for each released task.";
 
 /// What the done reminder asks for, after it names the tasks. The kinds of task are those of
 /// the MCP server's instructions (`mcp::INSTRUCTIONS`). It says that a one-line reply is a
@@ -2947,6 +3028,83 @@ mod tests {
             text.contains("reply \"nothing left to file\" and stop"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn release_reminders_cover_this_turns_tasks_once_each() {
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let mark = |task: &str, mins: i64| DoneMark {
+            task: task.parse().unwrap(),
+            at: t0 + chrono::Duration::minutes(mins),
+        };
+        let ids = |tasks: Vec<TaskId>| -> Vec<String> {
+            tasks.iter().map(|id| id.as_str().to_owned()).collect()
+        };
+        let about: Vec<TaskId> = vec!["factory-14".parse().unwrap()];
+        let mut reminded = Vec::new();
+        // Not the earlier turn's, the one something was filed about, or the one also done.
+        let marks = vec![
+            mark("factory-11", -1),
+            mark("factory-12", 1),
+            mark("factory-13", 2),
+            mark("factory-14", 2),
+            mark("factory-15", 2),
+        ];
+        let done = [mark("factory-15", 3)];
+        let released =
+            released_to_remind(marks.clone(), &done, Some(t0), &about, false, &mut reminded);
+        assert_eq!(ids(released), ["factory-12", "factory-13"]);
+        assert_eq!(about.len(), 1, "a released task stays filed about");
+        // Once each.
+        let again =
+            released_to_remind(marks.clone(), &done, Some(t0), &about, false, &mut reminded);
+        assert_eq!(again, vec![]);
+        // A proposal or an ask filed this turn: quiet for every task, none recorded.
+        let mut fresh = Vec::new();
+        let quiet = released_to_remind(marks.clone(), &[], Some(t0), &[], true, &mut fresh);
+        assert_eq!((quiet, fresh.len()), (vec![], 0));
+        // Unknown turn start: any mark counts.
+        let any = released_to_remind(marks, &[], None, &[], false, &mut fresh);
+        assert_eq!(any.len(), 5);
+    }
+
+    #[test]
+    fn the_release_reminder_reads_plainly_and_shares_the_done_block() {
+        let released: Vec<TaskId> = vec!["factory-12".parse().unwrap()];
+        assert_eq!(release_reminder(None, &[]), None);
+        assert_eq!(
+            release_reminder(Some("done text".into()), &[]).as_deref(),
+            Some("done text"),
+            "the done reminder is unchanged without a released task"
+        );
+        let alone = release_reminder(None, &released).unwrap();
+        let both = release_reminder(Some("done text".into()), &released).unwrap();
+        assert!(
+            alone.starts_with("board: you released factory-12 to open this turn, unfinished."),
+            "{alone}"
+        );
+        assert!(
+            both.starts_with("done text\nYou also released factory-12 to open this turn"),
+            "{both}"
+        );
+        // An agent with nothing to file is told that one line answers it.
+        assert!(
+            alone.contains("reply \"nothing left to file\" and stop"),
+            "{alone}"
+        );
+        for text in [&alone, &both] {
+            for placeholder in ["Proposal:", "<", "{", "...", "TODO"] {
+                assert!(!text.contains(placeholder), "{placeholder} in {text}");
+            }
+            for fact in [
+                "add a note there that says which steps are done",
+                "a follow-up task that one of its acceptance checks requires",
+                "A feedback report is not such a task",
+                "once for each released task",
+            ] {
+                assert!(text.contains(fact), "{fact} in {text}");
+            }
+        }
     }
 
     #[test]
