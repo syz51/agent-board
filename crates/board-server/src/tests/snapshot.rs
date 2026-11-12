@@ -1072,6 +1072,62 @@ async fn a_quiet_review_of_a_left_owner_names_the_one_step_close() {
 }
 
 #[tokio::test]
+async fn a_full_snapshot_names_the_reviews_nobody_is_left_to_close() {
+    let t = T::new();
+    let (owner, late, far) = ("t3:owner", "t3:late", "t3:far");
+    const OTHER_REPO: &str = "example.com/example/other";
+    t.register(owner, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Wait on the merge").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(owner, &id, review).await.0.is_success());
+    let left = format!(
+        "{id} is in review; its owner is gone and its board has no coordinator -> check its \
+         PR; once merged, close it with task_done {id} take=true"
+    );
+    let full = |agent: &'static str, repo: &'static str| async {
+        t.register(agent, Some(repo), None).await;
+        let full = snapshot(&t, agent, "kind=full").await;
+        text(&full).to_owned()
+    };
+
+    // While the owner's session lives, the task is its own.
+    let text = full(late, REPO).await;
+    assert!(!text.contains("is in review"), "{text}");
+
+    // The owner ended: a session that starts now is told at once, with no sweep. The
+    // owner itself and an agent on another repository are not.
+    set_state(&t, owner, "ended").await;
+    let text = full(late, REPO).await;
+    assert!(text.contains(&left), "{text}");
+    let text = full(far, OTHER_REPO).await;
+    assert!(!text.contains("is in review"), "{text}");
+    // A delta carries events only, so the line is not repeated at each prompt.
+    let delta = snapshot(&t, late, "kind=delta").await;
+    let delta = crate::tests::snapshot::text(&delta);
+    assert!(!delta.contains("is in review"), "{delta}");
+
+    // On a board that a coordinator runs, the coordinator closes it.
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(late),
+        Some(json!({ "device": "mac", "agent": late })),
+    )
+    .await;
+    let text = full(far, REPO).await;
+    assert!(!text.contains("is in review"), "{text}");
+}
+
+#[tokio::test]
 async fn a_quiet_review_is_not_passed_on_while_the_board_is_run_or_paused() {
     let t = T::new();
     let (maker, child, coordinator) = ("t3:maker", "t3:child", "t3:coord");
