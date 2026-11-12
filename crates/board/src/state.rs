@@ -513,6 +513,8 @@ fn take_marks<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
 }
 
 /// What an agent filed on the board: the kinds the `Stop` hook's done reminder asks for.
+/// The reminder reads only the task a mark is about ([`FiledMark::about`]); the kind and the
+/// time stay in the mark, so a rule by kind or by turn needs no new format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Filed {

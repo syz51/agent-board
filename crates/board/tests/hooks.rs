@@ -1858,7 +1858,7 @@ fn stop_reminds_once_per_task_marked_done_this_turn() {
     assert_eq!(reply["decision"], "block");
     assert_eq!(
         reply["reason"],
-        "board: you marked factory-12 done this turn. Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
+        "board: you marked factory-12 done this turn. Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
     );
     assert_eq!(stop(&e), None, "once per task");
 
