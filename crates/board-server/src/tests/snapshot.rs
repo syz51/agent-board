@@ -895,8 +895,15 @@ async fn a_quiet_review_whose_owner_ended_goes_to_the_coordinator() {
         Some(lease.clone()),
     )
     .await;
-    t.register(child, Some(REPO), None).await;
     t.advance(TimeDelta::hours(2));
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(coordinator),
+        Some(lease.clone()),
+    )
+    .await;
+    t.register(child, Some(REPO), None).await;
     assert_eq!(sweep_quiet_reviews(&t), 1);
     assert!(!quiet(&snapshot(&t, coordinator, "kind=delta").await));
 
@@ -1018,6 +1025,50 @@ async fn a_quiet_review_on_a_board_nobody_runs_goes_to_who_can_finish_it() {
         )
         .await;
     assert_eq!(taken["owner"], peer);
+}
+
+#[tokio::test]
+async fn a_quiet_review_of_a_left_owner_names_the_one_step_close() {
+    let t = T::new();
+    let (owner, peer, far) = ("t3:owner", "t3:peer", "t3:far");
+    const OTHER_REPO: &str = "example.com/example/other";
+    t.register(owner, Some(REPO), None).await;
+    t.register(peer, Some(REPO), None).await;
+    t.register(far, Some(OTHER_REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(owner, "factory", "Wait on the merge").await;
+    assert!(t.claim(owner, &id).await.0.is_success());
+    let review = json!({ "status": "review" });
+    assert!(t.patch(owner, &id, review).await.0.is_success());
+    for agent in [peer, far] {
+        snapshot(&t, agent, "kind=delta").await;
+    }
+    // The owner ended an hour ago, so it is not stale: a take is refused, the close is not.
+    t.advance(TimeDelta::hours(24));
+    t.register(owner, None, None).await;
+    set_state(&t, owner, "ended").await;
+    t.advance(TimeDelta::hours(1));
+    t.register(peer, Some(REPO), None).await;
+    t.register(far, Some(OTHER_REPO), None).await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let delta = snapshot(&t, peer, "kind=delta").await;
+    let want = format!(
+        "{id} has sat in review for 25h; its owner is gone and its board has no coordinator \
+         -> check its PR; once merged, close it with task_done {id} take=true and a pr or a \
+         passed check, or board done {id} --take"
+    );
+    assert!(text(&delta).contains(&want), "{}", text(&delta));
+    let delta = snapshot(&t, far, "kind=delta").await;
+    assert!(
+        !text(&delta).contains("has sat in review"),
+        "{}",
+        text(&delta)
+    );
+    let take = format!("/v1/tasks/{id}/take");
+    let (status, _) = t
+        .call("POST", &take, Some(peer), Some(json!({ "agent": peer })))
+        .await;
+    assert_eq!(status.as_u16(), 409);
 }
 
 #[tokio::test]

@@ -1233,6 +1233,17 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
     let events = events_of(&t, &unseen).await;
     assert!(events.iter().any(|(k, _)| k == "task_taken"), "{events:?}");
 
+    // An idle owner waits, on CI or on the user: it has not left.
+    t.register(A, Some(REPO), Some("main")).await;
+    let waiting = task_in(&t, TaskStatus::Review).await;
+    let state = format!("/v1/agents/{A}/state");
+    t.ok("POST", &state, Some(A), Some(json!({ "state": "idle" })))
+        .await;
+    t.advance(TimeDelta::minutes(61));
+    t.register(B, Some(REPO), Some("main")).await;
+    let (s, v) = done_take(&t, B, &waiting, pr.clone()).await;
+    refused(s, &v);
+
     // An owner held by a usage limit comes back at the reset, so it has not left.
     let held = t.task(B, "factory", "Held by the limit").await;
     t.register(A, Some(REPO), Some("main")).await;
@@ -1252,9 +1263,15 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
     let (s, v) = done_take(&t, B, &held, pr.clone()).await;
     refused(s, &v);
 
-    // An ended session has left at once.
+    // An ended session has left at once. Only an agent on the board's repositories closes
+    // its task.
     t.register(A, Some(REPO), Some("main")).await;
     end_session(&t, A).await;
+    let far = "claude:far";
+    t.register(far, Some("github.com/example/other"), Some("main"))
+        .await;
+    let (s, v) = done_take(&t, far, &ended, pr.clone()).await;
+    refused(s, &v);
     let (s, v) = done_take(&t, B, &ended, pr.clone()).await;
     closed_by_b(s, &v);
 
@@ -1273,6 +1290,27 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
     ));
     let (s, v) = done_take(&t, "claude:other", &run, pr.clone()).await;
     refused(s, &v);
+    assert!(!v["next"].as_str().unwrap().contains("nobody runs"), "{v}");
+
+    // So does the daemon, on a board that it dispatches.
+    t.exec(
+        "UPDATE boards SET coordinator = NULL, coordinator_device = NULL, \
+         coordinator_expires_at = NULL WHERE slug = 'factory'",
+    );
+    let dispatch = json!({ "autopilot": true, "dispatch": "daemon" });
+    t.ok("PATCH", "/v1/boards/factory", None, Some(dispatch))
+        .await;
+    let (s, v) = done_take(&t, "claude:other", &run, pr.clone()).await;
+    refused(s, &v);
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": false })),
+    )
+    .await;
+    let (s, v) = done_take(&t, "claude:other", &run, pr).await;
+    assert_eq!(s, 200, "{v}");
 }
 
 #[tokio::test]

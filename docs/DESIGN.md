@@ -100,14 +100,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `review` and `blocked` free the owner's one `doing` slot, and the doing-limit refusal says
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
-  when the owner is gone. When the owner is stale or its session ended, and nobody runs the
-  active board (no coordinator, and no daemon dispatch, which closes reviewed tasks
-  itself), the alert goes
-  to the agents that may take the task at once: its creator and the threads that delegated
-  its owner. When they are gone too, it goes to every agent on one of the board's
-  repositories, once the owner is stale, so that the take is not refused. That alert says
-  to check the PR and, once it merged, to take the task (`task_claim <id> take=true`) and
-  mark it done. Stats count dones that spent under a minute in `doing`, takeovers
+  when the owner is gone. When the owner is stale or has left, and nobody runs the active
+  board (no coordinator, and no daemon dispatch, which closes reviewed tasks itself), the
+  alert goes to the agents that may take the task at once: its creator and the threads
+  that delegated its owner. When they are gone too, it goes to every agent on one of the
+  board's repositories. That alert says to check the PR and, once it merged, names the
+  call that is not refused: take the task (`task_claim <id> take=true`) and mark it done,
+  or, while the owner is not stale yet, close it in one step (`task_done <id>
+  take=true`). Stats count dones that spent under a minute in `doing`, takeovers
   and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
@@ -148,14 +148,16 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `blocked_reason` that someone else set, which may name such a wait; the owner's claim
   clears a reason it set itself. Another live agent's parked task is refused, naming the
   owner. After 24 hours unseen the owner is stale and another agent may take the task
-  (logged). On a board that nobody runs, no coordinator closes a finished task for a child that
-  is gone, so there a task in `review` does not wait those 24 hours: any agent may close
-  it once its owner's session has ended, or the owner has been unseen for twice
-  `doing_idle_secs` (a session that stopped without an end hook), and no usage-limit
-  reset will bring it back. A take that starts work keeps the 24 hours.
-  A stale owner's task in `review`, or such a left owner's, can be closed in one step (`task_done` with
-  `take`, and a PR or a check as evidence), outside the closer's `doing` limit, since it
-  starts no work. The
+  (logged). On a board that nobody runs, no coordinator closes a finished task for an
+  owner that is gone, so there a task in `review` does not wait those 24 hours: an agent
+  on one of the board's repositories may close it once its owner has left. An owner has
+  left when its session has ended, or still counts as `running` and has been unseen for
+  twice `doing_idle_secs` (it stopped without an end hook), with no usage-limit reset
+  ahead and no delegated thread at work. An idle owner waits, on CI or on the user, and
+  keeps its task. A take that starts work keeps the 24 hours. A stale owner's task in
+  `review`, or such a left owner's, can be closed in one step (`task_done` with `take`,
+  and a PR or a check as evidence), outside the closer's `doing` limit, since it starts
+  no work. The
   owner, the board's coordinator or the user may hand a task to another agent, such as the
   child doing it, or back from a child that is gone (logged as an owner change). Once the
   owner's session has ended, the task's creator and the threads that delegated the owner
