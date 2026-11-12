@@ -486,6 +486,64 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert!(text(&bad).starts_with("error: invalid arguments"));
 }
 
+/// The `task_update` tool is how agents release: it leaves the Stop hook's mark.
+#[test]
+fn task_update_marks_a_release_to_open_of_an_owned_doing_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let mut doing = task_fixture("factory-12", "Fix the parser");
+    doing.status = board_proto::TaskStatus::Doing;
+    doing.owner = Some("t3:thread-1".parse().unwrap());
+    stub.on(
+        "GET /v1/tasks/factory-12",
+        json!({"task": doing, "notes": [], "evidence": [], "blocks": [], "children": [], "history": []}),
+    );
+    stub.on("PATCH /v1/tasks/factory-12", &doing);
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = git_repo(dir.path(), "git@github.com:acme/dotfiles.git");
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    let marks = || -> Vec<std::path::PathBuf> {
+        let Ok(agents) = std::fs::read_dir(home.join("state/released")) else {
+            return Vec::new();
+        };
+        agents
+            .flat_map(|agent| std::fs::read_dir(agent.unwrap().path()).unwrap())
+            .map(|mark| mark.unwrap().path())
+            .collect()
+    };
+    // A change that keeps the task in doing leaves none.
+    let updated = mcp.call(
+        2,
+        "task_update",
+        json!({"id": "factory-12", "priority": "p2"}),
+    );
+    assert_ne!(updated["isError"], true, "{updated}");
+    assert_eq!(marks(), Vec::<std::path::PathBuf>::new());
+
+    stub.on(
+        "PATCH /v1/tasks/factory-12",
+        task_fixture("factory-12", "Fix the parser"),
+    );
+    let updated = mcp.call(
+        3,
+        "task_update",
+        json!({"id": "factory-12", "status": "open"}),
+    );
+    assert_ne!(updated["isError"], true, "{updated}");
+    let marks = marks();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert!(marks[0].ends_with("factory-12.json"), "{marks:?}");
+}
+
 #[test]
 fn lease_paths_prints_the_servers_warning_above_the_lease() {
     let dir = tempfile::tempdir().unwrap();

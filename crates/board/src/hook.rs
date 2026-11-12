@@ -2067,8 +2067,8 @@ impl Hook<'_> {
     }
 }
 
-/// How many reminded tasks the hook state keeps; a task done again after it fell out is
-/// reminded about again.
+/// How many reminded tasks the hook state keeps, for done tasks and for released ones; a
+/// task done or released again after it fell out is reminded about again.
 const DONE_REMINDED_KEPT: usize = 100;
 
 /// How many tasks the agent filed something about the hook state keeps.
@@ -2136,8 +2136,8 @@ fn done_reminder(
 /// The tasks released to `open` this turn (marks at or after `turn_started`, any when the
 /// turn's start is unknown) to remind about, which it records in `reminded`: each once. None
 /// that the agent filed something about, in any turn, and none when `filed_this_turn`, as
-/// for a done task ([`Hook::take_filed`]). None the agent also marked done (`done`): the
-/// done reminder asks about that one. A released task stays in `filed_about`, so a later
+/// for a done task ([`Hook::take_filed`]). None the agent marked done after the release
+/// (`done`): the done reminder asks about that one, or did. A released task stays in `filed_about`, so a later
 /// done of it is judged as before.
 fn released_to_remind(
     marks: Vec<DoneMark>,
@@ -2152,7 +2152,7 @@ fn released_to_remind(
         if turn_started.is_none_or(|t| mark.at >= t)
             && !filed_this_turn
             && !filed_about.contains(&mark.task)
-            && !done.iter().any(|d| d.task == mark.task)
+            && !done.iter().any(|d| d.task == mark.task && d.at >= mark.at)
             && !reminded.contains(&mark.task)
             && !ids.contains(&mark.task)
         {
@@ -3050,7 +3050,9 @@ mod tests {
             mark("factory-14", 2),
             mark("factory-15", 2),
         ];
-        let done = [mark("factory-15", 3)];
+        // Done after the release; a done from before it (the task was opened again) is not
+        // what this release left.
+        let done = [mark("factory-15", 3), mark("factory-13", 1)];
         let released =
             released_to_remind(marks.clone(), &done, Some(t0), &about, false, &mut reminded);
         assert_eq!(ids(released), ["factory-12", "factory-13"]);

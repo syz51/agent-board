@@ -846,23 +846,19 @@ async fn board_of_repo(ctx: &Ctx, raw: &str) -> Result<BoardSlug> {
 /// `claim`, `release` or `take`.
 pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output> {
     // A release reads the task first, to know whether the agent gives up work in `doing`.
+    // Only the Stop hook's reminder needs it, so a failed read never fails the release.
     let before = match action {
-        "release" => Some(ctx.client.task(id).await?.task),
+        "release" => match ctx.client.task(id).await {
+            Ok(detail) => Some(detail.task),
+            Err(err) => {
+                tracing::warn!("reading {id} before the release: {err:#}");
+                None
+            }
+        },
         _ => None,
     };
     let task = ctx.client.task_action(id, action).await?;
-    match &before {
-        Some(before) => record_released(ctx, before, &task),
-        // The agent's again: nothing was given up.
-        None => {
-            let forgotten = ctx
-                .agent()
-                .and_then(|agent| crate::state::forget_released(&ctx.home, agent, &task.id));
-            if let Err(err) = forgotten {
-                tracing::warn!("forgetting the release of {}: {err:#}", task.id);
-            }
-        }
-    }
+    record_released(ctx, before.as_ref(), &task);
     let verb = match action {
         "claim" => "claimed",
         "release" => "released",
@@ -924,7 +920,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
             },
         )
         .await?;
-    record_released(ctx, &before, &task);
+    record_released(ctx, Some(&before), &task);
     if let Some(wanted) = &wanted_owner {
         check_owner(ctx, &task, wanted).await?;
     }
@@ -1031,17 +1027,23 @@ pub async fn task_done(
 /// what is not in the task (`hook::release_reminder`). Only that move: a task set `blocked`
 /// or `review` stays the agent's, and so does what the agent knows about it. The server has
 /// the change either way, so a failed write costs only the reminder.
-fn record_released(ctx: &Ctx, before: &Task, after: &Task) {
+///
+/// A task that is the agent's after the change (a claim, a take, a hand-over to itself)
+/// was not given up, so an earlier release of it is forgotten. `before` is `None` when it
+/// was not read.
+fn record_released(ctx: &Ctx, before: Option<&Task>, after: &Task) {
     let Ok(agent) = ctx.agent() else { return };
-    let released = before.status == TaskStatus::Doing
-        && before.owner.as_ref() == Some(agent)
-        && after.status == TaskStatus::Open;
-    if !released {
-        return;
-    }
-    if let Err(err) = crate::state::record_released(&ctx.home, agent, &after.id, chrono::Utc::now())
-    {
-        tracing::warn!("recording {} released for the Stop hook: {err:#}", after.id);
+    let released = after.status == TaskStatus::Open
+        && before.is_some_and(|b| b.status == TaskStatus::Doing && b.owner.as_ref() == Some(agent));
+    let marked = if released {
+        crate::state::record_released(&ctx.home, agent, &after.id, chrono::Utc::now())
+    } else if after.owner.as_ref() == Some(agent) {
+        crate::state::forget_released(&ctx.home, agent, &after.id)
+    } else {
+        Ok(())
+    };
+    if let Err(err) = marked {
+        tracing::warn!("marking {} for the Stop hook: {err:#}", after.id);
     }
 }
 
