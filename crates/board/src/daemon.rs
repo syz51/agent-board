@@ -5049,11 +5049,8 @@ impl<T: T3> Daemon<T> {
         } = &self.usage_source
         {
             let every = self.usage_poll_every(now);
-            let mut taken = Vec::new();
-            for path in snapshots {
-                taken.extend(crate::usage::read_snapshot(path, now).await);
-            }
-            let snapshot = taken
+            let snapshot = crate::usage::read_snapshots(snapshots, now)
+                .await
                 .into_iter()
                 .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
                 .filter(|s| {

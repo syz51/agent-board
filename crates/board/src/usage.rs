@@ -32,6 +32,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const T3_CACHES: &str = ".t3/caches";
 /// T3 Code's default Claude instance, which the user's own chats run on.
 const T3_CLAUDE_INSTANCE: &str = "claudeAgent";
+/// The driver of T3 Code's Claude instances.
+const T3_CLAUDE_DRIVER: &str = "claudeAgent";
 /// A snapshot dated further ahead of this device's clock than this is not believed.
 const SNAPSHOT_SKEW: TimeDelta = TimeDelta::minutes(1);
 /// A window whose reset time moved later by more than this is a new window.
@@ -239,18 +241,50 @@ async fn token(credentials: &Credentials, now: Timestamp) -> Result<Option<Strin
     Ok((!expired).then_some(oauth.access_token))
 }
 
-/// The reading in T3 Code's snapshot file at `path`, dated when T3 Code took it. `None`
-/// when there is no file, T3 Code marks the reading unavailable, or the usage part is not
-/// in the shape expected: the file is T3 Code's own format and may change, so the caller
-/// then reads the endpoint. Nothing but the usage part is read, and nothing of the file
-/// is logged.
-pub async fn read_snapshot(path: &Path, now: Timestamp) -> Option<ReportUsage> {
-    let text = tokio::fs::read_to_string(path).await.ok()?;
-    snapshot_reading(&text, now)
+/// The readings in T3 Code's snapshot files at `paths`, each dated when T3 Code took it.
+/// The first path is the default Claude instance's. A later file counts only while it is
+/// signed in to the same workspace as the first, so another account's usage is never
+/// reported. See [`read_snapshot`] for when a file gives no reading.
+pub async fn read_snapshots(paths: &[PathBuf], now: Timestamp) -> Vec<ReportUsage> {
+    let mut files = Vec::new();
+    for path in paths {
+        files.push(read_snapshot(path, now).await);
+    }
+    let workspace = files.first().cloned().flatten().and_then(|(_, w)| w);
+    files
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, file)| {
+            let (reading, ws) = file?;
+            (i == 0 || (ws.is_some() && ws == workspace)).then_some(reading)
+        })
+        .collect()
 }
 
-fn snapshot_reading(text: &str, now: Timestamp) -> Option<ReportUsage> {
+/// The reading in T3 Code's snapshot file at `path`, dated when T3 Code took it, with the
+/// workspace its instance is signed in to. `None` when there is no file, it is not a
+/// Claude instance's, T3 Code marks the reading unavailable, or the usage part is not in
+/// the shape expected: the file is T3 Code's own format and may change, so the caller
+/// then reads the endpoint. Nothing but the usage part, the driver and the workspace id is
+/// read, and nothing of the file is logged.
+async fn read_snapshot(path: &Path, now: Timestamp) -> Option<(ReportUsage, Option<String>)> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    snapshot_file(&text, now)
+}
+
+fn snapshot_file(text: &str, now: Timestamp) -> Option<(ReportUsage, Option<String>)> {
     let file: Value = serde_json::from_str(text).ok()?;
+    if file
+        .get("driver")
+        .and_then(Value::as_str)
+        .is_some_and(|driver| driver != T3_CLAUDE_DRIVER)
+    {
+        return None;
+    }
+    let workspace = file
+        .pointer("/auth/workspaceId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let limits = file.get("usageLimits")?;
     // A failed probe keeps older windows or none.
     if limits.get("unavailable").is_some_and(|v| !v.is_null()) {
@@ -279,7 +313,7 @@ fn snapshot_reading(text: &str, now: Timestamp) -> Option<ReportUsage> {
         seven_day: window("seven_day"),
         read_at,
     };
-    (report.five_hour.is_some() || report.seven_day.is_some()).then_some(report)
+    (report.five_hour.is_some() || report.seven_day.is_some()).then_some((report, workspace))
 }
 
 /// Whether `snapshot` can follow `known`, the newest reading the daemon has. T3 Code can
@@ -309,6 +343,81 @@ mod tests {
 
     /// A file T3 Code wrote, with every value outside the usage part replaced.
     const RECORDED: &str = include_str!("../tests/data/t3-claude-snapshot.json");
+
+    fn snapshot_reading(text: &str, now: Timestamp) -> Option<ReportUsage> {
+        snapshot_file(text, now).map(|(reading, _)| reading)
+    }
+
+    #[test]
+    fn the_thread_instance_s_file_is_read_next_to_the_default_one() {
+        let names = |source: UsageSource| match source {
+            UsageSource::ClaudeCode { snapshots, .. } => snapshots
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            UsageSource::Server => Vec::new(),
+        };
+        assert_eq!(names(UsageSource::claude_code(None)), ["claudeAgent.json"]);
+        assert_eq!(
+            names(UsageSource::claude_code(Some("claude-agents"))),
+            ["claudeAgent.json", "claude-agents.json"]
+        );
+        assert_eq!(
+            names(UsageSource::claude_code(Some("claudeAgent"))),
+            ["claudeAgent.json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_instance_counts_only_when_it_is_a_claude_one_on_the_same_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = at("2026-11-11T11:24:00Z");
+        let file = |name: &str, driver: &str, workspace: &str, checked: &str| {
+            let path = dir.path().join(name);
+            let text = serde_json::json!({
+                "driver": driver, "auth": { "workspaceId": workspace },
+                "usageLimits": { "checkedAt": checked,
+                    "windows": [{ "id": "five_hour", "usedPercent": 38 }] },
+            });
+            std::fs::write(&path, text.to_string()).unwrap();
+            path
+        };
+        let default = file(
+            "claudeAgent.json",
+            "claudeAgent",
+            "ws-1",
+            "2026-11-11T11:20:00Z",
+        );
+        let times = |paths: Vec<PathBuf>| async move {
+            read_snapshots(&paths, now)
+                .await
+                .into_iter()
+                .map(|r| r.read_at)
+                .collect::<Vec<_>>()
+        };
+
+        let same = file("a.json", "claudeAgent", "ws-1", "2026-11-11T11:23:00Z");
+        assert_eq!(
+            times(vec![default.clone(), same]).await,
+            [at("2026-11-11T11:20:00Z"), at("2026-11-11T11:23:00Z")]
+        );
+        for other in [
+            file("b.json", "claudeAgent", "ws-2", "2026-11-11T11:23:00Z"),
+            file("c.json", "codex", "ws-1", "2026-11-11T11:23:00Z"),
+        ] {
+            assert_eq!(
+                times(vec![default.clone(), other]).await,
+                [at("2026-11-11T11:20:00Z")]
+            );
+        }
+        // Without the default instance's reading, no workspace is known to match.
+        let same = file("d.json", "claudeAgent", "ws-1", "2026-11-11T11:23:00Z");
+        assert!(
+            times(vec![dir.path().join("none.json"), same])
+                .await
+                .is_empty()
+        );
+    }
 
     fn at(text: &str) -> Timestamp {
         text.parse().unwrap()

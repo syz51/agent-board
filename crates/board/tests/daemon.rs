@@ -8469,7 +8469,8 @@ fn usage_source_with_snapshot(e: &mut Env, url: String) -> std::path::PathBuf {
 /// Writes T3 Code's snapshot: the weekly window at `week` percent, read at `checked`.
 fn write_snapshot(path: &std::path::Path, week: f64, resets: Timestamp, checked: Timestamp) {
     let file = json!({
-        "auth": { "email": "user@example.com" },
+        "driver": "claudeAgent",
+        "auth": { "email": "user@example.com", "workspaceId": "ws-1" },
         "usageLimits": { "checkedAt": checked, "windows": [
             { "id": "five_hour", "kind": "session", "usedPercent": 20 },
             { "id": "seven_day", "kind": "weekly", "usedPercent": week, "resetsAt": resets },

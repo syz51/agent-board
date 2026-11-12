@@ -417,7 +417,10 @@ high for it. There is no total cap.
   (`~/.t3/caches/<instance>.json`: `usageLimits.checkedAt` and the `five_hour` and
   `seven_day` entries of `usageLimits.windows`). Those are the default instance,
   `claudeAgent`, and the `[thread_model]` provider when one is set: readings taken during
-  a turn go to the file of the thread's instance. Of the readings that pass the checks
+  a turn go to the file of the thread's instance. A file must be a Claude instance's
+  (`driver`), and the second counts only while it is signed in to the default instance's
+  workspace (`auth.workspaceId`), so another account's usage is never reported. Of the
+  readings that pass the checks
   below, the daemon reports the newest, dated when T3 Code took it, when it is newer than
   the one it knows. While the file's reading
   is at most 1 minute older than the time between two endpoint readings, the daemon reads
