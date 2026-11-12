@@ -133,11 +133,16 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
      "displayName": "Claude (agents)",
      "environment": [
        { "name": "ENABLE_CLAUDEAI_MCP_SERVERS", "value": "false", "sensitive": false }
-     ]
+     ],
+     "config": { "launchArgs": "--effort <level>" }
    }
    ```
 
-2. Restart T3 Code, and check that the instance shows in its provider list as signed in.
+   T3 Code starts these threads at the model's default effort, not the effort in the
+   project's default selection: `launchArgs` sets the effort the project uses.
+2. T3 Code applies the change within seconds, without a restart. Check that the instance
+   shows in its provider list as signed in (`~/.t3/caches/claude-agents.json` has
+   `"status": "ready"`).
 3. Name the instance and a model of it, then restart `board watch`:
 
    ```toml
@@ -149,7 +154,8 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
 
 Both keys are required: T3 Code takes a provider only with a model, so these threads use
 this model and not the project's default. Threads started before the change keep their
-provider.
+provider. T3 Code keeps this instance's usage readings in its own file, and the daemon
+reads it next to the default instance's.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a

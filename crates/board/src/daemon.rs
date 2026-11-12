@@ -5030,9 +5030,9 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Takes a new usage reading and reports it to the server: T3 Code's, while its file
-    /// holds one that is new enough and can follow the reading known here
-    /// ([`crate::usage::follows`]); else the endpoint's, when [`Self::usage_poll_every`] has
+    /// Takes a new usage reading and reports it to the server: T3 Code's, while one of its
+    /// files holds one that is new enough and can follow the reading known here
+    /// ([`crate::usage::follows`]), the newest such; else the endpoint's, when [`Self::usage_poll_every`] has
     /// passed since this daemon last read it. While T3 Code's readings stand in, the endpoint
     /// is read only every [`USAGE_CHECK_EVERY`], unless the pace is near a line. After a
     /// refusal that says how long to wait, the endpoint is read again then. With no new
@@ -5045,20 +5045,20 @@ impl<T: T3> Daemon<T> {
         if let UsageSource::ClaudeCode {
             url,
             credentials,
-            snapshot,
+            snapshots,
         } = &self.usage_source
         {
             let every = self.usage_poll_every(now);
-            let snapshot = match snapshot {
-                Some(path) => crate::usage::read_snapshot(path, now).await,
-                None => None,
-            }
-            .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
-            .filter(|s| {
-                self.usage
-                    .as_ref()
-                    .is_none_or(|known| crate::usage::follows(s, known))
-            });
+            let snapshot = crate::usage::read_snapshots(snapshots, now)
+                .await
+                .into_iter()
+                .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+                .filter(|s| {
+                    self.usage
+                        .as_ref()
+                        .is_none_or(|known| crate::usage::follows(s, known))
+                })
+                .max_by_key(|s| s.read_at);
             let wait = if snapshot.is_some() && every > USAGE_POLL_NEAR {
                 USAGE_CHECK_EVERY
             } else {
@@ -5766,8 +5766,10 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
+    let usage_source =
+        UsageSource::claude_code(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
     let mut daemon = Daemon::new(ctx, t3);
-    daemon.usage_source = UsageSource::claude_code();
+    daemon.usage_source = usage_source;
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
         let health = daemon.client().health().await?;
