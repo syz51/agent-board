@@ -832,6 +832,7 @@ fn fill_full(
     });
     model.counts = board_counts;
     model.dispatch = (dispatch == Dispatch::Daemon).then_some("daemon");
+    left_reviews(cx, model, agent, board)?;
 
     // mine: owned tasks that are not closed, on any board.
     let me = agent.id.as_str();
@@ -1848,6 +1849,51 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(None);
     }
     Ok(on_repo.then_some(if task.owner_stale { take } else { close }))
+}
+
+/// The most tasks [`left_reviews`] names in one snapshot, the longest in review first.
+const LEFT_REVIEWS_SHOWN: usize = 5;
+
+/// Adds to a full snapshot an alert for each task in `review` on `board` that nobody is
+/// left to close and `agent` may ([`unrun_review`]). The sweeper announces such a task
+/// once a quiet day, and a session that starts later never reads that event, so the state
+/// itself is shown: whoever works on the board next closes what has merged. A task the
+/// event scan already alerted on is not named twice.
+fn left_reviews(cx: &Ctx<'_>, model: &mut Model, agent: &Agent, board: &BoardSlug) -> Result<()> {
+    if !nobody_runs(&get_board(cx, board)?) {
+        return Ok(());
+    }
+    let in_review: Vec<TaskId> = cx
+        .db
+        .prepare_cached(
+            "SELECT id FROM tasks WHERE board = ?1 AND status = 'review' AND owner != ?2 \
+             ORDER BY updated_at, id",
+        )?
+        .query_map(params![board.as_str(), agent.id.as_str()], |r| {
+            crate::db::parse_id(&r.get::<_, String>(0)?)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut shown = 0;
+    for task in in_review {
+        if shown == LEFT_REVIEWS_SHOWN {
+            break;
+        }
+        let quiet = format!("{task} has sat in review");
+        if model.alerts.iter().any(|a| a.alert.starts_with(&quiet)) {
+            continue;
+        }
+        if let Some(then) = unrun_review(cx, &task, agent)? {
+            model.alerts.push(Alert {
+                alert: format!(
+                    "{task} is in review; its owner is gone and its board has no coordinator"
+                ),
+                action: format!("check its PR; once merged, {then}"),
+                rank: (QUIET_REVIEW, model.seq),
+            });
+            shown += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `me` is told of the server's notice that `away` has been away from `task` since
