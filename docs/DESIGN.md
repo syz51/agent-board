@@ -107,7 +107,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   board's repositories. That alert says to check the PR and, once it merged, names the
   call that is not refused: take the task (`task_claim <id> take=true`) and mark it done,
   or, while the owner is not stale yet, close it in one step (`task_done <id>
-  take=true`). Stats count dones that spent under a minute in `doing`, takeovers
+  take=true`). The sweeper's event reaches only sessions that run then, so a full snapshot
+  (session start, compaction) also names up to five such tasks from the board's state, as
+  soon as their owner has left: whoever works on the board next closes what has merged.
+  Stats count dones that spent under a minute in `doing`, takeovers
   and feedback items aside, which shows work done off the board and claimed afterwards.
   Waiting on another task, on any board, is a blocker; waiting on the user is an ask and
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
