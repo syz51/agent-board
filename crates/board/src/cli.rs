@@ -535,8 +535,13 @@ fn brief(home: &Home, board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> R
             if !tasks.is_empty() {
                 bail!("the coordinator brief names no task: leave out --task");
             }
-            let triage = *board == Config::load(home)?.feedback_board();
-            return Ok(crate::daemon::brief(board, triage));
+            let config = Config::load(home)?;
+            let triage = *board == config.feedback_board();
+            return Ok(crate::daemon::brief(
+                board,
+                triage,
+                config.thread_model.as_ref(),
+            ));
         }
         BriefKind::Worker => {
             let [task] = tasks else {
