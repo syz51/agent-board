@@ -553,7 +553,8 @@ of the board's repos; a board none of whose repos is mapped there, such as a fee
 with no repo, uses the folder `[board_projects]` names for its slug (the coordinator then
 registers without a repo). Each reconcile first re-reads `config.toml` when its text
 changed: new `[projects]`, `[board_projects]` and `feedback_board` apply at once and clear
-the start back-offs, since a missing project may be what failed; `server`, `device`,
+the start back-offs, since a missing project may be what failed; a new `runs_at_once`
+applies at once too; `server`, `device`,
 `t3_bin` and `[thread_model]` stay as started, with a warning to restart; a file gone or
 invalid keeps the settings in use, warned once per edit.
 
@@ -1164,7 +1165,8 @@ Built: any task in `doing` on the board takes a slot, whoever owns it, such as a
 the coordinator thread from before the switch. A worker that ends without claiming its
 task, or whose start fails, frees the slot and keeps that task waiting 30 minutes. So does
 a worker that gives its task back while no other task is in progress.
-Judges do not count, but at most 2 judges run per board at once. The rest wait, oldest
+Judges do not count in a board's slots, but at most 2 judges run per board at once, and
+both count in the device limit below. The rest wait, oldest
 first. With one slot, the dispatcher takes the highest-priority ready `auto` task, the
 oldest first on a tie. With more slots, code checks only the mechanical rules:
 
@@ -1188,6 +1190,18 @@ another task in progress stops and leaves its task `open`. The dispatcher skips 
 until a task in progress ends (built: it skips a task its worker gave back while other
 tasks were in progress, until one of those leaves `doing`). The rules a coordinator judged by eye (size L, shared kinds
 of files) are dropped. The revisit measures what dropping them costs.
+
+**Device limit** (built): the limits above are per board, so the boards a device dispatches
+would add up without end. Each run is an agent session of some hundred MiB of memory, and
+its builds take more. So the device has one limit on the runs it has at once, workers and
+judges together, across its daemon-dispatch boards: `runs_at_once` in `config.toml`, or
+without it one run per 4 GiB of host memory and at least 2 (4 when the memory cannot be
+read). Workers leave one slot of the limit to judges, since a judge ends work already in
+progress; with a limit of 1 a worker may take it. A board that was refused a slot gets the
+next free one before a board that asked later, workers and judges each in their own queue;
+a board that has not asked for 10 minutes loses its place. A run recorded for a board the
+device no longer dispatches takes no slot. The limit counts the daemon's runs only, not
+threads the user or a coordinator thread started.
 
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>
 --title "<id> <title>" -`. The brief goes in on stdin. The folder is the `[projects]`

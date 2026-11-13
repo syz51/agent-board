@@ -115,8 +115,18 @@ project on that device. `board watch` finds the project in the device's
 `$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
 A running `board watch` re-reads the file within a minute of an edit and applies these two
-tables and `feedback_board` without a restart; a change to `server`, `device`, `t3_bin`
-or `[thread_model]` needs one, and the daemon's log says so.
+tables, `feedback_board` and `runs_at_once` without a restart; a change to `server`,
+`device`, `t3_bin` or `[thread_model]` needs one, and the daemon's log says so.
+
+On daemon-dispatch boards the daemon has at most `runs_at_once` workers and judges at once
+on the device, across all its boards. Without the setting it is one per 4 GiB of host
+memory, at least 2. Each run is an agent session of some hundred MiB, and its builds take
+more, so lower it on a device you also work on:
+
+```toml
+# config.toml, above the first table
+runs_at_once = 3
+```
 
 `board watch` starts its threads (coordinators, workers and judges) with the project's
 default provider and model, which the user's own chats use too. To give them settings of

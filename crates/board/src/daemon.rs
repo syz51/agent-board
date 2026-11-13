@@ -71,6 +71,7 @@ use crate::state;
 use crate::t3::{ListedThread, PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
 
+pub mod device;
 pub mod judges;
 
 pub use judges::{
@@ -1610,6 +1611,12 @@ pub struct Daemon<T: T3> {
     dispatch_registered: bool,
     /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
     dispatch_renewed: BTreeMap<BoardSlug, Timestamp>,
+    /// The runs this device may have at once when `runs_at_once` is not set; `None`
+    /// leaves the device without a limit of its own.
+    default_run_limit: Option<usize>,
+    /// The boards that wait for one of the device's worker slots, and for a judge slot.
+    worker_turns: device::Turns,
+    judge_turns: device::Turns,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1641,7 +1648,37 @@ impl<T: T3> Daemon<T> {
             usage_snapshot_at: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
+            default_run_limit: None,
+            worker_turns: device::Turns::default(),
+            judge_turns: device::Turns::default(),
         }
+    }
+
+    /// Limits the runs of a device that sets no `runs_at_once` to `limit`.
+    #[must_use]
+    pub fn with_default_run_limit(mut self, limit: usize) -> Self {
+        self.default_run_limit = Some(limit);
+        self
+    }
+
+    /// How many runs, workers and judges together, this device may have at once across
+    /// its boards: `runs_at_once`, or the default from the host's memory.
+    fn run_limit(&self) -> usize {
+        self.ctx.config.runs_at_once.map_or_else(
+            || self.default_run_limit.unwrap_or(usize::MAX),
+            |n| n.get() as usize,
+        )
+    }
+
+    /// The runs this device has now, on every board it dispatches. A run recorded for a
+    /// board that left this device takes no slot: nothing here follows it to its end.
+    fn runs(&self) -> usize {
+        let workers = self.state.workers.keys().map(TaskId::board);
+        let judges = self.state.judges.iter().map(|r| r.board.clone());
+        workers
+            .chain(judges)
+            .filter(|slug| self.dispatching(slug))
+            .count()
     }
 
     /// Reads, updates and merges pull requests through `gh` instead of the `gh` CLI.
@@ -1699,6 +1736,10 @@ impl<T: T3> Daemon<T> {
                 "{} changes server, device, t3_bin or thread_model: restart board watch to apply them",
                 path.display()
             );
+        }
+        if new.runs_at_once != current.runs_at_once {
+            current.runs_at_once = new.runs_at_once;
+            tracing::info!("re-read {}: runs_at_once updated", path.display());
         }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
@@ -3091,6 +3132,8 @@ impl<T: T3> Daemon<T> {
             tracing::warn!("the judges and reviewed tasks of {slug}: {err:#}");
         }
         self.save()?;
+        // The board asks again below if it still wants one of the device's slots.
+        let waited = self.worker_turns.take(slug);
         let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
         if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
@@ -3110,6 +3153,18 @@ impl<T: T3> Daemon<T> {
             }
             if !independent(&task, &in_progress) {
                 continue;
+            }
+            // The device's limit holds across boards, and the board that waited longest
+            // for a slot gets the next one.
+            let limit = device::worker_limit(self.run_limit());
+            if self.runs() >= limit || self.worker_turns.another_first(slug, waited, now) {
+                if self.worker_turns.wait(slug, waited, now) {
+                    tracing::info!(
+                        "{slug}: {} waits for one of the {limit} worker slots of this device",
+                        task.id
+                    );
+                }
+                break;
             }
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
                 self.note_failure(board, now, now);
@@ -5899,7 +5954,15 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     let _relay = if once { None } else { start_relay(&ctx) };
     let usage_source =
         UsageSource::claude_code(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
-    let mut daemon = Daemon::new(ctx, t3);
+    let host_memory = device::host_memory();
+    if host_memory.is_none() {
+        tracing::warn!(
+            "the memory of this host could not be read; without `runs_at_once` in config.toml the device runs {} agents at once",
+            device::FALLBACK_RUNS
+        );
+    }
+    let mut daemon =
+        Daemon::new(ctx, t3).with_default_run_limit(device::default_run_limit(host_memory));
     daemon.usage_source = usage_source;
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
