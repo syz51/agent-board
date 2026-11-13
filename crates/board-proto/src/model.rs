@@ -42,11 +42,12 @@ pub struct Board {
     /// defaults to [`USAGE_STOP_AT_DEFAULT`].
     #[serde(default = "usage_stop_at_default")]
     pub usage_stop_at: u32,
-    /// The agent currently acting as the board's coordinator, if any.
+    /// The agent that holds the board's coordinator lease, if any: the dispatch agent of the
+    /// device whose daemon runs the board.
     pub coordinator: Option<AgentId>,
-    /// Who runs the board's autopilot: a coordinator thread, or the daemon of the device
-    /// that holds the coordinator lease. Absent from servers that predate it, so it
-    /// defaults to [`Dispatch::Thread`].
+    /// Who runs the board's autopilot. Every board of a current server is on
+    /// [`Dispatch::Daemon`]; a server that predates the setting leaves it out, so it
+    /// defaults to [`Dispatch::Thread`]. Daemons ignore it.
     #[serde(default)]
     pub dispatch: Dispatch,
     /// Devices allowed to host the coordinator, in order of preference.
@@ -61,7 +62,8 @@ pub struct Board {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dispatch {
-    /// A coordinator thread that lives for days.
+    /// A coordinator thread that lives for days. No current server or daemon runs a board
+    /// this way; the value stays so that an older server's boards still parse.
     #[default]
     Thread,
     /// The device daemon that holds the coordinator lease, as `dispatch:<device>`: it does

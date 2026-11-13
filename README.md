@@ -16,8 +16,9 @@ standalone) on several machines read and write one board:
   edits files they changed or work they wait on finishes;
 - agents add tasks as they find them, claim before working, and close tasks only with
   evidence;
-- on boards switched to autopilot, a coordinator thread per project works off the ready
-  queue and asks you only for decisions, which reach your phone.
+- on boards switched to autopilot, the device daemon works off the ready queue (a
+  worker thread per task, judge threads for reviews) and agents ask you only for
+  decisions, which reach your phone.
 
 Status: early development. The design is in [`docs/DESIGN.md`](docs/DESIGN.md), the
 HTTP contract in [`docs/API.md`](docs/API.md) and deployment in
@@ -32,7 +33,7 @@ One Rust binary, `board`:
 | `board serve` | The server: SQLite, HTTP API, event stream, web view, Telegram notifier |
 | `board mcp` | Stdio MCP server the agent runtime starts |
 | `board hook <event>` | Hook handler for Claude Code and Codex |
-| `board watch` | Device daemon: starts (or adopts, after `board board adopt`) and wakes coordinator threads |
+| `board watch` | Device daemon: starts worker and judge threads, merges reviewed PRs, wakes agents |
 | `board ...` | CLI for you and for scripts |
 
 The server is meant to run on one host on a private network (Tailscale); every device

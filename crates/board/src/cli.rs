@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use board_proto::{
     ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
-    Dispatch, EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX,
-    FeedbackActivity, FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX,
-    ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId,
-    TaskStatus, UpdateBoard,
+    EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
+    FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
+    ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
+    UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -92,7 +92,6 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "the board object {slug, title, status, ...}",
     ),
     ("board delete", "{deleted: slug}"),
-    ("board adopt", "the board object {slug, title, status, ...}"),
     ("log", "{events: [...], next_since}"),
     (
         "stats",
@@ -308,15 +307,15 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Pause all your work: every active board, or only those named. Their coordinators,
-    /// the threads they started and the agents on their tasks stop at their next hook, and
+    /// Pause all your work: every active board, or only those named. The workers
+    /// and judges the daemon started and the agents on their tasks stop at their next hook, and
     /// the daemon starts nothing on them. `board resume` undoes it. The feedback board always
     /// stays active: the server keeps it so, and the output lists it as kept active.
     Pause {
         /// Boards to pause. Default: every active board.
         boards: Vec<BoardSlug>,
     },
-    /// Resume every paused board, or only those named; the daemon wakes their coordinators.
+    /// Resume every paused board, or only those named; the daemon dispatches them again.
     Resume {
         /// Boards to resume. Default: every paused board.
         boards: Vec<BoardSlug>,
@@ -450,21 +449,18 @@ pub enum Command {
     /// Print or write runtime and service configuration.
     #[command(subcommand)]
     Install(crate::install::InstallCommand),
-    /// Print the standing prompt this device briefs the board's coordinator with: the
-    /// coordinator prompt, plus triage on the feedback board. A coordinator reads it at the
-    /// start of a fresh session. With `--kind`, print the brief a daemon-dispatch worker or
-    /// judge starts with instead.
+    /// Print the brief the daemon starts a worker or a judge of the board with.
     Brief {
         board: BoardSlug,
-        /// Which brief: the coordinator's (default), a worker's, or a judge's.
-        #[arg(long, value_enum, default_value_t = BriefKind::Coordinator)]
+        /// Which brief: a worker's, or a judge's.
+        #[arg(long, value_enum)]
         kind: BriefKind,
         /// The task the brief is for: exactly one for a worker, at least one for a review,
         /// verdict or triage judge, none otherwise. Repeat it for more.
         #[arg(long = "task")]
         tasks: Vec<TaskId>,
     },
-    /// Run the device daemon: coordinators and wake-ups.
+    /// Run the device daemon: dispatch (workers, judges, merges) and wake-ups.
     Watch {
         /// Run one reconcile pass and exit.
         #[arg(long)]
@@ -519,7 +515,6 @@ where
 /// The briefs `board brief` prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BriefKind {
-    Coordinator,
     Worker,
     Review,
     Verdict,
@@ -528,21 +523,9 @@ pub enum BriefKind {
 }
 
 /// The brief `board brief` prints for `kind` on `board`, or what to pass instead.
-fn brief(home: &Home, board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String> {
+fn brief(board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String> {
     use crate::brief::{JudgeKind, judge_brief, worker_brief};
     let judge = match kind {
-        BriefKind::Coordinator => {
-            if !tasks.is_empty() {
-                bail!("the coordinator brief names no task: leave out --task");
-            }
-            let config = Config::load(home)?;
-            let triage = *board == config.feedback_board();
-            return Ok(crate::daemon::brief(
-                board,
-                triage,
-                config.thread_model.as_ref(),
-            ));
-        }
         BriefKind::Worker => {
             let [task] = tasks else {
                 bail!("a worker brief is for one task: pass --task <id> once");
@@ -762,7 +745,7 @@ pub enum BoardCommand {
         repos: Vec<String>,
         #[arg(long)]
         autopilot: bool,
-        /// A device allowed to host the coordinator, in order of preference.
+        /// A device allowed to dispatch the board, in order of preference.
         #[arg(long = "home-device")]
         home_devices: Vec<DeviceName>,
         /// For a test or a one-off: the server closes the board once idle (a day by
@@ -793,14 +776,10 @@ pub enum BoardCommand {
         /// it later. Only the user may turn it on for an existing board.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         temporary: Option<bool>,
-        /// How many tasks the coordinator and its child threads may have in progress at
+        /// How many tasks the board may have in progress at
         /// once (1 to 4). Only the user may raise it.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
         parallel_tasks: Option<u32>,
-        /// Who runs the board's autopilot: a coordinator thread (thread), or the daemon of
-        /// the device holding the coordinator lease (daemon).
-        #[arg(long, value_parser = enum_arg::<Dispatch>())]
-        dispatch: Option<Dispatch>,
         /// The usage percent (1 to 100) of the 5-hour or weekly window at which the board
         /// starts no new task. Only the user may raise it.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
@@ -809,14 +788,6 @@ pub enum BoardCommand {
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
     Delete { slug: BoardSlug },
-    /// Make an existing T3 thread on this device the board's coordinator, then switch
-    /// autopilot on. Run it on a home device whose daemon (`board watch`) then briefs the
-    /// thread instead of starting a new one.
-    Adopt {
-        slug: BoardSlug,
-        /// The T3 thread id, as in its link or `t3 thread show`.
-        thread: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1168,7 +1139,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
         Command::Brief { board, kind, tasks } => {
-            println!("{}", brief(&home, &board, kind, &tasks)?);
+            println!("{}", brief(&board, kind, &tasks)?);
             return Ok(());
         }
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
@@ -1347,7 +1318,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
             home_devices,
             temporary,
             parallel_tasks,
-            dispatch,
             usage_stop_at,
         }) => {
             let body = UpdateBoard {
@@ -1359,17 +1329,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 home_devices,
                 temporary,
                 parallel_tasks,
-                dispatch,
+                dispatch: None,
                 usage_stop_at,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
         Command::Board(BoardCommand::Delete { slug }) => ops::board_delete(&ctx()?, &slug).await?,
-        Command::Board(BoardCommand::Adopt { slug, thread }) => {
-            let ctx = ctx()?;
-            let t3 = crate::t3::T3Cli::locate(ctx.config.t3_bin.as_deref());
-            ops::board_adopt(&ctx, &t3, &slug, &thread, chrono::Utc::now()).await?
-        }
         Command::Log {
             board,
             since,

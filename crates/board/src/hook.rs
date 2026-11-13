@@ -40,9 +40,7 @@ const DELEGATED_THREAD: &str = "thread:delegated-task:";
 /// The route a delegated thread's `SessionStart` context names for a PR waiting on checks.
 /// T3's PR rules, which every thread sees, say to call `watch_pull_request`, which T3 gives
 /// a delegated child none of, and forbid polling and `gh pr checks --watch`; a parent's
-/// brief may name this route (the coordinator's does), but children still polled. The
-/// wording follows the coordinator's brief (`prompts/coordinator.md`, step 4), and a brief
-/// that says otherwise wins.
+/// brief may name this route, but children still polled. A brief that says otherwise wins.
 const DELEGATED_PR_ROUTE: &str = "PR waiting on checks, unless your brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task you own in review with a note naming the PR, report, and end; never wait for CI.";
 
 /// Whether T3 started thread `id` for a parent thread's `delegate_task`.

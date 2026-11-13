@@ -41,6 +41,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0024_task_search.sql"),
     include_str!("../migrations/0025_server_runs.sql"),
     include_str!("../migrations/0026_stood_down.sql"),
+    include_str!("../migrations/0027_daemon_dispatch_only.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -545,8 +546,33 @@ mod tests {
                 ("on".to_owned(), some("t3:b"), some("mac")),
             ]
         );
+        // 'on' still ran its coordinator thread: the move of every board to daemon dispatch
+        // (0027) stood that down at the time it ran.
+        let on: (String, i64, String) = conn
+            .query_row(
+                "SELECT agent, since, reason FROM stood_down WHERE board = 'on'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (on.0.as_str(), on.2.as_str()),
+            ("t3:b", "the board is set to daemon dispatch")
+        );
+        assert!(on.1 > 1_700_000_000_000, "{}", on.1);
+        let thread: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM boards WHERE dispatch != 'daemon'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(thread, 0);
         let stood: Vec<(String, String, i64, String)> = conn
-            .prepare("SELECT board, agent, since, reason FROM stood_down ORDER BY board")
+            .prepare(
+                "SELECT board, agent, since, reason FROM stood_down WHERE board != 'on' \
+                 ORDER BY board",
+            )
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()

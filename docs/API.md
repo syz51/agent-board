@@ -244,16 +244,12 @@ server's minute sweep deletes older ones.
   `forbidden` otherwise); anyone may restate or lower it. A `Board` from a server that
   predates it reads as 90. `board board update <slug> --usage-stop-at N` sets it, and
   `board boards` shows ` · new work stops at N% usage` when it is not 90.
-  `dispatch` (`[Dispatch]`) is who runs the board's autopilot: `thread` (a coordinator
-  thread, the default) or `daemon` (the dispatch agent of the device holding the
-  coordinator lease; see "Daemon dispatch"). Anyone may change it; the change is recorded
-  as `board_updated` with `dispatch` in `fields`. `board board set <slug> --dispatch
-  daemon|thread` (`set` is another name for `update`) sets it. `board boards` and
-  `board_status` show ` · dispatch daemon` on the board's line, and `board_status` shows
-  `dispatch thread` otherwise; a full snapshot of a daemon board has the line
-  `dispatch: daemon` (in `json` and `yaml`, `dispatch` at the top). A `Board` from a server
-  that predates it reads as `thread`; a client leaves the field out of `UpdateBoard` unless
-  it sets it, and reports a server that ignored it.
+  `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
+  the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
+  sets it on every new board and refuses an update to `thread` (400 `invalid`), the
+  coordinator-thread dispatch that was removed; an update to `daemon` changes nothing.
+  No client reads it, and no command sets or shows it. A `Board` from a server that
+  predates the field reads as `thread`, and a daemon dispatches that board all the same.
   An update that changes `status` adds the new one to the `board_updated` payload
   (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
   reads `active` (see `DESIGN.md`, "Pausing work"). The server's feedback board
@@ -698,8 +694,8 @@ is not done (see "Temporary boards").
 
 ### Daemon dispatch
 
-A board set to `dispatch: daemon` (see "Boards") runs its autopilot from a device daemon
-instead of a long-lived coordinator thread (`DESIGN.md`, "Daemon dispatch"). The server
+A board's autopilot runs from a device daemon, not a long-lived thread (`DESIGN.md`,
+"Daemon dispatch"). The server
 knows two things for it:
 
 - **The dispatch agent** `dispatch:<device>`: an agent id source of its own, whose native id
@@ -968,8 +964,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   runtime `claude`, since the usage is the Claude account's: `held_since` is then
   the later of the line's time and the latest pause, and `held_for_usage` is `true` (left
   out otherwise, and by servers that predate it). A board that stopped running the
-  agent as its coordinator thread (autopilot off, closed, daemon dispatch, its device no
-  longer a home device, or another thread named) holds that agent alone, until a
+  agent as its coordinator thread, while boards had such threads (autopilot off, closed,
+  daemon dispatch, its device no longer a home device, or another thread named), holds that agent alone, until a
   coordinator claim names it again: the board is in `held_by` and in `stood_down`
   (`[{"board", "reason"}]`, left out when empty and by servers that predate it), and
   `held_since` is the latest of the stand-down's time and the other holds. Its line reads

@@ -75,7 +75,7 @@ pub struct Config {
     pub feedback_board: Option<BoardSlug>,
     /// Path of the `t3` binary used by `board watch`.
     pub t3_bin: Option<PathBuf>,
-    /// Local T3 project folders by repo key, for starting coordinator threads.
+    /// Local T3 project folders by repo key, for starting worker and judge threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,
     /// Local T3 project folders by board slug, for a board none of whose repos is under

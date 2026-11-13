@@ -1186,8 +1186,20 @@ async fn a_quiet_review_is_not_passed_on_while_the_board_is_run_or_paused() {
     t.advance(TimeDelta::hours(25));
     assert!(!told().await);
 
-    // Active again and still without a coordinator: the creator is told, and may take it.
+    // Active again and still without a coordinator, but on autopilot: its dispatcher
+    // finishes the task.
     status("active").await;
+    t.advance(TimeDelta::hours(25));
+    assert!(!told().await);
+
+    // Autopilot off: nobody runs the board, so the creator is told, and may take it.
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "autopilot": false })),
+    )
+    .await;
     t.advance(TimeDelta::hours(25));
     assert!(told().await);
     let taken = t
@@ -2240,10 +2252,10 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
 }
 
 #[tokio::test]
-async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
+async fn a_thread_that_no_longer_coordinates_its_board_is_held_alone() {
     let t = T::new();
-    let (coordinator, kid, worker, next) = ("t3:coord", "t3:kid", "t3:worker", "t3:next");
-    for agent in [coordinator, worker, next] {
+    let (coordinator, kid, worker) = ("t3:coord", "t3:kid", "t3:worker");
+    for agent in [coordinator, worker] {
         t.register(agent, Some(REPO), None).await;
     }
     t.ok(
@@ -2263,14 +2275,6 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO], "home_devices": ["mac"] })),
     )
     .await;
-    let claim = |agent: Option<&str>| json!({ "device": "mac", "agent": agent });
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        Some(coordinator),
-        Some(claim(Some(coordinator))),
-    )
-    .await;
     let id = t.task(worker, "auto", "Work").await;
     assert!(t.claim(worker, &id).await.0.is_success());
     let held = |s: &Value| s["held_by"].clone();
@@ -2279,33 +2283,27 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         Value::Null
     );
 
-    // Autopilot goes off while the lease is still live, as when the daemon is down or too
-    // old to release it: the coordinator is held all the same.
-    t.advance(TimeDelta::minutes(1));
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "autopilot": false })),
-    )
-    .await;
-    let events = t.ok("GET", "/v1/events?board=auto", None, None).await;
-    let off = events["events"].as_array().unwrap().last().unwrap()["at"].clone();
+    // The thread coordinated the board before every board went to daemon dispatch: the
+    // migration stood it down.
+    t.exec(
+        "INSERT INTO stood_down (board, agent, since, reason) \
+         VALUES ('auto', 't3:coord', 1000, 'the board is set to daemon dispatch')",
+    );
     for kind in ["full", "delta", "alerts"] {
         let snap = snapshot(&t, coordinator, &format!("kind={kind}")).await;
         assert_eq!(held(&snap), json!(["auto"]), "{kind}");
-        assert_eq!(snap["held_since"], off, "{kind}");
+        assert_ne!(snap["held_since"], Value::Null, "{kind}");
         assert_eq!(
             snap["stood_down"],
-            json!([{ "board": "auto", "reason": "autopilot was switched off" }]),
+            json!([{ "board": "auto", "reason": "the board is set to daemon dispatch" }]),
             "{kind}"
         );
         assert!(
             text(&snap).contains(
-                "hold: auto stood down: autopilot was switched off -> this thread no longer \
-                 coordinates the board: children already at work finish on their own. When \
-                 this turn's message is the board's message that this thread is no longer its \
-                 coordinator, do the steps it lists, then end this turn. If the user's own \
+                "hold: auto stood down: the board is set to daemon dispatch -> this thread no \
+                 longer coordinates the board: children already at work finish on their own. \
+                 When this turn's message is the board's message that this thread is no longer \
+                 its coordinator, do the steps it lists, then end this turn. If the user's own \
                  message in this turn asks you to go on"
             ),
             "{kind}: {}",
@@ -2323,7 +2321,7 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
     );
     assert!(
         text(&yaml).contains(
-            "  stood_down:\n    - board: \"auto\"\n      reason: \"autopilot was switched off\"\n"
+            "  stood_down:\n    - board: \"auto\"\n      reason: \"the board is set to daemon dispatch\"\n"
         ),
         "{}",
         text(&yaml)
@@ -2335,154 +2333,17 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         assert!(!text(&snap).contains("hold:"), "{agent}: {}", text(&snap));
     }
 
-    // Switching it off again changes nothing; the lease lapsing does not lift the hold.
-    t.advance(super::coordinator_ttl() * 2);
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "autopilot": false })),
-    )
-    .await;
-    assert_eq!(
-        snapshot(&t, coordinator, "kind=alerts").await["held_since"],
-        off
-    );
-
-    // Autopilot on again: the lease alone does not name the thread, a claim that names it
-    // lifts the hold.
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "autopilot": true })),
-    )
-    .await;
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        None,
-        Some(claim(None)),
-    )
-    .await;
-    assert_eq!(
-        held(&snapshot(&t, coordinator, "kind=alerts").await),
-        json!(["auto"])
-    );
+    // A claim by a daemon that predates the change, which still names the thread, does not
+    // lift the hold: no board runs a coordinator thread.
     t.ok(
         "POST",
         "/v1/boards/auto/coordinator",
         Some(coordinator),
-        Some(claim(Some(coordinator))),
-    )
-    .await;
-    let snap = snapshot(&t, coordinator, "kind=delta").await;
-    assert_eq!(held(&snap), Value::Null);
-    assert_eq!(snap["stood_down"], Value::Null);
-
-    // Off and on again before the daemon saw it: its renewal keeps the thread named, which
-    // lifts the hold.
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "autopilot": false })),
+        Some(json!({ "device": "mac", "agent": coordinator })),
     )
     .await;
     assert_eq!(
-        held(&snapshot(&t, coordinator, "kind=alerts").await),
-        json!(["auto"])
-    );
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "autopilot": true })),
-    )
-    .await;
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        None,
-        Some(claim(None)),
-    )
-    .await;
-    assert_eq!(
-        held(&snapshot(&t, coordinator, "kind=alerts").await),
-        Value::Null
-    );
-
-    // Another thread named coordinator holds the one it replaces.
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        Some(next),
-        Some(claim(Some(next))),
-    )
-    .await;
-    let snap = snapshot(&t, coordinator, "kind=alerts").await;
-    assert_eq!(
-        snap["stood_down"],
-        json!([{ "board": "auto", "reason": "another thread coordinates the board now" }])
-    );
-    assert_eq!(held(&snapshot(&t, next, "kind=alerts").await), Value::Null);
-
-    // Its device no longer a home holds it, and a renewal by a daemon that has not yet seen
-    // the change keeps the hold.
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "home_devices": ["air"] })),
-    )
-    .await;
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        None,
-        Some(claim(None)),
-    )
-    .await;
-    assert_eq!(
-        snapshot(&t, next, "kind=alerts").await["stood_down"],
-        json!([{
-            "board": "auto",
-            "reason": "its device is no longer one of the board's home devices"
-        }])
-    );
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "home_devices": ["mac"] })),
-    )
-    .await;
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        Some(next),
-        Some(claim(Some(next))),
-    )
-    .await;
-    assert_eq!(held(&snapshot(&t, next, "kind=alerts").await), Value::Null);
-
-    // Moving it to daemon dispatch holds the thread that runs it, through a renewal too.
-    t.ok(
-        "PATCH",
-        "/v1/boards/auto",
-        None,
-        Some(json!({ "dispatch": "daemon" })),
-    )
-    .await;
-    t.ok(
-        "POST",
-        "/v1/boards/auto/coordinator",
-        None,
-        Some(claim(None)),
-    )
-    .await;
-    assert_eq!(
-        snapshot(&t, next, "kind=alerts").await["stood_down"],
+        snapshot(&t, coordinator, "kind=alerts").await["stood_down"],
         json!([{ "board": "auto", "reason": "the board is set to daemon dispatch" }])
     );
 
@@ -2494,7 +2355,7 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         Some(json!({ "status": "paused" })),
     )
     .await;
-    let snap = snapshot(&t, next, "kind=alerts").await;
+    let snap = snapshot(&t, coordinator, "kind=alerts").await;
     assert_eq!(held(&snap), json!(["auto"]));
     assert_eq!(snap["stood_down"], Value::Null);
     assert!(
