@@ -164,4 +164,23 @@ impl AppState {
         .await
         .map_err(|e| Error::Internal(format!("read task failed: {e}")))?
     }
+
+    /// Runs `read` in a read transaction, then `write` with its result in a write
+    /// transaction, both on one blocking thread. The writer is held only for `write`, so
+    /// the work in `read` neither waits for other writes nor makes them wait. Other writes
+    /// may commit between the two: `write` checks whatever it relies on from `read`.
+    pub(crate) async fn read_then_write<M: Send + 'static, T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Ctx<'_>) -> Result<M> + Send + 'static,
+        write: impl FnOnce(&mut Ctx<'_>, M) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let (db, settings) = (&state.inner.db, &state.inner.settings);
+            let found = db.read(state.now(), settings, read)?;
+            db.write(|| state.now(), settings, |cx| write(cx, found))
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("read and write task failed: {e}")))?
+    }
 }

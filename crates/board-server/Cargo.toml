@@ -27,6 +27,8 @@ toml = { version = "1.2.0", default-features = false, features = ["parse", "serd
 tracing = "0.1.44"
 
 [dev-dependencies]
+# Tests record the SQL a request runs, to hold its statement count down.
+rusqlite = { version = "0.41.1", features = ["trace"] }
 tempfile = "3"
 tower = { version = "0.5.3", features = ["util"] }
 

@@ -10,11 +10,13 @@ export const tags = {
   asks: "asks",
   /** Tasks across boards, such as the agents screen's current tasks. */
   tasks: "tasks",
-  /** What coordinators said at the end of their turns (the agents screen's said lists). */
+  /** Every list of what a coordinator said at the end of its turns (the agents screen). */
   said: "said",
   board: (slug: string) => `board:${slug}`,
   task: (id: string) => `task:${id}`,
   handoff: (agentId: string) => `handoff:${agentId}`,
+  /** One agent's said list: a turn ending changes only the list of the agent it ends. */
+  saidOf: (agentId: string) => `said:${agentId}`,
 } as const;
 
 /** Lease and file-touch events change nothing the web view shows (they appear in the feed). */
@@ -72,8 +74,9 @@ export function tagsForEvent(event: BoardEvent): string[] {
       out.push(tags.agents, tags.boards);
       break;
     case "agent_state_changed":
-      // A coordinator's turn ending is stored on the same Stop that changes its state.
-      out.push(tags.agents, tags.boards, tags.said);
+      // A coordinator's turn ending is stored on the same Stop that changes its state: its
+      // own said list changes, no other agent's.
+      out.push(tags.agents, tags.boards, tags.saidOf(event.actor));
       break;
     case "ask_created":
     case "ask_answered":

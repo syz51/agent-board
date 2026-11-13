@@ -9,7 +9,7 @@ use crate::config::Settings;
 use crate::db::{Ctx, enum_str, live_sql, parse_id};
 use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
-use crate::store::{agent_missing, board_missing, get_board};
+use crate::store::{agent_missing, board_missing, get_board, get_board_uncounted};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
 use board_proto::{BOARD_TITLE_LONGER_TEXT_GOES, PARALLEL_TASKS_MAX};
 
@@ -513,7 +513,7 @@ pub(crate) fn sweep_temporary(cx: &mut Ctx<'_>, slug: &BoardSlug) -> Result<Opti
 }
 
 pub(crate) fn join(cx: &mut Ctx<'_>, slug: &BoardSlug, agent: &AgentId) -> Result<Board> {
-    get_board(cx, slug)?;
+    get_board_uncounted(cx, slug)?;
     touch_agent(cx, agent)?;
     join_board(cx, slug, agent)?;
     get_board(cx, slug)

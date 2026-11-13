@@ -28,7 +28,7 @@ use crate::ops::tasks::{
 };
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
-    get_board, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
+    get_board_uncounted, handle_of, is_live, json_ids, latest_events, load_agents, load_tasks,
 };
 use crate::text::{ago, cut, display_path, escape_json_text, quote};
 
@@ -286,6 +286,7 @@ struct Recent {
 }
 
 /// A validated snapshot request.
+#[derive(Clone)]
 pub(crate) struct Request {
     pub agent: AgentId,
     pub kind: SnapshotKind,
@@ -302,19 +303,28 @@ struct ShownCounts {
 /// A rendered snapshot, with what [`advance`] records when the agent itself asked for it.
 pub(crate) struct Rendered {
     pub snapshot: Snapshot,
-    agent: AgentId,
+    /// What was asked for, so [`advance`] can render it again.
+    req: Request,
+    /// The agent's cursor and stored counts as the render read them.
+    seen: Seen,
     /// The board counts shown, to compare the next delta with; `None` keeps the stored ones.
     shown: Option<ShownCounts>,
+}
+
+/// An agent's cursor and the board counts last shown to it, as stored.
+type Seen = (i64, Option<String>);
+
+const SEEN: &str = "SELECT cursor, last_counts FROM agents WHERE id = ?1";
+
+fn seen_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Seen> {
+    Ok((r.get(0)?, r.get(1)?))
 }
 
 /// Renders a snapshot and changes nothing, so a read transaction can run it.
 pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     let agent = get_agent(cx, &req.agent)?;
-    let (cursor, shown): (i64, Option<String>) = cx.db.query_row(
-        "SELECT cursor, last_counts FROM agents WHERE id = ?1",
-        [agent.id.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let seen = cx.db.query_row(SEEN, [agent.id.as_str()], seen_row)?;
+    let (cursor, shown) = (seen.0, seen.1.as_deref());
     let since = req.since.unwrap_or(cursor);
     let seq = cx.max_seq()?;
     let board = primary_board(cx, &agent)?;
@@ -390,7 +400,7 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             }
         }
         SnapshotKind::Delta => {
-            let before: Option<ShownCounts> = shown.as_deref().map(parse_json).transpose()?;
+            let before: Option<ShownCounts> = shown.map(parse_json).transpose()?;
             if shown_now.is_some() && before != shown_now {
                 model.counts = board_counts;
             }
@@ -423,22 +433,40 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
             held_for_usage: hold_usage.is_some(),
             stood_down,
         },
-        agent: agent.id,
+        req,
+        seen,
         shown,
     })
 }
 
 /// Records that the agent itself saw `rendered`: it counts as seen, and its cursor and
-/// shown counts move past it. Runs in the write transaction that rendered it.
+/// shown counts move past it.
+///
+/// The render ran in a read transaction, so the single writer is held only for this short
+/// step. Events committed since have a `seq` above the rendered one, so the cursor stays
+/// behind them and the next snapshot shows them. Only another snapshot of the same agent
+/// changes what this one should have shown: it moves the cursor or the stored counts. When
+/// either moved, the snapshot is rendered again here, in the transaction that advances it,
+/// so no alert or count change is shown twice.
 pub(crate) fn advance(cx: &mut Ctx<'_>, rendered: Rendered) -> Result<Snapshot> {
-    crate::ops::touch_agent(cx, &rendered.agent)?;
+    let agent = rendered.req.agent.clone();
+    let seen = cx
+        .db
+        .query_row(SEEN, [agent.as_str()], seen_row)
+        .optional()?;
+    let rendered = if seen.as_ref() == Some(&rendered.seen) {
+        rendered
+    } else {
+        snapshot(cx, rendered.req)?
+    };
+    crate::ops::touch_agent(cx, &agent)?;
     let shown = rendered
         .shown
         .map(|s| serde_json::to_string(&s).expect("serializes"));
     cx.db.execute(
         "UPDATE agents SET cursor = MAX(cursor, ?2), last_counts = COALESCE(?3, last_counts) \
          WHERE id = ?1",
-        params![rendered.agent.as_str(), rendered.snapshot.seq, shown],
+        params![agent.as_str(), rendered.snapshot.seq, shown],
     )?;
     Ok(rendered.snapshot)
 }
@@ -1767,7 +1795,7 @@ fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str])
     };
     let board: BoardSlug = parse_id(&board)?;
     Ok(gone
-        && get_board(cx, &board)?
+        && get_board_uncounted(cx, &board)?
             .coordinator
             .is_some_and(|c| c.as_str() == me))
 }
@@ -1818,7 +1846,7 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
     else {
         return Ok(None);
     };
-    let board = get_board(cx, &task.board)?;
+    let board = get_board_uncounted(cx, &task.board)?;
     if !nobody_runs(&board) {
         return Ok(None);
     }
@@ -1872,7 +1900,7 @@ const LEFT_REVIEWS_SHOWN: usize = 5;
 /// itself is shown: whoever works on the board next closes what has merged. A task the
 /// event scan already alerted on is not named twice.
 fn left_reviews(cx: &Ctx<'_>, model: &mut Model, agent: &Agent, board: &BoardSlug) -> Result<()> {
-    if !nobody_runs(&get_board(cx, board)?) {
+    if !nobody_runs(&get_board_uncounted(cx, board)?) {
         return Ok(());
     }
     let in_review: Vec<TaskId> = cx
@@ -1945,7 +1973,7 @@ fn idle_notice_for(
         since.is_some_and(|s| cx.now - s >= TimeDelta::milliseconds(2 * cx.s.doing_idle_ms()));
     let board: BoardSlug = parse_id(&board)?;
     Ok((!t3 || long)
-        && get_board(cx, &board)?
+        && get_board_uncounted(cx, &board)?
             .coordinator
             .is_some_and(|c| c.as_str() == me))
 }
