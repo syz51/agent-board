@@ -60,12 +60,20 @@ fn install_claude_merges_into_existing_settings_without_losing_keys() {
         "guard.sh"
     );
     let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre.len(), 2, "the user's hook is kept: {pre:?}");
+    assert_eq!(pre.len(), 3, "the user's hook is kept: {pre:?}");
     assert_eq!(pre[1]["matcher"], "Bash");
+    // The launch check of the device limit, with time for T3 to list the threads.
     assert_eq!(
-        pre[1]["hooks"][0]["command"],
-        "/opt/bin/board hook pre-tool-use --runtime claude"
+        pre[2]["matcher"],
+        "mcp__.*__(delegate_task|t3_thread_launch|create_threads)"
     );
+    assert_eq!(pre[2]["hooks"][0]["timeout"], 10);
+    for entry in &pre[1..] {
+        assert_eq!(
+            entry["hooks"][0]["command"],
+            "/opt/bin/board hook pre-tool-use --runtime claude"
+        );
+    }
     let stop = v["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(stop.len(), 2);
     assert_eq!(stop[0]["hooks"][0]["command"], "afplay done.aiff");

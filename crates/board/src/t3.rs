@@ -152,6 +152,10 @@ pub trait T3: Send + Sync {
         project: &Path,
         title: &str,
     ) -> impl Future<Output = Result<Vec<ListedThread>>> + Send;
+
+    /// The ids of the threads with a run in progress in the project containing `project`,
+    /// whoever started them.
+    fn running_threads(&self, project: &Path) -> impl Future<Output = Result<Vec<String>>> + Send;
 }
 
 /// The real `t3` binary.
@@ -226,6 +230,17 @@ impl T3Cli {
         Ok(Some(
             serde_json::from_str(&stdout).context("t3 thread show --json")?,
         ))
+    }
+
+    /// `t3 thread list --json --project <project>`, parsed.
+    async fn thread_list(&self, project: &Path) -> Result<Value> {
+        let project = project.to_string_lossy();
+        let args = ["thread", "list", "--json", "--project", &project];
+        let (ok, stdout, stderr) = self.run(&args, None).await?;
+        if !ok {
+            bail!("t3 thread list failed: {}", stderr.trim());
+        }
+        serde_json::from_str(&stdout).context("t3 thread list --json")
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
@@ -316,14 +331,14 @@ impl T3 for T3Cli {
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
-        let project = project.to_string_lossy();
-        let args = ["thread", "list", "--json", "--project", &project];
-        let (ok, stdout, stderr) = self.run(&args, None).await?;
-        if !ok {
-            bail!("t3 thread list failed: {}", stderr.trim());
-        }
-        let value: Value = serde_json::from_str(&stdout).context("t3 thread list --json")?;
-        Ok(parse_threads_titled(&value, title))
+        Ok(parse_threads_titled(
+            &self.thread_list(project).await?,
+            title,
+        ))
+    }
+
+    async fn running_threads(&self, project: &Path) -> Result<Vec<String>> {
+        Ok(parse_running_threads(&self.thread_list(project).await?))
     }
 }
 
@@ -361,6 +376,24 @@ pub fn parse_threads_titled(value: &Value, title: &str) -> Vec<ListedThread> {
                 ran: !run.is_null() || items > 0,
             })
         })
+        .collect()
+}
+
+/// The ids of the threads in `t3 thread list --json` output with a run that has not ended:
+/// `status` is one of [`BUSY_STATUSES`]. A run that prepares, waits in T3's queue or waits
+/// for a child or a background job still holds its agent process, so it counts as one that
+/// runs. A status this list does not name counts as ended.
+pub fn parse_running_threads(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| {
+            t["status"]
+                .as_str()
+                .is_some_and(|s| BUSY_STATUSES.contains(&s))
+        })
+        .filter_map(|t| t["threadId"].as_str().map(str::to_owned))
         .collect()
 }
 
@@ -602,6 +635,30 @@ mod tests {
             ]
         );
         assert!(parse_threads_titled(&json!({}), "f coordinator").is_empty());
+    }
+
+    #[test]
+    fn running_threads_are_those_with_a_run_in_progress() {
+        let value = json!([
+            {"threadId": "a", "status": "running", "createdBy": "user"},
+            {"threadId": "b", "status": "waiting", "createdBy": "agent"},
+            {"threadId": "c", "status": "completed"},
+            {"threadId": "mcp:d", "status": "running", "createdBy": "agent"},
+            {"status": "running"},
+            {"threadId": "e", "status": "preparing"},
+            {"threadId": "f", "status": "queued"},
+            {"threadId": "g", "status": "starting"},
+            {"threadId": "h", "status": "interrupted"},
+            {"threadId": "i", "status": "failed"},
+            {"threadId": "j", "status": "cancelled"},
+            {"threadId": "k", "status": "new-status"},
+            {"threadId": "l"},
+        ]);
+        assert_eq!(
+            parse_running_threads(&value),
+            ["a", "b", "mcp:d", "e", "f", "g"]
+        );
+        assert!(parse_running_threads(&json!({"error": "x"})).is_empty());
     }
 
     #[test]

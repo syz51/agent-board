@@ -9,7 +9,8 @@
 //! - Stop: never blocks (a block would continue the turn after the agent's report); Codex
 //!   requires JSON on stdout, so it gets `{}`.
 //! - PreCompact (Claude Code): plain stdout becomes compaction instructions.
-//! - PreToolUse (shell calls only): prints nothing, which lets the call run.
+//! - PreToolUse: prints nothing for a shell call, which lets the call run; refuses a T3
+//!   launch past the device's run limit with `permissionDecision: deny` (`hook/launch.rs`).
 //! - StopFailure and SessionEnd: output is ignored.
 
 use std::collections::HashSet;
@@ -34,6 +35,8 @@ use crate::mcp;
 use crate::render;
 use crate::state::{self, AgentLocal, SessionLocal, ThreadRead, ToolStart};
 use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
+
+mod launch;
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
 const DELEGATED_THREAD: &str = "thread:delegated-task:";
@@ -172,6 +175,8 @@ enum Reply {
     Plain(String),
     /// Stop the turn now, telling the user why: a paused board holds the agent.
     Halt(String),
+    /// Refuse the tool call of a `PreToolUse` hook, telling the agent why and what to do.
+    Deny(String),
 }
 
 /// Entry point: reads stdin, handles the event, prints the reply. Never fails.
@@ -180,7 +185,12 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let guard = guard(started.elapsed(), share_override());
+    let guard = if event == HookEvent::PreToolUse && launch::is_launch(&input) {
+        // The launch check waits for T3 to list the device's threads.
+        launch::BUDGET
+    } else {
+        guard(started.elapsed(), share_override())
+    };
     let reply = match tokio::time::timeout(
         guard,
         handle(event, runtime, explicit_agent, &input, started),
@@ -233,6 +243,16 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
         ),
         Reply::Plain(text) => Some(text),
         Reply::Halt(reason) => Some(json!({"continue": false, "stopReason": reason}).to_string()),
+        Reply::Deny(reason) => Some(
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": event.name(),
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+            .to_string(),
+        ),
         // Codex rejects plain or empty output from Stop.
         Reply::Nothing if event == HookEvent::Stop && runtime == Runtime::Codex => {
             Some("{}".into())
@@ -283,6 +303,9 @@ async fn handle(
     let shell_call = (input["tool_name"] == SHELL_TOOL)
         .then(|| input["tool_use_id"].as_str().filter(|s| !s.is_empty()))
         .flatten();
+    if event == HookEvent::PreToolUse && launch::is_launch(input) {
+        return launch::check(&home, runtime, explicit_agent, input).await;
+    }
     if event == HookEvent::PreToolUse {
         // Runs before every shell call: local only, no token or server. Logged out, no
         // PostToolUse could report the call, so it leaves no mark.

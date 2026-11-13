@@ -582,17 +582,23 @@ impl<T: T3> Daemon<T> {
             }
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
+            self.read_running().await;
             let limit = self.run_limit();
             if self.runs() >= limit || self.judge_turns.another_first(slug, waited) {
                 if self.judge_turns.wait(slug, waited, now) {
                     tracing::info!(
-                        "{slug}: `{}` waits for one of the {limit} runs of this device",
-                        want.title
+                        "{slug}: `{}` waits for one of the {limit} runs of this device; {}",
+                        want.title,
+                        self.load()
                     );
                 }
+                // A held judge gets no note, since a note on an owned task wakes its
+                // owner: the device's trail file is its record.
+                self.record_hold("judge", slug, &want.title, limit, now);
                 break;
             }
             let names = want.title.clone();
+            self.held.remove(&format!("judge {names}"));
             match self.start_judge(board, &client, &project, want, now).await {
                 Ok(()) => {
                     started += 1;

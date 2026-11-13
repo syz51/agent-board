@@ -107,6 +107,10 @@ fn hook_route(method: &Method, path: &str, agent: &AgentId) -> bool {
         ["snapshot"] | ["boards"] | ["tasks"] => method == Method::GET,
         ["agents", id, "state"] => method == Method::POST && *id == own,
         ["agents", id, "handoff"] => method == Method::GET && *id == own,
+        // The record of a launch the device limit refused (`hook/launch.rs`).
+        ["tasks", id, "notes"] => {
+            method == Method::POST && id.parse::<board_proto::TaskId>().is_ok()
+        }
         _ => false,
     }
 }
@@ -568,6 +572,7 @@ mod tests {
             (Method::GET, "/v1/boards".to_owned()),
             (Method::GET, "/v1/tasks".to_owned()),
             (Method::POST, "/v1/touches".to_owned()),
+            (Method::POST, "/v1/tasks/factory-1/notes".to_owned()),
         ];
         for (method, path) in &ok {
             assert!(hook_route(method, path, &me), "{method} {path}");
@@ -583,6 +588,9 @@ mod tests {
             (Method::POST, "/v1/agents/../tasks".to_owned()),
             (Method::POST, "/v1/tasks".to_owned()),
             (Method::POST, "/v1/tasks/factory-1/claim".to_owned()),
+            (Method::GET, "/v1/tasks/factory-1/notes".to_owned()),
+            (Method::POST, "/v1/tasks/../notes".to_owned()),
+            (Method::POST, "/v1/tasks/factory-1/notes/2".to_owned()),
             (Method::POST, "/v1/asks".to_owned()),
             (Method::GET, "/v1/admin/devices".to_owned()),
             (Method::GET, "/v1/events".to_owned()),

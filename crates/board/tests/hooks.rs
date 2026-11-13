@@ -3491,3 +3491,416 @@ fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
     let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
     assert_eq!(cached, json!({"nested": false}));
 }
+
+/// A device that may run `limit` agent turns, with one T3 project whose `t3` lists
+/// `running` threads with a turn in progress and one idle thread.
+#[cfg(unix)]
+fn device_with_turns(e: &Env, limit: usize, running: &[&str]) -> PathBuf {
+    let (t3, log, answer) = fake_t3(&e.home, false);
+    let mut threads: Vec<Value> = running
+        .iter()
+        .map(|id| json!({"threadId": id, "status": "running", "createdBy": "user"}))
+        .collect();
+    threads.push(json!({"threadId": "idle-1", "status": "completed", "createdBy": "agent"}));
+    std::fs::write(&answer, Value::from(threads).to_string()).unwrap();
+    let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "{config}runs_at_once = {limit}\nt3_bin = {t3:?}\n[projects]\n\"github.com/syz51/agent-board\" = {:?}\n",
+            e.repo
+        ),
+    )
+    .unwrap();
+    log
+}
+
+/// The records of refused launches this device keeps.
+fn refused_launches(e: &Env) -> Vec<Value> {
+    let Ok(dir) = std::fs::read_dir(e.home.join("state/refused-launches")) else {
+        return Vec::new();
+    };
+    dir.map(|f| serde_json::from_slice(&std::fs::read(f.unwrap().path()).unwrap()).unwrap())
+        .collect()
+}
+
+fn launch(e: &Env, tool: &str, input: Value) -> Value {
+    e.with(
+        "PreToolUse",
+        json!({"tool_name": tool, "tool_use_id": "toolu_launch_1", "tool_input": input}),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_launch_at_the_device_limit_is_refused_and_its_whole_call_is_kept() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    let mut doing = task_fixture("factory-4", "Build the counter");
+    doing.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", vec![doing]);
+    e.stub.on(
+        "POST /v1/tasks/factory-4/notes",
+        json!({
+            "id": 77, "task": "factory-4", "agent": CLAUDE_AGENT, "kind": "note",
+            "text": "x", "at": at(),
+        }),
+    );
+    let brief = "Review the diff.\n".repeat(400);
+    let call = json!({"task": brief, "title": "Review the counter", "isolation": "worktree"});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call.clone()),
+    );
+
+    let out = &reply.unwrap_or_else(|| panic!("no refusal\n{}", e.ran()))["hookSpecificOutput"];
+    assert_eq!(out["hookEventName"], "PreToolUse");
+    assert_eq!(out["permissionDecision"], "deny");
+    let reason = out["permissionDecisionReason"].as_str().unwrap();
+    assert!(
+        reason.contains("has 2 of 2 agent turns running and this launch asks for 1 more"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("Note #77 on factory-4 records the refusal."),
+        "{reason}\n{}",
+        e.ran()
+    );
+
+    // The file keeps the call as it was made, with the time, the cause and the threads.
+    let kept = refused_launches(&e);
+    assert_eq!(kept.len(), 1, "{}", e.ran());
+    let kept = &kept[0];
+    assert_eq!(kept["input"], call);
+    assert_eq!(kept["tool"], "mcp__t3-code__delegate_task");
+    assert_eq!(kept["tool_use"], "toolu_launch_1");
+    assert_eq!(kept["session"], SESSION);
+    assert_eq!(kept["running"], json!(["thread-a", "thread-b"]));
+    assert_eq!((&kept["limit"], &kept["asked"]), (&json!(2), &json!(1)));
+    assert!(
+        kept["at"].is_string() && kept["cause"].is_string(),
+        "{kept}"
+    );
+    let file = std::fs::read_dir(e.home.join("state/refused-launches"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(reason.contains(file.to_str().unwrap()), "{reason}");
+
+    // The note on the task the agent works on names the cause and the file.
+    let listed = &e.stub.requests_to("GET /v1/tasks")[0];
+    let query = listed.query_pairs();
+    assert_eq!(query["owner"], CLAUDE_AGENT);
+    assert_eq!(query["status"], "doing");
+    let note = &e.stub.requests_to("POST /v1/tasks/factory-4/notes")[0].body;
+    assert_eq!(note["agent"], CLAUDE_AGENT);
+    assert_eq!(note["kind"], "note");
+    let text = note["text"].as_str().unwrap();
+    assert!(text.contains("has 2 of 2 agent turns running"), "{text}");
+    assert!(text.contains("title \"Review the counter\""), "{text}");
+    assert!(text.contains(file.to_str().unwrap()), "{text}");
+    assert!(text.chars().count() <= 800);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_launch_is_kept_without_a_task_or_a_server() {
+    // No task in doing: the file is the record.
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let call = json!({"title": "Second thread", "message": "Do the thing."});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__t3_thread_launch", call.clone()),
+    );
+    let out = &reply.unwrap_or_else(|| panic!("no refusal\n{}", e.ran()))["hookSpecificOutput"];
+    assert_eq!(out["permissionDecision"], "deny");
+    let reason = out["permissionDecisionReason"].as_str().unwrap();
+    assert!(!reason.contains("Note #"), "{reason}");
+    assert_eq!(refused_launches(&e)[0]["input"], call);
+
+    // The server does not answer: the launch is refused all the same, with its file.
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    e.stub
+        .on_error("GET /v1/tasks", 500, "internal", "no", "retry");
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", json!({"task": "x"})),
+    );
+    assert_eq!(
+        reply.unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny",
+        "{}",
+        e.ran()
+    );
+    assert_eq!(refused_launches(&e).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_launch_runs_while_the_device_has_a_free_slot() {
+    let e = env();
+    let log = device_with_turns(&e, 3, &["thread-a", "thread-b"]);
+    let one = launch(&e, "mcp__t3-code__delegate_task", json!({"task": "x"}));
+    let (reply, text) = e.hook("pre-tool-use", "claude", one);
+    assert_eq!((reply, text.as_str()), (None, ""), "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+    assert!(e.stub.requests().is_empty(), "{}", e.ran());
+    let asked = std::fs::read_to_string(&log).unwrap();
+    assert!(asked.contains("thread list --json --project"), "{asked}");
+
+    // `create_threads` asks for each thread of its list: two do not fit one free slot.
+    let two = json!({"threads": [{"title": "a", "prompt": "p"}, {"title": "b", "prompt": "q"}]});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__create_threads", two),
+    );
+    let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    assert!(
+        reason
+            .as_str()
+            .unwrap()
+            .contains("this launch asks for 2 more"),
+        "{reason}"
+    );
+    assert_eq!(refused_launches(&e)[0]["asked"], 2);
+}
+
+/// The limit holds what agents start. A turn the user starts, and every other tool call,
+/// runs on a full device, and no hook but a launch's asks T3 for the device's threads.
+#[cfg(unix)]
+#[test]
+fn a_full_device_refuses_no_turn_of_the_user_and_no_other_tool() {
+    let e = env();
+    let log = device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+    let prompt = e.with("UserPromptSubmit", json!({"prompt": "go on"}));
+    let (_, text) = e.hook("user-prompt-submit", "claude", prompt);
+    assert!(
+        !text.contains("deny") && !text.contains("\"continue\":false"),
+        "{text}"
+    );
+    for tool in ["Bash", "Agent", "mcp__t3-code__t3_thread_send"] {
+        let call = e.with(
+            "PreToolUse",
+            json!({"tool_name": tool, "tool_use_id": "toolu_2", "tool_input": {"command": "ls"}}),
+        );
+        let (_, text) = e.hook("pre-tool-use", "claude", call);
+        assert_eq!(text, "", "{tool}: {}", e.ran());
+    }
+    // A launch for another device is not this device's to count.
+    let away = json!({"task": "x", "target": {"environmentId": "env-2"}});
+    let (_, text) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", away),
+    );
+    assert_eq!(text, "", "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+    let asked = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!asked.contains("thread list"), "{asked}");
+}
+
+/// An agent that makes a refused call again leaves one record with every refusal and one
+/// note, not a copy of the call and a note per attempt.
+#[cfg(unix)]
+#[test]
+fn a_launch_refused_again_adds_to_its_record_and_notes_once() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    let mut doing = task_fixture("factory-4", "Build the counter");
+    doing.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", vec![doing]);
+    e.stub.on(
+        "POST /v1/tasks/factory-4/notes",
+        json!({
+            "id": 77, "task": "factory-4", "agent": CLAUDE_AGENT, "kind": "note",
+            "text": "x", "at": at(),
+        }),
+    );
+    let call = json!({"task": "Review the diff.", "title": "Review"});
+    let refuse = |call: &Value| {
+        let (reply, _) = e.hook(
+            "pre-tool-use",
+            "claude",
+            launch(&e, "mcp__t3-code__delegate_task", call.clone()),
+        );
+        let out = reply.unwrap_or_else(|| panic!("no refusal\n{}", e.ran()));
+        let out = &out["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny");
+        out["permissionDecisionReason"].as_str().unwrap().to_owned()
+    };
+    let first = refuse(&call);
+    assert!(first.contains("refused this launch:"), "{first}");
+    let second = refuse(&call);
+    assert!(second.contains("refused this launch again"), "{second}");
+    let third = refuse(&call);
+
+    let kept = refused_launches(&e);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["input"], call);
+    let again = kept[0]["again"].as_array().unwrap();
+    assert_eq!(again.len(), 2, "{again:?}");
+    for refusal in again {
+        assert!(refusal["at"].is_string(), "{refusal}");
+        assert!(
+            refusal["cause"].as_str().unwrap().contains("2 of 2"),
+            "{refusal}"
+        );
+        assert_eq!(refusal["running"], json!(["thread-a", "thread-b"]));
+    }
+    let file = std::fs::read_dir(e.home.join("state/refused-launches"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for reason in [&second, &third] {
+        assert!(reason.contains(file.to_str().unwrap()), "{reason}");
+    }
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
+        1,
+        "{}",
+        e.ran()
+    );
+
+    // Another call is another record.
+    refuse(&json!({"task": "Review the other diff.", "title": "Review"}));
+    assert_eq!(refused_launches(&e).len(), 2);
+}
+
+/// A refusal tells the agent what can work: a call that asks for as many threads as the
+/// device runs can never fit, so it is not told to make the call again.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_can_never_fit_is_not_told_to_try_again() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let two = json!({"threads": [{"title": "a", "prompt": "p"}, {"title": "b", "prompt": "q"}]});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__create_threads", two),
+    );
+    let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    let reason = reason.as_str().unwrap();
+    assert!(reason.contains("can never run as it is"), "{reason}");
+    assert!(reason.contains("Ask for fewer threads"), "{reason}");
+    assert!(!reason.contains("make the same call again"), "{reason}");
+}
+
+/// A launch that names this device's own T3 environment is counted like one that names
+/// none, and in a list only the threads for other devices are left out.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_names_this_devices_environment_is_counted() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let sessions = e.home.join("state/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("claude-{SESSION}.json")),
+        json!({"nested": false, "t3_link": "https://app.example.test/threads/env-1/thread-1"})
+            .to_string(),
+    )
+    .unwrap();
+    let decision = |tool: &str, call: Value| {
+        let (reply, _) = e.hook("pre-tool-use", "claude", launch(&e, tool, call));
+        reply.map(|r| r["hookSpecificOutput"]["permissionDecisionReason"].clone())
+    };
+
+    let here = json!({"task": "x", "target": {"environmentId": "env-1"}});
+    assert!(
+        decision("mcp__t3-code__delegate_task", here).is_some(),
+        "{}",
+        e.ran()
+    );
+    let away = json!({"task": "x", "target": {"environmentId": "env-2"}});
+    assert_eq!(decision("mcp__t3-code__delegate_task", away), None);
+
+    let mixed = json!({"threads": [
+        {"title": "a", "target": {"environmentId": "env-2"}},
+        {"title": "b"},
+        {"title": "c", "target": {"environmentId": "env-1"}},
+    ]});
+    let reason = decision("mcp__t3-code__create_threads", mixed).unwrap();
+    assert!(
+        reason
+            .as_str()
+            .unwrap()
+            .contains("this launch asks for 2 more"),
+        "{reason}"
+    );
+    let all_away = json!({"threads": [{"title": "a", "target": {"environmentId": "env-2"}}]});
+    assert_eq!(decision("mcp__t3-code__create_threads", all_away), None);
+}
+
+/// The check fails open: when it cannot count or cannot keep the call, the launch runs.
+/// A refusal without its record would lose the call.
+#[cfg(unix)]
+#[test]
+fn a_launch_runs_when_the_check_cannot_count_or_keep_it() {
+    let call = || json!({"task": "x", "title": "t"});
+    let run = |e: &Env| {
+        let started = std::time::Instant::now();
+        let out = e.hook_output(
+            "pre-tool-use",
+            "claude",
+            launch(e, "mcp__t3-code__delegate_task", call()),
+            &[],
+        );
+        (out, started.elapsed())
+    };
+
+    // T3 fails: no thread is counted.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    common::script::write_script(&e.home.join("t3"), "#!/bin/sh\necho broken >&2\nexit 1\n");
+    let (out, _) = run(&e);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+
+    // T3 answers too late: the hook does not wait for it.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    let answer = e.home.join("t3-answer.json");
+    common::script::write_script(
+        &e.home.join("t3"),
+        &format!("#!/bin/sh\nsleep 7\ncat '{}'\n", answer.display()),
+    );
+    let (out, took) = run(&e);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "{}", e.ran());
+    assert!(took < std::time::Duration::from_secs(7), "{took:?}");
+    assert!(refused_launches(&e).is_empty());
+
+    // The record cannot be written: no refusal without it.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    std::fs::create_dir_all(e.home.join("state")).unwrap();
+    std::fs::write(e.home.join("state/refused-launches"), "not a directory").unwrap();
+    let (out, _) = run(&e);
+    assert!(
+        !stdout(&out).contains("deny"),
+        "{}\n{}",
+        stdout(&out),
+        e.ran()
+    );
+    assert!(e.stub.requests().is_empty(), "{}", e.ran());
+}
