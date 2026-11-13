@@ -286,7 +286,6 @@ struct Recent {
 }
 
 /// A validated snapshot request.
-#[derive(Clone)]
 pub(crate) struct Request {
     pub agent: AgentId,
     pub kind: SnapshotKind,

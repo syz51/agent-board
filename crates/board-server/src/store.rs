@@ -702,8 +702,10 @@ pub(crate) fn load_agents(
         .prepare_cached(&sql)?
         .query_map(extra.as_slice(), agent_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if let [agent] = agents.as_mut_slice() {
-        agent.boards = agent_boards(cx, &agent.id)?;
+    if agents.len() <= 1 {
+        if let Some(agent) = agents.first_mut() {
+            agent.boards = agent_boards(cx, &agent.id)?;
+        }
         return Ok(agents);
     }
     // Every agent's boards in one query, each agent's in the order `agent_boards` gives.
