@@ -781,6 +781,36 @@ async fn a_task_done_in_its_blockers_pr_is_claimed_while_the_blocker_is_in_revie
     assert!(s.is_success(), "{v}");
     assert_eq!(v["status"], "doing");
 
+    // A move to doing checks the owner the request leaves: B's blocked task waiting on A's
+    // blocker in review is refused for B, and allowed when handed to A in the same request.
+    let handed = t.task(A, "factory", "Handed over").await;
+    assert!(t.claim(B, &handed).await.0.is_success());
+    let (s, v) = t
+        .patch(
+            B,
+            &handed,
+            json!({ "status": "blocked", "blockers": [own] }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t.patch(B, &handed, json!({ "status": "doing" })).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains("a blocker in review that is an ancestor of the task or yours"),
+        "{v}"
+    );
+    let (s, v) = t
+        .patch(B, &handed, json!({ "status": "doing", "owner": A }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(A))
+    );
+
     // A take of an open task with a stale owner follows the same rule.
     let taken = waiting_on(&parent, Some(&parent)).await;
     t.exec(&format!(

@@ -442,8 +442,8 @@ Reopening a closed board, or any change on it, starts the period again.
     starts at once no longer races the coordinator for it. It is checked as a claim is,
     before anything is written: 409 `claim_refused` at the caller's `doing` limit (the
     error names the task in `doing` and says to move it to `review` or `blocked` first), and
-    400 `invalid_transition` while a blocker is not done or `not_before` is ahead. A refused
-    request creates nothing and uses no task number. The `task_created` payload then also
+    400 `invalid_transition` while a blocker is not done (a blocker in `review` excepted as
+    for a claim, below) or `not_before` is ahead. A refused request creates nothing and uses no task number. The `task_created` payload then also
     has `"claimed": true`, and a `task_claimed` event (`previous_owner: null`) follows.
     A body starting `Proposal:` with `claim: true` is 400 `invalid`: the agent that files a
     proposal cannot start it.
