@@ -1196,11 +1196,13 @@ would add up without end. Each run is an agent session of some hundred MiB of me
 its builds take more. So the device has one limit on the runs it has at once, workers and
 judges together, across its daemon-dispatch boards: `runs_at_once` in `config.toml`, or
 without it one run per 4 GiB of host memory and at least 2 (4 when the memory cannot be
-read). Workers leave one slot of the limit to judges, since a judge ends work already in
-progress; with a limit of 1 a worker may take it. A board that was refused a slot gets the
-next free one before a board that asked later, workers and judges each in their own queue;
-a board that has not asked for 10 minutes loses its place. A run recorded for a board the
-device no longer dispatches takes no slot. The limit counts the daemon's runs only, not
+read; the memory is rounded to the nearest 4 GiB). Workers take all but one slot of the
+limit, which is left to judges, since a judge ends work already in progress; with a limit
+of 1 a worker may take it. A board that was refused a slot gets the next free one before a
+board that asked later, workers and judges each in their own queue. A board that gets a
+slot goes to the end of the queue, and one that did not ask again in the last reconcile
+loses its place. The runs of a paused board count while they last. A run recorded for a
+board the device no longer hosts takes no slot. The limit counts the daemon's runs only, not
 threads the user or a coordinator thread started.
 
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>

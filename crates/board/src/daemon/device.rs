@@ -11,7 +11,6 @@
 use std::collections::BTreeMap;
 
 use board_proto::{BoardSlug, Timestamp};
-use chrono::TimeDelta;
 
 /// Host memory that allows one run, when `runs_at_once` is not set.
 pub const MEMORY_PER_RUN: u64 = 4 << 30;
@@ -22,14 +21,11 @@ pub const MIN_RUNS: usize = 2;
 /// The limit of a device whose memory could not be read.
 pub const FALLBACK_RUNS: usize = 4;
 
-/// How long a board keeps its place in the queue for a slot after it last asked: a board
-/// the device no longer dispatches must not hold the others back.
-pub const TURN_KEPT: TimeDelta = TimeDelta::minutes(10);
-
-/// The limit a device with `host_memory` bytes gets when `runs_at_once` is not set.
+/// The limit a device with `host_memory` bytes gets when `runs_at_once` is not set. The
+/// memory is rounded to the nearest run: a host reports somewhat less than it has.
 pub fn default_run_limit(host_memory: Option<u64>) -> usize {
     host_memory.map_or(FALLBACK_RUNS, |bytes| {
-        usize::try_from(bytes / MEMORY_PER_RUN)
+        usize::try_from(bytes.saturating_add(MEMORY_PER_RUN / 2) / MEMORY_PER_RUN)
             .unwrap_or(usize::MAX)
             .max(MIN_RUNS)
     })
@@ -84,19 +80,19 @@ impl Turns {
         self.waiting.remove(slug).map(|w| w.since)
     }
 
-    /// Whether a board other than `slug` has waited for a slot since before `since`
-    /// (`slug`'s own wait, if it waited) and asked within [`TURN_KEPT`].
-    pub fn another_first(
-        &self,
-        slug: &BoardSlug,
-        since: Option<Timestamp>,
-        now: Timestamp,
-    ) -> bool {
-        self.waiting.iter().any(|(other, w)| {
-            other != slug
-                && (TimeDelta::zero()..TURN_KEPT).contains(&(now - w.asked))
-                && since.is_none_or(|mine| w.since < mine)
-        })
+    /// Whether a board other than `slug` has waited for a slot since before `since`,
+    /// `slug`'s own wait, if it waited.
+    pub fn another_first(&self, slug: &BoardSlug, since: Option<Timestamp>) -> bool {
+        self.waiting
+            .iter()
+            .any(|(other, w)| other != slug && since.is_none_or(|mine| w.since < mine))
+    }
+
+    /// Drops the boards that have not asked since `last`, the reconcile before this one:
+    /// a board that no longer wants a slot, or that the device no longer dispatches, must
+    /// not hold the others back.
+    pub fn keep_asked_since(&mut self, last: Timestamp) {
+        self.waiting.retain(|_, w| w.asked >= last);
     }
 
     /// Records that `slug` was refused a slot at `now`, having waited since `since` if it
@@ -128,6 +124,8 @@ mod tests {
     #[test]
     fn the_default_limit_is_one_run_per_four_gib_and_at_least_two() {
         assert_eq!(default_run_limit(Some(16 << 30)), 4);
+        // A 16 GiB Linux host reports about 15.5 GiB.
+        assert_eq!(default_run_limit(Some(16_303_412 * 1024)), 4);
         assert_eq!(default_run_limit(Some(36 << 30)), 9);
         assert_eq!(default_run_limit(Some(4 << 30)), MIN_RUNS);
         assert_eq!(default_run_limit(Some(0)), MIN_RUNS);
@@ -152,21 +150,37 @@ mod tests {
     fn the_board_that_waited_longest_goes_first() {
         let (a, b) = (slug("alpha"), slug("beta"));
         let mut turns = Turns::default();
-        assert!(!turns.another_first(&a, None, at(0)));
+        assert!(!turns.another_first(&a, None));
         assert!(turns.wait(&b, None, at(0)));
         // `a` never waited, so `b` goes first; `b` itself is held back by nobody.
-        assert!(turns.another_first(&a, None, at(1)));
+        assert!(turns.another_first(&a, None));
         assert!(turns.wait(&a, None, at(1)));
         let since = turns.take(&b);
         assert_eq!(since, Some(at(0)));
-        assert!(!turns.another_first(&b, since, at(2)));
-        // Refused again, `b` keeps its place.
+        assert!(!turns.another_first(&b, since));
+        // Refused again without a start, `b` keeps its place.
         assert!(!turns.wait(&b, since, at(2)));
         let since = turns.take(&a);
-        assert!(turns.another_first(&a, since, at(3)));
+        assert!(turns.another_first(&a, since));
         // Once `b` is served, `a` is next.
         turns.take(&b);
-        assert!(!turns.another_first(&a, since, at(3)));
+        assert!(!turns.another_first(&a, since));
+    }
+
+    #[test]
+    fn a_board_that_was_served_waits_behind_the_boards_that_asked() {
+        let (a, b) = (slug("alpha"), slug("beta"));
+        let mut turns = Turns::default();
+        turns.wait(&a, None, at(0));
+        turns.wait(&b, None, at(1));
+        // `a` gets a slot, then is refused for its next task: its wait starts anew.
+        assert!(turns.take(&a).is_some());
+        assert!(turns.wait(&a, None, at(2)));
+        let since = turns.take(&b);
+        assert!(!turns.another_first(&b, since));
+        turns.wait(&b, since, at(3));
+        let since = turns.take(&a);
+        assert!(turns.another_first(&a, since));
     }
 
     #[test]
@@ -174,7 +188,12 @@ mod tests {
         let (a, b) = (slug("alpha"), slug("beta"));
         let mut turns = Turns::default();
         turns.wait(&b, None, at(0));
-        assert!(turns.another_first(&a, None, at(9)));
-        assert!(!turns.another_first(&a, None, at(10)));
+        // It asked in the last pass: kept.
+        turns.keep_asked_since(at(0));
+        assert!(turns.another_first(&a, None));
+        // It did not ask in the pass after: dropped, with its place.
+        turns.keep_asked_since(at(1));
+        assert!(!turns.another_first(&a, None));
+        assert_eq!(turns.take(&b), None);
     }
 }

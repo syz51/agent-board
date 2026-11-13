@@ -1617,6 +1617,8 @@ pub struct Daemon<T: T3> {
     /// The boards that wait for one of the device's worker slots, and for a judge slot.
     worker_turns: device::Turns,
     judge_turns: device::Turns,
+    /// The time of the last reconcile.
+    last_pass: Option<Timestamp>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1651,6 +1653,7 @@ impl<T: T3> Daemon<T> {
             default_run_limit: None,
             worker_turns: device::Turns::default(),
             judge_turns: device::Turns::default(),
+            last_pass: None,
         }
     }
 
@@ -1670,15 +1673,26 @@ impl<T: T3> Daemon<T> {
         )
     }
 
-    /// The runs this device has now, on every board it dispatches. A run recorded for a
-    /// board that left this device takes no slot: nothing here follows it to its end.
+    /// Whether the runs recorded for `slug` take slots of this device: it hosts the board
+    /// under daemon dispatch. A paused board counts, since its threads still run. A run
+    /// recorded for a board that left this device takes no slot: nothing here follows it
+    /// to its end.
+    fn counts_runs(&self, slug: &BoardSlug) -> bool {
+        self.boards
+            .get(slug)
+            .is_some_and(|b| b.dispatch == Dispatch::Daemon && self.hosts(b))
+    }
+
+    /// The workers this device has now, on every board.
+    fn worker_runs(&self) -> usize {
+        let workers = self.state.workers.keys();
+        workers.filter(|t| self.counts_runs(&t.board())).count()
+    }
+
+    /// The runs this device has now, workers and judges, on every board.
     fn runs(&self) -> usize {
-        let workers = self.state.workers.keys().map(TaskId::board);
-        let judges = self.state.judges.iter().map(|r| r.board.clone());
-        workers
-            .chain(judges)
-            .filter(|slug| self.dispatching(slug))
-            .count()
+        let judges = self.state.judges.iter();
+        self.worker_runs() + judges.filter(|r| self.counts_runs(&r.board)).count()
     }
 
     /// Reads, updates and merges pull requests through `gh` instead of the `gh` CLI.
@@ -1690,7 +1704,8 @@ impl<T: T3> Daemon<T> {
 
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
-    /// since a missing project may be what failed. `server`, `device`, `t3_bin` and
+    /// since a missing project may be what failed. `runs_at_once` takes effect at once
+    /// too. `server`, `device`, `t3_bin` and
     /// `[thread_model]` are fixed while the daemon runs, so changing them asks for a
     /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
@@ -1779,6 +1794,11 @@ impl<T: T3> Daemon<T> {
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         self.reconcile_began = tokio::time::Instant::now();
+        // A board that did not ask for a slot again in the last pass lost its place.
+        if let Some(last) = self.last_pass.replace(now) {
+            self.worker_turns.keep_asked_since(last);
+            self.judge_turns.keep_asked_since(last);
+        }
         let checks_until = self.reconcile_began + self.timing.reconcile_budget / 2;
         self.reload_config();
         let boards = self.client().boards().await?;
@@ -3133,7 +3153,7 @@ impl<T: T3> Daemon<T> {
         }
         self.save()?;
         // The board asks again below if it still wants one of the device's slots.
-        let waited = self.worker_turns.take(slug);
+        let mut waited = self.worker_turns.take(slug);
         let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
         if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
@@ -3157,7 +3177,10 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             let limit = device::worker_limit(self.run_limit());
-            if self.runs() >= limit || self.worker_turns.another_first(slug, waited, now) {
+            if self.worker_runs() >= limit
+                || self.runs() >= self.run_limit()
+                || self.worker_turns.another_first(slug, waited)
+            {
                 if self.worker_turns.wait(slug, waited, now) {
                     tracing::info!(
                         "{slug}: {} waits for one of the {limit} worker slots of this device",
@@ -3178,6 +3201,8 @@ impl<T: T3> Daemon<T> {
                 return Err(err.context(format!("starting a worker for {}", task.id)));
             }
             self.failures.remove(slug);
+            // Served: a further task of this board waits behind the boards that asked.
+            waited = None;
             in_progress.insert(
                 task.id.clone(),
                 InProgress {

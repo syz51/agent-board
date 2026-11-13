@@ -9884,6 +9884,26 @@ async fn the_device_limit_counts_the_runs_of_every_board_and_keeps_a_slot_for_ju
     e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 2);
+
+    // Two runs at once: the judge has one, and a worker takes the other.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A paused board's judge still runs, so it keeps its slot.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 3);
+    let mut paused = daemon_board(Some(DISPATCH));
+    paused.slug = "other".parse().unwrap();
+    paused.status = board_proto::BoardStatus::Paused;
+    let mut board = daemon_board(None);
+    board.parallel_tasks = 3;
+    e.stub.on("GET /v1/boards", [board, paused]);
+    e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
 
     // Without a limit of the device, the board's own three slots fill.

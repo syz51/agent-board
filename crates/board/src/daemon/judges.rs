@@ -561,7 +561,7 @@ impl<T: T3> Daemon<T> {
         }
 
         // The board asks again below if it still wants one of the device's slots.
-        let waited = self.judge_turns.take(slug);
+        let mut waited = self.judge_turns.take(slug);
         // A board at its usage stop gets no new judge, as it gets no new worker.
         if self.usage_holds(slug, now) {
             return self.save();
@@ -583,7 +583,7 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             let limit = self.run_limit();
-            if self.runs() >= limit || self.judge_turns.another_first(slug, waited, now) {
+            if self.runs() >= limit || self.judge_turns.another_first(slug, waited) {
                 if self.judge_turns.wait(slug, waited, now) {
                     tracing::info!(
                         "{slug}: `{}` waits for one of the {limit} runs of this device",
@@ -594,7 +594,11 @@ impl<T: T3> Daemon<T> {
             }
             let names = want.title.clone();
             match self.start_judge(board, &client, &project, want, now).await {
-                Ok(()) => started += 1,
+                Ok(()) => {
+                    started += 1;
+                    // Served: a further judge of this board waits behind the others.
+                    waited = None;
+                }
                 Err(err) => tracing::warn!("starting the judge `{names}`: {err:#}"),
             }
         }
