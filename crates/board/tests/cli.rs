@@ -3036,3 +3036,60 @@ fn a_repository_names_its_board_and_add_names_likely_duplicates() {
     assert!(!out.status.success());
     assert_eq!(e.stub.requests_to("POST /v1/tasks").len(), sent);
 }
+
+#[test]
+fn update_sets_and_clears_a_rank_and_rank_orders_many_tasks_in_one_call() {
+    let e = env();
+    e.stub.on("GET /v1/tasks/factory-12", noted_detail(&[]));
+    let mut ranked = task_fixture("factory-12", "Do it");
+    ranked.rank = Some(3);
+    e.stub.on("PATCH /v1/tasks/factory-12", &ranked);
+    for args in [
+        &["update", "factory-12", "--rank", "3"][..],
+        &["update", "factory-12", "--rank", "none"],
+        &["update", "factory-12", "--priority", "p1"],
+    ] {
+        let out = e.run(args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        // The row names the rank the server stored.
+        assert!(
+            stdout(&out).contains(" \"Do it\" rank 3"),
+            "{}",
+            stdout(&out)
+        );
+    }
+    let patches = e.stub.requests_to("PATCH /v1/tasks/factory-12");
+    let sent: Vec<Option<&Value>> = patches.iter().map(|p| p.body.get("rank")).collect();
+    assert_eq!(sent, [Some(&json!(3)), Some(&Value::Null), None]);
+    let out = e.run(&["update", "factory-12", "--rank", "first"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not a whole number"),
+        "{}",
+        stderr(&out)
+    );
+
+    // One call orders the tasks named, on the board of the first.
+    let mut first = task_fixture("factory-14", "Later made");
+    first.rank = Some(1);
+    let mut second = task_fixture("factory-12", "Do it");
+    second.rank = Some(2);
+    e.stub.on(
+        "POST /v1/boards/factory/rank",
+        board_proto::RankedTasks {
+            tasks: vec![first, second],
+        },
+    );
+    let out = e.run(&["rank", "factory-14", "factory-12", "--clear-others"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("ranked 2 tasks on factory\nfactory-14 open p1 \"Later made\" rank 1"),
+        "{text}"
+    );
+    let req = &e.stub.requests_to("POST /v1/boards/factory/rank")[0];
+    assert_eq!(req.body["tasks"], json!(["factory-14", "factory-12"]));
+    assert_eq!(req.body["clear_others"], true);
+    // No task named is refused before any request.
+    assert!(!e.run(&["rank"]).status.success());
+}

@@ -209,6 +209,18 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   sweeper deletes those older than 365 days (the stats window), in batches, always keeping
   the newest so the sequence holds. Refused claims are kept as long.
 
+### Order inside a priority level
+
+Priority has three levels, and a board holds many tasks in one level. A task's optional
+`rank` orders it inside its level: a whole number, lower first. Ranked tasks lead their
+level; the tasks without a rank follow by id number, as every task did before. Lists
+(`task_list`, `board ls`), the snapshot's `ready` and `mine`, the web view and the
+dispatcher all use this order, so the order somebody sets is the order work starts in.
+A rank says nothing across levels: a p1 task starts before every p2 task, whatever their
+ranks. A changed priority clears the rank, because it placed the task among other tasks.
+`board rank <id> <id> ...` orders many tasks in one call (`POST /v1/boards/{slug}/rank`);
+`task_update` and `board update --rank` set or clear one task's.
+
 ## Storage and server
 
 SQLite in WAL mode, owned by one server process; writes are `BEGIN IMMEDIATE`
@@ -875,8 +887,9 @@ task, or whose start fails, frees the slot and keeps that task waiting 30 minute
 a worker that gives its task back while no other task is in progress.
 Judges do not count in a board's slots, but at most 2 judges run per board at once, and
 both count in the device limit below. The rest wait, oldest
-first. With one slot, the dispatcher takes the highest-priority ready `auto` task, the
-oldest first on a tie. With more slots, code checks only the mechanical rules:
+first. With one slot, the dispatcher takes the highest-priority ready `auto` task; inside
+that priority level the ranked tasks go first, lowest `rank` first, then the rest, oldest
+first (see "Order inside a priority level"). With more slots, code checks only the mechanical rules:
 
 - Neither task waits on the other.
 - No agent of the board stopped on a usage limit since the tasks in progress started.
@@ -1169,7 +1182,7 @@ keeping untrusted text out of those channels, so:
   hold (`doing factory-12 (limit 1)`, or `doing none (limit 1)`), so it learns the limit
   before a claim is refused; the board's coordinator finds its `parallel_tasks` limit at
   the end of `you`;
-  `ready` lists the tasks marked `auto` first, then by priority and id, and marks a task
+  `ready` lists the tasks marked `auto` first, then in list order (priority, rank, id), and marks a task
   that is not `auto`, which waits on the user, `(user)`;
   `waiting` lists open tasks held by a `not_before`, soonest first; `proposals to review`
   lists pending proposals, which are never ready work); every alert ends with

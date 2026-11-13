@@ -232,6 +232,21 @@ pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>
     }
 }
 
+/// A `rank` argument: absent leaves it alone (`None`); `none` clears it (`Some(None)`);
+/// otherwise a whole number, lower first.
+pub fn parse_rank(value: Option<&str>) -> Result<Option<Option<u32>>> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    match value.parse() {
+        Ok(rank) => Ok(Some(Some(rank))),
+        Err(_) => bail!("rank {value:?} is not a whole number; send one, or none to clear it"),
+    }
+}
+
 /// Text limits from the server defaults (`docs/API.md`, "Defaults"), which the MCP schemas
 /// state and the CLI checks before sending.
 pub fn limits() -> &'static board_server::Settings {
@@ -534,7 +549,7 @@ looked{board} at open tasks only: done and dropped ones are left out"
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 26] = [
+const TASK_FIELDS: [&str; 27] = [
     "id",
     "board",
     "parent",
@@ -543,6 +558,7 @@ const TASK_FIELDS: [&str; 26] = [
     "acceptance",
     "status",
     "priority",
+    "rank",
     "blocked_reason",
     "owner",
     "owner_handle",
@@ -875,6 +891,32 @@ pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output>
     Ok(Output::new(text, &task))
 }
 
+/// Orders `tasks` inside their priority levels, first to start first. They are on one
+/// board: the first task's.
+pub async fn task_rank(ctx: &Ctx, tasks: Vec<TaskId>, clear_others: bool) -> Result<Output> {
+    let Some(first) = tasks.first() else {
+        bail!("name the tasks to rank, first to start first");
+    };
+    let board = first.board();
+    let ranked = ctx
+        .client
+        .rank_tasks(
+            &board,
+            &board_proto::RankTasks {
+                agent: ctx.agent()?.clone(),
+                tasks,
+                clear_others,
+            },
+        )
+        .await?;
+    let mut text = format!("ranked {} tasks on {board}", ranked.tasks.len());
+    for task in &ranked.tasks {
+        text.push('\n');
+        text.push_str(&render::task_line(task));
+    }
+    Ok(Output::new(text, &ranked))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskChanges {
     pub status: Option<TaskStatus>,
@@ -887,6 +929,8 @@ pub struct TaskChanges {
     pub auto: Option<bool>,
     /// `Some(None)` clears it.
     pub not_before: Option<Option<Timestamp>>,
+    /// `Some(None)` clears it.
+    pub rank: Option<Option<u32>>,
     /// Hand the task to this agent.
     pub owner: Option<AgentId>,
     /// Why the task is dropped, with `status: dropped`.
@@ -913,6 +957,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 blocked_reason: changes.blocked_reason,
                 auto: changes.auto,
                 not_before: changes.not_before,
+                rank: changes.rank,
                 owner: changes.owner,
                 reason: changes.reason,
             },

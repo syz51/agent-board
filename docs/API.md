@@ -342,7 +342,8 @@ Reopening a closed board, or any change on it, starts the period again.
 ### Tasks
 
 - `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&closed=&q=&since=&after=&limit=` â
-  `[Task]` list, sorted by priority, then id number, then board. `mine=true` uses the `X-Board-Agent` header.
+  `[Task]` list in list order: by priority, then the ranked tasks by `rank` (lower first),
+  then the tasks without a rank by id number, then board. `mine=true` uses the `X-Board-Agent` header.
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
@@ -462,6 +463,23 @@ Reopening a closed board, or any change on it, starts the period again.
   it is absent when none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
+- `rank` is a task's place inside its priority level: a whole number, lower first. A task
+  without one follows every ranked task of its level, by id number. In `[UpdateTask]`,
+  `rank` absent leaves it as it is, a number sets it and `null` clears it. A changed
+  `priority` clears it, unless the same request sets one. `rank` is absent from a `Task`
+  without one, and from servers that predate it. A change records `task_updated` with
+  `"rank"` in `fields` and the new `rank` (or `null`) in the payload.
+- `POST /v1/boards/{slug}/rank` `[RankTasks]` → `[RankedTasks]` orders many tasks in one
+  call. `tasks` holds at most 500 task ids of the board, each once, first to start first.
+  They get the ranks 1, 2, 3 and so on in that order, counted per priority level, so one
+  list may hold several levels. A task that is not listed keeps its rank, unless
+  `clear_others` is true: then every other task of the board loses its rank. Each task
+  whose rank changes gets a new `version` and a `task_updated` event as above; its
+  `updated_at` stays, since a rank is not work on the task. The answer holds the listed
+  tasks in the order sent. A task listed twice, a task of another board or more than 500
+  tasks is 400 `invalid`, an unknown task 404; a refused call ranks nothing.
+  `board rank <id> <id> ... [--clear-others]` sends it, on the board of the first id, and
+  `board update <id> --rank <n|none>` or `task_update` with `rank` sets one task's.
 - `reason` in `[UpdateTask]` says why the task is dropped: it applies only with `status:
   dropped` (400 `invalid` otherwise), at most `note_chars` characters, and a blank one counts
   as absent. The server keeps it as a `decision` note by the caller (with its `note_added`

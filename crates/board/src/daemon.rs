@@ -2097,7 +2097,7 @@ impl<T: T3> Daemon<T> {
                     .is_none_or(|at| *at <= now)
             })
             .collect();
-        tasks.sort_by_key(|t| (t.priority, t.created_at));
+        tasks.sort_by_key(start_order);
         Ok(tasks)
     }
 
@@ -4010,4 +4010,15 @@ fn idle_limited(
             )),
         }
     })
+}
+
+/// The order ready tasks start in: the highest priority first, inside it the ranked tasks by
+/// rank, then the rest, oldest first.
+pub(crate) fn start_order(task: &Task) -> (board_proto::Priority, bool, Option<u32>, Timestamp) {
+    (
+        task.priority,
+        task.rank.is_none(),
+        task.rank,
+        task.created_at,
+    )
 }

@@ -993,6 +993,7 @@ impl<T: T3> Daemon<T> {
                         blocked_reason: None,
                         auto: None,
                         not_before: None,
+                        rank: None,
                         owner: Some(agent.clone()),
                         reason: None,
                     },

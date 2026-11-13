@@ -392,6 +392,15 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 ("priority", one_of(PRIORITIES, "New priority."), false),
                 (
+                    "rank",
+                    json!({
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": "Order inside its priority level, lower first; null clears it.",
+                    }),
+                    false,
+                ),
+                (
                     "blockers",
                     strings("Replaces the blockers; [] clears them.", TASK_ID_MAX),
                     false,
@@ -938,6 +947,7 @@ impl BoardMcp {
                     blocked_reason: a.blocked_reason,
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?,
+                    rank: a.rank,
                     owner: a.owner,
                     reason: a.reason,
                 };
@@ -1199,8 +1209,16 @@ struct UpdateArgs {
     /// `null` clears it, as `none` does.
     #[serde(default, deserialize_with = "null_as_none")]
     not_before: Option<String>,
+    /// `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    rank: Option<Option<u32>>,
     owner: Option<AgentId>,
     reason: Option<String>,
+}
+
+/// Reads a field that is present (`null` included) as `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(d).map(Some)
 }
 
 /// Reads a present `null` as the string `none`, so it clears like the CLI's `none`.
@@ -1417,7 +1435,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 16_950, "tool list: {schemas}");
+        assert!(schemas < 17_100, "tool list: {schemas}");
         // `kind` is a parameter, which every reader shows: no text asks to repeat it.
         for tool in &tools {
             let text = tool.description.as_deref().unwrap_or_default();

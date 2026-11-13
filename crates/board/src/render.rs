@@ -102,6 +102,9 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
         enum_str(&task.priority),
         title(&task.title)
     );
+    if let Some(rank) = task.rank {
+        let _ = write!(line, " rank {rank}");
+    }
     if let Some(owner) = &task.owner {
         let _ = write!(line, " owner {}", who(owner.as_str()));
         if task.owner_stale {

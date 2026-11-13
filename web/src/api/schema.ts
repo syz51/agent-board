@@ -86,6 +86,8 @@ export const task = object({
   acceptance: string,
   status: taskStatus,
   priority,
+  /** The task's place inside its priority level, lower first; none follows the ranked. */
+  rank: nullable(integer),
   blocked_reason: nullable(string),
   owner: nullable(string),
   owner_stale: boolean,

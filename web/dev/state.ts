@@ -397,6 +397,7 @@ export class DevState {
       acceptance: "",
       status: "open",
       priority: "p2",
+      rank: null,
       blocked_reason: null,
       owner: null,
       blockers: [],

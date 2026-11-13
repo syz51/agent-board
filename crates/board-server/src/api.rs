@@ -14,10 +14,10 @@ use board_proto::{
     AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
     CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
     DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult,
-    MarkSeen, Note, PutHandoff, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Said,
-    SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
-    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Updates, Usage,
-    UsageReserve,
+    MarkSeen, Note, PutHandoff, RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task,
+    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    UpdateTask, Updates, Usage, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -77,6 +77,7 @@ pub(crate) fn router(state: AppState) -> Router {
             get(show_board).patch(update_board).delete(delete_board),
         )
         .route("/boards/{slug}/join", post(join_board))
+        .route("/boards/{slug}/rank", post(rank_tasks))
         .route(
             "/boards/{slug}/coordinator",
             post(claim_coordinator).delete(release_coordinator),
@@ -679,6 +680,23 @@ async fn update_task(
     Ok(Json(
         state
             .write(move |cx| tasks::update(cx, &id, req, by_user))
+            .await?,
+    ))
+}
+
+async fn rank_tasks(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(slug): Path<String>,
+    Body(req): Body<RankTasks>,
+) -> Result<Json<RankedTasks>> {
+    let slug: BoardSlug = parse_path(&slug)?;
+    caller.act_as(&req.agent)?;
+    tasks::validate_rank(&req)?;
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| tasks::rank(cx, &slug, req, by_user))
             .await?,
     ))
 }

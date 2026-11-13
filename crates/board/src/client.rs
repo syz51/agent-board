@@ -893,6 +893,15 @@ impl Client {
             .await
     }
 
+    pub async fn rank_tasks(
+        &self,
+        board: &BoardSlug,
+        body: &board_proto::RankTasks,
+    ) -> Result<board_proto::RankedTasks> {
+        self.with_body(Method::POST, &format!("/v1/boards/{board}/rank"), body)
+            .await
+    }
+
     /// `claim`, `release` or `take`.
     pub async fn task_action(&self, id: &TaskId, action: &str) -> Result<Task> {
         let body = TaskAction {

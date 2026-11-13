@@ -60,6 +60,10 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     ("release", "the task object {id, status, owner, ...}"),
     ("take", "the task object {id, status, owner, ...}"),
     ("update", "the task object {id, status, owner, ...}"),
+    (
+        "rank",
+        "{tasks: [...]}, the ranked tasks in the order named",
+    ),
     ("done", "the task object {id, status, owner, ...}"),
     ("note", "the note object {id, task, agent, kind, text, at}"),
     (
@@ -222,6 +226,16 @@ pub enum Command {
     Take { id: TaskId },
     /// Change a task's fields or status.
     Update(UpdateArgs),
+    /// Order tasks inside their priority levels: the tasks named start in this order, each
+    /// before the unranked tasks of its level. One board per call, at most 500 tasks.
+    Rank {
+        /// Task ids, first to start first.
+        #[arg(required = true)]
+        ids: Vec<TaskId>,
+        /// Clear the rank of every task of the board that is not named.
+        #[arg(long)]
+        clear_others: bool,
+    },
     /// Mark a task done with evidence, only when every acceptance check passes; file what
     /// remains first (sub-tasks, proposals).
     Done(DoneArgs),
@@ -699,6 +713,10 @@ pub struct UpdateArgs {
     /// Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.
     #[arg(long)]
     not_before: Option<String>,
+    /// The task's place inside its priority level, lower first; none clears it. `board rank`
+    /// orders many tasks in one call.
+    #[arg(long)]
+    rank: Option<String>,
     /// Hand the task to this agent id (owner, the board's coordinator or the user only, or,
     /// once the owner's session ended, the task's creator or the agent that delegated it).
     #[arg(long)]
@@ -1019,6 +1037,7 @@ impl Command {
                 | Self::Release { .. }
                 | Self::Take { .. }
                 | Self::Update(_)
+                | Self::Rank { .. }
                 | Self::Done(_)
                 | Self::Note { .. }
                 | Self::Handoff { .. }
@@ -1223,11 +1242,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 blocked_reason,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?,
+                rank: ops::parse_rank(a.rank.as_deref())?,
                 owner: a.owner,
                 reason,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }
+        Command::Rank { ids, clear_others } => ops::task_rank(&ctx()?, ids, clear_others).await?,
         Command::Done(a) => {
             if a.checks.len() != a.exits.len() {
                 bail!("pair every --check with an --exit code");

@@ -339,6 +339,21 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     let sent: Vec<Option<&Value>> = patches.iter().map(|p| p.body.get("not_before")).collect();
     assert_eq!(sent, [Some(&Value::Null), Some(&Value::Null), None]);
 
+    // rank takes a number, and a JSON null clears it; absent leaves it alone.
+    for (id, args) in [
+        (9, json!({"id": "factory-12", "rank": 2})),
+        (10, json!({"id": "factory-12", "rank": null})),
+    ] {
+        let updated = mcp.call(id, "task_update", args);
+        assert_ne!(updated["isError"], true, "{updated}");
+    }
+    let patches = stub.requests_to("PATCH /v1/tasks/factory-12");
+    let sent: Vec<Option<&Value>> = patches.iter().map(|p| p.body.get("rank")).collect();
+    assert_eq!(
+        sent,
+        [None, None, None, Some(&json!(2)), Some(&Value::Null)]
+    );
+
     // owner hands the task over; a server that ignores it is reported, not trusted.
     let mut handed = task_fixture("factory-12", "Fix the parser");
     handed.status = board_proto::TaskStatus::Doing;
@@ -351,7 +366,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     );
     assert_ne!(updated["isError"], true, "{updated}");
     assert_eq!(
-        stub.requests_to("PATCH /v1/tasks/factory-12")[3].body["owner"],
+        stub.requests_to("PATCH /v1/tasks/factory-12")[5].body["owner"],
         "t3:child"
     );
     stub.on(
