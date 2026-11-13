@@ -229,6 +229,13 @@ one winner. Schema migrations are numbered SQL files tracked by `PRAGMA user_ver
 this scale (thousands of tasks, tens of agents) the single writer is not a limit; if it ever
 is, the API boundary lets the storage move to Postgres.
 
+Reads run on a small pool of read connections and never wait for the writer. An agent's own
+snapshot both reads and writes (it moves the agent's cursor), so the server renders it on a
+read connection and then opens a short write transaction that moves the cursor. That
+transaction reads the cursor again and renders again inside itself when another request
+moved it meanwhile, so two snapshots for one agent never show the same delta twice or skip
+one.
+
 Rejected: sync-based stores (Turso Sync, CRDTs such as Automerge or cr-sqlite), because
 merging cannot make a claim exclusive; git-backed stores, for lack of compare-and-set;
 managed databases and Durable Objects, to keep conversation-derived text on the user's own
