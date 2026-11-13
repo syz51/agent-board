@@ -1049,7 +1049,7 @@ pub(crate) fn resolve(
             // An open, unowned item is claimed for the caller in the same transaction,
             // with task_claim's checks but the doing limit: the item closes at once.
             (None, Some(me)) if task.status == TaskStatus::Open => {
-                crate::ops::tasks::check_blockers_done(cx, id)?;
+                crate::ops::tasks::check_blockers_done(cx, &task, me)?;
                 crate::ops::tasks::check_not_before(cx, &task)?;
                 claim_to_resolve(cx, &task, me)?;
             }

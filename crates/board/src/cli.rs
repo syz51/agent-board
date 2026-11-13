@@ -17,7 +17,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::client::TaskQuery;
 use crate::config::{Config, Home, TokenStore, store_token};
 use crate::identity::{agent_from_env, proven_identity};
-use crate::ops::{self, Ctx, Output, check_chars, limits, parse_enum};
+use crate::ops::{self, Ctx, Output, TITLE_AIM_CHARS, check_chars, limits, parse_enum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -625,7 +625,9 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 pub struct AddArgs {
     #[arg(help = at_most(
-        "Imperative title, no status or ids; put detail in --body",
+        &format!(
+            "Imperative title, no status or ids; put detail in --body. Aim for about {TITLE_AIM_CHARS} characters"
+        ),
         limits().title_chars,
     ))]
     title: String,
@@ -668,7 +670,10 @@ pub struct UpdateArgs {
     /// Done goes through `board done`, with evidence.
     #[arg(long, value_parser = enum_arg_hiding::<TaskStatus>(&["done"]))]
     status: Option<TaskStatus>,
-    #[arg(long, help = at_most("New title", limits().title_chars))]
+    #[arg(long, help = at_most(
+        &format!("New title. Aim for about {TITLE_AIM_CHARS} characters"),
+        limits().title_chars,
+    ))]
     title: Option<String>,
     #[arg(long, help = at_most("New body", limits().body_chars))]
     body: Option<String>,
