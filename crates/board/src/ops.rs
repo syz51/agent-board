@@ -242,6 +242,10 @@ pub fn limits() -> &'static board_server::Settings {
     &LIMITS
 }
 
+/// The task title length the MCP descriptions and CLI help ask agents to aim for: the
+/// limit (`title_chars`) is a ceiling, and titles written up to it often pass it.
+pub const TITLE_AIM_CHARS: usize = 60;
+
 /// Text over a limit, refused before the request was sent, with the server's message and
 /// hint. The CLI reports it to the server (`POST /v1/errors`), so signals count it.
 #[derive(Debug, Clone, PartialEq, Eq)]
