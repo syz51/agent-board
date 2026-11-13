@@ -43,7 +43,8 @@ case "$1 $2" in
 esac
 "#,
     ),
-    // Logs the host and step, then runs the command locally, as the host would.
+    // Logs the host and step, then runs the command locally, as the host would. The host
+    // STUB_UNREACHABLE names fails as ssh does when it cannot connect.
     (
         "ssh",
         r#"#!/bin/sh
@@ -52,6 +53,10 @@ while [ "$1" != "--" ]; do shift; done
 shift
 host=$1
 shift
+if [ "$host" = "${STUB_UNREACHABLE:-}" ]; then
+    echo "ssh: connect to host $host port 22: Operation timed out" >&2
+    exit 255
+fi
 echo "$host $4" >> "$STATE/log"
 STUB_HOST=$host exec "$@"
 "#,
@@ -352,6 +357,7 @@ impl Env {
             "STUB_FAIL_RM",
             "STUB_FAIL_LIST",
             "STUB_FAIL_RESTART",
+            "STUB_UNREACHABLE",
             "STUB_OS",
             "STUB_FAIL_SIGN",
             "STUB_FAIL_UNLOCK",
@@ -1224,6 +1230,111 @@ fn a_device_whose_cargo_fails_stops_the_plan_before_any_change() {
     assert_eq!(env.server_head(), env.main[0]);
     assert!(!env.read("log").contains("server-upgrade"));
     assert!(!env.lock().exists(), "the lock was not released");
+
+    // A device that answers but fails its step is not left out.
+    let err = fails(env.run(
+        &["--yes", "--skip-unreachable", &env.main[1]],
+        &[("STUB_FAIL_LIST", "1")],
+    ));
+    assert!(
+        err.contains("could not read board's revision on local"),
+        "{err}"
+    );
+    assert_eq!(env.server_head(), env.main[0]);
+}
+
+#[test]
+fn an_unreachable_device_stops_the_run_unless_it_is_left_out() {
+    let env = Env::new();
+    let (old, new) = (&env.main[0], &env.main[1]);
+    let off = [("STUB_UNREACHABLE", "laptop")];
+    let err = fails(env.run(&["--yes", new], &off));
+    assert!(err.contains("ssh could not connect to laptop"), "{err}");
+    assert!(err.contains("--skip-unreachable"), "{err}");
+    assert_eq!(&env.server_head(), old);
+    assert_eq!(env.read("cargo-local").trim(), old);
+    assert!(!env.lock().exists(), "the lock was not released");
+
+    // The plan names the device it leaves out and exits 3.
+    let out = env.run(&["--skip-unreachable", new], &off);
+    let (stdout, err) = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{stdout}\n{err}");
+    assert!(
+        stdout.contains("device laptop: left out (ssh could not connect)"),
+        "{stdout}"
+    );
+    assert_eq!(&env.server_head(), old);
+
+    // Applied, it upgrades the other hosts and prints the command for the one left out.
+    let out = env.run(&["--yes", "--skip-unreachable", new], &off);
+    let (stdout, err) = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{stdout}\n{err}");
+    assert_eq!(&env.server_head(), new);
+    assert_eq!(env.read("cargo-local").trim(), new);
+    assert_eq!(env.read("cargo-laptop").trim(), old);
+    assert!(
+        stdout.contains("  laptop: left out (ssh could not connect)"),
+        "{stdout}"
+    );
+    let again = format!(
+        "--config {} --yes {new}",
+        env.root.join("hosts.conf").display()
+    );
+    assert!(
+        stdout.contains("left out because ssh could not connect: laptop. Once they answer, run: ")
+            && stdout.contains(&again),
+        "{stdout}"
+    );
+    assert!(!env.lock().exists(), "the lock was not released");
+
+    // Once the device answers, that command finishes it.
+    succeeds(env.run(&["--yes", new], &[]));
+    assert_eq!(env.read("cargo-laptop").trim(), new);
+}
+
+#[test]
+fn a_device_with_watch_no_gets_board_but_no_restart() {
+    let env = Env::new();
+    let new = &env.main[1];
+    let conf = env.root.join("hosts.conf");
+    let hosts = fs::read_to_string(&conf).unwrap();
+    fs::write(
+        &conf,
+        hosts.replace("~/.ssh/key\n", "~/.ssh/key watch=no\n"),
+    )
+    .unwrap();
+    let stdout = succeeds(env.run(&[new], &[]));
+    assert!(
+        stdout.contains(&format!(
+            "device laptop: {} -> {} (no board watch)",
+            &env.main[0][..12],
+            &new[..12]
+        )),
+        "{stdout}"
+    );
+
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    let log = env.read("log");
+    assert!(
+        log.contains("laptop install") && !log.contains("laptop restart"),
+        "{log}"
+    );
+    assert!(log.contains("local restart"), "{log}");
+    assert!(stdout.contains(&format!("  laptop: {new}")), "{stdout}");
+
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    assert!(
+        stdout.contains(&format!("device laptop: already at {}", &new[..12])),
+        "{stdout}"
+    );
+
+    fs::write(
+        &conf,
+        hosts.replace("~/.ssh/key\n", "~/.ssh/key watch=maybe\n"),
+    )
+    .unwrap();
+    let err = fails(env.run(&[new], &[]));
+    assert!(err.contains("watch must be yes or no"), "{err}");
 }
 
 #[test]
