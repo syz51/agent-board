@@ -937,6 +937,14 @@ pub struct Evidence {
 }
 
 impl Evidence {
+    /// No evidence of any kind: task_done refuses it.
+    pub fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+            && self.commits.is_empty()
+            && self.prs.is_empty()
+            && self.artifacts.is_empty()
+    }
+
     fn into_wire(self) -> Vec<NewEvidence> {
         let item = |kind, value, exit_code| NewEvidence {
             kind,
@@ -974,12 +982,13 @@ pub async fn task_done(
     summary: Option<String>,
     take: bool,
 ) -> Result<Output> {
-    let evidence = evidence.into_wire();
+    // The CLI's refusal; the MCP server refuses first in its own terms.
     if evidence.is_empty() {
         bail!(
             "done needs evidence: a check with its exit code (--check <cmd> --exit <code>), a commit, a PR or an artifact"
         );
     }
+    let evidence = evidence.into_wire();
     let detail = ctx.client.task(id).await?;
     let task = ctx
         .client

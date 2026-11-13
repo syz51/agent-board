@@ -941,18 +941,7 @@ impl BoardMcp {
                 ops::task_update(&ctx, &a.id, changes).await?
             }
             "task_done" => {
-                let a: DoneArgs = parse(name, args)?;
-                // Refused here, not in ops, whose refusal names the CLI's flags.
-                if a.checks.is_empty()
-                    && a.commits.is_empty()
-                    && a.prs.is_empty()
-                    && a.artifacts.is_empty()
-                {
-                    anyhow::bail!(
-                        "done needs evidence: call task_done again with at least one of \
-                         {EVIDENCE_SHAPE}. The summary is for the user, not evidence."
-                    );
-                }
+                let a = parse_done(args)?;
                 let evidence = ops::Evidence {
                     checks: a
                         .checks
@@ -963,6 +952,13 @@ impl BoardMcp {
                     prs: a.prs,
                     artifacts: a.artifacts,
                 };
+                // Refused here, not in ops, whose refusal names the CLI's flags.
+                if evidence.is_empty() {
+                    anyhow::bail!(
+                        "done needs evidence: call task_done again with at least one of \
+                         {EVIDENCE_SHAPE}. The summary is for the user, not evidence."
+                    );
+                }
                 ops::task_done(&ctx, &a.id, evidence, a.summary, a.take).await?
             }
             "task_note" => {
@@ -1062,9 +1058,28 @@ fn parse<T: DeserializeOwned>(name: &str, args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|err| {
         anyhow::anyhow!(
             "invalid arguments: {err}. Call {name} again with arguments that match its \
-             schema.{}",
-            arg_hint(name)
+             schema."
         )
+    })
+}
+
+/// Parses task_done's arguments. The refusal ends with the evidence shape only when the
+/// evidence arguments are what failed, so a bad id or take is not blamed on them.
+fn parse_done(args: Value) -> Result<DoneArgs> {
+    // The evidence arguments alone, with a valid id, show whether they parse.
+    let mut evidence = json!({"id": "board-1"});
+    for (key, value) in args.as_object().into_iter().flatten() {
+        if ["checks", "commits", "prs", "artifacts"].contains(&key.as_str()) {
+            evidence[key] = value.clone();
+        }
+    }
+    let evidence_failed = serde_json::from_value::<DoneArgs>(evidence).is_err();
+    parse("task_done", args).map_err(|err| {
+        if evidence_failed {
+            anyhow::anyhow!("{err}{}", arg_hint("task_done"))
+        } else {
+            err
+        }
     })
 }
 
@@ -1517,7 +1532,7 @@ mod tests {
             "task_add" => parse::<AddArgs>(tool, args).map(drop),
             "task_claim" => parse::<ClaimArgs>(tool, args).map(drop),
             "task_update" => parse::<UpdateArgs>(tool, args).map(drop),
-            "task_done" => parse::<DoneArgs>(tool, args).map(drop),
+            "task_done" => parse_done(args).map(drop),
             "task_note" => parse::<NoteArgs>(tool, args).map(drop),
             "handoff_set" => parse::<HandoffArgs>(tool, args).map(drop),
             "lease_paths" => parse::<LeaseArgs>(tool, args).map(drop),
@@ -1640,6 +1655,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.ends_with(shape), "{err}");
+        // A refusal the evidence did not cause does not point at it.
+        for args in [
+            json!({"id": "not an id", "prs": ["https://example.com/pull/4"]}),
+            json!({"id": "factory-1", "commits": ["4e1c2ab"], "take": "yes"}),
+        ] {
+            let err = parse_for("task_done", args).unwrap_err().to_string();
+            assert!(!err.contains("Its evidence is"), "{err}");
+        }
         let err = refuse_unknown_args("task_note", &json!({"id": "x", "txt": "a"}))
             .unwrap_err()
             .to_string();
