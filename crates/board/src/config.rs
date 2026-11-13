@@ -75,6 +75,10 @@ pub struct Config {
     pub feedback_board: Option<BoardSlug>,
     /// Path of the `t3` binary used by `board watch`.
     pub t3_bin: Option<PathBuf>,
+    /// How many runs, workers and judges together, `board watch` has at once on this
+    /// device across its daemon-dispatch boards; without it, one per 4 GiB of host memory
+    /// and at least 2.
+    pub runs_at_once: Option<std::num::NonZeroU32>,
     /// Local T3 project folders by repo key, for starting coordinator threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,

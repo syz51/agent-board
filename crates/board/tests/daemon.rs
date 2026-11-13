@@ -9847,3 +9847,112 @@ async fn a_wake_up_prompt_carries_the_board_change_without_a_snapshot_call() {
     let asked = e.stub.requests_to("GET /v1/snapshot");
     assert_eq!(asked.last().unwrap().query_pairs()["kind"], "delta");
 }
+
+/// A second daemon-dispatch board this device runs, with one judge of it at work.
+fn other_board_with_a_judge(e: &mut Env, slots: u32) {
+    let mut board = daemon_board(None);
+    board.parallel_tasks = slots;
+    let mut held = daemon_board(Some(DISPATCH));
+    held.parallel_tasks = slots;
+    let mut other = held.clone();
+    other.slug = "other".parse().unwrap();
+    e.stub.on("GET /v1/boards", [board, other.clone()]);
+    e.stub.on("POST /v1/boards/factory/coordinator", held);
+    e.stub.on("POST /v1/boards/other/coordinator", other);
+    e.daemon.state.judges.push(board::daemon::judges::JudgeRun {
+        board: "other".parse().unwrap(),
+        kind: board_proto::JudgeKind::Goal,
+        tasks: Vec::new(),
+        thread: Some(J2.to_owned()),
+        title: "goal review other".to_owned(),
+        started_at: at(),
+        registered: false,
+        noted: false,
+    });
+}
+
+#[tokio::test]
+async fn the_device_limit_counts_the_runs_of_every_board_and_keeps_a_slot_for_judges() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    // Three runs at once: two of them may be workers, and the other board's judge is one.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(3);
+    other_board_with_a_judge(&mut e, 3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 2);
+
+    // Two runs at once: the judge has one, and a worker takes the other.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A paused board's judge still runs, so it keeps its slot.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 3);
+    let mut paused = daemon_board(Some(DISPATCH));
+    paused.slug = "other".parse().unwrap();
+    paused.status = board_proto::BoardStatus::Paused;
+    let mut board = daemon_board(None);
+    board.parallel_tasks = 3;
+    e.stub.on("GET /v1/boards", [board, paused]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // Without a limit of the device, the board's own three slots fill.
+    let mut e = slots_env(3, &tasks);
+    other_board_with_a_judge(&mut e, 3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 3);
+}
+
+#[tokio::test]
+async fn runs_at_once_in_the_configuration_replaces_the_default_device_limit() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    let config = Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        runs_at_once: std::num::NonZeroU32::new(4),
+        ..Config::default()
+    };
+    let path = e._dir.path().join("home").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 3, "four runs leave three to workers");
+}
+
+#[tokio::test]
+async fn a_judge_waits_while_the_device_is_at_its_limit() {
+    let tasks = [review_task("factory-4", 0), review_task("factory-5", 1)];
+    let mut e = judges_env(&tasks);
+    for task in &tasks {
+        review_detail(&e, task, vec![]);
+    }
+    e.t3.ids
+        .lock()
+        .unwrap()
+        .extend([J1.to_owned(), J2.to_owned()]);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 1);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
+}

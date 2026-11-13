@@ -71,6 +71,7 @@ use crate::state;
 use crate::t3::{ListedThread, PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
 
+pub mod device;
 pub mod judges;
 
 pub use judges::{
@@ -1610,6 +1611,14 @@ pub struct Daemon<T: T3> {
     dispatch_registered: bool,
     /// When this daemon last claimed or renewed each board's lease as its dispatch agent.
     dispatch_renewed: BTreeMap<BoardSlug, Timestamp>,
+    /// The runs this device may have at once when `runs_at_once` is not set; `None`
+    /// leaves the device without a limit of its own.
+    default_run_limit: Option<usize>,
+    /// The boards that wait for one of the device's worker slots, and for a judge slot.
+    worker_turns: device::Turns,
+    judge_turns: device::Turns,
+    /// The time of the last reconcile.
+    last_pass: Option<Timestamp>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1641,7 +1650,49 @@ impl<T: T3> Daemon<T> {
             usage_snapshot_at: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
+            default_run_limit: None,
+            worker_turns: device::Turns::default(),
+            judge_turns: device::Turns::default(),
+            last_pass: None,
         }
+    }
+
+    /// Limits the runs of a device that sets no `runs_at_once` to `limit`.
+    #[must_use]
+    pub fn with_default_run_limit(mut self, limit: usize) -> Self {
+        self.default_run_limit = Some(limit);
+        self
+    }
+
+    /// How many runs, workers and judges together, this device may have at once across
+    /// its boards: `runs_at_once`, or the default from the host's memory.
+    fn run_limit(&self) -> usize {
+        self.ctx.config.runs_at_once.map_or_else(
+            || self.default_run_limit.unwrap_or(usize::MAX),
+            |n| n.get() as usize,
+        )
+    }
+
+    /// Whether the runs recorded for `slug` take slots of this device: it hosts the board
+    /// under daemon dispatch. A paused board counts, since its threads still run. A run
+    /// recorded for a board that left this device takes no slot: nothing here follows it
+    /// to its end.
+    fn counts_runs(&self, slug: &BoardSlug) -> bool {
+        self.boards
+            .get(slug)
+            .is_some_and(|b| b.dispatch == Dispatch::Daemon && self.hosts(b))
+    }
+
+    /// The workers this device has now, on every board.
+    fn worker_runs(&self) -> usize {
+        let workers = self.state.workers.keys();
+        workers.filter(|t| self.counts_runs(&t.board())).count()
+    }
+
+    /// The runs this device has now, workers and judges, on every board.
+    fn runs(&self) -> usize {
+        let judges = self.state.judges.iter();
+        self.worker_runs() + judges.filter(|r| self.counts_runs(&r.board)).count()
     }
 
     /// Reads, updates and merges pull requests through `gh` instead of the `gh` CLI.
@@ -1653,7 +1704,8 @@ impl<T: T3> Daemon<T> {
 
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
-    /// since a missing project may be what failed. `server`, `device`, `t3_bin` and
+    /// since a missing project may be what failed. `runs_at_once` takes effect at once
+    /// too. `server`, `device`, `t3_bin` and
     /// `[thread_model]` are fixed while the daemon runs, so changing them asks for a
     /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
@@ -1700,6 +1752,10 @@ impl<T: T3> Daemon<T> {
                 path.display()
             );
         }
+        if new.runs_at_once != current.runs_at_once {
+            current.runs_at_once = new.runs_at_once;
+            tracing::info!("re-read {}: runs_at_once updated", path.display());
+        }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
                 &current.projects,
@@ -1738,6 +1794,11 @@ impl<T: T3> Daemon<T> {
     /// Starts, renews or resumes the coordinators this device hosts.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         self.reconcile_began = tokio::time::Instant::now();
+        // A board that did not ask for a slot again in the last pass lost its place.
+        if let Some(last) = self.last_pass.replace(now) {
+            self.worker_turns.keep_asked_since(last);
+            self.judge_turns.keep_asked_since(last);
+        }
         let checks_until = self.reconcile_began + self.timing.reconcile_budget / 2;
         self.reload_config();
         let boards = self.client().boards().await?;
@@ -3091,6 +3152,8 @@ impl<T: T3> Daemon<T> {
             tracing::warn!("the judges and reviewed tasks of {slug}: {err:#}");
         }
         self.save()?;
+        // The board asks again below if it still wants one of the device's slots.
+        let mut waited = self.worker_turns.take(slug);
         let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
         if in_progress.len() >= slots || self.usage_holds(slug, now) {
             return Ok(());
@@ -3111,6 +3174,21 @@ impl<T: T3> Daemon<T> {
             if !independent(&task, &in_progress) {
                 continue;
             }
+            // The device's limit holds across boards, and the board that waited longest
+            // for a slot gets the next one.
+            let limit = device::worker_limit(self.run_limit());
+            if self.worker_runs() >= limit
+                || self.runs() >= self.run_limit()
+                || self.worker_turns.another_first(slug, waited)
+            {
+                if self.worker_turns.wait(slug, waited, now) {
+                    tracing::info!(
+                        "{slug}: {} waits for one of the {limit} worker slots of this device",
+                        task.id
+                    );
+                }
+                break;
+            }
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
                 self.note_failure(board, now, now);
                 // One task that cannot start does not hold up the others. A start that
@@ -3123,6 +3201,8 @@ impl<T: T3> Daemon<T> {
                 return Err(err.context(format!("starting a worker for {}", task.id)));
             }
             self.failures.remove(slug);
+            // Served: a further task of this board waits behind the boards that asked.
+            waited = None;
             in_progress.insert(
                 task.id.clone(),
                 InProgress {
@@ -5899,7 +5979,15 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     let _relay = if once { None } else { start_relay(&ctx) };
     let usage_source =
         UsageSource::claude_code(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
-    let mut daemon = Daemon::new(ctx, t3);
+    let host_memory = device::host_memory();
+    if host_memory.is_none() {
+        tracing::warn!(
+            "the memory of this host could not be read; without `runs_at_once` in config.toml the device runs {} agents at once",
+            device::FALLBACK_RUNS
+        );
+    }
+    let mut daemon =
+        Daemon::new(ctx, t3).with_default_run_limit(device::default_run_limit(host_memory));
     daemon.usage_source = usage_source;
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
