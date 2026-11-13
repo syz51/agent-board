@@ -85,9 +85,14 @@ const CONNECT_LEAD: Duration = Duration::from_millis(100);
 /// tailnet takes).
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
 /// Debug builds only: gives the server this many milliseconds from when the hook sets its
-/// share, whatever the local steps took, and lets those steps take up to [`BUDGET`] more.
-/// Tests set the share with it instead of slowing the machine; a release build ignores it.
+/// share, whatever the local steps took, and lets those steps take up to
+/// [`SHARED_LOCAL_LIMIT`] more. Tests set the share with it instead of slowing the machine,
+/// and so no step's time depends on the machine's load; a release build ignores it.
 pub const SHARE_ENV: &str = "BOARD_HOOK_SERVER_SHARE_MS";
+/// With [`SHARE_ENV`], the limit for the hook's work besides the server's share. A test
+/// that sets the share times the server, not the local steps: on a busy Mac a T3 hook's
+/// process table read and its wait for T3 took all of [`BUDGET`].
+const SHARED_LOCAL_LIMIT: Duration = Duration::from_secs(20);
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
@@ -175,12 +180,7 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    // A guard around the whole hook; `handle` keeps its own, earlier deadline for the
-    // network so it can still fall back to the cache.
-    let guard = match share_override() {
-        Some(share) => share + BUDGET,
-        None => BUDGET.saturating_sub(started.elapsed() + MARGIN / 2),
-    };
+    let guard = guard(started.elapsed(), share_override());
     let reply = match tokio::time::timeout(
         guard,
         handle(event, runtime, explicit_agent, &input, started),
@@ -199,6 +199,24 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     };
     if let Some(text) = render_reply(event, runtime, reply) {
         print!("{text}");
+    }
+    // What the budget limits: the process's start and exit, which a busy machine slows,
+    // are outside it. Tests time hooks by this line.
+    tracing::debug!(
+        "hook {}: answered in {}ms",
+        event.name(),
+        started.elapsed().as_millis()
+    );
+}
+
+/// The guard around the whole hook, started `elapsed` after the hook: the rest of
+/// [`BUDGET`], less half the [`MARGIN`] for the output. `handle` keeps its own, earlier
+/// deadline for the network so it can still fall back to the cache. With a test's `share`
+/// ([`share_override`]), that share plus [`SHARED_LOCAL_LIMIT`].
+fn guard(elapsed: Duration, share: Option<Duration>) -> Duration {
+    match share {
+        Some(share) => share + SHARED_LOCAL_LIMIT,
+        None => BUDGET.saturating_sub(elapsed + MARGIN / 2),
     }
 }
 
@@ -2404,6 +2422,15 @@ mod tests {
         tokio::time::advance(Duration::from_millis(300)).await;
         assert_eq!(deadline, started + BUDGET - MARGIN);
         assert_eq!(server_deadline(started), deadline);
+    }
+
+    #[test]
+    fn the_hooks_guard_keeps_the_budget_unless_a_test_sets_the_share() {
+        let ms = Duration::from_millis;
+        assert_eq!(guard(Duration::ZERO, None), ms(1400));
+        assert_eq!(guard(ms(300), None), ms(1100));
+        assert_eq!(guard(ms(1500), None), Duration::ZERO);
+        assert_eq!(guard(ms(300), Some(ms(1000))), ms(21_000));
     }
 
     #[test]
