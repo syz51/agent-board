@@ -1,9 +1,9 @@
-//! The git worktree a coordinator or worker thread starts in, so it never works in the
+//! The git worktree a worker or judge thread starts in, so it never works in the
 //! project root that other threads share.
 //!
 //! When the project folder is the top of a git repository, T3 creates the thread's branch
 //! from the default branch and runs the thread in a new worktree on it. The branch is
-//! `coordinator/<slug>` for a coordinator and `task/<id>` for a worker, or that name with
+//! `task/<id>` for a worker and `review/<id>` for a review judge, or that name with
 //! `-<UTC time>` when it exists: `t3 thread start` can only create a branch, never check out
 //! one that exists, and an earlier thread's worktree may still use it, maybe with a live
 //! thread or files git ignores. So nothing here removes a worktree or changes a branch.
@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{BoardSlug, TaskId, Timestamp};
+use board_proto::{TaskId, Timestamp};
 
 use crate::t3::NewWorktree;
 
@@ -38,27 +38,13 @@ const FETCH: Wait = Wait {
     on_folder: false,
 };
 
-/// The branch the coordinator of `slug` runs on when it is free.
-pub fn coordinator_branch(slug: &BoardSlug) -> String {
-    format!("coordinator/{slug}")
-}
-
 /// The branch the worker of `task` runs on when it is free.
 pub fn worker_branch(task: &TaskId) -> String {
     format!("task/{task}")
 }
 
-/// The worktree to start the coordinator of `slug` in; `None` when `project` is not the top
-/// of a git repository, so the thread runs in the folder itself.
-pub async fn coordinator_worktree(
-    project: &Path,
-    slug: &BoardSlug,
-    now: Timestamp,
-) -> Result<Option<NewWorktree>> {
-    new_worktree(project, coordinator_branch(slug), now).await
-}
-
-/// The worktree to start the worker of `task` in, as [`coordinator_worktree`].
+/// The worktree to start the worker of `task` in; `None` when `project` is not the top of a
+/// git repository, so the thread runs in the folder itself.
 pub async fn worker_worktree(
     project: &Path,
     task: &TaskId,
@@ -72,7 +58,7 @@ pub fn review_branch(task: &TaskId) -> String {
     format!("review/{task}")
 }
 
-/// The worktree to start the review judge of `task` in, as [`coordinator_worktree`]: on
+/// The worktree to start the review judge of `task` in, as [`worker_worktree`]: on
 /// `head`, the branch of the task's pull request, fetched first. Without a pull request,
 /// or when its branch cannot be fetched (a fork's), it starts from the default branch.
 pub async fn review_worktree(
@@ -549,8 +535,8 @@ mod tests {
         dir.join("repo")
     }
 
-    fn slug() -> BoardSlug {
-        "factory".parse().unwrap()
+    fn first_task() -> TaskId {
+        "factory-1".parse().unwrap()
     }
 
     fn at() -> Timestamp {
@@ -558,7 +544,7 @@ mod tests {
     }
 
     async fn start(project: &Path) -> Option<NewWorktree> {
-        coordinator_worktree(project, &slug(), at()).await.unwrap()
+        worker_worktree(project, &first_task(), at()).await.unwrap()
     }
 
     #[tokio::test]
@@ -586,7 +572,7 @@ mod tests {
             start(&repo).await,
             Some(NewWorktree {
                 base: "origin/trunk".into(),
-                branch: "coordinator/factory".into()
+                branch: "task/factory-1".into()
             })
         );
     }
@@ -647,7 +633,7 @@ mod tests {
         run(&repo, &["remote", "remove", "origin"]);
         assert_eq!(start(&repo).await.unwrap().base, "master");
         run(&repo, &["branch", "-m", "master", "develop"]);
-        let err = coordinator_worktree(&repo, &slug(), at())
+        let err = worker_worktree(&repo, &first_task(), at())
             .await
             .unwrap_err();
         assert!(
@@ -669,7 +655,7 @@ mod tests {
                 "add",
                 "--quiet",
                 "-b",
-                "coordinator/factory",
+                "task/factory-1",
                 old_s,
                 "origin/main",
             ],
@@ -677,12 +663,12 @@ mod tests {
         std::fs::write(old.join(".env"), "ignored, maybe").unwrap();
         assert_eq!(
             start(&repo).await.unwrap().branch,
-            "coordinator/factory-20261108-132005"
+            "task/factory-1-20261108-132005"
         );
         assert!(old.join(".env").exists(), "the old worktree is untouched");
         assert_eq!(
             run(&repo, &["branch", "--format=%(refname:short)"]),
-            "coordinator/factory\nmain\n"
+            "main\ntask/factory-1\n"
         );
     }
 }

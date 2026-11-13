@@ -420,9 +420,9 @@ function AutopilotSwitch({ board }: { board: Board }) {
       >
         {turningOn ? (
           <p>
-            A coordinator thread starts on one of the board's home devices and works through ready
-            tasks marked auto, one at a time, without waiting for you. It sends an ask when it needs
-            a decision.
+            The daemon on one of the board's home devices works through ready tasks marked auto, a
+            worker thread per task, without waiting for you. An agent sends an ask when it needs a
+            decision.
           </p>
         ) : (
           <p>

@@ -317,9 +317,17 @@ async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
     let (s, v) = move_as(&t, U, true, &doing, "review").await;
     assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
 
-    // A stale owner's task is taken first, which is logged. Nobody runs the board now, and
-    // the owner has left, so a drop with a reason needs no take.
+    // A stale owner's task is taken first, which is logged. Nobody runs the board now
+    // (autopilot off, the lease run out), and the owner has left, so a drop with a reason
+    // needs no take.
     let doing = task_in(&t, TaskStatus::Doing).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": false })),
+    )
+    .await;
     t.advance(stale_after() + TimeDelta::hours(1));
     t.register(B, Some(REPO), None).await;
     let (s, v) = move_as(&t, B, false, &doing, "review").await;

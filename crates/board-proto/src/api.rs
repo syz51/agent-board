@@ -78,8 +78,8 @@ pub struct UpdateBoard {
     /// tasks at once spend the shared usage limit faster; anyone may lower it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tasks: Option<u32>,
-    /// Who runs the board's autopilot (see [`crate::Board::dispatch`]). A server that
-    /// predates it ignores it, so a client checks the answer.
+    /// Who runs the board's autopilot (see [`crate::Board::dispatch`]). Only
+    /// [`Dispatch::Daemon`] is accepted, and it changes nothing; leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<Dispatch>,
     /// 1 to 100 (see [`crate::Board::usage_stop_at`]). Raising it is for the user only,
@@ -130,8 +130,8 @@ pub struct JoinBoard {
 }
 
 /// `POST /v1/boards/{slug}/coordinator`: take or renew the coordinator lease of an
-/// autopilot board. The lease belongs to a device, so only one device starts a
-/// coordinator thread; that device then names the thread's agent id once it exists.
+/// autopilot board. The lease belongs to a device, so only one device dispatches
+/// the board; that device names its dispatch agent (`dispatch:<device>`).
 /// The lease expires like a file lease unless renewed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimCoordinator {

@@ -90,10 +90,11 @@ async fn may_hand_over(t: &T, agent: &str, task: &str) -> bool {
 }
 
 #[tokio::test]
-async fn the_dispatch_setting_is_thread_by_default_and_changes_with_an_event() {
+async fn every_board_is_on_daemon_dispatch_and_thread_dispatch_is_dropped() {
     let t = T::new();
     let board = t.board("factory", &[]).await;
-    assert_eq!(board["dispatch"], "thread");
+    assert_eq!(board["dispatch"], "daemon");
+    // Setting what it already is changes nothing.
     let since = t.count("SELECT MAX(seq) FROM events");
     let board = t
         .ok(
@@ -104,17 +105,18 @@ async fn the_dispatch_setting_is_thread_by_default_and_changes_with_an_event() {
         )
         .await;
     assert_eq!(board["dispatch"], "daemon");
-    assert_eq!(
-        t.ok("GET", "/v1/boards/factory", None, None).await["dispatch"],
-        "daemon"
-    );
-    let events = t
-        .ok("GET", &format!("/v1/events?since={since}"), None, None)
+    assert_eq!(t.count("SELECT MAX(seq) FROM events"), since);
+    // The removed value is dropped, and the update's other fields apply, as an older
+    // client expects.
+    let board = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "dispatch": "thread", "parallel_tasks": 1 })),
+        )
         .await;
-    assert_eq!(
-        events["events"][0]["payload"]["fields"],
-        json!(["dispatch"])
-    );
+    assert_eq!(board["dispatch"], "daemon");
     let (code, _, v) = t
         .fail(
             "PATCH",
@@ -124,39 +126,6 @@ async fn the_dispatch_setting_is_thread_by_default_and_changes_with_an_event() {
         )
         .await;
     assert_eq!(code, 400, "{v}");
-}
-
-async fn full_snapshot(t: &T, agent: &str) -> String {
-    t.ok(
-        "GET",
-        &format!("/v1/snapshot?agent={agent}&kind=full"),
-        Some(agent),
-        None,
-    )
-    .await["text"]
-        .as_str()
-        .unwrap()
-        .to_owned()
-}
-
-#[tokio::test]
-async fn a_full_snapshot_names_daemon_dispatch_only() {
-    let t = T::new();
-    t.board("factory", &[super::REPO]).await;
-    t.register(WORKER, Some(super::REPO), None).await;
-    assert!(!full_snapshot(&t, WORKER).await.contains("dispatch"));
-    t.ok(
-        "PATCH",
-        "/v1/boards/factory",
-        None,
-        Some(json!({ "dispatch": "daemon" })),
-    )
-    .await;
-    assert!(
-        full_snapshot(&t, WORKER)
-            .await
-            .contains("\ndispatch: daemon\n")
-    );
 }
 
 #[tokio::test]

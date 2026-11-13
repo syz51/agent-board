@@ -40,9 +40,7 @@ const DELEGATED_THREAD: &str = "thread:delegated-task:";
 /// The route a delegated thread's `SessionStart` context names for a PR waiting on checks.
 /// T3's PR rules, which every thread sees, say to call `watch_pull_request`, which T3 gives
 /// a delegated child none of, and forbid polling and `gh pr checks --watch`; a parent's
-/// brief may name this route (the coordinator's does), but children still polled. The
-/// wording follows the coordinator's brief (`prompts/coordinator.md`, step 4), and a brief
-/// that says otherwise wins.
+/// brief may name this route, but children still polled. A brief that says otherwise wins.
 const DELEGATED_PR_ROUTE: &str = "PR waiting on checks, unless your brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task you own in review with a note naming the PR, report, and end; never wait for CI.";
 
 /// Whether T3 started thread `id` for a parent thread's `delegate_task`.
@@ -1695,7 +1693,7 @@ impl Hook<'_> {
         let snap = if self.runtime == Runtime::Claude && is_pull_request_update(self.input) {
             // A held thread's pull request watch wakes it at every check or review change,
             // for as long as the pause lasts. Such a turn ends before the model runs, and
-            // the watch stays; the resume wake-up has the coordinator check the PRs. The
+            // the watch stays; the dispatcher checks the PRs after the resume. The
             // snapshot comes first, so an ended turn changes no state: the agent stays idle
             // (or paused for a usage limit), and its sequence stays, so the next snapshot
             // brings again the alerts this one had. Codex is not ended here, since it may

@@ -1,9 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
-    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, Dispatch, DoneTask,
-    ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, SUMMARY_CHARS_MAX,
-    TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, DoneTask, ErrorCode,
+    EventType, EvidenceKind, Note, NoteKind, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
+    TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -2065,11 +2065,9 @@ pub(crate) fn update(
 }
 
 /// Whether nobody runs `board`: it is active with neither a coordinator (the server drops
-/// one whose lease ran out) nor a daemon dispatcher, which closes reviewed tasks itself.
+/// one whose lease ran out) nor autopilot, whose dispatcher closes reviewed tasks itself.
 pub(crate) fn nobody_runs(board: &Board) -> bool {
-    board.status == BoardStatus::Active
-        && board.coordinator.is_none()
-        && !(board.dispatch == Dispatch::Daemon && board.autopilot)
+    board.status == BoardStatus::Active && board.coordinator.is_none() && !board.autopilot
 }
 
 /// How long unseen a session still marked `running` counts as having stopped without an

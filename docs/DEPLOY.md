@@ -108,10 +108,10 @@ While `board watch` runs, hooks reach the server through it, on the socket
 new `board login` by itself. After upgrading `board`, restart it: until then hooks pass the
 older daemon by and call the server directly, as they do without one.
 
-### Coordinators and the feedback board
+### Dispatch and the feedback board
 
-A board with autopilot on gets a coordinator thread on one of its home devices, in a T3
-project on that device. `board watch` finds the project in the device's
+A board with autopilot on is dispatched by `board watch` on one of its home devices: it
+starts worker and judge threads in a T3 project on that device. `board watch` finds the project in the device's
 `$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
 A running `board watch` re-reads the file within a minute of an edit and applies these two
@@ -128,7 +128,7 @@ more, so lower it on a device you also work on:
 runs_at_once = 3
 ```
 
-`board watch` starts its threads (coordinators, workers and judges) with the project's
+`board watch` starts its threads (workers and judges) with the project's
 default provider and model, which the user's own chats use too. To give them settings of
 their own, add a provider instance in T3 Code and name it in `config.toml`. This example
 keeps the claude.ai connectors (such as Gmail and Docs) out of agent threads, where their
@@ -164,14 +164,13 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
 
 Both keys are required: T3 Code takes a provider only with a model, so these threads use
 this model and not the project's default. Threads started before the change keep their
-provider, but the daemon re-briefs running coordinators, so the children they start from
-then on use this instance. T3 Code keeps this instance's usage readings in its own file,
+provider; each thread the daemon starts from then on uses this instance. T3 Code keeps this instance's usage readings in its own file,
 and the daemon reads it next to the default instance's.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
-and its coordinator triages: it resolves each feedback item as a duplicate, routes it to a
+and a triage judge handles its items: it resolves each feedback item as a duplicate, routes it to a
 task on the owner's board, forwards it to the setup's own channel, declines it with a
-reason, or marks it fixed when the cause is already gone (`prompts/triage.md`). To give it one, pick a home device and a T3 project folder on
+reason, or marks it fixed when the cause is already gone (`prompts/judges/triage.md`). To give it a device, pick a home device and a T3 project folder on
 it (for example the folder holding your `setups.toml`, the registry of setups and their
 owning boards), then:
 
@@ -187,9 +186,9 @@ board-feedback = "/path/to/setups"
 board board update board-feedback --home-device laptop --autopilot on
 ```
 
-The daemon on that device starts the `board-feedback coordinator` thread within a minute
-and wakes it as feedback arrives. Use the same `feedback_board` on every device, so the
-feedback agents file and the board the coordinator triages are one.
+The daemon on that device starts a triage judge within a minute of a feedback item
+becoming ready. Use the same `feedback_board` on every device, so the feedback agents
+file and the board the judges triage are one.
 
 ## 4. Backups
 
@@ -317,7 +316,7 @@ run.
 
 On macOS, `cargo install` leaves an ad-hoc signature, which macOS knows only by the
 binary's hash. Each build then loses the privacy grants of the last one, such as access to
-`~/Documents`, and `board watch` cannot start a coordinator for a project there: git waits
+`~/Documents`, and `board watch` cannot start a thread for a project there: git waits
 on the new prompt until it times out. So step 7 signs `~/.cargo/bin/board` with a
 self-signed identity that stays the same across builds, as `dev.agent-board.board`. The
 first run makes the identity in its own keychain,

@@ -79,7 +79,7 @@ pub struct Config {
     /// device across its daemon-dispatch boards; without it, one per 4 GiB of host memory
     /// and at least 2.
     pub runs_at_once: Option<std::num::NonZeroU32>,
-    /// Local T3 project folders by repo key, for starting coordinator threads.
+    /// Local T3 project folders by repo key, for starting worker and judge threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,
     /// Local T3 project folders by board slug, for a board none of whose repos is under

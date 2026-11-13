@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use board_proto::{
-    Agent, AgentState, Ask, Board, Dispatch, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
+    Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
     LeaseResult, Note, NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
     TouchResult, Usage,
 };
@@ -648,19 +648,11 @@ pub fn board_line(board: &Board) -> String {
     if board.usage_stop_at != board_proto::USAGE_STOP_AT_DEFAULT {
         let _ = write!(line, " · new work stops at {}% usage", board.usage_stop_at);
     }
-    if board.dispatch == Dispatch::Daemon {
-        line.push_str(" · dispatch daemon");
-    }
     line
 }
 
 pub fn board_detail(board: &Board, agents: &[Agent], detailed: bool) -> String {
     let mut out = board_line(board);
-    // The line names daemon dispatch; on autopilot the default is named here, so the setting
-    // always shows where it applies.
-    if board.autopilot && board.dispatch == Dispatch::Thread {
-        out.push_str("\ndispatch thread");
-    }
     if !board.repos.is_empty() {
         let _ = write!(out, "\nrepos {}", board.repos.join(", "));
     }

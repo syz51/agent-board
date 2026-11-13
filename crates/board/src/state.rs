@@ -513,11 +513,6 @@ pub fn save_named<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()
     write_json(&home.state_dir().join(format!("{name}.json")), value)
 }
 
-/// Removes a named state file; a missing file is fine.
-pub fn remove_named(home: &Home, name: &str) -> Result<()> {
-    remove_if_exists(&home.state_dir().join(format!("{name}.json")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,7 @@ pub struct Board {
     /// Repo keys this board covers (normalized origin URLs such as
     /// `github.com/syz51/agent-board`).
     pub repos: Vec<String>,
-    /// When on, a coordinator thread works off the ready queue without the user.
+    /// When on, a device daemon works off the ready queue without the user.
     pub autopilot: bool,
     /// How many tasks the board's coordinator and its child threads may have in progress
     /// at once, 1 to [`PARALLEL_TASKS_MAX`]. Absent from servers that predate it, so it
@@ -42,11 +42,12 @@ pub struct Board {
     /// defaults to [`USAGE_STOP_AT_DEFAULT`].
     #[serde(default = "usage_stop_at_default")]
     pub usage_stop_at: u32,
-    /// The agent currently acting as the board's coordinator, if any.
+    /// The agent that holds the board's coordinator lease, if any: the dispatch agent of the
+    /// device whose daemon runs the board.
     pub coordinator: Option<AgentId>,
-    /// Who runs the board's autopilot: a coordinator thread, or the daemon of the device
-    /// that holds the coordinator lease. Absent from servers that predate it, so it
-    /// defaults to [`Dispatch::Thread`].
+    /// Who runs the board's autopilot. Every board of a current server is on
+    /// [`Dispatch::Daemon`]; a server that predates the setting leaves it out, so it
+    /// defaults to [`Dispatch::Thread`]. Daemons ignore it.
     #[serde(default)]
     pub dispatch: Dispatch,
     /// Devices allowed to host the coordinator, in order of preference.
@@ -61,7 +62,8 @@ pub struct Board {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dispatch {
-    /// A coordinator thread that lives for days.
+    /// A coordinator thread that lives for days. No current server or daemon runs a board
+    /// this way; the value stays so that an older server's boards still parse.
     #[default]
     Thread,
     /// The device daemon that holds the coordinator lease, as `dispatch:<device>`: it does
@@ -414,7 +416,7 @@ pub struct Task {
     pub proposal: bool,
     /// The task is not ready, and cannot be claimed, before this time. Once it passes, the
     /// server announces it with a `task_updated` event (actor `server`, no field changes),
-    /// which wakes the coordinator; the field itself stays.
+    /// which has the daemon dispatch it; the field itself stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
     /// May the coordinator start this task without the user? Defaults to true on autopilot
