@@ -382,7 +382,11 @@ fn done_reads_the_version_and_sends_paired_evidence() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("pair every --check"));
     let out = e.run(&["done", "factory-12"]);
-    assert!(stderr(&out).contains("done needs evidence"));
+    assert!(
+        stderr(&out).contains(
+            "done needs evidence: a check with its exit code (--check <cmd> --exit <code>)"
+        )
+    );
     assert!(
         e.stub
             .requests()

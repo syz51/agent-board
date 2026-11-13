@@ -944,7 +944,7 @@ impl BoardMcp {
                 ops::task_update(&ctx, &a.id, changes).await?
             }
             "task_done" => {
-                let a: DoneArgs = parse(name, args)?;
+                let a = parse_done(args)?;
                 let evidence = ops::Evidence {
                     checks: a
                         .checks
@@ -955,6 +955,13 @@ impl BoardMcp {
                     prs: a.prs,
                     artifacts: a.artifacts,
                 };
+                // Refused here, not in ops, whose refusal names the CLI's flags.
+                if evidence.is_empty() {
+                    anyhow::bail!(
+                        "done needs evidence: call task_done again with at least one of \
+                         {EVIDENCE_SHAPE}. The summary is for the user, not evidence."
+                    );
+                }
                 ops::task_done(&ctx, &a.id, evidence, a.summary, a.take).await?
             }
             "task_note" => {
@@ -1043,18 +1050,52 @@ fn refuse_unknown_args(name: &str, args: &Value) -> Result<()> {
     };
     anyhow::bail!(
         "invalid arguments: {name} has no {noun} {}; it accepts {}. Call {name} again with \
-         only those arguments.",
+         only those arguments.{}",
         unknown.join(", "),
-        accepted.join(", ")
+        accepted.join(", "),
+        arg_hint(name)
     )
 }
 
 fn parse<T: DeserializeOwned>(name: &str, args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|err| {
         anyhow::anyhow!(
-            "invalid arguments: {err}. Call {name} again with arguments that match its schema."
+            "invalid arguments: {err}. Call {name} again with arguments that match its \
+             schema."
         )
     })
+}
+
+/// Parses task_done's arguments. The refusal ends with the evidence shape only when the
+/// evidence arguments are what failed, so a bad id or take is not blamed on them.
+fn parse_done(args: Value) -> Result<DoneArgs> {
+    // The evidence arguments alone, with a valid id, show whether they parse.
+    let mut evidence = json!({"id": "board-1"});
+    for (key, value) in args.as_object().into_iter().flatten() {
+        if ["checks", "commits", "prs", "artifacts"].contains(&key.as_str()) {
+            evidence[key] = value.clone();
+        }
+    }
+    let evidence_failed = serde_json::from_value::<DoneArgs>(evidence).is_err();
+    parse("task_done", args).map_err(|err| {
+        if evidence_failed {
+            anyhow::anyhow!("{err}{}", arg_hint("task_done"))
+        } else {
+            err
+        }
+    })
+}
+
+/// task_done's evidence arguments in the JSON shape an agent sends. An agent whose schema
+/// is deferred learns the shape from the refusal, so each refusal shows it.
+const EVIDENCE_SHAPE: &str = r#"checks [{"command": "cargo test", "exit_code": 0}], commits ["<sha>"], prs ["<url>"] or artifacts ["<link or path>"]"#;
+
+/// The sentence that ends a tool's argument refusal: for task_done, the evidence shape.
+fn arg_hint(name: &str) -> String {
+    match name {
+        "task_done" => format!(" Its evidence is {EVIDENCE_SHAPE}."),
+        _ => String::new(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1494,7 +1535,7 @@ mod tests {
             "task_add" => parse::<AddArgs>(tool, args).map(drop),
             "task_claim" => parse::<ClaimArgs>(tool, args).map(drop),
             "task_update" => parse::<UpdateArgs>(tool, args).map(drop),
-            "task_done" => parse::<DoneArgs>(tool, args).map(drop),
+            "task_done" => parse_done(args).map(drop),
             "task_note" => parse::<NoteArgs>(tool, args).map(drop),
             "handoff_set" => parse::<HandoffArgs>(tool, args).map(drop),
             "lease_paths" => parse::<LeaseArgs>(tool, args).map(drop),
@@ -1566,8 +1607,9 @@ mod tests {
                 ))
                 .and_then(|rest| {
                     rest.strip_suffix(&format!(
-                        ". Call {} again with only those arguments.",
-                        tool.name
+                        ". Call {} again with only those arguments.{}",
+                        tool.name,
+                        arg_hint(&tool.name)
                     ))
                 })
                 .unwrap_or_else(|| panic!("{err}"));
@@ -1597,6 +1639,54 @@ mod tests {
             err.to_string(),
             r#"unknown tool "task_notes"; see tools/list"#
         );
+    }
+
+    /// An agent whose task_done schema is deferred guesses the evidence. Each refusal it can
+    /// get shows the shape, and that shape is one task_done accepts.
+    #[test]
+    fn task_done_refusals_show_the_evidence_shape() {
+        let shape = r#"Its evidence is checks [{"command": "cargo test", "exit_code": 0}], commits ["<sha>"], prs ["<url>"] or artifacts ["<link or path>"]."#;
+        let guessed = json!({"id": "factory-1", "evidence": "PR #4 merged"});
+        let err = refuse_unknown_args("task_done", &guessed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with(shape), "{err}");
+        let err = parse_for(
+            "task_done",
+            json!({"id": "factory-1", "checks": ["cargo test"]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.ends_with(shape), "{err}");
+        // A refusal the evidence did not cause does not point at it.
+        for args in [
+            json!({"id": "not an id", "prs": ["https://example.com/pull/4"]}),
+            json!({"id": "factory-1", "commits": ["4e1c2ab"], "take": "yes"}),
+        ] {
+            let err = parse_for("task_done", args).unwrap_err().to_string();
+            assert!(!err.contains("Its evidence is"), "{err}");
+        }
+        let err = refuse_unknown_args("task_note", &json!({"id": "x", "txt": "a"}))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("evidence"), "{err}");
+
+        let example = json!({
+            "id": "factory-1",
+            "checks": [{"command": "cargo test", "exit_code": 0}],
+            "commits": ["<sha>"],
+            "prs": ["<url>"],
+            "artifacts": ["<link or path>"],
+        });
+        for arg in ["checks", "commits", "prs", "artifacts"] {
+            let value = serde_json::to_string(&example[arg])
+                .unwrap()
+                .replace(",", ", ");
+            let value = value.replace(":", ": ");
+            assert!(shape.contains(&format!("{arg} {value}")), "{arg} {value}");
+        }
+        refuse_unknown_args("task_done", &example).unwrap();
+        parse_for("task_done", example).unwrap();
     }
 
     /// Every string an agent sends, nested ones included, declares the server's limit.
