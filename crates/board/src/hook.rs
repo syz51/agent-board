@@ -1746,12 +1746,14 @@ impl Hook<'_> {
             // The agent's own call in a turn the hold lets go on (a subagent's turn holds
             // no handoff of its own). Here, not at `Stop`: a block there continues the turn
             // after the agent's report, and its answer becomes the message T3 shows. A
-            // failed check only skips the reminder: the alerts above are already taken.
+            // failed or slow check only skips the reminder: the alerts above are already
+            // taken, so it ends before the hook's own deadline would drop them.
             if self.subagent.is_none() {
-                match self.handoff_reminder().await {
-                    Ok(Some(text)) => lines.push(text),
-                    Ok(None) => {}
-                    Err(err) => tracing::debug!("checking the handoff: {err:#}"),
+                match tokio::time::timeout_at(self.deadline, self.handoff_reminder()).await {
+                    Ok(Ok(Some(text))) => lines.push(text),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(err)) => tracing::debug!("checking the handoff: {err:#}"),
+                    Err(_) => tracing::debug!("checking the handoff: out of time"),
                 }
             }
         }
@@ -1865,8 +1867,13 @@ impl Hook<'_> {
         // the state of its tasks, or file edits long after the handoff) on the handoff's own
         // clock, so a turn that only read, replied or added notes leaves it current. A server
         // without that date falls back to: a handoff older than the turn is stale.
+        // No handoff: once per turn; a turn without a prompt of its own (a background
+        // wake-up) shares one key, so its heartbeats do not repeat the reminder.
         let (stale_since, why) = match &handoff {
-            None => (Some(turn.unwrap_or(self.now)), "you have no handoff"),
+            None => (
+                Some(turn.unwrap_or(Timestamp::UNIX_EPOCH)),
+                "you have no handoff",
+            ),
             Some(h) => match h.last_change_at {
                 Some(at) => (
                     (at > h.updated_at).then_some(at),

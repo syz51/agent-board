@@ -1284,6 +1284,65 @@ fn a_failed_handoff_check_keeps_the_heartbeats_alerts() {
     assert!(!shown.contains("handoff_set"), "{shown}");
 }
 
+/// A slow handoff check ends before the hook's deadline: the alerts the heartbeat took
+/// still show, and the server is not marked slow.
+#[test]
+fn a_slow_handoff_check_keeps_the_heartbeats_alerts() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(
+            SnapshotKind::Alerts,
+            "<board>\n! a peer joined\n</board>",
+            2,
+        ),
+    );
+    e.stub
+        .delay(&handoff_route(), std::time::Duration::from_secs(5));
+    heartbeat_due_again(&e);
+    let (reply, _) = e.hook_env(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+        ),
+        &FAIR_SHARE,
+    );
+    let shown = context(&reply, "PostToolUse");
+    assert!(shown.contains("a peer joined"), "{shown}");
+    assert!(!shown.contains("handoff_set"), "{shown}");
+    assert!(
+        !e.home.join("state/offline.json").exists(),
+        "a slow handoff check does not mark the server slow"
+    );
+}
+
+/// A turn without a prompt of its own (a background wake-up) and no handoff: one reminder,
+/// not one per heartbeat.
+#[test]
+fn a_turn_without_a_prompt_is_reminded_of_a_missing_handoff_once() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    e.stub.on_error(
+        &handoff_route(),
+        404,
+        "not_found",
+        "no handoff",
+        "write one",
+    );
+    // The session's first tool call: its heartbeat is due.
+    let reminder = context(&read_tool(&e).0, "PostToolUse");
+    assert!(reminder.contains("you have no handoff"), "{reminder}");
+    assert_eq!(heartbeat(&e), None, "the next heartbeat stays quiet");
+    assert_eq!(stop(&e), None);
+    assert_eq!(heartbeat(&e), None, "nor after a Stop without a prompt");
+    prompt(&e, "go");
+    assert!(heartbeat(&e).is_some(), "a prompted turn gets its own");
+}
+
 /// A subagent's tool call gets no handoff reminder: the handoff is the agent's.
 #[test]
 fn a_subagents_heartbeat_gives_no_handoff_reminder() {
