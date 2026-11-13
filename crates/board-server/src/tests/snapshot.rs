@@ -2303,8 +2303,10 @@ async fn a_board_that_stops_running_its_coordinator_holds_that_thread_alone() {
         assert!(
             text(&snap).contains(
                 "hold: auto stood down: autopilot was switched off -> this thread no longer \
-                 coordinates the board: children already at work finish on their own. If the \
-                 user's own message in this turn asks you to go on"
+                 coordinates the board: children already at work finish on their own. When \
+                 this turn's message is the board's message that this thread is no longer its \
+                 coordinator, do the steps it lists, then end this turn. If the user's own \
+                 message in this turn asks you to go on"
             ),
             "{kind}: {}",
             text(&snap)

@@ -7218,7 +7218,8 @@ async fn a_daemon_board_starts_nothing_while_paused_or_at_its_usage_stop() {
 }
 
 #[tokio::test]
-async fn a_board_switched_to_daemon_dispatch_drops_its_coordinator_and_is_never_rebriefed() {
+async fn a_board_switched_to_daemon_dispatch_sends_its_coordinator_one_last_message_and_takes_the_lease()
+ {
     let (mut e, agent) = coordinator_env(AgentState::Idle, None);
     e.daemon
         .state
@@ -7241,23 +7242,37 @@ async fn a_board_switched_to_daemon_dispatch_drops_its_coordinator_and_is_never_
     e.daemon.flush(at()).await;
 
     assert!(e.daemon.state.coordinators.is_empty());
-    // No re-brief: the thread is told once that the daemon replaced it.
+    // No re-brief: the thread gets the switch's last message, once.
     let sends = e.t3.sends();
     let [(thread, text)] = sends.as_slice() else {
         panic!("{sends:?}");
     };
     assert_eq!(thread, "coord");
-    assert!(
-        text.contains(
-            "this thread is no longer its coordinator: the board is set to daemon dispatch"
-        ),
-        "{text}"
-    );
+    assert_eq!(text, &board::daemon::switch_message(&factory()));
+    for step in [
+        "this thread is no longer its coordinator: the board is set to daemon dispatch",
+        "as a `decision` note",
+        "hand it to that child (`task_update owner=<child id>`)",
+        "set it `open`",
+        "settle this thread",
+    ] {
+        assert!(text.contains(step), "{step}: {text}");
+    }
     assert!(!text.contains("standing instructions"), "{text}");
+    let stood = &saved_state(&e).stood_down[&factory()];
+    assert_eq!(stood.coordinator.thread, "coord");
+    assert!(stood.told && stood.last);
     assert!(worker_starts(&e.t3).is_empty());
+    // The lease moves to the dispatcher.
     let claims = dispatch_claims(&e);
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].body["agent"], DISPATCH);
+
+    // Later reconciles, and a restarted daemon, send nothing more.
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.sends().len(), 1, "{:?}", e.t3.sends());
 
     // A ready task wakes no coordinator thread; it asks for a reconcile instead.
     e.stub
@@ -7266,6 +7281,162 @@ async fn a_board_switched_to_daemon_dispatch_drops_its_coordinator_and_is_never_
     assert!(e.daemon.on_event(&ready, at()).await.unwrap());
     e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 1, "nothing more: {:?}", e.t3.sends());
+
+    // Switched back to thread dispatch: the thread was told nothing more comes, so a new
+    // coordinator thread starts instead of that one resuming.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&format!("t3:{NEW_THREAD}")), &[DEVICE]),
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let to_coord =
+        e.t3.sends()
+            .into_iter()
+            .filter(|(t, _)| t == "coord")
+            .count();
+    assert_eq!(to_coord, 1, "no resume message: {:?}", e.t3.sends());
+    assert!(saved_state(&e).stood_down.is_empty());
+}
+
+/// The stubs a reconcile of a daemon board needs once its dispatcher claims the lease.
+fn on_daemon_switch(e: &Env, board: Board) {
+    e.stub.on("GET /v1/boards", [board]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+}
+
+#[tokio::test]
+async fn a_thread_that_stood_down_earlier_is_not_woken_by_the_switch() {
+    let (mut e, _) = stood_down_env().await;
+    assert_eq!(e.t3.sends().len(), 1, "told to stop dispatching");
+    on_daemon_switch(&e, daemon_board(None));
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(e.t3.sends().len(), 1, "{:?}", e.t3.sends());
+    assert!(!saved_state(&e).stood_down[&factory()].last);
+}
+
+#[tokio::test]
+async fn a_paused_board_switched_to_daemon_dispatch_sends_the_last_message_once_it_resumes() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.state.pending_starts.insert(factory(), at());
+    let mut paused = daemon_board(Some(&agent));
+    paused.status = board_proto::BoardStatus::Paused;
+    on_daemon_switch(&e, paused);
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    // The paused board's `hold:` line would end the message's turn: it waits.
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    let saved = saved_state(&e);
+    assert_eq!(saved.coordinators[&factory()].agent.as_str(), agent);
+    assert_eq!(saved.pending_starts.get(&factory()), Some(&at()));
+    assert!(dispatch_claims(&e).is_empty());
+
+    on_daemon_switch(&e, daemon_board(Some(&agent)));
+    e.daemon.reconcile(at()).await.unwrap();
+
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, "coord");
+    assert_eq!(text, &board::daemon::switch_message(&factory()));
+    let saved = saved_state(&e);
+    assert!(saved.coordinators.is_empty());
+    assert!(saved.pending_starts.is_empty(), "looked for and found none");
+    assert_eq!(dispatch_claims(&e)[0].body["agent"], DISPATCH);
+}
+
+#[tokio::test]
+async fn a_pending_coordinator_start_gets_the_switchs_last_message_when_its_thread_ran() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let mut e = dispatch_env(&[]);
+    let since = at() - chrono::Duration::minutes(5);
+    e.daemon.state.pending_starts.insert(factory(), since);
+    // Older than the start: not its thread.
+    e.t3.list(
+        "factory coordinator",
+        "older",
+        since - chrono::Duration::minutes(1),
+        true,
+    );
+    e.t3.list(
+        "factory coordinator",
+        "orphan",
+        since + chrono::Duration::seconds(5),
+        true,
+    );
+    // The lookup fails first: the mark stays, and nothing is sent.
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.sends().is_empty());
+    assert_eq!(saved_state(&e).pending_starts[&factory()], since);
+
+    e.t3.fail_list.store(false, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+
+    let sends = e.t3.sends();
+    let [(thread, text)] = sends.as_slice() else {
+        panic!("{sends:?}");
+    };
+    assert_eq!(thread, "orphan");
+    assert_eq!(text, &board::daemon::switch_message(&factory()));
+    let saved = saved_state(&e);
+    assert!(saved.pending_starts.is_empty());
+    assert!(saved.coordinators.is_empty());
+    let stood = &saved.stood_down[&factory()];
+    assert_eq!(stood.coordinator.thread, "orphan");
+    assert!(stood.told && stood.last);
+    assert!(
+        dispatch_claims(&e)
+            .iter()
+            .all(|c| c.body["agent"] == DISPATCH)
+    );
+    assert!(
+        logs.text()
+            .contains("coordinator thread orphan of factory stood down"),
+        "{}",
+        logs.text()
+    );
+}
+
+#[tokio::test]
+async fn a_pending_coordinator_start_whose_thread_never_ran_is_dropped_without_a_message() {
+    let logs = Logs::default();
+    let _guard = logs.capture_at(tracing::Level::INFO);
+    let mut e = dispatch_env(&[]);
+    e.daemon.state.pending_starts.insert(factory(), at());
+    e.t3.list("factory coordinator", "unbriefed", at(), false);
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert!(e.t3.sends().is_empty());
+    let saved = saved_state(&e);
+    assert!(saved.pending_starts.is_empty());
+    assert!(saved.stood_down.is_empty());
+    assert!(
+        logs.text().contains(
+            "thread unbriefed, which a start at 2026-11-06 12:00:00 UTC created, never ran and gets no message"
+        ),
+        "{}",
+        logs.text()
+    );
 }
 
 #[tokio::test]
