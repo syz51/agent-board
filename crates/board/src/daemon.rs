@@ -68,7 +68,7 @@ use crate::config::{Config, Home, ThreadModel};
 use crate::gh::{Gh, GhCli};
 use crate::ops::Ctx;
 use crate::state;
-use crate::t3::{PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
+use crate::t3::{ListedThread, PULL_REQUEST_UPDATE, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
 
 pub mod judges;
@@ -1744,13 +1744,11 @@ impl<T: T3> Daemon<T> {
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         // A board switched to daemon dispatch has no coordinator thread to check, renew,
         // wake or re-brief. Where this device does not run the board, the record stays until
-        // the loop below releases its lease.
+        // the loop below releases its lease. A paused board keeps it until it resumes: its
+        // `hold:` line would end the turn the switch's last message starts.
         let replaced: Vec<&Board> = boards
             .iter()
-            .filter(|b| {
-                b.dispatch == Dispatch::Daemon
-                    && (self.is_home(b) || (self.hosts(b) && b.status == BoardStatus::Paused))
-            })
+            .filter(|b| b.dispatch == Dispatch::Daemon && self.is_home(b))
             .collect();
         for board in replaced {
             self.retire_coordinator(board, now).await;
@@ -1782,15 +1780,17 @@ impl<T: T3> Daemon<T> {
         for board in order {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
-                self.state.pending_starts.remove(&board.slug);
                 self.dispatch_renewed.remove(&board.slug);
                 // A paused board keeps its coordinator thread and names it still, so the
                 // server holds that thread while paused (`Snapshot::held_by`), and the same
-                // thread is woken when the board resumes instead of a new one starting. A
-                // paused daemon-dispatch board starts no worker until it resumes.
+                // thread is woken when the board resumes instead of a new one starting. It
+                // keeps a pending start's mark too, so the thread that start made is found.
+                // A paused daemon-dispatch board starts no worker, and its coordinator thread
+                // gets the switch's last message, once it resumes.
                 if self.hosts(board) && board.status == BoardStatus::Paused {
                     continue;
                 }
+                self.state.pending_starts.remove(&board.slug);
                 let dispatching = board.coordinator.as_ref() == Some(&self.dispatch_agent());
                 let local = self.state.coordinators.remove(&board.slug);
                 if local.is_some() || dispatching {
@@ -2780,49 +2780,35 @@ impl<T: T3> Daemon<T> {
         self.tell_stood_down(slug).await;
     }
 
-    /// The switch of `board` to daemon dispatch, on a device that runs it: its coordinator
-    /// thread gets its last message ([`switch_message`]) once. So does a thread that an
-    /// unrecorded start created and briefed, and one that stood down earlier for another
-    /// reason, which was told only to stop dispatching. Then the dispatcher takes the
-    /// lease ([`Self::dispatch`]).
+    /// The switch of `board` to daemon dispatch, on a device that runs it while it is
+    /// active: its coordinator thread gets its last message ([`switch_message`]) once, and
+    /// so does the thread of a start not yet recorded, when that thread ran. A thread that
+    /// stood down earlier for another reason is not woken again. Then the dispatcher takes
+    /// the lease ([`Self::dispatch`]).
     async fn retire_coordinator(&mut self, board: &Board, now: Timestamp) {
         let slug = &board.slug;
         if let Some(local) = self.state.coordinators.remove(slug) {
             self.stand_down_as(slug, local, SWITCH_REASON.to_owned(), true)
                 .await;
-        } else if let Some(stood) = self.state.stood_down.get_mut(slug).filter(|s| !s.last) {
-            tracing::info!(
-                "coordinator of {slug}: thread {}, which stood down earlier, gets the switch's last message",
-                stood.coordinator.thread
-            );
-            stood.last = true;
-            stood.told = false;
-            stood.tries = 0;
-            stood.reason = SWITCH_REASON.to_owned();
-            self.tell_stood_down(slug).await;
         }
         let Some(&since) = self.state.pending_starts.get(slug) else {
             return;
         };
-        let found = match self.host_folder(board) {
-            Ok(project) => self
-                .t3
-                .threads_titled(&project, &coordinator_title(slug))
-                .await
-                .map(|threads| {
-                    threads
-                        .into_iter()
-                        .filter(|t| t.created_at >= since)
-                        .max_by_key(|t| t.created_at)
-                }),
-            Err(err) => Err(err),
+        let project = match self.host_folder(board) {
+            Ok(project) => project,
+            // The folder is not here, so no thread of ours can run in it.
+            Err(err) => {
+                tracing::warn!("coordinator of {slug}: dropped an unfinished start: {err:#}");
+                self.state.pending_starts.remove(slug);
+                return;
+            }
         };
-        let thread = match found {
+        let thread = match self.unrecorded_start(slug, &project, since).await {
             Ok(thread) => thread,
             // The mark stays, so the next reconcile looks again.
             Err(err) => {
                 tracing::warn!(
-                    "coordinator of {slug}: looking for the thread of an unfinished coordinator start: {err:#}; looked for again on the next reconcile"
+                    "coordinator of {slug}: {err:#}; looked for again on the next reconcile"
                 );
                 return;
             }
@@ -3559,6 +3545,10 @@ impl<T: T3> Daemon<T> {
     /// thread. `reason` is why a coordinator is needed, logged with the start.
     async fn resume_or_start(&mut self, board: &Board, now: Timestamp, reason: &str) -> Result<()> {
         let slug = &board.slug;
+        // A thread that got the switch's last message was told nothing more comes.
+        if self.state.stood_down.get(slug).is_some_and(|s| s.last) {
+            self.state.stood_down.remove(slug);
+        }
         let Some(stood) = self.state.stood_down.get(slug).cloned() else {
             return self.start_coordinator(board, now, reason).await;
         };
@@ -3687,6 +3677,24 @@ impl<T: T3> Daemon<T> {
         self.adopt(board, local, now).await
     }
 
+    /// The thread with the coordinator title of `slug` that a start begun at `since` and not
+    /// recorded created, if any: the newest one created since then.
+    async fn unrecorded_start(
+        &self,
+        slug: &BoardSlug,
+        project: &Path,
+        since: Timestamp,
+    ) -> Result<Option<ListedThread>> {
+        Ok(self
+            .t3
+            .threads_titled(project, &coordinator_title(slug))
+            .await
+            .context("looking for the thread of an unfinished coordinator start")?
+            .into_iter()
+            .filter(|t| t.created_at >= since)
+            .max_by_key(|t| t.created_at))
+    }
+
     /// The coordinator thread for `slug`: the one an unfinished earlier start created, if
     /// any, else a new one. An earlier start is unfinished when its pending mark is still
     /// saved (the daemon was killed, or `t3` failed or timed out, after the mark was written);
@@ -3702,37 +3710,29 @@ impl<T: T3> Daemon<T> {
     ) -> Result<(String, bool)> {
         let title = coordinator_title(slug);
         let message = coordinator_message(slug, self.triages(slug), self.children());
-        if let Some(&since) = self.state.pending_starts.get(slug) {
-            let found = self
-                .t3
-                .threads_titled(project, &title)
-                .await
-                .context("looking for the thread of an unfinished coordinator start")?
-                .into_iter()
-                .filter(|t| t.created_at >= since)
-                .max_by_key(|t| t.created_at);
-            if let Some(thread) = found {
-                if thread.ran {
-                    tracing::warn!(
-                        "coordinator of {slug}: adopting thread {}, which a start at {since} launched but did not record",
-                        thread.id
-                    );
-                    return Ok((thread.id, false));
-                }
+        if let Some(&since) = self.state.pending_starts.get(slug)
+            && let Some(thread) = self.unrecorded_start(slug, project, since).await?
+        {
+            if thread.ran {
                 tracing::warn!(
-                    "coordinator of {slug}: briefing thread {}, which a start at {since} created but did not send its message",
+                    "coordinator of {slug}: adopting thread {}, which a start at {since} launched but did not record",
                     thread.id
                 );
-                if let Err(err) = self.t3.send(&thread.id, &message).await {
-                    // Not that thread again: the next start makes a new one.
-                    self.state.pending_starts.remove(slug);
-                    return Err(err.context(format!(
-                        "briefing thread {} left by an earlier start; archive it in T3",
-                        thread.id
-                    )));
-                }
-                return Ok((thread.id, true));
+                return Ok((thread.id, false));
             }
+            tracing::warn!(
+                "coordinator of {slug}: briefing thread {}, which a start at {since} created but did not send its message",
+                thread.id
+            );
+            if let Err(err) = self.t3.send(&thread.id, &message).await {
+                // Not that thread again: the next start makes a new one.
+                self.state.pending_starts.remove(slug);
+                return Err(err.context(format!(
+                    "briefing thread {} left by an earlier start; archive it in T3",
+                    thread.id
+                )));
+            }
+            return Ok((thread.id, true));
         }
         // Never in the project root, which other threads share: see `worktree`.
         let worktree = crate::worktree::coordinator_worktree(project, slug, now)

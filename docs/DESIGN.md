@@ -1132,11 +1132,13 @@ one task and one section of the prompt, not the days before it.
    as a `decision` note, hand each task it owns in `doing` to its child or back to
    `open`, then end (built: once, with the stand-down record of "A coordinator that
    stands down", marked `last`; the server's `hold:` line lets the thread do these
-   steps). A thread that stood down earlier for another reason, and was told only to stop
-   dispatching, gets it too. A coordinator start not yet recorded (`pending_starts`) is
-   looked for by title as a start does: a thread it created that ran gets the message, one
-   that never ran was never briefed and gets nothing, and a failed lookup is tried again
-   on the next reconcile.
+   steps). A paused board keeps its coordinator until it resumes, since the pause's
+   `hold:` line would end that turn. A coordinator start not yet recorded
+   (`pending_starts`) is looked for by title as a start does: a thread it created that ran
+   gets the message, one that never ran was never briefed and gets nothing, and a failed
+   lookup is tried again on the next reconcile. A thread that stood down earlier for
+   another reason is not woken again. A board switched back to `thread` starts a new
+   coordinator thread rather than resuming the one told to end.
 3. The dispatcher takes the lease (built: a claim on the same device replaces the
    coordinator's).
 

@@ -7281,14 +7281,31 @@ async fn a_board_switched_to_daemon_dispatch_sends_its_coordinator_one_last_mess
     assert!(e.daemon.on_event(&ready, at()).await.unwrap());
     e.daemon.flush(at()).await;
     assert_eq!(e.t3.sends().len(), 1, "nothing more: {:?}", e.t3.sends());
+
+    // Switched back to thread dispatch: the thread was told nothing more comes, so a new
+    // coordinator thread starts instead of that one resuming.
+    e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        autopilot(Some(&format!("t3:{NEW_THREAD}")), &[DEVICE]),
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    assert_eq!(starts(&e.t3), 1);
+    let to_coord =
+        e.t3.sends()
+            .into_iter()
+            .filter(|(t, _)| t == "coord")
+            .count();
+    assert_eq!(to_coord, 1, "no resume message: {:?}", e.t3.sends());
+    assert!(saved_state(&e).stood_down.is_empty());
 }
 
-#[tokio::test]
-async fn a_thread_that_stood_down_earlier_gets_the_switchs_last_message_once() {
-    let (mut e, _) = stood_down_env().await;
-    assert_eq!(e.t3.sends().len(), 1, "told to stop dispatching");
-    let board = daemon_board(None);
-    e.stub.on("GET /v1/boards", [board.clone()]);
+/// The stubs a reconcile of a daemon board needs once its dispatcher claims the lease.
+fn on_daemon_switch(e: &Env, board: Board) {
+    e.stub.on("GET /v1/boards", [board]);
     e.stub.on(
         "POST /v1/boards/factory/coordinator",
         daemon_board(Some(DISPATCH)),
@@ -7298,17 +7315,50 @@ async fn a_thread_that_stood_down_earlier_gets_the_switchs_last_message_once() {
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
     e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+}
+
+#[tokio::test]
+async fn a_thread_that_stood_down_earlier_is_not_woken_by_the_switch() {
+    let (mut e, _) = stood_down_env().await;
+    assert_eq!(e.t3.sends().len(), 1, "told to stop dispatching");
+    on_daemon_switch(&e, daemon_board(None));
 
     e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(e.t3.sends().len(), 1, "{:?}", e.t3.sends());
+    assert!(!saved_state(&e).stood_down[&factory()].last);
+}
+
+#[tokio::test]
+async fn a_paused_board_switched_to_daemon_dispatch_sends_the_last_message_once_it_resumes() {
+    let (mut e, agent) = coordinator_env(AgentState::Idle, None);
+    e.daemon.state.pending_starts.insert(factory(), at());
+    let mut paused = daemon_board(Some(&agent));
+    paused.status = board_proto::BoardStatus::Paused;
+    on_daemon_switch(&e, paused);
+
+    e.daemon.reconcile(at()).await.unwrap();
+
+    // The paused board's `hold:` line would end the message's turn: it waits.
+    assert!(e.t3.sends().is_empty(), "{:?}", e.t3.sends());
+    let saved = saved_state(&e);
+    assert_eq!(saved.coordinators[&factory()].agent.as_str(), agent);
+    assert_eq!(saved.pending_starts.get(&factory()), Some(&at()));
+    assert!(dispatch_claims(&e).is_empty());
+
+    on_daemon_switch(&e, daemon_board(Some(&agent)));
     e.daemon.reconcile(at()).await.unwrap();
 
     let sends = e.t3.sends();
-    let [_, (thread, text)] = sends.as_slice() else {
+    let [(thread, text)] = sends.as_slice() else {
         panic!("{sends:?}");
     };
     assert_eq!(thread, "coord");
     assert_eq!(text, &board::daemon::switch_message(&factory()));
-    assert!(saved_state(&e).stood_down[&factory()].last);
+    let saved = saved_state(&e);
+    assert!(saved.coordinators.is_empty());
+    assert!(saved.pending_starts.is_empty(), "looked for and found none");
+    assert_eq!(dispatch_claims(&e)[0].body["agent"], DISPATCH);
 }
 
 #[tokio::test]
