@@ -1123,9 +1123,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
     // --agent naming the identity the environment proves acts as that identity.
     let named_own = std::cell::Cell::new(false);
     let loaded = std::cell::OnceCell::new();
+    // The agent's record, once this command has read it.
+    let known = std::cell::OnceCell::new();
     let ctx = || -> Result<Ctx> {
         if let Some(ctx) = loaded.get() {
-            return Ok(Ctx::clone(ctx));
+            let mut ctx = Ctx::clone(ctx);
+            ctx.known = known.get().cloned();
+            return Ok(ctx);
         }
         if let Some(named) = &cli.agent {
             let named: board_proto::AgentId = named.parse().context("--agent")?;
@@ -1155,8 +1159,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
     if cli.command.acts_as_agent() {
         let ctx = ctx()?;
         let named = cli.agent.is_some() && !cli.register && !named_own.get();
-        ctx.ensure_registered(named.then_some(ops::NamedAgent::CliFlag))
+        let registered = ctx
+            .ensure_registered(named.then_some(ops::NamedAgent::CliFlag))
             .await?;
+        if let Some(agent) = registered {
+            // Just set: nothing else fills the cell.
+            let _ = known.set(agent);
+        }
     }
     let out: Output = match cli.command {
         Command::Login { server, device } => return login(&home, server, device),

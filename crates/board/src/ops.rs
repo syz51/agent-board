@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
-    AddNote, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug, BoardStatus,
-    CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName, DoneTask,
-    ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
-    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX,
-    Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug,
+    BoardStatus, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
+    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
+    RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT,
+    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -63,6 +63,10 @@ pub struct Ctx {
     pub device: DeviceName,
     pub client: Client,
     pub repo: RepoInfo,
+    /// The calling agent as the server gave it earlier in this invocation
+    /// ([`Ctx::ensure_registered`]), so the command does not read it again. Only a process
+    /// that ends with its command sets it: in one that stays, the record goes stale.
+    pub known: Option<Agent>,
 }
 
 impl Ctx {
@@ -81,6 +85,7 @@ impl Ctx {
             device,
             client,
             repo: RepoInfo::detect(&cwd),
+            known: None,
         })
     }
 
@@ -92,6 +97,7 @@ impl Ctx {
     pub fn as_agent(&self, agent: Option<AgentId>) -> Self {
         Self {
             client: self.client.with_agent(agent),
+            known: None,
             ..self.clone()
         }
     }
@@ -120,12 +126,13 @@ impl Ctx {
     /// call from a session whose start hook did not run. A known agent is left as it is.
     /// An agent named by hand (`named`) is refused instead when unknown, before anything is
     /// written, since such an id would stay listed as running with nothing to end it.
-    pub async fn ensure_registered(&self, named: Option<NamedAgent>) -> Result<()> {
+    /// Returns the record of a known agent, for [`Ctx::known`].
+    pub async fn ensure_registered(&self, named: Option<NamedAgent>) -> Result<Option<Agent>> {
         let Some(agent) = self.client.agent() else {
-            return Ok(());
+            return Ok(None);
         };
         match self.client.agent_info(agent).await {
-            Ok(_) => Ok(()),
+            Ok(info) => Ok(Some(info)),
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
                 if let Some(named) = named {
                     return Err(named.unknown(agent));
@@ -139,7 +146,8 @@ impl Ctx {
                         Runtime::Claude
                     }
                 };
-                self.register(runtime, Vec::new()).await
+                self.register(runtime, Vec::new()).await?;
+                Ok(None)
             }
             Err(err) => Err(err),
         }
@@ -158,9 +166,12 @@ impl Ctx {
                 .as_ref()
                 .is_some_and(|k| b.repos.iter().any(|r| r == k))
         };
-        if let Some(agent) = self.client.agent()
-            && let Ok(info) = self.client.agent_info(agent).await
-        {
+        let info = match (&self.known, self.client.agent()) {
+            (Some(known), _) => Some(known.clone()),
+            (None, Some(agent)) => self.client.agent_info(agent).await.ok(),
+            (None, None) => None,
+        };
+        if let Some(info) = info {
             let mine: Vec<&Board> = boards
                 .iter()
                 .filter(|b| info.boards.contains(&b.slug))

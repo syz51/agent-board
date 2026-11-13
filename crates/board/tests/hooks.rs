@@ -1123,6 +1123,155 @@ fn shell_calls_leave_out_the_files_git_brought_in() {
     assert_eq!(paths, Some(json!(["src/b.rs"])));
 }
 
+/// Puts a `git` first on a hook's `PATH` that logs `start <command>` and `end <command>`
+/// around each run and waits before running a command named in `slow`. Returns that `PATH`
+/// and the log.
+fn logging_git(e: &Env, slow: &str) -> (String, PathBuf) {
+    let path = std::env::var_os("PATH").unwrap();
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .expect("git on PATH");
+    let bin = e.home.join("git-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = e.home.join("git.log");
+    let script = [
+        "#!/bin/sh".to_owned(),
+        "command=other".to_owned(),
+        "for arg in \"$@\"; do".to_owned(),
+        "  case \"$arg\" in".to_owned(),
+        "    status|diff|rev-parse|symbolic-ref|remote) command=$arg; break ;;".to_owned(),
+        "  esac".to_owned(),
+        "done".to_owned(),
+        format!("echo \"start $command\" >> '{}'", log.display()),
+        // Long enough to order the log lines, short enough for the scan's half second.
+        format!("[ \"$command\" = {slow} ] && sleep 0.1"),
+        format!("'{}' \"$@\"", real.display()),
+        "code=$?".to_owned(),
+        format!("echo \"end $command\" >> '{}'", log.display()),
+        "exit $code".to_owned(),
+    ]
+    .join("\n");
+    common::script::write_script(&bin.join("git"), &format!("{script}\n"));
+    let path = format!("{}:{}", bin.display(), path.to_string_lossy());
+    (path, log)
+}
+
+/// The lines of a [`logging_git`] log, emptied for the next hook.
+fn take_git_log(log: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let _ = std::fs::remove_file(log);
+    text.lines().map(str::to_owned).collect()
+}
+
+#[test]
+fn a_shell_calls_scan_runs_while_the_repo_is_detected() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    commit_files(&e.repo, &[("src/lib.rs", "a\n")]);
+    // Detecting the repo is slow; the scan must not wait for it.
+    let (path, log) = logging_git(&e, "symbolic-ref");
+    let slow_git = [("PATH", path.as_str())];
+    // The call runs in a directory below the work tree's top.
+    let call = |event: &str| {
+        e.with(
+            event,
+            json!({
+                "cwd": e.repo.join("src"),
+                "tool_name": "Bash",
+                "tool_input": {"command": "x"},
+                "tool_use_id": "toolu_scan",
+            }),
+        )
+    };
+    e.hook_env("pre-tool-use", "claude", call("PreToolUse"), &slow_git);
+    take_git_log(&log);
+    std::fs::write(e.repo.join("src/lib.rs"), "b\n").unwrap();
+    std::fs::write(e.repo.join("top.txt"), "x\n").unwrap();
+    e.hook_env("post-tool-use", "claude", call("PostToolUse"), &slow_git);
+
+    let ran = take_git_log(&log);
+    let at = |line: &str| {
+        ran.iter()
+            .position(|l| l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {ran:?}\n{}", e.ran()))
+    };
+    assert!(
+        at("start status") < at("end symbolic-ref"),
+        "the scan started only after the repo was detected: {ran:?}"
+    );
+    // Run from a directory below the top, the scan still covers the whole work tree and
+    // names each path from the top.
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 1, "{}", e.ran());
+    assert_eq!(touches[0].body["paths"], json!(["src/lib.rs", "top.txt"]));
+}
+
+#[test]
+fn the_diffs_of_what_git_brought_in_run_at_once() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    // Two branches change a.rs, so a rebase of one on the other stops on a conflict.
+    commit_files(&e.repo, &[("src/a.rs", "a\n"), ("src/b.rs", "b\n")]);
+    assert!(
+        git(&e.repo, &["switch", "-q", "-c", "other"])
+            .status
+            .success()
+    );
+    commit_files(&e.repo, &[("src/a.rs", "a-other\n"), ("src/c.rs", "c\n")]);
+    assert!(
+        git(&e.repo, &["switch", "-q", "feature/x"])
+            .status
+            .success()
+    );
+    commit_files(&e.repo, &[("src/a.rs", "a-mine\n")]);
+
+    let (path, log) = logging_git(&e, "diff");
+    let slow_git = [("PATH", path.as_str())];
+    let call = |event: &str| {
+        e.with(
+            event,
+            json!({"tool_name": "Bash", "tool_input": {"command": "git rebase other"}, "tool_use_id": "toolu_diffs"}),
+        )
+    };
+    e.hook_env("pre-tool-use", "claude", call("PreToolUse"), &slow_git);
+    take_git_log(&log);
+    // The stopped rebase moves HEAD and leaves the commit it applies: two ranges to diff.
+    assert!(!git(&e.repo, &["rebase", "other"]).status.success());
+    e.hook_env("post-tool-use", "claude", call("PostToolUse"), &slow_git);
+
+    let ran = take_git_log(&log);
+    let diffs: Vec<&str> = ran
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.ends_with(" diff"))
+        .collect();
+    assert_eq!(
+        diffs,
+        ["start diff", "start diff", "end diff", "end diff"],
+        "each diff waited for the one before: {ran:?}\n{}",
+        e.ran()
+    );
+    // Every file the rebase wrote is left out, as when the diffs ran one by one.
+    assert!(
+        e.stub.requests_to("POST /v1/touches").is_empty(),
+        "{:?}",
+        e.stub.requests_to("POST /v1/touches")
+    );
+}
+
 /// A task in doing, a delta snapshot and a handoff written an hour ago, with the agent's
 /// last change dated by the server (`None`: a server that does not date changes).
 fn doing_with_handoff(e: &Env, last_change_at: Option<chrono::DateTime<chrono::Utc>>) -> Handoff {

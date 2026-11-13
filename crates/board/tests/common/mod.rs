@@ -37,6 +37,10 @@ pub struct Recorded {
     pub auth: Option<String>,
     pub accept: Option<String>,
     pub body: Value,
+    /// The requests the stub had not answered yet when this one arrived, each as
+    /// `METHOD path?query`: what the client sent at once with it. Event streams, which
+    /// stay open, are left out.
+    pub beside: Vec<String>,
 }
 
 impl Recorded {
@@ -66,6 +70,10 @@ struct StubState {
     /// One-off answers per route, used before `routes`.
     once: BTreeMap<String, VecDeque<Canned>>,
     requests: Vec<Recorded>,
+    /// The requests being answered, each under its own number, for [`Recorded::beside`].
+    answering: Vec<(u64, String)>,
+    /// How many requests arrived so far.
+    arrived: u64,
     /// Delay applied to every request (an overloaded or hanging server).
     hang: Option<Duration>,
     /// Routes answered as a server-sent event stream: the events after the request's
@@ -299,8 +307,15 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         .find_map(|p| p.strip_prefix("since="))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let (canned, hang, stream, build) = {
+    let (canned, hang, stream, build, _answering) = {
         let mut st = state.lock().unwrap();
+        let beside = st.answering.iter().map(|(_, r)| r.clone()).collect();
+        st.arrived += 1;
+        let number = st.arrived;
+        let answering = (!st.streams.contains_key(&route)).then(|| {
+            st.answering.push((number, format!("{route}?{query}")));
+            Answering(state.clone(), number)
+        });
         st.requests.push(Recorded {
             method,
             path,
@@ -309,6 +324,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             auth,
             accept,
             body,
+            beside,
         });
         let once = st.once.get_mut(&route).and_then(VecDeque::pop_front);
         let stream = st.streams.get(&route).map(|stream| {
@@ -331,6 +347,7 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
             st.hang,
             stream,
             st.build.clone(),
+            answering,
         )
     };
     if let Some((text, flapping)) = stream {
@@ -378,6 +395,18 @@ async fn handle(State(state): State<Arc<Mutex<StubState>>>, req: Request) -> Res
         }
     }
     resp
+}
+
+/// A request the stub is answering, until the answer is ready or the client gives up.
+struct Answering(Arc<Mutex<StubState>>, u64);
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        // A poisoned lock means a test already failed: nothing more to keep right.
+        if let Ok(mut st) = self.0.lock() {
+            st.answering.retain(|(number, _)| *number != self.1);
+        }
+    }
 }
 
 /// Percent-encodes a path segment the way the client does.

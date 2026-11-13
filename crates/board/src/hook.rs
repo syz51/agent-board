@@ -27,6 +27,7 @@ use board_proto::{
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
 use serde_json::{Value, json};
+use tokio::process::Child;
 
 use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failure};
 use crate::config::{Config, Home, load_token};
@@ -443,17 +444,23 @@ async fn handle(
     steps.mark("t3");
     // A later hook that registers the thread's title registers where the agent runs too.
     let reregister = event != HookEvent::SessionStart && t3.is_some();
+    let cwd = input_cwd(input);
+    // `git status` needs the directory only, not the repo's root, so a shell call's scan
+    // starts here and runs while the repo is detected.
+    let shell = shell_start
+        .as_ref()
+        .map(|start| (start, list_changes(&cwd)));
     let repo = if event == HookEvent::SessionStart
         || reregister
         || !edited.is_empty()
         || shell_start.is_some()
     {
-        Some(detect_repo(input_cwd(input)).await?)
+        Some(detect_repo(cwd).await?)
     } else {
         None
     };
     let touches = match &repo {
-        Some(repo) if post => local_touches(&agent, repo, edited, shell_start.as_ref()).await,
+        Some(repo) if post => local_touches(&agent, repo, edited, shell).await,
         _ => Vec::new(),
     };
     let heartbeat = post && heartbeat_due(last_beat, now);
@@ -1992,13 +1999,14 @@ fn spawn_token(home: &Home) -> tokio::task::JoinHandle<Result<Option<String>>> {
 }
 
 /// What a `PostToolUse` hook reports for `agent`, in batches the server takes: the files an
-/// edit tool names, or those a shell call that started at `shell_start` changed in the work
-/// tree. Empty outside a repo with an `origin`.
+/// edit tool names, or those a shell call changed in the work tree, from its start mark and
+/// the listing [`list_changes`] began. Empty outside a repo with an `origin`, where a
+/// listing is dropped, which stops its `git`.
 async fn local_touches(
     agent: &AgentId,
     repo: &RepoInfo,
     edited: Vec<PathBuf>,
-    shell_start: Option<&ToolStart>,
+    shell: Option<(&ToolStart, Result<Child>)>,
 ) -> Vec<Touches> {
     let Some(key) = repo.key.clone() else {
         return Vec::new();
@@ -2006,21 +2014,21 @@ async fn local_touches(
     // An edit tool names its files; a shell call's are found by scanning the work tree, so
     // another agent in the same checkout may have written them. Edit tools never have a
     // start mark, and a shell call names no files.
-    let (paths, scanned) = match (shell_start, repo.root.as_deref()) {
-        (Some(start), Some(root)) => {
+    let (paths, scanned) = match (shell, repo.root.as_deref()) {
+        (Some((start, listing)), Some(root)) => {
             // Bounded on its own, so a slow work tree never eats the server's budget.
-            let found =
-                match tokio::time::timeout(SHELL_SCAN_BUDGET, shell_changes(root, start)).await {
-                    Ok(Ok(changed)) => changed,
-                    Ok(Err(err)) => {
-                        tracing::debug!("files changed by the shell call: {err:#}");
-                        Vec::new()
-                    }
-                    Err(_) => {
-                        tracing::debug!("files changed by the shell call: over budget");
-                        Vec::new()
-                    }
-                };
+            let scan = shell_changes(root, start, listing);
+            let found = match tokio::time::timeout(SHELL_SCAN_BUDGET, scan).await {
+                Ok(Ok(changed)) => changed,
+                Ok(Err(err)) => {
+                    tracing::debug!("files changed by the shell call: {err:#}");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::debug!("files changed by the shell call: over budget");
+                    Vec::new()
+                }
+            };
             let found = found.into_iter().map(|(p, at)| (p, Some(at))).collect();
             (found, true)
         }
@@ -2150,9 +2158,13 @@ pub async fn git_head(dir: &Path) -> Result<GitHead> {
 }
 
 /// What a shell call that started at `start` changed in the work tree `root`: the files
-/// [`changed_since`] finds, less those [`brought_in`] by git during the call.
-pub async fn shell_changes(root: &Path, start: &ToolStart) -> Result<Vec<(PathBuf, Timestamp)>> {
-    let changed = changed_since(root, start.at).await?;
+/// [`changed_since`] finds in `listing`, less those [`brought_in`] by git during the call.
+pub async fn shell_changes(
+    root: &Path,
+    start: &ToolStart,
+    listing: Result<Child>,
+) -> Result<Vec<(PathBuf, Timestamp)>> {
+    let changed = changed_since(root, start.at, listing?).await?;
     if changed.is_empty() {
         return Ok(changed);
     }
@@ -2206,14 +2218,19 @@ pub async fn brought_in(root: &Path, start: &ToolStart) -> Result<HashSet<PathBu
             ranges.push(vec![format!("{commit}^"), commit]);
         }
     }
-    let mut out = HashSet::new();
-    for range in ranges {
+    // The diffs read the same commits and their paths go into one set, so they run at
+    // once; the first failure drops the others, which stops their `git`.
+    let diffs = ranges.iter().map(|range| async move {
         let mut args = vec!["diff", "--name-only", "-z", "--no-renames"];
         args.extend(range.iter().map(String::as_str));
         args.push("--");
-        out.extend(nul_paths(root, &git_output(root, &args).await?));
-    }
-    Ok(out)
+        git_output(root, &args).await
+    });
+    let diffs = futures_util::future::try_join_all(diffs).await?;
+    Ok(diffs
+        .iter()
+        .flat_map(|diff| nul_paths(root, diff))
+        .collect())
 }
 
 /// Did `HEAD` go from `before` to `after` by commits alone (`git commit`, `--amend`), so the
@@ -2258,26 +2275,40 @@ fn committed_only(git_dir: &Path, before: &str, after: &str) -> bool {
     false
 }
 
-/// Files under the work tree `root` that `git status` lists as changed or untracked and
-/// that were modified at or after `since`: what a shell call that started then wrote.
-/// Not seen: files the call deleted, changed and committed, or wrote keeping an older
-/// modification time (`mv`, `cp -p`, archives). Seen as well: files another writer in the
-/// same work tree changed during the call. Dropping the future stops `git`.
-pub async fn changed_since(root: &Path, since: Timestamp) -> Result<Vec<(PathBuf, Timestamp)>> {
-    let out = git_output(
-        root,
-        &[
+/// Starts `git status` in the work tree containing `dir`, to list its changed and untracked
+/// files for [`changed_since`]. Any directory of the work tree gives the same list: this
+/// format names every path from the work tree's top. Dropping the child stops `git`.
+pub fn list_changes(dir: &Path) -> Result<Child> {
+    let child = git(dir)
+        .args([
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
             "--no-renames",
-        ],
-    )
-    .await?;
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    Ok(child)
+}
+
+/// Files under the work tree `root` that the `git status` in `listing` ([`list_changes`])
+/// names as changed or untracked and that were modified at or after `since`: what a shell
+/// call that started then wrote.
+/// Not seen: files the call deleted, changed and committed, or wrote keeping an older
+/// modification time (`mv`, `cp -p`, archives). Seen as well: files another writer in the
+/// same work tree changed during the call. Dropping the future stops `git`.
+pub async fn changed_since(
+    root: &Path,
+    since: Timestamp,
+    listing: Child,
+) -> Result<Vec<(PathBuf, Timestamp)>> {
+    let out = listing.wait_with_output().await?;
+    anyhow::ensure!(out.status.success(), "git status failed: {}", out.status);
     // Whole seconds: some file systems keep modification times to the second.
     let since = since.trunc_subsecs(0);
     Ok(out
+        .stdout
         .split(|b| *b == 0)
         // Each entry is `XY <path>`; paths are relative to the work tree.
         .filter_map(|entry| std::str::from_utf8(entry.get(3..)?).ok())
