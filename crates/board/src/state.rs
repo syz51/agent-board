@@ -19,7 +19,7 @@ pub struct AgentLocal {
     pub last_heartbeat: Option<Timestamp>,
     /// When the current turn started (`UserPromptSubmit`).
     pub turn_started: Option<Timestamp>,
-    /// What the last `Stop` handoff reminder was for: the change it reported (or the turn,
+    /// What the last handoff reminder (`PostToolUse`) was for: the change it reported (or the turn,
     /// against a server that does not date changes), so each is reminded about once.
     pub reminded_for: Option<Timestamp>,
     /// Set while the server is unreachable and the cached snapshot was already injected.
