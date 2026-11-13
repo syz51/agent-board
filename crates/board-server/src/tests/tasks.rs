@@ -404,6 +404,16 @@ async fn blocked_needs_a_reason_or_an_open_blocker() {
 
     let (s, v) = t.patch(A, &first, json!({ "blocked_reason": "why" })).await;
     assert_eq!(s.as_u16(), 400, "reason without blocked: {v}");
+    // The refusal names the way out: block the task, or leave the field out.
+    assert_eq!(
+        v["message"], "blocked_reason applies only to blocked tasks",
+        "{v}"
+    );
+    assert_eq!(
+        v["next"],
+        format!("send status=blocked with the reason, or leave blocked_reason out ({first})"),
+        "{v}"
+    );
 }
 
 #[tokio::test]
