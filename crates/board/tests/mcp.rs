@@ -445,6 +445,15 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         json!({"id": "factory-12", "commits": ["4e1c2ab"], "summary": "Parser fixed; PR #4 is open."}),
     );
     assert_ne!(done["isError"], true, "{done}");
+    // The done's own text asks to file what remains, as its last line.
+    assert_eq!(
+        text(&done).trim_end().lines().last(),
+        Some(
+            "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Name each open item's id in your final reply."
+        ),
+        "{done}"
+    );
+    assert!(!text(&done).contains("nothing left"), "{done}");
     let sent = &stub.requests_to("POST /v1/tasks/factory-12/done")[0].body;
     assert_eq!(sent["summary"], "Parser fixed; PR #4 is open.");
     assert_eq!(sent["evidence"][0]["value"], "4e1c2ab");
@@ -486,9 +495,9 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert!(text(&bad).starts_with("error: invalid arguments"));
 }
 
-/// The `task_update` tool is how agents release: it leaves the Stop hook's mark.
+/// The `task_update` tool is how agents release: its text then asks to file what remains.
 #[test]
-fn task_update_marks_a_release_to_open_of_an_owned_doing_task() {
+fn task_update_reminds_to_file_on_a_release_to_open_of_an_owned_doing_task() {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
     stub.on(
@@ -511,23 +520,18 @@ fn task_update_marks_a_release_to_open_of_an_owned_doing_task() {
         "initialize",
         json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
     );
-    let marks = || -> Vec<std::path::PathBuf> {
-        let Ok(agents) = std::fs::read_dir(home.join("state/released")) else {
-            return Vec::new();
-        };
-        agents
-            .flat_map(|agent| std::fs::read_dir(agent.unwrap().path()).unwrap())
-            .map(|mark| mark.unwrap().path())
-            .collect()
-    };
-    // A change that keeps the task in doing leaves none.
+    // A change that keeps the task in doing gets no reminder.
     let updated = mcp.call(
         2,
         "task_update",
         json!({"id": "factory-12", "priority": "p2"}),
     );
     assert_ne!(updated["isError"], true, "{updated}");
-    assert_eq!(marks(), Vec::<std::path::PathBuf>::new());
+    assert_eq!(text(&updated).lines().count(), 1, "{updated}");
+    assert!(
+        text(&updated).starts_with("updated factory-12"),
+        "{updated}"
+    );
 
     stub.on(
         "PATCH /v1/tasks/factory-12",
@@ -539,9 +543,18 @@ fn task_update_marks_a_release_to_open_of_an_owned_doing_task() {
         json!({"id": "factory-12", "status": "open"}),
     );
     assert_ne!(updated["isError"], true, "{updated}");
-    let marks = marks();
-    assert_eq!(marks.len(), 1, "{marks:?}");
-    assert!(marks[0].ends_with("factory-12.json"), "{marks:?}");
+    assert!(
+        text(&updated).starts_with("updated factory-12"),
+        "{updated}"
+    );
+    assert_eq!(
+        text(&updated).trim_end().lines().last(),
+        Some(
+            "Released unfinished: what remains of its own steps stays in this task, so note there which steps are done, unless a note says it. File now, unless it is on the board: a follow-up task an acceptance check requires, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. A feedback report is not such a task. Name each open item's id in your final reply."
+        ),
+        "{updated}"
+    );
+    assert!(!home.join("state/released").exists(), "no mark is left");
 }
 
 #[test]

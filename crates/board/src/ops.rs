@@ -21,7 +21,6 @@ use crate::config::{Config, Home, load_token};
 use crate::daemon::{self, Adoption};
 use crate::identity::RepoInfo;
 use crate::render;
-use crate::state::{Filed, FiledMark};
 use crate::t3::T3;
 
 /// How an agent other than the environment's own was named, which decides how the
@@ -703,16 +702,6 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             claim: new.claim,
         })
         .await?;
-    // For the Stop hook, which does not remind an agent that filed follow-ups to file them
-    // (`hook::done_reminder`). The task exists either way, so a failed write costs only that.
-    let kind = if task.is_pending_proposal() {
-        Some(Filed::Proposal)
-    } else {
-        task.parent.as_ref().map(|_| Filed::SubTask)
-    };
-    if let Some(kind) = kind {
-        record_filed(ctx, task.id.as_str(), kind, task.parent.clone());
-    }
     // A hint, never a refusal: the task exists, so a failed read only loses the hint.
     let duplicates = match likely_duplicates(ctx, &task).await {
         Ok(hint) => hint,
@@ -846,7 +835,7 @@ async fn board_of_repo(ctx: &Ctx, raw: &str) -> Result<BoardSlug> {
 /// `claim`, `release` or `take`.
 pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output> {
     // A release reads the task first, to know whether the agent gives up work in `doing`.
-    // Only the Stop hook's reminder needs it, so a failed read never fails the release.
+    // Only the reminder needs it, so a failed read never fails the release.
     let before = match action {
         "release" => match ctx.client.task(id).await {
             Ok(detail) => Some(detail.task),
@@ -858,13 +847,17 @@ pub async fn task_action(ctx: &Ctx, id: &TaskId, action: &str) -> Result<Output>
         _ => None,
     };
     let task = ctx.client.task_action(id, action).await?;
-    record_released(ctx, before.as_ref(), &task);
+    let gave_up = released(ctx, before.as_ref(), &task);
     let verb = match action {
         "claim" => "claimed",
         "release" => "released",
         _ => "took",
     };
     let mut text = format!("{verb} {}", render::task_line(&task));
+    if gave_up {
+        text.push('\n');
+        text.push_str(RELEASE_REMINDER);
+    }
     if action != "release" {
         // The task is the agent's now either way, so a failed read only loses the count.
         let notes = match ctx.client.task(id).await {
@@ -923,14 +916,15 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
             },
         )
         .await?;
-    record_released(ctx, Some(&before), &task);
     if let Some(wanted) = &wanted_owner {
         check_owner(ctx, &task, wanted).await?;
     }
-    Ok(Output::new(
-        format!("updated {}", render::task_line(&task)),
-        &task,
-    ))
+    let mut text = format!("updated {}", render::task_line(&task));
+    if released(ctx, Some(&before), &task) {
+        text.push('\n');
+        text.push_str(RELEASE_REMINDER);
+    }
+    Ok(Output::new(text, &task))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1000,13 +994,6 @@ pub async fn task_done(
             },
         )
         .await?;
-    // For the Stop hook's reminder to file what remains (`hook::done_reminder`). The server
-    // has the task done either way, so a failed write costs only the reminder.
-    if let Err(err) =
-        crate::state::record_done(&ctx.home, ctx.agent()?, &task.id, chrono::Utc::now())
-    {
-        tracing::warn!("recording {} done for the Stop hook: {err:#}", task.id);
-    }
     let mut text = format!("done {}", render::task_line(&task));
     // Read again: a note does not change the version, so one added after the read above
     // would be missed. When the read fails, the one above still lists the earlier ones.
@@ -1022,47 +1009,31 @@ pub async fn task_done(
         text.push('\n');
         text.push_str(&findings);
     }
+    text.push('\n');
+    text.push_str(DONE_REMINDER);
     Ok(Output::new(text, &task))
 }
 
-/// Leaves a mark for the agent's next `Stop` hook when the change from `before` to `after`
-/// released a task the agent owned in `doing` back to `open`: the hook reminds it to file
-/// what is not in the task (`hook::release_reminder`). Only that move: a task set `blocked`
-/// or `review` stays the agent's, and so does what the agent knows about it. The server has
-/// the change either way, so a failed write costs only the reminder.
-///
-/// A task that is the agent's after the change (a claim, a take, a hand-over to itself)
-/// was not given up, so an earlier release of it is forgotten. `before` is `None` when it
-/// was not read.
-fn record_released(ctx: &Ctx, before: Option<&Task>, after: &Task) {
-    let Ok(agent) = ctx.agent() else { return };
-    let released = after.status == TaskStatus::Open
-        && before.is_some_and(|b| b.status == TaskStatus::Doing && b.owner.as_ref() == Some(agent));
-    let marked = if released {
-        crate::state::record_released(&ctx.home, agent, &after.id, chrono::Utc::now())
-    } else if after.owner.as_ref() == Some(agent) {
-        crate::state::forget_released(&ctx.home, agent, &after.id)
-    } else {
-        Ok(())
-    };
-    if let Err(err) = marked {
-        tracing::warn!("marking {} for the Stop hook: {err:#}", after.id);
-    }
-}
+/// The last line of a done's text: what to file now, at the moment the agent closes the
+/// task, since a reminder at the turn's end would follow the agent's report and leave only
+/// its answer in view. The kinds of task are those of the MCP server's instructions
+/// (`mcp::INSTRUCTIONS`). It asks for no reply of its own.
+const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Name each open item's id in your final reply.";
 
-/// Leaves a mark of what the agent filed for its next `Stop` hook; see [`task_add`].
-fn record_filed(ctx: &Ctx, name: &str, kind: Filed, about: Option<TaskId>) {
-    let mark = FiledMark {
-        kind,
-        about,
-        at: chrono::Utc::now(),
-    };
-    let recorded = ctx
-        .agent()
-        .and_then(|agent| crate::state::record_filed(&ctx.home, agent, name, &mark));
-    if let Err(err) = recorded {
-        tracing::warn!("recording {name} filed for the Stop hook: {err:#}");
-    }
+/// The last line of a release's text ([`released`]): as [`DONE_REMINDER`], but what remains
+/// of a released task's own steps stays in it, so it asks for a note of the steps done and
+/// for the tasks that are not the task itself. A feedback report is named because agents
+/// took one for filed work.
+const RELEASE_REMINDER: &str = "Released unfinished: what remains of its own steps stays in this task, so note there which steps are done, unless a note says it. File now, unless it is on the board: a follow-up task an acceptance check requires, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. A feedback report is not such a task. Name each open item's id in your final reply.";
+
+/// Whether the change from `before` to `after` released a task the agent owned in `doing`
+/// back to `open`: its text then carries [`RELEASE_REMINDER`]. Only that move: a task set
+/// `blocked` or `review` stays the agent's, and so does what the agent knows about it.
+/// `before` is `None` when it was not read.
+fn released(ctx: &Ctx, before: Option<&Task>, after: &Task) -> bool {
+    let Ok(agent) = ctx.agent() else { return false };
+    after.status == TaskStatus::Open
+        && before.is_some_and(|b| b.status == TaskStatus::Doing && b.owner.as_ref() == Some(agent))
 }
 
 pub async fn task_note(ctx: &Ctx, id: &TaskId, kind: NoteKind, text: String) -> Result<Output> {
@@ -1199,12 +1170,6 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
         })
         .await?;
     let created = &answer.ask;
-    record_filed(
-        ctx,
-        &format!("ask-{}", created.id),
-        Filed::Ask,
-        created.task.clone(),
-    );
     let mut text = format!(
         "{}; the user is notified. Continue with other ready work; the answer wakes you.",
         render::ask_line(created)
@@ -1763,9 +1728,8 @@ pub async fn stats(ctx: &Ctx, days: u32, now: Timestamp) -> Result<Output> {
 }
 
 /// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a
-/// feedback item, or adds the report to the live item with the same signature. It leaves no
-/// filed mark: a report on a setup is not the task's remaining work, so the `Stop` hook's
-/// reminders still ask for that.
+/// feedback item, or adds the report to the live item with the same signature. A report on
+/// a setup is not a task's remaining work, which the done and release texts say.
 pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
     if req.text.trim().is_empty() {
         bail!("feedback is empty: say what cost you a step");

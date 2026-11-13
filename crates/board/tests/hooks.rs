@@ -1299,7 +1299,7 @@ fn a_turn_begun_after_the_pause_goes_on_when_it_claims_the_boards_work() {
     assert_eq!(
         stop(&e).unwrap()["decision"],
         "block",
-        "the user's turn gets its reminders"
+        "the user's turn gets its reminder"
     );
 
     // A pause after the turn began still ends it.
@@ -1703,7 +1703,7 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
     assert_eq!(
         stop(&e).unwrap()["decision"],
         "block",
-        "the user's own turn gets its reminders"
+        "the user's own turn gets its reminder"
     );
 
     // Resumed: no hold line and no halt.
@@ -1796,8 +1796,8 @@ fn codex_stop_always_prints_json() {
 }
 
 /// Marks `id` done as the agent would from its shell (`board done`), with the identity the
-/// hooks resolve: `env` names it, or `agent` passes it explicitly.
-fn mark_done(e: &Env, id: &str, agent: Option<&str>) {
+/// hooks resolve: `env` names it, or `agent` passes it explicitly. Returns what it printed.
+fn mark_done(e: &Env, id: &str, agent: Option<&str>) -> String {
     let detail = board_proto::TaskDetail {
         task: task_fixture(id, "Do it"),
         notes: vec![],
@@ -1833,9 +1833,10 @@ fn mark_done(e: &Env, id: &str, agent: Option<&str>) {
     };
     let out = board(&e.home, &e.repo, env, &args, "");
     assert!(out.status.success(), "{}", stderr(&out));
+    String::from_utf8(out.stdout).unwrap()
 }
 
-/// No task in doing, so only the done reminder can speak.
+/// No task in doing, so the handoff reminder has nothing to say.
 fn nothing_doing(e: &Env) {
     e.agent_ok();
     e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
@@ -1845,260 +1846,68 @@ fn nothing_doing(e: &Env) {
     );
 }
 
+/// The line `board done` and the `task_done` tool end with: what to file now.
+const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Name each open item's id in your final reply.";
+
+/// The line a release to `open` ends with.
+const RELEASE_REMINDER: &str = "Released unfinished: what remains of its own steps stays in this task, so note there which steps are done, unless a note says it. File now, unless it is on the board: a follow-up task an acceptance check requires, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. A feedback report is not such a task. Name each open item's id in your final reply.";
+
+/// The done's own output asks to file what remains, so the `Stop` after it does not block:
+/// a block there would continue the turn after the agent's report, and the answer to it
+/// would become the turn's last message, the one T3 shows.
 #[test]
-fn stop_reminds_once_per_task_marked_done_this_turn() {
+fn a_done_prints_the_filing_reminder_and_the_stop_after_it_stays_quiet() {
     let e = env();
     nothing_doing(&e);
-    prompt(&e, "go");
-    assert_eq!(stop(&e), None, "no reminder without a done task");
-
     prompt(&e, "finish it");
-    mark_done(&e, "factory-12", None);
-    let reply = stop(&e).expect("a done task gets the reminder");
-    assert_eq!(reply["decision"], "block");
+    let out = mark_done(&e, "factory-12", None);
     assert_eq!(
-        reply["reason"],
-        "board: you marked factory-12 done this turn. Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task."
+        out.trim_end().lines().last(),
+        Some(DONE_REMINDER),
+        "the reminder is the done's last line: {out}"
     );
-    assert_eq!(stop(&e), None, "once per task");
+    assert!(out.starts_with("done factory-12"), "{out}");
+    assert_eq!(stop(&e), None, "the Stop after a done does not block");
+    let said = e.stub.requests_to(&state_path()).last().unwrap().body["said"].clone();
+    assert_eq!(said, "Done.", "the report is the turn's last message");
 
-    // Reopened and done again in a later turn: still once per task. Another task speaks.
-    prompt(&e, "redo it");
-    mark_done(&e, "factory-12", None);
+    // Also with the server failing, and with the server skipped.
+    prompt(&e, "the next");
     mark_done(&e, "factory-13", None);
-    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
-    assert!(
-        reason.starts_with("board: you marked factory-13 done this turn."),
-        "{reason}"
-    );
-}
-
-/// Files a task as the agent would from its shell (`board add`); the server answers `task`.
-fn add_task(e: &Env, task: &board_proto::Task, args: &[&str]) {
-    e.stub.on(
-        &format!("GET /v1/agents/{}", enc(CLAUDE_AGENT)),
-        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
-    );
-    e.stub.on("POST /v1/tasks", task);
-    let mut all = vec!["add", "Follow up", "--board", "factory"];
-    all.extend(args);
-    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
-    let out = board(&e.home, &e.repo, &env, &all, "");
-    assert!(out.status.success(), "{}", stderr(&out));
-}
-
-fn sub_task(id: &str, parent: &str) -> board_proto::Task {
-    let mut task = task_fixture(id, "Follow up");
-    task.parent = Some(parent.parse().unwrap());
-    task
-}
-
-fn proposal(id: &str) -> board_proto::Task {
-    let mut task = task_fixture(id, "Follow up");
-    task.body = "Proposal: cache the builds.".to_owned();
-    task.auto = false;
-    task
-}
-
-#[test]
-fn stop_stays_quiet_about_a_done_task_whose_sub_task_the_agent_filed() {
-    let e = env();
-    nothing_doing(&e);
-    // Filed in an earlier turn, before the done: it still counts for its parent.
-    prompt(&e, "go");
-    add_task(
-        &e,
-        &sub_task("factory-20", "factory-12"),
-        &["--parent", "factory-12"],
-    );
+    e.stub
+        .on_error(&state_path(), 500, "internal", "boom", "retry");
     assert_eq!(stop(&e), None);
-    prompt(&e, "finish it");
-    mark_done(&e, "factory-12", None);
-    assert_eq!(stop(&e), None, "its remaining scope is on the board");
-
-    // What was filed about a task outlives the session; it answers for one done only.
-    add_task(
-        &e,
-        &sub_task("factory-22", "factory-15"),
-        &["--parent", "factory-15"],
-    );
-    session_start(&e, "resume");
-    prompt(&e, "finish that one");
-    mark_done(&e, "factory-15", None);
-    assert_eq!(stop(&e), None, "filed before the session was resumed");
-    prompt(&e, "it was opened again");
-    mark_done(&e, "factory-15", None);
-    assert!(stop(&e).is_some(), "done again with nothing new filed");
-
-    // Another task's sub-task says nothing about this one.
-    prompt(&e, "the next");
-    add_task(
-        &e,
-        &sub_task("factory-21", "factory-12"),
-        &["--parent", "factory-12"],
-    );
-    mark_done(&e, "factory-13", None);
-    let reason = stop(&e).expect("nothing filed for factory-13")["reason"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        reason.starts_with("board: you marked factory-13 done this turn."),
-        "{reason}"
-    );
-}
-
-/// Asks the user as the agent would from its shell (`board ask`), about `task` if given.
-fn ask_user(e: &Env, id: i64, task: Option<&str>) {
-    let ask = board_proto::Ask {
-        id,
-        board: "factory".parse().unwrap(),
-        agent: CLAUDE_AGENT.parse().unwrap(),
-        task: task.map(|id| id.parse().unwrap()),
-        kind: board_proto::AskKind::Decision,
-        question: "Which db?".into(),
-        options: vec![],
-        status: board_proto::AskStatus::Open,
-        answer: None,
-        answered_via: None,
-        created_at: chrono::Utc::now(),
-        answered_at: None,
-    };
-    e.stub.on("POST /v1/asks", &ask);
-    let mut all = vec!["ask", "Which db?", "--board", "factory"];
-    if let Some(task) = task {
-        all.extend(["--task", task]);
-    }
-    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
-    let out = board(&e.home, &e.repo, &env, &all, "");
-    assert!(out.status.success(), "{}", stderr(&out));
-}
-
-fn done_reminder_for(e: &Env, task: &str) {
-    let reply = stop(e).unwrap_or_else(|| panic!("a reminder for {task}"));
-    assert_eq!(reply["decision"], "block");
-    let reason = reply["reason"].as_str().unwrap();
-    assert!(
-        reason.starts_with(&format!("board: you marked {task} done this turn.")),
-        "{reason}"
-    );
-}
-
-#[test]
-fn stop_reminds_once_about_a_done_task_when_the_turn_filed_only_unrelated_items() {
-    let e = env();
-    nothing_doing(&e);
-    // A proposal with no parent: one item of found work is on the board, and the reply may
-    // hold more.
-    prompt(&e, "go");
-    assert!(proposal("factory-30").is_pending_proposal());
-    add_task(
-        &e,
-        &proposal("factory-30"),
-        &["--body", "Proposal: cache the builds."],
-    );
-    mark_done(&e, "factory-12", None);
-    done_reminder_for(&e, "factory-12");
-    assert_eq!(stop(&e), None, "once");
-
-    // An ask on no task, and one on another task.
-    prompt(&e, "the next");
-    ask_user(&e, 7, None);
-    mark_done(&e, "factory-13", None);
-    done_reminder_for(&e, "factory-13");
-    assert_eq!(stop(&e), None, "once");
-    prompt(&e, "and another");
-    ask_user(&e, 8, Some("factory-15"));
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        json!({"until": until}).to_string(),
+    )
+    .unwrap();
+    prompt(&e, "one more");
     mark_done(&e, "factory-14", None);
-    done_reminder_for(&e, "factory-14");
-    assert_eq!(stop(&e), None, "once");
+    assert_eq!(stop(&e), None);
+    // The done leaves no mark for a hook to read.
+    for gone in ["state/done", "state/released", "state/filed"] {
+        assert!(!e.home.join(gone).exists(), "{gone}");
+    }
 }
 
 #[test]
-fn stop_stays_quiet_about_a_done_task_the_agent_filed_a_proposal_under_or_an_ask_on() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    let mut under = proposal("factory-30");
-    under.parent = Some("factory-12".parse().unwrap());
-    assert!(under.is_pending_proposal());
-    add_task(
-        &e,
-        &under,
-        &[
-            "--body",
-            "Proposal: cache the builds.",
-            "--parent",
-            "factory-12",
-        ],
-    );
-    mark_done(&e, "factory-12", None);
-    assert_eq!(stop(&e), None, "found work is on the board, under the task");
-
-    prompt(&e, "the next");
-    ask_user(&e, 7, Some("factory-13"));
-    mark_done(&e, "factory-13", None);
-    assert_eq!(
-        stop(&e),
-        None,
-        "the user's part is on the board, on the task"
-    );
-}
-
-#[test]
-fn stop_stays_quiet_about_dones_while_stop_hook_active_and_from_earlier_turns() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    mark_done(&e, "factory-12", None);
-    let continued = e.with("Stop", json!({"stop_hook_active": true}));
-    assert_eq!(e.hook("stop", "claude", continued).1, "");
-    assert_eq!(
-        stop(&e),
-        None,
-        "the continued turn's done is not carried over"
-    );
-
-    // A turn whose Stop never ran (interrupted) leaves its mark to the next turn.
-    mark_done(&e, "factory-13", None);
-    prompt(&e, "next");
-    assert_eq!(stop(&e), None, "a done from an earlier turn");
-}
-
-#[test]
-fn stop_puts_the_done_and_handoff_reminders_in_one_block() {
+fn a_done_leaves_only_the_handoff_reminder_at_stop() {
     let e = env();
     doing_with_handoff(&e, None);
     prompt(&e, "go");
     mark_done(&e, "factory-11", None);
-    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
-    let (done, handoff) = reason.split_once('\n').expect("two lines");
+    let reason = stop(&e).expect("the handoff is stale")["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(
-        done.starts_with("board: you marked factory-11 done"),
+        reason.starts_with("board: factory-12 is in doing") && reason.contains("handoff_set"),
         "{reason}"
     );
-    assert!(
-        handoff.starts_with("board: factory-12 is in doing") && handoff.contains("handoff_set"),
-        "{reason}"
-    );
-}
-
-#[test]
-fn stop_reminds_about_a_done_task_while_the_server_fails() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    mark_done(&e, "factory-12", None);
-    e.stub
-        .on_error(&state_path(), 500, "internal", "boom", "retry");
-    let reply = stop(&e).expect("the reminder needs no server");
-    assert!(
-        reply["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("board: you marked factory-12 done"),
-        "{reply}"
-    );
+    assert!(!reason.contains("factory-11"), "{reason}");
+    assert_eq!(reason.lines().count(), 1, "{reason}");
 }
 
 /// `id` as the server holds it: in `status`, owned by the agent unless `open`.
@@ -2113,7 +1922,13 @@ fn held_task(id: &str, status: TaskStatus) -> board_proto::Task {
 
 /// Runs `board <args>` on `before.id` as the agent would from its shell (`update` with its
 /// flags, or `release`); the server holds the task as `before` and answers `after`.
-fn change_task(e: &Env, before: &board_proto::Task, after: &board_proto::Task, args: &[&str]) {
+/// Returns what it printed.
+fn change_task(
+    e: &Env,
+    before: &board_proto::Task,
+    after: &board_proto::Task,
+    args: &[&str],
+) -> String {
     let id = before.id.as_str();
     e.stub.on(
         &format!("GET /v1/agents/{}", enc(CLAUDE_AGENT)),
@@ -2138,237 +1953,99 @@ fn change_task(e: &Env, before: &board_proto::Task, after: &board_proto::Task, a
     let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
     let out = board(&e.home, &e.repo, &env, &all, "");
     assert!(out.status.success(), "{}", stderr(&out));
+    String::from_utf8(out.stdout).unwrap()
 }
 
-/// Releases `id`, which the agent owns in `doing`, to `open` (`board update --status open`).
-fn release_to_open(e: &Env, id: &str) {
-    change_task(
-        e,
-        &held_task(id, TaskStatus::Doing),
-        &held_task(id, TaskStatus::Open),
-        &["update", "--status", "open"],
-    );
-}
-
+/// Both release paths of the CLI print the reminder: `board update --status open` and
+/// `board release`, on a task the agent owned in `doing`. The `Stop` after them does not
+/// block.
 #[test]
-fn stop_reminds_once_per_task_released_to_open_this_turn() {
+fn a_release_prints_the_filing_reminder_and_the_stop_after_it_stays_quiet() {
     let e = env();
     nothing_doing(&e);
     prompt(&e, "do steps 1 and 2, then release it");
-    release_to_open(&e, "factory-12");
-    let reply = stop(&e).expect("a released task gets the reminder");
-    assert_eq!(reply["decision"], "block");
-    assert_eq!(
-        reply["reason"],
-        "board: you released factory-12 to open this turn, unfinished. Is any work left that is not on the board? What remains of the task's own steps stays in the task: add a note there that says which steps are done, unless one says it. File the rest now and name it in your reply: a follow-up task that one of its acceptance checks requires, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. A feedback report is not such a task. If nothing is left, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each released task."
-    );
-    assert_eq!(stop(&e), None, "once per task");
-
-    // Claimed and released again in a later turn: still once per task. `board release`
-    // counts as the update does, and another task speaks.
-    prompt(&e, "release them");
-    release_to_open(&e, "factory-12");
-    change_task(
+    let doing = |id| held_task(id, TaskStatus::Doing);
+    let open = |id| held_task(id, TaskStatus::Open);
+    let out = change_task(
         &e,
-        &held_task("factory-13", TaskStatus::Doing),
-        &held_task("factory-13", TaskStatus::Open),
-        &["release"],
-    );
-    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
-    assert!(
-        reason.starts_with("board: you released factory-13 to open this turn, unfinished."),
-        "{reason}"
-    );
-}
-
-#[test]
-fn stop_stays_quiet_about_a_released_task_when_the_agent_filed_what_remains() {
-    let e = env();
-    nothing_doing(&e);
-    // A sub-task of the task, filed in an earlier turn: it still counts for its parent.
-    prompt(&e, "go");
-    add_task(
-        &e,
-        &sub_task("factory-20", "factory-12"),
-        &["--parent", "factory-12"],
-    );
-    assert_eq!(stop(&e), None);
-    prompt(&e, "release it");
-    release_to_open(&e, "factory-12");
-    assert_eq!(stop(&e), None, "a sub-task of it is on the board");
-
-    // A proposal under the task, filed in the turn: found work is on the board.
-    prompt(&e, "the next");
-    let mut found = proposal("factory-30");
-    found.parent = Some("factory-13".parse().unwrap());
-    add_task(
-        &e,
-        &found,
-        &[
-            "--body",
-            "Proposal: cache the builds.",
-            "--parent",
-            "factory-13",
-        ],
-    );
-    release_to_open(&e, "factory-13");
-    assert_eq!(stop(&e), None, "found work is on the board");
-
-    // A proposal about no task does not answer for the released one, as for a done one.
-    prompt(&e, "one more");
-    add_task(
-        &e,
-        &proposal("factory-31"),
-        &["--body", "Proposal: cache the builds."],
-    );
-    release_to_open(&e, "factory-15");
-    let reason = stop(&e).expect("an unrelated filing")["reason"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        reason.starts_with("board: you released factory-15 to open this turn, unfinished."),
-        "{reason}"
-    );
-
-    // An ask on the task, in the turn that releases it.
-    prompt(&e, "and the next");
-    let ask = board_proto::Ask {
-        id: 7,
-        board: "factory".parse().unwrap(),
-        agent: CLAUDE_AGENT.parse().unwrap(),
-        task: Some("factory-14".parse().unwrap()),
-        kind: board_proto::AskKind::Decision,
-        question: "Which db?".into(),
-        options: vec![],
-        status: board_proto::AskStatus::Open,
-        answer: None,
-        answered_via: None,
-        created_at: chrono::Utc::now(),
-        answered_at: None,
-    };
-    e.stub.on("POST /v1/asks", &ask);
-    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
-    let args = [
-        "ask",
-        "Which db?",
-        "--board",
-        "factory",
-        "--task",
-        "factory-14",
-    ];
-    let out = board(&e.home, &e.repo, &env, &args, "");
-    assert!(out.status.success(), "{}", stderr(&out));
-    release_to_open(&e, "factory-14");
-    assert_eq!(stop(&e), None, "the user's part is on the board");
-}
-
-#[test]
-fn a_feedback_report_does_not_count_as_filed_work_for_a_released_task() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    e.stub.on(
-        &format!("GET /v1/agents/{}", enc(CLAUDE_AGENT)),
-        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
-    );
-    e.stub.on(
-        "POST /v1/feedback",
-        json!({"task": task_fixture("feedback-3", "The hook was slow"), "duplicate": false, "reports": 1}),
-    );
-    let env = [("CLAUDE_CODE_SESSION_ID", SESSION)];
-    let args = ["feedback", "--about", "board", "The hook was slow"];
-    let out = board(&e.home, &e.repo, &env, &args, "");
-    assert!(out.status.success(), "{}", stderr(&out));
-    release_to_open(&e, "factory-12");
-    let reason = stop(&e).expect("a report is not the task's remaining work")["reason"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        reason.starts_with("board: you released factory-12 to open this turn, unfinished."),
-        "{reason}"
-    );
-}
-
-#[test]
-fn stop_stays_quiet_about_a_task_update_that_releases_no_owned_doing_task() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    let doing = held_task("factory-12", TaskStatus::Doing);
-    // Its body, priority or blockers change; it stays the agent's in doing.
-    change_task(&e, &doing, &doing, &["update", "--body", "More detail."]);
-    change_task(&e, &doing, &doing, &["update", "--priority", "p2"]);
-    change_task(&e, &doing, &doing, &["update", "--blockers", "factory-9"]);
-    // Parked, not released: blocked and review keep the owner.
-    change_task(
-        &e,
-        &doing,
-        &held_task("factory-12", TaskStatus::Review),
-        &["update", "--status", "review"],
-    );
-    change_task(
-        &e,
-        &held_task("factory-13", TaskStatus::Doing),
-        &held_task("factory-13", TaskStatus::Blocked),
-        &["update", "--status", "blocked", "--reason", "waits on CI"],
-    );
-    // To open, but not from the agent's own doing: a review task, and another agent's task.
-    change_task(
-        &e,
-        &held_task("factory-14", TaskStatus::Review),
-        &held_task("factory-14", TaskStatus::Open),
+        &doing("factory-12"),
+        &open("factory-12"),
         &["update", "--status", "open"],
     );
+    assert!(out.starts_with("updated factory-12"), "{out}");
+    assert_eq!(
+        out.trim_end().lines().last(),
+        Some(RELEASE_REMINDER),
+        "{out}"
+    );
+    let out = change_task(&e, &doing("factory-13"), &open("factory-13"), &["release"]);
+    assert!(out.starts_with("released factory-13"), "{out}");
+    assert_eq!(
+        out.trim_end().lines().last(),
+        Some(RELEASE_REMINDER),
+        "{out}"
+    );
+    assert_eq!(stop(&e), None, "the Stop after a release does not block");
+}
+
+#[test]
+fn a_change_that_releases_no_owned_doing_task_prints_no_reminder() {
+    let e = env();
+    nothing_doing(&e);
+    let doing = held_task("factory-12", TaskStatus::Doing);
     let mut theirs = held_task("factory-15", TaskStatus::Doing);
     theirs.owner = Some("claude:other".parse().unwrap());
-    change_task(
-        &e,
-        &theirs,
-        &held_task("factory-15", TaskStatus::Open),
-        &["update", "--status", "open"],
-    );
-    // Released, then claimed again in the same turn: nothing was given up.
-    release_to_open(&e, "factory-16");
-    change_task(
-        &e,
-        &held_task("factory-16", TaskStatus::Open),
-        &held_task("factory-16", TaskStatus::Doing),
-        &["claim"],
-    );
-    assert_eq!(stop(&e), None);
-}
-
-#[test]
-fn stop_names_the_done_and_the_released_tasks_in_one_block() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "go");
-    mark_done(&e, "factory-11", None);
-    release_to_open(&e, "factory-12");
-    // Released and then done: the done reminder asks about it.
-    release_to_open(&e, "factory-13");
-    mark_done(&e, "factory-13", None);
-    let reply = stop(&e).expect("one block");
-    assert_eq!(
-        reply["reason"],
-        "board: you marked factory-11, factory-13 done this turn. Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task.\nYou also released factory-12 to open this turn, unfinished. What remains of its own steps stays in that task, not in a sub-task: add a note there that says which steps are done, unless one says it. File a follow-up task that one of its acceptance checks requires, too. A feedback report is not such a task. This reminder comes once for each released task."
-    );
-    assert_eq!(stop(&e), None, "once for each");
-}
-
-#[test]
-fn a_resumed_session_drops_the_earlier_turns_released_marks() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "one");
-    release_to_open(&e, "factory-9"); // interrupted: no Stop
-    prompt(&e, "two");
-    assert_eq!(stop(&e), None, "released in an earlier turn");
-    release_to_open(&e, "factory-10"); // interrupted again
-    session_start(&e, "resume");
-    assert_eq!(stop(&e), None);
+    let cases: [(board_proto::Task, board_proto::Task, &[&str]); 8] = [
+        // Its body, priority or blockers change; it stays the agent's in doing.
+        (
+            doing.clone(),
+            doing.clone(),
+            &["update", "--body", "More detail."],
+        ),
+        (
+            doing.clone(),
+            doing.clone(),
+            &["update", "--priority", "p2"],
+        ),
+        (
+            doing.clone(),
+            doing.clone(),
+            &["update", "--blockers", "factory-9"],
+        ),
+        // Parked, not released: blocked and review keep the owner.
+        (
+            doing.clone(),
+            held_task("factory-12", TaskStatus::Review),
+            &["update", "--status", "review"],
+        ),
+        (
+            held_task("factory-13", TaskStatus::Doing),
+            held_task("factory-13", TaskStatus::Blocked),
+            &["update", "--status", "blocked", "--reason", "waits on CI"],
+        ),
+        // To open, but not from the agent's own doing: a review task, another agent's task.
+        (
+            held_task("factory-14", TaskStatus::Review),
+            held_task("factory-14", TaskStatus::Open),
+            &["update", "--status", "open"],
+        ),
+        (
+            theirs,
+            held_task("factory-15", TaskStatus::Open),
+            &["update", "--status", "open"],
+        ),
+        // A claim gives nothing up.
+        (
+            held_task("factory-16", TaskStatus::Open),
+            held_task("factory-16", TaskStatus::Doing),
+            &["claim"],
+        ),
+    ];
+    for (before, after, args) in cases {
+        let out = change_task(&e, &before, &after, args);
+        assert!(!out.contains("Released unfinished"), "{args:?}: {out}");
+        assert!(!out.contains("File now"), "{args:?}: {out}");
+    }
 }
 
 fn session_start(e: &Env, source: &str) {
@@ -2386,58 +2063,28 @@ fn session_start(e: &Env, source: &str) {
     nothing_doing(e);
 }
 
+/// Mark files an earlier build left on the device are not read: the hooks run as usual.
 #[test]
-fn done_reminders_keep_turn_boundaries_across_compaction_and_sessions() {
+fn leftover_marks_from_an_earlier_build_change_nothing() {
     let e = env();
     nothing_doing(&e);
-    prompt(&e, "one");
-    mark_done(&e, "factory-9", None); // interrupted: no Stop
-    prompt(&e, "two");
-    mark_done(&e, "factory-10", None);
-    session_start(&e, "compact");
-    let reason = stop(&e).unwrap()["reason"].as_str().unwrap().to_owned();
-    assert!(
-        reason.starts_with("board: you marked factory-10 done this turn."),
-        "compaction keeps the turn and its marks: {reason}"
-    );
-
-    mark_done(&e, "factory-11", None); // interrupted again
+    let stem = CLAUDE_AGENT.replace(':', "_3a");
+    for dir in ["done", "released", "filed"] {
+        let dir = e.home.join("state").join(dir).join(&stem);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("factory-12.json"),
+            json!({"task": "factory-12", "at": chrono::Utc::now()}).to_string(),
+        )
+        .unwrap();
+    }
     session_start(&e, "resume");
-    assert_eq!(
-        stop(&e),
-        None,
-        "a resumed session drops the earlier turn's marks"
-    );
+    prompt(&e, "go");
+    assert_eq!(stop(&e), None);
 }
 
 #[test]
-fn done_reminders_keep_turn_boundaries_while_the_server_is_unreachable() {
-    let e = env();
-    nothing_doing(&e);
-    prompt(&e, "one");
-    mark_done(&e, "factory-9", None); // interrupted: no Stop
-    // Hooks on this device skip the server for a while after it failed to answer.
-    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
-    std::fs::write(
-        e.home.join("state/offline.json"),
-        json!({"until": until}).to_string(),
-    )
-    .unwrap();
-    prompt(&e, "two");
-    assert_eq!(stop(&e), None, "the offline prompt still starts a turn");
-    mark_done(&e, "factory-10", None);
-    let reply = stop(&e).expect("the reminder needs no server");
-    assert!(
-        reply["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("board: you marked factory-10 done this turn."),
-        "{reply}"
-    );
-}
-
-#[test]
-fn codex_stop_reminds_after_task_done_in_codex_shape() {
+fn codex_stop_stays_quiet_after_task_done_in_codex_shape() {
     let e = env();
     let codex_agent = "codex:thr_9";
     e.stub.on(
@@ -2445,26 +2092,14 @@ fn codex_stop_reminds_after_task_done_in_codex_shape() {
         agent_fixture(codex_agent, DEVICE, AgentState::Idle),
     );
     e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
-    mark_done(&e, "factory-12", Some(codex_agent));
-    let payload = |active: bool| {
-        json!({
-            "session_id": "thr_9", "transcript_path": null, "cwd": e.repo, "hook_event_name": "Stop",
-            "model": "gpt-5.5-codex", "turn_id": "t", "stop_hook_active": active, "last_assistant_message": "ok",
-        })
-    };
-    let (reply, _) = e.hook("stop", "codex", payload(false));
-    let reply = reply.expect("JSON output");
-    assert_eq!(reply.as_object().unwrap().len(), 2, "{reply}");
-    assert_eq!(reply["decision"], "block");
-    assert!(
-        reply["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("board: you marked factory-12 done"),
-        "{reply}"
-    );
-    let (reply, _) = e.hook("stop", "codex", payload(true));
-    assert_eq!(reply, Some(json!({})), "continued: valid empty Stop output");
+    let out = mark_done(&e, "factory-12", Some(codex_agent));
+    assert!(out.contains(DONE_REMINDER), "{out}");
+    let payload = json!({
+        "session_id": "thr_9", "transcript_path": null, "cwd": e.repo, "hook_event_name": "Stop",
+        "model": "gpt-5.5-codex", "turn_id": "t", "stop_hook_active": false, "last_assistant_message": "ok",
+    });
+    let (reply, _) = e.hook("stop", "codex", payload);
+    assert_eq!(reply, Some(json!({})), "valid empty Stop output");
 }
 
 #[test]
