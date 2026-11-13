@@ -182,12 +182,7 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    // A guard around the whole hook; `handle` keeps its own, earlier deadline for the
-    // network so it can still fall back to the cache.
-    let guard = match share_override() {
-        Some(share) => share + SHARED_LOCAL_LIMIT,
-        None => BUDGET.saturating_sub(started.elapsed() + MARGIN / 2),
-    };
+    let guard = guard(started.elapsed(), share_override());
     let reply = match tokio::time::timeout(
         guard,
         handle(event, runtime, explicit_agent, &input, started),
@@ -214,6 +209,17 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
         event.name(),
         started.elapsed().as_millis()
     );
+}
+
+/// The guard around the whole hook, started `elapsed` after the hook: the rest of
+/// [`BUDGET`], less half the [`MARGIN`] for the output. `handle` keeps its own, earlier
+/// deadline for the network so it can still fall back to the cache. With a test's `share`
+/// ([`share_override`]), that share plus [`SHARED_LOCAL_LIMIT`].
+fn guard(elapsed: Duration, share: Option<Duration>) -> Duration {
+    match share {
+        Some(share) => share + SHARED_LOCAL_LIMIT,
+        None => BUDGET.saturating_sub(elapsed + MARGIN / 2),
+    }
 }
 
 fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<String> {
@@ -2418,6 +2424,15 @@ mod tests {
         tokio::time::advance(Duration::from_millis(300)).await;
         assert_eq!(deadline, started + BUDGET - MARGIN);
         assert_eq!(server_deadline(started), deadline);
+    }
+
+    #[test]
+    fn the_hooks_guard_keeps_the_budget_unless_a_test_sets_the_share() {
+        let ms = Duration::from_millis;
+        assert_eq!(guard(Duration::ZERO, None), ms(1400));
+        assert_eq!(guard(ms(300), None), ms(1100));
+        assert_eq!(guard(ms(1500), None), Duration::ZERO);
+        assert_eq!(guard(ms(300), Some(ms(1000))), ms(21_000));
     }
 
     #[test]

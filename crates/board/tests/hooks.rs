@@ -2462,7 +2462,8 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
 /// The hook's 1.5 s budget on a machine too busy to wake its timers on time: at load
 /// average 72 on 8 cores, a hook whose connect gave up at its 0.5 s limit answered after
 /// 1.79 s by its own clock. Still far below the stub's 10 s hang, so a hook
-/// within it ended its wait on its own deadline; unit tests in `hook.rs` pin the deadlines.
+/// within it ended its wait on its own deadline. Unit tests in `hook.rs` pin the values of
+/// the hook's guard, its server deadline and its connect limit.
 const BUDGET_WHEN_BUSY: Duration = Duration::from_secs(5);
 
 /// Fails unless a hook that took `elapsed` by its own clock gave up on the server in time.
