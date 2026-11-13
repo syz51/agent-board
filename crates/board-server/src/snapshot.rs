@@ -627,9 +627,14 @@ const USAGE_HOLD_ACTION: &str = hold_action!("the weekly usage reached the user'
 /// What the `hold:` line tells a held agent to do.
 const HOLD_ACTION: &str = hold_action!("the user paused this work.");
 
-/// What the `hold:` line tells a stood-down coordinator to do.
+/// What the `hold:` line tells a stood-down coordinator to do. The daemon's message that
+/// stood it down asks for a few steps first (a note per task it owns; on a switch to
+/// daemon dispatch, the user's instructions and its tasks in `doing` handed back), and
+/// arrives as a prompt the hooks cannot tell from a wake-up, so the line lets it through.
 const STAND_DOWN_ACTION: &str = hold_action!(
-    "this thread no longer coordinates the board: children already at work finish on their own."
+    "this thread no longer coordinates the board: children already at work finish on their own. \
+     When this turn's message is the board's message that this thread is no longer its \
+     coordinator, do the steps it lists, then end this turn."
 );
 
 /// The query of [`held_by`]: `?1` the agent, `?2` the depth, `?3` active boards too, not

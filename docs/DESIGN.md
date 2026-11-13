@@ -659,7 +659,8 @@ and its digest are unchanged.
   coordinator, or another device takes the lease. The daemon releases the lease where it
   holds it, logs the reason, and sends the thread one message: it is no longer the
   coordinator, why, and to stop dispatching (claim no task, start no child or review,
-  close no task as coordinator). Without it the thread would keep dispatching beside the
+  close no task as coordinator). On a switch to daemon dispatch that message is the
+  switch's last message (see "Daemon dispatch", The switch). Without it the thread would keep dispatching beside the
   board's limit. The daemon keeps the thread's record in `watch.json` (`stood_down`), so
   it survives a daemon restart, and saves it before the send, so a daemon killed in
   between does not send twice. A send that failed is tried again on the next reconcile,
@@ -688,7 +689,8 @@ and its digest are unchanged.
   lists the board in the thread's `held_by` and `stood_down`, with `held_since` the
   stand-down's time, and the hooks hold it as for a pause (see "Pausing work"): a turn
   that began before is ended, a pull request wake-up is ended before the model runs, and
-  every other prompt gets a `hold:` line that lets only the user's own request go on.
+  every other prompt gets a `hold:` line that lets only the user's own request go on,
+  and the daemon's stand-down message, whose steps the thread does before it ends.
   Only that thread is held; the threads it started and the owners of its tasks finish
   their work. A claim that names the thread coordinator, or a renewal that keeps it
   named, deletes the record, but only on a board with thread dispatch that has the
@@ -1077,17 +1079,18 @@ and its digest are unchanged.
   before the reset time. Before a limit is hit, the board's `usage_stop_at` stops new work
   (see "Usage").
 
-## Daemon dispatch (partly built)
+## Daemon dispatch
 
-Status: partly built (agent-board-308; the user chose it on 2026-11-08). Built: the
+Status: built (agent-board-308; the user chose it on 2026-11-08); rolling out. Built: the
 `dispatch` board setting, the `dispatch` agent and judge registration, with their rights
 and records (`docs/API.md`, "Daemon dispatch"); the worker and judge briefs
 (`prompts/worker.md`, `prompts/judges/`); the dispatcher's lease, its worker starts in
 every slot, the lease-overlap skip, the gone-asker and away-owner steps, the judge starts,
-and merging and finishing. Each is marked "built" below. Not built yet: the switch's last
-message and the rollout. It replaces the
-coordinator thread above one board at a time. Until a board switches, the previous
-section holds for that board.
+and merging and finishing, and the switch's last message. Each is marked "built" below.
+Rollout: agent-board switched on 2026-11-13 (agent-board-316); the other boards follow,
+and then the coordinator-thread code goes (agent-board-317). It replaces the coordinator
+thread above one board at a time. Until a board switches, the previous section holds for
+that board.
 
 **Why**: a coordinator is one Claude session that lives for days. On agent-board
 (2026-11-06 to 11-08) it ran 506 turns. It auto-compacted 29 times at about 267K tokens.
@@ -1127,8 +1130,15 @@ one task and one section of the prompt, not the days before it.
    thread and sends it nothing).
 2. It sends that thread one last message: record each instruction the user gave in chat
    as a `decision` note, hand each task it owns in `doing` to its child or back to
-   `open`, then end.
-3. The dispatcher takes the lease.
+   `open`, then end (built: once, with the stand-down record of "A coordinator that
+   stands down", marked `last`; the server's `hold:` line lets the thread do these
+   steps). A thread that stood down earlier for another reason, and was told only to stop
+   dispatching, gets it too. A coordinator start not yet recorded (`pending_starts`) is
+   looked for by title as a start does: a thread it created that ran gets the message, one
+   that never ran was never briefed and gets nothing, and a failed lookup is tried again
+   on the next reconcile.
+3. The dispatcher takes the lease (built: a claim on the same device replaces the
+   coordinator's).
 
 **Routing** (event, then what handles it):
 
@@ -1298,7 +1308,9 @@ That is an estimate, not a measurement.
 
 1. agent-board switches first. A revisit one week later measures tokens per day, the
    wait for dispatch and review, rework, and overlap stops.
-2. Other boards switch once that revisit holds.
+2. Other boards switch once that revisit holds. The user waived that wait on 2026-11-13:
+   they switch once agent-board has finished a task under daemon dispatch, and the
+   revisit still measures the change.
 3. Then the coordinator-thread path is removed.
 
 ## Notifications and the web view

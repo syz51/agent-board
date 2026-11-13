@@ -974,8 +974,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   (`[{"board", "reason"}]`, left out when empty and by servers that predate it), and
   `held_since` is the latest of the stand-down's time and the other holds. Its line reads
   `hold: factory stood down: autopilot was switched off -> this thread no longer
-  coordinates the board: children already at work finish on their own. If the user's own
-  message in this turn asks you to go on, …`, one per board after any paused one; `yaml`
+  coordinates the board: children already at work finish on their own. When this turn's
+  message is the board's message that this thread is no longer its coordinator, do the
+  steps it lists, then end this turn. If the user's own message in this turn asks you to
+  go on, …`, one per board after any paused one; `yaml`
   adds `stood_down` with `board`, `reason` and `action` under `hold`. At the weekly hard
   line, the `hold:` line reads `hold:
   factory: weekly usage 94.5% reached 94.5% (the user keeps 5.5% in reserve) -> the

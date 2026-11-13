@@ -1439,6 +1439,10 @@ pub struct StoodDown {
     /// Whether [`resume_message`] was sent, set and saved before the send like `told`.
     #[serde(default)]
     pub resuming: bool,
+    /// The board went to daemon dispatch: the thread is told with [`switch_message`]
+    /// instead, its last message as the board's coordinator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last: bool,
 }
 
 /// A stand-down message is sent at most this many times when its sends fail.
@@ -1749,12 +1753,7 @@ impl<T: T3> Daemon<T> {
             })
             .collect();
         for board in replaced {
-            if let Some(local) = self.state.coordinators.remove(&board.slug) {
-                let reason =
-                    "the board is set to daemon dispatch, so the daemon starts its workers";
-                self.stand_down(&board.slug, local, reason.to_owned()).await;
-            }
-            self.state.pending_starts.remove(&board.slug);
+            self.retire_coordinator(board, now).await;
         }
         // A stand-down message whose send failed on an earlier reconcile is tried again.
         let untold: Vec<BoardSlug> = self
@@ -2173,6 +2172,7 @@ impl<T: T3> Daemon<T> {
                 told: true,
                 tries: 0,
                 resuming: false,
+                last: false,
             };
             self.state.stood_down.insert(slug.clone(), stood);
         }
@@ -2752,6 +2752,18 @@ impl<T: T3> Daemon<T> {
     /// and tells the thread so, once: it stops dispatching. The record is what
     /// [`Self::resume_or_start`] takes the thread back from.
     async fn stand_down(&mut self, slug: &BoardSlug, local: Coordinator, reason: String) {
+        self.stand_down_as(slug, local, reason, false).await;
+    }
+
+    /// [`Self::stand_down`]; `last` when the board went to daemon dispatch, so the thread
+    /// gets its [`switch_message`].
+    async fn stand_down_as(
+        &mut self,
+        slug: &BoardSlug,
+        local: Coordinator,
+        reason: String,
+        last: bool,
+    ) {
         tracing::info!(
             "coordinator thread {} of {slug} stood down: {reason}",
             local.thread
@@ -2762,9 +2774,79 @@ impl<T: T3> Daemon<T> {
             told: false,
             tries: 0,
             resuming: false,
+            last,
         };
         self.state.stood_down.insert(slug.clone(), stood);
         self.tell_stood_down(slug).await;
+    }
+
+    /// The switch of `board` to daemon dispatch, on a device that runs it: its coordinator
+    /// thread gets its last message ([`switch_message`]) once. So does a thread that an
+    /// unrecorded start created and briefed, and one that stood down earlier for another
+    /// reason, which was told only to stop dispatching. Then the dispatcher takes the
+    /// lease ([`Self::dispatch`]).
+    async fn retire_coordinator(&mut self, board: &Board, now: Timestamp) {
+        let slug = &board.slug;
+        if let Some(local) = self.state.coordinators.remove(slug) {
+            self.stand_down_as(slug, local, SWITCH_REASON.to_owned(), true)
+                .await;
+        } else if let Some(stood) = self.state.stood_down.get_mut(slug).filter(|s| !s.last) {
+            tracing::info!(
+                "coordinator of {slug}: thread {}, which stood down earlier, gets the switch's last message",
+                stood.coordinator.thread
+            );
+            stood.last = true;
+            stood.told = false;
+            stood.tries = 0;
+            stood.reason = SWITCH_REASON.to_owned();
+            self.tell_stood_down(slug).await;
+        }
+        let Some(&since) = self.state.pending_starts.get(slug) else {
+            return;
+        };
+        let found = match self.host_folder(board) {
+            Ok(project) => self
+                .t3
+                .threads_titled(&project, &coordinator_title(slug))
+                .await
+                .map(|threads| {
+                    threads
+                        .into_iter()
+                        .filter(|t| t.created_at >= since)
+                        .max_by_key(|t| t.created_at)
+                }),
+            Err(err) => Err(err),
+        };
+        let thread = match found {
+            Ok(thread) => thread,
+            // The mark stays, so the next reconcile looks again.
+            Err(err) => {
+                tracing::warn!(
+                    "coordinator of {slug}: looking for the thread of an unfinished coordinator start: {err:#}; looked for again on the next reconcile"
+                );
+                return;
+            }
+        };
+        self.state.pending_starts.remove(slug);
+        match thread {
+            None => {}
+            // Never briefed, so it does nothing: no message starts it now.
+            Some(thread) if !thread.ran => tracing::warn!(
+                "coordinator of {slug}: thread {}, which a start at {since} created, never ran and gets no message; archive it in T3",
+                thread.id
+            ),
+            Some(thread) => match thread_agent(&thread.id) {
+                Ok(agent) => {
+                    let local = Coordinator::new(thread.id, agent, now, false, None);
+                    self.stand_down_as(slug, local, SWITCH_REASON.to_owned(), true)
+                        .await;
+                }
+                Err(err) => tracing::warn!(
+                    "coordinator of {slug}: thread {:?}, which a start at {since} created: {err:#}; archive it in T3",
+                    thread.id
+                ),
+            },
+        }
     }
 
     /// [`Self::stand_down`] for our thread that the board replaced with a coordinator that
@@ -2795,7 +2877,11 @@ impl<T: T3> Daemon<T> {
             stood.coordinator.agent.clone(),
             stood.coordinator.thread.clone(),
         );
-        let message = stand_down_message(slug, &stood.reason);
+        let message = if stood.last {
+            switch_message(slug)
+        } else {
+            stand_down_message(slug, &stood.reason)
+        };
         if let Err(err) = self.save() {
             tracing::warn!("saving the stood-down coordinator of {slug}: {err:#}");
         }
@@ -5726,6 +5812,17 @@ pub fn adoption_message(slug: &BoardSlug, triage: bool, children: Option<&Thread
 pub fn stand_down_message(slug: &BoardSlug, reason: &str) -> String {
     format!(
         "board {slug}: this thread is no longer its coordinator: {reason}. Stop dispatching now: claim no task, start no child and no review, and close no task as its coordinator. Children already at work finish on their own. For each task you own, add a note that says where it stands, then stop. You get one message here if this thread becomes the board's coordinator again."
+    )
+}
+
+/// Why a coordinator thread stood down when its board went to daemon dispatch.
+const SWITCH_REASON: &str = "the board is set to daemon dispatch, so the daemon starts its workers";
+
+/// The last message to the coordinator thread of `slug` when the board goes to daemon
+/// dispatch: it records what only its chat holds, gives back its tasks and ends.
+pub fn switch_message(slug: &BoardSlug) -> String {
+    format!(
+        "board {slug}: this thread is no longer its coordinator: {SWITCH_REASON}. This is the board's last message to this thread: the `hold:` line lets you do the steps below. Stop dispatching now: claim no task, start no child and no review, and close no task as its coordinator. Then: 1. Record each instruction the user gave you in chat about this board's work that the board does not hold yet, as a `decision` note (task_note kind=decision) on the task it concerns. 2. For each task you own in `doing`: when a child of yours still works on it, hand it to that child (`task_update owner=<child id>`); otherwise add a note that says where it stands and set it `open`. 3. End: start nothing more, and settle this thread. Nothing more is sent to this thread."
     )
 }
 
