@@ -379,15 +379,20 @@ pub fn parse_threads_titled(value: &Value, title: &str) -> Vec<ListedThread> {
         .collect()
 }
 
-/// The ids of the threads in `t3 thread list --json` output whose `status` is `running`: a
-/// run of theirs is in progress. A thread that waits for a child or a background job, or
-/// whose run ended, is not among them.
+/// The ids of the threads in `t3 thread list --json` output with a run that has not ended:
+/// `status` is one of [`BUSY_STATUSES`]. A run that prepares, waits in T3's queue or waits
+/// for a child or a background job still holds its agent process, so it counts as one that
+/// runs. A status this list does not name counts as ended.
 pub fn parse_running_threads(value: &Value) -> Vec<String> {
     value
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|t| t["status"].as_str() == Some("running"))
+        .filter(|t| {
+            t["status"]
+                .as_str()
+                .is_some_and(|s| BUSY_STATUSES.contains(&s))
+        })
         .filter_map(|t| t["threadId"].as_str().map(str::to_owned))
         .collect()
 }
@@ -640,8 +645,19 @@ mod tests {
             {"threadId": "c", "status": "completed"},
             {"threadId": "mcp:d", "status": "running", "createdBy": "agent"},
             {"status": "running"},
+            {"threadId": "e", "status": "preparing"},
+            {"threadId": "f", "status": "queued"},
+            {"threadId": "g", "status": "starting"},
+            {"threadId": "h", "status": "interrupted"},
+            {"threadId": "i", "status": "failed"},
+            {"threadId": "j", "status": "cancelled"},
+            {"threadId": "k", "status": "new-status"},
+            {"threadId": "l"},
         ]);
-        assert_eq!(parse_running_threads(&value), ["a", "mcp:d"]);
+        assert_eq!(
+            parse_running_threads(&value),
+            ["a", "b", "mcp:d", "e", "f", "g"]
+        );
         assert!(parse_running_threads(&json!({"error": "x"})).is_empty());
     }
 

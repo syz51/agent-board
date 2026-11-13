@@ -3712,3 +3712,195 @@ fn a_full_device_refuses_no_turn_of_the_user_and_no_other_tool() {
     let asked = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(!asked.contains("thread list"), "{asked}");
 }
+
+/// An agent that makes a refused call again leaves one record with every refusal and one
+/// note, not a copy of the call and a note per attempt.
+#[cfg(unix)]
+#[test]
+fn a_launch_refused_again_adds_to_its_record_and_notes_once() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    let mut doing = task_fixture("factory-4", "Build the counter");
+    doing.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", vec![doing]);
+    e.stub.on(
+        "POST /v1/tasks/factory-4/notes",
+        json!({
+            "id": 77, "task": "factory-4", "agent": CLAUDE_AGENT, "kind": "note",
+            "text": "x", "at": at(),
+        }),
+    );
+    let call = json!({"task": "Review the diff.", "title": "Review"});
+    let refuse = |call: &Value| {
+        let (reply, _) = e.hook(
+            "pre-tool-use",
+            "claude",
+            launch(&e, "mcp__t3-code__delegate_task", call.clone()),
+        );
+        let out = reply.unwrap_or_else(|| panic!("no refusal\n{}", e.ran()));
+        let out = &out["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny");
+        out["permissionDecisionReason"].as_str().unwrap().to_owned()
+    };
+    let first = refuse(&call);
+    assert!(first.contains("refused this launch:"), "{first}");
+    let second = refuse(&call);
+    assert!(second.contains("refused this launch again"), "{second}");
+    let third = refuse(&call);
+
+    let kept = refused_launches(&e);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["input"], call);
+    let again = kept[0]["again"].as_array().unwrap();
+    assert_eq!(again.len(), 2, "{again:?}");
+    for refusal in again {
+        assert!(refusal["at"].is_string(), "{refusal}");
+        assert!(
+            refusal["cause"].as_str().unwrap().contains("2 of 2"),
+            "{refusal}"
+        );
+        assert_eq!(refusal["running"], json!(["thread-a", "thread-b"]));
+    }
+    let file = std::fs::read_dir(e.home.join("state/refused-launches"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for reason in [&second, &third] {
+        assert!(reason.contains(file.to_str().unwrap()), "{reason}");
+    }
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
+        1,
+        "{}",
+        e.ran()
+    );
+
+    // Another call is another record.
+    refuse(&json!({"task": "Review the other diff.", "title": "Review"}));
+    assert_eq!(refused_launches(&e).len(), 2);
+}
+
+/// A refusal tells the agent what can work: a call that asks for as many threads as the
+/// device runs can never fit, so it is not told to make the call again.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_can_never_fit_is_not_told_to_try_again() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let two = json!({"threads": [{"title": "a", "prompt": "p"}, {"title": "b", "prompt": "q"}]});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__create_threads", two),
+    );
+    let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    let reason = reason.as_str().unwrap();
+    assert!(reason.contains("can never run as it is"), "{reason}");
+    assert!(reason.contains("Ask for fewer threads"), "{reason}");
+    assert!(!reason.contains("make the same call again"), "{reason}");
+}
+
+/// A launch that names this device's own T3 environment is counted like one that names
+/// none, and in a list only the threads for other devices are left out.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_names_this_devices_environment_is_counted() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let sessions = e.home.join("state/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("claude-{SESSION}.json")),
+        json!({"nested": false, "t3_link": "https://app.example.test/threads/env-1/thread-1"})
+            .to_string(),
+    )
+    .unwrap();
+    let decision = |tool: &str, call: Value| {
+        let (reply, _) = e.hook("pre-tool-use", "claude", launch(&e, tool, call));
+        reply.map(|r| r["hookSpecificOutput"]["permissionDecisionReason"].clone())
+    };
+
+    let here = json!({"task": "x", "target": {"environmentId": "env-1"}});
+    assert!(
+        decision("mcp__t3-code__delegate_task", here).is_some(),
+        "{}",
+        e.ran()
+    );
+    let away = json!({"task": "x", "target": {"environmentId": "env-2"}});
+    assert_eq!(decision("mcp__t3-code__delegate_task", away), None);
+
+    let mixed = json!({"threads": [
+        {"title": "a", "target": {"environmentId": "env-2"}},
+        {"title": "b"},
+        {"title": "c", "target": {"environmentId": "env-1"}},
+    ]});
+    let reason = decision("mcp__t3-code__create_threads", mixed).unwrap();
+    assert!(
+        reason
+            .as_str()
+            .unwrap()
+            .contains("this launch asks for 2 more"),
+        "{reason}"
+    );
+    let all_away = json!({"threads": [{"title": "a", "target": {"environmentId": "env-2"}}]});
+    assert_eq!(decision("mcp__t3-code__create_threads", all_away), None);
+}
+
+/// The check fails open: when it cannot count or cannot keep the call, the launch runs.
+/// A refusal without its record would lose the call.
+#[cfg(unix)]
+#[test]
+fn a_launch_runs_when_the_check_cannot_count_or_keep_it() {
+    let call = || json!({"task": "x", "title": "t"});
+    let run = |e: &Env| {
+        let started = std::time::Instant::now();
+        let out = e.hook_output(
+            "pre-tool-use",
+            "claude",
+            launch(e, "mcp__t3-code__delegate_task", call()),
+            &[],
+        );
+        (out, started.elapsed())
+    };
+
+    // T3 fails: no thread is counted.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    common::script::write_script(&e.home.join("t3"), "#!/bin/sh\necho broken >&2\nexit 1\n");
+    let (out, _) = run(&e);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+
+    // T3 answers too late: the hook does not wait for it.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    let answer = e.home.join("t3-answer.json");
+    common::script::write_script(
+        &e.home.join("t3"),
+        &format!("#!/bin/sh\nsleep 7\ncat '{}'\n", answer.display()),
+    );
+    let (out, took) = run(&e);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "{}", e.ran());
+    assert!(took < std::time::Duration::from_secs(7), "{took:?}");
+    assert!(refused_launches(&e).is_empty());
+
+    // The record cannot be written: no refusal without it.
+    let e = env();
+    device_with_turns(&e, 1, &["thread-a", "thread-b"]);
+    std::fs::create_dir_all(e.home.join("state")).unwrap();
+    std::fs::write(e.home.join("state/refused-launches"), "not a directory").unwrap();
+    let (out, _) = run(&e);
+    assert!(
+        !stdout(&out).contains("deny"),
+        "{}\n{}",
+        stdout(&out),
+        e.ran()
+    );
+    assert!(e.stub.requests().is_empty(), "{}", e.ran());
+}

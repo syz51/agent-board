@@ -5226,6 +5226,15 @@ fn running_lists(t3: &FakeT3) -> usize {
     calls.filter(|c| matches!(c, Call::Running(_))).count()
 }
 
+/// The holds by the device limit in the device's trail file.
+fn holds(home: &Home) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(home.state_dir().join("device-holds.jsonl"));
+    let text = text.unwrap_or_default();
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[tokio::test]
 async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     use board_proto::Priority::P1;
@@ -5255,6 +5264,16 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(text.chars().count() <= 800, "{text}");
+    // The device's trail file has the hold too: the time, the task, the load, the threads.
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "worker");
+    assert_eq!(held[0]["subject"], "factory-5");
+    assert_eq!(held[0]["board"], "factory");
+    assert_eq!(held[0]["others"], json!(["agent-child-2", "user-1"]));
+    assert!(held[0]["at"].is_string(), "{held:?}");
+    let cause = held[0]["cause"].as_str().unwrap();
+    assert!(cause.contains("has 3 of 3 runs"), "{cause}");
 
     // The dispatcher's own run is among the running threads and counts once.
     let mut e = slots_env(3, &tasks);
@@ -5278,6 +5297,7 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
         e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
         1
     );
+    assert_eq!(holds(&home_of(&e)).len(), 1);
 
     // A T3 that does not answer leaves the count to the dispatcher's own runs.
     let mut e = slots_env(3, &tasks);
@@ -5307,6 +5327,21 @@ async fn a_judge_waits_while_other_threads_fill_the_device() {
         .await
         .unwrap();
     assert!(titles(&e.t3).is_empty());
+    // A held judge gets no note: the device's trail file is its record, once per hold.
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(5) + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "judge");
+    assert_eq!(held[0]["subject"], "review factory-4 Task factory-4");
+    assert_eq!(held[0]["others"], json!(["user-1", "user-2"]));
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-4/notes")
+            .is_empty()
+    );
 
     // One of them ends: the judge starts.
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];

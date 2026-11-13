@@ -592,9 +592,13 @@ impl<T: T3> Daemon<T> {
                         self.load()
                     );
                 }
+                // A held judge gets no note, since a note on an owned task wakes its
+                // owner: the device's trail file is its record.
+                self.record_hold("judge", slug, &want.title, limit, now);
                 break;
             }
             let names = want.title.clone();
+            self.held.remove(&format!("judge {names}"));
             match self.start_judge(board, &client, &project, want, now).await {
                 Ok(()) => {
                     started += 1;

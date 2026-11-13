@@ -332,6 +332,51 @@ pub fn save_refused_launch<T: Serialize>(home: &Home, name: &str, record: &T) ->
     Ok(path)
 }
 
+/// Records that the launch kept as `name` was refused again: adds `refusal` (its time and
+/// cause) to the record's `again` list and gives the record's path. `None` when no such
+/// record is kept, so the caller keeps the call first. One call that an agent repeats so
+/// leaves one record with every refusal, not a copy of the call per attempt.
+pub fn repeat_refused_launch<T: Serialize>(
+    home: &Home,
+    name: &str,
+    refusal: &T,
+) -> Result<Option<PathBuf>> {
+    let path = home
+        .state_dir()
+        .join("refused-launches")
+        .join(format!("{}.json", safe_stem(name)));
+    let Some(mut record) = read_json::<serde_json::Value>(&path) else {
+        return Ok(None);
+    };
+    let Some(fields) = record.as_object_mut() else {
+        return Ok(None);
+    };
+    let again = fields
+        .entry("again")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(again) = again.as_array_mut() {
+        again.push(serde_json::to_value(refusal)?);
+    }
+    write_json(&path, &record)?;
+    Ok(Some(path))
+}
+
+/// Adds `record` as one line to `device-holds.jsonl` in the state directory: the trail of
+/// the tasks and judges the device limit held. Nothing prunes it.
+pub fn append_hold<T: Serialize>(home: &Home, record: &T) -> Result<()> {
+    use std::io::Write as _;
+    let dir = home.state_dir();
+    std::fs::create_dir_all(&dir)?;
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("device-holds.jsonl"))?
+        .write_all(&line)?;
+    Ok(())
+}
+
 /// When a shell tool call started, from its `PreToolUse` hook.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStart {

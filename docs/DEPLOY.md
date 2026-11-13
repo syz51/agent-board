@@ -118,10 +118,18 @@ A running `board watch` re-reads the file within a minute of an edit and applies
 tables, `feedback_board` and `runs_at_once` without a restart; a change to `server`,
 `device`, `t3_bin` or `[thread_model]` needs one, and the daemon's log says so.
 
-On daemon-dispatch boards the daemon has at most `runs_at_once` workers and judges at once
-on the device, across all its boards. Without the setting it is one per 4 GiB of host
-memory, at least 2. Each run is an agent session of some hundred MiB, and its builds take
-more, so lower it on a device you also work on:
+`runs_at_once` is how many agent turns the device runs at once. Without the setting it is
+one per 4 GiB of host memory, at least 2. Every thread of the configured T3 projects whose
+run has not ended counts, whoever started it: you, a coordinator, a delegate or the daemon.
+At the limit the daemon starts no worker and no judge on any of its boards, and the
+`PreToolUse` hook refuses the threads agents start through T3 (`delegate_task`,
+`t3_thread_launch`, `create_threads`); a turn you start yourself always runs. The hook
+checks on every logged-in device, also one without daemon-dispatch boards. Every hold and
+refusal is recorded: holds in `state/device-holds.jsonl`, refused calls in
+`state/refused-launches/`, both under `$BOARD_HOME`; the note on the task names the file. After
+an upgrade that adds a hook, run `board install claude --write ~/.claude/settings.json`
+again so that Claude Code has it. Each run is an agent session of some hundred MiB, and
+its builds take more, so lower the limit on a device you also work on:
 
 ```toml
 # config.toml, above the first table

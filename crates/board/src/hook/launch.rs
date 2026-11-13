@@ -4,7 +4,11 @@
 //!
 //! A refusal loses nothing. The whole call is kept in a file on the device before the
 //! hook answers, and a note on the task the agent works on records the time, the cause,
-//! the thread and that file. The agent reads both places in the refusal.
+//! the thread and that file. The agent reads both places in the refusal. The same call,
+//! refused again, adds its time and cause to the same file and no second note.
+//!
+//! A thread the call starts in another T3 environment runs on another device and is not
+//! counted here; this device's environment is known from the session thread's T3 link.
 //!
 //! The check fails open: with no limit, no T3 answer in time or a record it could not
 //! write, the launch runs. A turn the user starts is no tool call and so never comes here.
@@ -18,13 +22,12 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{HookEvent, Reply, T3_CLI_ENV, direct_client, nested_session, spawn_token};
+use super::{HookEvent, Reply, direct_client, nested_session, spawn_token, t3_cli};
 use crate::client::{Client, TaskQuery};
 use crate::config::{Config, Home};
 use crate::daemon::device;
 use crate::identity::{T3_THREAD_ENV, resolve_agent};
 use crate::state;
-use crate::t3::T3Cli;
 
 /// The T3 tools that start a thread, as their MCP server names them.
 const LAUNCH_TOOLS: [&str; 3] = ["delegate_task", "t3_thread_launch", "create_threads"];
@@ -39,29 +42,66 @@ const COUNT_BUDGET: Duration = Duration::from_millis(4500);
 /// How long the server has to take the note of a refusal; later, the file is the record.
 const NOTE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Whether the tool call of `input` starts a T3 thread on this device. One that names an
-/// environment may start it on another device, which this one cannot count for.
+/// Whether the tool call of `input` starts a T3 thread.
 pub(super) fn is_launch(input: &Value) -> bool {
-    let named = input["tool_name"]
+    input["tool_name"]
         .as_str()
         .and_then(|tool| tool.strip_prefix("mcp__"))
         .and_then(|tool| tool.rsplit_once("__"))
-        .is_some_and(|(_, name)| LAUNCH_TOOLS.contains(&name));
-    named && !names_environment(&input["tool_input"])
+        .is_some_and(|(_, name)| LAUNCH_TOOLS.contains(&name))
 }
 
-fn names_environment(call: &Value) -> bool {
-    let given = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
-    given(&call["environmentId"])
-        || given(&call["target"]["environmentId"])
-        || call["threads"]
-            .as_array()
-            .is_some_and(|threads| threads.iter().any(|t| given(&t["target"]["environmentId"])))
+/// The T3 environment a call or one thread of its list names, when it names one.
+fn environment(of: &Value) -> Option<&str> {
+    [&of["environmentId"], &of["target"]["environmentId"]]
+        .into_iter()
+        .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
 }
 
-/// How many threads the call starts: each of `create_threads`' list, else one.
-fn threads_asked(call: &Value) -> usize {
-    call["threads"].as_array().map_or(1, |t| t.len().max(1))
+/// How many threads the call starts on this device: each of `create_threads`' list, else
+/// one. A thread that names an environment starts there: it counts when that environment is
+/// `local`, this device's. With `local` unknown it is not counted, since it may start on
+/// another device, which this one cannot count for.
+fn threads_asked(call: &Value, local: Option<&str>) -> usize {
+    let here = |named: Option<&str>| named.is_none_or(|env| local == Some(env));
+    match call["threads"].as_array() {
+        Some(threads) => threads
+            .iter()
+            .filter(|t| here(environment(t).or_else(|| environment(call))))
+            .count(),
+        None => usize::from(here(environment(call))),
+    }
+}
+
+/// The T3 environment of this device, read from the link T3 gave the session's thread
+/// (`…/threads/<environment>/<thread>`), which the session's hooks cache.
+fn local_environment(home: &Home, runtime: Runtime, session: Option<&str>) -> Option<String> {
+    let link = state::load_session(home, runtime, session?)?.t3_link?;
+    let (_, rest) = link.split_once("/threads/")?;
+    let (environment, _) = rest.split_once('/')?;
+    (!environment.is_empty()).then(|| environment.to_owned())
+}
+
+/// The name of the record of a refused call: the same call of the same session has the
+/// same name, so that its repeats add to one record.
+fn record_name(session: Option<&str>, tool: &str, call: &Value) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    for part in [session.unwrap_or_default(), tool, &call.to_string()] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    let digest = hash.finalize();
+    digest[..12].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One more refusal of a call whose record is kept already.
+#[derive(Debug, Serialize)]
+struct Again<'a> {
+    at: Timestamp,
+    cause: &'a str,
+    running: &'a std::collections::BTreeSet<String>,
+    tool_use: Option<&'a str>,
 }
 
 /// The record of a refused launch, as the file keeps it.
@@ -97,17 +137,18 @@ pub(super) async fn check(
     };
     let default = device::default_run_limit(device::host_memory());
     let limit = device::run_limit(&config, Some(default));
-    let bin = std::env::var_os(T3_CLI_ENV)
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| config.t3_bin.clone());
-    let t3 = T3Cli::locate(bin.as_deref());
+    let session = input["session_id"].as_str().filter(|s| !s.is_empty());
+    let local = local_environment(home, runtime, session);
+    let asked = threads_asked(&input["tool_input"], local.as_deref());
+    if asked == 0 {
+        return Ok(Reply::Nothing);
+    }
+    let t3 = t3_cli(home);
     let counted = tokio::time::timeout(COUNT_BUDGET, device::running_threads(&t3, &config)).await;
     let Ok(running) = counted else {
         tracing::debug!("launch check: T3 listed no threads within {COUNT_BUDGET:?}; not checked");
         return Ok(Reply::Nothing);
     };
-    let asked = threads_asked(&input["tool_input"]);
     if running.len().saturating_add(asked) <= limit {
         return Ok(Reply::Nothing);
     }
@@ -117,6 +158,24 @@ pub(super) async fn check(
     let tool = input["tool_name"].as_str().unwrap_or_default();
     let tool_use = input["tool_use_id"].as_str().filter(|s| !s.is_empty());
     let load = load(device_name.as_str(), limit, running.len(), asked);
+    let advice = advice(asked, limit);
+    let name = record_name(session, tool, &input["tool_input"]);
+    // The same call, refused before: its record takes this refusal too, and the task has
+    // its note already.
+    let again = Again {
+        at,
+        cause: &load,
+        running: &running,
+        tool_use,
+    };
+    if let Some(file) = state::repeat_refused_launch(home, &name, &again)? {
+        return Ok(Reply::Deny(format!(
+            "The device limit refused this launch again: {load}. Nothing is lost: the whole \
+             call is kept in {}, and this refusal is added to it. {advice} Do not start the \
+             thread another way.",
+            file.display()
+        )));
+    }
     let record = Refused {
         at,
         cause: &load,
@@ -125,16 +184,11 @@ pub(super) async fn check(
         running: running.iter().map(String::as_str).collect(),
         asked,
         thread,
-        session: input["session_id"].as_str().filter(|s| !s.is_empty()),
+        session,
         tool,
         tool_use,
         input: &input["tool_input"],
     };
-    let name = format!(
-        "{}-{}",
-        at.format("%Y%m%dT%H%M%S%3fZ"),
-        tool_use.unwrap_or("call")
-    );
     // Before the refusal: a call that is not kept is not refused.
     let file = state::save_refused_launch(home, &name, &record)?;
     let text = note_text(&load, tool, title(&input["tool_input"]), thread, &file);
@@ -154,7 +208,31 @@ pub(super) async fn check(
             None
         }
     };
-    Ok(Reply::Deny(refusal(&load, &file, noted.as_ref())))
+    Ok(Reply::Deny(refusal(&load, &file, noted.as_ref(), &advice)))
+}
+
+/// What the agent of a refused launch does next. The device runs `limit` turns at most and
+/// the agent's own turn is one of them, so a call for `limit` threads or more never fits.
+fn advice(asked: usize, limit: usize) -> String {
+    if asked >= limit {
+        let fewer = if asked > 1 {
+            "Ask for fewer threads, or do the work in this thread."
+        } else {
+            "Do the work in this thread."
+        };
+        format!(
+            "This call can never run as it is: it asks for {asked} and the device runs \
+             {limit} at most, your own turn among them. {fewer}"
+        )
+    } else if asked > 1 {
+        "Do the work in this thread, ask for fewer threads, or make the same call again \
+         when turns on the device have ended."
+            .to_owned()
+    } else {
+        "Do the work in this thread, or make the same call again when a turn on the device \
+         has ended."
+            .to_owned()
+    }
 }
 
 /// The cause of a refusal, in one sentence.
@@ -197,14 +275,13 @@ fn note_text(load: &str, tool: &str, title: String, thread: Option<&str>, file: 
     )
 }
 
-fn refusal(load: &str, file: &Path, noted: Option<&(TaskId, i64)>) -> String {
+fn refusal(load: &str, file: &Path, noted: Option<&(TaskId, i64)>, advice: &str) -> String {
     let noted = noted.map_or_else(String::new, |(task, note)| {
         format!(" Note #{note} on {task} records the refusal.")
     });
     format!(
         "The device limit refused this launch: {load}. Nothing is lost: the whole call is \
-         kept in {}.{noted} Do the work in this thread, or make the same call again when a \
-         turn on the device has ended. Do not start the thread another way.",
+         kept in {}.{noted} {advice} Do not start the thread another way.",
         file.display()
     )
 }
@@ -298,25 +375,76 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_that_names_an_environment_is_not_counted_here() {
-        let call =
-            |input: Value| json!({"tool_name": "mcp__t3-code__delegate_task", "tool_input": input});
-        assert!(!is_launch(&call(
-            json!({"target": {"environmentId": "env-2"}})
-        )));
-        assert!(!is_launch(&call(json!({"environmentId": "env-2"}))));
-        assert!(!is_launch(&call(
-            json!({"threads": [{"title": "a"}, {"target": {"environmentId": "env-2"}}]})
-        )));
-        assert!(is_launch(&call(json!({"target": {"model": "m"}}))));
-        assert!(is_launch(&call(json!({"environmentId": ""}))));
+    fn a_thread_for_another_environment_is_not_counted_here() {
+        let here = Some("env-1");
+        assert_eq!(threads_asked(&json!({"task": "x"}), here), 1);
+        assert_eq!(threads_asked(&json!({"task": "x"}), None), 1);
+        assert_eq!(threads_asked(&json!({"environmentId": ""}), None), 1);
+        // This device's environment, named, is this device.
+        for call in [
+            json!({"environmentId": "env-1"}),
+            json!({"target": {"environmentId": "env-1", "model": "m"}}),
+        ] {
+            assert_eq!(threads_asked(&call, here), 1, "{call}");
+            // Unknown here: it may be another device's.
+            assert_eq!(threads_asked(&call, None), 0, "{call}");
+            assert_eq!(threads_asked(&call, Some("env-2")), 0, "{call}");
+        }
     }
 
     #[test]
-    fn create_threads_asks_for_each_thread_of_its_list() {
-        assert_eq!(threads_asked(&json!({"task": "x"})), 1);
-        assert_eq!(threads_asked(&json!({"threads": [{}, {}, {}]})), 3);
-        assert_eq!(threads_asked(&json!({"threads": []})), 1);
+    fn create_threads_asks_for_each_local_thread_of_its_list() {
+        let here = Some("env-1");
+        assert_eq!(threads_asked(&json!({"threads": [{}, {}, {}]}), here), 3);
+        assert_eq!(threads_asked(&json!({"threads": []}), here), 0);
+        // One thread for another device does not take the others out of the count.
+        let mixed = json!({"threads": [
+            {"title": "a"},
+            {"target": {"environmentId": "env-2"}},
+            {"target": {"environmentId": "env-1"}},
+        ]});
+        assert_eq!(threads_asked(&mixed, here), 2);
+        assert_eq!(threads_asked(&mixed, None), 1);
+        // The call's environment holds for the threads that name none.
+        let all = json!({"environmentId": "env-2", "threads": [{}, {"environmentId": "env-1"}]});
+        assert_eq!(threads_asked(&all, here), 1);
+    }
+
+    #[test]
+    fn the_same_call_of_a_session_has_one_record_name() {
+        let call = json!({"title": "a", "task": "b"});
+        let name = record_name(Some("s1"), "mcp__t3-code__delegate_task", &call);
+        assert_eq!(name.len(), 24);
+        assert_eq!(
+            name,
+            record_name(Some("s1"), "mcp__t3-code__delegate_task", &call)
+        );
+        assert_ne!(
+            name,
+            record_name(Some("s2"), "mcp__t3-code__delegate_task", &call)
+        );
+        assert_ne!(
+            name,
+            record_name(Some("s1"), "mcp__t3-code__t3_thread_launch", &call)
+        );
+        let other = json!({"title": "a", "task": "c"});
+        assert_ne!(
+            name,
+            record_name(Some("s1"), "mcp__t3-code__delegate_task", &other)
+        );
+    }
+
+    #[test]
+    fn the_advice_of_a_refusal_fits_what_was_asked() {
+        assert!(advice(1, 4).contains("make the same call again"));
+        assert!(advice(2, 4).contains("ask for fewer threads"));
+        let never = advice(4, 4);
+        assert!(never.contains("can never run as it is"), "{never}");
+        assert!(never.contains("Ask for fewer threads"), "{never}");
+        assert!(!never.contains("again"), "{never}");
+        let one = advice(1, 1);
+        assert!(one.contains("can never run"), "{one}");
+        assert!(!one.contains("fewer"), "{one}");
     }
 
     #[test]
@@ -338,7 +466,12 @@ mod tests {
         assert!(text.contains("from thread thread-1"), "{text}");
         assert!(text.contains(&format!("\"{}…\"", "t".repeat(TITLE_CHARS))));
         assert!(text.ends_with(&format!("in {}.", file.display())), "{text}");
-        let told = refusal(&cause, file, Some(&("factory-4".parse().unwrap(), 12)));
+        let told = refusal(
+            &cause,
+            file,
+            Some(&("factory-4".parse().unwrap(), 12)),
+            &advice(1, 4),
+        );
         assert!(told.contains("Note #12 on factory-4 records the refusal."));
         assert!(told.contains(&file.display().to_string()));
         assert_eq!(

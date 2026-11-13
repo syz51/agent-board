@@ -1089,6 +1089,9 @@ pub struct Daemon<T: T3> {
     running: Option<BTreeSet<String>>,
     /// The tasks that carry a note of the device limit holding them, until they start.
     held_noted: BTreeSet<TaskId>,
+    /// The holds by the device limit that the device's trail file has, until their task or
+    /// judge starts: `worker <task>` and `judge <title>`.
+    held: BTreeSet<String>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1122,6 +1125,7 @@ impl<T: T3> Daemon<T> {
             last_pass: None,
             running: None,
             held_noted: BTreeSet::new(),
+            held: BTreeSet::new(),
         }
     }
 
@@ -1293,17 +1297,53 @@ impl<T: T3> Daemon<T> {
         }
     }
 
+    /// Adds the start of a hold by the device limit to the device's trail
+    /// (`state/device-holds.jsonl`), once until the held task or judge starts: the time,
+    /// the board, what is held and the device's load. It is the record of a held judge,
+    /// which gets no note, and of a held task whose note the server did not take.
+    fn record_hold(
+        &mut self,
+        kind: &str,
+        board: &BoardSlug,
+        subject: &str,
+        limit: usize,
+        now: Timestamp,
+    ) {
+        let key = format!("{kind} {subject}");
+        if self.held.contains(&key) {
+            return;
+        }
+        let record = serde_json::json!({
+            "at": now,
+            "kind": kind,
+            "board": board,
+            "device": self.ctx.device,
+            "subject": subject,
+            "limit": limit,
+            "cause": self.load(),
+            "others": self.other_turns(),
+        });
+        match state::append_hold(&self.ctx.home, &record) {
+            Ok(()) => {
+                self.held.insert(key);
+            }
+            Err(err) => tracing::warn!("recording that the device limit holds {key}: {err:#}"),
+        }
+    }
+
     /// Records on `task` that the device limit holds it, once until it starts, so that a
     /// reader of the board sees why a ready task did not start and what ran instead. A
-    /// note that fails is logged: the hold itself is in the log either way.
+    /// note that fails is logged and tried again; the hold is in the device's trail file
+    /// either way.
     async fn note_held(&mut self, task: &TaskId, agent: &AgentId, workers: usize, load: &str) {
         if !self.held_noted.insert(task.clone()) {
             return;
         }
-        let text = format!(
+        let text = clip_note(format!(
             "The device limit holds this task: {load}; workers may take {workers}. The \
-             dispatcher starts it when a slot is free, after the boards that waited longer."
-        );
+             dispatcher starts it when a slot is free, after the boards that waited longer. \
+             The device keeps each hold in state/device-holds.jsonl."
+        ));
         let client = self.client().with_agent(Some(agent.clone()));
         if let Err(err) = add_note(&client, task, agent, NoteKind::Note, text).await {
             self.held_noted.remove(task);
@@ -1689,17 +1729,21 @@ impl<T: T3> Daemon<T> {
                 || self.runs() >= self.run_limit()
                 || self.worker_turns.another_first(slug, waited)
             {
+                let load = self.load();
                 if self.worker_turns.wait(slug, waited, now) {
-                    let load = self.load();
                     tracing::info!(
                         "{slug}: {} waits for one of the {limit} worker slots of this device; {load}",
                         task.id
                     );
-                    self.note_held(&task.id, &agent, limit, &load).await;
                 }
+                // Each task the limit holds gets its record, not only the one that
+                // started the board's wait.
+                self.record_hold("worker", slug, task.id.as_str(), limit, now);
+                self.note_held(&task.id, &agent, limit, &load).await;
                 break;
             }
             self.held_noted.remove(&task.id);
+            self.held.remove(&format!("worker {}", task.id));
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
                 self.note_failure(board, now);
                 // One task that cannot start does not hold up the others. A start that
