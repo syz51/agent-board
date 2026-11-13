@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use crate::client::TaskQuery;
 use crate::config::Home;
 use crate::identity::agent_from_env;
-use crate::ops::{self, Ctx, Output, limits};
+use crate::ops::{self, Ctx, Output, TITLE_AIM_CHARS, limits};
 
 const INSTRUCTIONS: &str = "Shared work board for agent threads. Call board_snapshot when your \
 context holds no board state from session start or compaction, or when unsure what to do next. \
@@ -279,7 +279,7 @@ const TOOLS: &[ToolSpec] = &[
                     "title",
                     s(
                         &format!(
-                            "Imperative title, at most {} characters.",
+                            "Imperative title, at most {} characters; aim for about {TITLE_AIM_CHARS}.",
                             limits().title_chars
                         ),
                         limits().title_chars,
@@ -376,7 +376,10 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "title",
                     s(
-                        &format!("New title, at most {} characters.", limits().title_chars),
+                        &format!(
+                            "New title, at most {} characters; aim for about {TITLE_AIM_CHARS}.",
+                            limits().title_chars
+                        ),
                         limits().title_chars,
                     ),
                     false,
@@ -1373,7 +1376,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 16_820, "tool list: {schemas}");
+        assert!(schemas < 16_850, "tool list: {schemas}");
         // `kind` is a parameter, which every reader shows: no text asks to repeat it.
         for tool in &tools {
             let text = tool.description.as_deref().unwrap_or_default();
@@ -1683,6 +1686,24 @@ mod tests {
             assert!(param_description.contains(&said), "{name}.{param}");
             let description = tool.description.as_deref().unwrap().to_lowercase();
             assert!(description.contains(&said), "{name}: {description}");
+        }
+    }
+
+    /// The title limit is a ceiling: agents writing up to it keep passing it, so both title
+    /// tools' title parameter names a shorter length to aim for, next to the limit.
+    #[test]
+    fn title_descriptions_say_what_length_to_aim_for() {
+        let said = format!(
+            "at most {} characters; aim for about {TITLE_AIM_CHARS}.",
+            limits().title_chars
+        );
+        let tools = tools();
+        for name in ["task_add", "task_update"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            let param = tool.input_schema["properties"]["title"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(param.contains(&said), "{name}.title: {param}");
         }
     }
 }
