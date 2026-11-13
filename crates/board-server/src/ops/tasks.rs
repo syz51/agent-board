@@ -358,14 +358,17 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
 /// claim checks: no blocker left to finish, no `not_before` ahead, and room in the
 /// creator's `doing` limit. Checked before anything is written.
 fn check_claimable_new(cx: &Ctx<'_>, req: &CreateTask, blockers: &[TaskId]) -> Result<()> {
-    let waiting = undone_blockers(cx, blockers)?;
+    let waiting = holding_blockers(cx, req.parent.as_ref(), blockers, &req.agent)?;
     if !waiting.is_empty() {
         return Err(bad_transition(
             format!(
                 "a claimed task starts in doing, but it would wait on {}",
                 waiting.join(", ")
             ),
-            "add it without claim; it becomes ready when its blockers are done",
+            format!(
+                "add it without claim; it becomes ready when its blockers are done; \
+                 {ALONGSIDE_RULE}"
+            ),
         ));
     }
     if req
@@ -1008,17 +1011,76 @@ fn open_blockers(cx: &Ctx<'_>, task: &TaskId) -> Result<Vec<(String, String)>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Refuses to start `task` while a blocker is not done.
-pub(crate) fn check_blockers_done(cx: &Ctx<'_>, task: &TaskId) -> Result<()> {
-    let waiting = open_blockers(cx, task)?;
+/// What a refusal for blockers adds: the blockers that do not hold a start.
+const ALONGSIDE_RULE: &str = "a blocker in review that is an ancestor of the task or yours \
+                              does not hold it, so a task done in that blocker's PR is claimed \
+                              and moved to review with a note naming the PR";
+
+/// Refuses `agent`'s start of `task` while a blocker holds it ([`holding_blockers`]).
+pub(crate) fn check_blockers_done(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<()> {
+    let waiting = holding_blockers(cx, task.parent.as_ref(), &task.blockers, agent)?;
     if waiting.is_empty() {
         return Ok(());
     }
-    let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
     Err(bad_transition(
-        format!("{task} waits on {}", list.join(", ")),
-        "pick a ready task (task_list ready=true), or help finish its blockers",
+        format!("{} waits on {}", task.id, waiting.join(", ")),
+        format!(
+            "pick a ready task (task_list ready=true), or help finish its blockers; \
+             {ALONGSIDE_RULE}"
+        ),
     ))
+}
+
+/// The tasks in `blockers` that hold a start of a task under `parent` by `agent`, each as
+/// `id (status)`: those not done, except one in `review` that is an ancestor of the task
+/// (`parent` or above) or that `agent` owns. The task's work then goes out in that
+/// blocker's PR, so it moves to `review` alongside it. It stays out of `ready` all the
+/// same, so no coordinator starts it.
+fn holding_blockers(
+    cx: &Ctx<'_>,
+    parent: Option<&TaskId>,
+    blockers: &[TaskId],
+    agent: &AgentId,
+) -> Result<Vec<String>> {
+    // Read only once a blocker in review that is not the agent's needs it.
+    let mut ancestors: Option<HashSet<String>> = None;
+    let mut statement = cx
+        .db
+        .prepare_cached("SELECT status, owner FROM tasks WHERE id = ?1 AND status != 'done'")?;
+    let mut waiting = Vec::new();
+    for b in blockers {
+        let row: Option<(String, Option<String>)> = statement
+            .query_row([b.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((status, owner)) = row else {
+            continue;
+        };
+        if status == status_str(TaskStatus::Review) {
+            if owner.as_deref() == Some(agent.as_str()) {
+                continue;
+            }
+            let ancestors = match &mut ancestors {
+                Some(set) => set,
+                None => ancestors.insert(match parent {
+                    Some(parent) => cx
+                        .db
+                        .prepare_cached(
+                            "WITH RECURSIVE up(id) AS (SELECT ?1 UNION SELECT t.parent \
+                             FROM tasks t JOIN up ON t.id = up.id WHERE t.parent IS NOT NULL) \
+                             SELECT id FROM up",
+                        )?
+                        .query_map([parent.as_str()], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                    None => HashSet::new(),
+                }),
+            };
+            if ancestors.contains(b.as_str()) {
+                continue;
+            }
+        }
+        waiting.push(format!("{b} ({status})"));
+    }
+    Ok(waiting)
 }
 
 /// Claims an open task: one conditional update, so concurrent claims have one winner. A
@@ -1088,7 +1150,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
     if task.proposal {
         return Err(unaccepted_proposal(id));
     }
-    check_blockers_done(cx, id)?;
+    check_blockers_done(cx, &task, agent)?;
     check_not_before(cx, &task)?;
     check_doing_limit(cx, agent, id)?;
     let now = cx.now_ms();
@@ -1190,14 +1252,13 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             ),
         ));
     }
-    let waiting = open_blockers(cx, id)?;
+    let waiting = holding_blockers(cx, task.parent.as_ref(), &task.blockers, agent)?;
     if !waiting.is_empty() {
-        let list: Vec<String> = waiting.iter().map(|(b, s)| format!("{b} ({s})")).collect();
         return Err(bad_transition(
-            format!("{id} waits on {}", list.join(", ")),
+            format!("{id} waits on {}", waiting.join(", ")),
             format!(
                 "help finish them, or remove the ones it no longer waits on (task_update {id} \
-                 with blockers), then claim it again"
+                 with blockers), then claim it again; {ALONGSIDE_RULE}"
             ),
         ));
     }
@@ -1277,7 +1338,7 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
         _ => TaskStatus::Doing,
     };
     if task.status == TaskStatus::Open {
-        check_blockers_done(cx, id)?;
+        check_blockers_done(cx, &task, agent)?;
         check_not_before(cx, &task)?;
     }
     if status == TaskStatus::Doing {
@@ -1683,15 +1744,17 @@ pub(crate) fn release(
     get_task(cx, id)
 }
 
-/// Refuses a `PATCH` into `doing` while `blockers` (the list the request leaves) has one
-/// that is not done or `not_before` is still ahead, as a claim would.
+/// Refuses a `PATCH` into `doing` for `owner` while `blockers` (the list the request leaves)
+/// has one that holds it ([`holding_blockers`]) or `not_before` is still ahead, as a claim would.
 fn check_ready_to_start(
     cx: &Ctx<'_>,
-    id: &TaskId,
+    task: &Task,
     blockers: &[TaskId],
     not_before: Option<Timestamp>,
+    owner: &AgentId,
 ) -> Result<()> {
-    let waiting = undone_blockers(cx, blockers)?;
+    let id = &task.id;
+    let waiting = holding_blockers(cx, task.parent.as_ref(), blockers, owner)?;
     // Both waits at once, so one refusal names everything that holds the task.
     let mut waits: Vec<String> = Vec::new();
     let mut drop: Vec<&str> = Vec::new();
@@ -1713,7 +1776,7 @@ fn check_ready_to_start(
         ),
         format!(
             "wait until that ends, or drop what it no longer waits on in the same request \
-             (task_update {id} status=doing {})",
+             (task_update {id} status=doing {}); {ALONGSIDE_RULE}",
             drop.join(" ")
         ),
     ))
@@ -1914,7 +1977,9 @@ pub(crate) fn update(
     // same request may remove the blockers or the not_before it no longer waits on. Checked
     // before the doing limit, as a claim does, so no task is parked for a refused move.
     if to == TaskStatus::Doing && from != TaskStatus::Doing {
-        check_ready_to_start(cx, id, &blockers, not_before)?;
+        // A move to doing always leaves an owner; the caller is the fallback all the same.
+        let starter = owner.as_ref().unwrap_or(agent);
+        check_ready_to_start(cx, &task, &blockers, not_before, starter)?;
     }
     // A task entering doing, or changing hands in doing, counts against its owner's limit.
     if let Some(worker) = owner
