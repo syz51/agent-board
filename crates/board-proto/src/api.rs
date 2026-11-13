@@ -130,8 +130,8 @@ pub struct JoinBoard {
 }
 
 /// `POST /v1/boards/{slug}/coordinator`: take or renew the coordinator lease of an
-/// autopilot board. The lease belongs to a device, so only one device starts a
-/// coordinator thread; that device then names the thread's agent id once it exists.
+/// autopilot board. The lease belongs to a device, so only one device dispatches
+/// the board; that device names its dispatch agent (`dispatch:<device>`).
 /// The lease expires like a file lease unless renewed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimCoordinator {

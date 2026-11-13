@@ -649,7 +649,7 @@ const HELD_BY: &str = concat!(
 
 /// The boards that hold `agent` (`?1`) as a stood-down coordinator, with when and why it
 /// stood down. A lease left live when the board stopped running the thread does not lift
-/// the hold: only a claim that names the thread, or keeps it named, does.
+/// the hold, and no claim does: the hold lasts as long as the board.
 const STOOD_DOWN: &str = "SELECT board, since, reason FROM stood_down WHERE agent = ?1 \
      ORDER BY board";
 

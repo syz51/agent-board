@@ -90,7 +90,7 @@ async fn may_hand_over(t: &T, agent: &str, task: &str) -> bool {
 }
 
 #[tokio::test]
-async fn every_board_is_on_daemon_dispatch_and_thread_dispatch_is_refused() {
+async fn every_board_is_on_daemon_dispatch_and_thread_dispatch_is_dropped() {
     let t = T::new();
     let board = t.board("factory", &[]).await;
     assert_eq!(board["dispatch"], "daemon");
@@ -106,20 +106,17 @@ async fn every_board_is_on_daemon_dispatch_and_thread_dispatch_is_refused() {
         .await;
     assert_eq!(board["dispatch"], "daemon");
     assert_eq!(t.count("SELECT MAX(seq) FROM events"), since);
-    // The removed value says what to do instead.
-    let (code, _, v) = t
-        .fail(
+    // The removed value is dropped, and the update's other fields apply, as an older
+    // client expects.
+    let board = t
+        .ok(
             "PATCH",
             "/v1/boards/factory",
             None,
-            Some(json!({ "dispatch": "thread" })),
+            Some(json!({ "dispatch": "thread", "parallel_tasks": 1 })),
         )
         .await;
-    assert_eq!(code, 400, "{v}");
-    assert!(
-        v["next"].as_str().unwrap().contains("leave dispatch out"),
-        "{v}"
-    );
+    assert_eq!(board["dispatch"], "daemon");
     let (code, _, v) = t
         .fail(
             "PATCH",

@@ -2940,6 +2940,38 @@ fn dispatch_env(tasks: &[board_proto::Task]) -> Env {
     e
 }
 
+#[test]
+fn the_worker_brief_says_how_to_run_a_climb() {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let brief = words(board::brief::WORKER_PROMPT);
+    for rule in [
+        "A climb is a task whose acceptance is a score command",
+        "note starting `score:`",
+        "use its verdict, do not judge a plateau yourself",
+        "report friction in the climb process",
+        "applies from the next run: start one and note why",
+        "Never change the bar, judges or references within a run",
+        "which judges scored it, the gap to the bar and the budget spent",
+        "merges only on the user's decision",
+    ] {
+        assert!(brief.contains(rule), "missing {rule:?}");
+    }
+}
+
+/// A board from a server that predates the `dispatch` field reads as `thread`, and the
+/// daemon dispatches it all the same.
+#[tokio::test]
+async fn a_board_that_reads_thread_dispatch_is_dispatched() {
+    let task = ready_task("factory-4", board_proto::Priority::P1, 0);
+    let e = dispatch_env(std::slice::from_ref(&task));
+    let mut board = daemon_board(None);
+    board.dispatch = board_proto::Dispatch::Thread;
+    e.stub.on("GET /v1/boards", [board]);
+    let mut e = e;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+}
+
 fn note(task: &board_proto::TaskId) -> serde_json::Value {
     json!({"id": 1, "task": task, "agent": DISPATCH, "kind": "note", "text": "noted", "at": at()})
 }

@@ -1,6 +1,6 @@
 use board_proto::{
-    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, Dispatch,
-    EventType, TaskId, UpdateBoard,
+    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType,
+    TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -148,12 +148,9 @@ pub(crate) fn update(
     if *slug == cx.s.feedback_board && req.status == Some(BoardStatus::Paused) {
         req.status = None;
     }
-    if req.dispatch == Some(Dispatch::Thread) {
-        return Err(invalid(
-            format!("board {slug} cannot be set to thread dispatch: it was removed"),
-            "every board is dispatched by the device daemon; leave dispatch out",
-        ));
-    }
+    // Thread dispatch was removed: the value is dropped, not refused, so an older client's
+    // update still applies its other fields.
+    req.dispatch = None;
     if req.temporary == Some(true) && !before.temporary && !by_user {
         return Err(forbidden(
             format!("only the user may make board {slug} temporary"),
@@ -369,7 +366,7 @@ pub(crate) fn delete(cx: &mut Ctx<'_>, actor: &str, slug: &BoardSlug) -> Result<
 }
 
 /// Resumes the feedback board when it is paused, a state left from servers that allowed it,
-/// as the server, so the daemon wakes its coordinator. Returns whether it did.
+/// as the server, so the daemon dispatches it again. Returns whether it did.
 pub(crate) fn resume_feedback_board(cx: &mut Ctx<'_>) -> Result<bool> {
     let slug = cx.s.feedback_board.clone();
     if !cx.exists(

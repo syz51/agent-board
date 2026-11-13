@@ -246,12 +246,13 @@ server's minute sweep deletes older ones.
   `board boards` shows ` · new work stops at N% usage` when it is not 90.
   `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
   the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
-  sets it on every new board and refuses an update to `thread` (400 `invalid`), the
-  coordinator-thread dispatch that was removed; an update to `daemon` changes nothing.
+  sets it on every new board and drops `dispatch` from an update: `thread`, the
+  coordinator-thread dispatch that was removed, is ignored, so an older client's update
+  still applies its other fields.
   No client reads it, and no command sets or shows it. A `Board` from a server that
   predates the field reads as `thread`, and a daemon dispatches that board all the same.
   An update that changes `status` adds the new one to the `board_updated` payload
-  (`{"fields": ["status"], "status": "paused"}`); the daemon wakes the coordinator when it
+  (`{"fields": ["status"], "status": "paused"}`); the daemon dispatches the board again when it
   reads `active` (see `DESIGN.md`, "Pausing work"). The server's feedback board
   (`defaults.feedback_board`) is never paused: the server drops `status: paused` for it,
   for the user too, applies the rest of the update and answers `200` with the board
@@ -434,8 +435,8 @@ Reopening a closed board, or any change on it, starts the period again.
   neither done nor dropped, an agent with an unfinished task anywhere above it, other than
   its creator, sees it in its snapshot alerts (`<agent> filed <ids> under your task <id>`).
   - `claim: true` creates the task in `doing` owned by `agent`, in the same transaction, so
-    it is never `ready` and no coordinator is woken for it: an agent that files work it
-    starts at once no longer races the coordinator for it. It is checked as a claim is,
+    it is never `ready` and the dispatcher starts no worker for it: an agent that files work it
+    starts at once no longer races the dispatcher for it. It is checked as a claim is,
     before anything is written: 409 `claim_refused` at the caller's `doing` limit (the
     error names the task in `doing` and says to move it to `review` or `blocked` first), and
     400 `invalid_transition` while a blocker is not done (a blocker in `review` excepted as
@@ -490,7 +491,7 @@ Reopening a closed board, or any change on it, starts the period again.
 - Within a minute of an open task's `not_before` passing, the server records one
   `task_updated` event by actor `server` with payload `{"fields": [], "not_before_passed":
   <time>}`; the task itself is unchanged (same `version`, `not_before` kept). The daemon
-  wakes the coordinator if the task is then ready. Setting a new `not_before` announces it
+  dispatches the task if it is then ready. Setting a new `not_before` announces it
   again once that passes. `not_before` is absent from a `Task` without one.
 - Within a minute of a task in `review` passing `review_quiet_secs` with no note from its
   owner, the server records one `task_updated` event by actor `server` with payload
@@ -972,8 +973,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   the later of the line's time and the latest pause, and `held_for_usage` is `true` (left
   out otherwise, and by servers that predate it). A board that stopped running the
   agent as its coordinator thread, while boards had such threads (autopilot off, closed,
-  daemon dispatch, its device no longer a home device, or another thread named), holds that agent alone, until a
-  coordinator claim names it again: the board is in `held_by` and in `stood_down`
+  daemon dispatch, its device no longer a home device, or another thread named), holds that agent alone, for as long as the board
+  exists: the board is in `held_by` and in `stood_down`
   (`[{"board", "reason"}]`, left out when empty and by servers that predate it), and
   `held_since` is the latest of the stand-down's time and the other holds. Its line reads
   `hold: factory stood down: autopilot was switched off -> this thread no longer

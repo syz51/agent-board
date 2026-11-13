@@ -817,8 +817,8 @@ one task and one section of the prompt, not the days before it.
   needs is on the board.
 
 **The `dispatch` field**: a board still carries `dispatch`, and it is always `daemon`:
-the server sets it on new boards, migration 0027 moved every board to it, and a change to
-`thread` is refused. Nothing reads it; it stays in `/v1` so older clients parse a board.
+the server sets it on new boards, migration 0027 moved every board to it, and an update's
+`dispatch` is dropped. Nothing reads it; it stays in `/v1` so older clients parse a board.
 To bring thread dispatch back, restore the coordinator-thread path from commit `7f673d2`.
 
 **Routing** (event, then what handles it):

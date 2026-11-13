@@ -1675,7 +1675,7 @@ impl Hook<'_> {
         let snap = if self.runtime == Runtime::Claude && is_pull_request_update(self.input) {
             // A held thread's pull request watch wakes it at every check or review change,
             // for as long as the pause lasts. Such a turn ends before the model runs, and
-            // the watch stays; the resume wake-up has the coordinator check the PRs. The
+            // the watch stays; the dispatcher checks the PRs after the resume. The
             // snapshot comes first, so an ended turn changes no state: the agent stays idle
             // (or paused for a usage limit), and its sequence stays, so the next snapshot
             // brings again the alerts this one had. Codex is not ended here, since it may

@@ -418,8 +418,7 @@ enum Paid {
 /// [`SEND_CHECK_AFTER`] after its send, and holds the agent's next lines until then, so
 /// they go out with what is owed again. Found, a message is settled; missing while no run
 /// of the thread may still take it, what it carried is owed again, once: its wake-ups are
-/// queued again (see [`Wake::resent`]), its re-briefs are owed, and its fresh-session
-/// notices are due.
+/// queued again (see [`Wake::resent`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UnsureWakes {
     #[serde(default)]
@@ -930,8 +929,8 @@ fn arrival_in(
 /// How a wake-up send went.
 enum Sent {
     Delivered,
-    /// It ran out of time: T3 may have delivered it, so its wake-up lines and a re-brief it
-    /// carried are sent again only when a later check finds the thread lacks it.
+    /// It ran out of time: T3 may have delivered it, so its wake-up lines
+    /// are sent again only when a later check finds the thread lacks it.
     MaybeDelivered(anyhow::Error),
     /// T3 no longer has the thread, it is archived, or its worktree is gone.
     Gone(anyhow::Error),
@@ -2676,7 +2675,6 @@ impl<T: T3> Daemon<T> {
                 queue
                     .wakes
                     .retain(|w| !matches!(&w.about, WakeAbout::Idle { away, .. } if away == agent));
-                self.forward(agent, &mut queue.wakes, false, now);
                 self.requeue(agent.clone(), queue);
                 return None;
             }

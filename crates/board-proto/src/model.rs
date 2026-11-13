@@ -30,7 +30,7 @@ pub struct Board {
     /// Repo keys this board covers (normalized origin URLs such as
     /// `github.com/syz51/agent-board`).
     pub repos: Vec<String>,
-    /// When on, a coordinator thread works off the ready queue without the user.
+    /// When on, a device daemon works off the ready queue without the user.
     pub autopilot: bool,
     /// How many tasks the board's coordinator and its child threads may have in progress
     /// at once, 1 to [`PARALLEL_TASKS_MAX`]. Absent from servers that predate it, so it
@@ -416,7 +416,7 @@ pub struct Task {
     pub proposal: bool,
     /// The task is not ready, and cannot be claimed, before this time. Once it passes, the
     /// server announces it with a `task_updated` event (actor `server`, no field changes),
-    /// which wakes the coordinator; the field itself stays.
+    /// which has the daemon dispatch it; the field itself stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<Timestamp>,
     /// May the coordinator start this task without the user? Defaults to true on autopilot
