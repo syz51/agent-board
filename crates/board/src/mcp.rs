@@ -400,7 +400,7 @@ const TOOLS: &[ToolSpec] = &[
                     "blocked_reason",
                     s(
                         &format!(
-                            "Why it is blocked; at most {} characters.",
+                            "Why it is blocked; at most {} characters. Only for status=blocked or a blocked task; omit it otherwise (a drop's reason goes in reason).",
                             limits().note_chars
                         ),
                         limits().note_chars,
@@ -1417,7 +1417,7 @@ mod tests {
         let instructions = INSTRUCTIONS.chars().count();
         assert!(instructions < 1_440, "instructions: {instructions}");
         let schemas = serde_json::to_string(&tools).unwrap().chars().count();
-        assert!(schemas < 16_850, "tool list: {schemas}");
+        assert!(schemas < 16_950, "tool list: {schemas}");
         // `kind` is a parameter, which every reader shows: no text asks to repeat it.
         for tool in &tools {
             let text = tool.description.as_deref().unwrap_or_default();
@@ -1746,6 +1746,17 @@ mod tests {
         );
         let update = by_name("task_update");
         assert_eq!(update.input_schema["properties"]["title"]["maxLength"], 80);
+        // Agents sent a blocked reason with other statuses and were refused: the field says
+        // when to leave it out, and where a drop's reason goes.
+        assert!(
+            update.input_schema["properties"]["blocked_reason"]["description"]
+                .as_str()
+                .unwrap()
+                .contains(
+                    "Only for status=blocked or a blocked task; omit it otherwise (a drop's \
+                     reason goes in reason)."
+                )
+        );
         let done = by_name("task_done");
         assert_eq!(done.input_schema["properties"]["summary"]["maxLength"], 800);
     }

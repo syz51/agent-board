@@ -2185,6 +2185,16 @@ fn help_states_text_limits_and_enum_values() {
         update.contains("Aim for about 60 characters. At most 80 characters"),
         "{update}"
     );
+    // Agents sent a blocked reason with other statuses and were refused: the help says when
+    // to leave it out.
+    let words = update.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains(
+            "Why it is blocked, only with --status blocked or on a blocked task (leave it out \
+             otherwise), or with --status dropped why it is dropped"
+        ),
+        "{update}"
+    );
     let note = help(&["note", "--help"]);
     assert!(note.contains("At most 800 characters"), "{note}");
     assert!(
