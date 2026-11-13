@@ -468,6 +468,26 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         stub.requests_to("POST /v1/tasks/factory-12/done")[1].body["take"],
         true
     );
+    // With no evidence, the refusal names the MCP arguments, not the CLI's flags, and
+    // nothing is sent.
+    let refused = mcp.call(
+        10,
+        "task_done",
+        json!({"id": "factory-12", "summary": "Merged in PR #4, commit 4e1c2ab."}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let message = text(&refused);
+    for arg in [
+        "checks [{\"command\"",
+        "\"exit_code\"",
+        "commits [",
+        "prs [",
+        "artifacts [",
+    ] {
+        assert!(message.contains(arg), "{arg}: {message}");
+    }
+    assert!(!message.contains("--check"), "{message}");
+    assert_eq!(stub.requests_to("POST /v1/tasks/factory-12/done").len(), 2);
 
     // task_list proposals=true asks for proposals, and keeps only them from a server that
     // predates the filter.
@@ -858,8 +878,11 @@ fn an_unknown_argument_is_refused_before_anything_is_sent() {
             .collect();
         listed.sort();
         assert_eq!(listed, declared, "{message}");
+        // task_done's refusal adds its evidence shape after the call to action.
+        let ending = format!("Call {name} again with only those arguments.");
         assert!(
-            message.ends_with(&format!("Call {name} again with only those arguments.")),
+            message.ends_with(&ending)
+                || (name == "task_done" && message.contains(&format!("{ending} Its evidence is"))),
             "{message}"
         );
     }

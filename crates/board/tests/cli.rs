@@ -382,7 +382,11 @@ fn done_reads_the_version_and_sends_paired_evidence() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("pair every --check"));
     let out = e.run(&["done", "factory-12"]);
-    assert!(stderr(&out).contains("done needs evidence"));
+    assert!(
+        stderr(&out).contains(
+            "done needs evidence: a check with its exit code (--check <cmd> --exit <code>)"
+        )
+    );
     assert!(
         e.stub
             .requests()
@@ -1653,6 +1657,16 @@ fn help_states_text_limits_and_enum_values() {
     let update = help(&["update", "--help"]);
     assert!(
         update.contains("Aim for about 60 characters. At most 80 characters"),
+        "{update}"
+    );
+    // Agents sent a blocked reason with other statuses and were refused: the help says when
+    // to leave it out.
+    let words = update.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains(
+            "Why it is blocked, only with --status blocked or on a blocked task (leave it out \
+             otherwise), or with --status dropped why it is dropped"
+        ),
         "{update}"
     );
     let note = help(&["note", "--help"]);

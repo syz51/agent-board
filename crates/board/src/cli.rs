@@ -687,7 +687,8 @@ pub struct UpdateArgs {
     // With `--status dropped`, why it is dropped, kept as a decision note (required to drop
     // a task whose owner has left, on a board nobody runs); otherwise why it is blocked.
     #[arg(long, help = at_most(
-        "Why it is blocked, or with --status dropped why it is dropped",
+        "Why it is blocked, only with --status blocked or on a blocked task (leave it out \
+         otherwise), or with --status dropped why it is dropped",
         limits().note_chars,
     ))]
     reason: Option<String>,
