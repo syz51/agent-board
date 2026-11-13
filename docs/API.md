@@ -537,7 +537,12 @@ Reopening a closed board, or any change on it, starts the period again.
 - `POST /v1/tasks/{id}/claim` `[TaskAction]` → `[Task]` with status `doing` and the caller
   as owner. Refused with 409 `claim_refused` when a live agent owns it or the caller is at
   its `doing` limit, and with 400 `invalid_transition` while a blocker is not done or its
-  `not_before` has not passed. A pending proposal is refused the same way, with 400
+  `not_before` has not passed. A blocker in `review` that is an ancestor of the task (its
+  parent or above) or that the caller owns does not hold the claim: the task's work went
+  out in that blocker's PR, so its agent claims it, moves it to `review` and notes the PR.
+  The task stays out of `ready` all the same, and the refusal's `next` names this rule.
+  The same holds for a take, a resume, a move to `doing` and a task created with `claim`.
+  A pending proposal is refused the same way, with 400
   `invalid_transition`, until a verdict sets it `auto`. A claim
   is one conditional update in one transaction; exactly one of any concurrent claims wins.
   A task in `review` or `blocked`:
@@ -625,7 +630,8 @@ Moving it to `doing` makes the caller the owner, within the caller's `doing` lim
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
 `owner` and `previous_owner`. Like a claim, a move to `doing` (from `blocked` or
 `review`) is refused with 400 `invalid_transition` while a blocker is not done or
-`not_before` has not passed, before the `doing` limit is checked. The check reads the task
+`not_before` has not passed (a blocker in `review` excepted as for a claim, for the owner
+the request leaves), before the `doing` limit is checked. The check reads the task
 as the request leaves it, so the same request may drop those blockers (`blockers`) or clear
 `not_before` (`null`); the message names every wait and `next` what to drop. A `blocked`
 task nobody owns is refused a move to `review` with 400 `invalid_transition` (`next` says
@@ -683,7 +689,8 @@ otherwise). A blank one (empty or only whitespace) counts as absent, with any st
 leaves a stored reason as it is, so `blocked` with a blank reason still needs a stored
 reason or a blocker that is not done. Every move out of `blocked` clears the reason.
 Blockers must exist and must not form a cycle; they may be on any board. A task is not
-`ready`, and cannot be claimed, until every blocker is done, wherever it is.
+`ready`, and cannot be claimed, until every blocker is done, wherever it is, except as
+the claim above says for a blocker in `review` that is its ancestor or the caller's.
 `GET /v1/tasks/{id}` lists the tasks waiting on it in `blocks`, from every board, and a
 blocker's `task_done` event,
 on its own board's feed, wakes the waiting task's board coordinator and the owner of a

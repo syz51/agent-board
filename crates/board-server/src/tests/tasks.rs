@@ -689,6 +689,121 @@ async fn claims_follow_ownership_blockers_and_the_doing_limit() {
 }
 
 #[tokio::test]
+async fn a_task_done_in_its_blockers_pr_is_claimed_while_the_blocker_is_in_review() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
+    let review = |title: &'static str| {
+        let t = &t;
+        async move {
+            let id = t.task(A, "factory", title).await;
+            assert!(t.claim(A, &id).await.0.is_success());
+            let (s, v) = t.patch(A, &id, json!({ "status": "review" })).await;
+            assert!(s.is_success(), "{v}");
+            id
+        }
+    };
+    let waiting_on = |blocker: &str, parent: Option<&str>| {
+        let t = &t;
+        let mut body = json!({ "board": "factory", "title": "Folded in", "blockers": [blocker] });
+        if let Some(parent) = parent {
+            body["parent"] = json!(parent);
+        }
+        async move { t.task_with(A, body).await }
+    };
+
+    // A grandchild waiting on its grandparent in review, A's: another agent may claim it
+    // and move it to review alongside, yet it is not ready, so no coordinator starts it.
+    let parent = review("Parent").await;
+    let child = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Child", "parent": parent }),
+        )
+        .await;
+    let grandchild = waiting_on(&parent, Some(&child)).await;
+    assert_eq!(t.get_task(&grandchild).await["ready"], false);
+    let (s, v) = t.claim(B, &grandchild).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(B))
+    );
+    let (s, v) = t.patch(B, &grandchild, json!({ "status": "review" })).await;
+    assert!(s.is_success(), "{v}");
+    // Its claim resumes it from review too.
+    let (s, v) = t.claim(B, &grandchild).await;
+    assert_eq!(
+        (s.is_success(), v["status"].as_str()),
+        (true, Some("doing")),
+        "{v}"
+    );
+
+    // A blocker in review that the claiming agent owns, with no parent link.
+    let own = review("Own").await;
+    let follows = waiting_on(&own, None).await;
+    let (s, v) = t.claim(A, &follows).await;
+    assert!(s.is_success(), "{v}");
+
+    // The same blocker refuses another agent, naming it and the rule.
+    let other = waiting_on(&own, None).await;
+    let (s, v) = t.claim(B, &other).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains(&own), "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains("a blocker in review that is an ancestor of the task or yours"),
+        "{v}"
+    );
+    // So does an ancestor that is not in review yet.
+    let busy = t.task(A, "factory", "Busy parent").await;
+    assert!(t.claim(A, &busy).await.0.is_success());
+    let early = waiting_on(&busy, Some(&busy)).await;
+    let (s, v) = t.claim(B, &early).await;
+    assert_eq!(s.as_u16(), 400, "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&busy), "{v}");
+    // And a task created claimed checks the same way.
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(
+                json!({ "agent": A, "board": "factory", "title": "Filed and folded",
+                         "parent": parent, "blockers": [parent], "claim": true }),
+            ),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["status"], "doing");
+
+    // A take of an open task with a stale owner follows the same rule.
+    let taken = waiting_on(&parent, Some(&parent)).await;
+    t.exec(&format!(
+        "UPDATE tasks SET owner = '{A}' WHERE id = '{taken}'"
+    ));
+    t.advance(stale_after() + TimeDelta::hours(1));
+    t.register(B, Some(REPO), None).await;
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{taken}/take"),
+            Some(B),
+            Some(json!({ "agent": B })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("doing"), Some(B))
+    );
+}
+
+#[tokio::test]
 async fn claim_resumes_a_parked_task_that_is_the_callers_or_nobodys() {
     let t = setup_with(|c| c.defaults.max_doing_per_agent = 10).await;
 
