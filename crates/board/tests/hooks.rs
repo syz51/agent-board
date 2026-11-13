@@ -29,6 +29,8 @@ struct Env {
     stub: Stub,
     home: PathBuf,
     repo: PathBuf,
+    /// Each hook this test ran: its exit, output and debug log, for failure messages.
+    ran: std::cell::RefCell<Vec<String>>,
 }
 
 fn env() -> Env {
@@ -41,6 +43,7 @@ fn env() -> Env {
         stub,
         home,
         repo,
+        ran: Default::default(),
     }
 }
 
@@ -73,20 +76,78 @@ impl Env {
         payload: Value,
         env: &[(&str, &str)],
     ) -> std::process::Output {
+        // At debug level each hook logs its steps' times and why it gave up on one; a
+        // background read it starts inherits the level. A test's own env comes after.
+        let mut defaults = vec![("BOARD_LOG", "board=debug"), ("NO_COLOR", "1")];
+        if env.iter().any(|(k, _)| *k == "T3CODE_THREAD_ID") {
+            defaults.push(T3_SHARE);
+        }
+        let env = [defaults.as_slice(), env].concat();
         let out = board(
             &self.home,
             &self.repo,
-            env,
+            &env,
             &["hook", event, "--runtime", runtime],
             &payload.to_string(),
         );
+        let ran = format!(
+            "{event}: {}, stdout {:?}\n{}",
+            out.status,
+            stdout(&out),
+            stderr(&out).trim_end()
+        );
+        self.ran.borrow_mut().push(ran);
         assert_eq!(
             out.status.code(),
             Some(0),
             "hooks always exit 0: {}",
-            stderr(&out)
+            self.ran()
         );
         out
+    }
+
+    /// What the last few hooks of this test did, for a failure message: each one's exit,
+    /// output and debug log.
+    fn ran(&self) -> String {
+        let ran = self.ran.borrow();
+        let from = ran.len().saturating_sub(4);
+        format!("the last hooks, oldest first:\n{}", ran[from..].join("\n"))
+    }
+
+    /// The bodies of the hooks' registrations (`POST /v1/agents`) the stub took.
+    fn registered(&self) -> Vec<Value> {
+        self.stub
+            .requests_to("POST /v1/agents")
+            .into_iter()
+            .map(|r| r.body)
+            .collect()
+    }
+
+    /// The first request the stub took, or a failure that shows what the hooks did.
+    fn first_sent(&self) -> Recorded {
+        let first = self.stub.requests().into_iter().next();
+        first.unwrap_or_else(|| panic!("no hook sent the server anything\n{}", self.ran()))
+    }
+
+    /// The first registration, or a failure that shows what the hooks did.
+    fn first_registered(&self) -> Value {
+        let first = self.registered().into_iter().next();
+        first.unwrap_or_else(|| panic!("no hook registered the agent\n{}", self.ran()))
+    }
+
+    /// The last registration, or a failure that shows what the hooks did.
+    fn last_registered(&self) -> Value {
+        self.registered()
+            .pop()
+            .unwrap_or_else(|| panic!("no hook registered the agent\n{}", self.ran()))
+    }
+
+    /// The context in a hook's reply, or a failure that shows what the hooks did.
+    fn context(&self, reply: &Option<Value>, event: &str) -> String {
+        if reply.is_none() {
+            panic!("the hook replied with no JSON\n{}", self.ran());
+        }
+        context(reply, event)
     }
 
     fn base(&self, event: &str) -> Value {
@@ -2297,7 +2358,8 @@ fn breaker(e: &Env) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Runs a hook and returns its reply and how long it took.
+/// Runs a hook and returns its reply and how long it took by its own clock, which the
+/// budget limits: the process's start and exit, which a busy machine slows, are outside it.
 fn timed(e: &Env, event: &str, payload: &Value) -> (Option<Value>, Duration) {
     timed_env(e, event, payload, &[])
 }
@@ -2308,9 +2370,14 @@ fn timed_env(
     payload: &Value,
     env: &[(&str, &str)],
 ) -> (Option<Value>, Duration) {
-    let began = Instant::now();
-    let (reply, _) = e.hook_env(event, "claude", payload.clone(), env);
-    (reply, began.elapsed())
+    let out = e.hook_output(event, "claude", payload.clone(), env);
+    let log = stderr(&out);
+    let ms = log
+        .lines()
+        .find_map(|line| line.split_once(": answered in ")?.1.strip_suffix("ms"))
+        .unwrap_or_else(|| panic!("the hook logged no answer time\n{}", e.ran()));
+    let reply = serde_json::from_str(&stdout(&out)).ok();
+    (reply, Duration::from_millis(ms.parse().unwrap()))
 }
 
 // Debug builds of the hook give the server exactly the share in `SHARE_ENV`, from just
@@ -2319,6 +2386,11 @@ fn timed_env(
 use board::hook::SHARE_ENV;
 /// A fair share: enough to judge the server.
 const FAIR_SHARE: [(&str, &str); 1] = [(SHARE_ENV, "1000")];
+/// The share of a T3 thread's hooks. Before its server share, a T3 hook reads the process
+/// table and waits for T3 up to 0.4 seconds; on a busy Mac those steps took the whole real
+/// budget, so the hook registered nothing. With a share set, debug builds
+/// give the local steps a limit no machine's load reaches.
+const T3_SHARE: (&str, &str) = (SHARE_ENV, "1500");
 /// What a hook whose local steps took most of the budget leaves the server: too little to
 /// judge it.
 const SHORT_SHARE: [(&str, &str); 1] = [(SHARE_ENV, "300")];
@@ -2387,6 +2459,21 @@ fn a_slow_server_falls_back_to_the_cache_and_is_tried_again() {
     assert_eq!(breaker(&e), json!({}));
 }
 
+/// The hook's 1.5 s budget on a machine too busy to wake its timers on time: at load
+/// average 72 on 8 cores, a hook whose connect gave up at its 0.5 s limit answered after
+/// 1.79 s by its own clock. Still far below the stub's 10 s hang, so a hook
+/// within it ended its wait on its own deadline; unit tests in `hook.rs` pin the deadlines.
+const BUDGET_WHEN_BUSY: Duration = Duration::from_secs(5);
+
+/// Fails unless a hook that took `elapsed` by its own clock gave up on the server in time.
+fn gave_up_in_time(e: &Env, elapsed: Duration) {
+    assert!(
+        elapsed < BUDGET_WHEN_BUSY,
+        "took {elapsed:?}, past the hook's budget\n{}",
+        e.ran()
+    );
+}
+
 /// A hook that answers within its budget with the real share, whether the server is slow or
 /// its connect hangs.
 #[test]
@@ -2394,7 +2481,7 @@ fn a_slow_server_or_a_hung_connect_costs_a_hook_no_more_than_its_budget() {
     let (e, start) = cached_env();
     e.stub.hang(Duration::from_secs(10));
     let (reply, elapsed) = timed(&e, "session-start", &start);
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    gave_up_in_time(&e, elapsed);
     // On a very slow runner the hook's own guard may answer first, with nothing.
     if reply.is_some() {
         assert!(context(&reply, "SessionStart").starts_with("board server slow"));
@@ -2402,7 +2489,7 @@ fn a_slow_server_or_a_hung_connect_costs_a_hook_no_more_than_its_budget() {
 
     let _listener = hang_connects(&e);
     let (reply, elapsed) = timed(&e, "session-start", &start);
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    gave_up_in_time(&e, elapsed);
     if reply.is_some() {
         let text = context(&reply, "SessionStart");
         assert!(text.starts_with("board server "), "{text}");
@@ -2459,7 +2546,7 @@ fn an_unreachable_server_falls_back_to_the_cache_and_backs_off_a_minute() {
     let (e, start) = cached_env();
     refuse_connects(&e);
     let (reply, elapsed) = timed(&e, "session-start", &start);
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    gave_up_in_time(&e, elapsed);
     let text = context(&reply, "SessionStart");
     assert!(
         text.starts_with("board server unreachable: cached snapshot from ")
@@ -2597,7 +2684,7 @@ fn t3_thread_id_wins_over_the_hook_session() {
         e.base("SessionEnd"),
         &[("T3CODE_THREAD_ID", "thread-7")],
     );
-    assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(t3));
+    assert_eq!(e.first_sent().agent.as_deref(), Some(t3), "{}", e.ran());
 }
 
 /// A slow `t3`, so every answer comes from a background read and no step depends on how
@@ -2625,26 +2712,21 @@ fn a_delegated_t3_thread_registers_its_parent() {
             "GET /v1/snapshot",
             snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
         );
-        // At debug level the hook logs why it has no parent: T3 over budget, a background
-        // read that did not start, or T3's error; the background read inherits the level.
-        let out = e.hook_output(
+        // The hook's debug log says why it has no parent: T3 over budget, a background
+        // read that did not start, or T3's error.
+        e.hook_env(
             "session-start",
             "claude",
             e.with("SessionStart", json!({"source": "startup"})),
-            &[
-                ("T3CODE_THREAD_ID", thread),
-                ("T3CODE_CLI_PATH", &t3),
-                ("BOARD_LOG", "board=debug"),
-                ("NO_COLOR", "1"),
-            ],
+            &[("T3CODE_THREAD_ID", thread), ("T3CODE_CLI_PATH", &t3)],
         );
-        let register = e.stub.requests_to("POST /v1/agents").pop().unwrap().body;
-        assert_eq!(register["id"], agent);
+        let register = e.last_registered();
+        assert_eq!(register["id"], agent, "{}", e.ran());
         assert_eq!(register["native_ids"]["t3_thread"], thread);
         let parent = register["native_ids"]["t3_parent"]
             .as_str()
             .map(str::to_owned);
-        (parent, stderr(&out))
+        (parent, e.ran())
     };
     let calls = || {
         std::fs::read_to_string(&log)
@@ -2722,7 +2804,7 @@ fn only_a_delegated_t3_threads_session_start_names_the_pr_route() {
         }
         let payload = e.with("SessionStart", json!({"source": "startup"}));
         let (reply, _) = e.hook_env("session-start", runtime, payload, &env);
-        context(&reply, "SessionStart")
+        e.context(&reply, "SessionStart")
     };
     let delegated = format!("{SNAPSHOT}\n{ROUTE}\n{TOOL_SEARCH}");
 
@@ -2744,11 +2826,8 @@ fn only_a_delegated_t3_threads_session_start_names_the_pr_route() {
         );
         let out = nested_hook(&e, CHILD, "session-start", &e.base("SessionStart"));
         let reply = serde_json::from_str(&out).ok();
-        assert_eq!(context(&reply, "SessionStart"), started());
-        assert_eq!(
-            e.stub.requests_to("POST /v1/agents")[0].body["id"],
-            CLAUDE_AGENT
-        );
+        assert_eq!(e.context(&reply, "SessionStart"), started());
+        assert_eq!(e.first_registered()["id"], CLAUDE_AGENT);
     }
 
     // Offline, the delegated thread's cached snapshot names the route too.
@@ -2822,9 +2901,9 @@ impl SessionFiles {
         std::fs::write(&self.read, read.to_string()).unwrap();
     }
 
-    /// Waits, bounded, for the background read a hook started to leave its answer.
-    fn read_done(&self) {
-        self.read_done_after("not kept");
+    /// Waits, bounded, for the background read a hook of `e` started to leave its answer.
+    fn read_done(&self, e: &Env) {
+        self.read_done_after(&e.ran());
     }
 
     /// [`Self::read_done`] after a hook that logged `hook`. A read that never answers fails
@@ -2894,29 +2973,22 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
         );
         e.hook_env("stop", "claude", payload, &t3_env);
     };
-    let registered = || {
-        e.stub
-            .requests_to("POST /v1/agents")
-            .into_iter()
-            .map(|r| r.body)
-            .collect::<Vec<_>>()
-    };
 
     // SessionStart does not wait for a slow T3: it registers the thread without its title
     // or link and leaves them to a background read.
     titled("New thread");
     start("startup");
-    let first = registered().pop().unwrap();
+    let first = e.last_registered();
     assert_eq!(first["native_ids"]["t3_thread"], "thread-7");
     assert!(first["title"].is_null(), "{first}");
     assert!(first["native_ids"].get("t3_link").is_none(), "{first}");
 
     // The next hook registers what the read found, and drops it.
-    files.read_done();
+    files.read_done(&e);
     assert_eq!(answered(), 1);
     e.stub.clear();
     prompt();
-    let read = registered().pop().unwrap();
+    let read = e.last_registered();
     assert_eq!(read["title"], "New thread");
     assert_eq!(read["native_ids"]["t3_link"], LINK);
     assert_eq!(read["repo"], first["repo"]);
@@ -2929,16 +3001,16 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     let started = files.cached()["thread_read_at"].clone();
     e.stub.clear();
     stop();
-    assert!(registered().is_empty());
+    assert!(e.registered().is_empty());
     assert!(files.cached()["title_checked_at"].is_null());
     assert_eq!(files.cached()["thread_read_at"], started);
 
     // Once that read is done with, the next Stop starts a new one and counts the check.
     files.backdate("thread_read_at");
     stop();
-    assert!(registered().is_empty());
+    assert!(e.registered().is_empty());
     assert!(!files.cached()["title_checked_at"].is_null());
-    files.read_done();
+    files.read_done(&e);
     assert_eq!(answered(), 2);
 
     // The next Stop marks the agent idle with its message first, then registers the new
@@ -2968,7 +3040,7 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
         routes(),
         [state.clone(), "POST /v1/agents".to_owned(), state.clone()]
     );
-    let again = registered().pop().unwrap();
+    let again = e.last_registered();
     assert_eq!(again["title"], "Fix the parser");
     assert_eq!(again["native_ids"]["t3_link"], LINK);
     assert_eq!(again["repo"], first["repo"]);
@@ -2985,7 +3057,7 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     let started = files.cached()["thread_read_at"].clone();
     e.stub.clear();
     stop();
-    assert!(registered().is_empty());
+    assert!(e.registered().is_empty());
     assert_eq!(files.cached()["thread_read_at"], started);
 
     // An hour later a Stop asks again; an unchanged title sends nothing.
@@ -2993,10 +3065,10 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     files.backdate("title_checked_at");
     stop();
     assert_ne!(files.cached()["thread_read_at"], started, "no read started");
-    files.read_done();
+    files.read_done(&e);
     assert_eq!(answered(), 3);
     stop();
-    assert!(registered().is_empty(), "the title did not change");
+    assert!(e.registered().is_empty(), "the title did not change");
     assert!(!files.read.exists());
 
     // Compaction starts the session again: the cached title, without asking T3.
@@ -3004,7 +3076,7 @@ fn a_t3_thread_registers_its_title_and_link_and_follows_a_rename() {
     files.backdate("thread_read_at");
     let started = files.cached()["thread_read_at"].clone();
     start("compact");
-    assert_eq!(registered().pop().unwrap()["title"], "Fix the parser");
+    assert_eq!(e.last_registered()["title"], "Fix the parser");
     assert_eq!(files.cached()["thread_read_at"], started);
 }
 
@@ -3092,10 +3164,10 @@ impl SlowThread {
 #[test]
 fn background_reads_older_than_the_registered_facts_or_refused_are_dropped() {
     let t = SlowThread::start();
-    t.files.read_done();
+    t.files.read_done(&t.e);
     t.e.stub.clear();
     t.prompt();
-    assert_eq!(t.titles(), ["New thread"]);
+    assert_eq!(t.titles(), ["New thread"], "{}", t.e.ran());
     let facts_at: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(t.files.cached()["t3_facts_at"].clone()).unwrap();
 
@@ -3104,7 +3176,7 @@ fn background_reads_older_than_the_registered_facts_or_refused_are_dropped() {
     t.files.write_read("thread-7", before, "Older title");
     t.e.stub.clear();
     t.prompt();
-    assert!(t.titles().is_empty());
+    assert!(t.titles().is_empty(), "{}", t.e.ran());
     assert!(!t.files.read.exists());
 
     // So is one over an hour old, such as one a session that ended left behind.
@@ -3113,14 +3185,14 @@ fn background_reads_older_than_the_registered_facts_or_refused_are_dropped() {
         .set("t3_facts_at", stale - chrono::Duration::minutes(1));
     t.files.write_read("thread-7", stale, "Stale title");
     t.prompt();
-    assert!(t.titles().is_empty());
+    assert!(t.titles().is_empty(), "{}", t.e.ran());
     assert!(!t.files.read.exists());
 
     // A read of another thread says nothing of this one.
     t.files
         .write_read("thread-8", chrono::Utc::now(), "Another thread");
     t.prompt();
-    assert!(t.titles().is_empty());
+    assert!(t.titles().is_empty(), "{}", t.e.ran());
     assert!(!t.files.read.exists());
 
     // A server that refuses a read as invalid would refuse it again: it is dropped.
@@ -3129,11 +3201,11 @@ fn background_reads_older_than_the_registered_facts_or_refused_are_dropped() {
     t.e.stub
         .once_error("POST /v1/agents", 400, "invalid", "bad native id");
     t.prompt();
-    assert_eq!(t.titles(), ["Refused title"]);
+    assert_eq!(t.titles(), ["Refused title"], "{}", t.e.ran());
     assert!(!t.files.read.exists());
     t.e.stub.clear();
     t.prompt();
-    assert!(t.titles().is_empty());
+    assert!(t.titles().is_empty(), "{}", t.e.ran());
 }
 
 #[cfg(unix)]
@@ -3142,7 +3214,7 @@ fn a_due_title_check_asks_t3_before_an_older_read_counts() {
     // The read SessionStart started finishes during a first turn that uses no tool, and
     // T3 renames the thread meanwhile.
     let t = SlowThread::start();
-    t.files.read_done();
+    t.files.read_done(&t.e);
     t.titled("Fix the parser");
     t.files.backdate("thread_read_at");
 
@@ -3150,15 +3222,15 @@ fn a_due_title_check_asks_t3_before_an_older_read_counts() {
     // the older one meanwhile.
     t.e.stub.clear();
     t.stop();
-    assert_eq!(t.titles(), ["New thread"]);
+    assert_eq!(t.titles(), ["New thread"], "{}", t.e.ran());
     let checked = t.files.cached()["title_checked_at"].clone();
     assert!(!checked.is_null());
 
     // The next Stop registers the new read; the check it already counted stays as it was.
-    t.files.read_done();
+    t.files.read_done(&t.e);
     t.e.stub.clear();
     t.stop();
-    assert_eq!(t.titles(), ["Fix the parser"]);
+    assert_eq!(t.titles(), ["Fix the parser"], "{}", t.e.ran());
     assert_eq!(t.files.cached()["title_checked_at"], checked);
 }
 
@@ -3192,13 +3264,6 @@ fn a_slow_t3_brings_a_delegated_threads_title_link_and_parent_to_a_tool_call() {
         &format!("POST /v1/agents/{}/state", enc(&agent)),
         agent_fixture(&agent, DEVICE, AgentState::Running),
     );
-    let registered = || {
-        e.stub
-            .requests_to("POST /v1/agents")
-            .into_iter()
-            .map(|r| r.body)
-            .collect::<Vec<_>>()
-    };
     let read_tool = || {
         let payload = e.with(
             "PostToolUse",
@@ -3214,15 +3279,15 @@ fn a_slow_t3_brings_a_delegated_threads_title_link_and_parent_to_a_tool_call() {
 
     let payload = e.with("SessionStart", json!({"source": "startup"}));
     e.hook_env("session-start", "claude", payload, &t3_env);
-    let first = registered().pop().unwrap();
+    let first = e.last_registered();
     assert!(first["title"].is_null(), "{first}");
     assert!(first["native_ids"].get("t3_parent").is_none(), "{first}");
 
     // The first tool call after the read registers all three, the agent still running.
-    files.read_done();
+    files.read_done(&e);
     e.stub.clear();
     read_tool();
-    let read = registered().pop().unwrap();
+    let read = e.last_registered();
     assert_eq!(read["title"], "Child work");
     assert_eq!(read["native_ids"]["t3_link"], LINK);
     assert_eq!(read["native_ids"]["t3_parent"], "parent-1");
@@ -3238,7 +3303,7 @@ fn a_slow_t3_brings_a_delegated_threads_title_link_and_parent_to_a_tool_call() {
     // Later tool calls register nothing more, and T3 was asked once to the end.
     e.stub.clear();
     read_tool();
-    assert!(registered().is_empty());
+    assert!(e.registered().is_empty());
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 }
 
@@ -3279,14 +3344,13 @@ fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
         );
         e.hook_env("stop", "claude", payload, &t3_env);
     };
-    let last_registered = || e.stub.requests_to("POST /v1/agents").pop().unwrap().body;
 
     // T3 has neither title nor parent for the thread at SessionStart, and answers too late.
     std::fs::write(&answer, json!({"thread": {"threadId": CHILD}}).to_string()).unwrap();
     start("startup");
-    assert!(last_registered()["native_ids"].get("t3_parent").is_none());
+    assert!(e.last_registered()["native_ids"].get("t3_parent").is_none());
     // Its background read finds nothing new, which the next hook drops.
-    files.read_done();
+    files.read_done(&e);
 
     // The first Stop's check starts a read that finds the title, and the parent with it;
     // the next Stop registers both.
@@ -3299,9 +3363,9 @@ fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
     e.stub.clear();
     stop();
     assert!(e.stub.requests_to("POST /v1/agents").is_empty());
-    files.read_done();
+    files.read_done(&e);
     stop();
-    let renamed = last_registered();
+    let renamed = e.last_registered();
     assert_eq!(renamed["title"], "Child work");
     assert_eq!(renamed["native_ids"]["t3_parent"], "parent-1");
 
@@ -3312,7 +3376,7 @@ fn a_delegated_thread_t3_missed_at_start_registers_its_parent_with_its_title() {
     e.stub.clear();
     start("compact");
     assert_eq!(files.cached()["thread_read_at"], started);
-    assert_eq!(last_registered()["native_ids"]["t3_parent"], "parent-1");
+    assert_eq!(e.last_registered()["native_ids"]["t3_parent"], "parent-1");
 }
 
 /// Runs a hook two `claude` processes deep, as a `claude -p` started from a T3 thread's
@@ -3340,11 +3404,14 @@ fn nested_hook(e: &Env, thread: &str, event: &str, payload: &Value) -> String {
         .env("BOARD_TOKEN", TOKEN)
         .env("BOARD_KEYCHAIN", "0")
         .env("T3CODE_THREAD_ID", thread)
+        .env(T3_SHARE.0, T3_SHARE.1)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OPENCODE_SESSION_ID")
-        .env_remove("BOARD_LOG")
+        .env("BOARD_LOG", "board=debug")
+        .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     child
@@ -3354,7 +3421,14 @@ fn nested_hook(e: &Env, thread: &str, event: &str, payload: &Value) -> String {
         .write_all(payload.to_string().as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
+    let ran = format!(
+        "{event} (nested): {}, stdout {:?}\n{}",
+        out.status,
+        stdout(&out),
+        stderr(&out).trim_end()
+    );
+    e.ran.borrow_mut().push(ran);
+    assert!(out.status.success(), "{}", e.ran());
     stdout(&out)
 }
 
@@ -3389,30 +3463,30 @@ fn a_session_nested_in_a_t3_thread_keeps_its_own_identity() {
 
     // Nested: the session registers as itself, without the thread it runs inside.
     nested_hook(&e, "thread-7", "session-start", &e.base("SessionStart"));
-    let register = &e.stub.requests_to("POST /v1/agents")[0];
-    assert_eq!(register.body["id"], CLAUDE_AGENT);
-    assert!(register.body["native_ids"].get("t3_thread").is_none());
-    assert_eq!(register.body["native_ids"]["claude_session"], SESSION);
+    let register = e.first_registered();
+    assert_eq!(register["id"], CLAUDE_AGENT);
+    assert!(register["native_ids"].get("t3_thread").is_none());
+    assert_eq!(register["native_ids"]["claude_session"], SESSION);
     let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
     assert_eq!(cached, json!({"nested": true}));
 
     // Later hooks of the session use the cached decision, wherever they run.
     e.stub.clear();
     e.hook_env("stop", "claude", e.base("Stop"), &t3_env);
-    assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(CLAUDE_AGENT));
+    assert_eq!(e.first_sent().agent.as_deref(), Some(CLAUDE_AGENT));
 
     // SessionEnd drops the cache.
     e.stub.clear();
     e.hook_env("session-end", "claude", e.base("SessionEnd"), &t3_env);
-    assert_eq!(e.stub.requests()[0].agent.as_deref(), Some(CLAUDE_AGENT));
+    assert_eq!(e.first_sent().agent.as_deref(), Some(CLAUDE_AGENT));
     assert!(!cache.exists());
 
     // SessionStart decides again: run directly, the session is the T3 thread.
     e.stub.clear();
     e.hook_env("session-start", "claude", e.base("SessionStart"), &t3_env);
-    let register = &e.stub.requests_to("POST /v1/agents")[0];
-    assert_eq!(register.body["id"], t3);
-    assert_eq!(register.body["native_ids"]["t3_thread"], "thread-7");
+    let register = e.first_registered();
+    assert_eq!(register["id"], t3);
+    assert_eq!(register["native_ids"]["t3_thread"], "thread-7");
     let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
     assert_eq!(cached, json!({"nested": false}));
 }

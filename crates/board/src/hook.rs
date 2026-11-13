@@ -87,9 +87,14 @@ const CONNECT_LEAD: Duration = Duration::from_millis(100);
 /// tailnet takes).
 const SERVER_SHARE_FAIR: Duration = Duration::from_millis(500);
 /// Debug builds only: gives the server this many milliseconds from when the hook sets its
-/// share, whatever the local steps took, and lets those steps take up to [`BUDGET`] more.
-/// Tests set the share with it instead of slowing the machine; a release build ignores it.
+/// share, whatever the local steps took, and lets those steps take up to
+/// [`SHARED_LOCAL_LIMIT`] more. Tests set the share with it instead of slowing the machine,
+/// and so no step's time depends on the machine's load; a release build ignores it.
 pub const SHARE_ENV: &str = "BOARD_HOOK_SERVER_SHARE_MS";
+/// With [`SHARE_ENV`], the limit for the hook's work besides the server's share. A test
+/// that sets the share times the server, not the local steps: on a busy Mac a T3 hook's
+/// process table read and its wait for T3 took all of [`BUDGET`].
+const SHARED_LOCAL_LIMIT: Duration = Duration::from_secs(20);
 /// After a failed connection (refused, DNS, TLS), hooks on this device use the cache for
 /// this long instead of trying the server again.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
@@ -180,7 +185,7 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     // A guard around the whole hook; `handle` keeps its own, earlier deadline for the
     // network so it can still fall back to the cache.
     let guard = match share_override() {
-        Some(share) => share + BUDGET,
+        Some(share) => share + SHARED_LOCAL_LIMIT,
         None => BUDGET.saturating_sub(started.elapsed() + MARGIN / 2),
     };
     let reply = match tokio::time::timeout(
@@ -202,6 +207,13 @@ pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str
     if let Some(text) = render_reply(event, runtime, reply) {
         print!("{text}");
     }
+    // What the budget limits: the process's start and exit, which a busy machine slows,
+    // are outside it. Tests time hooks by this line.
+    tracing::debug!(
+        "hook {}: answered in {}ms",
+        event.name(),
+        started.elapsed().as_millis()
+    );
 }
 
 fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<String> {
