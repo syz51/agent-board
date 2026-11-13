@@ -4356,3 +4356,288 @@ async fn after_continues_a_cut_list_in_list_order() {
     let (s, _, v) = t.fail("GET", "/v1/tasks?after=nope", None, None).await;
     assert_eq!(s, 400, "{v}");
 }
+
+/// Five tasks on `factory`: p3, p1, p3, p3, p1, numbered 1 to 5.
+async fn levels(t: &T) -> Vec<String> {
+    let mut ids = Vec::new();
+    for priority in ["p3", "p1", "p3", "p3", "p1"] {
+        ids.push(
+            t.task_with(
+                A,
+                json!({ "board": "factory", "title": "Ordered", "priority": priority }),
+            )
+            .await,
+        );
+    }
+    ids
+}
+
+fn picked(ids: &[String], order: [usize; 5]) -> Vec<String> {
+    order.iter().map(|&i| ids[i].clone()).collect()
+}
+
+async fn rank(t: &T, tasks: &[&String], clear_others: bool) -> Value {
+    t.ok(
+        "POST",
+        "/v1/boards/factory/rank",
+        Some(A),
+        Some(json!({ "agent": A, "tasks": tasks, "clear_others": clear_others })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ranked_tasks_list_first_in_rank_order_inside_their_priority_level() {
+    let t = setup().await;
+    let ids = levels(&t).await;
+    // Without a rank: priority, then number.
+    let plain = listed(&t.ok("GET", "/v1/tasks", None, None).await);
+    assert_eq!(plain, picked(&ids, [1, 4, 0, 2, 3]));
+
+    // One call ranks tasks of two levels; each level counts from 1.
+    let ranked = rank(&t, &[&ids[3], &ids[4], &ids[0]], false).await;
+    let ranks: Vec<_> = ranked["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| {
+            (
+                task["id"].as_str().unwrap().to_owned(),
+                task["rank"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ranks,
+        [
+            (ids[3].clone(), json!(1)),
+            (ids[4].clone(), json!(1)),
+            (ids[0].clone(), json!(2)),
+        ]
+    );
+    // Ranked tasks lead their level in rank order; the unranked follow by number.
+    let order = picked(&ids, [4, 1, 3, 0, 2]);
+    let whole = listed(&t.ok("GET", "/v1/tasks", None, None).await);
+    assert_eq!(whole, order);
+    // The unranked task says nothing of a rank.
+    assert!(t.get_task(&ids[2]).await.get("rank").is_none());
+
+    // A cut list continues in the same order.
+    let mut paged: Vec<String> = Vec::new();
+    loop {
+        let after = paged
+            .last()
+            .map(|id| format!("&after={id}"))
+            .unwrap_or_default();
+        let page = listed(
+            &t.ok("GET", &format!("/v1/tasks?limit=1{after}"), None, None)
+                .await,
+        );
+        if page.is_empty() {
+            break;
+        }
+        paged.extend(page);
+    }
+    assert_eq!(paged, whole);
+
+    // The same order again changes nothing.
+    let version = t.get_task(&ids[0]).await["version"].clone();
+    rank(&t, &[&ids[3], &ids[4], &ids[0]], false).await;
+    assert_eq!(t.get_task(&ids[0]).await["version"], version);
+
+    // A new list leaves the other ranks alone, unless it is told to clear them.
+    rank(&t, &[&ids[2]], false).await;
+    assert_eq!(t.get_task(&ids[2]).await["rank"], 1);
+    assert_eq!(t.get_task(&ids[0]).await["rank"], 2);
+    rank(&t, &[&ids[2]], true).await;
+    for id in [&ids[0], &ids[3], &ids[4]] {
+        assert!(t.get_task(id).await.get("rank").is_none(), "{id}");
+    }
+    let cleared = listed(&t.ok("GET", "/v1/tasks", None, None).await);
+    assert_eq!(cleared, picked(&ids, [1, 4, 2, 0, 3]));
+}
+
+#[tokio::test]
+async fn an_update_sets_and_clears_a_rank_and_a_new_priority_drops_it() {
+    let t = setup().await;
+    let ids = levels(&t).await;
+    let (s, task) = t.patch(A, &ids[3], json!({ "rank": 7 })).await;
+    assert_eq!((s.as_u16(), &task["rank"]), (200, &json!(7)), "{task}");
+    let whole = listed(&t.ok("GET", "/v1/tasks?board=factory", None, None).await);
+    assert_eq!(whole[2], ids[3]);
+
+    // Another field leaves the rank alone.
+    let (_, task) = t.patch(A, &ids[3], json!({ "title": "Renamed" })).await;
+    assert_eq!(task["rank"], 7);
+    // Null clears it.
+    let (_, task) = t.patch(A, &ids[3], json!({ "rank": null })).await;
+    assert!(task.get("rank").is_none(), "{task}");
+
+    // A rank belongs to one priority level: it goes when the level changes, unless the
+    // same request sets one for the new level.
+    t.patch(A, &ids[3], json!({ "rank": 7 })).await;
+    let (_, task) = t.patch(A, &ids[3], json!({ "priority": "p1" })).await;
+    assert!(task.get("rank").is_none(), "{task}");
+    let (_, task) = t
+        .patch(A, &ids[3], json!({ "priority": "p2", "rank": 4 }))
+        .await;
+    assert_eq!(
+        (&task["priority"], &task["rank"]),
+        (&json!("p2"), &json!(4))
+    );
+}
+
+#[tokio::test]
+async fn a_rank_call_refuses_a_task_twice_another_boards_task_and_too_many() {
+    let t = setup().await;
+    t.board("other", &[]).await;
+    let ids = levels(&t).await;
+    let elsewhere = t.task(A, "other", "Elsewhere").await;
+    for tasks in [
+        json!([ids[0], ids[0]]),
+        json!([ids[0], elsewhere]),
+        Value::Array((1..=501).map(|n| json!(format!("factory-{n}"))).collect()),
+    ] {
+        let (s, code, v) = t
+            .fail(
+                "POST",
+                "/v1/boards/factory/rank",
+                Some(A),
+                Some(json!({ "agent": A, "tasks": tasks })),
+            )
+            .await;
+        assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
+    }
+    // A refused call ranks nothing.
+    assert!(t.get_task(&ids[0]).await.get("rank").is_none());
+    // Sixty tasks in one call, the newest first.
+    let mut many = Vec::new();
+    for _ in 0..60 {
+        many.push(t.task(A, "factory", "One of many").await);
+    }
+    many.reverse();
+    let refs: Vec<&String> = many.iter().collect();
+    rank(&t, &refs, false).await;
+    assert_eq!(t.get_task(&many[59]).await["rank"], 60);
+    let p2 = listed(&t.ok("GET", "/v1/tasks?limit=62", None, None).await);
+    assert_eq!(p2[2..], many[..]);
+}
+
+#[tokio::test]
+async fn a_rank_keeps_the_version_and_age_and_alerts_nobody() {
+    let t = setup().await;
+    let ids = levels(&t).await;
+    assert!(t.claim(B, &ids[0]).await.0.is_success());
+    let before = t.get_task(&ids[0]).await;
+    let seq = t.count("SELECT MAX(seq) FROM events");
+    t.advance(TimeDelta::minutes(5));
+
+    // One task alone, then many in one call: neither is a change to the task.
+    let (s, task) = t.patch(A, &ids[0], json!({ "rank": 4 })).await;
+    assert_eq!((s.as_u16(), &task["rank"]), (200, &json!(4)), "{task}");
+    rank(&t, &[&ids[2], &ids[0]], false).await;
+    let after = t.get_task(&ids[0]).await;
+    assert_eq!(after["rank"], 2);
+    assert_eq!(after["version"], before["version"]);
+    assert_eq!(after["updated_at"], before["updated_at"]);
+
+    // Each change is on the trail, with the rank it set.
+    let events = t
+        .ok("GET", &format!("/v1/events?since={seq}"), None, None)
+        .await;
+    let trail: Vec<_> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "task_updated")
+        .map(|e| (e["task"].clone(), e["payload"].clone()))
+        .collect();
+    let set = |rank: u32| json!({ "fields": ["rank"], "rank": rank });
+    assert_eq!(
+        trail,
+        [
+            (json!(ids[0]), set(4)),
+            (json!(ids[2]), set(1)),
+            (json!(ids[0]), set(2)),
+        ]
+    );
+    // The owner hears nothing of it; a change of the task itself still reaches it.
+    let alerts = |since: i64| {
+        let t = &t;
+        async move {
+            let path = format!("/v1/snapshot?agent={B}&kind=alerts&since={since}");
+            let snap = t.ok("GET", &path, Some(B), None).await;
+            snap["text"].as_str().unwrap().to_owned()
+        }
+    };
+    let quiet = alerts(seq).await;
+    assert!(!quiet.contains("changed your task"), "{quiet}");
+    // With another field the request is a change: the version moves and the owner hears.
+    let (_, task) = t
+        .patch(A, &ids[0], json!({ "rank": 9, "title": "Renamed" }))
+        .await;
+    assert_ne!(task["version"], before["version"]);
+    assert_ne!(task["updated_at"], before["updated_at"]);
+    let loud = alerts(seq).await;
+    assert!(loud.contains("changed your task"), "{loud}");
+}
+
+#[tokio::test]
+async fn a_closed_task_holds_no_rank_and_a_rank_call_refuses_it() {
+    let t = setup().await;
+    let ids = levels(&t).await;
+    rank(&t, &[&ids[0], &ids[2], &ids[3]], false).await;
+    // Done and dropped both clear the rank, so a reopened task is placed anew.
+    assert!(t.claim(A, &ids[0]).await.0.is_success());
+    let (s, done) = t
+        .done(A, &ids[0], json!([{ "kind": "artifact", "value": "seen" }]))
+        .await;
+    assert!(s.is_success(), "{done}");
+    assert!(t.get_task(&ids[0]).await.get("rank").is_none());
+    let (s, dropped) = t
+        .patch(
+            A,
+            &ids[2],
+            json!({ "status": "dropped", "reason": "decision: not needed" }),
+        )
+        .await;
+    assert!(s.is_success(), "{dropped}");
+    assert!(dropped.get("rank").is_none(), "{dropped}");
+    let (_, reopened) = t.patch(A, &ids[2], json!({ "status": "open" })).await;
+    assert!(reopened.get("rank").is_none(), "{reopened}");
+
+    // The call names each closed task and ranks nothing.
+    let (s, code, v) = t
+        .fail(
+            "POST",
+            "/v1/boards/factory/rank",
+            Some(A),
+            Some(json!({ "agent": A, "tasks": [ids[2], ids[0], ids[3]] })),
+        )
+        .await;
+    assert_eq!((s, code.as_str()), (400, "invalid"), "{v}");
+    assert!(v.to_string().contains(&ids[0]), "{v}");
+    assert!(t.get_task(&ids[2]).await.get("rank").is_none());
+    assert_eq!(t.get_task(&ids[3]).await["rank"], 3);
+}
+
+#[tokio::test]
+async fn a_cut_search_continues_in_rank_order() {
+    let t = setup().await;
+    let ids = levels(&t).await;
+    rank(&t, &[&ids[3], &ids[0]], false).await;
+    let whole = listed(&t.ok("GET", "/v1/tasks?q=Ordered", None, None).await);
+    assert_eq!(whole, picked(&ids, [1, 4, 3, 0, 2]));
+    let mut paged: Vec<String> = Vec::new();
+    while paged.len() < whole.len() {
+        let after = paged
+            .last()
+            .map(|id| format!("&after={id}"))
+            .unwrap_or_default();
+        let path = format!("/v1/tasks?q=Ordered&limit=2{after}");
+        let page = listed(&t.ok("GET", &path, None, None).await);
+        assert!(!page.is_empty(), "{paged:?}");
+        paged.extend(page);
+    }
+    assert_eq!(paged, whole);
+}

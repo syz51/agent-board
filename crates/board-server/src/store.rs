@@ -70,7 +70,10 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
      t.updated_at, t.not_before, t.summary, \
-     (SELECT a.handle FROM agents a WHERE a.id = t.owner)";
+     (SELECT a.handle FROM agents a WHERE a.id = t.owner), t.rank";
+
+/// List order over alias `t`: priority, then ranked tasks by rank, then the rest by number.
+pub(crate) const LIST_ORDER: &str = "t.priority, t.rank IS NULL, t.rank, t.number, t.board";
 
 fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -85,6 +88,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         acceptance: r.get(5)?,
         status: parse_enum(&r.get::<_, String>(6)?)?,
         priority: parse_enum(&r.get::<_, String>(7)?)?,
+        rank: r.get(18)?,
         blocked_reason: r.get(8)?,
         owner: r
             .get::<_, Option<String>>(9)?
@@ -120,7 +124,7 @@ const SNIPPET_CHARS_MAX: usize = 200;
 /// holds a found word. Words found only in the id or title need none: the line shows them.
 fn found_task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = task_row(r)?;
-    for column in [18, 19] {
+    for column in [19, 20] {
         let text: String = r.get(column)?;
         if text.contains(FOUND_START) {
             let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -168,7 +172,7 @@ pub(crate) const SEARCH_RANK: &str = "(CASE \
 pub(crate) const SEARCH_RANK_ANY: &str = "bm25(task_search, 4.0, 4.0, 2.0, 1.0)";
 
 /// Loads tasks matching `filter` (SQL over alias `t`, may use `:now` and `:cutoff`), in
-/// list order: priority, then id number.
+/// list order ([`LIST_ORDER`]).
 pub(crate) fn load_tasks(cx: &Ctx<'_>, filter: &str, extra: &NamedParams<'_>) -> Result<Vec<Task>> {
     load_tasks_up_to(cx, filter, extra, None)
 }
@@ -182,7 +186,7 @@ pub(crate) fn load_tasks_up_to(
 ) -> Result<Vec<Task>> {
     let sql = format!(
         "SELECT {TASK_COLUMNS} FROM tasks t WHERE {filter} \
-         ORDER BY t.priority, t.number, t.board LIMIT :limit"
+         ORDER BY {LIST_ORDER} LIMIT :limit"
     );
     query_tasks(cx, &sql, filter, extra, limit, task_row)
 }
@@ -204,7 +208,7 @@ pub(crate) fn load_tasks_found(
          JOIN task_search_docs d ON d.doc = task_search.rowid \
          JOIN tasks t ON t.id = d.task \
          WHERE task_search MATCH :match AND {filter} \
-         ORDER BY {rank}, t.priority, t.number, t.board LIMIT :limit"
+         ORDER BY {rank}, {LIST_ORDER} LIMIT :limit"
     );
     query_tasks(cx, &sql, filter, extra, Some(limit), found_task_row)
 }
@@ -707,14 +711,15 @@ pub(crate) fn handoff_files_grace() -> chrono::TimeDelta {
 /// When the agent last made a change its handoff must cover, among those after the
 /// handoff: a claim, release, take or completion of a task, an update of a task that is
 /// or was its own, or a file touch more than [`handoff_files_grace`] after the handoff.
-/// A note, a new task, a lease, an ask or an update of another agent's task adds to the
+/// A note, a new task, a lease, an ask, a new rank or an update of another agent's task adds to the
 /// board and leaves the handoff as true as it was. Without such a change, the handoff's
 /// own time. Reads only the agent's events newer than the handoff.
 fn last_change(cx: &Ctx<'_>, agent: &AgentId, handoff_at: Timestamp) -> Result<Timestamp> {
     let mut stmt = cx.db.prepare_cached(
         "SELECT e.at, e.type, \
-                json_extract(e.payload, '$.previous_owner') = ?1 \
-                OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task AND t.owner = ?1) \
+                json_extract(e.payload, '$.fields') IS NOT '[\"rank\"]' \
+                AND (json_extract(e.payload, '$.previous_owner') = ?1 \
+                     OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task AND t.owner = ?1)) \
          FROM events e WHERE e.actor = ?1 ORDER BY e.seq DESC",
     )?;
     let mut rows = stmt.query([agent.as_str()])?;

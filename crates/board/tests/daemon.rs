@@ -5371,3 +5371,29 @@ async fn a_judge_waits_while_the_device_is_at_its_limit() {
         .unwrap();
     assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
 }
+
+#[tokio::test]
+async fn a_ranked_task_starts_before_the_older_tasks_of_its_priority_level() {
+    use board_proto::Priority::{P1, P2};
+    let mut second = ready_task("factory-6", P2, 3);
+    second.rank = Some(2);
+    let mut first = ready_task("factory-7", P2, 4);
+    first.rank = Some(1);
+    let mut low = ready_task("factory-8", P2, -30);
+    low.rank = None;
+    let tasks = [low, second, first];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    // The rank leads, not the age: the newest task holds rank 1.
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].0, "factory-7 Task factory-7");
+
+    // A rank orders one level only: a higher priority still starts first.
+    let mut ranked = ready_task("factory-6", P2, 3);
+    ranked.rank = Some(1);
+    let tasks = [ranked, ready_task("factory-9", P1, 5)];
+    let mut e = dispatch_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(worker_starts(&e.t3)[0].0, "factory-9 Task factory-9");
+}

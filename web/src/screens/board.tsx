@@ -49,6 +49,21 @@ export interface TaskGroup {
   tasks: Task[];
 }
 
+const taskNumber = (task: Task) => Number(task.id.slice(task.id.lastIndexOf("-") + 1));
+
+/**
+ * The server's list order: priority, then ranked tasks by rank, then the rest by number.
+ * Exported for tests.
+ */
+export function inListOrder(a: Task, b: Task): number {
+  return (
+    a.priority.localeCompare(b.priority) ||
+    Number(a.rank == null) - Number(b.rank == null) ||
+    (a.rank ?? 0) - (b.rank ?? 0) ||
+    taskNumber(a) - taskNumber(b)
+  );
+}
+
 /**
  * Group a board's tasks for display: doing, review, blocked, ready, open tasks still
  * waiting, and done in the last 30 days. Dropped tasks are not shown. The children of the
@@ -75,6 +90,7 @@ export function groupTasks(tasks: Task[], filters: TaskFilters, now: number): Ta
     if (filters.readyOnly && !task.ready) return false;
     return !q || task.title.toLowerCase().includes(q) || task.id.toLowerCase().includes(q);
   });
+  visible.sort(inListOrder);
   const of = (status: Task["status"]) => visible.filter((task) => task.status === status);
   const open = of("open");
   const done = of("done").sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));

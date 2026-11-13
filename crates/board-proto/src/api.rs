@@ -447,6 +447,15 @@ pub struct UpdateTask {
         deserialize_with = "present"
     )]
     pub not_before: Option<Option<Timestamp>>,
+    /// The task's place inside its priority level, lower first. Absent leaves it unchanged,
+    /// except that a changed priority clears it; `null` clears it. A server that predates
+    /// it ignores it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub rank: Option<Option<u32>>,
     /// Hand the task over: the agent that owns it from now on. Absent leaves the owner as
     /// the status change sets it. Sent only when set; a server that predates it ignores it
     /// and answers with the owner unchanged.
@@ -462,12 +471,31 @@ pub struct UpdateTask {
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
 /// absent field stays `None`.
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(d).map(Some)
+}
+
+/// `POST /v1/boards/{slug}/rank`: orders tasks inside their priority levels. The listed
+/// tasks get the ranks 1, 2, 3 and so on in the order sent, counted per priority level, so
+/// one list may hold several levels. A task of the board that is not listed keeps its rank.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankTasks {
+    pub agent: AgentId,
+    /// At most 500 open tasks of the board, each once, first to start first.
+    pub tasks: Vec<TaskId>,
+    /// Clear the rank of every task of the board that is not listed.
+    #[serde(default)]
+    pub clear_others: bool,
+}
+
+/// The answer to [`RankTasks`]: the listed tasks as stored, in the order sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankedTasks {
+    pub tasks: Vec<Task>,
 }
 
 /// `POST /v1/tasks/{id}/done`: at least one evidence item is required.
@@ -895,6 +923,26 @@ mod tests {
         assert!(json.get("not_before").is_none());
         let json = serde_json::to_value(&cleared).unwrap();
         assert_eq!(json["not_before"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn update_task_tells_an_absent_rank_from_null() {
+        let base = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        let absent: UpdateTask = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.rank, None);
+        assert!(serde_json::to_value(&absent).unwrap().get("rank").is_none());
+        let mut cleared = base.clone();
+        cleared["rank"] = serde_json::Value::Null;
+        let cleared: UpdateTask = serde_json::from_value(cleared).unwrap();
+        assert_eq!(cleared.rank, Some(None));
+        assert_eq!(
+            serde_json::to_value(&cleared).unwrap()["rank"],
+            serde_json::Value::Null
+        );
+        let mut set = base;
+        set["rank"] = serde_json::json!(3);
+        let set: UpdateTask = serde_json::from_value(set).unwrap();
+        assert_eq!(set.rank, Some(Some(3)));
     }
 
     /// `owner` is optional and sent only when set, so older peers see the same requests.

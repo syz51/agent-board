@@ -14,6 +14,23 @@ const ids = (filters: Partial<TaskFilters> = {}) =>
   );
 
 describe("groupTasks", () => {
+  test("ranked tasks lead their priority level in rank order, the rest follow by number", () => {
+    const ranks: Record<string, number> = { "factory-21": 1, "factory-16": 2 };
+    const ranked = tasks.map((task) => ({
+      ...task,
+      priority: task.id === "factory-20" ? ("p1" as const) : ("p2" as const),
+      rank: ranks[task.id] ?? null,
+    }));
+    const ready = groupTasks(ranked.toReversed(), none, now).find((group) => group.key === "ready");
+    expect(ready?.tasks.map((task) => task.id)).toEqual([
+      "factory-20",
+      "factory-21",
+      "factory-16",
+      "factory-15",
+      "factory-18",
+    ]);
+  });
+
   test("groups by status, ready apart from waiting, done of the last 30 days only, no dropped", () => {
     expect(ids()).toEqual({
       doing: ["factory-12", "factory-14"],

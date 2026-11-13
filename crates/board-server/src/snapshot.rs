@@ -60,6 +60,7 @@ pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
      OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
+      AND json_extract(payload, '$.fields') IS NOT '[\"rank\"]' \
       AND (task IN (SELECT value FROM json_each(:mine)) \
            OR json_extract(payload, '$.previous_owner') = :me)) \
      OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \
@@ -742,7 +743,7 @@ fn primary_board(cx: &Ctx<'_>, agent: &Agent) -> Result<Option<BoardSlug>> {
         .db
         .query_row(
             "SELECT board FROM tasks WHERE owner = ?1 AND status = 'doing' \
-             ORDER BY priority, number LIMIT 1",
+             ORDER BY priority, rank IS NULL, rank, number LIMIT 1",
             [agent.id.as_str()],
             |r| r.get(0),
         )
@@ -840,7 +841,15 @@ fn fill_full(
         "t.owner = :me AND t.status NOT IN ('done', 'dropped')",
         &vec![(":me", &me)],
     )?;
-    mine.sort_by_key(|t| (status_rank(t.status), t.priority, t.id.number()));
+    mine.sort_by_key(|t| {
+        (
+            status_rank(t.status),
+            t.priority,
+            t.rank.is_none(),
+            t.rank,
+            t.id.number(),
+        )
+    });
     if let Some(you) = &mut model.you {
         you.doing = mine
             .iter()

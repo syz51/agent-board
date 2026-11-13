@@ -2518,3 +2518,41 @@ async fn a_paused_board_holds_its_coordinator_its_threads_and_its_workers() {
         again
     );
 }
+
+#[tokio::test]
+async fn ready_and_mine_follow_the_rank_inside_a_priority_level() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    for title in ["First made", "Second made", "Third made", "Fourth made"] {
+        t.task_with("t3:alpha", json!({ "board": "factory", "title": title }))
+            .await;
+    }
+    // Two of them are mine and blocked.
+    for id in ["factory-3", "factory-4"] {
+        t.claim("t3:alpha", id).await;
+        t.patch(
+            "t3:alpha",
+            id,
+            json!({ "status": "blocked", "blocked_reason": "waits" }),
+        )
+        .await;
+    }
+    t.ok(
+        "POST",
+        "/v1/boards/factory/rank",
+        Some("t3:alpha"),
+        Some(json!({ "agent": "t3:alpha", "tasks": ["factory-2", "factory-1", "factory-4"] })),
+    )
+    .await;
+    let full = snapshot(&t, "t3:alpha", "").await;
+    let text = text(&full);
+    assert!(
+        text.contains(
+            "ready (2):\n  factory-2 p2 \"Second made\" (user)\n  factory-1 p2 \"First made\" (user)\n"
+        ),
+        "{text}"
+    );
+    let mine = text.find("factory-4 blocked").expect(text);
+    assert!(mine < text.find("factory-3 blocked").expect(text), "{text}");
+}

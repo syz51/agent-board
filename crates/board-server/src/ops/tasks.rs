@@ -2,8 +2,8 @@ use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
     AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, DoneTask, ErrorCode,
-    EventType, EvidenceKind, Note, NoteKind, Priority, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
-    TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    EventType, EvidenceKind, Note, NoteKind, Priority, RankTasks, RankedTasks, SUMMARY_CHARS_MAX,
+    TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -917,8 +917,9 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
 }
 
 /// The cursor clause of a list in list order; expects `:after`.
-const AFTER_IN_LIST_ORDER: &str = "(t.priority, t.number, t.board) > \
-     (SELECT c.priority, c.number, c.board FROM tasks c WHERE c.id = :after)";
+const AFTER_IN_LIST_ORDER: &str = "(t.priority, t.rank IS NULL, COALESCE(t.rank, 0), t.number, t.board) > \
+     (SELECT c.priority, c.rank IS NULL, COALESCE(c.rank, 0), c.number, c.board \
+      FROM tasks c WHERE c.id = :after)";
 
 /// One page of a search with the FTS5 query `query`, after the task `after` when given.
 /// None when the search does not list that task: its place is its rank by `rank_sql`.
@@ -1278,6 +1279,7 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             blocked_reason: None,
             auto: None,
             not_before: None,
+            rank: None,
             owner: None,
             reason: None,
         },
@@ -1961,6 +1963,18 @@ pub(crate) fn update(
     if priority != task.priority {
         fields.push("priority");
     }
+    // A rank orders a task inside one priority level, so it does not follow the task to
+    // another level unless the same request sets one there. A closed task holds none: it
+    // waits for nothing, and a reopened one is placed anew.
+    let rank = match req.rank {
+        _ if to.is_closed() => None,
+        Some(new) => new,
+        None if priority != task.priority => None,
+        None => task.rank,
+    };
+    if rank != task.rank {
+        fields.push("rank");
+    }
     let auto = req.auto.unwrap_or(task.auto);
     if auto != task.auto {
         fields.push("auto");
@@ -1998,11 +2012,15 @@ pub(crate) fn update(
     }
 
     let now = cx.now_ms();
+    // A rank alone places the task and changes nothing of it: its version and `updated_at`
+    // stay, so no writer holding the task meets a conflict and no age restarts.
+    let placed_only = fields == ["rank"];
     cx.db.execute(
         "UPDATE tasks SET status = ?2, owner = ?3, title = ?4, body = ?5, acceptance = ?6, \
-         priority = ?7, auto = ?8, blocked_reason = ?9, version = version + 1, updated_at = ?10, \
+         priority = ?7, auto = ?8, blocked_reason = ?9, version = version + ?13, \
+         updated_at = CASE WHEN ?13 = 1 THEN ?10 ELSE updated_at END, \
          not_before_announced = CASE WHEN not_before IS ?11 THEN not_before_announced ELSE 0 END, \
-         not_before = ?11, \
+         not_before = ?11, rank = ?12, \
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \
          done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END, \
@@ -2020,6 +2038,8 @@ pub(crate) fn update(
             blocked_reason,
             now,
             not_before.map(|at| at.timestamp_millis()),
+            rank,
+            i64::from(!placed_only),
         ],
     )?;
     if fields.contains(&"blockers") {
@@ -2050,6 +2070,9 @@ pub(crate) fn update(
     if fields.contains(&"not_before") {
         payload["not_before"] = serde_json::json!(not_before);
     }
+    if fields.contains(&"rank") {
+        payload["rank"] = serde_json::json!(rank);
+    }
     if fields.contains(&"owner") {
         payload["owner"] = serde_json::json!(owner);
         payload["previous_owner"] = serde_json::json!(task.owner);
@@ -2062,6 +2085,104 @@ pub(crate) fn update(
         payload,
     )?;
     get_task(cx, id)
+}
+
+/// Most tasks one [`RankTasks`] call orders.
+pub(crate) const RANK_TASKS_MAX: usize = 500;
+
+pub(crate) fn validate_rank(req: &RankTasks) -> Result<()> {
+    if req.tasks.len() > RANK_TASKS_MAX {
+        return Err(invalid(
+            format!("one call ranks at most {RANK_TASKS_MAX} tasks"),
+            "send the first tasks of each priority level; the rest follow them by number",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(twice) = req.tasks.iter().find(|id| !seen.insert(*id)) {
+        return Err(invalid(
+            format!("{twice} is listed twice"),
+            "list each task once, first to start first",
+        ));
+    }
+    Ok(())
+}
+
+/// Orders tasks of `board` inside their priority levels: the listed tasks get the ranks
+/// 1, 2, 3 and so on in the order sent, counted per level. With `clear_others`, every other
+/// task of the board loses its rank. A rank places a task and changes nothing of it, so its
+/// version and `updated_at` stay. A closed task takes no rank.
+pub(crate) fn rank(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    req: RankTasks,
+    by_user: bool,
+) -> Result<RankedTasks> {
+    if by_user {
+        note_agent_seen(cx, &req.agent)?;
+    } else {
+        touch_agent(cx, &req.agent)?;
+    }
+    get_board(cx, board)?;
+    let mut next = [0u32; 3];
+    let mut changes: Vec<(TaskId, Option<u32>)> = Vec::new();
+    let mut tasks = Vec::with_capacity(req.tasks.len());
+    let mut closed = Vec::new();
+    for id in &req.tasks {
+        let mut task = get_task(cx, id)?;
+        if &task.board != board {
+            return Err(invalid(
+                format!("{id} is on board {}, not {board}", task.board),
+                format!("rank it with the tasks of {}", task.board),
+            ));
+        }
+        if task.status.is_closed() {
+            closed.push(id.to_string());
+            continue;
+        }
+        let level = &mut next[task.priority as usize];
+        *level += 1;
+        if task.rank != Some(*level) {
+            changes.push((id.clone(), Some(*level)));
+            task.rank = Some(*level);
+        }
+        tasks.push(task);
+    }
+    if !closed.is_empty() {
+        return Err(invalid(
+            format!("done or dropped, so not ranked: {}", closed.join(", ")),
+            "send the list again without them; a closed task holds no rank",
+        ));
+    }
+    if req.clear_others {
+        let listed: HashSet<&TaskId> = req.tasks.iter().collect();
+        let mut stmt = cx
+            .db
+            .prepare_cached("SELECT id FROM tasks WHERE board = ?1 AND rank IS NOT NULL")?;
+        let ranked = stmt
+            .query_map([board.as_str()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for id in ranked {
+            let id: TaskId = parse_id(&id)?;
+            if !listed.contains(&id) {
+                changes.push((id, None));
+            }
+        }
+    }
+    for (id, rank) in &changes {
+        cx.db.execute(
+            "UPDATE tasks SET rank = ?2 WHERE id = ?1",
+            params![id.as_str(), rank],
+        )?;
+        cx.emit(
+            Some(board),
+            req.agent.as_str(),
+            EventType::TaskUpdated,
+            Some(id),
+            serde_json::json!({ "fields": ["rank"], "rank": rank }),
+        )?;
+    }
+    Ok(RankedTasks { tasks })
 }
 
 /// Whether nobody runs `board`: it is active with neither a coordinator (the server drops
@@ -2303,7 +2424,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     };
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
-         owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
+         rank = NULL, owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![
             id.as_str(),
             now,

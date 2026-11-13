@@ -560,6 +560,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         acceptance: String::new(),
         status: TaskStatus::Open,
         priority: Priority::P1,
+        rank: None,
         blocked_reason: None,
         owner: None,
         owner_stale: false,

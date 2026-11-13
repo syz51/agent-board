@@ -399,6 +399,11 @@ pub struct Task {
     pub acceptance: String,
     pub status: TaskStatus,
     pub priority: Priority,
+    /// The task's place inside its priority level: lower first, and a task without one
+    /// after every ranked task, by number. A changed priority clears it. Absent from older
+    /// servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
     /// Required when `status` is `blocked` without blockers.
     pub blocked_reason: Option<String>,
     pub owner: Option<AgentId>,

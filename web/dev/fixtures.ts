@@ -271,6 +271,7 @@ export function createFixtures(now: number): Fixtures {
   ): TaskFixture => ({
     board: fields.id.replace(/-\d+$/, ""),
     parent: null,
+    rank: null,
     body: "",
     acceptance: "",
     priority: "p2",
