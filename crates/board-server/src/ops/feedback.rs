@@ -1125,7 +1125,7 @@ pub(crate) fn resolve(
         params![id.as_str(), evidence.value, credited.as_str(), now],
     )?;
     cx.db.execute(
-        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, \
+        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, rank = NULL, \
          version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now],
     )?;

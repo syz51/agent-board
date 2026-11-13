@@ -60,6 +60,7 @@ pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
      OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
+      AND json_extract(payload, '$.fields') IS NOT '[\"rank\"]' \
       AND (task IN (SELECT value FROM json_each(:mine)) \
            OR json_extract(payload, '$.previous_owner') = :me)) \
      OR (type = 'note_added' AND json_extract(payload, '$.kind') = 'finding' \

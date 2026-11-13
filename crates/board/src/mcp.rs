@@ -1210,15 +1210,10 @@ struct UpdateArgs {
     #[serde(default, deserialize_with = "null_as_none")]
     not_before: Option<String>,
     /// `null` clears it.
-    #[serde(default, deserialize_with = "present")]
+    #[serde(default, deserialize_with = "board_proto::present")]
     rank: Option<Option<u32>>,
     owner: Option<AgentId>,
     reason: Option<String>,
-}
-
-/// Reads a field that is present (`null` included) as `Some`.
-fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
-    Option::<u32>::deserialize(d).map(Some)
 }
 
 /// Reads a present `null` as the string `none`, so it clears like the CLI's `none`.

@@ -711,14 +711,15 @@ pub(crate) fn handoff_files_grace() -> chrono::TimeDelta {
 /// When the agent last made a change its handoff must cover, among those after the
 /// handoff: a claim, release, take or completion of a task, an update of a task that is
 /// or was its own, or a file touch more than [`handoff_files_grace`] after the handoff.
-/// A note, a new task, a lease, an ask or an update of another agent's task adds to the
+/// A note, a new task, a lease, an ask, a new rank or an update of another agent's task adds to the
 /// board and leaves the handoff as true as it was. Without such a change, the handoff's
 /// own time. Reads only the agent's events newer than the handoff.
 fn last_change(cx: &Ctx<'_>, agent: &AgentId, handoff_at: Timestamp) -> Result<Timestamp> {
     let mut stmt = cx.db.prepare_cached(
         "SELECT e.at, e.type, \
-                json_extract(e.payload, '$.previous_owner') = ?1 \
-                OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task AND t.owner = ?1) \
+                json_extract(e.payload, '$.fields') IS NOT '[\"rank\"]' \
+                AND (json_extract(e.payload, '$.previous_owner') = ?1 \
+                     OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task AND t.owner = ?1)) \
          FROM events e WHERE e.actor = ?1 ORDER BY e.seq DESC",
     )?;
     let mut rows = stmt.query([agent.as_str()])?;

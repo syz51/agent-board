@@ -2071,8 +2071,8 @@ impl<T: T3> Daemon<T> {
     }
 
     /// The tasks the next workers on `slug` take, in order: the ready `auto` tasks that
-    /// have no worker, no retry still to wait for and no skip, the highest priority first
-    /// and the oldest first on a tie.
+    /// have no worker, no retry still to wait for and no skip, the highest priority first,
+    /// inside it the ranked tasks by rank, then the rest, oldest first ([`start_order`]).
     async fn next_tasks(&self, slug: &BoardSlug, now: Timestamp) -> Result<Vec<Task>> {
         let tasks = self
             .client()

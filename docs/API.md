@@ -468,16 +468,19 @@ Reopening a closed board, or any change on it, starts the period again.
   `rank` absent leaves it as it is, a number sets it and `null` clears it. A changed
   `priority` clears it, unless the same request sets one. `rank` is absent from a `Task`
   without one, and from servers that predate it. A change records `task_updated` with
-  `"rank"` in `fields` and the new `rank` (or `null`) in the payload.
+  `"rank"` in `fields` and the new `rank` (or `null`) in the payload. A rank places a task
+  and changes nothing of it: a request that changes the rank alone keeps the task's
+  `version` and `updated_at`, and its event alerts nobody and leaves a handoff current.
+  A task that is done or dropped holds no rank; closing one clears it.
 - `POST /v1/boards/{slug}/rank` `[RankTasks]` → `[RankedTasks]` orders many tasks in one
   call. `tasks` holds at most 500 task ids of the board, each once, first to start first.
   They get the ranks 1, 2, 3 and so on in that order, counted per priority level, so one
   list may hold several levels. A task that is not listed keeps its rank, unless
   `clear_others` is true: then every other task of the board loses its rank. Each task
-  whose rank changes gets a new `version` and a `task_updated` event as above; its
-  `updated_at` stays, since a rank is not work on the task. The answer holds the listed
-  tasks in the order sent. A task listed twice, a task of another board or more than 500
-  tasks is 400 `invalid`, an unknown task 404; a refused call ranks nothing.
+  whose rank changes gets a `task_updated` event as above. The answer holds the listed
+  tasks in the order sent. A task listed twice, a task of another board, a done or dropped
+  task (the error names each) or more than 500 tasks is 400 `invalid`, an unknown task 404;
+  a refused call ranks nothing.
   `board rank <id> <id> ... [--clear-others]` sends it, on the board of the first id, and
   `board update <id> --rank <n|none>` or `task_update` with `rank` sets one task's.
 - `reason` in `[UpdateTask]` says why the task is dropped: it applies only with `status:

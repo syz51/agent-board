@@ -1964,8 +1964,10 @@ pub(crate) fn update(
         fields.push("priority");
     }
     // A rank orders a task inside one priority level, so it does not follow the task to
-    // another level unless the same request sets one there.
+    // another level unless the same request sets one there. A closed task holds none: it
+    // waits for nothing, and a reopened one is placed anew.
     let rank = match req.rank {
+        _ if to.is_closed() => None,
         Some(new) => new,
         None if priority != task.priority => None,
         None => task.rank,
@@ -2010,9 +2012,13 @@ pub(crate) fn update(
     }
 
     let now = cx.now_ms();
+    // A rank alone places the task and changes nothing of it: its version and `updated_at`
+    // stay, so no writer holding the task meets a conflict and no age restarts.
+    let placed_only = fields == ["rank"];
     cx.db.execute(
         "UPDATE tasks SET status = ?2, owner = ?3, title = ?4, body = ?5, acceptance = ?6, \
-         priority = ?7, auto = ?8, blocked_reason = ?9, version = version + 1, updated_at = ?10, \
+         priority = ?7, auto = ?8, blocked_reason = ?9, version = version + ?13, \
+         updated_at = CASE WHEN ?13 = 1 THEN ?10 ELSE updated_at END, \
          not_before_announced = CASE WHEN not_before IS ?11 THEN not_before_announced ELSE 0 END, \
          not_before = ?11, rank = ?12, \
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
@@ -2033,6 +2039,7 @@ pub(crate) fn update(
             now,
             not_before.map(|at| at.timestamp_millis()),
             rank,
+            i64::from(!placed_only),
         ],
     )?;
     if fields.contains(&"blockers") {
@@ -2102,7 +2109,8 @@ pub(crate) fn validate_rank(req: &RankTasks) -> Result<()> {
 
 /// Orders tasks of `board` inside their priority levels: the listed tasks get the ranks
 /// 1, 2, 3 and so on in the order sent, counted per level. With `clear_others`, every other
-/// task of the board loses its rank. A rank is not work on the task, so `updated_at` stays.
+/// task of the board loses its rank. A rank places a task and changes nothing of it, so its
+/// version and `updated_at` stay. A closed task takes no rank.
 pub(crate) fn rank(
     cx: &mut Ctx<'_>,
     board: &BoardSlug,
@@ -2117,22 +2125,36 @@ pub(crate) fn rank(
     get_board(cx, board)?;
     let mut next = [0u32; 3];
     let mut changes: Vec<(TaskId, Option<u32>)> = Vec::new();
+    let mut tasks = Vec::with_capacity(req.tasks.len());
+    let mut closed = Vec::new();
     for id in &req.tasks {
-        let task = get_task(cx, id)?;
+        let mut task = get_task(cx, id)?;
         if &task.board != board {
             return Err(invalid(
                 format!("{id} is on board {}, not {board}", task.board),
                 format!("rank it with the tasks of {}", task.board),
             ));
         }
+        if task.status.is_closed() {
+            closed.push(id.to_string());
+            continue;
+        }
         let level = &mut next[task.priority as usize];
         *level += 1;
         if task.rank != Some(*level) {
             changes.push((id.clone(), Some(*level)));
+            task.rank = Some(*level);
         }
+        tasks.push(task);
+    }
+    if !closed.is_empty() {
+        return Err(invalid(
+            format!("done or dropped, so not ranked: {}", closed.join(", ")),
+            "send the list again without them; a closed task holds no rank",
+        ));
     }
     if req.clear_others {
-        let listed: std::collections::HashSet<&TaskId> = req.tasks.iter().collect();
+        let listed: HashSet<&TaskId> = req.tasks.iter().collect();
         let mut stmt = cx
             .db
             .prepare_cached("SELECT id FROM tasks WHERE board = ?1 AND rank IS NOT NULL")?;
@@ -2149,7 +2171,7 @@ pub(crate) fn rank(
     }
     for (id, rank) in &changes {
         cx.db.execute(
-            "UPDATE tasks SET rank = ?2, version = version + 1 WHERE id = ?1",
+            "UPDATE tasks SET rank = ?2 WHERE id = ?1",
             params![id.as_str(), rank],
         )?;
         cx.emit(
@@ -2160,11 +2182,6 @@ pub(crate) fn rank(
             serde_json::json!({ "fields": ["rank"], "rank": rank }),
         )?;
     }
-    let tasks = req
-        .tasks
-        .iter()
-        .map(|id| get_task(cx, id))
-        .collect::<Result<Vec<_>>>()?;
     Ok(RankedTasks { tasks })
 }
 
@@ -2407,7 +2424,7 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     };
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
-         owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
+         rank = NULL, owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![
             id.as_str(),
             now,

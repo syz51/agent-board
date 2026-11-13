@@ -471,7 +471,7 @@ pub struct UpdateTask {
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
 /// absent field stays `None`.
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

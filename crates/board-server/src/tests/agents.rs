@@ -202,6 +202,9 @@ async fn handoffs_carry_the_agents_last_change() {
     let found = t.task(a, "factory", "Found work").await;
     let (s, v) = t.patch(a, &found, json!({ "priority": "p3" })).await;
     assert!(s.is_success(), "{v}");
+    // A rank places its own task and changes nothing of it.
+    let (s, v) = t.patch(a, &task, json!({ "rank": 1 })).await;
+    assert_eq!((s.as_u16(), &v["rank"]), (200, &json!(1)), "{v}");
     let h = t.ok("GET", &path, None, None).await;
     assert_eq!(h["last_change_at"], written_at);
 
