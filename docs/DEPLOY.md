@@ -253,10 +253,14 @@ outside the repository:
 ```text
 # server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
 server root@board-host
-# device local | <ssh-target> [identity=FILE]
+# device local | <ssh-target> [identity=FILE] [watch=no]
 device local
 device user@laptop identity=~/.ssh/id_ed25519_board
+device user@spare watch=no
 ```
+
+`watch=no` marks a device that runs no `board watch` service and only needs a current
+`board` CLI: the upgrade installs and signs `board` there but restarts nothing.
 
 `db` is the server's database (`db` in `server.toml`); it must sit in the directory
 `compose.yaml` mounts, which has the same path inside the container.
@@ -283,7 +287,8 @@ nothing. With `--yes` it:
    other image.
 7. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
    it is already installed, signs it on macOS (see below), restarts `board watch` (launchd
-   or the systemd user unit), and checks `cargo install --list`.
+   or the systemd user unit) unless the device has `watch=no`, and checks `cargo install
+   --list`.
 8. Prints each device's revision, the previous ones, and the rollback command.
 
 It stops at the first failed step and says what to do next. A failed server step leaves
@@ -292,6 +297,13 @@ the server is skipped once it runs the revision, devices already at it only rest
 watch`, and the rollback command still names the revision from before the first run.
 Rolling back moves the code only; migrations do not run backwards, so a rollback across a
 migration needs the pre-upgrade backup restored as in section 4.
+
+A device that ssh cannot connect to, such as a laptop that is asleep, stops even the plan.
+With `--skip-unreachable`, the script leaves out each such device and upgrades the other
+hosts. It names the devices it left out, prints the command to run once they answer, and
+exits 3, not 0 or the failure code 1. It leaves out only a device where ssh itself fails
+(exit 255, such as a timeout or a refused key); a device whose step fails still stops the
+run.
 
 On macOS, `cargo install` leaves an ad-hoc signature, which macOS knows only by the
 binary's hash. Each build then loses the privacy grants of the last one, such as access to
@@ -327,6 +339,6 @@ SSH runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, keepalives and no ag
 port forwarding, so each host must already be in `known_hosts` and reachable with a key.
 The server target must run `docker compose`, own the clone, and read and write the data
 directory (mode 0700, owned by the container's user), so it is `root`. Devices need
-`cargo` (looked up in `~/.cargo/bin` too) and the `board watch` service from `board
-install launchd` or `board install systemd`; a service that runs another `board` binary
+`cargo` (looked up in `~/.cargo/bin` too) and, unless they have `watch=no`, the `board
+watch` service from `board install launchd` or `board install systemd`; a service that runs another `board` binary
 than cargo's is not upgraded by this.

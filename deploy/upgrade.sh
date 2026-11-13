@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upgrades the board server and every home device to one pinned revision.
 #
-#   deploy/upgrade.sh [--yes] [--rollback] [--build] [--config FILE] REV
+#   deploy/upgrade.sh [--yes] [--rollback] [--build] [--skip-unreachable] [--config FILE] REV
 #
 # REV is a full commit SHA on main or a v* release tag whose commit is on main. The server
 # runs the image CI published for that commit (ghcr.io/syz51/agent-board:sha-<commit>):
@@ -12,16 +12,19 @@
 # builds the new image, backs up the database, restarts the server and waits for /healthz,
 # then installs the board CLI at REV on each device and restarts its `board watch` daemon.
 # It stops at the first failure and says what to do next. It refuses a REV older than a
-# host's current one unless --rollback is given.
+# host's current one unless --rollback is given. --skip-unreachable leaves out each device
+# that ssh cannot connect to, upgrades the other hosts, names the devices it left out with
+# the command to run later, and exits 3.
 #
 # Hosts come from a config file outside the repository (docs/DEPLOY.md, "Upgrade"):
 #   server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
-#   device local
-#   device <ssh-target> [identity=FILE]
+#   device local [watch=no]
+#   device <ssh-target> [identity=FILE] [watch=no]
+# watch=no marks a device that runs no `board watch` service: it gets board, but no restart.
 set -euo pipefail
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -33,6 +36,7 @@ die() {
 yes=0
 rollback=0
 build=0
+skip_unreachable=0
 config="${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf"
 rev=""
 while [ $# -gt 0 ]; do
@@ -40,6 +44,7 @@ while [ $# -gt 0 ]; do
     --yes) yes=1 ;;
     --rollback) rollback=1 ;;
     --build) build=1 ;;
+    --skip-unreachable) skip_unreachable=1 ;;
     --config)
         [ $# -ge 2 ] || usage
         config=$2
@@ -137,6 +142,7 @@ port=7377
 server_id=""
 devices=()
 device_ids=()
+device_watch=()
 n=0
 while read -r role target opts || [ -n "${role:-}" ]; do
     n=$((n + 1))
@@ -144,6 +150,7 @@ while read -r role target opts || [ -n "${role:-}" ]; do
     [ -n "${target:-}" ] || die "$config line $n: '$role' needs a host"
     [[ $target =~ $target_re ]] || die "$config line $n: '$target' is not an ssh host name"
     identity=""
+    watch=yes
     for opt in ${opts:-}; do
         key=${opt%%=*}
         value=${opt#*=}
@@ -162,6 +169,10 @@ while read -r role target opts || [ -n "${role:-}" ]; do
             port=$value
             ;;
         *:identity) identity=${value/#\~/$HOME} ;;
+        device:watch)
+            [[ $value =~ ^(yes|no)$ ]] || die "$config line $n: watch must be yes or no"
+            watch=$value
+            ;;
         *) die "$config line $n: unknown option '$key' for $role" ;;
         esac
     done
@@ -175,6 +186,7 @@ while read -r role target opts || [ -n "${role:-}" ]; do
     device)
         devices+=("$target")
         device_ids+=("$identity")
+        device_watch+=("$watch")
         ;;
     *) die "$config line $n: '$role' is not 'server' or 'device'" ;;
     esac
@@ -238,11 +250,24 @@ status=$(run_on "$server" "$server_id" server-status "$clone" "$port") ||
 read -r server_prev server_running server_recorded <<<"$status"
 [[ $server_prev =~ $sha_re ]] || die "the server reported '$status', not a revision"
 
+# device_prev holds "skipped" for a device left out by --skip-unreachable.
 device_prev=()
+skipped=""
 i=0
 while [ $i -lt ${#devices[@]} ]; do
-    prev=$(run_on "${devices[$i]}" "${device_ids[$i]}" device-status) ||
-        die "could not read board's revision on ${devices[$i]} (see above): nothing was changed"
+    host=${devices[$i]}
+    rc=0
+    prev=$(run_on "$host" "${device_ids[$i]}" device-status) || rc=$?
+    # ssh exits 255 when it cannot connect or log in; a step that fails exits 1.
+    if [ $rc = 255 ] && [ "$host" != local ] && [ $skip_unreachable = 1 ]; then
+        echo "upgrade: ssh could not connect to $host (see above): leaving it out (--skip-unreachable)" >&2
+        prev=skipped
+        skipped="$skipped $host"
+    elif [ $rc = 255 ] && [ "$host" != local ]; then
+        die "ssh could not connect to $host (see above): nothing was changed. Pass --skip-unreachable to upgrade the other hosts without it"
+    elif [ $rc != 0 ]; then
+        die "could not read board's revision on $host (see above): nothing was changed"
+    fi
     device_prev+=("$prev")
     i=$((i + 1))
 done
@@ -277,12 +302,18 @@ fi
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     prev=${device_prev[$i]}
-    if [ "$prev" = "$sha" ]; then
+    if [ "$prev" = skipped ]; then
+        echo "  device ${devices[$i]}: left out (ssh could not connect)"
+    elif [ "$prev" = "$sha" ] && [ "${device_watch[$i]}" = no ]; then
+        echo "  device ${devices[$i]}: $short (already there; no board watch)"
+    elif [ "$prev" = "$sha" ]; then
         echo "  device ${devices[$i]}: $short (already there; board watch restarts)"
+    elif [ "${device_watch[$i]}" = no ]; then
+        echo "  device ${devices[$i]}: ${prev:0:12} -> $short (no board watch)"
     else
         echo "  device ${devices[$i]}: ${prev:0:12} -> $short"
     fi
-    check_order "${devices[$i]}" "$prev"
+    [ "$prev" = skipped ] || check_order "${devices[$i]}" "$prev"
     i=$((i + 1))
 done
 
@@ -291,6 +322,10 @@ done
 
 if [ $yes = 0 ]; then
     echo "plan only: nothing changed. Run again with --yes to apply."
+    if [ -n "$skipped" ]; then
+        echo "left out because ssh could not connect:$skipped"
+        exit 3
+    fi
     exit 0
 fi
 
@@ -327,12 +362,18 @@ device_now=()
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     host=${devices[$i]}
-    if [ "${device_prev[$i]}" = "$sha" ]; then
+    if [ "${device_prev[$i]}" = skipped ]; then
+        device_now+=(skipped)
+        i=$((i + 1))
+        continue
+    elif [ "${device_prev[$i]}" = "$sha" ] && [ "${device_watch[$i]}" = no ]; then
+        echo "device $host: already at $short"
+    elif [ "${device_prev[$i]}" = "$sha" ]; then
         echo "device $host: restarting board watch"
     else
         echo "device $host: installing"
     fi
-    now=$(run_on "$host" "${device_ids[$i]}" device-upgrade "$git_url" "$sha") ||
+    now=$(run_on "$host" "${device_ids[$i]}" device-upgrade "$git_url" "$sha" "${device_watch[$i]}") ||
         die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
     device_now+=("$now")
     i=$((i + 1))
@@ -341,7 +382,18 @@ done
 echo "done: the server runs $short; cargo install --list on each device shows:"
 i=0
 while [ $i -lt ${#devices[@]} ]; do
-    echo "  ${devices[$i]}: ${device_now[$i]} (was ${device_prev[$i]:0:12})"
+    if [ "${device_now[$i]}" = skipped ]; then
+        echo "  ${devices[$i]}: left out (ssh could not connect)"
+    else
+        echo "  ${devices[$i]}: ${device_now[$i]} (was ${device_prev[$i]:0:12})"
+    fi
     i=$((i + 1))
 done
 echo "$rollback_hint"
+if [ -n "$skipped" ]; then
+    again=$(printf '%q' "$0")
+    again="$again --config $(printf '%q' "$config")"
+    [ $rollback = 0 ] || again="$again --rollback"
+    echo "left out because ssh could not connect:$skipped. Once they answer, run: $again --yes $sha"
+    exit 3
+fi

@@ -283,7 +283,7 @@ device-status)
     echo "${rev:-unknown}"
     ;;
 device-upgrade)
-    url=$1 sha=$2
+    url=$1 sha=$2 watch=$3
     if [ "$(installed)" != "$sha" ]; then
         BOARD_COMMIT=$(printf '%.12s' "$sha") cargo install --quiet --git "$url" --rev "$sha" --locked --force board ||
             fail "cargo install of $sha failed: read the output above; the previous board stays installed"
@@ -295,11 +295,13 @@ device-upgrade)
         echo "upgrade: could not sign board with a lasting identity (see above), so macOS may ask again for folder access" >&2
     fi
     # Restart even when the install was already there: a run that failed here earlier
-    # left the old daemon running.
-    case "$(uname -s)" in
-    Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
-    *) systemctl --user restart agent-board-watch.service ;;
-    esac || fail "board $sha is installed but board watch did not restart: run 'board install launchd' (or systemd) and load it, then run again"
+    # left the old daemon running. watch=no in upgrade.conf: the device runs no daemon.
+    if [ "$watch" = yes ]; then
+        case "$(uname -s)" in
+        Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
+        *) systemctl --user restart agent-board-watch.service ;;
+        esac || fail "board $sha is installed but board watch did not restart: run 'board install launchd' (or systemd) and load it, then run again, or set watch=no for a device that runs no board watch"
+    fi
     rev=$(installed)
     [ "$rev" = "$sha" ] || fail "cargo install --list shows ${rev:-no board from git}, not $sha"
     echo "$rev"
