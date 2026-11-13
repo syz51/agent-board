@@ -194,7 +194,8 @@ async fn hooks_use_the_relay_with_their_own_agent_and_the_daemons_token() {
     // No token of its own: the relay holds the device's.
     let text = e.hook("user-prompt-submit", e.prompt(), "").await;
     assert!(text.contains("alerts: x"), "{text}");
-    // The agent's first PostToolUse: touches, then the heartbeat and the alerts at once.
+    // The agent's first PostToolUse: touches, then the heartbeat and the alerts at once,
+    // then the handoff check (its tasks in doing and its handoff, at once).
     let text = e.hook("post-tool-use", e.edit(), "").await;
     assert!(text.contains("alerts: x"), "{text}");
 
@@ -203,7 +204,7 @@ async fn hooks_use_the_relay_with_their_own_agent_and_the_daemons_token() {
         .iter()
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
-    assert_eq!(routes.len(), 5, "{routes:?}");
+    assert_eq!(routes.len(), 7, "{routes:?}");
     for r in &requests {
         assert_eq!(r.agent.as_deref(), Some(AGENT), "the caller's agent");
         assert_eq!(

@@ -1114,6 +1114,7 @@ fn stop_stays_quiet_when_nothing_changed_since_the_handoff() {
     e.stub.on(&handoff_route(), &h);
     for text in ["status?", "and now?"] {
         prompt(&e, text);
+        assert_eq!(heartbeat(&e), None, "a current handoff gets no reminder");
         assert_eq!(
             stop(&e),
             None,
@@ -1165,16 +1166,36 @@ fn stop_sends_the_turns_last_message_cleaned_and_cut() {
     assert_eq!(said(Value::Null), None, "a runtime without the field");
 }
 
+/// The context a tool call's heartbeat adds, if any.
+fn heartbeat(e: &Env) -> Option<String> {
+    heartbeat_due_again(e);
+    let (reply, _) = read_tool(e);
+    reply.map(|r| context(&Some(r), "PostToolUse"))
+}
+
+/// The handoff reminder comes with a tool call's heartbeat, not at `Stop`: a block there
+/// would continue the turn after the agent's report, and the answer to it would become the
+/// turn's last message, the one T3 shows.
 #[test]
-fn stop_reminds_once_per_change_made_after_the_handoff() {
+fn a_heartbeat_reminds_once_per_change_made_after_the_handoff() {
     let e = env();
     let mut h = doing_with_handoff(&e, None);
     h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(1));
     e.stub.on(&handoff_route(), &h);
     prompt(&e, "go");
-    let reply = stop(&e).expect("a change after the handoff gets the demand");
-    assert_eq!(reply["decision"], "block");
-    let blocked = e
+    let reminder = heartbeat(&e).expect("a change after the handoff gets the reminder");
+    assert!(
+        reminder.contains("board: factory-12 is in doing")
+            && reminder.contains("predates a later change to your tasks")
+            && reminder.contains("handoff_set")
+            && !reminder.contains("then stop"),
+        "{reminder}"
+    );
+    assert_eq!(heartbeat(&e), None, "one reminder per change");
+
+    // The turn ends on the agent's report: Stop does not block, and keeps it as said.
+    assert_eq!(stop(&e), None, "the Stop never blocks for the handoff");
+    let state = e
         .stub
         .requests_to(&state_path())
         .last()
@@ -1182,21 +1203,14 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
         .body
         .clone();
     assert_eq!(
-        (blocked["state"].as_str(), blocked["said"].as_str()),
+        (state["state"].as_str(), state["said"].as_str()),
         (Some("idle"), Some("Done.")),
-        "the reminder interrupts the turn's real closing message: keep it"
+        "the report is the turn's last message"
     );
-    let reason = reply["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("factory-12")
-            && reason.contains("predates a later change to your tasks")
-            && reason.contains("handoff_set"),
-        "{reason}"
-    );
-    assert_eq!(stop(&e), None, "one reminder per change");
+    // A Stop after another hook's block keeps that report: it sends no said.
     let continued = e.with(
         "Stop",
-        json!({"stop_hook_active": true, "last_assistant_message": "Handoff updated."}),
+        json!({"stop_hook_active": true, "last_assistant_message": "Answered the other hook."}),
     );
     assert_eq!(e.hook("stop", "claude", continued).1, "");
     let after = e
@@ -1208,18 +1222,19 @@ fn stop_reminds_once_per_change_made_after_the_handoff() {
         .clone();
     assert_eq!(
         (after["state"].as_str(), after.get("said")),
-        (Some("idle"), None),
-        "the reply to the reminder is not what the user should read"
+        (Some("idle"), None)
     );
 
-    // A later change in the same turn (say, after a background task woke the agent).
-    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(2));
+    // A later change (say, file edits long after the handoff) gets a reminder of its own.
+    h.last_change_at = Some(h.updated_at + chrono::Duration::minutes(40));
     e.stub.on(&handoff_route(), &h);
-    assert_eq!(stop(&e).unwrap()["decision"], "block");
+    prompt(&e, "go on");
+    assert!(heartbeat(&e).unwrap().contains("handoff_set"));
+    assert_eq!(stop(&e), None);
 }
 
 #[test]
-fn stop_asks_for_a_first_handoff() {
+fn a_heartbeat_asks_for_a_first_handoff() {
     let e = env();
     doing_with_handoff(&e, None);
     e.stub.on_error(
@@ -1230,31 +1245,116 @@ fn stop_asks_for_a_first_handoff() {
         "write one",
     );
     prompt(&e, "go");
-    let reply = stop(&e).unwrap();
-    assert!(
-        reply["reason"]
-            .as_str()
-            .unwrap()
-            .contains("you have no handoff"),
-        "{reply}"
-    );
-    assert_eq!(stop(&e), None, "one reminder per turn");
+    let reminder = heartbeat(&e).unwrap();
+    assert!(reminder.contains("you have no handoff"), "{reminder}");
+    assert_eq!(heartbeat(&e), None, "one reminder per turn");
+    assert_eq!(stop(&e), None);
 }
 
 #[test]
-fn stop_falls_back_to_the_turn_against_a_server_without_change_dates() {
+fn a_heartbeat_falls_back_to_the_turn_against_a_server_without_change_dates() {
     let e = env();
     doing_with_handoff(&e, None);
     prompt(&e, "go");
-    let reply = stop(&e).unwrap();
-    assert!(
-        reply["reason"]
-            .as_str()
-            .unwrap()
-            .contains("older than this turn"),
-        "{reply}"
+    let reminder = heartbeat(&e).unwrap();
+    assert!(reminder.contains("older than this turn"), "{reminder}");
+    assert_eq!(heartbeat(&e), None, "one reminder per turn");
+    prompt(&e, "next");
+    assert!(heartbeat(&e).is_some(), "the next turn gets its own");
+}
+
+/// A failed handoff check costs only the reminder: the heartbeat's alerts still show.
+#[test]
+fn a_failed_handoff_check_keeps_the_heartbeats_alerts() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(
+            SnapshotKind::Alerts,
+            "<board>\n! a peer joined\n</board>",
+            2,
+        ),
     );
-    assert_eq!(stop(&e), None, "one reminder per turn");
+    e.stub
+        .on_error(&handoff_route(), 500, "internal", "boom", "retry");
+    let shown = heartbeat(&e).expect("the alerts");
+    assert!(shown.contains("a peer joined"), "{shown}");
+    assert!(!shown.contains("handoff_set"), "{shown}");
+}
+
+/// A slow handoff check ends before the hook's deadline: the alerts the heartbeat took
+/// still show, and the server is not marked slow.
+#[test]
+fn a_slow_handoff_check_keeps_the_heartbeats_alerts() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(
+            SnapshotKind::Alerts,
+            "<board>\n! a peer joined\n</board>",
+            2,
+        ),
+    );
+    e.stub
+        .delay(&handoff_route(), std::time::Duration::from_secs(5));
+    heartbeat_due_again(&e);
+    let (reply, _) = e.hook_env(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+        ),
+        &FAIR_SHARE,
+    );
+    let shown = context(&reply, "PostToolUse");
+    assert!(shown.contains("a peer joined"), "{shown}");
+    assert!(!shown.contains("handoff_set"), "{shown}");
+    assert!(
+        !e.home.join("state/offline.json").exists(),
+        "a slow handoff check does not mark the server slow"
+    );
+}
+
+/// A turn without a prompt of its own (a background wake-up) and no handoff: one reminder,
+/// not one per heartbeat.
+#[test]
+fn a_turn_without_a_prompt_is_reminded_of_a_missing_handoff_once() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    e.stub.on_error(
+        &handoff_route(),
+        404,
+        "not_found",
+        "no handoff",
+        "write one",
+    );
+    // The session's first tool call: its heartbeat is due.
+    let reminder = context(&read_tool(&e).0, "PostToolUse");
+    assert!(reminder.contains("you have no handoff"), "{reminder}");
+    assert_eq!(heartbeat(&e), None, "the next heartbeat stays quiet");
+    assert_eq!(stop(&e), None);
+    assert_eq!(heartbeat(&e), None, "nor after a Stop without a prompt");
+    prompt(&e, "go");
+    assert!(heartbeat(&e).is_some(), "a prompted turn gets its own");
+}
+
+/// A subagent's tool call gets no handoff reminder: the handoff is the agent's.
+#[test]
+fn a_subagents_heartbeat_gives_no_handoff_reminder() {
+    let e = env();
+    doing_with_handoff(&e, None);
+    prompt(&e, "go");
+    heartbeat_due_again(&e);
+    assert_eq!(subagent_read(&e, "sub-1"), None);
+    assert!(
+        heartbeat(&e).is_some(),
+        "the agent's own call still gets it"
+    );
 }
 
 /// Serves snapshots that say whether a paused board holds the agent.
@@ -1296,11 +1396,11 @@ fn a_turn_begun_after_the_pause_goes_on_when_it_claims_the_boards_work() {
     serve_hold_at(&e, "2030-01-01T10:01:00Z", Some("2030-01-01T09:00:00Z"));
     let (reply, _) = read_tool(&e);
     assert!(not_halted(&reply), "{reply:?}");
-    assert_eq!(
-        stop(&e).unwrap()["decision"],
-        "block",
+    assert!(
+        context(&reply, "PostToolUse").contains("handoff_set"),
         "the user's turn gets its reminder"
     );
+    assert_eq!(stop(&e), None);
 
     // A pause after the turn began still ends it.
     serve_hold_at(&e, "2030-01-01T11:00:00Z", None);
@@ -1677,15 +1777,14 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
         e.stub.requests_to(&state_path()).last().unwrap().body["state"],
         "idle"
     );
-    // A runtime that went on anyway (a subagent's tool call) is halted again.
+    // A runtime that went on anyway (a subagent's tool call) is halted again, with no
+    // handoff reminder: the halt is all it says.
     heartbeat_due_again(&e);
     let (reply, _) = read_tool(&e);
-    assert_eq!(reply.expect("a second halt")["continue"], false);
-    assert_eq!(
-        stop(&e),
-        None,
-        "no handoff reminder in a halted turn: it would continue the turn"
-    );
+    let reply = reply.expect("a second halt");
+    assert_eq!(reply["continue"], false);
+    assert!(!reply.to_string().contains("handoff_set"), "{reply}");
+    assert_eq!(stop(&e), None);
 
     // A turn the user starts while held is told, not stopped.
     let (reply, _) = e.hook(
@@ -1700,9 +1799,8 @@ fn a_paused_board_stops_a_running_turn_and_only_tells_a_new_one() {
         reply.as_ref().is_none_or(|r| r.get("continue").is_none()),
         "{reply:?}"
     );
-    assert_eq!(
-        stop(&e).unwrap()["decision"],
-        "block",
+    assert!(
+        context(&reply, "PostToolUse").contains("handoff_set"),
         "the user's own turn gets its reminder"
     );
 
@@ -1892,22 +1990,22 @@ fn a_done_prints_the_filing_reminder_and_the_stop_after_it_stays_quiet() {
     }
 }
 
+/// A done with another task still in doing and a stale handoff: the heartbeat names that
+/// task, and the Stop stays quiet.
 #[test]
-fn a_done_leaves_only_the_handoff_reminder_at_stop() {
+fn a_done_and_a_stale_handoff_leave_the_stop_quiet() {
     let e = env();
     doing_with_handoff(&e, None);
     prompt(&e, "go");
     mark_done(&e, "factory-11", None);
-    let reason = stop(&e).expect("the handoff is stale")["reason"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let reminder = heartbeat(&e).expect("the handoff is stale");
     assert!(
-        reason.starts_with("board: factory-12 is in doing") && reason.contains("handoff_set"),
-        "{reason}"
+        reminder.starts_with("board: factory-12 is in doing") && reminder.contains("handoff_set"),
+        "{reminder}"
     );
-    assert!(!reason.contains("factory-11"), "{reason}");
-    assert_eq!(reason.lines().count(), 1, "{reason}");
+    assert!(!reminder.contains("factory-11"), "{reminder}");
+    assert_eq!(reminder.lines().count(), 1, "{reminder}");
+    assert_eq!(stop(&e), None);
 }
 
 /// `id` as the server holds it: in `status`, owned by the agent unless `open`.

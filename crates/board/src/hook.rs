@@ -6,8 +6,8 @@
 //! - SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure (Claude Code):
 //!   `{"hookSpecificOutput": {"hookEventName":
 //!   <event>, "additionalContext": <text>}}` on both runtimes.
-//! - Stop: `{"decision": "block", "reason": <text>}` continues the turn with the reason on
-//!   both runtimes; Codex requires JSON on stdout, so it gets `{}` otherwise.
+//! - Stop: never blocks (a block would continue the turn after the agent's report); Codex
+//!   requires JSON on stdout, so it gets `{}`.
 //! - PreCompact (Claude Code): plain stdout becomes compaction instructions.
 //! - PreToolUse (shell calls only): prints nothing, which lets the call run.
 //! - StopFailure and SessionEnd: output is ignored.
@@ -165,8 +165,6 @@ enum Reply {
     Nothing,
     /// Context for the model.
     Context(String),
-    /// Continue the turn with this instruction (Stop).
-    Block(String),
     /// Plain text (PreCompact instructions).
     Plain(String),
     /// Stop the turn now, telling the user why: a paused board holds the agent.
@@ -217,7 +215,6 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
             })
             .to_string(),
         ),
-        Reply::Block(reason) => Some(json!({"decision": "block", "reason": reason}).to_string()),
         Reply::Plain(text) => Some(text),
         Reply::Halt(reason) => Some(json!({"continue": false, "stopReason": reason}).to_string()),
         // Codex rejects plain or empty output from Stop.
@@ -1746,6 +1743,19 @@ impl Hook<'_> {
             if !alerts.is_empty() {
                 lines.push(alerts);
             }
+            // The agent's own call in a turn the hold lets go on (a subagent's turn holds
+            // no handoff of its own). Here, not at `Stop`: a block there continues the turn
+            // after the agent's report, and its answer becomes the message T3 shows. A
+            // failed or slow check only skips the reminder: the alerts above are already
+            // taken, so it ends before the hook's own deadline would drop them.
+            if self.subagent.is_none() {
+                match tokio::time::timeout_at(self.deadline, self.handoff_reminder()).await {
+                    Ok(Ok(Some(text))) => lines.push(text),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(err)) => tracing::debug!("checking the handoff: {err:#}"),
+                    Err(_) => tracing::debug!("checking the handoff: out of time"),
+                }
+            }
         }
         Ok(if lines.is_empty() {
             Reply::Nothing
@@ -1766,20 +1776,19 @@ impl Hook<'_> {
             .passes(self.local.held_since)
     }
 
-    /// A `Stop` that follows our own block, ending the turn that answered the handoff reminder.
+    /// A `Stop` that follows a `Stop` hook's block (another hook's: this one never blocks),
+    /// ending the turn that answered it.
     fn stop_continued(&self) -> bool {
         self.input["stop_hook_active"].as_bool().unwrap_or(false)
     }
 
     /// Marks the agent idle with the turn's last message, which the server keeps for the
-    /// user while the agent coordinates a board, then gives the handoff reminder when one is
-    /// due. The `Stop` that follows its block has `stop_hook_active` and stays quiet.
-    ///
-    /// A done or a release gives no reminder here: the `task_done` and release outputs ask
-    /// to file what remains (`ops::task_done`), since a block here continues the turn after
-    /// the agent's report, and its answer then becomes the last message, the one T3 shows.
+    /// user while the agent coordinates a board. It never blocks: a block here continues
+    /// the turn after the agent's report, and its answer then becomes the last message, the
+    /// one T3 shows. So a done or a release reminds in its own output (`ops::task_done`), and
+    /// the handoff reminder comes with a `PostToolUse` heartbeat ([`Self::post_tool_use`]).
     async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
-        // The message worth keeping after our own block was the one the reminder followed.
+        // After another hook's block, the message worth keeping was the one it followed.
         let continued = self.stop_continued();
         let said = if continued {
             None
@@ -1799,22 +1808,10 @@ impl Hook<'_> {
                 },
             )
             .await?;
-        // A halted turn is not asked to go on: the user paused its work. A turn begun
-        // while held (the user's own request) gets the reminder as any other.
-        let reply = if continued || self.local.halted() {
-            Reply::Nothing
-        } else {
-            self.handoff_reminder()
-                .await?
-                .map_or(Reply::Nothing, Reply::Block)
-        };
-        // A block continues the turn; otherwise it has ended, and a turn without a prompt
-        // that follows has no time of its own.
-        if !matches!(reply, Reply::Block(_)) {
-            self.local.end_turn_hold();
-        }
+        // The turn has ended: a turn without a prompt that follows has no time of its own.
+        self.local.end_turn_hold();
         self.register_again(repo.as_ref()).await;
-        Ok(reply)
+        Ok(Reply::Nothing)
     }
 
     /// T3 renamed the thread, or a background read found its title, link or parent:
@@ -1851,27 +1848,32 @@ impl Hook<'_> {
         }
     }
 
-    /// The handoff reminder: when a task is in `doing` and the handoff is missing or stale.
+    /// The handoff reminder: when a task is in `doing` and the handoff is missing or stale,
+    /// once per change (or per turn, against a server that does not date changes).
     async fn handoff_reminder(&mut self) -> Result<Option<String>> {
-        let doing = self
-            .client
-            .tasks(&TaskQuery {
-                mine: Some(true),
-                status: Some(TaskStatus::Doing),
-                ..TaskQuery::default()
-            })
-            .await?;
+        let query = TaskQuery {
+            mine: Some(true),
+            status: Some(TaskStatus::Doing),
+            ..TaskQuery::default()
+        };
+        // Both at once: this runs within a tool call's heartbeat.
+        let (doing, handoff) =
+            tokio::try_join!(self.client.tasks(&query), self.client.handoff(&self.agent))?;
         let Some(task) = doing.first() else {
             return Ok(None);
         };
-        let handoff = self.client.handoff(&self.agent).await?;
         let turn = self.local.turn_started;
         // The server dates the agent's last change that the handoff must cover (a change to
         // the state of its tasks, or file edits long after the handoff) on the handoff's own
         // clock, so a turn that only read, replied or added notes leaves it current. A server
         // without that date falls back to: a handoff older than the turn is stale.
+        // No handoff: once per turn; a turn without a prompt of its own (a background
+        // wake-up) shares one key, so its heartbeats do not repeat the reminder.
         let (stale_since, why) = match &handoff {
-            None => (Some(turn.unwrap_or(self.now)), "you have no handoff"),
+            None => (
+                Some(turn.unwrap_or(Timestamp::UNIX_EPOCH)),
+                "you have no handoff",
+            ),
             Some(h) => match h.last_change_at {
                 Some(at) => (
                     (at > h.updated_at).then_some(at),
@@ -1891,7 +1893,7 @@ impl Hook<'_> {
         }
         self.local.reminded_for = Some(since);
         Ok(Some(format!(
-            "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so the next session can resume, then stop.",
+            "board: {} is in doing and {why}. Call handoff_set (now, next, blockers) so a later session can resume, then go on with your work.",
             task.id
         )))
     }
@@ -2738,17 +2740,6 @@ mod tests {
         assert_eq!(
             render_reply(HookEvent::Stop, Runtime::Claude, Reply::Nothing),
             None
-        );
-        let block: Value = serde_json::from_str(
-            &render_reply(HookEvent::Stop, Runtime::Claude, Reply::Block("r".into())).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(block, json!({"decision": "block", "reason": "r"}));
-        let codex = render_reply(HookEvent::Stop, Runtime::Codex, Reply::Block("r".into()));
-        assert_eq!(
-            serde_json::from_str::<Value>(&codex.unwrap()).unwrap(),
-            json!({"decision": "block", "reason": "r"}),
-            "Codex takes the same block shape"
         );
     }
 }
