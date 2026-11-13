@@ -2175,6 +2175,12 @@ fn help_states_text_limits_and_enum_values() {
     let add = help(&["add", "--help"]);
     assert!(add.contains("At most 80 characters"), "{add}");
     assert!(add.contains("[possible values: p1, p2, p3]"), "{add}");
+    assert!(add.contains("Aim for about 60 characters"), "{add}");
+    let update = help(&["update", "--help"]);
+    assert!(
+        update.contains("Aim for about 60 characters. At most 80 characters"),
+        "{update}"
+    );
     let note = help(&["note", "--help"]);
     assert!(note.contains("At most 800 characters"), "{note}");
     assert!(
