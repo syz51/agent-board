@@ -320,6 +320,18 @@ fn tool_start_path(home: &Home, runtime: Runtime, tool_use: &str) -> PathBuf {
     ))
 }
 
+/// Keeps the record of a launch the device limit refused, as `refused-launches/<name>.json`
+/// in the state directory, and gives its path. These records are the trail of what an
+/// agent asked for and did not get, so nothing prunes them.
+pub fn save_refused_launch<T: Serialize>(home: &Home, name: &str, record: &T) -> Result<PathBuf> {
+    let path = home
+        .state_dir()
+        .join("refused-launches")
+        .join(format!("{}.json", safe_stem(name)));
+    write_json(&path, record)?;
+    Ok(path)
+}
+
 /// When a shell tool call started, from its `PreToolUse` hook.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStart {

@@ -582,12 +582,14 @@ impl<T: T3> Daemon<T> {
             }
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
+            self.read_running().await;
             let limit = self.run_limit();
             if self.runs() >= limit || self.judge_turns.another_first(slug, waited) {
                 if self.judge_turns.wait(slug, waited, now) {
                     tracing::info!(
-                        "{slug}: `{}` waits for one of the {limit} runs of this device",
-                        want.title
+                        "{slug}: `{}` waits for one of the {limit} runs of this device; {}",
+                        want.title,
+                        self.load()
                     );
                 }
                 break;

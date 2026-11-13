@@ -24,6 +24,34 @@ threads work off a backlog without the user watching. The wire contract is `docs
 8. **Private and simple to run**: one small binary, one SQLite file, encrypted backups.
 9. **Evolving with feedback**: rules, defaults and prompts are tuned from usage data and
    agents' feedback, through reviewed changes.
+10. **Nothing lost, everything traced**: the board never drops information. Whatever holds,
+    refuses, stops, retries or gives back work leaves a record first: the time, the cause,
+    the thread or agent, and all of what was asked for (see "The trail rule").
+
+### The trail rule
+
+A later investigation must be able to say what happened, when, why and to which thread,
+from records alone. So every part of the board keeps these rules:
+
+- **Record before you act.** A hold, a refusal, a stop, a retry, a give-back and a drop each
+  write their record before they take effect. When the record cannot be written, the action
+  does not happen: the hook that cannot keep a launch lets it run.
+- **A record has the time, the cause, the subject and the actor.** The cause is the rule and
+  the numbers that decided, such as "device has 4 of 4 runs", not only "refused".
+- **Keep the whole of what was asked.** A brief, a prompt or a call that is not run is kept
+  as it was given, not as a summary. Text that passes a size limit goes to a file or is
+  split, and the short record names where the rest is.
+- **Records go where a reader looks.** On the board first: a note on the task, an event, an
+  ask. A record that cannot reach the server, or is too large for it, goes to a file under
+  `$BOARD_HOME/state/` on the device, and the board record names the file when there is
+  one. A log line alone is not a record: logs rotate.
+- **Nothing prunes a record of a decision.** Only caches and marks that a later step
+  replaces are removed by age.
+- **Once per cause.** A hold that lasts leaves one record when it starts, not one per
+  check, so the trail stays readable.
+
+A change that adds a way to hold, refuse or stop work adds its record and a test of it in
+the same change.
 
 ## Architecture
 
@@ -229,7 +257,8 @@ host.
   only peers with its own user id (`getpeereid`, `SO_PEERCRED`). It forwards each request
   with the device token and the caller's own `X-Board-Agent`, never an identity of its own,
   and only the routes hooks call: registering, state and handoff of the agent the request
-  names, snapshot, touches, boards and tasks. The server's rules for that agent apply as
+  names, snapshot, touches, boards, tasks and adding a note to a task (the record of a
+  refused launch). The server's rules for that agent apply as
   for a direct call. A hook uses the relay only when the home and the socket belong to its
   user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a
   token of the session's own, and the relay's status (`GET /relay`, answered by the relay
@@ -517,6 +546,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 | Background read of a T3 thread | When `t3 thread show` misses a hook's 0.4 seconds (at `SessionStart` or a `Stop` title check), the hook starts `board read-thread` on its own (its own process group, not waited for), so the hook takes no longer. It gives `t3 thread show` 30 seconds and leaves the answer, with the time it asked, in `$BOARD_HOME/state/thread-reads/<runtime>-<session>.json`; what goes wrong goes to `$BOARD_HOME/state/read-thread.log` (started over at 256 KiB). A later hook of the session registers a read that holds a title, link or parent other than the registered ones: `UserPromptSubmit`, a `PostToolUse` with a heartbeat due (so at most once a minute), or a `Stop` with no title check due. It registers after its own work, in what is left of its budget (at `Stop`, then marks the agent idle again). The read goes once the server took it or refused it as invalid; a read that tells nothing new, asked T3 before the registered facts were read, is over an hour old or is of another thread is dropped. A session starts a read at most every 45 seconds and logs its first at info level; while one may run, `SessionStart` and a due `Stop` check do not ask T3. Registering a read counts no title check. `SessionEnd` and the week-old pruning of session caches remove the read too |
 | `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped, except a T3 pull request update in Claude Code, which ends before the model runs (see "Pausing work") |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
+| `PreToolUse` on a T3 launch (`mcp__<server>__delegate_task`, `t3_thread_launch`, `create_threads`; Claude Code) | The launch check of the device limit (see "Daemon dispatch", Device limit). The hook asks T3 for the running threads of the configured projects (at most 4.5 seconds; all projects at once, about 1.4 seconds measured for 15) and lets the call run while the running turns plus the threads asked for (each of `create_threads`' list, else one) stay within the limit. Past it, the hook first writes the whole call to `$BOARD_HOME/state/refused-launches/<time>-<tool use>.json` (time, cause, device, limit, running threads, asking thread and session, tool and its full input; never pruned), then adds one note to the task the agent has in `doing`, when it has one and the server answers within 2 seconds (cause, tool, title, asking thread and the file), and refuses the call (`permissionDecision: deny`) with the cause, the file and the note's id. It lets the call run when no limit applies, T3 does not answer in time, the file cannot be written, or the call names an `environmentId` (it may start on another device, which this one cannot count for). The hook has 8 seconds in all; `board install` gives it 10 |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
 | `PostToolUse` on `Bash`, and Claude Code's `PostToolUseFailure` on `Bash`, with a start mark | The same, for files `git status` (read-only, at most 0.5 seconds) lists as changed or untracked with a modification time since the mark, in batches of 100. Not seen: files the call deleted, changed and committed, or wrote keeping an older modification time (`mv`, `cp -p`); counted too: files another writer in the same work tree changed during the call, except a peer agent's edit-tool write on the same device (same modification time), which stays the peer's in overlaps and alerts whichever touch reaches the server first (the event history keeps what each agent reported); a write that both peers' shell scans find with the same time is no one's, so it raises no overlap or alert between the two. Left out: files git itself wrote during the call: those that differ between `HEAD` at the mark and after the call (checkout, switch, merge, rebase, pull, reset), unless `HEAD`'s reflog shows it moved by the call's own commits alone (`git commit`, `--amend`); what a merge that stopped during the call brings in since the merge base (a conflicted merge stages it without moving `HEAD`); and what the commit a cherry-pick, revert or rebase stopped on changes. Only when `git status` found files, with `git diff --name-only` within the same 0.5 seconds; when git cannot say, the call records nothing. A merge stopped before the call is the agent's to finish, so what it resolves counts. Not seen either: a `HEAD` that moved and came back within the call. The hook takes the mark first, so it is gone even when the hook then stops (no token or agent). Marks that never reach this hook are pruned at `SessionStart` after a day |
 | `PostToolUse`, any tool, at most once a minute | Heartbeat; inject alerts; end a turn that began before a pause that holds the agent (`continue: false`, see "Pausing work"); in a T3 thread, register a finished background read of it (see above). A `PostToolUse` with no touches to record and no heartbeat due makes no server call and reads no token (no Keychain lookup). Claude Code runs this hook for a subagent's tool calls too, with the agent's session and an `agent_id`. Such a call gets only the lines a subagent can use: the `hold:` line and the overlaps with a peer's edit or lease. It asks for alerts from a cursor the agent's subagents share (or the agent's, when that is later) and leaves the cursor the agent's hooks keep, so the agent's own next heartbeat or prompt still brings its other alerts (an answered ask, a change to its task, a new peer). The server's own cursor for the agent does move with a subagent's request; a `SessionStart` snapshot therefore asks from the hooks' cursor while the subagents' is ahead of it. A request without `since` in between, such as the `board_snapshot` tool, starts after those alerts. A `SessionStart` with an `agent_id` gets no snapshot, which describes the agent, not the subagent. Claude Code 2.1.322 sends none there: after a subagent's compaction it runs `SessionStart` (source `compact`) with the same input as for the agent's own, so that subagent still gets the agent's snapshot. The agent's own heartbeat, in a turn not halted, also gives the handoff reminder: when a task is in `doing`, once per turn if there is no handoff (turns without a prompt of their own, such as a background wake-up, share one reminder until the next prompt), or once per change if the handoff predates the agent's last change as the server dates it (`Handoff.last_change_at`: after the handoff, its newest change to the state of its tasks, or a file touch more than 30 minutes later, from MCP or the CLI). It asks the agent to call `handoff_set` and go on with its work. A turn that only read, replied or added notes gets none. Not seen as changes: work that leaves no touch, such as files changed and committed in one shell call or a push. A server without the date falls back to: remind once per turn when the handoff is older than the turn. It reads the agent's `doing` tasks and its handoff at once, two requests more per heartbeat, also for an agent with nothing in `doing`, so a reminder that is due costs no extra round trip. A failed read only skips the reminder, since the alerts are already taken; so does a slow one, which ends before the hook's deadline and does not count against the server. A subagent's call gets none: the handoff is the agent's. The reminder was given at `Stop` until it moved here (see `Stop`). A change in the last minute of a turn with no tool call after it is reminded about at the next turn's first heartbeat |
@@ -880,8 +910,32 @@ of 1 a worker may take it. A board that was refused a slot gets the next free on
 board that asked later, workers and judges each in their own queue. A board that gets a
 slot goes to the end of the queue, and one that did not ask again in the last reconcile
 loses its place. The runs of a paused board count while they last. A run recorded for a
-board the device no longer hosts takes no slot. The limit counts the daemon's runs only, not
-threads the user or a coordinator thread started.
+board the device no longer hosts takes no slot.
+
+The limit is the device's, so every agent turn that runs on it counts, whoever started it:
+the user, a coordinator thread, a delegate or the daemon. Once per reconcile that wants a
+slot, the daemon asks T3 for the threads with a turn in progress (`t3 thread list --json
+--project <path>`, status `running`) in every project of `config.toml` (`[projects]` and
+`[board_projects]`), all projects at once. The threads that are not its own counted
+workers and judges take slots too. Idle threads take none. The three kinds of turn are
+treated as follows:
+
+- **A turn the user starts** by typing always runs. It counts, so the daemon and the
+  agents make room for it; nothing holds or refuses it.
+- **The daemon yields.** At the limit it starts no worker and no judge, and it never stops
+  a thread to make room. When a task's wait starts, the daemon adds one note to the task
+  (the device's load, the other threads' ids, at most 6 of them, and the workers' share)
+  and logs the same; a judge's wait is logged only, since a note on an owned task wakes
+  its owner. The task is started when a slot is free.
+- **A thread an agent starts through T3** (`delegate_task`, `t3_thread_launch`,
+  `create_threads`) is refused by the `PreToolUse` hook when the running turns plus the
+  threads asked for pass the limit (see "Runtime integration"). The agent does the work in
+  its own thread or makes the call again later.
+
+What is not counted: threads in T3 projects that `config.toml` does not name, agent
+sessions outside T3, and Claude Code's in-process subagents (`Agent`), which run inside
+their thread's turn. A project T3 cannot list adds none, and when T3 does not answer the
+daemon counts its own runs only and the hook lets the launch run.
 
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>
 --title "<id> <title>" -`. The brief goes in on stdin. The folder is the `[projects]`

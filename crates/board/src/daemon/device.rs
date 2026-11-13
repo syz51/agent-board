@@ -7,10 +7,19 @@
 //! limit. Workers and judges count alike. One slot is kept for judges, since a judge ends
 //! work already in progress, and a board that was refused a slot gets the next free one
 //! before a board that asked later ([`Turns`]).
+//!
+//! The device's memory is taken by every agent turn that runs on it, not only by the
+//! dispatcher's runs, so the turns of the other threads count too ([`running_threads`]).
+//! The dispatcher yields to them: it never stops a thread, and it starts none of its own
+//! while the device is full.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use board_proto::{BoardSlug, Timestamp};
+
+use crate::config::Config;
+use crate::t3::T3;
 
 /// Host memory that allows one run, when `runs_at_once` is not set.
 pub const MEMORY_PER_RUN: u64 = 4 << 30;
@@ -20,6 +29,9 @@ pub const MIN_RUNS: usize = 2;
 
 /// The limit of a device whose memory could not be read.
 pub const FALLBACK_RUNS: usize = 4;
+
+/// How many of the other threads' ids a record of a hold names; the rest are counted.
+pub const THREADS_SHOWN: usize = 6;
 
 /// The limit a device with `host_memory` bytes gets when `runs_at_once` is not set. The
 /// memory is rounded to the nearest run: a host reports somewhat less than it has.
@@ -58,6 +70,39 @@ fn mem_total(meminfo: &str) -> Option<u64> {
     let line = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
     let kib: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
     kib.checked_mul(1024)
+}
+
+/// The limit of this device: `runs_at_once` of `config`, else `default`, else none.
+pub fn run_limit(config: &Config, default: Option<usize>) -> usize {
+    config
+        .runs_at_once
+        .map_or_else(|| default.unwrap_or(usize::MAX), |n| n.get() as usize)
+}
+
+/// The threads with a run in progress in the T3 projects of `config`, whoever started
+/// them: the user, an agent or the dispatcher. These are the turns that take the device's
+/// memory now. A project T3 cannot list adds none, so a T3 that does not answer leaves the
+/// count to the runs the dispatcher knows of itself.
+pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> BTreeSet<String> {
+    let projects: BTreeSet<&Path> = config
+        .projects
+        .values()
+        .chain(config.board_projects.values())
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    let lists = projects.iter().map(|project| t3.running_threads(project));
+    let lists = futures_util::future::join_all(lists).await;
+    let mut running = BTreeSet::new();
+    for (project, list) in projects.iter().zip(lists) {
+        match list {
+            Ok(threads) => running.extend(threads),
+            Err(err) => tracing::debug!(
+                "the running threads of {}: {err:#}; counted as none",
+                project.display()
+            ),
+        }
+    }
+    running
 }
 
 /// The boards that were refused a slot of one kind, oldest first served. Kept in memory:

@@ -80,6 +80,13 @@ const CLAUDE_HOOKS: &[HookSpec] = &[
         matcher: Some("Bash"),
         timeout: 5,
     },
+    // Refuses a thread an agent starts through T3 while the device is at its run limit
+    // (`hook/launch.rs`); the timeout covers T3 listing the device's threads.
+    HookSpec {
+        event: HookEvent::PreToolUse,
+        matcher: Some("mcp__.*__(delegate_task|t3_thread_launch|create_threads)"),
+        timeout: 10,
+    },
     HookSpec {
         event: HookEvent::PostToolUse,
         matcher: Some("*"),
@@ -321,7 +328,11 @@ fn hooks_json(bin: &Path, runtime: &str, specs: &[HookSpec]) -> Value {
                 "timeout": spec.timeout,
             }]),
         );
-        hooks.insert(spec.event.name().into(), json!([group]));
+        // An event may have several entries, one per matcher.
+        let groups = hooks.entry(spec.event.name()).or_insert_with(|| json!([]));
+        if let Some(groups) = groups.as_array_mut() {
+            groups.push(Value::Object(group));
+        }
     }
     json!({ "hooks": hooks })
 }

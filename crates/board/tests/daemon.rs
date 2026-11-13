@@ -45,6 +45,8 @@ enum Call {
         project: PathBuf,
         title: String,
     },
+    /// `t3 thread list`, read for the threads that run.
+    Running(PathBuf),
 }
 
 /// `message` without the `(wake-up <digest>)` line a wake-up message ends with.
@@ -393,6 +395,17 @@ impl T3 for FakeT3 {
             .filter(|(t, _)| t == title)
             .map(|(_, thread)| thread.clone())
             .collect())
+    }
+
+    async fn running_threads(&self, project: &Path) -> Result<Vec<String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Running(project.to_path_buf()));
+        if self.fail_list.load(Ordering::SeqCst) {
+            anyhow::bail!("t3 thread list failed: server not running");
+        }
+        Ok(self.running.lock().unwrap().clone())
     }
 }
 
@@ -5206,6 +5219,102 @@ async fn runs_at_once_in_the_configuration_replaces_the_default_device_limit() {
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3).len(), 3, "four runs leave three to workers");
+}
+
+fn running_lists(t3: &FakeT3) -> usize {
+    let calls = t3.calls().into_iter();
+    calls.filter(|c| matches!(c, Call::Running(_))).count()
+}
+
+#[tokio::test]
+async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    // Two threads the dispatcher did not start run on the device: one of its three runs
+    // is left, so one worker starts and the next task is held, with a note that says why.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(3);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "agent-child-2".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+    // T3 is asked once in the reconcile, for the one project of this device.
+    assert_eq!(running_lists(&e.t3), 1);
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-5/notes");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].agent.as_deref(), Some(DISPATCH));
+    let text = notes[0].body["text"].as_str().unwrap();
+    for part in [
+        "The device limit holds this task",
+        "has 3 of 3 runs: 1 of the dispatcher, 2 turns of other threads",
+        "agent-child-2, user-1",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(text.chars().count() <= 800, "{text}");
+
+    // The dispatcher's own run is among the running threads and counts once.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut e, 3);
+    *e.t3.running.lock().unwrap() = vec![J2.to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A full device starts nothing, and a task held in two reconciles gets one note.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(titles(&e.t3).is_empty());
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
+        1
+    );
+
+    // A T3 that does not answer leaves the count to the dispatcher's own runs.
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A device without a limit asks T3 for nothing.
+    let mut e = slots_env(3, &tasks);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 3);
+    assert_eq!(running_lists(&e.t3), 0);
+}
+
+#[tokio::test]
+async fn a_judge_waits_while_other_threads_fill_the_device() {
+    let tasks = [review_task("factory-4", 0)];
+    let mut e = judges_env(&tasks);
+    review_detail(&e, &tasks[0], vec![]);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(titles(&e.t3).is_empty());
+
+    // One of them ends: the judge starts.
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
 }
 
 #[tokio::test]

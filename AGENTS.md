@@ -14,6 +14,12 @@
   --all-targets -- -D warnings`, `cargo test --workspace`; for `web/`, its type check and
   build; for `deploy/`, `shellcheck deploy/*.sh`. Add tests with every behavior change.
 - Time comes from an injectable clock so expiry and staleness are testable.
+- The board never loses information (`docs/DESIGN.md`, "The trail rule"). Code that holds,
+  refuses, stops, retries, gives back or drops work writes a record first: the time, the
+  cause with its numbers, the thread or agent, and the whole of what was asked for. Put it
+  on the board (a note, an event, an ask), or in a file under `$BOARD_HOME/state/` that a
+  board record names; a log line alone is not a record. Add the record and its test in the
+  same change.
 
 ## Merging
 
