@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use board_proto::{
     AgentId, AgentState, AgentStateUpdate, EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION,
-    PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskId,
-    TaskStatus, Timestamp, Touches,
+    PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus,
+    Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -32,7 +32,7 @@ use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
 use crate::mcp;
 use crate::render;
-use crate::state::{self, AgentLocal, DoneMark, FiledMark, SessionLocal, ThreadRead, ToolStart};
+use crate::state::{self, AgentLocal, SessionLocal, ThreadRead, ToolStart};
 use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
 
 /// T3 thread ids of threads T3 started for a parent thread's `delegate_task`.
@@ -252,8 +252,6 @@ struct Hook<'a> {
     /// `UserPromptSubmit` and a `PostToolUse` with a heartbeat, the same when its title,
     /// link or parent changed since the hooks registered them.
     t3: Option<SeenThread>,
-    /// At `Stop`, the done reminder once worked out, kept for when the server then fails.
-    done_reminder: Option<String>,
     now: Timestamp,
     /// Shortly before the hook's server share runs out: what a hook may still spend
     /// registering the thread again ([`Hook::register_again`]).
@@ -308,11 +306,6 @@ async fn handle(
         // PostToolUse (failed to start, denied, interrupted, or hooks offline).
         if let Err(err) = state::prune_tool_starts(&home, TOOL_START_AGE) {
             tracing::debug!("pruning tool start marks: {err:#}");
-        }
-        // Done and filed marks of turns whose Stop hook never ran (interrupted, or the
-        // session ended).
-        if let Err(err) = state::prune_marks(&home, DONE_MARK_AGE) {
-            tracing::debug!("pruning done and filed marks: {err:#}");
         }
         // Hook state and cached snapshots of agents gone for a week.
         if let Err(err) = state::prune_agents(&home, AGENT_FILE_AGE) {
@@ -478,32 +471,23 @@ async fn handle(
         input,
         touches,
         t3,
-        done_reminder: None,
         now,
         // Set with the server's share, below.
         deadline: tokio::time::Instant::now(),
     };
-    // Turn boundaries for the done reminder hold whether or not the server answers.
+    // Turn boundaries hold whether or not the server answers.
     match event {
         // The prompt's snapshot sets the turn's hold anew, also when the server is not
-        // reached, so a mark from an earlier turn never decides this one's halt.
+        // reached, so an earlier turn's hold never decides this one's halt.
         HookEvent::UserPromptSubmit => {
             hook.local.turn_started = Some(hook.now);
             hook.local.end_turn_hold();
         }
-        // A new or resumed session: done marks left over were from a turn whose Stop never
-        // ran. Compaction happens within a turn, so it keeps them and the turn's start.
+        // A new or resumed session starts no turn. Compaction happens within a turn, so it
+        // keeps the turn's start.
         HookEvent::SessionStart if input["source"] != "compact" => {
             hook.local.turn_started = None;
             hook.local.end_turn_hold();
-            if let Err(err) = state::take_done(&hook.home, &hook.agent) {
-                tracing::debug!("dropping done marks: {err:#}");
-            }
-            if let Err(err) = state::take_released(&hook.home, &hook.agent) {
-                tracing::debug!("dropping released marks: {err:#}");
-            }
-            // What those turns filed still counts for the tasks it was about.
-            hook.take_filed();
         }
         _ => {}
     }
@@ -512,13 +496,7 @@ async fn handle(
         state::save_agent(&hook.home, &hook.agent, &hook.local)?;
         return Ok(reply);
     }
-    if event == HookEvent::Stop {
-        // Before any server call, so it survives a server that fails (`local_stop`), and
-        // before the share is measured, so its file reads count against the share.
-        hook.prepare_done_reminder();
-    }
-    // What the server gets: what the local steps, the client build and a `Stop`'s local work
-    // left of the budget.
+    // What the server gets: what the local steps and the client build left of the budget.
     let server_deadline = server_deadline(tokio::time::Instant::from_std(started));
     connects.set_deadline(server_deadline);
     let share = server_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -541,12 +519,12 @@ async fn handle(
         // The server answered with an error: it is reachable, so the cache is no better.
         Ok(Err(err)) if crate::client::error_code(&err).is_some() => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            (hook.local_stop(), None, true)
+            (Reply::Nothing, None, true)
         }
         // The relay did not forward the request: nothing is known about the server.
         Ok(Err(err)) if relay_failure(&err) == Some(RelayFailure::Refused) => {
             tracing::debug!("hook {}: {err:#}", event.name());
-            (hook.local_stop(), None, false)
+            (Reply::Nothing, None, false)
         }
         Ok(Err(err)) => {
             tracing::debug!("hook {}: {err:#}", event.name());
@@ -970,8 +948,6 @@ const SESSION_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(7 
 const TOOL_START_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 /// How long an agent's hook state and cached snapshot outlive its last write.
 const AGENT_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-/// How long a done mark no `Stop` hook read (an interrupted turn, an ended session) is kept.
-const DONE_MARK_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// Whether this session runs inside another agent session, which matters only when the
 /// T3 thread id would name it. Decided from the process table at `SessionStart` (or the
@@ -1444,88 +1420,7 @@ impl Hook<'_> {
                 self.cached_snapshot(failure)
             }
             HookEvent::PreCompact => self.compact_instructions(None),
-            _ => self.local_stop(),
-        }
-    }
-
-    /// At `Stop` without the server's answer: the done and release reminder, which needs no
-    /// server.
-    fn local_stop(&mut self) -> Reply {
-        if self.event != HookEvent::Stop {
-            return Reply::Nothing;
-        }
-        if self.done_reminder.is_none() {
-            self.prepare_done_reminder();
-        }
-        self.done_reminder
-            .take()
-            .map_or(Reply::Nothing, Reply::Block)
-    }
-
-    /// Sets `done_reminder`; a state file that cannot be read costs only the reminder, never
-    /// the handoff check or the offline backoff.
-    fn prepare_done_reminder(&mut self) {
-        match self.take_done_reminder() {
-            Ok(text) => self.done_reminder = text,
-            Err(err) => tracing::debug!("reading done marks: {err:#}"),
-        }
-    }
-
-    /// Reads the tasks this agent marked done since the last `Stop` and returns the reminder
-    /// to file what remains of them, once per task.
-    ///
-    /// The signal is the mark `ops::task_done` writes in this device's state after the server
-    /// accepted the done, rather than server events since the turn began. Every done this
-    /// agent makes goes through it (the `task_done` tool and `board done`), on this device,
-    /// under the same agent id the hooks resolve, and it needs no server call, so it holds
-    /// within the hook's budget, offline, and on a busy board whose events would take pages to
-    /// read. Each `Stop` takes the marks, so the next one sees only later dones; marks older
-    /// than the turn (`UserPromptSubmit`) are from a turn whose `Stop` never ran.
-    ///
-    /// A task the agent already filed follow-ups for gets no reminder ([`Hook::take_filed`]).
-    ///
-    /// The tasks the agent released to `open` this turn (`ops::record_released` marks them
-    /// the same way) are named in the same text, after the done ones: [`release_reminder`].
-    fn take_done_reminder(&mut self) -> Result<Option<String>> {
-        let marks = state::take_done(&self.home, &self.agent)?;
-        // Read apart, so marks that cannot be read cost only their own part.
-        let released = state::take_released(&self.home, &self.agent).unwrap_or_else(|err| {
-            tracing::debug!("reading released marks: {err:#}");
-            Vec::new()
-        });
-        self.take_filed();
-        if self.stop_continued() {
-            return Ok(None);
-        }
-        let released = released_to_remind(
-            released,
-            &marks,
-            self.local.turn_started,
-            &self.local.filed_about,
-            &mut self.local.release_reminded,
-        );
-        let done = done_reminder(
-            marks,
-            self.local.turn_started,
-            &mut self.local.filed_about,
-            &mut self.local.done_reminded,
-        );
-        Ok(release_reminder(done, &released))
-    }
-
-    /// Takes the marks of what this agent filed since the last `Stop` (`ops::task_add` and
-    /// `ops::ask_user` write them, as `ops::task_done` writes the done marks, so the signal
-    /// is as local and as complete). Remembers the tasks they were about in `filed_about`,
-    /// across turns.
-    ///
-    /// A done task then needs no reminder when the agent filed something about it, in any
-    /// turn: a sub-task, a proposal under it, an ask on it. A filing about another task, or
-    /// about none, does not answer for it: an agent that filed one item of found work has
-    /// left others only in its reply. Marks that cannot be read count as none.
-    fn take_filed(&mut self) {
-        match state::take_filed(&self.home, &self.agent) {
-            Ok(marks) => fold_filed(marks, &mut self.local.filed_about),
-            Err(err) => tracing::debug!("reading filed marks: {err:#}"),
+            _ => Reply::Nothing,
         }
     }
 
@@ -1871,20 +1766,20 @@ impl Hook<'_> {
             .passes(self.local.held_since)
     }
 
-    /// A `Stop` that follows our own block, ending the turn that answered a reminder.
+    /// A `Stop` that follows our own block, ending the turn that answered the handoff reminder.
     fn stop_continued(&self) -> bool {
         self.input["stop_hook_active"].as_bool().unwrap_or(false)
     }
 
     /// Marks the agent idle with the turn's last message, which the server keeps for the
-    /// user while the agent coordinates a board. A turn the reminders continue has not
-    /// ended, so its message is not sent; the next `Stop` sends the final one.
+    /// user while the agent coordinates a board, then gives the handoff reminder when one is
+    /// due. The `Stop` that follows its block has `stop_hook_active` and stays quiet.
     ///
-    /// Both reminders go in one block: the turn continues once, and the `Stop` that follows
-    /// has `stop_hook_active` and stays quiet, so a second block would never be seen.
-    /// `handle` has prepared the done reminder ([`Hook::prepare_done_reminder`]).
+    /// A done or a release gives no reminder here: the `task_done` and release outputs ask
+    /// to file what remains (`ops::task_done`), since a block here continues the turn after
+    /// the agent's report, and its answer then becomes the last message, the one T3 shows.
     async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
-        // The message worth keeping after our own block was the one the reminder interrupted.
+        // The message worth keeping after our own block was the one the reminder followed.
         let continued = self.stop_continued();
         let said = if continued {
             None
@@ -1905,22 +1800,13 @@ impl Hook<'_> {
             )
             .await?;
         // A halted turn is not asked to go on: the user paused its work. A turn begun
-        // while held (the user's own request) gets the reminders as any other.
+        // while held (the user's own request) gets the reminder as any other.
         let reply = if continued || self.local.halted() {
             Reply::Nothing
         } else {
-            let handoff = self.handoff_reminder().await?;
-            let text: Vec<String> = self
-                .done_reminder
-                .take()
-                .into_iter()
-                .chain(handoff)
-                .collect();
-            if text.is_empty() {
-                Reply::Nothing
-            } else {
-                Reply::Block(text.join("\n"))
-            }
+            self.handoff_reminder()
+                .await?
+                .map_or(Reply::Nothing, Reply::Block)
         };
         // A block continues the turn; otherwise it has ended, and a turn without a prompt
         // that follows has no time of its own.
@@ -2057,127 +1943,6 @@ impl Hook<'_> {
         ))
     }
 }
-
-/// How many reminded tasks the hook state keeps, for done tasks and for released ones; a
-/// task done or released again after it fell out is reminded about again.
-const DONE_REMINDED_KEPT: usize = 100;
-
-/// How many tasks the agent filed something about the hook state keeps.
-const FILED_ABOUT_KEPT: usize = 100;
-
-/// Remembers in `filed_about` the tasks `marks` were about, newest last; see
-/// [`Hook::take_filed`].
-fn fold_filed(marks: Vec<FiledMark>, filed_about: &mut Vec<TaskId>) {
-    for mark in marks {
-        if let Some(about) = mark.about {
-            filed_about.retain(|id| *id != about);
-            filed_about.push(about);
-        }
-    }
-    let excess = filed_about.len().saturating_sub(FILED_ABOUT_KEPT);
-    filed_about.drain(..excess);
-}
-
-/// The reminder for tasks marked done this turn (marks at or after `turn_started`, any when
-/// the turn's start is unknown) not reminded about before, which it records in `reminded`.
-/// None for the tasks in `filed_about`, which the agent already filed follow-ups about
-/// ([`Hook::take_filed`]). A done task leaves `filed_about`: what was filed about it answers
-/// for this done, not for one after the task is opened again.
-fn done_reminder(
-    marks: Vec<DoneMark>,
-    turn_started: Option<Timestamp>,
-    filed_about: &mut Vec<TaskId>,
-    reminded: &mut Vec<TaskId>,
-) -> Option<String> {
-    let mut ids: Vec<TaskId> = Vec::new();
-    for mark in marks {
-        let filed = filed_about.contains(&mark.task);
-        filed_about.retain(|id| *id != mark.task);
-        if turn_started.is_none_or(|t| mark.at >= t)
-            && !filed
-            && !reminded.contains(&mark.task)
-            && !ids.contains(&mark.task)
-        {
-            ids.push(mark.task);
-        }
-    }
-    if ids.is_empty() {
-        return None;
-    }
-    reminded.extend(ids.iter().cloned());
-    let excess = reminded.len().saturating_sub(DONE_REMINDED_KEPT);
-    reminded.drain(..excess);
-    let ids: Vec<&str> = ids.iter().map(TaskId::as_str).collect();
-    Some(format!(
-        "board: you marked {} done this turn. {DONE_REMINDER_ASK}",
-        ids.join(", ")
-    ))
-}
-
-/// The tasks released to `open` this turn (marks at or after `turn_started`, any when the
-/// turn's start is unknown) to remind about, which it records in `reminded`: each once. None
-/// that the agent filed something about, in any turn, as for a done task
-/// ([`Hook::take_filed`]). None the agent marked done after the release (`done`): the done
-/// reminder asks about that one, or did. A released task stays in `filed_about`, so a
-/// later done of it is judged as before.
-fn released_to_remind(
-    marks: Vec<DoneMark>,
-    done: &[DoneMark],
-    turn_started: Option<Timestamp>,
-    filed_about: &[TaskId],
-    reminded: &mut Vec<TaskId>,
-) -> Vec<TaskId> {
-    let mut ids: Vec<TaskId> = Vec::new();
-    for mark in marks {
-        if turn_started.is_none_or(|t| mark.at >= t)
-            && !filed_about.contains(&mark.task)
-            && !done.iter().any(|d| d.task == mark.task && d.at >= mark.at)
-            && !reminded.contains(&mark.task)
-            && !ids.contains(&mark.task)
-        {
-            ids.push(mark.task);
-        }
-    }
-    reminded.extend(ids.iter().cloned());
-    let excess = reminded.len().saturating_sub(DONE_REMINDED_KEPT);
-    reminded.drain(..excess);
-    ids
-}
-
-/// The `Stop` reminder for the turn: the done reminder (`done`), then the tasks the agent
-/// released to `open` unfinished, in one text, since a turn gets one block.
-fn release_reminder(done: Option<String>, released: &[TaskId]) -> Option<String> {
-    if released.is_empty() {
-        return done;
-    }
-    let ids: Vec<&str> = released.iter().map(TaskId::as_str).collect();
-    let ids = ids.join(", ");
-    Some(match done {
-        Some(done) => format!(
-            "{done}\nYou also released {ids} to open this turn, unfinished. {RELEASE_REMINDER_ALSO}"
-        ),
-        None => format!(
-            "board: you released {ids} to open this turn, unfinished. {RELEASE_REMINDER_ASK}"
-        ),
-    })
-}
-
-/// What the release reminder asks for, after it names the tasks: as [`DONE_REMINDER_ASK`],
-/// but what remains of a released task's own steps stays in it, so it asks for a note of
-/// the steps done and for the tasks that are not the task itself. A feedback report is
-/// named because agents took one for filed work.
-const RELEASE_REMINDER_ASK: &str = "Is any work left that is not on the board? What remains of the task's own steps stays in the task: add a note there that says which steps are done, unless one says it. File the rest now and name it in your reply: a follow-up task that one of its acceptance checks requires, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. A feedback report is not such a task. If nothing is left, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each released task.";
-
-/// The release reminder's part after a done reminder, which has asked the question and
-/// said how to answer it.
-const RELEASE_REMINDER_ALSO: &str = "What remains of its own steps stays in that task, not in a sub-task: add a note there that says which steps are done, unless one says it. File a follow-up task that one of its acceptance checks requires, too. A feedback report is not such a task. This reminder comes once for each released task.";
-
-/// What the done reminder asks for, after it names the tasks. The kinds of task are those of
-/// the MCP server's instructions (`mcp::INSTRUCTIONS`). It asks for the id of each open
-/// item's task or ask, not for a yes or a no: an agent that filed one item answered "no"
-/// with others still only in its reply. It says that a one-line reply is a complete answer,
-/// so an agent with nothing to file spends no more than that line.
-const DONE_REMINDER_ASK: &str = "Is any work left that is not on the board? Check each open item in your reply and your work: a limit, a follow-up, a step that waits on the user. Each one needs the id of its task or ask. File now each item that has none: a sub-task for what remains of the task, a proposal for work you found outside the task, a blocked task with an ask for what the user must do or decide. Then name each open item with its id in your reply. If there is no open item, or your reply already names each one with its id, reply \"nothing left to file\" and stop. That one line is a complete answer: do not read the board again, and do not file a task only to answer this. This reminder comes once for each done task.";
 
 /// Looks up the device token off the async threads: the Keychain lookup runs `security`.
 fn spawn_token(home: &Home) -> tokio::task::JoinHandle<Result<Option<String>>> {
@@ -2629,7 +2394,6 @@ pub fn current_exe() -> PathBuf {
 mod tests {
 
     use super::*;
-    use crate::state::Filed;
 
     #[tokio::test(start_paused = true)]
     async fn the_server_deadline_counts_all_time_since_the_hook_started() {
@@ -2836,254 +2600,6 @@ mod tests {
         assert_eq!(parse_reset("resets 9am", now), Some(local(9, 0, 7)));
         assert_eq!(parse_reset("usage limit reached", now), None);
         assert_eq!(parse_reset("resets soon", now), None);
-    }
-
-    #[test]
-    fn done_reminders_cover_this_turns_tasks_once_each() {
-        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
-        let mark = |task: &str, mins: i64| DoneMark {
-            task: task.parse().unwrap(),
-            at: t0 + chrono::Duration::minutes(mins),
-        };
-        let mut reminded = Vec::new();
-        assert_eq!(
-            done_reminder(vec![], Some(t0), &mut vec![], &mut reminded),
-            None
-        );
-        let text = done_reminder(
-            vec![
-                mark("factory-11", -1),
-                mark("factory-12", 1),
-                mark("factory-13", 2),
-            ],
-            Some(t0),
-            &mut vec![],
-            &mut reminded,
-        )
-        .unwrap();
-        assert!(
-            text.starts_with("board: you marked factory-12, factory-13 done this turn."),
-            "{text}"
-        );
-        assert_eq!(reminded.len(), 2, "the earlier turn's task is not recorded");
-        assert_eq!(
-            done_reminder(
-                vec![mark("factory-12", 5)],
-                Some(t0),
-                &mut vec![],
-                &mut reminded
-            ),
-            None
-        );
-        // Unknown turn start (no prompt since the session started): any mark counts.
-        assert!(
-            done_reminder(
-                vec![mark("factory-11", -1)],
-                None,
-                &mut vec![],
-                &mut reminded
-            )
-            .is_some()
-        );
-        // Bounded: the oldest fall out.
-        for n in 0..DONE_REMINDED_KEPT {
-            done_reminder(
-                vec![mark(&format!("other-{}", n + 1), 1)],
-                Some(t0),
-                &mut vec![],
-                &mut reminded,
-            );
-        }
-        assert_eq!(reminded.len(), DONE_REMINDED_KEPT);
-        assert!(!reminded.iter().any(|id| id.as_str() == "factory-12"));
-    }
-
-    #[test]
-    fn done_reminders_skip_tasks_with_follow_ups_filed() {
-        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
-        let mark = |task: &str| DoneMark {
-            task: task.parse().unwrap(),
-            at: t0,
-        };
-        let mut about: Vec<TaskId> = vec!["factory-12".parse().unwrap()];
-        let mut reminded = Vec::new();
-        // Something filed about the task itself: quiet for it, not for another task.
-        let text = done_reminder(
-            vec![mark("factory-12"), mark("factory-13")],
-            Some(t0),
-            &mut about,
-            &mut reminded,
-        )
-        .unwrap();
-        assert!(
-            text.starts_with("board: you marked factory-13 done this turn."),
-            "{text}"
-        );
-        // That answered for the one done: opened and done again, the task is asked about.
-        assert_eq!(about, vec![]);
-        assert!(
-            done_reminder(
-                vec![mark("factory-12")],
-                Some(t0),
-                &mut about,
-                &mut reminded
-            )
-            .is_some()
-        );
-        // Something filed about another task this turn does not answer for this one.
-        about.push("factory-15".parse().unwrap());
-        let text = done_reminder(
-            vec![mark("factory-14")],
-            Some(t0),
-            &mut about,
-            &mut reminded,
-        )
-        .unwrap();
-        assert!(
-            text.starts_with("board: you marked factory-14 done this turn."),
-            "{text}"
-        );
-        assert_eq!(reminded.len(), 3);
-    }
-
-    #[test]
-    fn filed_marks_count_for_the_task_they_are_about() {
-        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
-        let mark = |kind, about: Option<&str>| FiledMark {
-            kind,
-            about: about.map(|id| id.parse().unwrap()),
-            at: t0,
-        };
-        let mut about: Vec<TaskId> = Vec::new();
-        // Every kind counts for its task; a filing about no task counts for none.
-        fold_filed(
-            vec![
-                mark(Filed::SubTask, Some("factory-12")),
-                mark(Filed::Proposal, Some("factory-13")),
-                mark(Filed::Ask, None),
-            ],
-            &mut about,
-        );
-        assert_eq!(about.len(), 2);
-        fold_filed(vec![mark(Filed::Ask, Some("factory-12"))], &mut about);
-        assert_eq!(
-            about.iter().map(TaskId::as_str).collect::<Vec<_>>(),
-            ["factory-13", "factory-12"],
-            "each task once, the newest last"
-        );
-        // Bounded: the oldest fall out.
-        let many = (0..FILED_ABOUT_KEPT)
-            .map(|n| mark(Filed::SubTask, Some(&format!("other-{}", n + 1))))
-            .collect();
-        fold_filed(many, &mut about);
-        assert_eq!(about.len(), FILED_ABOUT_KEPT);
-        assert!(!about.iter().any(|id| id.as_str() == "factory-12"));
-    }
-
-    #[test]
-    fn the_done_reminder_reads_plainly() {
-        let text = done_reminder(
-            vec![DoneMark {
-                task: "factory-12".parse().unwrap(),
-                at: Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap(),
-            }],
-            None,
-            &mut vec![],
-            &mut Vec::new(),
-        )
-        .unwrap();
-        // "Proposal: tasks for found work" read as a placeholder to be filled in.
-        for placeholder in ["Proposal:", "<", "{", "...", "TODO"] {
-            assert!(!text.contains(placeholder), "{placeholder} in {text}");
-        }
-        // It asks for the id of each open item, not for a yes or a no.
-        assert!(
-            text.contains("Each one needs the id of its task or ask."),
-            "{text}"
-        );
-        assert!(
-            text.contains("name each open item with its id in your reply"),
-            "{text}"
-        );
-        // An agent with nothing to file is told that one line answers it.
-        assert!(
-            text.contains("reply \"nothing left to file\" and stop"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn release_reminders_cover_this_turns_tasks_once_each() {
-        let t0 = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
-        let mark = |task: &str, mins: i64| DoneMark {
-            task: task.parse().unwrap(),
-            at: t0 + chrono::Duration::minutes(mins),
-        };
-        let ids = |tasks: Vec<TaskId>| -> Vec<String> {
-            tasks.iter().map(|id| id.as_str().to_owned()).collect()
-        };
-        let about: Vec<TaskId> = vec!["factory-14".parse().unwrap()];
-        let mut reminded = Vec::new();
-        // Not the earlier turn's, the one something was filed about, or the one also done.
-        let marks = vec![
-            mark("factory-11", -1),
-            mark("factory-12", 1),
-            mark("factory-13", 2),
-            mark("factory-14", 2),
-            mark("factory-15", 2),
-        ];
-        // Done after the release; a done from before it (the task was opened again) is not
-        // what this release left.
-        let done = [mark("factory-15", 3), mark("factory-13", 1)];
-        let released = released_to_remind(marks.clone(), &done, Some(t0), &about, &mut reminded);
-        assert_eq!(ids(released), ["factory-12", "factory-13"]);
-        assert_eq!(about.len(), 1, "a released task stays filed about");
-        // Once each.
-        let again = released_to_remind(marks.clone(), &done, Some(t0), &about, &mut reminded);
-        assert_eq!(again, vec![]);
-        let mut fresh = Vec::new();
-        // Unknown turn start: any mark counts.
-        let any = released_to_remind(marks, &[], None, &[], &mut fresh);
-        assert_eq!(any.len(), 5);
-    }
-
-    #[test]
-    fn the_release_reminder_reads_plainly_and_shares_the_done_block() {
-        let released: Vec<TaskId> = vec!["factory-12".parse().unwrap()];
-        assert_eq!(release_reminder(None, &[]), None);
-        assert_eq!(
-            release_reminder(Some("done text".into()), &[]).as_deref(),
-            Some("done text"),
-            "the done reminder is unchanged without a released task"
-        );
-        let alone = release_reminder(None, &released).unwrap();
-        let both = release_reminder(Some("done text".into()), &released).unwrap();
-        assert!(
-            alone.starts_with("board: you released factory-12 to open this turn, unfinished."),
-            "{alone}"
-        );
-        assert!(
-            both.starts_with("done text\nYou also released factory-12 to open this turn"),
-            "{both}"
-        );
-        // An agent with nothing to file is told that one line answers it.
-        assert!(
-            alone.contains("reply \"nothing left to file\" and stop"),
-            "{alone}"
-        );
-        for text in [&alone, &both] {
-            for placeholder in ["Proposal:", "<", "{", "...", "TODO"] {
-                assert!(!text.contains(placeholder), "{placeholder} in {text}");
-            }
-            for fact in [
-                "add a note there that says which steps are done",
-                "a follow-up task that one of its acceptance checks requires",
-                "A feedback report is not such a task",
-                "once for each released task",
-            ] {
-                assert!(text.contains(fact), "{fact} in {text}");
-            }
-        }
     }
 
     #[test]
