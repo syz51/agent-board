@@ -484,6 +484,7 @@ fn daemon_configured(
         client: Client::new(&stub.url, TOKEN.into(), None, timeout).unwrap(),
         config,
         repo: RepoInfo::default(),
+        known: None,
     };
     Daemon::new(ctx, t3.clone()).with_gh(t3.gh.clone())
 }
@@ -1797,6 +1798,7 @@ async fn start_daemon(
             ..config
         },
         repo: RepoInfo::default(),
+        known: None,
     };
     let mut daemon = Daemon::new(ctx, t3.clone());
     daemon.reconcile(at()).await.unwrap();
@@ -4657,6 +4659,119 @@ async fn proposals_get_one_verdict_judge_per_parent_with_at_most_five_each() {
     let judged = registered(&e);
     assert_eq!(judged.len(), 4);
     assert_eq!(judged[3]["tasks"], json!(["factory-15", "factory-16"]));
+}
+
+/// Whether the stub was answering a request whose `METHOD path?query` contains `a` when
+/// one containing `b` arrived, or the other way round: the daemon sent them at once.
+fn at_once(stub: &Stub, a: &str, b: &str) -> bool {
+    stub.requests().iter().any(|r| {
+        let this = format!("{} {}?{}", r.method, r.path, r.query);
+        let beside = |other: &str| r.beside.iter().any(|o| o.contains(other));
+        (this.contains(a) && beside(b)) || (this.contains(b) && beside(a))
+    })
+}
+
+#[tokio::test]
+async fn the_proposals_and_the_ready_tasks_are_listed_at_once() {
+    let tasks = [proposal("factory-10", Some("factory-1"), 0)];
+    let mut e = judges_env(&tasks);
+    e.stub.delay("GET /v1/tasks", Duration::from_millis(100));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        at_once(&e.stub, "proposal=true", "ready=true&proposal=false"),
+        "{:#?}",
+        e.stub.requests_to("GET /v1/tasks")
+    );
+    // The judge the proposals call for is started all the same.
+    assert_eq!(
+        registered(&e),
+        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "verdict", "tasks": ["factory-10"]})]
+    );
+}
+
+#[tokio::test]
+async fn the_tasks_of_an_ended_judge_are_read_at_once_and_each_keeps_its_own_date() {
+    let batch = ["factory-10", "factory-11", "factory-12"];
+    let tasks: Vec<board_proto::Task> = (0..3)
+        .map(|n| proposal(batch[n], Some("factory-1"), n as i64))
+        .collect();
+    let mut e = judges_env(&tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(registered(&e).len(), 1);
+
+    // The judge ended. Each task changed at its own time; the first is the slowest to read.
+    let changed = |n: usize| at() + chrono::Duration::seconds(n as i64 + 1);
+    for (n, id) in batch.iter().enumerate() {
+        let mut read = detail(id, false, &[]);
+        read.task.updated_at = changed(n);
+        let route = format!("GET /v1/tasks/{id}");
+        e.stub.on(&route, read);
+        e.stub
+            .delay(&route, Duration::from_millis(if n == 0 { 200 } else { 50 }));
+    }
+    e.stub.clear();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    for other in &batch[1..] {
+        assert!(
+            at_once(&e.stub, "tasks/factory-10?", &format!("tasks/{other}?")),
+            "{other}: {:#?}",
+            e.stub.requests()
+        );
+    }
+    for (n, id) in batch.iter().enumerate() {
+        let retry = &e.daemon.state.judge_retry[&format!("verdict:{id}")];
+        assert_eq!(retry.updated_at, Some(changed(n)), "{id}");
+    }
+}
+
+/// The tasks that waited on a finished one are read side by side, and the wake-ups keep the
+/// order the finished task lists them in, however long each read takes.
+#[tokio::test]
+async fn the_tasks_a_done_task_blocked_are_read_at_once_and_woken_in_order() {
+    let (mut e, _) = owner_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    let owner: board_proto::AgentId = "t3:worker".parse().unwrap();
+    let waiting = ["factory-12", "factory-13", "factory-14"];
+    let mut done = detail("other-3", false, &waiting);
+    done.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/other-3", &done);
+    for (n, id) in waiting.iter().enumerate() {
+        let mut blocked = detail(id, false, &[]);
+        blocked.task.status = TaskStatus::Blocked;
+        blocked.task.owner = Some(owner.clone());
+        blocked.task.blockers = vec!["other-3".parse().unwrap()];
+        let route = format!("GET /v1/tasks/{id}");
+        e.stub.on(&route, &blocked);
+        // The first is the slowest to read.
+        e.stub
+            .delay(&route, Duration::from_millis(if n == 0 { 200 } else { 50 }));
+    }
+    e.stub.clear();
+
+    let mut ev = event(20, EventType::TaskDone, Some("other-3"), "t3:elsewhere");
+    ev.board = Some("other".parse().unwrap());
+    e.daemon.on_event(&ev, at()).await.unwrap();
+    for other in &waiting[1..] {
+        assert!(
+            at_once(&e.stub, "tasks/factory-12?", &format!("tasks/{other}?")),
+            "{other}: {:#?}",
+            e.stub.requests()
+        );
+    }
+    let woken: Vec<String> = e.daemon.state.wakes[&owner]
+        .wakes
+        .iter()
+        .map(|wake| match &wake.about {
+            board::daemon::WakeAbout::Unblocked { task, .. } => task.to_string(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(woken, waiting);
+    // The finished task is read once, and each blocker of a waiting task once.
+    assert_eq!(e.stub.requests_to("GET /v1/tasks/other-3").len(), 4);
 }
 
 #[tokio::test]

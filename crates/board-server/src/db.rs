@@ -68,6 +68,9 @@ pub struct Db {
     /// Read and write transactions begun, so tests can tell what a request cost.
     #[cfg(test)]
     transactions: Arc<[std::sync::atomic::AtomicUsize; 2]>,
+    /// The SQL of each statement run while a test records them; `None` when none does.
+    #[cfg(test)]
+    statements: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl Db {
@@ -83,7 +86,42 @@ impl Db {
             events,
             #[cfg(test)]
             transactions: Arc::default(),
+            #[cfg(test)]
+            statements: Arc::default(),
         })
+    }
+
+    /// Starts recording the SQL of every statement run from here on.
+    #[cfg(test)]
+    pub(crate) fn record_statements(&self) {
+        *lock(&self.statements) = Some(Vec::new());
+    }
+
+    /// The statements run since [`Db::record_statements`], in order; stops recording.
+    #[cfg(test)]
+    pub(crate) fn recorded_statements(&self) -> Vec<String> {
+        lock(&self.statements).take().expect("recording")
+    }
+
+    /// While a test records statements, has `conn` report each one it starts.
+    #[cfg(test)]
+    fn trace(&self, conn: &mut Connection) {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        if lock(&self.statements).is_none() {
+            return;
+        }
+        let log = Arc::clone(&self.statements);
+        conn.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(move |event: TraceEvent<'_>| {
+                if let TraceEvent::Stmt(_, sql) = event
+                    && let Some(log) = lock(&log).as_mut()
+                {
+                    log.push(sql.to_owned());
+                }
+            }),
+        )
+        .expect("traces statements");
     }
 
     /// Read and write transactions begun since the database opened.
@@ -140,6 +178,8 @@ impl Db {
         let mut conn = self.lock();
         #[cfg(test)]
         self.count_transaction(true);
+        #[cfg(test)]
+        self.trace(&mut conn);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cx = Ctx {
             db: &tx,
@@ -168,6 +208,8 @@ impl Db {
         let mut conn = self.readers.lend();
         #[cfg(test)]
         self.count_transaction(false);
+        #[cfg(test)]
+        self.trace(&mut conn);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let cx = Ctx {
             db: &tx,

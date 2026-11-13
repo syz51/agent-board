@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use board_proto::{AgentState, BoardStats, EvidenceKind, NewEvidence, Stats, Timestamp};
+use rusqlite::types::ValueRef;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 
@@ -98,14 +99,7 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
             |r| r.get(0),
         )?)
     };
-    let sum_payload = |kind: &str, field: &str| -> Result<u32> {
-        Ok(cx.db.query_row(
-            "SELECT COALESCE(SUM(json_extract(payload, ?3)), 0) FROM events \
-             WHERE type = ?1 AND at >= ?2",
-            params![kind, from, format!("$.{field}")],
-            |r| r.get(0),
-        )?)
-    };
+    let conflicts = conflicts_by_repo(cx, from)?;
     let done_payloads = cx
         .db
         .prepare_cached(
@@ -188,8 +182,7 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
             [from],
             |r| r.get(0),
         )?,
-        lease_conflicts: sum_payload("lease_created", "conflicts")?
-            + sum_payload("files_touched", "overlaps")?,
+        lease_conflicts: conflicts.iter().map(|(_, n)| n).sum(),
         asks_created: cx.db.query_row(
             "SELECT COUNT(*) FROM asks WHERE created_at >= ?1",
             [from],
@@ -202,8 +195,32 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
         done_under_a_minute: Some(under_a_minute),
         feedback: crate::ops::feedback::stats(cx, from)?,
         since: Some(ts(since)),
-        boards: board_stats(cx, from, since, done_by_board)?,
+        boards: board_stats(cx, from, since, done_by_board, &conflicts)?,
     })
+}
+
+/// Lease conflicts and touch overlaps since `?1`, summed per repository: the scan that
+/// [`conflicts_by_repo`] runs once for the total and for every board.
+pub(crate) const CONFLICTS_BY_REPO: &str = "SELECT json_extract(payload, '$.repo'), \
+     COALESCE(SUM(json_extract(payload, CASE type WHEN 'lease_created' THEN '$.conflicts' \
+                                         ELSE '$.overlaps' END)), 0) \
+     FROM events WHERE type IN ('lease_created', 'files_touched') AND at >= ?1 GROUP BY 1";
+
+/// Lease conflicts and touch overlaps since `from`, by the repository their event names
+/// (`None` for an event that names none, which counts for no board).
+fn conflicts_by_repo(cx: &Ctx<'_>, from: i64) -> Result<Vec<(Option<String>, u32)>> {
+    Ok(cx
+        .db
+        .prepare_cached(CONFLICTS_BY_REPO)?
+        .query_map([from], |r| {
+            // A board's repositories are strings, so a `repo` of another type matches none.
+            let repo = match r.get_ref(0)? {
+                ValueRef::Text(repo) => Some(String::from_utf8_lossy(repo).into_owned()),
+                _ => None,
+            };
+            Ok((repo, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// A `task_done` event of a board's task, as its board's stats read it.
@@ -222,6 +239,7 @@ fn board_stats(
     from: i64,
     since: i64,
     mut done: HashMap<String, Vec<DoneRow>>,
+    conflicts: &[(Option<String>, u32)],
 ) -> Result<Vec<BoardStats>> {
     let days = ((cx.now_ms() - since) as f64 / DAY_MS as f64).max(1.0 / 1440.0);
     // A board's newest event, by key, says whether it has any since `from`: one index
@@ -236,6 +254,7 @@ fn board_stats(
         .collect::<rusqlite::Result<_>>()?;
     let mut out = Vec::with_capacity(boards.len());
     for (slug, repos) in boards {
+        let repos: Vec<String> = parse_json(&repos)?;
         let waits = waits(cx, &slug, from)?;
         let done = done.remove(&slug).unwrap_or_default();
         let doing: Vec<f64> = doing_minutes(cx, &done)?.into_iter().flatten().collect();
@@ -251,14 +270,11 @@ fn board_stats(
             done_per_day: f64::from(tasks_done) / days,
             doing_minutes_median: median(doing),
             // On the board's repos, whichever board's task (if any) the lease names.
-            lease_conflicts: cx.db.query_row(
-                "SELECT COALESCE(SUM(json_extract(payload, CASE type \
-                 WHEN 'lease_created' THEN '$.conflicts' ELSE '$.overlaps' END)), 0) \
-                 FROM events WHERE type IN ('lease_created', 'files_touched') AND at >= ?1 \
-                 AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(?2))",
-                params![from, repos],
-                |r| r.get::<_, u32>(0),
-            )?,
+            lease_conflicts: conflicts
+                .iter()
+                .filter(|(repo, _)| repo.as_ref().is_some_and(|repo| repos.contains(repo)))
+                .map(|(_, n)| n)
+                .sum(),
             reopened_after_review: cx.db.query_row(
                 "SELECT COUNT(*) FROM events \
                  WHERE type IN ('task_released', 'task_updated') AND at >= ?2 AND board = ?1 \

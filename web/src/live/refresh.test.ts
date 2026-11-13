@@ -3,7 +3,7 @@ import { ApiFailure } from "../api/client.ts";
 import type { BoardEvent } from "../api/schema.ts";
 import type { QueryClient } from "@tanstack/react-query";
 import { QueryObserver } from "@tanstack/react-query";
-import { createQueryClient, fetching, invalidateTags } from "./query.ts";
+import { createQueryClient, fetching, invalidateTags, queries } from "./query.ts";
 import { TagBatcher, tags, tagsForEvent } from "./refresh.ts";
 import { manualTimers } from "./testing.ts";
 
@@ -78,11 +78,11 @@ describe("tagsForEvent", () => {
     ]);
   });
 
-  test("an agent's state change also refreshes said lists: a coordinator's turn ending comes with it", () => {
-    expect(tagsForEvent(event("agent_state_changed", { board: null }))).toEqual([
+  test("an agent's state change also refreshes its own said list: a coordinator's turn ending comes with it", () => {
+    expect(tagsForEvent(event("agent_state_changed", { board: null, actor: "t3:c2d0" }))).toEqual([
       tags.agents,
       tags.boards,
-      tags.said,
+      tags.saidOf("t3:c2d0"),
     ]);
   });
 
@@ -193,6 +193,31 @@ describe("query tags", () => {
 
     await invalidateTags(client, [tags.board("factory")]);
     expect(shown.read().data).toBe(2);
+  });
+
+  test("an agent's state change refetches that agent's said list and no other agent's", async () => {
+    const client = createQueryClient();
+    const calls = { "t3:c2d0": 0, "t3:9e41": 0 };
+    const said = (agent: keyof typeof calls) =>
+      show(
+        client,
+        `said:${agent}`,
+        [...(queries.said(agent, 3).meta?.tags ?? [])],
+        async () => ++calls[agent],
+      );
+    const lists = [said("t3:c2d0"), said("t3:9e41")];
+    await flush();
+    expect(calls).toEqual({ "t3:c2d0": 1, "t3:9e41": 1 });
+
+    const stopped = event("agent_state_changed", { board: null, actor: "t3:c2d0" });
+    await invalidateTags(client, tagsForEvent(stopped));
+    expect(calls).toEqual({ "t3:c2d0": 2, "t3:9e41": 1 });
+
+    // A deleted board takes its turn endings with it, whoever said them.
+    const deleted = event("board_updated", { payload: { fields: ["deleted"] } });
+    await invalidateTags(client, tagsForEvent(deleted));
+    expect(calls).toEqual({ "t3:c2d0": 3, "t3:9e41": 2 });
+    for (const list of lists) list.unsubscribe();
   });
 
   test("a query nobody shows is marked stale and refetched when shown again", async () => {

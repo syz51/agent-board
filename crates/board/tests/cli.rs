@@ -1046,6 +1046,45 @@ fn login_stores_config_and_a_private_token_without_printing_it() {
     }
 }
 
+/// A command that acts as the agent and then looks for the agent's board reads the agent
+/// once: the record that showed it registered also names its boards.
+#[test]
+fn a_command_without_a_board_reads_the_agent_once() {
+    let e = env();
+    let me = format!("GET /v1/agents/{}", enc(ME));
+    let mut agent = agent_fixture(ME, DEVICE, board_proto::AgentState::Running);
+    agent.boards = vec!["tool".parse().unwrap()];
+    e.stub.on(&me, &agent);
+    // Neither board covers this folder: only the agent's record names its board.
+    e.stub.on(
+        "GET /v1/boards",
+        [
+            board_fixture("factory", &["github.com/acme/factory"]),
+            board_fixture("tool", &["github.com/acme/tool"]),
+        ],
+    );
+    e.stub.on(
+        "GET /v1/boards/tool",
+        board_fixture("tool", &["github.com/acme/tool"]),
+    );
+    e.stub.on("GET /v1/agents", [&agent]);
+
+    let out = e.run(&["status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("tool board"), "{}", stdout(&out));
+    assert_eq!(e.stub.requests_to("GET /v1/boards/tool").len(), 1);
+    assert_eq!(e.stub.requests_to(&me).len(), 1, "{:?}", e.stub.requests());
+
+    // An agent registered by this command has no board yet, so its record is read anew.
+    e.stub.clear();
+    e.stub.once_error(&me, 404, "not_found", "no such agent");
+    e.stub.on("POST /v1/agents", &agent);
+    let out = e.run(&["status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("tool board"), "{}", stdout(&out));
+    assert_eq!(e.stub.requests_to(&me).len(), 2, "{:?}", e.stub.requests());
+}
+
 #[test]
 fn an_unregistered_agent_is_registered_before_acting() {
     let e = env();

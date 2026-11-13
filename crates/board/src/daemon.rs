@@ -79,6 +79,9 @@ pub const WAKE_RETRY_MAX: TimeDelta = TimeDelta::minutes(10);
 const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many agents' wake-ups a flush checks at once.
 const FLUSH_CHECKS_AT_ONCE: usize = 8;
+/// How many of the tasks that waited on a finished task are read at once. The client speaks
+/// HTTP/1.1, so each read at once holds a connection of its own.
+const BLOCKED_CHECKS_AT_ONCE: usize = 4;
 /// Renew the 45-minute coordinator lease of a dispatched board this often.
 pub const RENEW_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 /// The daemon reads the usage endpoint at most this often; between its own readings, each
@@ -2526,24 +2529,39 @@ impl<T: T3> Daemon<T> {
             EventType::TaskDone => {
                 if let Some(done) = &event.task {
                     let detail = self.client().task(done).await?;
-                    for blocked in &detail.blocks {
-                        // One gone since (its board deleted) does not hold up the rest.
-                        let t = match self.client().task(blocked).await {
-                            Ok(d) => d.task,
-                            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
-                            Err(err) => return Err(err),
+                    // Each waiting task is read apart from the others, so a few are read at
+                    // once; the results are taken in the order the finished task lists them.
+                    let checks = futures_util::stream::iter(detail.blocks.iter().map(
+                        |blocked| async move {
+                            // One gone since (its board deleted) does not hold up the rest.
+                            let t = match self.client().task(blocked).await {
+                                Ok(d) => d.task,
+                                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                                    return Ok(None);
+                                }
+                                Err(err) => return Err(err),
+                            };
+                            let unblocked = !(t.ready && t.auto)
+                                && self.wakeable(t.owner.as_ref(), event).is_some()
+                                && t.status == TaskStatus::Blocked
+                                && self.blockers_done(&t).await?;
+                            Ok(Some((t, unblocked)))
+                        },
+                    ))
+                    .buffered(BLOCKED_CHECKS_AT_ONCE);
+                    tokio::pin!(checks);
+                    while let Some(check) = checks.next().await {
+                        let Some((t, unblocked)) = check? else {
+                            continue;
                         };
                         if t.ready && t.auto {
                             reconcile |= self.dispatches_here(&t.board);
-                        } else if let Some(owner) = self.wakeable(t.owner.as_ref(), event)
-                            && t.status == TaskStatus::Blocked
-                            && self.blockers_done(&t).await?
-                        {
+                        } else if unblocked && let Some(owner) = t.owner {
                             let about = WakeAbout::Unblocked {
                                 done: done.clone(),
-                                task: t.id.clone(),
+                                task: t.id,
                             };
-                            wakes.push((t.board.clone(), owner.clone(), about));
+                            wakes.push((t.board, owner, about));
                         }
                     }
                 }

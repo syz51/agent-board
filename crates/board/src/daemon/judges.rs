@@ -466,15 +466,24 @@ impl<T: T3> Daemon<T> {
             }
         }
 
-        let proposals = client
-            .tasks(&TaskQuery {
-                board: Some(slug.clone()),
-                proposal: Some(true),
-                limit: Some(board_proto::TASKS_LIMIT_MAX),
-                ..TaskQuery::default()
-            })
-            .await
-            .context("listing the pending proposals")?;
+        // Neither list needs the other, so both are read at once. A failure of the first is
+        // the one reported, as when they were read in turn.
+        let proposals = TaskQuery {
+            board: Some(slug.clone()),
+            proposal: Some(true),
+            limit: Some(board_proto::TASKS_LIMIT_MAX),
+            ..TaskQuery::default()
+        };
+        let ready = TaskQuery {
+            board: Some(slug.clone()),
+            ready: Some(true),
+            proposal: Some(false),
+            limit: Some(board_proto::TASKS_LIMIT_MAX),
+            ..TaskQuery::default()
+        };
+        let (proposals, ready) = tokio::join!(client.tasks(&proposals), client.tasks(&ready));
+        let proposals = proposals.context("listing the pending proposals")?;
+        let ready = ready.context("listing the ready tasks")?;
         let mut by_parent: BTreeMap<Option<TaskId>, Vec<&Task>> = BTreeMap::new();
         for proposal in proposals.iter().filter(|t| is_proposal(t)) {
             by_parent
@@ -509,16 +518,6 @@ impl<T: T3> Daemon<T> {
             });
         }
 
-        let ready = client
-            .tasks(&TaskQuery {
-                board: Some(slug.clone()),
-                ready: Some(true),
-                proposal: Some(false),
-                limit: Some(board_proto::TASKS_LIMIT_MAX),
-                ..TaskQuery::default()
-            })
-            .await
-            .context("listing the ready tasks")?;
         if self.triages(slug) {
             let mut items: Vec<&Task> = ready
                 .iter()
@@ -639,8 +638,10 @@ impl<T: T3> Daemon<T> {
             };
             self.state.judge_retry.insert(goal_key(&run.board), retry);
         }
-        for task in &run.tasks {
-            let updated_at = match client.task(task).await {
+        // At most [`JUDGE_TASKS_AT_ONCE`] tasks, each read apart from the others.
+        let reads = futures_util::future::join_all(run.tasks.iter().map(|t| client.task(t))).await;
+        for (task, read) in run.tasks.iter().zip(reads) {
+            let updated_at = match read {
                 Ok(detail) => Some(detail.task.updated_at),
                 Err(err) => {
                     tracing::debug!("reading {task} after its judge: {err:#}");

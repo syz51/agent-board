@@ -492,14 +492,7 @@ pub(crate) fn counts(cx: &Ctx<'_>, board: &BoardSlug) -> Result<StatusCounts> {
     })?;
     for row in rows {
         let (status, n) = row?;
-        match parse_enum::<TaskStatus>(&status)? {
-            TaskStatus::Open => counts.open = n,
-            TaskStatus::Doing => counts.doing = n,
-            TaskStatus::Blocked => counts.blocked = n,
-            TaskStatus::Review => counts.review = n,
-            TaskStatus::Done => counts.done = n,
-            TaskStatus::Dropped => counts.dropped = n,
-        }
+        count_status(&mut counts, &status, n)?;
     }
     let ready_auto;
     (counts.ready, ready_auto) = cx.db.query_row(
@@ -519,42 +512,69 @@ pub(crate) fn counts(cx: &Ctx<'_>, board: &BoardSlug) -> Result<StatusCounts> {
     Ok(counts)
 }
 
-pub(crate) fn find_board(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<Board>> {
-    let row = cx
+fn count_status(counts: &mut StatusCounts, status: &str, n: u32) -> Result<()> {
+    match parse_enum::<TaskStatus>(status)? {
+        TaskStatus::Open => counts.open = n,
+        TaskStatus::Doing => counts.doing = n,
+        TaskStatus::Blocked => counts.blocked = n,
+        TaskStatus::Review => counts.review = n,
+        TaskStatus::Done => counts.done = n,
+        TaskStatus::Dropped => counts.dropped = n,
+    }
+    Ok(())
+}
+
+const BOARD_COLUMNS: &str = "slug, title, goal, status, repos, autopilot, home_devices, \
+     coordinator, coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, \
+     dispatch, usage_stop_at";
+
+/// A board's stored columns and its live coordinator, with nothing counted yet.
+fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
+    let expires: Option<i64> = r.get(8)?;
+    let coordinator: Option<String> = r.get(7)?;
+    Ok(Board {
+        slug: parse_id(&r.get::<_, String>(0)?)?,
+        title: r.get(1)?,
+        goal: r.get(2)?,
+        status: parse_enum(&r.get::<_, String>(3)?)?,
+        temporary: r.get(11)?,
+        repos: parse_json(&r.get::<_, String>(4)?)?,
+        autopilot: r.get(5)?,
+        parallel_tasks: r.get(12)?,
+        usage_stop_at: r.get(14)?,
+        coordinator: match (coordinator, expires) {
+            (Some(c), Some(e)) if e > now_ms => Some(parse_id(&c)?),
+            _ => None,
+        },
+        dispatch: parse_enum(&r.get::<_, String>(13)?)?,
+        home_devices: parse_json(&r.get::<_, String>(6)?)?,
+        counts: StatusCounts::default(),
+        open_asks: 0,
+        created_at: ts(r.get(9)?),
+        updated_at: ts(r.get(10)?),
+    })
+}
+
+/// A board that only has to exist, or whose settings or coordinator are read: its `counts`
+/// and `open_asks` are zero. Counting a board's tasks reads every open one, so a caller
+/// that shows neither number asks for this instead of [`get_board`].
+pub(crate) fn get_board_uncounted(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Board> {
+    find_board_uncounted(cx, slug)?.ok_or_else(|| board_missing(slug))
+}
+
+fn find_board_uncounted(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<Board>> {
+    let now_ms = cx.now_ms();
+    Ok(cx
         .db
-        .query_row(
-            "SELECT slug, title, goal, status, repos, autopilot, home_devices, coordinator, \
-             coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, dispatch, \
-             usage_stop_at FROM boards WHERE slug = ?1",
-            [slug.as_str()],
-            |r| {
-                let expires: Option<i64> = r.get(8)?;
-                let coordinator: Option<String> = r.get(7)?;
-                Ok(Board {
-                    slug: parse_id(&r.get::<_, String>(0)?)?,
-                    title: r.get(1)?,
-                    goal: r.get(2)?,
-                    status: parse_enum(&r.get::<_, String>(3)?)?,
-                    temporary: r.get(11)?,
-                    repos: parse_json(&r.get::<_, String>(4)?)?,
-                    autopilot: r.get(5)?,
-                    parallel_tasks: r.get(12)?,
-                    usage_stop_at: r.get(14)?,
-                    coordinator: match (coordinator, expires) {
-                        (Some(c), Some(e)) if e > cx.now_ms() => Some(parse_id(&c)?),
-                        _ => None,
-                    },
-                    dispatch: parse_enum(&r.get::<_, String>(13)?)?,
-                    home_devices: parse_json(&r.get::<_, String>(6)?)?,
-                    counts: StatusCounts::default(),
-                    open_asks: 0,
-                    created_at: ts(r.get(9)?),
-                    updated_at: ts(r.get(10)?),
-                })
-            },
-        )
-        .optional()?;
-    let Some(mut board) = row else {
+        .prepare_cached(&format!(
+            "SELECT {BOARD_COLUMNS} FROM boards WHERE slug = ?1"
+        ))?
+        .query_row([slug.as_str()], |r| board_row(r, now_ms))
+        .optional()?)
+}
+
+pub(crate) fn find_board(cx: &Ctx<'_>, slug: &BoardSlug) -> Result<Option<Board>> {
+    let Some(mut board) = find_board_uncounted(cx, slug)? else {
         return Ok(None);
     };
     board.counts = counts(cx, slug)?;
@@ -577,13 +597,68 @@ pub(crate) fn board_missing(slug: &BoardSlug) -> crate::Error {
     )
 }
 
+/// Every board's tasks by status: [`counts`]'s first query, for all boards at once.
+pub(crate) const ALL_STATUS_COUNTS: &str =
+    "SELECT board, status, COUNT(*) FROM tasks GROUP BY board, status";
+
+/// Every board's ready tasks and how many of them are auto: [`counts`]'s second query, for
+/// all boards at once. It searches each board's open tasks, as the query for one board does.
+pub(crate) fn all_ready_counts_sql() -> String {
+    format!(
+        "SELECT b.slug, COUNT(*), COALESCE(SUM(t.auto = 1), 0) \
+         FROM boards b CROSS JOIN tasks t ON t.board = b.slug WHERE {} GROUP BY b.slug",
+        ready_sql("t")
+    )
+}
+
+/// Every board's open asks.
+pub(crate) const ALL_OPEN_ASKS: &str =
+    "SELECT board, COUNT(*) FROM asks WHERE status = 'open' GROUP BY board";
+
+/// Every board with its counts, as [`get_board`] gives each, in four statements however
+/// many boards there are.
 pub(crate) fn list_boards(cx: &Ctx<'_>) -> Result<Vec<Board>> {
-    let slugs = cx
+    let now_ms = cx.now_ms();
+    let mut boards = cx
         .db
-        .prepare_cached("SELECT slug FROM boards ORDER BY slug")?
-        .query_map([], |r| parse_id::<BoardSlug>(&r.get::<_, String>(0)?))?
+        .prepare_cached(&format!("SELECT {BOARD_COLUMNS} FROM boards ORDER BY slug"))?
+        .query_map([], |r| board_row(r, now_ms))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    slugs.iter().map(|s| get_board(cx, s)).collect()
+    let at: HashMap<String, usize> = boards
+        .iter()
+        .enumerate()
+        .map(|(i, board)| (board.slug.to_string(), i))
+        .collect();
+    for board in &mut boards {
+        board.counts.ready_auto = Some(0);
+    }
+    let mut stmt = cx.db.prepare_cached(ALL_STATUS_COUNTS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if let Some(&i) = at.get(&r.get::<_, String>(0)?) {
+            count_status(&mut boards[i].counts, &r.get::<_, String>(1)?, r.get(2)?)?;
+        }
+    }
+    let mut stmt = cx.db.prepare_cached(&all_ready_counts_sql())?;
+    let mut rows = stmt.query(named_params! {
+        ":now": now_ms,
+        ":cutoff": cx.stale_cutoff(),
+    })?;
+    while let Some(r) = rows.next()? {
+        if let Some(&i) = at.get(&r.get::<_, String>(0)?) {
+            let counts = &mut boards[i].counts;
+            counts.ready = r.get(1)?;
+            counts.ready_auto = Some(r.get(2)?);
+        }
+    }
+    let mut stmt = cx.db.prepare_cached(ALL_OPEN_ASKS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if let Some(&i) = at.get(&r.get::<_, String>(0)?) {
+            boards[i].open_asks = r.get(1)?;
+        }
+    }
+    Ok(boards)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -627,11 +702,31 @@ pub(crate) fn load_agents(
         .prepare_cached(&sql)?
         .query_map(extra.as_slice(), agent_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if agents.len() <= 1 {
+        if let Some(agent) = agents.first_mut() {
+            agent.boards = agent_boards(cx, &agent.id)?;
+        }
+        return Ok(agents);
+    }
+    // Every agent's boards in one query, each agent's in the order `agent_boards` gives.
+    let mut stmt = cx.db.prepare_cached(BATCH_AGENT_BOARDS)?;
+    let mut rows = stmt.query([json_ids(agents.iter().map(|a| a.id.as_str()))])?;
+    let mut boards: HashMap<String, Vec<BoardSlug>> = HashMap::new();
+    while let Some(r) = rows.next()? {
+        boards
+            .entry(r.get(0)?)
+            .or_default()
+            .push(parse_id(&r.get::<_, String>(1)?)?);
+    }
     for agent in &mut agents {
-        agent.boards = agent_boards(cx, &agent.id)?;
+        agent.boards = boards.remove(agent.id.as_str()).unwrap_or_default();
     }
     Ok(agents)
 }
+
+/// The boards of many agents in one query, the ids bound as one JSON array.
+pub(crate) const BATCH_AGENT_BOARDS: &str = "SELECT agent, board FROM board_members \
+     WHERE agent IN (SELECT value FROM json_each(?1)) ORDER BY board";
 
 pub(crate) fn agent_boards(cx: &Ctx<'_>, agent: &AgentId) -> Result<Vec<BoardSlug>> {
     Ok(cx

@@ -966,11 +966,10 @@ async fn show_snapshot(
         format: q.format.unwrap_or_default(),
     };
     let snapshot = if advance {
+        // Rendered on a read connection, so snapshots of many agents render at once and
+        // the writer is held only to move the cursor.
         state
-            .write(move |cx| {
-                let rendered = snapshot::snapshot(cx, req)?;
-                snapshot::advance(cx, rendered)
-            })
+            .read_then_write(move |cx| snapshot::snapshot(cx, req), snapshot::advance)
             .await?
     } else {
         state

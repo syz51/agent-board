@@ -1,5 +1,5 @@
-//! Query cost: the plans of the snapshot's hot queries, and a timed snapshot over a large
-//! board (ignored by default: run it in a release build).
+//! Query cost: the plans of the hot queries, the statements a request runs, and a timed
+//! snapshot over a large board (ignored by default: run it in a release build).
 
 use std::time::{Duration, Instant};
 
@@ -405,4 +405,274 @@ async fn ready_filter_and_limit_match_the_full_list() {
         open.iter()
             .all(|t| t["status"] == json!("open") && t["ready"] == json!(false))
     );
+}
+
+/// What `request` answers, and the SQL of each statement the database ran for it.
+async fn statements<R>(t: &T, request: impl Future<Output = R>) -> (R, Vec<String>) {
+    t.state.db().record_statements();
+    let response = request.await;
+    (response, t.state.db().recorded_statements())
+}
+
+/// How many of the statements in `run` contain `part`.
+fn running(run: &[String], part: &str) -> usize {
+    run.iter().filter(|sql| sql.contains(part)).count()
+}
+
+/// A board `slug` with `tasks` tasks in every state its counts tell apart: each status, and
+/// open tasks that are ready (auto or not), owned by a live agent, blocked or not yet due.
+async fn counted_board(t: &T, slug: &str, tasks: u32) {
+    t.board(slug, &[&format!("github.com/example/{slug}")])
+        .await;
+    let now = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {tasks})
+         INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, owner,
+                            auto, not_before, created_by, version, done_at, created_at, updated_at)
+         SELECT '{slug}-' || i, '{slug}', i, 'Task ' || i, '', '',
+                CASE i % 7 WHEN 0 THEN 'doing' WHEN 1 THEN 'blocked' WHEN 2 THEN 'review'
+                           WHEN 3 THEN 'done' WHEN 4 THEN 'dropped' ELSE 'open' END,
+                'p2',
+                CASE WHEN i % 7 = 0 OR i % 14 = 6 THEN '{ME}' WHEN i % 14 = 5 THEN 't3:gone' END,
+                i % 3 > 0,
+                CASE WHEN i % 21 = 5 THEN {now} + 60000 END,
+                '{ME}', 1, CASE WHEN i % 7 = 3 THEN {now} END, {now}, {now}
+         FROM n;
+         UPDATE boards SET next_number = {tasks} + 1 WHERE slug = '{slug}';
+         INSERT INTO task_blockers (task, blocker)
+         SELECT id, '{slug}-1' FROM tasks
+         WHERE board = '{slug}' AND status = 'open' AND number % 4 = 0;"
+    ));
+}
+
+/// The list of boards runs the same statements however many boards there are, and gives
+/// each board the row, the counts and the open asks its own read gives.
+#[tokio::test]
+async fn listing_boards_costs_the_same_however_many_there_are() {
+    use crate::store::{ALL_OPEN_ASKS, ALL_STATUS_COUNTS, all_ready_counts_sql};
+    let t = T::new();
+    big_board(&t, 60, 60).await;
+    let (_, few) = statements(&t, t.ok("GET", "/v1/boards", Some(ME), None)).await;
+    for n in 0..6 {
+        let slug = format!("extra{n}");
+        counted_board(&t, &slug, 20 + 9 * n).await;
+        for ask in 0..n % 3 {
+            t.ok(
+                "POST",
+                "/v1/asks",
+                Some(ME),
+                Some(json!({
+                    "agent": ME, "board": slug, "kind": "decision",
+                    "question": format!("Question {ask}?"), "options": ["yes", "no"],
+                })),
+            )
+            .await;
+        }
+    }
+    t.board("empty", &["github.com/example/empty"]).await;
+    let (listed, many) = statements(&t, t.ok("GET", "/v1/boards", Some(ME), None)).await;
+    assert_eq!(many.len(), few.len(), "{many:#?}");
+
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 9);
+    let (mut ready, mut held, mut asked) = (0, 0, 0);
+    for board in listed {
+        let slug = board["slug"].as_str().unwrap();
+        let own = t
+            .ok("GET", &format!("/v1/boards/{slug}"), Some(ME), None)
+            .await;
+        assert_eq!(*board, own, "{slug}");
+        let counts = &board["counts"];
+        ready += usize::from(counts["ready"].as_u64() > Some(0));
+        held += usize::from(counts["ready"].as_u64() > counts["ready_auto"].as_u64());
+        asked += usize::from(board["open_asks"].as_u64() > Some(0));
+    }
+    // The fixture covers every case: ready tasks, some of them not auto, open asks, and a
+    // board with no task, whose ready counts are zero and not unknown.
+    assert!(ready > 5 && held > 3 && asked > 2, "{ready} {held} {asked}");
+    let empty = listed.iter().find(|b| b["slug"] == "empty").unwrap();
+    assert_eq!(
+        empty["counts"],
+        json!({
+            "open": 0, "doing": 0, "blocked": 0, "review": 0, "done": 0, "dropped": 0,
+            "ready": 0, "ready_auto": 0,
+        })
+    );
+
+    // Each board's open tasks are searched along `tasks_board`, as one board's count does,
+    // and the other two counts read an index in its own order: no scan of tasks, no sort.
+    let p = plan(&t, &all_ready_counts_sql());
+    assert!(
+        p.contains("SEARCH t USING INDEX tasks_board (board=? AND status=?)"),
+        "{p}"
+    );
+    assert!(!p.contains("SCAN t") && !p.contains("TEMP B-TREE"), "{p}");
+    let p = plan(&t, ALL_STATUS_COUNTS);
+    assert_eq!(p, "SCAN tasks USING COVERING INDEX tasks_board");
+    let p = plan(&t, ALL_OPEN_ASKS);
+    assert_eq!(p, "SEARCH asks USING COVERING INDEX asks_status (status=?)");
+}
+
+/// The list of agents reads every agent's boards in one query, and gives each agent the
+/// boards its own read gives, in the same order.
+#[tokio::test]
+async fn listing_agents_reads_their_boards_in_one_query() {
+    use crate::store::BATCH_AGENT_BOARDS;
+    let t = T::new();
+    big_board(&t, 30, 30).await;
+    t.board("zeta", &["github.com/example/zeta"]).await;
+    // An agent on no repository is on no board.
+    t.register("t3:nowhere", None, None).await;
+    for n in 0..PEERS {
+        // No board, one, two or three, joined in an order that is not the listed one.
+        for slug in &["zeta", "app", "other"][..n % 4] {
+            let agent = peer(n);
+            t.ok(
+                "POST",
+                &format!("/v1/boards/{slug}/join"),
+                Some(&agent),
+                Some(json!({ "agent": agent })),
+            )
+            .await;
+        }
+    }
+    let (agents, run) = statements(&t, t.ok("GET", "/v1/agents", Some(ME), None)).await;
+    assert_eq!(running(&run, "FROM board_members"), 1, "{run:#?}");
+
+    let agents = agents.as_array().unwrap();
+    assert_eq!(agents.len(), PEERS + 3);
+    let mut sizes = [0; 4];
+    for agent in agents {
+        let id = agent["id"].as_str().unwrap();
+        let own = t
+            .ok("GET", &format!("/v1/agents/{id}"), Some(ME), None)
+            .await;
+        assert_eq!(*agent, own, "{id}");
+        let boards = t.strings(&format!(
+            "SELECT board FROM board_members WHERE agent = '{id}' ORDER BY board"
+        ));
+        assert_eq!(agent["boards"], json!(boards), "{id}");
+        sizes[boards.len()] += 1;
+    }
+    assert!(sizes.iter().all(|&n| n > 0), "{sizes:?}");
+
+    // A search per agent along `board_members_agent`, no scan of the memberships.
+    let p = plan(&t, BATCH_AGENT_BOARDS);
+    assert!(
+        p.contains("SEARCH board_members USING INDEX board_members_agent (agent=?)"),
+        "{p}"
+    );
+    assert!(!p.contains("SCAN board_members"), "{p}");
+}
+
+/// A request that only needs a board to exist, or reads its settings, does not count the
+/// board's tasks and asks; one that answers with the board counts them once.
+#[tokio::test]
+async fn a_request_that_shows_no_board_counts_counts_nothing() {
+    let t = T::new();
+    big_board(&t, 60, 60).await;
+    // The three statements that count a board, as `get_board` runs them.
+    let counted = |run: &[String]| {
+        [
+            running(run, "FROM tasks WHERE board = ?1 GROUP BY status"),
+            running(run, "COALESCE(SUM(t.auto = 1), 0) FROM tasks t"),
+            running(run, "FROM asks WHERE board = ?1 AND status = 'open'"),
+        ]
+    };
+    let create = json!({ "agent": ME, "board": "app", "title": "One more" });
+    let (_, run) = statements(&t, t.ok("POST", "/v1/tasks", Some(ME), Some(create))).await;
+    assert_eq!(counted(&run), [0, 0, 0], "{run:#?}");
+    let ask = json!({
+        "agent": ME, "board": "app", "kind": "decision", "question": "Which one?",
+        "options": ["yes", "no"],
+    });
+    let (_, run) = statements(&t, t.ok("POST", "/v1/asks", Some(ME), Some(ask))).await;
+    assert_eq!(counted(&run), [0, 0, 0], "{run:#?}");
+    let join = json!({ "agent": peer(0) });
+    let (board, run) = statements(
+        &t,
+        t.ok("POST", "/v1/boards/other/join", Some(&peer(0)), Some(join)),
+    )
+    .await;
+    assert_eq!(counted(&run), [1, 1, 1], "{run:#?}");
+    assert_eq!(board["counts"]["open"], json!(1));
+}
+
+/// Stats sum lease conflicts and touch overlaps in one scan of the window's lease events,
+/// for the total and for every board, and give each board what its own scan gives.
+#[tokio::test]
+async fn stats_scan_lease_events_once_for_every_board() {
+    use crate::ops::stats::CONFLICTS_BY_REPO;
+    let t = T::new();
+    big_board(&t, 30, 300).await;
+    for n in 0..5 {
+        counted_board(&t, &format!("extra{n}"), 10).await;
+    }
+    // A board on two repositories, one of them shared with `app`.
+    t.board("both", &[REPO, "github.com/example/extra0"]).await;
+    let now = t.state.now().timestamp_millis();
+    let lease = |kind: &str, field: &str, repo: &str, n: u32| {
+        t.exec(&format!(
+            "INSERT INTO events (at, actor, type, payload) \
+             VALUES ({now}, '{ME}', '{kind}', json_object('repo', {repo}, '{field}', {n}))"
+        ));
+    };
+    lease("lease_created", "conflicts", &format!("'{REPO}'"), 3);
+    lease("files_touched", "overlaps", &format!("'{REPO}'"), 4);
+    lease(
+        "lease_created",
+        "conflicts",
+        "'github.com/example/extra0'",
+        5,
+    );
+    lease(
+        "files_touched",
+        "overlaps",
+        "'github.com/example/extra3'",
+        6,
+    );
+    // On no board's repository: one names none, one names a number.
+    lease("lease_created", "conflicts", "NULL", 7);
+    lease("files_touched", "overlaps", "8", 8);
+    // Outside the window.
+    t.exec(&format!(
+        "INSERT INTO events (at, actor, type, payload) VALUES \
+         (0, '{ME}', 'lease_created', json_object('repo', '{REPO}', 'conflicts', 100))"
+    ));
+
+    let (stats, run) = statements(&t, t.ok("GET", "/v1/stats?days=7", Some(ME), None)).await;
+    assert_eq!(running(&run, "'$.overlaps'"), 1, "{run:#?}");
+    assert_eq!(running(&run, "'$.conflicts'"), 1, "{run:#?}");
+    assert_eq!(stats["lease_conflicts"], json!(33));
+    let boards = stats["boards"].as_array().unwrap();
+    assert_eq!(boards.len(), 8, "{boards:?}");
+    let from = now - 7 * 24 * 3_600_000;
+    for board in boards {
+        let slug = board["board"].as_str().unwrap();
+        // The scan each board ran for itself before they shared one.
+        let own = t.count(&format!(
+            "SELECT COALESCE(SUM(json_extract(payload, CASE type WHEN 'lease_created' \
+             THEN '$.conflicts' ELSE '$.overlaps' END)), 0) FROM events \
+             WHERE type IN ('lease_created', 'files_touched') AND at >= {from} \
+             AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each( \
+                 (SELECT repos FROM boards WHERE slug = '{slug}')))"
+        ));
+        assert_eq!(board["lease_conflicts"], json!(own), "{slug}");
+    }
+    let conflicts = |slug: &str| {
+        let board = boards.iter().find(|b| b["board"] == slug).unwrap();
+        board["lease_conflicts"].as_u64().unwrap()
+    };
+    assert_eq!(
+        ["app", "other", "extra0", "extra3", "both"].map(conflicts),
+        [7, 0, 5, 6, 12]
+    );
+
+    // The window's lease events along `events_type`, never a scan of every event.
+    let p = plan(&t, CONFLICTS_BY_REPO);
+    assert!(
+        p.contains("SEARCH events USING INDEX events_type (type=? AND at>?)"),
+        "{p}"
+    );
+    assert!(!p.contains("SCAN events"), "{p}");
 }

@@ -16,8 +16,8 @@ use crate::error::{
 use crate::ops::feedback::{DUPLICATE_DEPTH_MAX, LIVE_ITEMS};
 use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
-    NamedParams, SEARCH_RANK, SEARCH_RANK_ANY, find_agent, get_board, get_task, handle_of, is_live,
-    load_tasks_found, load_tasks_up_to, seen,
+    NamedParams, SEARCH_RANK, SEARCH_RANK_ANY, find_agent, get_board_uncounted, get_task,
+    handle_of, is_live, load_tasks_found, load_tasks_up_to, seen,
 };
 use crate::text::{ago, check_line, check_text};
 
@@ -256,7 +256,7 @@ fn set_blockers(cx: &Ctx<'_>, task: &TaskId, blockers: &[TaskId]) -> Result<()> 
 }
 
 pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
-    let board = get_board(cx, &req.board)?;
+    let board = get_board_uncounted(cx, &req.board)?;
     touch_agent(cx, &req.agent)?;
     if let Some(parent) = &req.parent {
         if parent.board() != req.board {
@@ -2122,7 +2122,7 @@ pub(crate) fn rank(
     } else {
         touch_agent(cx, &req.agent)?;
     }
-    get_board(cx, board)?;
+    get_board_uncounted(cx, board)?;
     let mut next = [0u32; 3];
     let mut changes: Vec<(TaskId, Option<u32>)> = Vec::new();
     let mut tasks = Vec::with_capacity(req.tasks.len());
@@ -2231,7 +2231,7 @@ fn left_unrun(cx: &Ctx<'_>, task: &Task, owner: &AgentId, agent: &AgentId) -> Re
     if task.status.is_closed() {
         return Ok(false);
     }
-    let board = get_board(cx, &task.board)?;
+    let board = get_board_uncounted(cx, &task.board)?;
     if !nobody_runs(&board) {
         return Ok(false);
     }
@@ -2287,7 +2287,7 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
                 "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
                 owner_desc(cx, owner)?
             ),
-            if !task.status.is_closed() && nobody_runs(&get_board(cx, &task.board)?) {
+            if !task.status.is_closed() && nobody_runs(&get_board_uncounted(cx, &task.board)?) {
                 format!(
                     "{ask}; nobody runs this board, so an agent on one of its repositories \
                      may drop it with a reason, or close it with take, once the owner's \

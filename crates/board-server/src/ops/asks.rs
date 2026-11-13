@@ -7,7 +7,9 @@ use crate::config::Settings;
 use crate::db::{Ctx, enum_str};
 use crate::error::{Result, bad_transition, forbidden, invalid};
 use crate::ops::touch_agent;
-use crate::store::{NamedParams, get_ask, get_board, get_task, load_asks, load_newest_asks};
+use crate::store::{
+    NamedParams, get_ask, get_board_uncounted, get_task, load_asks, load_newest_asks,
+};
 use crate::text::{ago, check_line, check_text};
 
 pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
@@ -40,7 +42,7 @@ pub(crate) fn validate_answer(req: &AnswerAsk, s: &Settings) -> Result<()> {
 /// Creates the ask and warns of the board's other recent open asks, which it may repeat:
 /// the ask is made either way.
 pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
-    get_board(cx, &req.board)?;
+    get_board_uncounted(cx, &req.board)?;
     touch_agent(cx, &req.agent)?;
     if let Some(task) = &req.task {
         let task = get_task(cx, task)?;

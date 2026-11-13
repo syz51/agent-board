@@ -12,7 +12,7 @@ use rusqlite::{Row, named_params, params};
 
 use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ts};
 use crate::error::{Result, forbidden, invalid};
-use crate::store::{agent_by_id_or_handle, find_agent, get_board, get_task};
+use crate::store::{agent_by_id_or_handle, find_agent, get_board_uncounted, get_task};
 
 /// The longest a registration lasts.
 const JUDGE_MS: i64 = JUDGE_HOURS_MAX * 3_600_000;
@@ -120,7 +120,7 @@ fn judge_row(r: &Row<'_>) -> rusqlite::Result<Judge> {
 
 /// The board's live judges, oldest first.
 pub(crate) fn list(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Vec<Judge>> {
-    get_board(cx, board)?;
+    get_board_uncounted(cx, board)?;
     Ok(cx
         .db
         .prepare_cached(&LIST)?
@@ -140,7 +140,7 @@ pub(crate) fn register(
     board: &BoardSlug,
     req: RegisterJudge,
 ) -> Result<Judge> {
-    let found = get_board(cx, board)?;
+    let found = get_board_uncounted(cx, board)?;
     if found.coordinator.as_ref() != Some(caller) {
         return Err(forbidden(
             format!("{caller} does not hold the coordinator lease of {board}"),
