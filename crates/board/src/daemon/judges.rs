@@ -583,7 +583,10 @@ impl<T: T3> Daemon<T> {
             // for a slot gets the next one.
             self.read_running().await;
             let limit = self.run_limit();
-            if self.runs() >= limit || self.judge_turns.another_first(slug, waited) {
+            if self.load_unknown().is_some()
+                || self.runs() >= limit
+                || self.judge_turns.another_first(slug, waited)
+            {
                 if self.judge_turns.wait(slug, waited, now) {
                     tracing::info!(
                         "{slug}: `{}` waits for one of the {limit} runs of this device; {}",
@@ -597,7 +600,7 @@ impl<T: T3> Daemon<T> {
                 break;
             }
             let names = want.title.clone();
-            self.held.remove(&format!("judge {names}"));
+            self.hold_ended("judge", &names);
             match self.start_judge(board, &client, &project, want, now).await {
                 Ok(()) => {
                     started += 1;

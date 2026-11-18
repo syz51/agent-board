@@ -5414,20 +5414,156 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     );
     assert_eq!(holds(&home_of(&e)).len(), 1);
 
-    // A T3 that does not answer leaves the count to the dispatcher's own runs.
-    let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
-    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
-    e.t3.fail_list.store(true, Ordering::SeqCst);
-    e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
-
     // A device without a limit asks T3 for nothing.
     let mut e = slots_env(3, &tasks);
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3).len(), 3);
     assert_eq!(running_lists(&e.t3), 0);
+}
+
+/// The limit protects the device's memory, so a T3 that cannot list the running threads
+/// leaves the load unknown: the dispatcher starts nothing and records the hold.
+#[tokio::test]
+async fn a_t3_that_cannot_list_threads_holds_every_start_with_a_record() {
+    use board_proto::Priority::P1;
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+    ];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(4);
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(titles(&e.t3).is_empty());
+    // One line in the trail file and one note on the task, for both passes.
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "worker");
+    assert_eq!(held[0]["subject"], "factory-4");
+    let cause = held[0]["cause"].as_str().unwrap();
+    assert!(
+        cause.contains("T3 could not list the running threads of")
+            && cause.contains("server not running")
+            && cause.contains("nothing starts"),
+        "{cause}"
+    );
+    assert_eq!(held[0]["unread"].as_array().unwrap().len(), 1, "{held:?}");
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 1);
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains("T3 could not list the running threads")
+            && text.contains("device-holds.jsonl"),
+        "{text}"
+    );
+
+    // T3 answers again: the task starts.
+    e.t3.fail_list.store(false, Ordering::SeqCst);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3)[0], "factory-4 Task factory-4");
+}
+
+/// A hold whose cause changes gets a line for each cause, and a hold older than
+/// [`board::daemon::HOLD_KEPT`] is written again.
+#[tokio::test]
+async fn a_hold_gets_a_line_per_cause_and_a_new_one_after_a_week() {
+    use board_proto::Priority::P1;
+    let tasks = [ready_task("factory-4", P1, 0)];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(holds(&home_of(&e)).len(), 1);
+
+    // T3 stops answering: the same task is held for another cause.
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon
+        .reconcile(later + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert_eq!(held[0]["unread"], json!([]));
+    assert_eq!(held[1]["unread"].as_array().unwrap().len(), 1);
+    let notes = || e.stub.requests_to("POST /v1/tasks/factory-4/notes").len();
+    assert_eq!(notes(), 1);
+
+    // Still held after the daemon forgot the records: both are written again.
+    let week = later + board::daemon::HOLD_KEPT + chrono::Duration::minutes(1);
+    e.daemon.reconcile(week).await.unwrap();
+    assert_eq!(holds(&home_of(&e)).len(), 3);
+    assert_eq!(notes(), 2);
+}
+
+/// The daemon keeps the holds it recorded, so a restart writes none of them again.
+#[tokio::test]
+async fn a_restart_writes_no_second_record_of_a_hold() {
+    use board_proto::Priority::P1;
+    let tasks = [ready_task("factory-4", P1, 0)];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(holds(&home_of(&e)).len(), 1);
+    let notes = || e.stub.requests_to("POST /v1/tasks/factory-4/notes").len();
+    assert_eq!(notes(), 1);
+
+    let mut restarted =
+        daemon_at(e._dir.path(), &e.stub, projects(), &e.t3).with_default_run_limit(2);
+    restarted
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(titles(&e.t3).is_empty());
+    assert_eq!(holds(&home_of(&e)).len(), 1);
+    assert_eq!(notes(), 1);
+
+    // The task starts: the daemon forgets the hold, so a later one is recorded anew.
+    *e.t3.running.lock().unwrap() = Vec::new();
+    restarted
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+    assert!(
+        restarted.state.holds.is_empty(),
+        "{:?}",
+        restarted.state.holds
+    );
+    assert!(restarted.state.hold_notes.is_empty());
+}
+
+/// A judge is held like a worker while T3 cannot list the running threads.
+#[tokio::test]
+async fn a_judge_waits_while_t3_cannot_list_threads() {
+    let tasks = [review_task("factory-4", 0)];
+    let mut e = judges_env(&tasks);
+    review_detail(&e, &tasks[0], vec![]);
+    e.daemon = e.daemon.with_default_run_limit(4);
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(titles(&e.t3).is_empty());
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "judge");
+    let cause = held[0]["cause"].as_str().unwrap();
+    assert!(
+        cause.contains("T3 could not list the running threads"),
+        "{cause}"
+    );
 }
 
 #[tokio::test]

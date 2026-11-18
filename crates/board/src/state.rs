@@ -364,17 +364,44 @@ pub fn repeat_refused_launch<T: Serialize>(
 /// Adds `record` as one line to `device-holds.jsonl` in the state directory: the trail of
 /// the tasks and judges the device limit held. Nothing prunes it.
 pub fn append_hold<T: Serialize>(home: &Home, record: &T) -> Result<()> {
+    append_line(home, "device-holds.jsonl", record).map(drop)
+}
+
+/// Adds `record` as one line to `unchecked-launches.jsonl` in the state directory, and
+/// gives its path: the trail of the launches that ran while T3 could not count the
+/// device's turns. Nothing prunes it.
+pub fn append_unchecked_launch<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "unchecked-launches.jsonl", record)
+}
+
+/// Whether `unchecked-launches.jsonl` has a launch of `session` at or after `since`.
+pub fn unchecked_launch_since(home: &Home, session: &str, since: Timestamp) -> bool {
+    let path = home.state_dir().join("unchecked-launches.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record["session"].as_str() == Some(session)
+                && serde_json::from_value::<Timestamp>(record["at"].clone())
+                    .is_ok_and(|at| at >= since)
+        })
+}
+
+fn append_line<T: Serialize>(home: &Home, file: &str, record: &T) -> Result<PathBuf> {
     use std::io::Write as _;
     let dir = home.state_dir();
     std::fs::create_dir_all(&dir)?;
+    let path = dir.join(file);
     let mut line = serde_json::to_vec(record)?;
     line.push(b'\n');
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("device-holds.jsonl"))?
+        .open(&path)?
         .write_all(&line)?;
-    Ok(())
+    Ok(path)
 }
 
 /// When a shell tool call started, from its `PreToolUse` hook.

@@ -79,11 +79,49 @@ pub fn run_limit(config: &Config, default: Option<usize>) -> usize {
         .map_or_else(|| default.unwrap_or(usize::MAX), |n| n.get() as usize)
 }
 
+/// What T3 said of the turns that run on the device.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Running {
+    /// The threads with a run in progress, in the projects T3 listed.
+    pub threads: BTreeSet<String>,
+    /// The projects T3 could not list, each with the error. While one is here the count
+    /// is a lower bound, and the device's load is unknown.
+    pub unread: Vec<String>,
+}
+
+/// How much of the first unlisted project and its error [`Running::unknown`] quotes; a
+/// record's `unread` list has every project in full.
+pub const UNREAD_CHARS: usize = 240;
+
+impl Running {
+    /// Why the count is not whole, in words short enough for a note; `None` when T3 listed
+    /// every project. It names the first project with its error, counts the rest, and says
+    /// what ends it.
+    pub fn unknown(&self) -> Option<String> {
+        let first = self.unread.first()?;
+        let mut text = String::from("T3 could not list the running threads of ");
+        if first.chars().count() > UNREAD_CHARS {
+            text.extend(first.chars().take(UNREAD_CHARS));
+            text.push('…');
+        } else {
+            text.push_str(first);
+        }
+        match self.unread.len() - 1 {
+            0 => {}
+            more => text.push_str(&format!(" and of {more} more projects")),
+        }
+        text.push_str(
+            " (start T3, or take a project that is gone out of config.toml, to end this)",
+        );
+        Some(text)
+    }
+}
+
 /// The threads with a run in progress in the T3 projects of `config`, whoever started
 /// them: the user, an agent or the dispatcher. These are the turns that take the device's
-/// memory now. A project T3 cannot list adds none, so a T3 that does not answer leaves the
-/// count to the runs the dispatcher knows of itself.
-pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> BTreeSet<String> {
+/// memory now. A project T3 cannot list adds no thread and is named in
+/// [`Running::unread`]: its caller decides what an unknown load means.
+pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> Running {
     let projects: BTreeSet<&Path> = config
         .projects
         .values()
@@ -92,14 +130,13 @@ pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> BTreeSet<String>
         .collect();
     let lists = projects.iter().map(|project| t3.running_threads(project));
     let lists = futures_util::future::join_all(lists).await;
-    let mut running = BTreeSet::new();
+    let mut running = Running::default();
     for (project, list) in projects.iter().zip(lists) {
         match list {
-            Ok(threads) => running.extend(threads),
-            Err(err) => tracing::debug!(
-                "the running threads of {}: {err:#}; counted as none",
-                project.display()
-            ),
+            Ok(threads) => running.threads.extend(threads),
+            Err(err) => running
+                .unread
+                .push(format!("{} ({err:#})", project.display())),
         }
     }
     running
@@ -175,6 +212,21 @@ mod tests {
         assert_eq!(default_run_limit(Some(4 << 30)), MIN_RUNS);
         assert_eq!(default_run_limit(Some(0)), MIN_RUNS);
         assert_eq!(default_run_limit(None), FALLBACK_RUNS);
+    }
+
+    #[test]
+    fn an_unknown_load_names_one_project_and_stays_short() {
+        assert_eq!(Running::default().unknown(), None);
+        let unread = (0..15).map(|n| format!("/projects/{n} ({})", "e".repeat(400)));
+        let running = Running {
+            threads: BTreeSet::new(),
+            unread: unread.collect(),
+        };
+        let text = running.unknown().unwrap();
+        assert!(text.contains("/projects/0 (eee"), "{text}");
+        assert!(text.contains("and of 14 more projects"), "{text}");
+        assert!(text.contains("config.toml"), "{text}");
+        assert!(text.chars().count() < 450, "{text}");
     }
 
     #[test]
