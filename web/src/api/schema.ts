@@ -94,6 +94,12 @@ export const task = object({
   blockers: array(string),
   ready: boolean,
   /**
+   * Blockers hold the task though every one is closed: it is `blocked`, or `open` with a
+   * dropped blocker, which never counts as done. The board moves nothing; false from older
+   * servers.
+   */
+  blockers_closed: withDefault(boolean, false),
+  /**
    * A pending proposal: open, not `auto`, with a body starting `Proposal:`. Agents review it
    * with a `verdict:` note; it is never ready work.
    */

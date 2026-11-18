@@ -1179,7 +1179,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
 }
 
 /// The oldest open ask on `task`, if any.
-fn open_ask(cx: &Ctx<'_>, task: &TaskId) -> Result<Option<i64>> {
+pub(crate) fn open_ask(cx: &Ctx<'_>, task: &TaskId) -> Result<Option<i64>> {
     Ok(cx
         .db
         .query_row(

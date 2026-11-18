@@ -212,6 +212,9 @@ export function RelTime({ at }: { at: string }) {
   );
 }
 
+/** What a task held only by closed blockers says, on its row and on its page. */
+export const BLOCKERS_CLOSED = "every blocker is done or dropped";
+
 export function StatusBadge({ status, ready }: { status: TaskStatus; ready?: boolean }) {
   return <StatusPill status={statusKey({ status, ready: ready ?? false })} />;
 }

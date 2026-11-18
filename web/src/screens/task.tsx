@@ -19,6 +19,7 @@ import { Markdown, PlainText, SafeLink, safeHref } from "@/text/markdown.tsx";
 import {
   AbsTime,
   agentIndex,
+  BLOCKERS_CLOSED,
   Crumbs,
   Empty,
   Owner,
@@ -141,6 +142,9 @@ function TaskView({
           <PriorityBadge priority={task.priority} />
           <Owner task={task} agents={agents} />
         </p>
+        {task.blockers_closed && (
+          <p className="mt-1.5 text-meta text-amber lg:hidden">{BLOCKERS_CLOSED}</p>
+        )}
         {/* The links to other tasks are far down there too; this says they exist. */}
         {(task.blockers.length > 0 || detail.child_tasks.length > 0) && (
           <p className="mt-1.5 flex flex-wrap items-center gap-x-3 text-meta text-muted-foreground lg:hidden">
@@ -176,8 +180,16 @@ function TaskView({
               <dt>Status</dt>
               <dd>
                 <StatusBadge status={task.status} ready={task.ready} />
-                {task.status === "open" && !task.ready && task.blockers.length > 0 && (
-                  <span className="text-muted-foreground">waiting on blockers</span>
+                {task.blockers_closed ? (
+                  <span className="text-amber">
+                    {BLOCKERS_CLOSED}: clear the blockers or drop the task
+                  </span>
+                ) : (
+                  task.status === "open" &&
+                  !task.ready &&
+                  task.blockers.length > 0 && (
+                    <span className="text-muted-foreground">waiting on blockers</span>
+                  )
                 )}
               </dd>
             </div>

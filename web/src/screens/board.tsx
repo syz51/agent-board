@@ -11,9 +11,10 @@ import { useNow } from "@/live/runtime.ts";
 import type { BoardSearch } from "@/router.tsx";
 import { PlainText } from "@/text/markdown.tsx";
 import {
-  DayTime,
   agentIndex,
+  BLOCKERS_CLOSED,
   Crumbs,
+  DayTime,
   Empty,
   Owner,
   PageHeader,
@@ -612,6 +613,13 @@ function TaskMain({ task, done, now }: TaskRowData) {
               </Fragment>
             ))}
           </span>
+        </span>
+      )}
+      {/* Nothing it waits on is still in progress, and the board moves nothing itself. */}
+      {task.blockers_closed && (
+        <span className={cn(DEPENDENCY, "text-amber")} data-dependency="closed">
+          <Icon name="link" className="size-3.5 flex-none" />
+          {BLOCKERS_CLOSED}
         </span>
       )}
       {/* An umbrella task: its children, narrowed to on this list. */}

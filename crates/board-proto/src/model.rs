@@ -415,6 +415,12 @@ pub struct Task {
     /// Open, every blocker done, no live owner, `not_before` (if any) passed, and not a
     /// pending proposal.
     pub ready: bool,
+    /// The task is held by blockers that are all closed (done or dropped): it is `blocked`,
+    /// or `open` with a dropped blocker, which never counts as done. The board moves
+    /// nothing: an agent or the user clears the blockers or drops the task. Derived when
+    /// read; absent from older servers, read as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blockers_closed: bool,
     /// A pending proposal ([`is_pending_proposal`]): agents review it before it is work.
     /// Derived when read; absent from older servers, read as false.
     #[serde(default)]
@@ -879,6 +885,14 @@ mod tests {
         let read: Task = serde_json::from_value(task).unwrap();
         assert!(!read.proposal);
         assert_eq!(serde_json::to_value(&read).unwrap()["proposal"], false);
+        // An older server sends no `blockers_closed`; false is left out when written.
+        assert!(!read.blockers_closed);
+        assert!(
+            serde_json::to_value(&read)
+                .unwrap()
+                .get("blockers_closed")
+                .is_none()
+        );
     }
 
     #[test]

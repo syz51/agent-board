@@ -709,6 +709,21 @@ reason or a blocker that is not done. Every move out of `blocked` clears the rea
 Blockers must exist and must not form a cycle; they may be on any board. A task is not
 `ready`, and cannot be claimed, until every blocker is done, wherever it is, except as
 the claim above says for a blocker in `review` that is its ancestor or the caller's.
+A dropped blocker never counts as done, and the server changes neither the status nor the
+blockers of a task when its blocker closes (`DESIGN.md`, "Closed blockers"). A `[Task]`
+carries `blockers_closed: true`, computed when read and left out when false, while
+blockers hold it though every one is done or dropped: it is `blocked`, or `open` with a
+dropped blocker. The owner of a task that lists a blocker gets a snapshot alert from the
+blocker's `task_done` event and from the `task_updated` event that drops it (`"to":
+"dropped"`), and a full snapshot names up to three tasks with `blockers_closed` that the
+agent owns or that have no owner or a stale one, its own first; a task with an open ask,
+or with a blocked reason and another owner, is left out. Each alert's action holds the
+`task_update` call that clears the blockers. The call also moves a `blocked` task that has
+no reason, which could not stay `blocked` (`status=doing` for its owner, `status=open`
+with no owner or while `not_before` is ahead), and follows `task_claim <id> take=true`
+for a stale owner's task. A dropped blocker's alert goes on to the other choices: name
+the task that replaces it, or drop the waiting task. An alert for a blocker that was
+reopened before the snapshot is not shown.
 `GET /v1/tasks/{id}` lists the tasks waiting on it in `blocks`, from every board, and a
 blocker's `task_done` event,
 on its own board's feed, wakes the waiting task's board coordinator and the owner of a

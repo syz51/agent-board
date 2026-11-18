@@ -596,6 +596,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         proposal: false,
         blockers: Vec::new(),
         ready: true,
+        blockers_closed: false,
         not_before: None,
         auto: true,
         created_by: "t3:creator".parse().unwrap(),

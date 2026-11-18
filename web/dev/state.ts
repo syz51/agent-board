@@ -507,7 +507,9 @@ export class DevState {
   }
 
   private toTask(task: Fixtures["tasks"][number]): Task {
-    const done = (id: string) => this.data.tasks.find((item) => item.id === id)?.status === "done";
+    const status = (id: string) => this.data.tasks.find((item) => item.id === id)?.status;
+    const done = (id: string) => status(id) === "done";
+    const dropped = (id: string) => status(id) === "dropped";
     const owner = this.data.agents.find((item) => item.id === task.owner);
     // The dev server stands in for the Rust one, so it mirrors `is_pending_proposal` in
     // crates/board-proto/src/model.rs; the web view itself only reads `proposal`.
@@ -524,6 +526,11 @@ export class DevState {
       child_count: this.data.tasks.filter((item) => item.parent === task.id).length,
       snippet: null,
       any_word: false,
+      // Mirrors `complete_tasks` in crates/board-server/src/store.rs.
+      blockers_closed:
+        task.blockers.length > 0 &&
+        task.blockers.every((id) => done(id) || dropped(id)) &&
+        (task.status === "blocked" || (task.status === "open" && task.blockers.some(dropped))),
       ready:
         task.status === "open" &&
         !proposal &&
