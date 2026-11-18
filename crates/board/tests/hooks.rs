@@ -3823,6 +3823,69 @@ fn a_launch_runs_while_the_device_has_a_free_slot() {
     assert_eq!(refused_launches(&e)[0]["asked"], 2);
 }
 
+/// The launch gate stays open when T3 cannot count the device's turns, and each launch it
+/// lets through leaves a line in the device's trail and a note that names that file.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_t3_cannot_count_runs_with_a_record_and_a_note() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    // T3 fails: no list at all.
+    common::script::write_script(
+        &e.home.join("t3"),
+        "#!/bin/sh\necho 'server not running' >&2\nexit 1\n",
+    );
+    let mut doing = task_fixture("factory-4", "Build the counter");
+    doing.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", vec![doing]);
+    e.stub.on(
+        "POST /v1/tasks/factory-4/notes",
+        json!({
+            "id": 78, "task": "factory-4", "agent": CLAUDE_AGENT, "kind": "note",
+            "text": "x", "at": at(),
+        }),
+    );
+    let call = json!({"task": "Review the diff.", "title": "Review the counter"});
+    let (reply, text) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call),
+    );
+    assert_eq!((reply, text.as_str()), (None, ""), "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+    let file = e.home.join("state/unchecked-launches.jsonl");
+    let lines = std::fs::read_to_string(&file).unwrap();
+    let records: Vec<Value> = lines
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert!(
+        record["cause"]
+            .as_str()
+            .unwrap()
+            .contains("T3 could not list the running threads of"),
+        "{record}"
+    );
+    assert_eq!(record["limit"], 2);
+    assert_eq!(record["asked"], 1);
+    assert_eq!(record["tool"], "mcp__t3-code__delegate_task");
+    assert_eq!(record["tool_use"], "toolu_launch_1");
+    assert_eq!(record["title"], "Review the counter");
+    assert!(record["at"].is_string(), "{record}");
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 1, "{}", e.ran());
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains("ran without the device limit's check")
+            && text.contains("Review the counter")
+            && text.contains(file.to_str().unwrap()),
+        "{text}"
+    );
+    assert!(text.chars().count() <= 800, "{text}");
+}
+
 /// The limit holds what agents start. A turn the user starts, and every other tool call,
 /// runs on a full device, and no hook but a launch's asks T3 for the device's threads.
 #[cfg(unix)]

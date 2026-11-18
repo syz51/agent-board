@@ -364,17 +364,29 @@ pub fn repeat_refused_launch<T: Serialize>(
 /// Adds `record` as one line to `device-holds.jsonl` in the state directory: the trail of
 /// the tasks and judges the device limit held. Nothing prunes it.
 pub fn append_hold<T: Serialize>(home: &Home, record: &T) -> Result<()> {
+    append_line(home, "device-holds.jsonl", record).map(drop)
+}
+
+/// Adds `record` as one line to `unchecked-launches.jsonl` in the state directory, and
+/// gives its path: the trail of the launches that ran while T3 could not count the
+/// device's turns. Nothing prunes it.
+pub fn append_unchecked_launch<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "unchecked-launches.jsonl", record)
+}
+
+fn append_line<T: Serialize>(home: &Home, file: &str, record: &T) -> Result<PathBuf> {
     use std::io::Write as _;
     let dir = home.state_dir();
     std::fs::create_dir_all(&dir)?;
+    let path = dir.join(file);
     let mut line = serde_json::to_vec(record)?;
     line.push(b'\n');
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("device-holds.jsonl"))?
+        .open(&path)?
         .write_all(&line)?;
-    Ok(())
+    Ok(path)
 }
 
 /// When a shell tool call started, from its `PreToolUse` hook.

@@ -118,6 +118,10 @@ pub const WORKER_RETRY: TimeDelta = TimeDelta::minutes(30);
 /// task in progress started before it.
 pub const USAGE_STOP_KEPT: TimeDelta = TimeDelta::days(7);
 
+/// How long the daemon remembers that it recorded a hold by the device limit. A hold that
+/// lasts longer gets a new line in the trail file, and its task a new note.
+pub const HOLD_KEPT: TimeDelta = TimeDelta::days(7);
+
 /// How long after the server's repeat idle notice the dispatcher waits before it sets the
 /// task of an owner still away `open`: the notice also wakes the owner, which may come
 /// back.
@@ -239,6 +243,25 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub usage_stops: BTreeMap<AgentId, Timestamp>,
+    /// The holds by the device limit that the device's trail file has, and when each was
+    /// written, until their task or judge starts or [`HOLD_KEPT`] passes: `worker <task>`
+    /// and `judge <title>`, with ` unread` for a hold on a T3 that listed no threads. Saved
+    /// so a restart writes no second line for a hold it recorded. Read leniently like
+    /// `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_holds",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub holds: BTreeMap<String, Timestamp>,
+    /// The tasks that carry a note of the device limit holding them, and when it was
+    /// written, kept like `holds`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_worker_retry",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub hold_notes: BTreeMap<TaskId, Timestamp>,
     /// The first idle notice of each task in `doing` on a board this device dispatches: the
     /// server's repeat of the same spell releases the task when its owner is still away.
     /// Read leniently like `wakes`.
@@ -596,6 +619,16 @@ fn lenient_worker_skips<'de, D: serde::Deserializer<'de>>(
     Ok(lenient_by_key(
         serde_json::Value::deserialize(d)?,
         "the worker skip",
+    ))
+}
+
+/// Each recorded hold read on its own, like [`lenient_queues`].
+fn lenient_holds<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, Timestamp>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the recorded hold",
     ))
 }
 
@@ -1089,12 +1122,7 @@ pub struct Daemon<T: T3> {
     last_pass: Option<Timestamp>,
     /// The threads with a run in progress on this device, read from T3 at most once in a
     /// reconcile, when a board first wants a slot; `None` before that.
-    running: Option<BTreeSet<String>>,
-    /// The tasks that carry a note of the device limit holding them, until they start.
-    held_noted: BTreeSet<TaskId>,
-    /// The holds by the device limit that the device's trail file has, until their task or
-    /// judge starts: `worker <task>` and `judge <title>`.
-    held: BTreeSet<String>,
+    running: Option<device::Running>,
 }
 
 impl<T: T3> Daemon<T> {
@@ -1127,8 +1155,6 @@ impl<T: T3> Daemon<T> {
             judge_turns: device::Turns::default(),
             last_pass: None,
             running: None,
-            held_noted: BTreeSet::new(),
-            held: BTreeSet::new(),
         }
     }
 
@@ -1178,7 +1204,8 @@ impl<T: T3> Daemon<T> {
             .filter_map(|(_, worker)| worker.thread.as_deref())
             .chain(judges.filter_map(|run| run.thread.as_deref()))
             .collect();
-        let running = self.running.iter().flatten().map(String::as_str);
+        let running = self.running.iter().flat_map(|r| &r.threads);
+        let running = running.map(String::as_str);
         running.filter(|thread| !own.contains(thread)).collect()
     }
 
@@ -1192,8 +1219,19 @@ impl<T: T3> Daemon<T> {
     /// start it decides on. A device without a limit reads none.
     async fn read_running(&mut self) {
         if self.running.is_none() && self.run_limit() != usize::MAX {
-            self.running = Some(device::running_threads(&self.t3, &self.ctx.config).await);
+            let running = device::running_threads(&self.t3, &self.ctx.config).await;
+            if let Some(unknown) = running.unknown() {
+                tracing::warn!("{unknown}; the dispatcher starts nothing in this pass");
+            }
+            self.running = Some(running);
         }
+    }
+
+    /// Why the device's load is unknown in this reconcile: T3 could not list the threads
+    /// of a project. The limit protects the device's memory, so the dispatcher starts
+    /// nothing while it cannot count (`docs/DESIGN.md`, "Daemon dispatch", Device limit).
+    fn load_unknown(&self) -> Option<String> {
+        self.running.as_ref().and_then(device::Running::unknown)
     }
 
     /// What takes the device's slots now, in words: for the log and for the note on a task
@@ -1217,6 +1255,11 @@ impl<T: T3> Daemon<T> {
                 more => text.push_str(&format!(" and {more} more")),
             }
             text.push(')');
+        }
+        if let Some(unknown) = self.load_unknown() {
+            text.push_str(&format!(
+                "; {unknown}, so the turns of other threads are not known and nothing starts"
+            ));
         }
         text
     }
@@ -1312,8 +1355,15 @@ impl<T: T3> Daemon<T> {
         limit: usize,
         now: Timestamp,
     ) {
-        let key = format!("{kind} {subject}");
-        if self.held.contains(&key) {
+        let unread = self.running.as_ref().map(|r| r.unread.as_slice());
+        let unread = unread.unwrap_or_default();
+        // A hold whose cause changes to a T3 that does not answer gets a line of its own.
+        let key = if unread.is_empty() {
+            format!("{kind} {subject}")
+        } else {
+            format!("{kind} {subject} unread")
+        };
+        if self.state.holds.contains_key(&key) {
             return;
         }
         let record = serde_json::json!({
@@ -1325,10 +1375,11 @@ impl<T: T3> Daemon<T> {
             "limit": limit,
             "cause": self.load(),
             "others": self.other_turns(),
+            "unread": unread,
         });
         match state::append_hold(&self.ctx.home, &record) {
             Ok(()) => {
-                self.held.insert(key);
+                self.state.holds.insert(key, now);
             }
             Err(err) => tracing::warn!("recording that the device limit holds {key}: {err:#}"),
         }
@@ -1338,10 +1389,18 @@ impl<T: T3> Daemon<T> {
     /// reader of the board sees why a ready task did not start and what ran instead. A
     /// note that fails is logged and tried again; the hold is in the device's trail file
     /// either way.
-    async fn note_held(&mut self, task: &TaskId, agent: &AgentId, workers: usize, load: &str) {
-        if !self.held_noted.insert(task.clone()) {
+    async fn note_held(
+        &mut self,
+        task: &TaskId,
+        agent: &AgentId,
+        workers: usize,
+        load: &str,
+        now: Timestamp,
+    ) {
+        if self.state.hold_notes.contains_key(task) {
             return;
         }
+        self.state.hold_notes.insert(task.clone(), now);
         let text = clip_note(format!(
             "The device limit holds this task: {load}; workers may take {workers}. The \
              dispatcher starts it when a slot is free, after the boards that waited longer. \
@@ -1349,9 +1408,15 @@ impl<T: T3> Daemon<T> {
         ));
         let client = self.client().with_agent(Some(agent.clone()));
         if let Err(err) = add_note(&client, task, agent, NoteKind::Note, text).await {
-            self.held_noted.remove(task);
+            self.state.hold_notes.remove(task);
             tracing::warn!("noting on {task} that the device limit holds it: {err:#}");
         }
+    }
+
+    /// Forgets the recorded hold of `subject`: it started, so a later hold is a new one.
+    fn hold_ended(&mut self, kind: &str, subject: &str) {
+        self.state.holds.remove(&format!("{kind} {subject}"));
+        self.state.holds.remove(&format!("{kind} {subject} unread"));
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1420,6 +1485,8 @@ impl<T: T3> Daemon<T> {
         self.state
             .usage_stops
             .retain(|_, at| now - *at < USAGE_STOP_KEPT);
+        self.state.holds.retain(|_, at| now - *at < HOLD_KEPT);
+        self.state.hold_notes.retain(|_, at| now - *at < HOLD_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
         self.save()
@@ -1641,6 +1708,11 @@ impl<T: T3> Daemon<T> {
                 )
             })
             .collect();
+        // A held task that someone else started is held no longer.
+        for task in in_progress.keys() {
+            self.hold_ended("worker", task.as_str());
+            self.state.hold_notes.remove(task);
+        }
         let mut left = Vec::new();
         for (task, followed) in followed {
             match followed {
@@ -1728,7 +1800,8 @@ impl<T: T3> Daemon<T> {
             // for a slot gets the next one.
             self.read_running().await;
             let limit = device::worker_limit(self.run_limit());
-            if self.worker_runs() >= limit
+            if self.load_unknown().is_some()
+                || self.worker_runs() >= limit
                 || self.runs() >= self.run_limit()
                 || self.worker_turns.another_first(slug, waited)
             {
@@ -1742,11 +1815,11 @@ impl<T: T3> Daemon<T> {
                 // Each task the limit holds gets its record, not only the one that
                 // started the board's wait.
                 self.record_hold("worker", slug, task.id.as_str(), limit, now);
-                self.note_held(&task.id, &agent, limit, &load).await;
+                self.note_held(&task.id, &agent, limit, &load, now).await;
                 break;
             }
-            self.held_noted.remove(&task.id);
-            self.held.remove(&format!("worker {}", task.id));
+            self.state.hold_notes.remove(&task.id);
+            self.hold_ended("worker", task.id.as_str());
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
                 self.note_failure(board, now);
                 // One task that cannot start does not hold up the others. A start that

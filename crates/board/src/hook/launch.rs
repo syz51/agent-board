@@ -10,8 +10,11 @@
 //! A thread the call starts in another T3 environment runs on another device and is not
 //! counted here; this device's environment is known from the session thread's T3 link.
 //!
-//! The check fails open: with no limit, no T3 answer in time or a record it could not
-//! write, the launch runs. A turn the user starts is no tool call and so never comes here.
+//! The check fails open, since a hook that blocks stops an interactive agent: with no
+//! limit, no T3 answer in time, a project T3 could not list or a record it could not
+//! write, the launch runs. A launch that runs while T3 could not count the device's turns
+//! leaves a line in `state/unchecked-launches.jsonl` and a note on the agent's task that
+//! names that file. A turn the user starts is no tool call and so never comes here.
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,7 +39,8 @@ const LAUNCH_TOOLS: [&str; 3] = ["delegate_task", "t3_thread_launch", "create_th
 /// local steps. `board install` gives the hook more than this.
 pub(super) const BUDGET: Duration = Duration::from_secs(8);
 
-/// How long T3 has to list the running threads; later, the launch runs unchecked.
+/// How long T3 has to list the running threads; later, the launch runs unchecked, with a
+/// record.
 const COUNT_BUDGET: Duration = Duration::from_millis(4500);
 
 /// How long the server has to take the note of a refusal; later, the file is the record.
@@ -104,6 +108,23 @@ struct Again<'a> {
     tool_use: Option<&'a str>,
 }
 
+/// The record of a launch that ran while the device's turns could not be counted.
+#[derive(Debug, Serialize)]
+struct Unchecked<'a> {
+    at: Timestamp,
+    cause: &'a str,
+    device: &'a str,
+    limit: usize,
+    /// The threads T3 did list with a turn in progress: a lower bound.
+    running: &'a std::collections::BTreeSet<String>,
+    asked: usize,
+    thread: Option<&'a str>,
+    session: Option<&'a str>,
+    tool: &'a str,
+    tool_use: Option<&'a str>,
+    title: &'a str,
+}
+
 /// The record of a refused launch, as the file keeps it.
 #[derive(Debug, Serialize)]
 struct Refused<'a> {
@@ -145,18 +166,66 @@ pub(super) async fn check(
     }
     let t3 = t3_cli(home);
     let counted = tokio::time::timeout(COUNT_BUDGET, device::running_threads(&t3, &config)).await;
-    let Ok(running) = counted else {
-        tracing::debug!("launch check: T3 listed no threads within {COUNT_BUDGET:?}; not checked");
-        return Ok(Reply::Nothing);
+    // What T3 did not count: everything, when it did not answer in time, else the projects
+    // it could not list.
+    let (running, unknown) = match counted {
+        Ok(running) => {
+            let unknown = running.unknown();
+            (running.threads, unknown)
+        }
+        Err(_) => (
+            std::collections::BTreeSet::new(),
+            Some(format!("T3 listed no threads within {COUNT_BUDGET:?}")),
+        ),
     };
-    if running.len().saturating_add(asked) <= limit {
-        return Ok(Reply::Nothing);
-    }
     let at = Utc::now();
     let thread = std::env::var(T3_THREAD_ENV).ok();
     let thread = thread.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let tool = input["tool_name"].as_str().unwrap_or_default();
     let tool_use = input["tool_use_id"].as_str().filter(|s| !s.is_empty());
+    if running.len().saturating_add(asked) <= limit {
+        let Some(cause) = unknown else {
+            return Ok(Reply::Nothing);
+        };
+        // The launch runs: the threads T3 did count leave it room. Its record comes first.
+        let title = title(&input["tool_input"]);
+        let record = Unchecked {
+            at,
+            cause: &cause,
+            device: device_name.as_str(),
+            limit,
+            running: &running,
+            asked,
+            thread,
+            session,
+            tool,
+            tool_use,
+            title: &title,
+        };
+        let file = match state::append_unchecked_launch(home, &record) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!("launch check: no record of an unchecked launch ({cause}): {err:#}");
+                return Ok(Reply::Nothing);
+            }
+        };
+        let text = unchecked_note(&cause, tool, title, thread, &file);
+        let noted = tokio::time::timeout(
+            NOTE_BUDGET,
+            note(home, server, runtime, explicit_agent, input, text),
+        )
+        .await;
+        match noted {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::debug!("launch check: no note of the unchecked launch: {err:#}");
+            }
+            Err(_) => {
+                tracing::debug!("launch check: no note of the unchecked launch in {NOTE_BUDGET:?}");
+            }
+        }
+        return Ok(Reply::Nothing);
+    }
     let load = load(device_name.as_str(), limit, running.len(), asked);
     let advice = advice(asked, limit);
     let name = record_name(session, tool, &input["tool_input"]);
@@ -260,13 +329,38 @@ fn title(call: &Value) -> String {
 /// How much of a launch's title the note of its refusal quotes; the file has all of it.
 const TITLE_CHARS: usize = 120;
 
-fn note_text(load: &str, tool: &str, title: String, thread: Option<&str>, file: &Path) -> String {
-    let title = if title.chars().count() > TITLE_CHARS {
-        let cut: String = title.chars().take(TITLE_CHARS).collect();
+/// `text` cut to `chars` characters, with a mark when it was longer.
+fn cut(text: &str, chars: usize) -> String {
+    if text.chars().count() > chars {
+        let cut: String = text.chars().take(chars).collect();
         format!("{cut}…")
     } else {
-        title
-    };
+        text.to_owned()
+    }
+}
+
+/// How much of the cause the note of an unchecked launch quotes; the file has all of it.
+const CAUSE_CHARS: usize = 300;
+
+fn unchecked_note(
+    cause: &str,
+    tool: &str,
+    title: String,
+    thread: Option<&str>,
+    file: &Path,
+) -> String {
+    let title = cut(&title, TITLE_CHARS);
+    let cause = cut(cause, CAUSE_CHARS);
+    let thread = thread.map_or_else(String::new, |t| format!(" from thread {t}"));
+    format!(
+        "A launch{thread} ran without the device limit's check: {cause}. Tool {tool}, title \
+         \"{title}\". The device keeps each such launch in {}.",
+        file.display()
+    )
+}
+
+fn note_text(load: &str, tool: &str, title: String, thread: Option<&str>, file: &Path) -> String {
+    let title = cut(&title, TITLE_CHARS);
     let thread = thread.map_or_else(String::new, |t| format!(" from thread {t}"));
     format!(
         "The device limit refused a launch{thread}: {load}. Tool {tool}, title \"{title}\". \

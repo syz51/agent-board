@@ -79,11 +79,33 @@ pub fn run_limit(config: &Config, default: Option<usize>) -> usize {
         .map_or_else(|| default.unwrap_or(usize::MAX), |n| n.get() as usize)
 }
 
+/// What T3 said of the turns that run on the device.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Running {
+    /// The threads with a run in progress, in the projects T3 listed.
+    pub threads: BTreeSet<String>,
+    /// The projects T3 could not list, each with the error. While one is here the count
+    /// is a lower bound, and the device's load is unknown.
+    pub unread: Vec<String>,
+}
+
+impl Running {
+    /// Why the count is not whole, in words; `None` when T3 listed every project.
+    pub fn unknown(&self) -> Option<String> {
+        (!self.unread.is_empty()).then(|| {
+            format!(
+                "T3 could not list the running threads of {}",
+                self.unread.join("; ")
+            )
+        })
+    }
+}
+
 /// The threads with a run in progress in the T3 projects of `config`, whoever started
 /// them: the user, an agent or the dispatcher. These are the turns that take the device's
-/// memory now. A project T3 cannot list adds none, so a T3 that does not answer leaves the
-/// count to the runs the dispatcher knows of itself.
-pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> BTreeSet<String> {
+/// memory now. A project T3 cannot list adds no thread and is named in
+/// [`Running::unread`]: its caller decides what an unknown load means.
+pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> Running {
     let projects: BTreeSet<&Path> = config
         .projects
         .values()
@@ -92,14 +114,13 @@ pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> BTreeSet<String>
         .collect();
     let lists = projects.iter().map(|project| t3.running_threads(project));
     let lists = futures_util::future::join_all(lists).await;
-    let mut running = BTreeSet::new();
+    let mut running = Running::default();
     for (project, list) in projects.iter().zip(lists) {
         match list {
-            Ok(threads) => running.extend(threads),
-            Err(err) => tracing::debug!(
-                "the running threads of {}: {err:#}; counted as none",
-                project.display()
-            ),
+            Ok(threads) => running.threads.extend(threads),
+            Err(err) => running
+                .unread
+                .push(format!("{} ({err:#})", project.display())),
         }
     }
     running
