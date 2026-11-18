@@ -59,6 +59,8 @@ pub(crate) const ALERT_FILTER: &str = "seq <= :seq AND actor <> :me AND ( \
      (type IN ('files_touched', 'lease_created', 'agent_registered') \
       AND json_extract(payload, '$.repo') IN (SELECT value FROM json_each(:repos))) \
      OR (type = 'task_done' AND task IN (SELECT value FROM json_each(:watched))) \
+     OR (type = 'task_updated' AND json_extract(payload, '$.to') = 'dropped' \
+      AND task IN (SELECT value FROM json_each(:watched))) \
      OR (type IN ('task_updated', 'task_released', 'note_added') \
       AND json_extract(payload, '$.fields') IS NOT '[\"rank\"]' \
       AND (task IN (SELECT value FROM json_each(:mine)) \
@@ -860,6 +862,7 @@ fn fill_full(
     });
     model.counts = board_counts;
     left_reviews(cx, model, agent, board)?;
+    closed_blockers(cx, model, agent, board)?;
 
     // mine: owned tasks that are not closed, on any board.
     let me = agent.id.as_str();
@@ -1367,6 +1370,24 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
             }
         };
         let rank = |kind: u8| (kind, event.seq);
+        // A dropped blocker never counts as done, so my tasks that list it stay held until
+        // I clear it. The board changes neither their status nor their blockers.
+        if event.event_type == EventType::TaskUpdated
+            && event.payload.get("to").and_then(|to| to.as_str()) == Some("dropped")
+            && let Some(dropped) = &event.task
+        {
+            for task in mine.iter().filter(|t| t.blockers.contains(dropped)) {
+                let id = &task.id;
+                out.insert(
+                    (BLOCKER_DONE, format!("{dropped}>{id}")),
+                    Alert {
+                        alert: format!("{dropped} was dropped: it still holds your {id}"),
+                        action: dropped_action(id, &open_blockers(cx, task, dropped)?),
+                        rank: rank(BLOCKER_DONE),
+                    },
+                );
+            }
+        }
         // Work the agent delegated, or was delegated, is its own: no overlap or peer alerts.
         if matches!(
             event.event_type,
@@ -1379,15 +1400,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
             EventType::TaskDone => {
                 let Some(done) = &event.task else { continue };
                 for task in mine.iter().filter(|t| t.blockers.contains(done)) {
-                    let mut remaining: Vec<String> = Vec::new();
-                    for b in task.blockers.iter().filter(|b| *b != done) {
-                        if !cx.exists(
-                            "SELECT 1 FROM tasks WHERE id = ?1 AND status = 'done'",
-                            [b.as_str()],
-                        )? {
-                            remaining.push(b.to_string());
-                        }
-                    }
+                    let remaining = open_blockers(cx, task, done)?;
                     let mut action =
                         format!("task_update {} blockers=[{}]", task.id, remaining.join(","));
                     // A not_before still ahead holds the move to doing, so it is not offered.
@@ -1888,6 +1901,122 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(None);
     }
     Ok(on_repo.then_some(if task.owner_stale { take } else { close }))
+}
+
+/// The blockers of `task` other than `except` that are not done, as the list a
+/// `task_update` keeps.
+fn open_blockers(cx: &Ctx<'_>, task: &Task, except: &TaskId) -> Result<Vec<String>> {
+    let mut remaining = Vec::new();
+    for b in task.blockers.iter().filter(|b| *b != except) {
+        if !cx.exists(
+            "SELECT 1 FROM tasks WHERE id = ?1 AND status = 'done'",
+            [b.as_str()],
+        )? {
+            remaining.push(b.to_string());
+        }
+    }
+    Ok(remaining)
+}
+
+/// What the holder of `task` does about a dropped blocker; `keep` is the blockers that stay.
+fn dropped_action(task: &TaskId, keep: &[String]) -> String {
+    format!(
+        "if {task} can go on without it, task_update {task} blockers=[{}]; else name the \
+         task that replaces it, or drop {task} with a reason",
+        keep.join(",")
+    )
+}
+
+/// The most tasks [`closed_blockers`] names in one snapshot, in list order.
+const CLOSED_BLOCKERS_SHOWN: usize = 3;
+
+/// Adds to a full snapshot an alert for each task on `board` that blockers still hold
+/// though all of them are closed ([`Task::blockers_closed`]): a `blocked` task whose
+/// blockers are done or dropped, and an `open` task with a dropped blocker, which is never
+/// ready. The board moves neither, so the state itself is shown, to the agent that can act:
+/// the task's owner, or any agent when the task has no owner or a stale one. A task the
+/// event scan already alerted on is not named twice.
+fn closed_blockers(
+    cx: &Ctx<'_>,
+    model: &mut Model,
+    agent: &Agent,
+    board: &BoardSlug,
+) -> Result<()> {
+    let slug = board.as_str();
+    let held = load_tasks(
+        cx,
+        "t.board = :board AND t.status IN ('open', 'blocked') \
+         AND EXISTS (SELECT 1 FROM task_blockers b WHERE b.task = t.id) \
+         AND NOT EXISTS (SELECT 1 FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
+                         WHERE b.task = t.id AND bt.status NOT IN ('done', 'dropped'))",
+        &vec![(":board", &slug)],
+    )?;
+    let mut shown = 0;
+    for task in held.iter().filter(|t| t.blockers_closed) {
+        if shown == CLOSED_BLOCKERS_SHOWN {
+            break;
+        }
+        let mine = task.owner.as_ref() == Some(&agent.id);
+        if !mine && task.owner.is_some() && !task.owner_stale {
+            continue;
+        }
+        let id = &task.id;
+        if model
+            .alerts
+            .iter()
+            .any(|a| a.action.contains(&format!("task_update {id} ")))
+        {
+            continue;
+        }
+        let dropped: Vec<String> = cx
+            .db
+            .prepare_cached(
+                "SELECT b.blocker FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
+                 WHERE b.task = ?1 AND bt.status = 'dropped' ORDER BY bt.number, bt.board",
+            )?
+            .query_map([id.as_str()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let (alert, action) = match dropped.first() {
+            Some(first) => {
+                let more = match dropped.len() - 1 {
+                    0 => String::new(),
+                    n => format!(" and {n} more"),
+                };
+                (
+                    format!(
+                        "{id} is held by dropped {first}{more}; no blocker of it is in progress"
+                    ),
+                    dropped_action(id, &[]),
+                )
+            }
+            None => {
+                let mut action = if mine {
+                    format!("task_update {id} blockers=[]")
+                } else {
+                    let take = if task.owner_stale { " take=true" } else { "" };
+                    format!("task_claim {id}{take}, then task_update {id} blockers=[]")
+                };
+                // A not_before still ahead holds the move to doing, so it is not offered.
+                if mine && task.not_before.is_none_or(|at| at <= cx.now) {
+                    action.push_str(" status=doing");
+                }
+                if task.blocked_reason.is_some() {
+                    action.push_str("; check its blocked reason first");
+                }
+                (
+                    format!("{id} is blocked, and every blocker of it is done"),
+                    action,
+                )
+            }
+        };
+        model.alerts.push(Alert {
+            alert,
+            action,
+            rank: (BLOCKER_DONE, model.seq),
+        });
+        shown += 1;
+    }
+    Ok(())
 }
 
 /// The most tasks [`left_reviews`] names in one snapshot, the longest in review first.

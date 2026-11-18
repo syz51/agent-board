@@ -113,7 +113,7 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   slug created again continues its task numbering, and ask ids are not handed out again.
 - **Task**: `open` → `doing` → `review` → `done`, with `blocked` and `dropped`. `ready` is
   computed when read (open, all blockers done, no live owner, `not_before` passed, not a
-  pending proposal), never stored. Done requires
+  pending proposal), never stored; so is `blockers_closed` (see "Closed blockers"). Done requires
   evidence (a check with its exit code, a commit, a PR or an artifact), and may carry a
   `summary` for the user: what changed and what they should know or decide. Reopening
   clears it. `auto` says whether
@@ -144,6 +144,21 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `blocked`; waiting for a date is `not_before`, which the server's sweeper announces once
   passed. An agent that files a task it starts at once creates it claimed (`claim`), so
   the coordinator never sees it ready and the two never both start it.
+- **Closed blockers**: the board alerts and moves nothing. When a blocker is done, an
+  `open` task that waited only on it is ready at once, since `ready` is computed. A
+  `blocked` task stays `blocked` with its blocker list as it was: its owner may have a
+  blocked reason or an ask as well, so only an agent or the user moves it. A dropped
+  blocker never counts as done: the work was not done, so a task that lists it is never
+  `ready` and cannot be claimed until someone removes that blocker, names the task that
+  replaces it, or drops the waiting task too. Both cases are shown, not acted on. The
+  owner of a task that lists the blocker is alerted when it is done and when it is
+  dropped, with the `task_update` call that clears it. A task that blockers still hold
+  though every one is done or dropped (`blocked`, or `open` with a dropped blocker)
+  carries `blockers_closed`, computed when read: the web view marks it on its row and its
+  page, and a full snapshot names up to three such tasks from the board's state, to the
+  owner, or to every agent when the task has no owner or a stale one. The daemon wakes an
+  idle owner only for a done blocker ("Wake-ups"); a dropped one waits for the owner's
+  next snapshot.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),
   otherwise `claude:<session id>`, `codex:<session id>` or `opencode:<session id>`
   (from `OPENCODE_SESSION_ID`, which comes after `CLAUDE_CODE_SESSION_ID`, or the

@@ -98,6 +98,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         proposal: false,
         blockers: Vec::new(),
         ready: false,
+        blockers_closed: false,
         not_before: r.get::<_, Option<i64>>(15)?.map(ts),
         auto: r.get(10)?,
         created_by: parse_id(&r.get::<_, String>(11)?)?,
@@ -260,17 +261,22 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
     }
     let ids = json_ids(tasks.iter().map(|t| t.id.as_str()));
 
-    // Each task's blockers in blocker order, and whether all of them are done.
-    let mut blockers: HashMap<String, (Vec<TaskId>, bool)> = HashMap::new();
+    // Each task's blockers in blocker order, whether all of them are done, and how many
+    // are neither done nor dropped, and how many dropped.
+    let mut blockers: HashMap<String, (Vec<TaskId>, bool, usize, usize)> = HashMap::new();
     let mut stmt = cx.db.prepare_cached(BATCH_BLOCKERS)?;
     let mut rows = stmt.query([&ids])?;
     while let Some(r) = rows.next()? {
         let task: String = r.get(0)?;
         let blocker = parse_id(&r.get::<_, String>(1)?)?;
-        let done = r.get::<_, String>(2)? == "done";
-        let entry = blockers.entry(task).or_insert_with(|| (Vec::new(), true));
+        let status: String = r.get(2)?;
+        let entry = blockers
+            .entry(task)
+            .or_insert_with(|| (Vec::new(), true, 0, 0));
         entry.0.push(blocker);
-        entry.1 &= done;
+        entry.1 &= status == "done";
+        entry.2 += usize::from(status != "done" && status != "dropped");
+        entry.3 += usize::from(status == "dropped");
     }
     drop(rows);
     drop(stmt);
@@ -312,7 +318,15 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
     for task in &mut tasks {
         task.child_count = child_counts.get(task.id.as_str()).copied().unwrap_or(0);
         let all_done = match blockers.remove(task.id.as_str()) {
-            Some((ids, all_done)) => {
+            Some((ids, all_done, in_progress, dropped)) => {
+                // Held by nothing that is still in progress. A blocked task stays blocked
+                // when its last blocker is done, and a dropped blocker never counts as done.
+                task.blockers_closed = in_progress == 0
+                    && match task.status {
+                        TaskStatus::Blocked => true,
+                        TaskStatus::Open => dropped > 0,
+                        _ => false,
+                    };
                 task.blockers = ids;
                 all_done
             }

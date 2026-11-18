@@ -32,6 +32,19 @@ describe("task rows", () => {
     expect(item.querySelector("[data-dependency=blockers]")).toBeNull();
   });
 
+  test("a task held only by closed blockers says so", async () => {
+    const held = { ...base, status: "blocked" as const, blockers: ["factory-14"] };
+    const item = await row({ ...held, blockers_closed: true }, new Set(["factory-14"]));
+    expect(item.querySelector("[data-dependency=closed]")?.textContent).toBe(
+      "every blocker is done or dropped",
+    );
+  });
+
+  test("a task that still waits on a blocker in progress does not", async () => {
+    const item = await row({ ...base, status: "blocked", blockers: ["factory-14"] });
+    expect(item.querySelector("[data-dependency=closed]")).toBeNull();
+  });
+
   test("a start date ahead shows as a short day, with the full time on hover", async () => {
     const at = "2026-11-22T11:47:00Z";
     const item = await row({ ...base, status: "open", not_before: at });

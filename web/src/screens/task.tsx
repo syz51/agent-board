@@ -19,6 +19,7 @@ import { Markdown, PlainText, SafeLink, safeHref } from "@/text/markdown.tsx";
 import {
   AbsTime,
   agentIndex,
+  BLOCKERS_CLOSED,
   Crumbs,
   Empty,
   Owner,
@@ -176,8 +177,16 @@ function TaskView({
               <dt>Status</dt>
               <dd>
                 <StatusBadge status={task.status} ready={task.ready} />
-                {task.status === "open" && !task.ready && task.blockers.length > 0 && (
-                  <span className="text-muted-foreground">waiting on blockers</span>
+                {task.blockers_closed ? (
+                  <span className="text-amber">
+                    {BLOCKERS_CLOSED}: clear the blockers or drop the task
+                  </span>
+                ) : (
+                  task.status === "open" &&
+                  !task.ready &&
+                  task.blockers.length > 0 && (
+                    <span className="text-muted-foreground">waiting on blockers</span>
+                  )
                 )}
               </dd>
             </div>

@@ -29,12 +29,19 @@ export interface BoardFixture {
 }
 
 /**
- * A task as stored: `ready`, `proposal`, `owner_stale` and `owner_handle` are computed when
- * read, and `snippet` and `any_word` belong to a search.
+ * A task as stored: `ready`, `blockers_closed`, `proposal`, `owner_stale` and `owner_handle`
+ * are computed when read, and `snippet` and `any_word` belong to a search.
  */
 export type TaskFixture = Omit<
   Task,
-  "ready" | "proposal" | "owner_stale" | "child_count" | "owner_handle" | "snippet" | "any_word"
+  | "ready"
+  | "blockers_closed"
+  | "proposal"
+  | "owner_stale"
+  | "child_count"
+  | "owner_handle"
+  | "snippet"
+  | "any_word"
 >;
 
 /** Evidence as stored, with the task it belongs to. */

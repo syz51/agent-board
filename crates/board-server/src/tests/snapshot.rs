@@ -705,6 +705,117 @@ async fn a_cleared_blocker_offers_doing_only_once_not_before_passed() {
     );
 }
 
+/// A blocked task stays blocked when its last blocker is done: the board names it and
+/// changes neither its status nor its blockers.
+#[tokio::test]
+async fn a_blocked_task_whose_blockers_are_done_is_named_and_not_moved() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let (s, v) = t.patch(ME, &mine, json!({ "status": "blocked" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(t.get_task(&mine).await["blockers_closed"], json!(null));
+    finish(&t, B, &blocker).await;
+
+    let task = t.get_task(&mine).await;
+    assert_eq!(task["status"], "blocked");
+    assert_eq!(task["blockers"], json!([blocker]));
+    assert_eq!(task["blockers_closed"], true, "{task}");
+
+    // The event's alert names it once; a full snapshot does not name it a second time.
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!("{blocker} done: your blocker is cleared")),
+        "{full}"
+    );
+    assert!(!full.contains("every blocker of it is done"), "{full}");
+    // A session that starts later never reads that event: the state itself is shown.
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!(
+            "! {mine} is blocked, and every blocker of it is done -> task_update {mine} \
+             blockers=[] status=doing\n"
+        )),
+        "{full}"
+    );
+    // A live peer owns it: not the peer's to move, so the peer is not told.
+    let peer = text(&snapshot(&t, B, "").await).to_owned();
+    assert!(!peer.contains("every blocker of it is done"), "{peer}");
+
+    // Its owner clears the blockers: no longer named.
+    let (s, v) = t
+        .patch(ME, &mine, json!({ "blockers": [], "status": "doing" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(t.get_task(&mine).await["blockers_closed"], json!(null));
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(!full.contains("every blocker of it is done"), "{full}");
+}
+
+/// A dropped blocker never counts as done: the owner of a task that lists it is alerted,
+/// and an open task that lists it is named and stays out of ready until someone clears it.
+#[tokio::test]
+async fn a_dropped_blocker_alerts_the_tasks_it_holds_and_frees_none() {
+    let t = T::new();
+    let (blocker, mine) = blocked_on_peer(&t).await;
+    let other = t.task(B, "factory", "Still open").await;
+    let waits = t
+        .task_with(
+            ME,
+            json!({ "board": "factory", "title": "Waits", "blockers": [blocker, other] }),
+        )
+        .await;
+    snapshot(&t, ME, "kind=alerts").await;
+    let (s, v) = t
+        .patch(
+            B,
+            &blocker,
+            json!({ "status": "dropped", "reason": "not needed" }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // The owner of a task that lists it hears of the drop.
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(
+        alerts.contains(&format!(
+            "! {blocker} was dropped: it still holds your {mine} -> if {mine} can go on \
+             without it, task_update {mine} blockers=[]"
+        )),
+        "{alerts}"
+    );
+    let task = t.get_task(&mine).await;
+    assert_eq!(task["status"], "doing");
+    assert_eq!(task["blockers"], json!([blocker]));
+
+    // An open task with another blocker in progress is held by that one: not named.
+    let task = t.get_task(&waits).await;
+    assert_eq!(task["ready"], false);
+    assert_eq!(task["blockers_closed"], json!(null), "{task}");
+    assert!(t.claim(B, &other).await.0.is_success());
+    finish(&t, B, &other).await;
+
+    // Every blocker closed, one of them dropped: open, never ready, and named.
+    let task = t.get_task(&waits).await;
+    assert_eq!(task["status"], "open");
+    assert_eq!(task["ready"], false);
+    assert_eq!(task["blockers_closed"], true, "{task}");
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!(
+            "! {waits} is held by dropped {blocker}; no blocker of it is in progress -> if \
+             {waits} can go on without it, task_update {waits} blockers=[]"
+        )),
+        "{full}"
+    );
+
+    // Clearing the blockers is what frees it.
+    let (s, v) = t.patch(ME, &waits, json!({ "blockers": [] })).await;
+    assert!(s.is_success(), "{v}");
+    let task = t.get_task(&waits).await;
+    assert_eq!(task["ready"], true);
+    assert_eq!(task["blockers_closed"], json!(null));
+}
+
 #[tokio::test]
 async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
     let t = T::new();
