@@ -5471,6 +5471,40 @@ async fn a_t3_that_cannot_list_threads_holds_every_start_with_a_record() {
     assert_eq!(titles(&e.t3)[0], "factory-4 Task factory-4");
 }
 
+/// A hold whose cause changes gets a line for each cause, and a hold older than
+/// [`board::daemon::HOLD_KEPT`] is written again.
+#[tokio::test]
+async fn a_hold_gets_a_line_per_cause_and_a_new_one_after_a_week() {
+    use board_proto::Priority::P1;
+    let tasks = [ready_task("factory-4", P1, 0)];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(2);
+    *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(holds(&home_of(&e)).len(), 1);
+
+    // T3 stops answering: the same task is held for another cause.
+    e.t3.fail_list.store(true, Ordering::SeqCst);
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    e.daemon
+        .reconcile(later + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert_eq!(held[0]["unread"], json!([]));
+    assert_eq!(held[1]["unread"].as_array().unwrap().len(), 1);
+    let notes = || e.stub.requests_to("POST /v1/tasks/factory-4/notes").len();
+    assert_eq!(notes(), 1);
+
+    // Still held after the daemon forgot the records: both are written again.
+    let week = later + board::daemon::HOLD_KEPT + chrono::Duration::minutes(1);
+    e.daemon.reconcile(week).await.unwrap();
+    assert_eq!(holds(&home_of(&e)).len(), 3);
+    assert_eq!(notes(), 2);
+}
+
 /// The daemon keeps the holds it recorded, so a restart writes none of them again.
 #[tokio::test]
 async fn a_restart_writes_no_second_record_of_a_hold() {

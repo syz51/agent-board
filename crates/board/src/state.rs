@@ -374,6 +374,21 @@ pub fn append_unchecked_launch<T: Serialize>(home: &Home, record: &T) -> Result<
     append_line(home, "unchecked-launches.jsonl", record)
 }
 
+/// Whether `unchecked-launches.jsonl` has a launch of `session` at or after `since`.
+pub fn unchecked_launch_since(home: &Home, session: &str, since: Timestamp) -> bool {
+    let path = home.state_dir().join("unchecked-launches.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record["session"].as_str() == Some(session)
+                && serde_json::from_value::<Timestamp>(record["at"].clone())
+                    .is_ok_and(|at| at >= since)
+        })
+}
+
 fn append_line<T: Serialize>(home: &Home, file: &str, record: &T) -> Result<PathBuf> {
     use std::io::Write as _;
     let dir = home.state_dir();

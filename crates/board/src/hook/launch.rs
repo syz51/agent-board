@@ -43,6 +43,10 @@ pub(super) const BUDGET: Duration = Duration::from_secs(8);
 /// record.
 const COUNT_BUDGET: Duration = Duration::from_millis(4500);
 
+/// A session whose launches run unchecked gets one note in this time; the file has each
+/// launch.
+const UNCHECKED_NOTE_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
 /// How long the server has to take the note of a refusal; later, the file is the record.
 const NOTE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -202,6 +206,10 @@ pub(super) async fn check(
             tool_use,
             title: &title,
         };
+        // A note in the last hour names the file already: this launch adds its line only.
+        let noted = session.is_some_and(|session| {
+            state::unchecked_launch_since(home, session, at - UNCHECKED_NOTE_EVERY)
+        });
         let file = match state::append_unchecked_launch(home, &record) {
             Ok(file) => file,
             Err(err) => {
@@ -209,6 +217,9 @@ pub(super) async fn check(
                 return Ok(Reply::Nothing);
             }
         };
+        if noted {
+            return Ok(Reply::Nothing);
+        }
         let text = unchecked_note(&cause, tool, title, thread, &file);
         let noted = tokio::time::timeout(
             NOTE_BUDGET,
@@ -226,7 +237,14 @@ pub(super) async fn check(
         }
         return Ok(Reply::Nothing);
     }
-    let load = load(device_name.as_str(), limit, running.len(), asked);
+    let mut load = load(device_name.as_str(), limit, running.len(), asked);
+    // A count that is not whole says so: more turns may run than it names.
+    if let Some(unknown) = &unknown {
+        load.push_str(&format!(
+            "; {}, so more turns may run than these",
+            cut(unknown, CAUSE_CHARS)
+        ));
+    }
     let advice = advice(asked, limit);
     let name = record_name(session, tool, &input["tool_input"]);
     // The same call, refused before: its record takes this refusal too, and the task has
@@ -354,7 +372,8 @@ fn unchecked_note(
     let thread = thread.map_or_else(String::new, |t| format!(" from thread {t}"));
     format!(
         "A launch{thread} ran without the device limit's check: {cause}. Tool {tool}, title \
-         \"{title}\". The device keeps each such launch in {}.",
+         \"{title}\". The device keeps each such launch in {}; further ones of this session \
+         in the next hour add a line there and no note.",
         file.display()
     )
 }

@@ -258,7 +258,7 @@ pub struct WatchState {
     /// written, kept like `holds`.
     #[serde(
         default,
-        deserialize_with = "lenient_worker_retry",
+        deserialize_with = "lenient_hold_notes",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub hold_notes: BTreeMap<TaskId, Timestamp>,
@@ -629,6 +629,16 @@ fn lenient_holds<'de, D: serde::Deserializer<'de>>(
     Ok(lenient_by_key(
         serde_json::Value::deserialize(d)?,
         "the recorded hold",
+    ))
+}
+
+/// Each task's note of a hold read on its own, like [`lenient_queues`].
+fn lenient_hold_notes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<TaskId, Timestamp>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the note of a hold",
     ))
 }
 
@@ -1444,6 +1454,10 @@ impl<T: T3> Daemon<T> {
             self.judge_turns.keep_asked_since(last);
         }
         self.running = None;
+        // Before the boards are dispatched, so that a hold past this age is written anew
+        // in this pass.
+        self.state.holds.retain(|_, at| now - *at < HOLD_KEPT);
+        self.state.hold_notes.retain(|_, at| now - *at < HOLD_KEPT);
         self.reload_config();
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
@@ -1485,8 +1499,6 @@ impl<T: T3> Daemon<T> {
         self.state
             .usage_stops
             .retain(|_, at| now - *at < USAGE_STOP_KEPT);
-        self.state.holds.retain(|_, at| now - *at < HOLD_KEPT);
-        self.state.hold_notes.retain(|_, at| now - *at < HOLD_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
         self.save()

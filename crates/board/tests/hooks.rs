@@ -3884,6 +3884,42 @@ fn a_launch_that_t3_cannot_count_runs_with_a_record_and_a_note() {
         "{text}"
     );
     assert!(text.chars().count() <= 800, "{text}");
+
+    // The session's next unchecked launch adds its line and no second note.
+    let call = json!({"task": "Run the tests.", "title": "Test the counter"});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call),
+    );
+    assert_eq!(reply, None, "{}", e.ran());
+    let lines = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
+        1
+    );
+
+    // A call that can never fit is refused, and its cause says the count was not whole.
+    let three = json!({"threads": [{"title": "a"}, {"title": "b"}, {"title": "c"}]});
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__create_threads", three),
+    );
+    let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    let reason = reason.as_str().unwrap();
+    assert!(
+        reason.contains("has 0 of 2 agent turns running")
+            && reason.contains("T3 could not list the running threads of")
+            && reason.contains("more turns may run"),
+        "{reason}"
+    );
+    let cause = refused_launches(&e)[0]["cause"].clone();
+    assert!(
+        cause.as_str().unwrap().contains("T3 could not list"),
+        "{cause}"
+    );
 }
 
 /// The limit holds what agents start. A turn the user starts, and every other tool call,

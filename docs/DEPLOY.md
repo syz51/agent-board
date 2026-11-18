@@ -126,7 +126,13 @@ At the limit the daemon starts no worker and no judge on any of its boards, and 
 `t3_thread_launch`, `create_threads`); a turn you start yourself always runs. The hook
 checks on every logged-in device, also one without daemon-dispatch boards. Every hold and
 refusal is recorded: holds in `state/device-holds.jsonl`, refused calls in
-`state/refused-launches/`, both under `$BOARD_HOME`; the note on the task names the file. After
+`state/refused-launches/`, both under `$BOARD_HOME`; the note on the task names the file.
+When T3 cannot list the threads of a configured project (T3 is down, or a `[projects]` or
+`[board_projects]` folder is gone), the device's load is unknown: the daemon starts no
+worker and no judge on any board until T3 lists every project, and the hold's line names
+the projects and their errors (`unread`). So a daemon that starts nothing with free slots
+has a T3 that is down or a stale project entry: start T3, or take the entry out. The hook
+lets a launch run in that case and keeps each one in `state/unchecked-launches.jsonl`. After
 an upgrade that adds a hook, run `board install claude --write ~/.claude/settings.json`
 again so that Claude Code has it. Each run is an agent session of some hundred MiB, and
 its builds take more, so lower the limit on a device you also work on:

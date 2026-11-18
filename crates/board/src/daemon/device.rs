@@ -89,15 +89,31 @@ pub struct Running {
     pub unread: Vec<String>,
 }
 
+/// How much of the first unlisted project and its error [`Running::unknown`] quotes; a
+/// record's `unread` list has every project in full.
+pub const UNREAD_CHARS: usize = 240;
+
 impl Running {
-    /// Why the count is not whole, in words; `None` when T3 listed every project.
+    /// Why the count is not whole, in words short enough for a note; `None` when T3 listed
+    /// every project. It names the first project with its error, counts the rest, and says
+    /// what ends it.
     pub fn unknown(&self) -> Option<String> {
-        (!self.unread.is_empty()).then(|| {
-            format!(
-                "T3 could not list the running threads of {}",
-                self.unread.join("; ")
-            )
-        })
+        let first = self.unread.first()?;
+        let mut text = String::from("T3 could not list the running threads of ");
+        if first.chars().count() > UNREAD_CHARS {
+            text.extend(first.chars().take(UNREAD_CHARS));
+            text.push('…');
+        } else {
+            text.push_str(first);
+        }
+        match self.unread.len() - 1 {
+            0 => {}
+            more => text.push_str(&format!(" and of {more} more projects")),
+        }
+        text.push_str(
+            " (start T3, or take a project that is gone out of config.toml, to end this)",
+        );
+        Some(text)
     }
 }
 
@@ -196,6 +212,21 @@ mod tests {
         assert_eq!(default_run_limit(Some(4 << 30)), MIN_RUNS);
         assert_eq!(default_run_limit(Some(0)), MIN_RUNS);
         assert_eq!(default_run_limit(None), FALLBACK_RUNS);
+    }
+
+    #[test]
+    fn an_unknown_load_names_one_project_and_stays_short() {
+        assert_eq!(Running::default().unknown(), None);
+        let unread = (0..15).map(|n| format!("/projects/{n} ({})", "e".repeat(400)));
+        let running = Running {
+            threads: BTreeSet::new(),
+            unread: unread.collect(),
+        };
+        let text = running.unknown().unwrap();
+        assert!(text.contains("/projects/0 (eee"), "{text}");
+        assert!(text.contains("and of 14 more projects"), "{text}");
+        assert!(text.contains("config.toml"), "{text}");
+        assert!(text.chars().count() < 450, "{text}");
     }
 
     #[test]
