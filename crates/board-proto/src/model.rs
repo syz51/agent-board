@@ -885,6 +885,14 @@ mod tests {
         let read: Task = serde_json::from_value(task).unwrap();
         assert!(!read.proposal);
         assert_eq!(serde_json::to_value(&read).unwrap()["proposal"], false);
+        // An older server sends no `blockers_closed`; false is left out when written.
+        assert!(!read.blockers_closed);
+        assert!(
+            serde_json::to_value(&read)
+                .unwrap()
+                .get("blockers_closed")
+                .is_none()
+        );
     }
 
     #[test]

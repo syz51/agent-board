@@ -156,7 +156,10 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   though every one is done or dropped (`blocked`, or `open` with a dropped blocker)
   carries `blockers_closed`, computed when read: the web view marks it on its row and its
   page, and a full snapshot names up to three such tasks from the board's state, to the
-  owner, or to every agent when the task has no owner or a stale one. The daemon wakes an
+  owner, or to every agent when the task has no owner or a stale one, the agent's own
+  first. A task with an open ask, or with a blocked reason that another agent owns, is not
+  named: its blockers are not what holds it. Every call an alert offers is one the server
+  accepts, so for a `blocked` task with no reason it carries the status to move to. The daemon wakes an
   idle owner only for a done blocker ("Wake-ups"); a dropped one waits for the owner's
   next snapshot.
 - **Agent**: one thread. Id `t3:<thread id>` when T3 Code hosts it (from `T3CODE_THREAD_ID`),

@@ -816,6 +816,188 @@ async fn a_dropped_blocker_alerts_the_tasks_it_holds_and_frees_none() {
     assert_eq!(task["blockers_closed"], json!(null));
 }
 
+/// A blocked task of mine on `blocker`, parked with `extra` (a reason or a `not_before`).
+async fn parked_on_peer(t: &T, extra: Value) -> (String, String) {
+    let (blocker, mine) = blocked_on_peer(t).await;
+    let mut body = json!({ "status": "blocked" });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let (s, v) = t.patch(ME, &mine, body).await;
+    assert!(s.is_success(), "{v}");
+    (blocker, mine)
+}
+
+async fn drop_task(t: &T, agent: &str, task: &str) {
+    let body = json!({ "status": "dropped", "reason": "not needed" });
+    let (s, v) = t.patch(agent, task, body).await;
+    assert!(s.is_success(), "{v}");
+}
+
+/// The server accepts the call each alert offers: a blocked task with no reason cannot
+/// stay blocked without a blocker in progress, so the call moves it too.
+#[tokio::test]
+async fn the_call_a_closed_blocker_alert_offers_is_accepted() {
+    // My blocked task, its only blocker dropped: the event's alert, then the state's.
+    let t = T::new();
+    let (blocker, mine) = parked_on_peer(&t, json!({})).await;
+    drop_task(&t, B, &blocker).await;
+    let call = format!("task_update {mine} blockers=[] status=doing; else");
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(alerts.contains(&call), "{alerts}");
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!(
+            "! {mine} is held by dropped {blocker}; no blocker"
+        )),
+        "{full}"
+    );
+    assert!(full.contains(&call), "{full}");
+    let (s, v) = t
+        .patch(ME, &mine, json!({ "blockers": [], "status": "doing" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // With a reason it stays blocked for the reason, and only its owner is told.
+    let t = T::new();
+    let (blocker, mine) = parked_on_peer(&t, json!({ "blocked_reason": "needs a key" })).await;
+    finish(&t, B, &blocker).await;
+    snapshot(&t, ME, "kind=alerts").await;
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!(
+            "-> task_update {mine} blockers=[]; it stays blocked for its reason\n"
+        )),
+        "{full}"
+    );
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let peer = text(&snapshot(&t, B, "").await).to_owned();
+    assert!(!peer.contains("every blocker of it is done"), "{peer}");
+    let (s, v) = t.patch(ME, &mine, json!({ "blockers": [] })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(t.get_task(&mine).await["status"], "blocked");
+
+    // A date still ahead holds the move to doing: the call gives the task back.
+    let t = T::new();
+    let ahead = (t.state.now() + TimeDelta::days(2)).to_rfc3339();
+    let (blocker, mine) = parked_on_peer(&t, json!({ "not_before": ahead })).await;
+    finish(&t, B, &blocker).await;
+    snapshot(&t, ME, "kind=alerts").await;
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!("-> task_update {mine} blockers=[] status=open\n")),
+        "{full}"
+    );
+    let (s, v) = t
+        .patch(ME, &mine, json!({ "blockers": [], "status": "open" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // Its owner went stale: any agent is told, and takes the task before it moves it.
+    let t = T::new();
+    let (blocker, mine) = parked_on_peer(&t, json!({})).await;
+    finish(&t, B, &blocker).await;
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let peer = text(&snapshot(&t, B, "").await).to_owned();
+    assert!(
+        peer.contains(&format!(
+            "! {mine} is blocked, and every blocker of it is done -> task_claim {mine} \
+             take=true, then task_update {mine} blockers=[] status=doing\n"
+        )),
+        "{peer}"
+    );
+    let take = format!("/v1/tasks/{mine}/take");
+    let (s, v) = t
+        .call("POST", &take, Some(B), Some(json!({ "agent": B })))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t
+        .patch(B, &mine, json!({ "blockers": [], "status": "doing" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(t.get_task(&mine).await["owner"], B);
+
+    // The same with a dropped blocker: the take is not refused for it.
+    let t = T::new();
+    let (blocker, mine) = parked_on_peer(&t, json!({})).await;
+    drop_task(&t, B, &blocker).await;
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let peer = text(&snapshot(&t, B, "").await).to_owned();
+    assert!(
+        peer.contains(&format!(
+            "if {mine} can go on without it, task_claim {mine} take=true, then task_update \
+             {mine} blockers=[] status=doing; else"
+        )),
+        "{peer}"
+    );
+    let take = format!("/v1/tasks/{mine}/take");
+    let (s, v) = t
+        .call("POST", &take, Some(B), Some(json!({ "agent": B })))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t
+        .patch(B, &mine, json!({ "blockers": [], "status": "doing" }))
+        .await;
+    assert!(s.is_success(), "{v}");
+}
+
+/// A blocker dropped and reopened before the owner's next snapshot is in progress again.
+#[tokio::test]
+async fn a_blocker_reopened_after_a_drop_alerts_nobody() {
+    let t = T::new();
+    let (blocker, _) = blocked_on_peer(&t).await;
+    drop_task(&t, B, &blocker).await;
+    let (s, v) = t.patch(B, &blocker, json!({ "status": "open" })).await;
+    assert!(s.is_success(), "{v}");
+    let alerts = text(&snapshot(&t, ME, "kind=alerts").await).to_owned();
+    assert!(!alerts.contains("was dropped"), "{alerts}");
+}
+
+/// The cap of three names the agent's own task before the tasks of nobody.
+#[tokio::test]
+async fn closed_blocker_alerts_name_my_task_first_and_stop_at_three() {
+    let t = T::new();
+    let (blocker, mine) = parked_on_peer(&t, json!({})).await;
+    let second = t.task(B, "factory", "Second blocker").await;
+    drop_task(&t, B, &second).await;
+    // Filed at a higher priority than mine, so they come first in list order.
+    let mut loose = Vec::new();
+    for n in 0..3 {
+        let body = json!({
+            "board": "factory", "title": format!("Loose {n}"), "priority": "p1",
+            "blockers": [second],
+        });
+        loose.push(t.task_with(B, body).await);
+    }
+    let (s, v) = t
+        .patch(ME, &mine, json!({ "blockers": [blocker, second] }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    drop_task(&t, B, &blocker).await;
+    snapshot(&t, ME, "kind=alerts").await;
+
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.contains(&format!(
+            "! {mine} is held by dropped {blocker} and 1 more; no blocker"
+        )),
+        "{full}"
+    );
+    assert_eq!(full.matches("; no blocker of it is in progress").count(), 3);
+    assert!(!full.contains(&format!("! {} is held", loose[2])), "{full}");
+    // An open task needs no status with the call.
+    assert!(
+        full.contains(&format!(
+            "if {0} can go on without it, task_update {0} blockers=[]; else",
+            loose[0]
+        )),
+        "{full}"
+    );
+}
+
 #[tokio::test]
 async fn alerts_past_the_scan_cap_say_how_many_wait_and_resume_there() {
     let t = T::new();

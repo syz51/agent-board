@@ -560,7 +560,7 @@ looked{board} at open tasks only: done and dropped ones are left out"
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 27] = [
+const TASK_FIELDS: [&str; 28] = [
     "id",
     "board",
     "parent",
@@ -576,6 +576,7 @@ const TASK_FIELDS: [&str; 27] = [
     "owner_stale",
     "blockers",
     "ready",
+    "blockers_closed",
     "proposal",
     "not_before",
     "auto",

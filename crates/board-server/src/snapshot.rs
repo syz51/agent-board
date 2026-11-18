@@ -23,8 +23,8 @@ use crate::error::Result;
 use crate::ops::agents::boards_for_repo;
 use crate::ops::leases::{Glob, delegation_family, shared_scan};
 use crate::ops::tasks::{
-    done_take_hint, drop_hint, nobody_runs, owner_left, owner_session_ended, priority_str,
-    status_str,
+    done_take_hint, drop_hint, nobody_runs, open_ask, owner_left, owner_session_ended,
+    priority_str, status_str,
 };
 use crate::store::{
     EVENT_COLUMNS, NamedParams, agent_boards, counts, event_row, find_handoff, get_agent,
@@ -1375,6 +1375,11 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         if event.event_type == EventType::TaskUpdated
             && event.payload.get("to").and_then(|to| to.as_str()) == Some("dropped")
             && let Some(dropped) = &event.task
+            // Reopened since: it is a blocker in progress again, and nothing is to clear.
+            && cx.exists(
+                "SELECT 1 FROM tasks WHERE id = ?1 AND status = 'dropped'",
+                [dropped.as_str()],
+            )?
         {
             for task in mine.iter().filter(|t| t.blockers.contains(dropped)) {
                 let id = &task.id;
@@ -1382,7 +1387,10 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                     (BLOCKER_DONE, format!("{dropped}>{id}")),
                     Alert {
                         alert: format!("{dropped} was dropped: it still holds your {id}"),
-                        action: dropped_action(id, &open_blockers(cx, task, dropped)?),
+                        action: dropped_action(
+                            id,
+                            &clear_call(cx, task, &agent.id, &open_blockers(cx, task, dropped)?)?,
+                        ),
                         rank: rank(BLOCKER_DONE),
                     },
                 );
@@ -1918,24 +1926,53 @@ fn open_blockers(cx: &Ctx<'_>, task: &Task, except: &TaskId) -> Result<Vec<Strin
     Ok(remaining)
 }
 
-/// What the holder of `task` does about a dropped blocker; `keep` is the blockers that stay.
-fn dropped_action(task: &TaskId, keep: &[String]) -> String {
+/// The `task_update` call that takes `task` out from under closed blockers; `keep` is the
+/// blockers that stay, none of them done. A `blocked` task with no reason needs a blocker
+/// that is not done, so the call that removes the last one also moves the task: to `doing`
+/// for its owner, else to `open`, where a `not_before` still ahead holds it and any agent
+/// may claim it. Only the owner may move an owned task, so another agent takes a stale
+/// owner's task first. An open ask on such a task is named, since the task waits on it too.
+fn clear_call(cx: &Ctx<'_>, task: &Task, agent: &AgentId, keep: &[String]) -> Result<String> {
+    let id = &task.id;
+    let mut call = format!("task_update {id} blockers=[{}]", keep.join(","));
+    if task.status == TaskStatus::Blocked && task.blocked_reason.is_none() && keep.is_empty() {
+        let taken = task.owner.is_some() && task.owner.as_ref() != Some(agent);
+        let held = task.not_before.is_some_and(|at| at > cx.now);
+        call.push_str(if task.owner.is_some() && !held {
+            " status=doing"
+        } else {
+            " status=open"
+        });
+        if taken {
+            call = format!("task_claim {id} take=true, then {call}");
+        }
+        if let Some(ask) = open_ask(cx, id)? {
+            call = format!("once ask #{ask} is answered or withdrawn, {call}");
+        }
+    }
+    Ok(call)
+}
+
+/// What the holder of `task` does about a dropped blocker; `call` is its [`clear_call`].
+fn dropped_action(task: &TaskId, call: &str) -> String {
     format!(
-        "if {task} can go on without it, task_update {task} blockers=[{}]; else name the \
-         task that replaces it, or drop {task} with a reason",
-        keep.join(",")
+        "if {task} can go on without it, {call}; else name the task that replaces it, or \
+         drop {task} with a reason"
     )
 }
 
-/// The most tasks [`closed_blockers`] names in one snapshot, in list order.
+/// The most tasks [`closed_blockers`] names in one snapshot: the agent's own first, then in
+/// list order.
 const CLOSED_BLOCKERS_SHOWN: usize = 3;
 
 /// Adds to a full snapshot an alert for each task on `board` that blockers still hold
 /// though all of them are closed ([`Task::blockers_closed`]): a `blocked` task whose
 /// blockers are done or dropped, and an `open` task with a dropped blocker, which is never
 /// ready. The board moves neither, so the state itself is shown, to the agent that can act:
-/// the task's owner, or any agent when the task has no owner or a stale one. A task the
-/// event scan already alerted on is not named twice.
+/// the task's owner, or any agent when the task has no owner or a stale one. A task that
+/// waits on an open ask, or on a blocked reason that is not this agent's to judge, is left
+/// out: its blockers are not what holds it. A task the event scan already alerted on is not
+/// named twice.
 fn closed_blockers(
     cx: &Ctx<'_>,
     model: &mut Model,
@@ -1943,21 +1980,26 @@ fn closed_blockers(
     board: &BoardSlug,
 ) -> Result<()> {
     let slug = board.as_str();
-    let held = load_tasks(
+    let mut held = load_tasks(
         cx,
         "t.board = :board AND t.status IN ('open', 'blocked') \
          AND EXISTS (SELECT 1 FROM task_blockers b WHERE b.task = t.id) \
          AND NOT EXISTS (SELECT 1 FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
-                         WHERE b.task = t.id AND bt.status NOT IN ('done', 'dropped'))",
+                         WHERE b.task = t.id AND bt.status NOT IN ('done', 'dropped')) \
+         AND (t.status = 'blocked' \
+              OR EXISTS (SELECT 1 FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
+                         WHERE b.task = t.id AND bt.status = 'dropped'))",
         &vec![(":board", &slug)],
     )?;
+    // The cap never spends its places on tasks of others before the agent's own.
+    held.sort_by_key(|t| t.owner.as_ref() != Some(&agent.id));
     let mut shown = 0;
-    for task in held.iter().filter(|t| t.blockers_closed) {
+    for task in &held {
         if shown == CLOSED_BLOCKERS_SHOWN {
             break;
         }
         let mine = task.owner.as_ref() == Some(&agent.id);
-        if !mine && task.owner.is_some() && !task.owner_stale {
+        if !mine && ((task.owner.is_some() && !task.owner_stale) || task.blocked_reason.is_some()) {
             continue;
         }
         let id = &task.id;
@@ -1965,6 +2007,7 @@ fn closed_blockers(
             .alerts
             .iter()
             .any(|a| a.action.contains(&format!("task_update {id} ")))
+            || open_ask(cx, id)?.is_some()
         {
             continue;
         }
@@ -1976,6 +2019,7 @@ fn closed_blockers(
             )?
             .query_map([id.as_str()], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let call = clear_call(cx, task, &agent.id, &[])?;
         let (alert, action) = match dropped.first() {
             Some(first) => {
                 let more = match dropped.len() - 1 {
@@ -1986,28 +2030,17 @@ fn closed_blockers(
                     format!(
                         "{id} is held by dropped {first}{more}; no blocker of it is in progress"
                     ),
-                    dropped_action(id, &[]),
+                    dropped_action(id, &call),
                 )
             }
-            None => {
-                let mut action = if mine {
-                    format!("task_update {id} blockers=[]")
-                } else {
-                    let take = if task.owner_stale { " take=true" } else { "" };
-                    format!("task_claim {id}{take}, then task_update {id} blockers=[]")
-                };
-                // A not_before still ahead holds the move to doing, so it is not offered.
-                if mine && task.not_before.is_none_or(|at| at <= cx.now) {
-                    action.push_str(" status=doing");
-                }
+            None => (
+                format!("{id} is blocked, and every blocker of it is done"),
                 if task.blocked_reason.is_some() {
-                    action.push_str("; check its blocked reason first");
-                }
-                (
-                    format!("{id} is blocked, and every blocker of it is done"),
-                    action,
-                )
-            }
+                    format!("{call}; it stays blocked for its reason")
+                } else {
+                    call
+                },
+            ),
         };
         model.alerts.push(Alert {
             alert,

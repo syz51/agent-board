@@ -716,8 +716,14 @@ blockers hold it though every one is done or dropped: it is `blocked`, or `open`
 dropped blocker. The owner of a task that lists a blocker gets a snapshot alert from the
 blocker's `task_done` event and from the `task_updated` event that drops it (`"to":
 "dropped"`), and a full snapshot names up to three tasks with `blockers_closed` that the
-agent owns or that have no owner or a stale one. Each alert ends with the `task_update`
-call that clears the blockers.
+agent owns or that have no owner or a stale one, its own first; a task with an open ask,
+or with a blocked reason and another owner, is left out. Each alert's action holds the
+`task_update` call that clears the blockers. The call also moves a `blocked` task that has
+no reason, which could not stay `blocked` (`status=doing` for its owner, `status=open`
+with no owner or while `not_before` is ahead), and follows `task_claim <id> take=true`
+for a stale owner's task. A dropped blocker's alert goes on to the other choices: name
+the task that replaces it, or drop the waiting task. An alert for a blocker that was
+reopened before the snapshot is not shown.
 `GET /v1/tasks/{id}` lists the tasks waiting on it in `blocks`, from every board, and a
 blocker's `task_done` event,
 on its own board's feed, wakes the waiting task's board coordinator and the owner of a
