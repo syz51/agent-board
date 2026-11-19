@@ -131,9 +131,10 @@ When T3 cannot list the threads of a configured project (T3 is down or answers w
 error), the device's load is unknown: the daemon starts no
 worker and no judge on any board until T3 lists every project, and the hold's line names
 the projects and their errors (`unread`). So a daemon that starts nothing with free slots
-has a T3 that is down or that fails for one entry: start T3, or take the entry out. An
-entry whose folder T3 has no project for is no such failure: it counts as no threads. The hook
-lets a launch run in that case and keeps each one in `state/unchecked-launches.jsonl`. After
+has a T3 that is down or that fails for one entry: start T3, or take the entry out. The hook
+lets a launch run in that case and keeps each one in `state/unchecked-launches.jsonl`. An
+entry whose folder T3 has no project for is no such failure: T3 answered, so the entry
+counts as no threads, and `watch.log` names it once. After
 an upgrade that adds a hook, run `board install claude --write ~/.claude/settings.json`
 again so that Claude Code has it. Each run is an agent session of some hundred MiB, and
 its builds take more, so lower the limit on a device you also work on:

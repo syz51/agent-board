@@ -18,9 +18,11 @@
 //! - `t3 thread list --json --project <project path>`: the project's active (unarchived)
 //!   threads.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -337,15 +339,35 @@ impl T3 for T3Cli {
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
-        let list = self.thread_list(project).await?;
-        Ok(list.map_or_else(Vec::new, |list| parse_threads_titled(&list, title)))
+        // A start in a folder without a T3 project cannot be followed: that stays an error,
+        // so the caller holds the run instead of taking the thread for one never made.
+        let Some(list) = self.thread_list(project).await? else {
+            bail!(
+                "t3 thread list failed: T3 has no project for {}",
+                project.display()
+            );
+        };
+        Ok(parse_threads_titled(&list, title))
     }
 
     async fn running_threads(&self, project: &Path) -> Result<Vec<String>> {
         // A folder T3 has no project for has no T3 thread: that is a count of none, not a
-        // count T3 could not give.
-        let list = self.thread_list(project).await?;
-        Ok(list.map_or_else(Vec::new, |list| parse_running_threads(&list)))
+        // count T3 could not give. The entry may be stale all the same (a repository that
+        // moved), so the log names it, once for a process.
+        let Some(list) = self.thread_list(project).await? else {
+            static NAMED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+            let mut named = NAMED.lock().unwrap_or_else(PoisonError::into_inner);
+            if named.insert(project.to_owned()) {
+                tracing::warn!(
+                    "T3 has no project for {}, a folder of config.toml: its running threads \
+                     count as none. Add the folder as a T3 project, or correct or remove the \
+                     entry",
+                    project.display()
+                );
+            }
+            return Ok(Vec::new());
+        };
+        Ok(parse_running_threads(&list))
     }
 }
 
