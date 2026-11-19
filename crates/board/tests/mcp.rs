@@ -464,7 +464,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
     assert_eq!(
         text(&done).trim_end().lines().last(),
         Some(
-            "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply."
+            "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you that you have not reported, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply."
         ),
         "{done}"
     );

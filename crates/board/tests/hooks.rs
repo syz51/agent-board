@@ -2155,7 +2155,7 @@ fn nothing_doing(e: &Env) {
 }
 
 /// The line `board done` and the `task_done` tool end with: what to file now.
-const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply.";
+const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you that you have not reported, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply.";
 
 /// The line a release to `open` ends with.
 const RELEASE_REMINDER: &str = "Released unfinished: what remains of its own steps stays in this task, so note there which steps are done, unless a note says it. File now, unless it is on the board: a follow-up task an acceptance check requires, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. A feedback report is not such a task. Name each open item's id in your final reply.";
