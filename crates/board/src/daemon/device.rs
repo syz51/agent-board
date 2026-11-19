@@ -111,7 +111,7 @@ impl Running {
             more => text.push_str(&format!(" and of {more} more projects")),
         }
         text.push_str(
-            " (start T3, or take a project that is gone out of config.toml, to end this)",
+            " (start T3, or take the project T3 fails for out of config.toml, to end this)",
         );
         Some(text)
     }

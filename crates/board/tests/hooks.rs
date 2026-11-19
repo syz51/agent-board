@@ -3823,6 +3823,30 @@ fn a_launch_runs_while_the_device_has_a_free_slot() {
     assert_eq!(refused_launches(&e)[0]["asked"], 2);
 }
 
+/// A configured folder that T3 has no project for has no T3 thread: T3 answered, so the
+/// count is whole, and a launch under the limit runs as a counted one, with no record of
+/// an unchecked launch.
+#[cfg(unix)]
+#[test]
+fn a_folder_without_a_t3_project_counts_as_no_running_threads() {
+    let e = env();
+    device_with_turns(&e, 2, &[]);
+    common::script::write_script(
+        &e.home.join("t3"),
+        "#!/bin/sh\necho \"No T3 Code project matches '/projects/gone'. Pass a project id \
+         or a path inside a project.\" >&2\nexit 1\n",
+    );
+    let call = json!({"task": "Review the diff.", "title": "Review the counter"});
+    let (reply, text) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call),
+    );
+    assert_eq!((reply, text.as_str()), (None, ""), "{}", e.ran());
+    assert!(refused_launches(&e).is_empty());
+    assert!(!e.home.join("state/unchecked-launches.jsonl").exists());
+}
+
 /// The launch gate stays open when T3 cannot count the device's turns, and each launch it
 /// lets through leaves a line in the device's trail and a note that names that file.
 #[cfg(unix)]
