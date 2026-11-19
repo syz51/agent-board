@@ -986,6 +986,10 @@ treated as follows:
   held task's note names the first of them, counts the rest and says what ends the hold:
   start T3, or take a project that is gone out of `config.toml`. A task held first at the limit and then by this gets a line
   for each cause. The board keeps its place in the queue.
+  A folder that T3 has no project for is not such a case: T3 answered ("No T3 Code project
+  matches …"), so the folder has no T3 thread and counts as none, for the daemon and for
+  the launch check. Before 2026-11-19 it counted as unknown, and one such `config.toml`
+  entry held every board of the device for 20 hours.
 - **A thread an agent starts through T3** (`delegate_task`, `t3_thread_launch`,
   `create_threads`) is refused by the `PreToolUse` hook when the running turns plus the
   threads asked for pass the limit (see "Runtime integration"). The agent does the work in

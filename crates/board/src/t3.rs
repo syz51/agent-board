@@ -232,15 +232,21 @@ impl T3Cli {
         ))
     }
 
-    /// `t3 thread list --json --project <project>`, parsed.
-    async fn thread_list(&self, project: &Path) -> Result<Value> {
+    /// `t3 thread list --json --project <project>`, parsed; `None` when T3 has no project
+    /// for the folder.
+    async fn thread_list(&self, project: &Path) -> Result<Option<Value>> {
         let project = project.to_string_lossy();
         let args = ["thread", "list", "--json", "--project", &project];
         let (ok, stdout, stderr) = self.run(&args, None).await?;
         if !ok {
+            if is_unknown_project(&stderr) {
+                return Ok(None);
+            }
             bail!("t3 thread list failed: {}", stderr.trim());
         }
-        serde_json::from_str(&stdout).context("t3 thread list --json")
+        serde_json::from_str(&stdout)
+            .map(Some)
+            .context("t3 thread list --json")
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
@@ -331,14 +337,15 @@ impl T3 for T3Cli {
     }
 
     async fn threads_titled(&self, project: &Path, title: &str) -> Result<Vec<ListedThread>> {
-        Ok(parse_threads_titled(
-            &self.thread_list(project).await?,
-            title,
-        ))
+        let list = self.thread_list(project).await?;
+        Ok(list.map_or_else(Vec::new, |list| parse_threads_titled(&list, title)))
     }
 
     async fn running_threads(&self, project: &Path) -> Result<Vec<String>> {
-        Ok(parse_running_threads(&self.thread_list(project).await?))
+        // A folder T3 has no project for has no T3 thread: that is a count of none, not a
+        // count T3 could not give.
+        let list = self.thread_list(project).await?;
+        Ok(list.map_or_else(Vec::new, |list| parse_running_threads(&list)))
     }
 }
 
@@ -409,6 +416,16 @@ pub fn is_unknown_thread(stderr: &str, thread: &str) -> bool {
             "thread {} is no longer available",
             thread.to_ascii_lowercase()
         ))
+}
+
+/// Whether `t3 thread list --project` failed because T3 has no project for the folder
+/// (0.1.8: "No T3 Code project matches '<folder>'. Pass a project id or a path inside a
+/// project."). T3 answered, so the folder has no T3 thread; any other failure leaves that
+/// unknown.
+pub fn is_unknown_project(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("no t3 code project matches")
 }
 
 /// Reads `{"thread": {"archived": …, "providerInstanceId": …, "worktreePath": …, "runCount": …}}` from
@@ -635,6 +652,16 @@ mod tests {
             ]
         );
         assert!(parse_threads_titled(&json!({}), "f coordinator").is_empty());
+    }
+
+    #[test]
+    fn a_folder_without_a_t3_project_is_told_from_a_t3_that_cannot_answer() {
+        assert!(is_unknown_project(
+            "No T3 Code project matches '/projects/gone'. Pass a project id or a path inside a project."
+        ));
+        assert!(!is_unknown_project("connection refused"));
+        assert!(!is_unknown_project("Project /projects/gone timed out"));
+        assert!(!is_unknown_project(""));
     }
 
     #[test]
