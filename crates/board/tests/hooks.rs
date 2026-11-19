@@ -17,7 +17,7 @@ const CLAUDE_AGENT: &str = "claude:00893aaf-19fa-41d2-8238-13269b9b3ca0";
 const SNAPSHOT: &str =
     "<board agent=\"claude:0089\" board=\"factory\" seq=\"812\">\nyou: claude:0089\n</board>";
 /// What Claude's `SessionStart` adds after the snapshot: Claude Code defers MCP tool schemas.
-const TOOL_SEARCH: &str = "If the board tools show by name only, load these with your first board work, and any other the same way (mcp__board__<tool>) when you need it: ToolSearch query \"select:mcp__board__board_snapshot,mcp__board__task_claim,mcp__board__task_show,mcp__board__task_note,mcp__board__handoff_set,mcp__board__task_done\" max_results 6";
+const TOOL_SEARCH: &str = "If the board tools show by name only, load these with your first board work, and any other the same way (mcp__board__<tool>) when you need it: ToolSearch query \"select:mcp__board__task_claim,mcp__board__task_show,mcp__board__task_note,mcp__board__task_add,mcp__board__feedback,mcp__board__handoff_set,mcp__board__task_done\" max_results 7";
 
 /// Claude's `SessionStart` context for [`SNAPSHOT`].
 fn started() -> String {
@@ -308,7 +308,7 @@ fn session_start_without_a_board_hints_only_when_the_repo_has_one() {
         load,
         TOOL_SEARCH
             .replace("select:", "select:mcp__board__board_join,")
-            .replace("max_results 6", "max_results 7"),
+            .replace("max_results 7", "max_results 8"),
         "board_join is loaded first"
     );
 }
@@ -2155,7 +2155,7 @@ fn nothing_doing(e: &Env) {
 }
 
 /// The line `board done` and the `task_done` tool end with: what to file now.
-const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Name each open item's id in your final reply.";
+const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you that you have not reported, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply.";
 
 /// The line a release to `open` ends with.
 const RELEASE_REMINDER: &str = "Released unfinished: what remains of its own steps stays in this task, so note there which steps are done, unless a note says it. File now, unless it is on the board: a follow-up task an acceptance check requires, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. A feedback report is not such a task. Name each open item's id in your final reply.";
