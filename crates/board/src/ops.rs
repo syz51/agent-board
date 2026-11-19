@@ -1085,8 +1085,10 @@ pub async fn task_done(
 /// The last line of a done's text: what to file now, at the moment the agent closes the
 /// task, since a reminder at the turn's end would follow the agent's report and leave only
 /// its answer in view. The kinds of task are those of the MCP server's instructions
-/// (`mcp::INSTRUCTIONS`). It asks for no reply of its own.
-const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Name each open item's id in your final reply.";
+/// (`mcp::INSTRUCTIONS`). It also asks for the problems the tools and the setup gave: agents
+/// work around these and count them as solved, so they filed them only when the owner asked.
+/// It asks for no reply of its own.
+const DONE_REMINDER: &str = "File now what remains, unless it is on the board: a sub-task for this task's remaining scope, a Proposal: task for work you found outside it, a blocked task with an ask for the user's part. Then go back over this task's tool calls: report with feedback each problem a tool, hook, instruction or setup gave you, also one you worked around, and file a Proposal: task for each step you did by hand that a tool should do. Name each open item's id in your final reply.";
 
 /// The last line of a release's text ([`released`]): as [`DONE_REMINDER`], but what remains
 /// of a released task's own steps stays in it, so it asks for a note of the steps done and

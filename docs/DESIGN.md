@@ -373,9 +373,11 @@ but `task` in `lease_paths` and `ask_user`, priority `p1|p2|p3`, note kind
 `note|finding|decision`, `handoff_set` needs `now` and `next`, and `task_done` evidence is
 `checks` of `{command, exit_code}`, `commits`, `prs` or `artifacts`, not prose. The tools
 to load are named in one place, the Claude `SessionStart` context, since only Claude Code
-defers them: the six a session calls first (`board_snapshot`, `task_claim`, `task_show`,
-`task_note`, `handoff_set`, `task_done`), with the name pattern that loads any other. A
-longer list made each session load schemas it never called.
+defers them: the seven a session calls first (`task_claim`, `task_show`, `task_note`,
+`task_add`, `feedback`, `handoff_set`, `task_done`), with the name pattern that loads any
+other. A longer list made each session load schemas it never called. `task_add` and
+`feedback` are in it so that an agent files an item or a setup problem when it meets it;
+`board_snapshot` is not, since the session start gives the snapshot.
 
 Each rule is said once in what a session is given at its start. The rules (when to call
 `board_snapshot`, claim before working, keep the handoff current, file what remains, report
@@ -699,7 +701,11 @@ apart from the user's chats, such as environment variables.
   done (`task_done`, `board done`) and of a release of a task the agent owned in `doing`
   to `open` (`task_update` or `board update` with status `open`, `board release`) ends
   with one line that asks to file what remains now and to name each open item's id in the
-  final reply. A release's line says that what remains of the task's own steps stays in
+  final reply. A done's line also asks the agent to go back over the task's tool calls,
+  report each problem a tool, hook, instruction or setup gave it, also one it worked
+  around, and propose each step it did by hand that a tool should do: agents count a
+  problem they got past as solved, and filed these only when the owner asked. A release's
+  line says that what remains of the task's own steps stays in
   it, with a note of the steps done, and that a feedback report is not such a task. The
   line asks for no reply of its own: the `Stop` hook gave this reminder until it was
   moved here, and its block made the agent's answer, often "nothing left to file", the
