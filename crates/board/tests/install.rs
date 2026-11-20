@@ -316,3 +316,168 @@ fn install_claude_keeps_file_modes_and_links() {
     assert_eq!(mode(&fresh), 0o600);
     assert_eq!(mode(&settings2), 0o600);
 }
+
+/// A settings file as a dotfiles repository keeps it: every board hook runs through a wrapper
+/// script. `launch` adds the entry for the launch matcher.
+fn wrapper_settings(launch: bool) -> Value {
+    let wrapper = |event: &str| {
+        json!([{
+            "type": "command",
+            "command": format!("/bin/sh \"$HOME/.claude/hooks/board-hook.sh\" {event} claude"),
+            "timeout": 5
+        }])
+    };
+    let mut pre_tool_use = vec![
+        json!({"matcher": "^Bash$", "hooks": [{"type": "command", "command": "guard.sh"}]}),
+        json!({"matcher": "Bash", "hooks": wrapper("pre-tool-use")}),
+    ];
+    if launch {
+        pre_tool_use.push(json!({
+            "matcher": "mcp__.*__(delegate_task|t3_thread_launch|create_threads)",
+            "hooks": wrapper("pre-tool-use")
+        }));
+    }
+    json!({
+        "model": "opus",
+        "hooks": {
+            "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": wrapper("session-start")}],
+            "UserPromptSubmit": [{"hooks": wrapper("user-prompt-submit")}],
+            "PreToolUse": pre_tool_use,
+            "PostToolUse": [{"matcher": "*", "hooks": wrapper("post-tool-use")}],
+            "PostToolUseFailure": [{"matcher": "Bash", "hooks": wrapper("post-tool-use-failure")}],
+            "Stop": [{"hooks": wrapper("stop")}],
+            "StopFailure": [{"matcher": "rate_limit", "hooks": wrapper("stop-failure")}],
+            "SessionEnd": [{"hooks": wrapper("session-end")}],
+            "PreCompact": [{"matcher": "manual|auto", "hooks": wrapper("pre-compact")}]
+        }
+    })
+}
+
+#[test]
+fn install_claude_adds_no_second_entry_beside_wrapper_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("board-home");
+    let settings = dir.path().join("settings.json");
+    let claude_json = dir.path().join("claude.json");
+    std::fs::write(&settings, wrapper_settings(true).to_string()).unwrap();
+    let args = [
+        "install",
+        "claude",
+        "--bin",
+        "/opt/bin/board",
+        "--write",
+        settings.to_str().unwrap(),
+        "--mcp-config",
+        claude_json.to_str().unwrap(),
+    ];
+    let out = board(&home, dir.path(), &[], &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("kept 10 of 10 that the file already runs through a wrapper"),
+        "{}",
+        stdout(&out)
+    );
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(after, wrapper_settings(true), "no entry added or removed");
+
+    // A file that lacks one matcher gets that entry only, and a direct entry that repeats a
+    // wrapper (written by an older `board install`) is removed.
+    let mut stale = wrapper_settings(false);
+    stale["hooks"]["Stop"].as_array_mut().unwrap().push(json!({
+        "hooks": [{"type": "command", "command": "/old/board hook stop --runtime claude"}]
+    }));
+    std::fs::write(&settings, stale.to_string()).unwrap();
+    let out = board(&home, dir.path(), &[], &args, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("kept 9 of 10"), "{}", stdout(&out));
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let mut expected = wrapper_settings(false);
+    expected["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "matcher": "mcp__.*__(delegate_task|t3_thread_launch|create_threads)",
+            "hooks": [{
+                "type": "command",
+                "command": "/opt/bin/board hook pre-tool-use --runtime claude",
+                "timeout": 10
+            }]
+        }));
+    assert_eq!(after, expected);
+}
+
+#[test]
+fn install_check_reports_missing_and_doubled_hooks_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("board-home");
+    let settings = dir.path().join("settings.json");
+    let check = |runtime: &str| {
+        board(
+            &home,
+            dir.path(),
+            &[],
+            &["install", runtime, "--check", settings.to_str().unwrap()],
+            "",
+        )
+    };
+
+    // No file: every hook is missing, and none is created.
+    let out = check("claude");
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out).matches("missing: ").count(), 10);
+    assert!(!settings.exists());
+
+    // Wrapper hooks for every event and matcher: nothing to report.
+    std::fs::write(&settings, wrapper_settings(true).to_string()).unwrap();
+    let out = check("claude");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("holds each of the 10 board hooks once"));
+
+    // One matcher missing, and one event with a direct entry beside its wrapper.
+    let mut text = wrapper_settings(false);
+    text["hooks"]["SessionStart"].as_array_mut().unwrap().push(json!({
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [{"type": "command", "command": "/opt/bin/board hook session-start --runtime claude"}]
+    }));
+    let text = text.to_string();
+    std::fs::write(&settings, &text).unwrap();
+    let out = check("claude");
+    assert!(!out.status.success());
+    let listed = stdout(&out);
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        [
+            "runs more than once: SessionStart (matcher `startup|resume|clear|compact`) (1 direct, 1 through a wrapper)",
+            "missing: PreToolUse (matcher `mcp__.*__(delegate_task|t3_thread_launch|create_threads)`)",
+        ]
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("lacks or repeats 2 of the 10 board hooks"),
+        "{err}"
+    );
+    assert!(err.contains("board install claude --write"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        text,
+        "unchanged"
+    );
+
+    // --check and --write are two routes.
+    let out = board(
+        &home,
+        dir.path(),
+        &[],
+        &[
+            "install",
+            "codex",
+            "--check",
+            settings.to_str().unwrap(),
+            "--write",
+            settings.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), text);
+}

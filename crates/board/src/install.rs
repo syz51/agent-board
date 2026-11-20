@@ -19,9 +19,15 @@ const SYSTEMD_UNIT: &str = "agent-board-watch.service";
 pub enum InstallCommand {
     /// Hooks and the MCP server for Claude Code.
     Claude {
-        /// Merge the hooks into this settings file, such as ~/.claude/settings.json.
+        /// Merge the hooks into this settings file, such as ~/.claude/settings.json. An entry
+        /// that runs board for the same event and matcher through a wrapper script is kept
+        /// and gets no second entry.
         #[arg(long)]
         write: Option<PathBuf>,
+        /// Write nothing: list the hooks this settings file lacks or runs twice, and fail
+        /// when there are any. For a file that another tool manages.
+        #[arg(long, conflicts_with = "write")]
+        check: Option<PathBuf>,
         /// With --write, merge the MCP server into this file (user scope: ~/.claude.json).
         #[arg(long, requires = "write")]
         mcp_config: Option<PathBuf>,
@@ -31,9 +37,14 @@ pub enum InstallCommand {
     },
     /// Hooks (hooks.json) and the MCP server (config.toml snippet) for Codex.
     Codex {
-        /// Merge the hooks into this hooks file, such as ~/.codex/hooks.json.
+        /// Merge the hooks into this hooks file, such as ~/.codex/hooks.json; wrapper
+        /// entries are kept as for Claude Code.
         #[arg(long)]
         write: Option<PathBuf>,
+        /// Write nothing: list the hooks this hooks file lacks or runs twice, and fail when
+        /// there are any.
+        #[arg(long, conflicts_with = "write")]
+        check: Option<PathBuf>,
         #[arg(long)]
         bin: Option<PathBuf>,
     },
@@ -158,9 +169,17 @@ const CODEX_HOOKS: &[HookSpec] = &[
 pub fn run(cmd: InstallCommand) -> Result<()> {
     match cmd {
         InstallCommand::Claude {
+            check: Some(settings),
+            ..
+        } => check_hooks_file(&expand_tilde(settings), "claude", CLAUDE_HOOKS)?,
+        InstallCommand::Codex {
+            check: Some(path), ..
+        } => check_hooks_file(&expand_tilde(path), "codex", CODEX_HOOKS)?,
+        InstallCommand::Claude {
             write,
             mcp_config,
             bin,
+            check: None,
         } => {
             let bin = binary(bin);
             let hooks = hooks_json(&bin, "claude", CLAUDE_HOOKS);
@@ -177,8 +196,7 @@ pub fn run(cmd: InstallCommand) -> Result<()> {
                 }
                 Some(settings) => {
                     let settings = expand_tilde(settings);
-                    merge_hooks_file(&settings, &hooks)?;
-                    println!("merged board hooks into {}", settings.display());
+                    write_hooks_file(&settings, &bin, "claude", CLAUDE_HOOKS)?;
                     let mcp_path = match mcp_config {
                         Some(path) => expand_tilde(path),
                         None => dirs::home_dir()
@@ -190,7 +208,11 @@ pub fn run(cmd: InstallCommand) -> Result<()> {
                 }
             }
         }
-        InstallCommand::Codex { write, bin } => {
+        InstallCommand::Codex {
+            write,
+            bin,
+            check: None,
+        } => {
             let bin = binary(bin);
             let hooks = hooks_json(&bin, "codex", CODEX_HOOKS);
             match write {
@@ -200,8 +222,7 @@ pub fn run(cmd: InstallCommand) -> Result<()> {
                 }
                 Some(path) => {
                     let path = expand_tilde(path);
-                    merge_hooks_file(&path, &hooks)?;
-                    println!("merged board hooks into {}", path.display());
+                    write_hooks_file(&path, &bin, "codex", CODEX_HOOKS)?;
                 }
             }
             println!("# Add to ~/.codex/config.toml:");
@@ -313,25 +334,85 @@ fn split_program(command: &str) -> Option<(String, &str)> {
     }
 }
 
-fn hooks_json(bin: &Path, runtime: &str, specs: &[HookSpec]) -> Value {
-    let mut hooks = Map::new();
-    for spec in specs {
+/// Does this command run board for `event` through another program, such as a wrapper script
+/// (`/bin/sh "$HOME/.claude/hooks/board-hook.sh" stop claude`)? A settings file that another
+/// tool manages holds such entries; they count as present.
+fn is_wrapped_board_hook(command: &str, event: HookEvent) -> bool {
+    !is_board_hook(command)
+        && command.contains("board")
+        && command
+            .split_whitespace()
+            .any(|word| word.trim_matches(['"', '\'']) == event.arg())
+}
+
+/// Claude Code and Codex match every value for no matcher, `""` and `"*"`.
+fn matcher_key(matcher: Option<&str>) -> &str {
+    match matcher {
+        None | Some("*") => "",
+        Some(matcher) => matcher,
+    }
+}
+
+impl HookSpec {
+    /// The hook as a message names it.
+    fn label(&self) -> String {
+        match self.matcher {
+            Some(matcher) => format!("{} (matcher `{matcher}`)", self.event.name()),
+            None => self.event.name().to_owned(),
+        }
+    }
+
+    fn group(&self, bin: &Path, runtime: &str) -> Value {
         let mut group = Map::new();
-        if let Some(matcher) = spec.matcher {
+        if let Some(matcher) = self.matcher {
             group.insert("matcher".into(), json!(matcher));
         }
         group.insert(
             "hooks".into(),
             json!([{
                 "type": "command",
-                "command": hook_command(bin, spec.event, runtime),
-                "timeout": spec.timeout,
+                "command": hook_command(bin, self.event, runtime),
+                "timeout": self.timeout,
             }]),
         );
+        Value::Object(group)
+    }
+
+    /// How many entries of `hooks` run board for this event and matcher: directly, and
+    /// through a wrapper.
+    fn count_in(&self, hooks: &Map<String, Value>) -> (usize, usize) {
+        let (mut direct, mut wrapped) = (0, 0);
+        let groups = hooks.get(self.event.name()).and_then(Value::as_array);
+        for group in groups.into_iter().flatten() {
+            if matcher_key(group.get("matcher").and_then(Value::as_str))
+                != matcher_key(self.matcher)
+            {
+                continue;
+            }
+            let commands = group.get("hooks").and_then(Value::as_array);
+            for command in commands
+                .into_iter()
+                .flatten()
+                .filter_map(|h| h["command"].as_str())
+            {
+                if is_board_hook(command) {
+                    direct += 1;
+                } else if is_wrapped_board_hook(command, self.event) {
+                    wrapped += 1;
+                }
+            }
+        }
+        (direct, wrapped)
+    }
+}
+
+fn hooks_json(bin: &Path, runtime: &str, specs: &[HookSpec]) -> Value {
+    let mut hooks = Map::new();
+    for spec in specs {
         // An event may have several entries, one per matcher.
         let groups = hooks.entry(spec.event.name()).or_insert_with(|| json!([]));
         if let Some(groups) = groups.as_array_mut() {
-            groups.push(Value::Object(group));
+            groups.push(spec.group(bin, runtime));
         }
     }
     json!({ "hooks": hooks })
@@ -511,13 +592,73 @@ fn write_temp_beside(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     Ok(tmp)
 }
 
-/// Merges `ours` (`{"hooks": {...}}`) into the file: previous board hook entries are
-/// replaced, every other key and hook is kept, and running it twice changes nothing.
-pub fn merge_hooks_file(path: &Path, ours: &Value) -> Result<()> {
-    update_json_file(path, |root| merge_hooks(root, ours))
+/// `--write`: merges the hooks into the file and says which ones a wrapper already runs.
+fn write_hooks_file(path: &Path, bin: &Path, runtime: &str, specs: &[HookSpec]) -> Result<()> {
+    let mut wrapped = Vec::new();
+    update_json_file(path, |root| {
+        wrapped = merge_hooks(root, bin, runtime, specs)?;
+        Ok(())
+    })?;
+    println!("merged board hooks into {}", path.display());
+    if !wrapped.is_empty() {
+        println!(
+            "kept {} of {} that the file already runs through a wrapper, with no second entry: {}",
+            wrapped.len(),
+            specs.len(),
+            wrapped.join(", ")
+        );
+    }
+    Ok(())
 }
 
-fn merge_hooks(root: &mut Map<String, Value>, ours: &Value) -> Result<()> {
+/// `--check`: lists the hooks the file lacks or runs more than once, and writes nothing.
+fn check_hooks_file(path: &Path, runtime: &str, specs: &[HookSpec]) -> Result<()> {
+    let text = read_text(path)?.unwrap_or_default();
+    let root = parse_json_object(path, &text)?;
+    let empty = Map::new();
+    let hooks = match root.get("hooks") {
+        None => &empty,
+        Some(hooks) => hooks.as_object().context("\"hooks\" is not an object")?,
+    };
+    let mut problems = 0;
+    for spec in specs {
+        let (direct, wrapped) = spec.count_in(hooks);
+        match direct + wrapped {
+            1 => continue,
+            0 => println!("missing: {}", spec.label()),
+            _ => println!(
+                "runs more than once: {} ({direct} direct, {wrapped} through a wrapper)",
+                spec.label()
+            ),
+        }
+        problems += 1;
+    }
+    if problems == 0 {
+        println!(
+            "{} holds each of the {} board hooks once",
+            path.display(),
+            specs.len()
+        );
+        return Ok(());
+    }
+    bail!(
+        "{} lacks or repeats {problems} of the {} board hooks, listed above. Where another tool manages the file, change it there: add each missing hook and delete each second entry. Otherwise run: board install {runtime} --write {}",
+        path.display(),
+        specs.len(),
+        shell_word(path)
+    )
+}
+
+/// Merges the hooks into `root`: previous direct board hook entries are replaced, every other
+/// key and hook is kept, and running it twice changes nothing. A hook that the file already
+/// runs through a wrapper for the same event and matcher gets no direct entry; the result
+/// names those hooks.
+fn merge_hooks(
+    root: &mut Map<String, Value>,
+    bin: &Path,
+    runtime: &str,
+    specs: &[HookSpec],
+) -> Result<Vec<String>> {
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
@@ -540,19 +681,25 @@ fn merge_hooks(root: &mut Map<String, Value>, ours: &Value) -> Result<()> {
         });
     }
     hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
-    for (event, groups) in ours["hooks"].as_object().into_iter().flatten() {
-        let list = hooks
-            .entry(event.clone())
+    let mut wrapped = Vec::new();
+    for spec in specs {
+        if spec.count_in(hooks).1 > 0 {
+            wrapped.push(spec.label());
+            continue;
+        }
+        let event = spec.event.name();
+        hooks
+            .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .with_context(|| format!("hooks.{event} is not an array"))?;
-        list.extend(groups.as_array().into_iter().flatten().cloned());
+            .with_context(|| format!("hooks.{event} is not an array"))?
+            .push(spec.group(bin, runtime));
     }
-    Ok(())
+    Ok(wrapped)
 }
 
 /// Sets `mcpServers.board` in the file, keeping everything else.
-pub fn merge_mcp_file(path: &Path, server: Value) -> Result<()> {
+fn merge_mcp_file(path: &Path, server: Value) -> Result<()> {
     update_json_file(path, |root| {
         root.entry("mcpServers")
             .or_insert_with(|| Value::Object(Map::new()))
@@ -673,10 +820,10 @@ mod tests {
             }
         }))
         .unwrap();
-        let ours = hooks_json(Path::new("/new/board"), "claude", CLAUDE_HOOKS);
-        merge_hooks(&mut root, &ours).unwrap();
+        let bin = Path::new("/new/board");
+        merge_hooks(&mut root, bin, "claude", CLAUDE_HOOKS).unwrap();
         let once = root.clone();
-        merge_hooks(&mut root, &ours).unwrap();
+        merge_hooks(&mut root, bin, "claude", CLAUDE_HOOKS).unwrap();
         assert_eq!(root, once);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
@@ -691,6 +838,49 @@ mod tests {
         );
         assert_eq!(root["hooks"]["StopFailure"][0]["matcher"], "rate_limit");
         assert_eq!(root["hooks"]["PreCompact"][0]["matcher"], "manual|auto");
+    }
+
+    #[test]
+    fn wrapped_board_hooks_are_recognized_by_event() {
+        let wrapper = r#"/bin/sh "$HOME/.claude/hooks/board-hook.sh" post-tool-use claude"#;
+        assert!(is_wrapped_board_hook(wrapper, HookEvent::PostToolUse));
+        assert!(!is_wrapped_board_hook(
+            wrapper,
+            HookEvent::PostToolUseFailure
+        ));
+        assert!(is_wrapped_board_hook(
+            "'/opt/my hooks/board-hook' 'stop' codex",
+            HookEvent::Stop
+        ));
+        // A direct entry is replaced by the merge, not kept as a wrapper.
+        assert!(!is_wrapped_board_hook(
+            "/usr/local/bin/board hook stop --runtime claude",
+            HookEvent::Stop
+        ));
+        assert!(!is_wrapped_board_hook("notify.sh stop", HookEvent::Stop));
+    }
+
+    #[test]
+    fn a_wrapper_counts_only_for_its_own_event_and_matcher() {
+        let wrapper = |event: &str| json!({"type": "command", "command": format!("/bin/sh board-hook.sh {event} claude")});
+        let mut root: Map<String, Value> = serde_json::from_value(json!({
+            "hooks": {
+                // Another matcher than the installed `Bash` and launch matchers.
+                "PreToolUse": [{"matcher": "Edit", "hooks": [wrapper("pre-tool-use")]}],
+                // No matcher equals the installed `*`.
+                "PostToolUse": [{"hooks": [wrapper("post-tool-use")]}],
+                // The wrapper runs another event than the one it is filed under.
+                "Stop": [{"hooks": [wrapper("session-end")]}]
+            }
+        }))
+        .unwrap();
+        let wrapped =
+            merge_hooks(&mut root, Path::new("/b/board"), "claude", CLAUDE_HOOKS).unwrap();
+        assert_eq!(wrapped, ["PostToolUse (matcher `*`)"]);
+        let hooks = &root["hooks"];
+        assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 3);
+        assert_eq!(hooks["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(hooks["Stop"].as_array().unwrap().len(), 2);
     }
 
     #[test]
