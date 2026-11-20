@@ -10,20 +10,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use board_proto::{
-    AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError, Ask,
-    AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard,
-    CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceInfo, DeviceName,
-    DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult,
-    MarkSeen, Note, PutHandoff, RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage,
-    ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task,
-    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateTask, Updates, Usage, UsageReserve,
+    AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError,
+    ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError,
+    CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk,
+    DeviceInfo, DeviceName, DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff,
+    Judge, LeaseResult, MarkSeen, Note, PutHandoff, RankTasks, RankedTasks, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
+    Touches, UpdateBoard, UpdateTask, Updates, Usage, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::auth::Caller;
-use crate::error::{Error, Result, invalid, not_found};
+use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
     agents, asks, boards, devices, feedback, judges, leases, stats, tasks, updates, usage,
@@ -77,6 +77,7 @@ pub(crate) fn router(state: AppState) -> Router {
             get(show_board).patch(update_board).delete(delete_board),
         )
         .route("/boards/{slug}/join", post(join_board))
+        .route("/boards/{slug}/approved", post(approved_board_change))
         .route("/boards/{slug}/rank", post(rank_tasks))
         .route(
             "/boards/{slug}/coordinator",
@@ -345,6 +346,41 @@ async fn update_board(
     Ok(Json(
         state
             .write(move |cx| boards::update(cx, &actor, &slug, req, by_user))
+            .await?,
+    ))
+}
+
+/// Applies a change to the settings only the user may raise, which the user approved in
+/// their own words. It takes the user's login: an agent runs it on a device that holds one
+/// (`board approved board update`), and the event names the agent, the device and the words.
+async fn approved_board_change(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(slug): Path<String>,
+    Body(req): Body<ApprovedBoardChange>,
+) -> Result<Json<Board>> {
+    if !caller.is_user() {
+        return Err(forbidden(
+            "only the user's login may apply an approved board change",
+            "run `board approved board update` where the user home holds a login with a \
+             token created with --user, or ask the user with the change attached (ask_user \
+             with change)",
+        ));
+    }
+    let slug: BoardSlug = parse_path(&slug)?;
+    boards::validate_approved(&req)?;
+    boards::validate_change(&req.change, state.settings())?;
+    let actor = caller.actor();
+    let device = caller.device().cloned();
+    Ok(Json(
+        state
+            .write(move |cx| {
+                let approval = boards::Approval::Said {
+                    said: &req.said,
+                    device: device.as_ref(),
+                };
+                boards::update_approved(cx, &actor, &slug, &req.change, approval)
+            })
             .await?,
     ))
 }

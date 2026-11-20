@@ -3,6 +3,8 @@
 
 /// Longest ask option, in characters.
 pub const ASK_OPTION_CHARS_MAX: usize = 60;
+/// Longest quote of the user's words on an approved board change, in characters.
+pub const APPROVAL_SAID_CHARS_MAX: usize = 500;
 /// Longest evidence value (a check command, commit, PR or artifact), in characters.
 pub const EVIDENCE_VALUE_CHARS_MAX: usize = 500;
 /// Longest agent title (a thread's title), in characters.

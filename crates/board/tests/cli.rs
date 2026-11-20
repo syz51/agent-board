@@ -606,6 +606,7 @@ fn add_feedback_ask_answer_log_and_snapshot_send_their_bodies() {
         answered_via: None,
         created_at: at(),
         answered_at: None,
+        change: None,
     };
     e.stub.on("POST /v1/asks", &ask);
     let out = e.run(&[
@@ -1313,6 +1314,7 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
         answered_via: None,
         created_at: at(),
         answered_at: None,
+        change: None,
     };
     let mut theirs = open(8, "factory-3");
     theirs.agent = "t3:c2d0".parse().unwrap();
@@ -2878,6 +2880,7 @@ fn status_and_asks_list_a_bounded_number_by_default() {
             answered_via: None,
             created_at: at(),
             answered_at: None,
+            change: None,
         })
         .collect();
     e.stub.on("GET /v1/asks", &asks);
@@ -3131,4 +3134,184 @@ fn update_sets_and_clears_a_rank_and_rank_orders_many_tasks_in_one_call() {
     assert_eq!(req.body["clear_others"], true);
     // No task named is refused before any request.
     assert!(!e.run(&["rank"]).status.success());
+}
+
+/// A home holding the user's login: its own server address and token file.
+fn user_home(e: &Env, token: Option<&str>) -> std::path::PathBuf {
+    let home = e.cwd.parent().unwrap().join("user-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!("server = \"{}\"\ndevice = \"user-cli\"\n", e.stub.url),
+    )
+    .unwrap();
+    if let Some(token) = token {
+        std::fs::write(home.join("token"), token).unwrap();
+    }
+    home
+}
+
+fn run_approved(e: &Env, user_home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut all = vec!["approved", "board", "update"];
+    all.extend_from_slice(args);
+    board(
+        &e.home,
+        &e.cwd,
+        &[
+            ("T3CODE_THREAD_ID", "thread-1"),
+            ("BOARD_USER_HOME", user_home.to_str().unwrap()),
+        ],
+        &all,
+        "",
+    )
+}
+
+#[test]
+fn approved_applies_the_change_with_the_users_login_and_quotes_their_words() {
+    let e = env();
+    let home = user_home(&e, Some("user-token"));
+    let mut board = board_fixture("factory", &[]);
+    board.parallel_tasks = 2;
+    e.stub.on("POST /v1/boards/factory/approved", &board);
+
+    let out = run_approved(
+        &e,
+        &home,
+        &[
+            "factory",
+            "--parallel-tasks",
+            "2",
+            "--said",
+            "make it scale to 2",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("applied parallel_tasks=2 to "),
+        "{}",
+        stdout(&out)
+    );
+    let sent = &e.stub.requests_to("POST /v1/boards/factory/approved")[0];
+    assert_eq!(
+        sent.body,
+        json!({"said": "make it scale to 2", "change": {"parallel_tasks": 2}})
+    );
+    // The user home's token, not the session's device token; the agent is named.
+    assert_eq!(sent.auth.as_deref(), Some("Bearer user-token"));
+    assert_eq!(sent.agent.as_deref(), Some(ME));
+}
+
+#[test]
+fn approved_refuses_without_a_user_login_and_other_settings() {
+    let e = env();
+    // No token in the user home: refused before any request, with both ways on.
+    let empty = user_home(&e, None);
+    let out = run_approved(
+        &e,
+        &empty,
+        &["factory", "--parallel-tasks", "2", "--said", "make it 2"],
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("no user login on this device"), "{err}");
+    assert!(err.contains("ask_user with change"), "{err}");
+
+    let home = user_home(&e, Some("user-token"));
+    for args in [
+        // Only the listed settings: no other board setting, no other command.
+        vec!["factory", "--status", "closed", "--said", "go"],
+        vec![
+            "factory",
+            "--parallel-tasks",
+            "2",
+            "--autopilot",
+            "true",
+            "--said",
+            "go",
+        ],
+        vec!["factory", "--title", "Mine", "--said", "go"],
+        // A setting and the words are required.
+        vec!["factory", "--said", "go"],
+        vec!["factory", "--parallel-tasks", "2"],
+        vec!["factory", "--parallel-tasks", "5", "--said", "go"],
+    ] {
+        let out = run_approved(&e, &home, &args);
+        assert!(!out.status.success(), "{args:?}");
+    }
+    for args in [
+        vec!["approved", "answer", "7", "yes"],
+        vec!["approved", "board", "delete", "factory"],
+        vec!["approved", "board", "create", "x", "--title", "X"],
+        vec!["approved", "admin", "device", "x"],
+    ] {
+        let out = board(
+            &e.home,
+            &e.cwd,
+            &[("BOARD_USER_HOME", home.to_str().unwrap())],
+            &args,
+            "",
+        );
+        assert!(!out.status.success(), "{args:?}");
+    }
+    assert!(
+        e.stub
+            .requests()
+            .iter()
+            .all(|r| !r.path.contains("approved"))
+    );
+}
+
+#[test]
+fn ask_sends_a_board_change_and_says_who_applies_it() {
+    let e = env();
+    let change = board_proto::BoardChange {
+        parallel_tasks: Some(2),
+        ..Default::default()
+    };
+    let mut ask = Ask {
+        id: 9,
+        board: "factory".parse().unwrap(),
+        task: None,
+        agent: ME.parse().unwrap(),
+        kind: AskKind::Decision,
+        question: "Two at once?".into(),
+        options: vec![change.approving_option(), "Keep 1".into()],
+        status: AskStatus::Open,
+        answer: None,
+        answered_via: None,
+        created_at: at(),
+        answered_at: None,
+        change: Some(change),
+    };
+    e.stub.on("POST /v1/asks", &ask);
+    let args = [
+        "ask",
+        "Two at once?",
+        "--board",
+        "factory",
+        "--option",
+        "Keep 1",
+        "--set-parallel-tasks",
+        "2",
+    ];
+    let out = e.run(&args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        e.stub.requests_to("POST /v1/asks")[0].body["change"],
+        json!({"parallel_tasks": 2})
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("\"Apply: parallel_tasks=2\", the server applies it to board factory"),
+        "{text}"
+    );
+
+    // A server that predates changes on asks drops it: the text says no answer applies it.
+    ask.change = None;
+    e.stub.on("POST /v1/asks", &ask);
+    let text = stdout(&e.run(&args));
+    assert!(
+        text.contains("warning: the server ignored the change (parallel_tasks=2)"),
+        "{text}"
+    );
 }

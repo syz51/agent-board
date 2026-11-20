@@ -828,6 +828,7 @@ fn answered_ask(id: i64, agent: &str) -> Ask {
         answered_via: Some("web".into()),
         created_at: at(),
         answered_at: Some(at()),
+        change: None,
     }
 }
 

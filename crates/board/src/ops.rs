@@ -6,18 +6,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
-    AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, AskKind, Board, BoardSlug,
-    BoardStatus, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceName,
-    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
-    RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT,
-    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, ApprovedBoardChange, AskKind,
+    Board, BoardChange, BoardSlug, BoardStatus, CreateAsk, CreateBoard, CreateFeedback,
+    CreateLeases, CreateTask, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence,
+    NoteKind, Priority, PutHandoff, RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat,
+    SnapshotKind, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus,
+    Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::client::{Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code};
-use crate::config::{Config, Home, load_token};
+use crate::config::{Config, Home, load_stored_token, load_token};
 use crate::identity::RepoInfo;
 use crate::render;
 
@@ -78,6 +79,39 @@ impl Ctx {
             load_token(&home)?.context("no device token: run `board login`, or set BOARD_TOKEN")?;
         let client = Client::new(server, token, agent, timeout)?;
         let device = device.clone();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        Ok(Self {
+            home,
+            config,
+            device,
+            client,
+            repo: RepoInfo::detect(&cwd),
+            known: None,
+        })
+    }
+
+    /// The context of the user's login on this device, for `board approved`: the server and
+    /// token of the user home ([`Home::user_from_env`]), never the session's `BOARD_TOKEN`.
+    /// `agent` is who runs the command, which the server records. Refuses when the home
+    /// holds no login.
+    pub fn load_user_login(agent: Option<AgentId>) -> Result<Self> {
+        let home = Home::user_from_env()?;
+        let config = Config::load(&home)?;
+        let token = load_stored_token(&home)?;
+        let (Some(server), Some(device), Some(token)) =
+            (config.server.as_deref(), config.device.clone(), token)
+        else {
+            bail!(
+                "no user login on this device: {} holds no login. The user sets it up once \
+                 with a token created with --user (BOARD_HOME={} board login --server <url> \
+                 --device <name>; BOARD_USER_HOME names another home). Without it, ask the \
+                 user with the change attached (ask_user with change; CLI: board ask \
+                 --set-...), which the server applies when they approve",
+                home.root().display(),
+                home.root().display(),
+            );
+        };
+        let client = Client::new(server, token, agent, None)?;
         let cwd = std::env::current_dir().unwrap_or_default();
         Ok(Self {
             home,
@@ -1220,6 +1254,8 @@ pub struct NewAsk {
     pub kind: AskKind,
     pub question: String,
     pub options: Vec<String>,
+    /// A change to the board that the server applies when the user approves it.
+    pub change: Option<BoardChange>,
 }
 
 pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
@@ -1237,6 +1273,7 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
             kind: ask.kind,
             question: ask.question,
             options: ask.options,
+            change: ask.change,
         })
         .await?;
     let created = &answer.ask;
@@ -1247,6 +1284,20 @@ pub async fn ask_user(ctx: &Ctx, ask: NewAsk) -> Result<Output> {
     // The server's warning names the board's other recent open asks, which this may repeat.
     if let Some(warning) = &answer.warning {
         text.push_str(&format!("\nwarning: {warning}"));
+    }
+    match (&ask.change, &created.change) {
+        (Some(change), Some(kept)) if change == kept => text.push_str(&format!(
+            "\nWhen the user picks the first option, \"{}\", the server applies it to board \
+             {}: no step of yours follows. Any other answer changes nothing.",
+            change.approving_option(),
+            created.board
+        )),
+        (Some(change), _) => text.push_str(&format!(
+            "\nwarning: the server ignored the change ({}): it predates changes on asks, so \
+             no answer applies it. Upgrade the server, withdraw this ask and ask again.",
+            change.settings()
+        )),
+        (None, _) => {}
     }
     if let Some(task) = &created.task {
         // Advisory: the ask is made either way, so a failed check is reported, not raised.
@@ -1565,6 +1616,31 @@ fn ignored_owner(task: &Task, wanted: &AgentId) -> anyhow::Error {
         id = task.id,
         owner = task.owner.as_ref().map_or("nobody", AgentId::as_str),
     )
+}
+
+/// Applies a board change the user approved in their own words (`board approved board
+/// update`), with the user's login; `ctx` comes from [`Ctx::load_user_login`].
+pub async fn board_approved(
+    ctx: &Ctx,
+    slug: &BoardSlug,
+    change: BoardChange,
+    said: String,
+) -> Result<Output> {
+    if change.is_empty() {
+        bail!(
+            "name the setting the user approved: --parallel-tasks, --usage-stop-at or --temporary"
+        );
+    }
+    let body = ApprovedBoardChange { said, change };
+    let board = ctx.client.approved_board_change(slug, &body).await?;
+    Ok(Output::new(
+        format!(
+            "applied {} to {} as the user approved; the event log records you and their words",
+            change.settings(),
+            render::board_line(&board)
+        ),
+        &board,
+    ))
 }
 
 /// A server that predates temporary boards ignores the flag, so a board meant to be

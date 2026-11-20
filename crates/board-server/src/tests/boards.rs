@@ -835,3 +835,136 @@ async fn resuming_a_board_works_without_a_feedback_board() {
     assert_eq!(resumed["status"], "active");
     assert!(!resume_feedback_board(&t), "no feedback board to resume");
 }
+
+const APPROVED: &str = "/v1/boards/factory/approved";
+
+/// Sends as the user's login, speaking for agent `t3:alpha`.
+async fn approved(t: &T, body: Value) -> (u16, Value) {
+    let bearer = format!("Bearer {}", t.user_token);
+    let headers = [
+        ("authorization", bearer.as_str()),
+        ("x-board-agent", "t3:alpha"),
+    ];
+    let (s, v) = t.send("POST", APPROVED, &headers, Some(body)).await;
+    (s.as_u16(), v)
+}
+
+async fn board_updates(t: &T) -> Vec<Value> {
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "board_updated")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn an_approved_change_is_applied_and_names_the_agent_and_the_words() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register("t3:alpha", None, None).await;
+    let (s, board) = approved(
+        &t,
+        json!({ "said": "make it scale to 2", "change": { "parallel_tasks": 2 } }),
+    )
+    .await;
+    assert_eq!(s, 200, "{board}");
+    assert_eq!(board["parallel_tasks"], 2);
+    let events = board_updates(&t).await;
+    let event = events.last().unwrap();
+    assert_eq!(event["actor"], "t3:alpha", "{event}");
+    assert_eq!(
+        event["payload"],
+        json!({
+            "fields": ["parallel_tasks"], "parallel_tasks": 2, "approved": "said",
+            "said": "make it scale to 2", "device": "phone",
+        })
+    );
+
+    // A use that changes nothing still leaves its event.
+    let (s, _) = approved(
+        &t,
+        json!({ "said": "make it scale to 2", "change": { "parallel_tasks": 2 } }),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let again = board_updates(&t).await;
+    assert_eq!(again.len(), events.len() + 1);
+    assert_eq!(again.last().unwrap()["payload"]["fields"], json!([]));
+}
+
+#[tokio::test]
+async fn an_approved_change_takes_the_users_login_and_only_the_listed_settings() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    // A device token is refused, and told the two routes.
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            APPROVED,
+            Some("t3:alpha"),
+            Some(json!({ "said": "make it 2", "change": { "parallel_tasks": 2 } })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("board approved board update") && next.contains("ask_user"),
+        "{v}"
+    );
+
+    for body in [
+        // The words are required.
+        json!({ "change": { "parallel_tasks": 2 } }),
+        json!({ "said": " ", "change": { "parallel_tasks": 2 } }),
+        json!({ "said": "x".repeat(501), "change": { "parallel_tasks": 2 } }),
+        // So is a setting, in range.
+        json!({ "said": "go", "change": {} }),
+        json!({ "said": "go", "change": { "parallel_tasks": 5 } }),
+        // No other board setting passes, beside a listed one or in its place.
+        json!({ "said": "go", "change": { "status": "closed" } }),
+        json!({ "said": "go", "change": { "parallel_tasks": 2, "autopilot": true } }),
+        json!({ "said": "go", "change": { "parallel_tasks": 2 }, "title": "Mine" }),
+    ] {
+        let (s, v) = approved(&t, body.clone()).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (400, Some("invalid")),
+            "{body} {v}"
+        );
+    }
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(
+        (board["parallel_tasks"].as_u64(), board["title"].as_str()),
+        (Some(1), Some("Board factory"))
+    );
+    assert_eq!(board_updates(&t).await.len(), 0);
+}
+
+#[tokio::test]
+async fn the_refusals_of_user_only_settings_name_both_routes() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    for (body, flag) in [
+        (json!({ "parallel_tasks": 2 }), "--parallel-tasks <n>"),
+        (json!({ "usage_stop_at": 100 }), "--usage-stop-at <n>"),
+        (json!({ "temporary": true }), "--temporary true"),
+    ] {
+        let (code, err, v) = t
+            .fail("PATCH", "/v1/boards/factory", None, Some(body))
+            .await;
+        assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+        let next = v["next"].as_str().unwrap();
+        assert!(next.contains("ask_user with change"), "{v}");
+        assert!(
+            next.contains(&format!(
+                "board approved board update factory {flag} --said"
+            )),
+            "{v}"
+        );
+    }
+}
