@@ -863,7 +863,8 @@ Status: built (agent-board-308; the user chose it on 2026-11-08) and the only wa
 is run. agent-board switched on 2026-11-13 (agent-board-316), the other boards the same
 day, and the coordinator-thread code was removed (agent-board-317). The daemon dispatches
 every active autopilot board whose home devices list its device; it does not read the
-board's `dispatch` field.
+board's `dispatch` field. On an active home board that is not on autopilot it starts
+verdict judges and nothing else (see "Boards off autopilot" below).
 
 **Why**: a coordinator thread was one Claude session that lived for days. On agent-board
 (2026-11-06 to 11-08) it ran 506 turns. It auto-compacted 29 times at about 267K tokens.
@@ -1068,6 +1069,37 @@ has not registered it yet.
   unless the task changes (`updated_at`). So a judge that ended without its judgment is
   not started in a loop. A note does not change a task, so a proposal's second verdict
   waits out that time.
+
+**Boards off autopilot** (built, agent-board-491; the user chose it on 2026-11-13, ask
+#171): a proposal gets its verdict on every active board that lists the daemon's device
+as a home, with or without autopilot. Before this, the proposals of a board off autopilot
+got no verdict, were never claimed, and agents filed the same finding again.
+
+- **What runs**: verdict judges only, by the Verdict rules above. Such a board gets no
+  worker, no review, goal or triage judge, no merge and no finished task, and the daemon
+  takes no coordinator lease there. Of the board it reads the judges and the pending
+  proposals, nothing else.
+- **Where**: only on a device in the board's `home_devices`. A board with no home, or a
+  paused one, gets no judge. A device that is not a home never starts one.
+- **Rights**: the server lets the dispatch agent of a home device register a verdict
+  judge without the lease (`API.md`, "Daemon dispatch"). The judge has the coordinator's
+  rights on that board while the board stays active, off autopilot and a home of that
+  device.
+- **One device per board**: no lease gives the board to one home device. The device
+  whose verdict judge is at work has the board's proposals: the server refuses another
+  home device's registration with 409 `claim_refused` until that judge is over, and a daemon
+  that sees another device's judge listed starts none.
+- **Failures**: a failure that keeps a board's proposals from their verdicts (no project
+  folder on the device, the server refuses) is written once to
+  `state/device-holds.jsonl` with kind `verdicts` and the error as `cause`.
+- **Limits**: the board's usage stop and the weekly pace hold a new verdict judge, as on
+  an autopilot board. At most 2 judges run per board, and they count in the device
+  limit. Each device runs at most 2 verdict judges at once on all the boards off
+  autopilot together (`HOME_VERDICTS_AT_ONCE`), because such a board can hold hundreds of proposals that
+  waited. These boards are served after the dispatched ones in each reconcile and wait
+  in a queue of their own, so their backlog never holds a dispatched board's judge. A
+  judge that this limit holds is written to `state/device-holds.jsonl` like one the
+  device limit holds, with `limit` 2 and the count as `cause`.
 
 **Merging and finishing**:
 

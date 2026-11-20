@@ -11,6 +11,8 @@
 //! - a board with a goal gets a goal judge once a task was finished and nothing is ready,
 //!   in progress, in review or being judged.
 //!
+//! A home board that is not on autopilot gets the verdict judges alone ([`Judging`]).
+//!
 //! A task in `review` with a standing pass is closed in code: its pull request is read at
 //! most every [`PR_READ_EVERY`], updated when behind, merged once every check passed, and
 //! the task is finished with the judge's summary once the pull request is merged (or the
@@ -26,6 +28,12 @@ use crate::gh::{Checks, MergeState, PrState, PullRequest, Updated, pull_request_
 
 /// The most judges of one board at work at once; the rest wait, the oldest need first.
 pub const JUDGES_AT_ONCE: usize = 2;
+
+/// The most verdict judges at work at once on all the boards off autopilot together
+/// ([`Judging::Verdicts`]). Such a board can hold hundreds of proposals that waited while
+/// nothing judged them; this keeps that backlog to a part of the device's runs and of the
+/// usage, and leaves the rest to the dispatched boards and the user's threads.
+pub const HOME_VERDICTS_AT_ONCE: usize = 2;
 
 /// The most proposals one verdict judge, or items one triage judge, is started for.
 pub const JUDGE_TASKS_AT_ONCE: usize = 5;
@@ -137,6 +145,17 @@ pub(super) fn lenient_merges<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::deserialize(d)?,
         "the merge",
     ))
+}
+
+/// What a reconcile does for a board's judgments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Judging {
+    /// Every judge the board needs, and its reviewed tasks closed: a board this device
+    /// dispatches.
+    All,
+    /// Verdict judges for the pending proposals, and nothing else: an active home board
+    /// that is not on autopilot (the user's choice, ask #171 of agent-board-491).
+    Verdicts,
 }
 
 /// A judgment the board needs.
@@ -389,15 +408,19 @@ fn brief_kind(kind: JudgeKind) -> crate::brief::JudgeKind {
 
 impl<T: T3> Daemon<T> {
     /// Follows the judges started on `board`, closes its reviewed tasks, and starts the
-    /// judges it needs. `in_progress` is how many tasks hold a slot.
+    /// judges it needs. `in_progress` is how many tasks hold a slot. With
+    /// [`Judging::Verdicts`] it follows the judges, starts verdict judges, and reads and
+    /// changes nothing else of the board.
     pub(super) async fn judge_and_close(
         &mut self,
         board: &Board,
         agent: &AgentId,
+        judging: Judging,
         in_progress: usize,
         now: Timestamp,
     ) -> Result<()> {
         let slug = &board.slug;
+        let all = judging == Judging::All;
         let project = self.host_folder(board)?;
         let client = self.client().with_agent(Some(agent.clone()));
         self.settle_judge_starts(board, &client, &project, now)
@@ -407,22 +430,31 @@ impl<T: T3> Daemon<T> {
             .await
             .context("listing the board's judges")?;
         self.end_judges(slug, &client, &listed, now).await;
+        // Off autopilot no lease gives the board to one device: the home device whose
+        // verdict judge is at work has its proposals, and the server refuses another's.
+        if !all && listed.iter().any(|j| j.registered_by != *agent) {
+            return self.save();
+        }
         self.state.judge_retry.retain(|_, retry| retry.until > now);
         let at_work = AtWork::of(&listed, &self.state.judges, slug);
         let mut wants = Vec::new();
 
-        let in_review: Vec<Task> = client
-            .tasks(&TaskQuery {
-                board: Some(slug.clone()),
-                status: Some(TaskStatus::Review),
-                limit: Some(board_proto::TASKS_LIMIT_MAX),
-                ..TaskQuery::default()
-            })
-            .await
-            .context("listing the tasks in review")?
-            .into_iter()
-            .filter(|t| t.status == TaskStatus::Review)
-            .collect();
+        let in_review: Vec<Task> = if all {
+            client
+                .tasks(&TaskQuery {
+                    board: Some(slug.clone()),
+                    status: Some(TaskStatus::Review),
+                    limit: Some(board_proto::TASKS_LIMIT_MAX),
+                    ..TaskQuery::default()
+                })
+                .await
+                .context("listing the tasks in review")?
+                .into_iter()
+                .filter(|t| t.status == TaskStatus::Review)
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.state
             .merges
             .retain(|task, _| task.board() != *slug || in_review.iter().any(|t| t.id == *task));
@@ -481,7 +513,15 @@ impl<T: T3> Daemon<T> {
             limit: Some(board_proto::TASKS_LIMIT_MAX),
             ..TaskQuery::default()
         };
-        let (proposals, ready) = tokio::join!(client.tasks(&proposals), client.tasks(&ready));
+        // The ready tasks serve the triage and the goal review alone.
+        let ready = async {
+            if all {
+                client.tasks(&ready).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let (proposals, ready) = tokio::join!(client.tasks(&proposals), ready);
         let proposals = proposals.context("listing the pending proposals")?;
         let ready = ready.context("listing the ready tasks")?;
         let mut by_parent: BTreeMap<Option<TaskId>, Vec<&Task>> = BTreeMap::new();
@@ -518,7 +558,7 @@ impl<T: T3> Daemon<T> {
             });
         }
 
-        if self.triages(slug) {
+        if all && self.triages(slug) {
             let mut items: Vec<&Task> = ready
                 .iter()
                 .filter(|t| t.ready && t.feedback.is_some())
@@ -541,7 +581,8 @@ impl<T: T3> Daemon<T> {
         let work_left = ready
             .iter()
             .any(|t| t.ready && t.auto && t.feedback.is_none());
-        if !board.goal.trim().is_empty()
+        if all
+            && !board.goal.trim().is_empty()
             && self.state.goal_due.contains(slug)
             && in_progress == 0
             && !work_left
@@ -560,7 +601,7 @@ impl<T: T3> Daemon<T> {
         }
 
         // The board asks again below if it still wants one of the device's slots.
-        let mut waited = self.judge_turns.take(slug);
+        let mut waited = self.turns(judging).take(slug);
         // A board at its usage stop gets no new judge, as it gets no new worker.
         if self.usage_holds(slug, now) {
             return self.save();
@@ -583,20 +624,31 @@ impl<T: T3> Daemon<T> {
             // for a slot gets the next one.
             self.read_running().await;
             let limit = self.run_limit();
-            if self.load_unknown().is_some()
-                || self.runs() >= limit
-                || self.judge_turns.another_first(slug, waited)
-            {
-                if self.judge_turns.wait(slug, waited, now) {
+            let verdicts = self.home_verdict_runs();
+            let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
+            let full = self.load_unknown().is_some() || self.runs() >= limit;
+            if capped || full || self.turns(judging).another_first(slug, waited) {
+                // The limit that holds it, and that limit's numbers. Off autopilot, a
+                // board that waits its turn while the device has a free run waits for
+                // the boards that this cap held before it.
+                let (limit, of, cause) = if capped || (!all && !full) {
+                    let cause = format!(
+                        "{verdicts} verdict judges run on the boards that are not on autopilot"
+                    );
+                    let of = "verdict judges at once of the boards that are not on autopilot";
+                    (HOME_VERDICTS_AT_ONCE, of, cause)
+                } else {
+                    (limit, "runs of this device", self.load())
+                };
+                if self.turns(judging).wait(slug, waited, now) {
                     tracing::info!(
-                        "{slug}: `{}` waits for one of the {limit} runs of this device; {}",
-                        want.title,
-                        self.load()
+                        "{slug}: `{}` waits for one of the {limit} {of}; {cause}",
+                        want.title
                     );
                 }
                 // A held judge gets no note, since a note on an owned task wakes its
                 // owner: the device's trail file is its record.
-                self.record_hold("judge", slug, &want.title, limit, now);
+                self.record_hold("judge", slug, &want.title, limit, &cause, now);
                 break;
             }
             let names = want.title.clone();
@@ -611,6 +663,15 @@ impl<T: T3> Daemon<T> {
             }
         }
         self.save()
+    }
+
+    /// The queue of the boards that wait for a judge's slot: the boards off autopilot
+    /// have their own.
+    fn turns(&mut self, judging: Judging) -> &mut device::Turns {
+        match judging {
+            Judging::All => &mut self.judge_turns,
+            Judging::Verdicts => &mut self.verdict_turns,
+        }
     }
 
     /// Whether `task` still waits out the retry of `key`: its judge ended less than

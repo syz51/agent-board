@@ -799,13 +799,19 @@ knows two things for it:
   (see "Boards"). Holding the lease, it has the coordinator's rights on the board: it hands
   tasks over, moves them, and finishes a task it handed to itself with `/done`. Without the
   lease it is an agent like any other.
-- **Judges**: short-lived threads the lease holder starts for one judgment.
+- **Judges**: short-lived threads the lease holder starts for one judgment. A board that
+  is not on autopilot gives no lease; there the dispatch agent of a home device registers
+  verdict judges (below).
   - `POST /v1/boards/{slug}/judges` `[RegisterJudge]` `{agent, kind, tasks?}` → `[Judge]`
     `{board, agent, kind, tasks, registered_by, created_at, expires_at, running}`. Only the
     agent holding the board's coordinator lease may call it, acting as itself in
     `X-Board-Agent` (400 `invalid` without the header; 403 `forbidden` for any other agent,
-    a judge included). `kind` is `review`, `verdict`, `goal` or `triage`. `tasks` names
-    tasks of this board: repeats are dropped, then at most 20 may remain
+    a judge included). One more agent may, for `kind` `verdict` only: `dispatch:<device>`
+    on an `active` board that is not on autopilot and lists `<device>` in `home_devices`
+    (403 `forbidden` for another kind, another agent or a paused board; 409 `claim_refused`
+    while a judge that another home device registered there is live, so one device at a
+    time judges the board's proposals). `kind` is `review`, `verdict`, `goal` or `triage`.
+    `tasks` names tasks of this board: repeats are dropped, then at most 20 may remain
     (`JUDGE_TASKS_MAX`; 400 `invalid` for more), and a `review` names at least one (400
     `invalid`). An unknown task is 404, a task of another board 400 `invalid`. `agent` is
     an id or a handle, stored as the id. The agent may not be registered yet, since its
@@ -816,8 +822,9 @@ knows two things for it:
     hold: its agent has not ended since it was registered (a resumed agent does not get them
     back), at most 2 hours have passed since it was registered (`JUDGE_HOURS_MAX`;
     `expires_at`), and the agent that registered it still holds the board's coordinator
-    lease. Registering the same agent again before its registration ended or expired
-    replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
+    lease, or, for a verdict judge registered without the lease, the board is still
+    `active`, not on autopilot, and a home of the registering agent's device. Registering
+    the same agent again before its registration ended or expired replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
     registration starts afresh.
   - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first.
     `running` is true while the judge's agent is `running` or not registered yet: the

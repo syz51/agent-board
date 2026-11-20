@@ -7,6 +7,9 @@
 //!   [`Worker`]). No long-lived coordinator thread holds work;
 //! - starts the board's judges (review, verdict, goal and triage), merges the pull request
 //!   of a task whose review passed and finishes that task (see [`judges`]);
+//! - on an active board that lists this device in `home_devices` and is not on autopilot,
+//!   starts verdict judges for its pending proposals, and nothing else: no lease, no
+//!   worker and no other judge;
 //! - wakes the owner of a blocked task when its last blocker is done, the owner of a task
 //!   in `doing` when the server announces it has been away from it (`idle_doing`), and the
 //!   asker when its ask is answered;
@@ -1128,6 +1131,10 @@ pub struct Daemon<T: T3> {
     /// The boards that wait for one of the device's worker slots, and for a judge slot.
     worker_turns: device::Turns,
     judge_turns: device::Turns,
+    /// The boards off autopilot that wait for one of their verdict judges' slots
+    /// ([`judges::HOME_VERDICTS_AT_ONCE`]): a queue of their own, so that their backlog
+    /// never puts a dispatched board's judge behind them.
+    verdict_turns: device::Turns,
     /// The time of the last reconcile.
     last_pass: Option<Timestamp>,
     /// The threads with a run in progress on this device, read from T3 at most once in a
@@ -1163,6 +1170,7 @@ impl<T: T3> Daemon<T> {
             default_run_limit: None,
             worker_turns: device::Turns::default(),
             judge_turns: device::Turns::default(),
+            verdict_turns: device::Turns::default(),
             last_pass: None,
             running: None,
         }
@@ -1189,6 +1197,13 @@ impl<T: T3> Daemon<T> {
         self.boards.get(slug).is_some_and(|b| self.hosts(b))
     }
 
+    /// Whether the judges recorded for `slug` take slots of this device: it hosts the
+    /// board, or follows the board's verdict judges ([`Self::judges_proposals`]).
+    fn counts_judges(&self, slug: &BoardSlug) -> bool {
+        let board = self.boards.get(slug);
+        board.is_some_and(|b| self.hosts(b) || self.judges_proposals(b))
+    }
+
     /// The workers this device has now, on every board.
     fn worker_runs(&self) -> usize {
         let workers = self.state.workers.keys();
@@ -1198,7 +1213,7 @@ impl<T: T3> Daemon<T> {
     /// The runs of the dispatcher on this device now, workers and judges, on every board.
     fn own_runs(&self) -> usize {
         let judges = self.state.judges.iter();
-        self.worker_runs() + judges.filter(|r| self.counts_runs(&r.board)).count()
+        self.worker_runs() + judges.filter(|r| self.counts_judges(&r.board)).count()
     }
 
     /// The threads with a run in progress that are no run of the dispatcher counted in
@@ -1209,7 +1224,7 @@ impl<T: T3> Daemon<T> {
         let workers = self.state.workers.iter();
         let workers = workers.filter(|(task, _)| self.counts_runs(&task.board()));
         let judges = self.state.judges.iter();
-        let judges = judges.filter(|run| self.counts_runs(&run.board));
+        let judges = judges.filter(|run| self.counts_judges(&run.board));
         let own: BTreeSet<&str> = workers
             .filter_map(|(_, worker)| worker.thread.as_deref())
             .chain(judges.filter_map(|run| run.thread.as_deref()))
@@ -1355,7 +1370,8 @@ impl<T: T3> Daemon<T> {
 
     /// Adds the start of a hold by the device limit to the device's trail
     /// (`state/device-holds.jsonl`), once until the held task or judge starts: the time,
-    /// the board, what is held and the device's load. It is the record of a held judge,
+    /// the board, what is held, the limit and its `cause` (the device's load, or the count
+    /// that another limit holds it by). It is the record of a held judge,
     /// which gets no note, and of a held task whose note the server did not take.
     fn record_hold(
         &mut self,
@@ -1363,6 +1379,7 @@ impl<T: T3> Daemon<T> {
         board: &BoardSlug,
         subject: &str,
         limit: usize,
+        cause: &str,
         now: Timestamp,
     ) {
         let unread = self.running.as_ref().map(|r| r.unread.as_slice());
@@ -1383,7 +1400,7 @@ impl<T: T3> Daemon<T> {
             "device": self.ctx.device,
             "subject": subject,
             "limit": limit,
-            "cause": self.load(),
+            "cause": cause,
             "others": self.other_turns(),
             "unread": unread,
         });
@@ -1446,12 +1463,22 @@ impl<T: T3> Daemon<T> {
         board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
+    /// An active board with this device among its homes that is not on autopilot: its
+    /// pending proposals get verdict judges, and the board gets nothing else from this
+    /// daemon (`docs/DESIGN.md`, "Daemon dispatch", Boards off autopilot).
+    fn judges_proposals(&self, board: &Board) -> bool {
+        !board.autopilot
+            && board.status == BoardStatus::Active
+            && board.home_devices.contains(&self.ctx.device)
+    }
+
     /// Dispatches the boards this device runs: each one's lease, workers, judges and merges.
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         // A board that did not ask for a slot again in the last pass lost its place.
         if let Some(last) = self.last_pass.replace(now) {
             self.worker_turns.keep_asked_since(last);
             self.judge_turns.keep_asked_since(last);
+            self.verdict_turns.keep_asked_since(last);
         }
         self.running = None;
         // Before the boards are dispatched, so that a hold past this age is written anew
@@ -1462,6 +1489,9 @@ impl<T: T3> Daemon<T> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         self.refresh_usage(now).await;
+        // The boards off autopilot come after the dispatched ones, which so get the
+        // device's free runs first.
+        let mut off_autopilot = Vec::new();
         for board in &boards {
             if !self.is_home(board) {
                 self.failures.remove(&board.slug);
@@ -1473,10 +1503,26 @@ impl<T: T3> Daemon<T> {
                 if board.coordinator.as_ref() == Some(&self.dispatch_agent()) {
                     self.release(&board.slug).await;
                 }
+                if self.judges_proposals(board) {
+                    off_autopilot.push(board);
+                }
                 continue;
             }
             if let Err(err) = self.dispatch(board, now).await {
                 tracing::warn!("dispatcher of {}: {err:#}", board.slug);
+            }
+        }
+        for board in off_autopilot {
+            // What keeps a board's proposals from their verdicts is written to the
+            // device's trail, once until it is over.
+            let subject = format!("the verdict judges of {}", board.slug);
+            match self.judge_proposals(board, now).await {
+                Ok(()) => self.hold_ended("verdicts", &subject),
+                Err(err) => {
+                    tracing::warn!("{subject}: {err:#}");
+                    let cause = format!("{err:#}");
+                    self.record_hold("verdicts", &board.slug, &subject, 0, &cause, now);
+                }
             }
         }
         let boards = &self.boards;
@@ -1665,6 +1711,39 @@ impl<T: T3> Daemon<T> {
             })
     }
 
+    /// The verdict judges that run now on the boards off autopilot, all of them together.
+    fn home_verdict_runs(&self) -> usize {
+        let judges = self.state.judges.iter();
+        let judges = judges.filter(|r| r.kind == board_proto::JudgeKind::Verdict);
+        judges
+            .filter(|r| {
+                let board = self.boards.get(&r.board);
+                board.is_some_and(|b| self.judges_proposals(b))
+            })
+            .count()
+    }
+
+    /// Follows and starts the verdict judges of a home board that is not on autopilot.
+    /// The server gives no lease there, so the dispatch agent registers them without one.
+    async fn judge_proposals(&mut self, board: &Board, now: Timestamp) -> Result<()> {
+        let agent = self.dispatch_agent();
+        // Before the agent is registered: a device that cannot host the judge's thread
+        // asks the server for nothing.
+        self.host_folder(board)?;
+        if !self.dispatch_registered {
+            self.register_dispatch(&agent).await?;
+            self.dispatch_registered = true;
+        }
+        let judged = self
+            .judge_and_close(board, &agent, judges::Judging::Verdicts, 0, now)
+            .await;
+        if judged.is_err() {
+            // The server may have lost the agent: registered again on the next try.
+            self.dispatch_registered = false;
+        }
+        judged
+    }
+
     /// Runs a home board: holds its coordinator lease as this
     /// device's dispatch agent, does the steps it owes for agents no device can wake, follows
     /// the workers it started there, and starts workers for the next ready tasks while slots
@@ -1780,7 +1859,7 @@ impl<T: T3> Daemon<T> {
         self.save()?;
         // A failure here leaves the workers their turn.
         if let Err(err) = self
-            .judge_and_close(board, &agent, in_progress.len(), now)
+            .judge_and_close(board, &agent, judges::Judging::All, in_progress.len(), now)
             .await
         {
             tracing::warn!("the judges and reviewed tasks of {slug}: {err:#}");
@@ -1826,7 +1905,7 @@ impl<T: T3> Daemon<T> {
                 }
                 // Each task the limit holds gets its record, not only the one that
                 // started the board's wait.
-                self.record_hold("worker", slug, task.id.as_str(), limit, now);
+                self.record_hold("worker", slug, task.id.as_str(), limit, &load, now);
                 self.note_held(&task.id, &agent, limit, &load, now).await;
                 break;
             }
