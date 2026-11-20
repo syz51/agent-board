@@ -26,7 +26,7 @@ pub enum InstallCommand {
         write: Option<PathBuf>,
         /// Write nothing: list the hooks this settings file lacks or runs twice, and fail
         /// when there are any. For a file that another tool manages.
-        #[arg(long, conflicts_with = "write")]
+        #[arg(long, conflicts_with_all = ["write", "bin"])]
         check: Option<PathBuf>,
         /// With --write, merge the MCP server into this file (user scope: ~/.claude.json).
         #[arg(long, requires = "write")]
@@ -43,7 +43,7 @@ pub enum InstallCommand {
         write: Option<PathBuf>,
         /// Write nothing: list the hooks this hooks file lacks or runs twice, and fail when
         /// there are any.
-        #[arg(long, conflicts_with = "write")]
+        #[arg(long, conflicts_with_all = ["write", "bin"])]
         check: Option<PathBuf>,
         #[arg(long)]
         bin: Option<PathBuf>,
@@ -336,13 +336,31 @@ fn split_program(command: &str) -> Option<(String, &str)> {
 
 /// Does this command run board for `event` through another program, such as a wrapper script
 /// (`/bin/sh "$HOME/.claude/hooks/board-hook.sh" stop claude`)? A settings file that another
-/// tool manages holds such entries; they count as present.
+/// tool manages holds such entries; they count as present. The command must name a program
+/// or script whose file name holds `board` as a word of its own (`board-hook.sh`, not
+/// `dashboard.sh` or a script in a folder `agent-board/`), and the event as its own word.
 fn is_wrapped_board_hook(command: &str, event: HookEvent) -> bool {
     !is_board_hook(command)
-        && command.contains("board")
-        && command
-            .split_whitespace()
-            .any(|word| word.trim_matches(['"', '\'']) == event.arg())
+        && names_event(command, event)
+        && command_words(command).any(|word| {
+            Path::new(word).file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|part| part == "board")
+            })
+        })
+}
+
+/// The command's words, without the quotes around them.
+fn command_words(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+}
+
+/// Does the command hold the event as `board hook` takes it, as a word of its own?
+fn names_event(command: &str, event: HookEvent) -> bool {
+    command_words(command).any(|word| word == event.arg())
 }
 
 /// Claude Code and Codex match every value for no matcher, `""` and `"*"`.
@@ -379,14 +397,14 @@ impl HookSpec {
     }
 
     /// How many entries of `hooks` run board for this event and matcher: directly, and
-    /// through a wrapper.
+    /// through a wrapper. An entry counts under the same matcher, or under one that matches
+    /// every value; whether another pattern covers this one is not worked out.
     fn count_in(&self, hooks: &Map<String, Value>) -> (usize, usize) {
         let (mut direct, mut wrapped) = (0, 0);
         let groups = hooks.get(self.event.name()).and_then(Value::as_array);
         for group in groups.into_iter().flatten() {
-            if matcher_key(group.get("matcher").and_then(Value::as_str))
-                != matcher_key(self.matcher)
-            {
+            let matcher = matcher_key(group.get("matcher").and_then(Value::as_str));
+            if !matcher.is_empty() && matcher != matcher_key(self.matcher) {
                 continue;
             }
             let commands = group.get("hooks").and_then(Value::as_array);
@@ -395,7 +413,7 @@ impl HookSpec {
                 .flatten()
                 .filter_map(|h| h["command"].as_str())
             {
-                if is_board_hook(command) {
+                if is_board_hook(command) && names_event(command, self.event) {
                     direct += 1;
                 } else if is_wrapped_board_hook(command, self.event) {
                     wrapped += 1;
@@ -605,7 +623,17 @@ fn write_hooks_file(path: &Path, bin: &Path, runtime: &str, specs: &[HookSpec]) 
             "kept {} of {} that the file already runs through a wrapper, with no second entry: {}",
             wrapped.len(),
             specs.len(),
-            wrapped.join(", ")
+            wrapped
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Wrapper entries are not board's to delete: say so, as --check does.
+    for (label, count) in wrapped.iter().filter(|(_, count)| *count > 1) {
+        println!(
+            "runs more than once: {label} ({count} through a wrapper); delete the other entries in the tool that manages the file"
         );
     }
     Ok(())
@@ -622,6 +650,13 @@ fn check_hooks_file(path: &Path, runtime: &str, specs: &[HookSpec]) -> Result<()
     };
     let mut problems = 0;
     for spec in specs {
+        let event = spec.event.name();
+        if hooks.get(event).is_some_and(|groups| !groups.is_array()) {
+            bail!(
+                "hooks.{event} in {} is not an array: make it a list of matcher groups, then run this again",
+                path.display()
+            );
+        }
         let (direct, wrapped) = spec.count_in(hooks);
         match direct + wrapped {
             1 => continue,
@@ -652,13 +687,13 @@ fn check_hooks_file(path: &Path, runtime: &str, specs: &[HookSpec]) -> Result<()
 /// Merges the hooks into `root`: previous direct board hook entries are replaced, every other
 /// key and hook is kept, and running it twice changes nothing. A hook that the file already
 /// runs through a wrapper for the same event and matcher gets no direct entry; the result
-/// names those hooks.
+/// names those hooks, each with the number of its wrapper entries.
 fn merge_hooks(
     root: &mut Map<String, Value>,
     bin: &Path,
     runtime: &str,
     specs: &[HookSpec],
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, usize)>> {
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
@@ -683,8 +718,9 @@ fn merge_hooks(
     hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
     let mut wrapped = Vec::new();
     for spec in specs {
-        if spec.count_in(hooks).1 > 0 {
-            wrapped.push(spec.label());
+        let count = spec.count_in(hooks).1;
+        if count > 0 {
+            wrapped.push((spec.label(), count));
             continue;
         }
         let event = spec.event.name();
@@ -858,6 +894,15 @@ mod tests {
             HookEvent::Stop
         ));
         assert!(!is_wrapped_board_hook("notify.sh stop", HookEvent::Stop));
+        // `board` inside another word, or only in a folder's name, is another program.
+        assert!(!is_wrapped_board_hook(
+            "dashboard-ping stop",
+            HookEvent::Stop
+        ));
+        assert!(!is_wrapped_board_hook(
+            "/Users/me/agent-board/scripts/notify.sh stop",
+            HookEvent::Stop
+        ));
     }
 
     #[test]
@@ -869,18 +914,37 @@ mod tests {
                 "PreToolUse": [{"matcher": "Edit", "hooks": [wrapper("pre-tool-use")]}],
                 // No matcher equals the installed `*`.
                 "PostToolUse": [{"hooks": [wrapper("post-tool-use")]}],
+                // No matcher covers the installed `Bash`, since it matches every tool.
+                "PostToolUseFailure": [{"hooks": [wrapper("post-tool-use-failure")]}],
                 // The wrapper runs another event than the one it is filed under.
-                "Stop": [{"hooks": [wrapper("session-end")]}]
+                "Stop": [{"hooks": [wrapper("session-end")]}],
+                "SessionEnd": [{"hooks": [wrapper("session-end")]}, {"hooks": [wrapper("session-end")]}]
             }
         }))
         .unwrap();
         let wrapped =
             merge_hooks(&mut root, Path::new("/b/board"), "claude", CLAUDE_HOOKS).unwrap();
-        assert_eq!(wrapped, ["PostToolUse (matcher `*`)"]);
-        let hooks = &root["hooks"];
+        assert_eq!(
+            wrapped,
+            [
+                ("PostToolUse (matcher `*`)".to_owned(), 1),
+                ("PostToolUseFailure (matcher `Bash`)".to_owned(), 1),
+                ("SessionEnd".to_owned(), 2)
+            ]
+        );
+        let hooks = root["hooks"].as_object().unwrap();
         assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 3);
         assert_eq!(hooks["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(hooks["PostToolUseFailure"].as_array().unwrap().len(), 1);
         assert_eq!(hooks["Stop"].as_array().unwrap().len(), 2);
+        // A direct entry counts only for the event its command names.
+        let stop = &CLAUDE_HOOKS[6];
+        assert_eq!(stop.count_in(hooks), (1, 0));
+        let misfiled: Map<String, Value> = serde_json::from_value(json!({
+            "Stop": [{"hooks": [{"type": "command", "command": "/b/board hook session-end --runtime claude"}]}]
+        }))
+        .unwrap();
+        assert_eq!(stop.count_in(&misfiled), (0, 0));
     }
 
     #[test]

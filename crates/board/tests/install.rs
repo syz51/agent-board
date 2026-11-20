@@ -463,6 +463,24 @@ fn install_check_reports_missing_and_doubled_hooks_without_writing() {
         "unchanged"
     );
 
+    // A value that is not a list of groups is named, not read as a missing hook.
+    std::fs::write(&settings, r#"{"hooks": {"Stop": {}}}"#).unwrap();
+    let out = check("claude");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("hooks.Stop in"), "{}", stderr(&out));
+    std::fs::write(&settings, &text).unwrap();
+
+    // Codex has its own hooks: six, none for the launch matcher or StopFailure.
+    let out = check("codex");
+    assert!(!out.status.success());
+    assert_eq!(
+        stdout(&out).lines().collect::<Vec<_>>(),
+        ["missing: SessionStart (matcher `startup|resume|clear|compact|fork`)"]
+    );
+    let err = stderr(&out);
+    assert!(err.contains("1 of the 6 board hooks"), "{err}");
+    assert!(err.contains("board install codex --write"), "{err}");
+
     // --check and --write are two routes.
     let out = board(
         &home,
