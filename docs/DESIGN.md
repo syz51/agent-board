@@ -389,8 +389,8 @@ other agents says so itself, once: the snapshot's first line, a delta that quote
 the header of peer text in a tool result. And the `ask_user` description names the reasons
 for an ask, where the agent reads them as it asks. The instructions ask for `board_snapshot`
 only when the context holds no board state, since `SessionStart` injects the snapshot at
-start-up and after compaction. Tests pin the sizes: the instructions under 1,440
-characters, the tool list under 16,500.
+start-up and after compaction. Tests pin the sizes: the instructions under 1,580
+characters, the tool list under 17,500.
 
 Results are concise text by default with a `detailed` option; the CLI offers the same
 operations with `--json` for scripts. Errors say what to do next.
@@ -504,6 +504,9 @@ high for it. There is no total cap.
 - **Setting**: each board has `usage_stop_at`, a percent from 1 to 100, default 90. Only
   the user may raise it; anyone may lower it. A lower stop makes a board give way first,
   so the user ranks boards by it.
+  An agent gets a raise the user approved applied through an ask that carries the change,
+  or with `board approved board update` and the user's quoted words; both leave an event
+  (`API.md`, "Approved board changes").
 - **Over**: a reading is fresh for 30 minutes. A board is over when a window of a fresh
   reading is at or above its stop and has not reset yet. A stale reading, or none, holds
   nothing: a device that cannot read the usage never stops work.

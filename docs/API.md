@@ -258,6 +258,9 @@ server's minute sweep deletes older ones.
   for the user too, applies the rest of the update and answers `200` with the board
   still `active` (closing it is allowed). The minute sweep sets a feedback board left
   `paused` by an older server back to `active`, recorded as `board_updated` by `server`.
+  The user-only changes (raising `parallel_tasks` or `usage_stop_at`, turning `temporary`
+  on) have two routes for an agent, which each 403 names in `next`; see "Approved board
+  changes" below.
   `board pause [<slug>…]` and `board resume [<slug>…]` set every active (or paused) board,
   or those named, with this endpoint; `--json` prints the changed `[Board]` list. A board
   the server kept active is left out of that list, and the text lists it apart, as does
@@ -338,6 +341,54 @@ fails is logged and tried again on the next sweep.
   the board was closed at the earliest.
 
 Reopening a closed board, or any change on it, starts the period again.
+
+### Approved board changes
+
+Three board settings are user only: raising `parallel_tasks`, raising `usage_stop_at`, and
+turning `temporary` on. A device token gets 403 `forbidden` for them. An agent gets such a
+change applied in one of two ways, and in no other. Each use leaves a `board_updated`
+event, which the web view's event list shows with its payload.
+
+Policy: an agent uses a route only for a change the user approved specifically, that
+setting with that value on that board. A general go-ahead, an older approval or an
+approval for another board is not one. An agent that has no such approval asks (route 1).
+
+1. **Approval through an ask.** `[CreateAsk]` takes `change` (`[BoardChange]`:
+   `parallel_tasks`, `usage_stop_at`, `temporary`; at least one, in range, and no other
+   field, else 400 `invalid`). The change is for the ask's board. The server writes the
+   approving option itself, `Apply: parallel_tasks=2` (the settings as `name=value`,
+   joined by `, `), and puts it first in `options`, so the user reads what the answer
+   applies whatever the question says; the agent may add at most 7 options of its own.
+   The `[Ask]` carries `change`. When the user answers with exactly that option (web,
+   Telegram button or `board answer`), the server applies the change as the user in the
+   same transaction as the answer. No agent step follows. An answer typed as that exact
+   text counts as the option; spaces around it are ignored. Any other answer applies
+   nothing. An approving answer never lowers `parallel_tasks` or `usage_stop_at` below
+   the board's value at that time: it leaves that setting alone and the event names it in
+   `not_lowered`. The agent's own options may not start with `Apply:`. The event: actor `user`, payload `{"fields": [...],
+   "parallel_tasks": 2, "approved": "ask", "ask": <id>, "agent": "<the asker>"}`.
+   `ask_user` (MCP) takes `change`; `board ask` takes `--set-parallel-tasks N`,
+   `--set-usage-stop-at N` and `--set-temporary true|false`. Both say that the first option
+   applies the change. A server that predates `change` drops it, and both then warn that
+   no answer applies it.
+2. **Approval in chat.** `POST /v1/boards/{slug}/approved` `[ApprovedBoardChange]` →
+   `[Board]`: `said`, the user's words that approve the change (required, at most 500
+   characters), and `change` (`[BoardChange]`, as above). User only: a device token gets
+   403 `forbidden`, whose `next` names both routes. Unknown fields, in the body or in
+   `change`, are refused (400 `invalid`), so no other board setting and no other act
+   passes through it. `X-Board-Agent` is required and must name a registered agent (400 `invalid`, 404
+   `not_found`), so the event always names who applied it. The event: actor that agent,
+   payload `{"fields": [...], "parallel_tasks": 2, "approved": "said", "said": "<the
+   words>", "device": "<the token's device>"}`. It is recorded also when the board already
+   had the values (`fields` is then empty); the board itself is then not written.
+   `board approved board update <slug> [--parallel-tasks N] [--usage-stop-at N]
+   [--temporary true|false] --said "<the user's words>"` calls it. It has no other
+   subcommand and takes no other setting. It sends the token of the user's login on the
+   device, not the session's: the login in the user home, `$BOARD_USER_HOME`, else the
+   default home's path with `-user` added (`~/.local/share/agent-board-user`), never
+   `BOARD_TOKEN`. The user sets that login up once, with a token created with `--user`
+   (`BOARD_HOME=<user home> board login`). Where the user home holds no login, the command
+   refuses before any request and names route 1.
 
 ### Tasks
 
@@ -833,6 +884,8 @@ knows two things for it:
 - `POST /v1/asks/{id}/answer` `[AnswerAsk]` → `[Ask]`. User only; `answered_via` records
   `cli`, `web` or `telegram`. The `ask_answered` event's payload names the ask (`id`) and
   the asking `agent`, and the asker's next alerts include the answer.
+  An ask that carries a `change` applies it when the answer is its first option (see
+  "Approved board changes").
 - `POST /v1/asks/{id}/withdraw` `[TaskAction]` → `[Ask]` with status `withdrawn`. The
   asking agent only (403 otherwise); 400 `invalid_transition` unless the ask is open. It
   leaves the open queue, and its Telegram message is edited to say so and loses its

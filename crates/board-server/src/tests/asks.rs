@@ -330,3 +330,235 @@ async fn an_ask_warns_of_the_boards_other_open_asks_under_30_minutes_old() {
     let fifth = ask(A, "factory", None).await;
     assert!(fifth.get("warning").is_none(), "{fifth}");
 }
+
+/// The newest `board_updated` event.
+async fn last_board_update(t: &T) -> serde_json::Value {
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "board_updated")
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn ask_with_change(
+    t: &T,
+    change: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    t.register(A, None, None).await;
+    t.call(
+        "POST",
+        "/v1/asks",
+        Some(A),
+        Some(json!({
+            "agent": A, "board": "factory", "kind": "decision",
+            "question": "Run two tasks at once?", "options": ["Keep 1"], "change": change,
+        })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_approving_option_of_an_ask_applies_its_board_change() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    let (s, ask) = ask_with_change(&t, json!({ "parallel_tasks": 2, "usage_stop_at": 95 })).await;
+    assert_eq!(s.as_u16(), 200, "{ask}");
+    // The server writes the approving option, first, so the user reads what it applies.
+    assert_eq!(
+        ask["options"],
+        json!(["Apply: parallel_tasks=2, usage_stop_at=95", "Keep 1"])
+    );
+    assert_eq!(
+        ask["change"],
+        json!({ "parallel_tasks": 2, "usage_stop_at": 95 })
+    );
+    let id = ask["id"].as_i64().unwrap();
+    // Asking changes nothing.
+    assert_eq!(
+        t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
+        1
+    );
+
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{id}/answer"),
+            Some(json!({ "answer": "Apply: parallel_tasks=2, usage_stop_at=95" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(
+        (
+            board["parallel_tasks"].as_u64(),
+            board["usage_stop_at"].as_u64()
+        ),
+        (Some(2), Some(95))
+    );
+    // The event names the user, the ask, its asker and the values.
+    let event = last_board_update(&t).await;
+    assert_eq!(event["actor"], "user", "{event}");
+    assert_eq!(
+        event["payload"],
+        json!({
+            "fields": ["parallel_tasks", "usage_stop_at"], "parallel_tasks": 2,
+            "usage_stop_at": 95, "approved": "ask", "ask": id, "agent": A,
+        })
+    );
+}
+
+#[tokio::test]
+async fn another_answer_to_an_ask_with_a_change_applies_nothing() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    for answer in ["Keep 1", "yes", "Apply: parallel_tasks=3"] {
+        let (_, ask) = ask_with_change(&t, json!({ "parallel_tasks": 2 })).await;
+        let id = ask["id"].as_i64().unwrap();
+        let (s, v) = t
+            .as_user(
+                "POST",
+                &format!("/v1/asks/{id}/answer"),
+                Some(json!({ "answer": answer })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+        assert_eq!(
+            t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
+            1,
+            "{answer}"
+        );
+    }
+    // An ask without a change whose option copies the approving text applies nothing.
+    let id = ask(&t, "Ship it?").await;
+    t.ok(
+        "POST",
+        &format!("/v1/asks/{id}/withdraw"),
+        Some(A),
+        Some(json!({ "agent": A })),
+    )
+    .await;
+    let plain = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "kind": "decision", "question": "Two?",
+                "options": ["Apply: parallel_tasks=2"],
+            })),
+        )
+        .await;
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{}/answer", plain["id"]),
+            Some(json!({ "answer": "Apply: parallel_tasks=2" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    assert_eq!(
+        t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_ask_carries_only_the_user_only_board_settings() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    for (change, code) in [
+        (json!({}), "invalid"),
+        (json!({ "parallel_tasks": 9 }), "invalid"),
+        (json!({ "usage_stop_at": 0 }), "invalid"),
+        // No other board setting, and nothing else, passes through an approval.
+        (
+            json!({ "parallel_tasks": 2, "status": "closed" }),
+            "invalid",
+        ),
+        (json!({ "autopilot": true }), "invalid"),
+    ] {
+        let (s, v) = ask_with_change(&t, change.clone()).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (400, Some(code)),
+            "{change} {v}"
+        );
+    }
+    // The longest approving option fits an option.
+    let (s, v) = ask_with_change(
+        &t,
+        json!({ "parallel_tasks": 4, "usage_stop_at": 100, "temporary": false }),
+    )
+    .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert!(
+        v["options"][0].as_str().unwrap().chars().count() <= board_proto::ASK_OPTION_CHARS_MAX,
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn a_late_approving_answer_never_lowers_a_setting_and_typed_text_counts() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    let (s, ask) = ask_with_change(&t, json!({ "parallel_tasks": 2, "usage_stop_at": 95 })).await;
+    assert_eq!(s.as_u16(), 200, "{ask}");
+    let id = ask["id"].as_i64().unwrap();
+    // The user raises the board past the ask before answering it.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 4 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    // The option typed as text, with spaces around it, is the option.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{id}/answer"),
+            Some(json!({ "answer": " Apply: parallel_tasks=2, usage_stop_at=95 " })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(
+        (
+            board["parallel_tasks"].as_u64(),
+            board["usage_stop_at"].as_u64()
+        ),
+        (Some(4), Some(95))
+    );
+    let payload = last_board_update(&t).await["payload"].clone();
+    assert_eq!(payload["fields"], json!(["usage_stop_at"]), "{payload}");
+    assert_eq!(payload["not_lowered"], json!(["parallel_tasks"]));
+    assert!(payload.get("parallel_tasks").is_none(), "{payload}");
+}
+
+#[tokio::test]
+async fn an_agents_own_option_may_not_read_as_the_approving_one() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+    for option in ["Apply: parallel_tasks=2", " apply: parallel_tasks=4"] {
+        let (code, err, v) = t
+            .fail(
+                "POST",
+                "/v1/asks",
+                Some(A),
+                Some(json!({
+                    "agent": A, "board": "factory", "kind": "decision",
+                    "question": "Run two tasks at once?", "options": [option],
+                    "change": { "parallel_tasks": 2 },
+                })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+    }
+}

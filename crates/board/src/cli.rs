@@ -96,6 +96,15 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "the board object {slug, title, status, ...}",
     ),
     ("board delete", "{deleted: slug}"),
+    ("approved", "the board object {slug, title, status, ...}"),
+    (
+        "approved board",
+        "the board object {slug, title, status, ...}",
+    ),
+    (
+        "approved board update",
+        "the board object {slug, title, status, ...}",
+    ),
     ("log", "{events: [...], next_since}"),
     (
         "stats",
@@ -291,6 +300,17 @@ pub enum Command {
             ASK_OPTION_CHARS_MAX,
         ))]
         options: Vec<String>,
+        /// Attach a change to the board: the server puts the option that applies it first
+        /// and applies it when the user picks that option, so no step of yours follows.
+        /// For the settings only the user may raise: how many tasks run at once (1 to 4).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
+        set_parallel_tasks: Option<u32>,
+        /// Attach a change to the board's usage stop percent (1 to 100), applied as above.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
+        set_usage_stop_at: Option<u32>,
+        /// Attach a change to whether the board is temporary, applied as above.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        set_temporary: Option<bool>,
     },
     /// List asks, the newest when more match than the limit.
     Asks {
@@ -312,6 +332,11 @@ pub enum Command {
         #[arg(help = at_most("The answer", limits().question_chars))]
         answer: String,
     },
+    /// Apply a change the user approved in their own words, with the user's login on this
+    /// device. Use it only after the user approved this exact change; otherwise ask them
+    /// (`board ask --set-...`). The event log records who ran it and the words quoted.
+    #[command(subcommand)]
+    Approved(ApprovedCommand),
     /// Join a board (default: the one for this repo).
     Join { board: Option<BoardSlug> },
     /// List boards.
@@ -815,6 +840,36 @@ pub enum BoardCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ApprovedCommand {
+    /// A board's settings that only the user may raise or turn on.
+    #[command(subcommand)]
+    Board(ApprovedBoardCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApprovedBoardCommand {
+    /// Apply the approved settings to a board. It takes only these settings: change any
+    /// other with `board board update`.
+    Update {
+        slug: BoardSlug,
+        /// How many tasks the board may have in progress at once (1 to 4).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(board_proto::PARALLEL_TASKS_MAX)))]
+        parallel_tasks: Option<u32>,
+        /// The usage percent (1 to 100) at which the board starts no new task.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
+        usage_stop_at: Option<u32>,
+        /// Whether the server closes the board once idle and deletes it later.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        temporary: Option<bool>,
+        #[arg(long, help = at_most(
+            "The user's words that approve this change, quoted",
+            board_proto::APPROVAL_SAID_CHARS_MAX,
+        ))]
+        said: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum AdminCommand {
     /// Create a device and print its token once. List and revoke devices through
     /// `/v1/admin/devices` as the user.
@@ -1291,6 +1346,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             task,
             kind,
             options,
+            set_parallel_tasks,
+            set_usage_stop_at,
+            set_temporary,
         } => {
             let ask = ops::NewAsk {
                 board,
@@ -1298,6 +1356,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 kind,
                 question,
                 options,
+                change: Some(board_proto::BoardChange {
+                    parallel_tasks: set_parallel_tasks,
+                    usage_stop_at: set_usage_stop_at,
+                    temporary: set_temporary,
+                })
+                .filter(|change| !change.is_empty()),
             };
             ops::ask_user(&ctx()?, ask).await?
         }
@@ -1371,6 +1435,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::board_update(&ctx()?, &slug, body).await?
         }
         Command::Board(BoardCommand::Delete { slug }) => ops::board_delete(&ctx()?, &slug).await?,
+        Command::Approved(ApprovedCommand::Board(ApprovedBoardCommand::Update {
+            slug,
+            parallel_tasks,
+            usage_stop_at,
+            temporary,
+            said,
+        })) => {
+            let change = board_proto::BoardChange {
+                parallel_tasks,
+                usage_stop_at,
+                temporary,
+            };
+            // The user's login, not the session's device token; the agent is recorded.
+            let ctx = Ctx::load_user_login(agent()?)?;
+            ops::board_approved(&ctx, &slug, change, said).await?
+        }
         Command::Log {
             board,
             since,

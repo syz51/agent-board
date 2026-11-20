@@ -802,6 +802,55 @@ pub struct Ask {
     pub answered_via: Option<String>,
     pub created_at: Timestamp,
     pub answered_at: Option<Timestamp>,
+    /// The board change the ask carries, which the server applies when the user answers
+    /// with the ask's first option. Absent without one, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<BoardChange>,
+}
+
+/// The board settings only the user may raise or turn on, as a change the user approves:
+/// attached to an ask ([`Ask::change`]) or sent with the user's words
+/// (`POST /v1/boards/{slug}/approved`). At least one field is set. Fields it does not name
+/// are refused, so no other board setting passes through an approval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoardChange {
+    /// 1 to [`PARALLEL_TASKS_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks: Option<u32>,
+    /// 1 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_stop_at: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary: Option<bool>,
+}
+
+impl BoardChange {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The settings as `name=value`, in a fixed order, separated by `, `.
+    pub fn settings(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(n) = self.parallel_tasks {
+            parts.push(format!("parallel_tasks={n}"));
+        }
+        if let Some(n) = self.usage_stop_at {
+            parts.push(format!("usage_stop_at={n}"));
+        }
+        if let Some(on) = self.temporary {
+            parts.push(format!("temporary={on}"));
+        }
+        parts.join(", ")
+    }
+
+    /// The option the server puts first on an ask that carries this change. Answering
+    /// with exactly this text applies the change. With values in range it is never longer
+    /// than [`crate::ASK_OPTION_CHARS_MAX`].
+    pub fn approving_option(&self) -> String {
+        format!("Apply: {}", self.settings())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

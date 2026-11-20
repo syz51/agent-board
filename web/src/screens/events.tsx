@@ -185,6 +185,9 @@ export function describe(
     case "agent_state_changed":
       return [to ? `went ${to}` : "changed state", ""];
     case "board_updated":
+      // A user-only setting an agent applied: by your answer to an ask, or quoting you.
+      if (payload.approved === "ask") return ["updated", "by your answer to an ask"];
+      if (payload.approved === "said") return ["updated", "with your approval, as quoted"];
       return ["updated", ""];
     case "lease_created":
       return ["leased files for", ""];

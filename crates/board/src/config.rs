@@ -39,6 +39,25 @@ impl Home {
         dirs::home_dir().map(|home| home.join(".local/share/agent-board"))
     }
 
+    /// The home that holds the user's login on this device, which `board approved` acts
+    /// with: `$BOARD_USER_HOME`, else the default home's path with `-user` added
+    /// (`~/.local/share/agent-board-user`). It is a home of its own, so the device's token
+    /// stays the one every other command uses.
+    pub fn user_from_env() -> Result<Self> {
+        if let Some(root) = std::env::var_os("BOARD_USER_HOME").filter(|v| !v.is_empty()) {
+            return Ok(Self::at(PathBuf::from(root)));
+        }
+        let root = Self::default_root().context("no home directory; set BOARD_USER_HOME")?;
+        Ok(Self::at(Self::user_root(&root)))
+    }
+
+    /// The user home beside the default home at `default_root`.
+    fn user_root(default_root: &Path) -> PathBuf {
+        let mut root = default_root.as_os_str().to_owned();
+        root.push("-user");
+        PathBuf::from(root)
+    }
+
     pub fn at(root: PathBuf) -> Self {
         Self { root }
     }
@@ -178,6 +197,12 @@ pub fn load_token(home: &Home) -> Result<Option<String>> {
         TokenStore::for_platform(),
         &SecurityCli,
     )
+}
+
+/// The token stored for `home` itself: the Keychain, else `home`'s token file. Never
+/// `BOARD_TOKEN`, which names the session's device token whatever the home.
+pub fn load_stored_token(home: &Home) -> Result<Option<String>> {
+    load_token_from(home, None, TokenStore::for_platform(), &SecurityCli)
 }
 
 fn load_token_from(

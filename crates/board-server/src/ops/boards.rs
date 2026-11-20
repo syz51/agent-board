@@ -1,6 +1,6 @@
 use board_proto::{
-    AgentId, Board, BoardSlug, BoardStatus, ClaimCoordinator, CreateBoard, DeviceName, EventType,
-    TaskId, UpdateBoard,
+    AgentId, ApprovedBoardChange, Board, BoardChange, BoardSlug, BoardStatus, ClaimCoordinator,
+    CreateBoard, DeviceName, EventType, TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -132,14 +132,100 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
     get_board(cx, &req.slug)
 }
 
+/// The two routes by which an agent gets a user-only setting changed, named by each
+/// refusal of one.
+fn approved_routes(slug: &BoardSlug, setting: &str, flag: &str, value: &str) -> String {
+    format!(
+        "ask the user with the change attached (ask_user with change {{\"{setting}\": {value}}}; \
+         CLI: board ask --set-{flag} {value}): the server applies it when they pick the first \
+         option. When the user already approved this change in their own words, run `board \
+         approved board update {slug} --{flag} {value} --said \"<their words>\"`"
+    )
+}
+
+/// How the user approved a change to the settings only they may raise or turn on. The
+/// `board_updated` event of the change records it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Approval<'a> {
+    /// The user answered ask `id`, asked by `agent`, with its approving option.
+    Ask { id: i64, agent: &'a AgentId },
+    /// The user said `said`; the caller, on `device`'s user login, quotes it.
+    Said {
+        said: &'a str,
+        device: Option<&'a DeviceName>,
+    },
+}
+
+/// Checks a change that goes through an approval: it names a setting, in range.
+pub(crate) fn validate_change(change: &BoardChange, s: &Settings) -> Result<()> {
+    if change.is_empty() {
+        return Err(invalid(
+            "the change names no setting",
+            "send at least one of parallel_tasks, usage_stop_at and temporary",
+        ));
+    }
+    validate_update(change_request(change), s).map(|_| ())
+}
+
+/// Checks the user's quoted words on an approved change.
+pub(crate) fn validate_approved(req: &ApprovedBoardChange) -> Result<()> {
+    if req.said.trim().is_empty() {
+        return Err(invalid(
+            "said is empty",
+            "quote the user's words that approve this change",
+        ));
+    }
+    check_text("said", &req.said, board_proto::APPROVAL_SAID_CHARS_MAX)
+}
+
+fn change_request(change: &BoardChange) -> UpdateBoard {
+    UpdateBoard {
+        parallel_tasks: change.parallel_tasks,
+        usage_stop_at: change.usage_stop_at,
+        temporary: change.temporary,
+        ..UpdateBoard::default()
+    }
+}
+
+/// Applies a change the user approved, with the user's rights. Always records a
+/// `board_updated` event that names the approval and the values, also when the board
+/// already had them, so no use of an approval is without a trace.
+pub(crate) fn update_approved(
+    cx: &mut Ctx<'_>,
+    actor: &str,
+    slug: &BoardSlug,
+    change: &BoardChange,
+    approval: Approval<'_>,
+) -> Result<Board> {
+    apply(
+        cx,
+        actor,
+        slug,
+        change_request(change),
+        true,
+        Some(approval),
+    )
+}
+
 /// Changes a board. Only the user may make a board temporary, since the sweep then
 /// deletes it once idle.
 pub(crate) fn update(
     cx: &mut Ctx<'_>,
     actor: &str,
     slug: &BoardSlug,
+    req: UpdateBoard,
+    by_user: bool,
+) -> Result<Board> {
+    apply(cx, actor, slug, req, by_user, None)
+}
+
+fn apply(
+    cx: &mut Ctx<'_>,
+    actor: &str,
+    slug: &BoardSlug,
     mut req: UpdateBoard,
     by_user: bool,
+    approval: Option<Approval<'_>>,
 ) -> Result<Board> {
     let before = get_board(cx, slug)?;
     // The user keeps the feedback board on whatever other boards do, so triage never stops.
@@ -154,8 +240,11 @@ pub(crate) fn update(
     if req.temporary == Some(true) && !before.temporary && !by_user {
         return Err(forbidden(
             format!("only the user may make board {slug} temporary"),
-            "temporary boards are deleted once idle; ask the user (ask_user), or create a \
-             new board with temporary set",
+            format!(
+                "temporary boards are deleted once idle; create a new board with temporary \
+                 set, or {}",
+                approved_routes(slug, "temporary", "temporary", "true")
+            ),
         ));
     }
     if let Some(n) = req.parallel_tasks
@@ -164,8 +253,10 @@ pub(crate) fn update(
     {
         return Err(forbidden(
             format!("only the user may raise parallel_tasks on board {slug}"),
-            "more tasks at once spend the shared usage limit faster; ask the user (ask_user) \
-             to raise it",
+            format!(
+                "more tasks at once spend the shared usage limit faster; {}",
+                approved_routes(slug, "parallel_tasks", "parallel-tasks", "<n>")
+            ),
         ));
     }
     if let Some(n) = req.usage_stop_at
@@ -174,9 +265,27 @@ pub(crate) fn update(
     {
         return Err(forbidden(
             format!("only the user may raise usage_stop_at on board {slug}"),
-            "a higher stop lets the board spend more of the shared usage limit; ask the user \
-             (ask_user) to raise it",
+            format!(
+                "a higher stop lets the board spend more of the shared usage limit; {}",
+                approved_routes(slug, "usage_stop_at", "usage-stop-at", "<n>")
+            ),
         ));
+    }
+    // An ask may be answered long after it was written. Its answer never lowers a value
+    // the board has since been given: the event names what it left alone.
+    let mut not_lowered = Vec::new();
+    if let Some(Approval::Ask { .. }) = approval {
+        if req
+            .parallel_tasks
+            .is_some_and(|n| n < before.parallel_tasks)
+        {
+            req.parallel_tasks = None;
+            not_lowered.push("parallel_tasks");
+        }
+        if req.usage_stop_at.is_some_and(|n| n < before.usage_stop_at) {
+            req.usage_stop_at = None;
+            not_lowered.push("usage_stop_at");
+        }
     }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
@@ -221,40 +330,80 @@ pub(crate) fn update(
         "usage_stop_at",
         req.usage_stop_at.is_some_and(|v| v != before.usage_stop_at),
     );
-    if fields.is_empty() {
+    if fields.is_empty() && approval.is_none() {
         return Ok(before);
     }
     // A status change names the new status, so a daemon sees a resumed board without
     // reading it.
+    let changed = !fields.is_empty();
     let mut payload = serde_json::json!({ "fields": fields });
+    if !not_lowered.is_empty() {
+        payload["not_lowered"] = serde_json::json!(not_lowered);
+    }
     if let Some(status) = req.status.filter(|&s| s != before.status) {
         payload["status"] = serde_json::Value::from(enum_str(&status));
     }
-    // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
-    // only turns that began before it.
-    cx.db.execute(
-        "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
+    if let Some(approval) = approval {
+        // The values and who approved them, so the event alone shows what was granted.
+        for (name, value) in [
+            (
+                "parallel_tasks",
+                req.parallel_tasks.map(serde_json::Value::from),
+            ),
+            (
+                "usage_stop_at",
+                req.usage_stop_at.map(serde_json::Value::from),
+            ),
+            ("temporary", req.temporary.map(serde_json::Value::from)),
+        ] {
+            if let Some(value) = value {
+                payload[name] = value;
+            }
+        }
+        match approval {
+            Approval::Ask { id, agent } => {
+                payload["approved"] = "ask".into();
+                payload["ask"] = id.into();
+                payload["agent"] = agent.as_str().into();
+            }
+            Approval::Said { said, device } => {
+                payload["approved"] = "said".into();
+                payload["said"] = said.into();
+                if let Some(device) = device {
+                    payload["device"] = device.as_str().into();
+                }
+            }
+        }
+    }
+    // An approval that changes no value still leaves its event, but not a write: the
+    // board's `updated_at` moves only when the board does.
+    if changed {
+        // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
+        // only turns that began before it.
+        cx.db.execute(
+            "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
          dispatch = ?11, usage_stop_at = ?12, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
                           WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
-        params![
-            slug.as_str(),
-            req.title.unwrap_or(before.title),
-            req.goal.unwrap_or(before.goal),
-            enum_str(&req.status.unwrap_or(before.status)),
-            serde_json::to_string(&req.repos.unwrap_or(before.repos)).expect("serializes"),
-            req.autopilot.unwrap_or(before.autopilot),
-            serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
-                .expect("serializes"),
-            cx.now_ms(),
-            req.temporary.unwrap_or(before.temporary),
-            req.parallel_tasks.unwrap_or(before.parallel_tasks),
-            enum_str(&req.dispatch.unwrap_or(before.dispatch)),
-            req.usage_stop_at.unwrap_or(before.usage_stop_at),
-        ],
-    )?;
+            params![
+                slug.as_str(),
+                req.title.unwrap_or(before.title),
+                req.goal.unwrap_or(before.goal),
+                enum_str(&req.status.unwrap_or(before.status)),
+                serde_json::to_string(&req.repos.unwrap_or(before.repos)).expect("serializes"),
+                req.autopilot.unwrap_or(before.autopilot),
+                serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
+                    .expect("serializes"),
+                cx.now_ms(),
+                req.temporary.unwrap_or(before.temporary),
+                req.parallel_tasks.unwrap_or(before.parallel_tasks),
+                enum_str(&req.dispatch.unwrap_or(before.dispatch)),
+                req.usage_stop_at.unwrap_or(before.usage_stop_at),
+            ],
+        )?;
+    }
     cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
 }

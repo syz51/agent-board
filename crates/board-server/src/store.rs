@@ -882,7 +882,7 @@ pub(crate) fn live_leases(cx: &Ctx<'_>, repo: &str) -> Result<Vec<Lease>> {
 }
 
 const ASK_COLUMNS: &str = "id, board, task, agent, kind, question, options, status, answer, \
-     answered_via, created_at, answered_at";
+     answered_via, created_at, answered_at, change";
 
 fn ask_row(r: &Row<'_>) -> rusqlite::Result<Ask> {
     Ok(Ask {
@@ -901,6 +901,10 @@ fn ask_row(r: &Row<'_>) -> rusqlite::Result<Ask> {
         answered_via: r.get(9)?,
         created_at: ts(r.get(10)?),
         answered_at: r.get::<_, Option<i64>>(11)?.map(ts),
+        change: r
+            .get::<_, Option<String>>(12)?
+            .map(|c| parse_json(&c))
+            .transpose()?,
     })
 }
 

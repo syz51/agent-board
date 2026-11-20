@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use board_proto::{
-    AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError, Ask, Board,
-    BoardSlug, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
-    CreateTask, CreatedAsk, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
-    JoinBoard, Judge, LeaseResult, Note, PutHandoff, RegisterAgent, RegisterJudge, ReportUsage,
-    ResolveFeedback, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
-    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage,
-    UsageReserve,
+    AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError,
+    ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
+    CreateBoard, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DoneTask, ErrorCode,
+    ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff,
+    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
+    Touches, UpdateBoard, UpdateTask, Usage, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -760,6 +760,16 @@ impl Client {
 
     pub async fn update_board(&self, slug: &BoardSlug, body: &UpdateBoard) -> Result<Board> {
         self.with_body(Method::PATCH, &format!("/v1/boards/{slug}"), body)
+            .await
+    }
+
+    /// Applies a board change the user approved in their own words; takes a user token.
+    pub async fn approved_board_change(
+        &self,
+        slug: &BoardSlug,
+        body: &ApprovedBoardChange,
+    ) -> Result<Board> {
+        self.with_body(Method::POST, &format!("/v1/boards/{slug}/approved"), body)
             .await
     }
 

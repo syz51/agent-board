@@ -706,6 +706,22 @@ pub struct CreateAsk {
     pub question: String,
     #[serde(default)]
     pub options: Vec<String>,
+    /// A change to the ask's board that the server applies when the user answers with the
+    /// approving option, which the server puts first ([`BoardChange::approving_option`]).
+    /// A server that predates it ignores it, so a client checks the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<crate::BoardChange>,
+}
+
+/// `POST /v1/boards/{slug}/approved` (user only): applies a change the user approved in
+/// their own words, outside an ask. The event records the calling agent and `said`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedBoardChange {
+    /// The user's words that approve this change, quoted; at most
+    /// [`crate::APPROVAL_SAID_CHARS_MAX`] characters.
+    pub said: String,
+    pub change: crate::BoardChange,
 }
 
 /// The answer to `POST /v1/asks`: the new ask, and a warning when it may repeat another.

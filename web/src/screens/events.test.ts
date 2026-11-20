@@ -15,6 +15,24 @@ const event = (type: string, payload: unknown, task: string | null = "factory-9"
 });
 
 describe("event sentences", () => {
+  test("say when a board change went through your approval, and keep its words", () => {
+    const said = event(
+      "board_updated",
+      { fields: ["parallel_tasks"], parallel_tasks: 2, approved: "said", said: "make it 2" },
+      null,
+    );
+    expect(describeEvent(said)).toEqual(["updated", "with your approval, as quoted"]);
+    expect(detail(said)).toContain("said: make it 2");
+    expect(detail(said)).toContain("parallel_tasks: 2");
+    expect(
+      describeEvent(event("board_updated", { fields: [], approved: "ask", ask: 4 }, null)),
+    ).toEqual(["updated", "by your answer to an ask"]);
+    expect(describeEvent(event("board_updated", { fields: ["goal"] }, null))).toEqual([
+      "updated",
+      "",
+    ]);
+  });
+
   test("say what happened around the task link", () => {
     expect(describeEvent(event("task_updated", { from: "doing", to: "review" }))).toEqual([
       "moved",

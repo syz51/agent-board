@@ -6,6 +6,7 @@ use rusqlite::params;
 use crate::config::Settings;
 use crate::db::{Ctx, enum_str};
 use crate::error::{Result, bad_transition, forbidden, invalid};
+use crate::ops::boards::{self, Approval};
 use crate::ops::touch_agent;
 use crate::store::{
     NamedParams, get_ask, get_board_uncounted, get_task, load_asks, load_newest_asks,
@@ -29,6 +30,28 @@ pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
     for option in &req.options {
         check_line("option", option, board_proto::ASK_OPTION_CHARS_MAX)?;
     }
+    if let Some(change) = &req.change {
+        boards::validate_change(change, s)?;
+        // The server adds the approving option, so one fewer fits.
+        if req.options.len() > 7 {
+            return Err(invalid(
+                "at most 7 options beside the approving one",
+                "the server puts the option that applies the change first; offer fewer others",
+            ));
+        }
+        // Only the server's option may read as the one that applies the change.
+        if let Some(own) = req
+            .options
+            .iter()
+            .find(|o| o.trim_start().to_lowercase().starts_with("apply:"))
+        {
+            return Err(invalid(
+                format!("option {own:?} reads like the option that applies the change"),
+                "the server writes that option itself, as \"Apply: <settings>\"; word yours \
+                 another way",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -42,6 +65,12 @@ pub(crate) fn validate_answer(req: &AnswerAsk, s: &Settings) -> Result<()> {
 /// Creates the ask and warns of the board's other recent open asks, which it may repeat:
 /// the ask is made either way.
 pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
+    // The approving option is the server's own text, so the user reads the change that
+    // their answer applies, whatever the question says.
+    let mut options = req.options;
+    if let Some(change) = &req.change {
+        options.insert(0, change.approving_option());
+    }
     get_board_uncounted(cx, &req.board)?;
     touch_agent(cx, &req.agent)?;
     if let Some(task) = &req.task {
@@ -57,16 +86,19 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
         }
     }
     cx.db.execute(
-        "INSERT INTO asks (board, task, agent, kind, question, options, status, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
+        "INSERT INTO asks (board, task, agent, kind, question, options, status, created_at, \
+         change) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8)",
         params![
             req.board.as_str(),
             req.task.as_ref().map(|t| t.as_str()),
             req.agent.as_str(),
             enum_str(&req.kind),
             req.question,
-            serde_json::to_string(&req.options).expect("strings serialize"),
+            serde_json::to_string(&options).expect("strings serialize"),
             cx.now_ms(),
+            req.change
+                .as_ref()
+                .map(|c| serde_json::to_string(c).expect("serializes")),
         ],
     )?;
     let id = cx.db.last_insert_rowid();
@@ -164,7 +196,9 @@ fn require_open(ask: &Ask) -> Result<()> {
     Ok(())
 }
 
-/// Answers an open ask (the user only; checked by the caller).
+/// Answers an open ask (the user only; checked by the caller). When the ask carries a board
+/// change and the answer is its approving option, applies the change as the user in the
+/// same transaction; any other answer changes nothing on the board.
 pub(crate) fn answer(cx: &mut Ctx<'_>, id: i64, answer: &str, via: &str) -> Result<Ask> {
     let ask = get_ask(cx, id)?;
     require_open(&ask)?;
@@ -180,6 +214,15 @@ pub(crate) fn answer(cx: &mut Ctx<'_>, id: i64, answer: &str, via: &str) -> Resu
         ask.task.as_ref(),
         serde_json::json!({ "id": id, "agent": ask.agent, "via": via }),
     )?;
+    if let Some(change) = &ask.change
+        && answer.trim() == change.approving_option()
+    {
+        let approval = Approval::Ask {
+            id,
+            agent: &ask.agent,
+        };
+        boards::update_approved(cx, "user", &ask.board, change, approval)?;
+    }
     get_ask(cx, id)
 }
 
