@@ -9,7 +9,9 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
 1. `task_claim {task}`.
 2. `task_show {task}`. Read its body, its acceptance checks and every note. Pass
    `detailed` for the older plain notes. Each finding and decision is part of the work:
-   address each one.
+   address each one. A part that a verdict cut is a judge's call, not the user's decision:
+   never give the cut as the reason of a `no action` line or a limit. Name the task that
+   holds the part, and file the part as a proposal when no task does.
 3. Lease the paths you will change (`lease_paths` with the task) before you edit them.
    When a lease overlaps another task in progress, stop: set {task} `open` with a note
    naming that task, and end. The dispatcher starts {task} again once the other task ends.

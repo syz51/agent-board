@@ -137,6 +137,36 @@ mod tests {
         }
     }
 
+    /// A verdict judge's cut is not the user's decision, and no brief lets it pass as one.
+    #[test]
+    fn a_cut_is_accounted_for_and_never_the_users_decision() {
+        let verdict = judge_brief(JudgeKind::Verdict, &board(), &[task(7)]);
+        for rule in [
+            "A cut is your call, never the user's decision.",
+            "Scope the user asked for is not yours to cut",
+            "`cut: <part> -> <task id>` or `cut: <part>, dropped: <reason>`",
+            "`Out of scope (cut by a judge): <part>, <task id>`",
+        ] {
+            assert!(flat(&verdict).contains(rule), "verdict: {rule}");
+        }
+        let worker = worker_brief(&board(), &task(7), WORKER_CLOSER);
+        assert!(
+            flat(&worker)
+                .contains("never give the cut as the reason of a `no action` line or a limit"),
+            "{worker}"
+        );
+        let review = judge_brief(JudgeKind::Review, &board(), &[task(7)]);
+        assert!(
+            flat(&review).contains("A result that gives the cut as the user's decision"),
+            "{review}"
+        );
+    }
+
+    /// `text` with each run of white space as one space, so a rule matches across lines.
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn each_judge_brief_stays_under_its_size() {
         let tasks: Vec<TaskId> = (1000..1005).map(task).collect();

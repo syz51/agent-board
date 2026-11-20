@@ -1324,7 +1324,10 @@ agrees, after checking it.
   value against the board goal and cost.
 - **Verdict**: a `decision` note starting `verdict:` (accept, merge, decline, escalate) with
   reasons and the evidence checked. Accept sets `auto`; merge and decline drop the task with
-  the reason; escalate asks the user and blocks it.
+  the reason; escalate asks the user and blocks it. A judge that cuts a proposal accounts
+  for each cut part in the verdict: a task that holds it, or its drop with the reason.
+  Scope the user asked for is not cut. A cut is a judge's call: workers and review judges
+  never report it as the user's decision (`prompts/judges/verdict.md`, `prompts/worker.md`).
 - **Agreement**: one independent accept, or two for L proposals and for security-boundary,
   destructive, irreversible or cross-repository changes. Split verdicts and decisions only
   the user can make (direction, spending, security posture, publishing, deleting data, what
