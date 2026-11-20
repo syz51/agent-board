@@ -14,10 +14,11 @@ proposer checks it and agrees.
 5. Account for each part you cut. A cut is your call, never the user's decision.
    - Scope the user asked for is not yours to cut: read the parent task and each task the
      body names. Keep such a part, or move it to a sub-task of the user's task, not a
-     proposal. Only the user drops it: escalate.
+     proposal. You never drop it: only the user does.
    - File each other part that is worth doing as its own proposal. Drop the rest.
    - In the verdict, write `cut: <part> -> <task id>` or `cut: <part>, dropped: <reason>`.
-     Write the acceptance line as `Out of scope (cut by a judge): <part>, <task id>`.
+     Write the acceptance line as `Out of scope (cut by a judge): <part>, <task id>`, with
+     `dropped` in place of the id for a dropped part.
 6. Record the verdict as a `decision` note starting `verdict:` with accept, merge <id>,
    decline or escalate, the reasons and the evidence you checked.
 

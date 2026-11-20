@@ -9,9 +9,10 @@ request.
    that can pass only after the merge, such as a deploy, is not a failure: name it in your
    pass note as left for after the merge.
 3. Check each finding noted on the task: the work or a note covers it, does it, or
-   declines it with a reason. One that is missed fails the review. A verdict's `cut` is
-   a finding too: a task holds the part or the verdict states its drop. A result that
-   gives the cut as the user's decision, or as the reason for `no action`, fails.
+   declines it with a reason. One that is missed fails the review. A part a verdict cut,
+   in any wording, needs a task that holds it or a drop the verdict states: file a part
+   with neither yourself, and do not fail the result for it. A result that gives the cut
+   as the user's decision, or as the reason that an item needs no work, fails.
 4. Read the tasks filed under it (`children` in `task_show`). Leave each proposal to its
    verdict judge. Set priority and blockers on the others.
 

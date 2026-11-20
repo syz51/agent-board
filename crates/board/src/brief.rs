@@ -145,19 +145,26 @@ mod tests {
             "A cut is your call, never the user's decision.",
             "Scope the user asked for is not yours to cut",
             "`cut: <part> -> <task id>` or `cut: <part>, dropped: <reason>`",
-            "`Out of scope (cut by a judge): <part>, <task id>`",
+            "You never drop it: only the user does.",
+            "`Out of scope (cut by a judge): <part>, <task id>`, with `dropped` in place of the id",
         ] {
             assert!(flat(&verdict).contains(rule), "verdict: {rule}");
         }
         let worker = worker_brief(&board(), &task(7), WORKER_CLOSER);
         assert!(
+            flat(&worker).contains("never give the cut as the reason that a limit or an open item"),
+            "{worker}"
+        );
+        // A part the verdict dropped is not filed again.
+        assert!(
             flat(&worker)
-                .contains("never give the cut as the reason of a `no action` line or a limit"),
+                .contains("or the verdict's drop and its reason. A part with neither: file it"),
             "{worker}"
         );
         let review = judge_brief(JudgeKind::Review, &board(), &[task(7)]);
         assert!(
-            flat(&review).contains("A result that gives the cut as the user's decision"),
+            flat(&review).contains("A result that gives the cut as the user's decision")
+                && flat(&review).contains("file a part with neither yourself"),
             "{review}"
         );
     }
