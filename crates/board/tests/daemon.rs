@@ -5649,3 +5649,159 @@ async fn a_ranked_task_starts_before_the_older_tasks_of_its_priority_level() {
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(worker_starts(&e.t3)[0].0, "factory-9 Task factory-9");
 }
+
+/// The active board `slug` with this device as a home, not on autopilot.
+fn off_autopilot(slug: &str) -> Board {
+    let mut board = daemon_board(None);
+    board.slug = slug.parse().unwrap();
+    board.autopilot = false;
+    board
+}
+
+/// A device with `boards`, each holding `tasks` and no judge at work.
+fn off_autopilot_env(boards: &[Board], tasks: &[board_proto::Task]) -> Env {
+    let e = env();
+    e.stub.on("GET /v1/boards", boards);
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", tasks);
+    for board in boards {
+        let judges = format!("/v1/boards/{}/judges", board.slug);
+        e.stub.on(&format!("GET {judges}"), json!([]));
+        e.stub.on(
+            &format!("POST {judges}"),
+            judge(NEW_THREAD, "verdict", &[], true),
+        );
+    }
+    e
+}
+
+/// The user's choice in ask #171 (agent-board-491): proposals get their verdict on every
+/// home board, and a board that is not on autopilot gets nothing else.
+#[tokio::test]
+async fn a_home_board_off_autopilot_gets_verdict_judges_and_no_other_run() {
+    // Work that an autopilot board would start a worker, a review judge and, with the
+    // goal due, a goal judge for.
+    let tasks = [
+        ready_task("factory-4", board_proto::Priority::P1, 0),
+        review_task("factory-5", 0),
+        proposal("factory-10", Some("factory-1"), 0),
+        proposal("factory-11", Some("factory-1"), 1),
+    ];
+    let mut board = off_autopilot("factory");
+    board.goal = "Ship the factory".into();
+    let mut e = off_autopilot_env(&[board], &tasks);
+    review_detail(&e, &tasks[1], vec![]);
+    e.daemon.reconcile(at()).await.unwrap();
+
+    assert_eq!(titles(&e.t3), ["verdict factory-10 (under factory-1)"]);
+    assert_eq!(
+        registered(&e),
+        [json!({
+            "agent": format!("t3:{NEW_THREAD}"), "kind": "verdict",
+            "tasks": ["factory-10", "factory-11"],
+        })]
+    );
+    // No lease, and nothing read of the board but its proposals.
+    assert!(dispatch_claims(&e).is_empty());
+    let lists = e.stub.requests_to("GET /v1/tasks");
+    assert!(
+        lists.iter().all(|r| r.query.contains("proposal=true")),
+        "{lists:#?}"
+    );
+    assert!(e.stub.requests_to("GET /v1/tasks/factory-5").is_empty());
+    assert!(e.stub.requests_to("PATCH /v1/tasks/factory-4").is_empty());
+
+    // While that judge runs, nothing more starts.
+    e.stub.on(
+        "GET /v1/boards/factory/judges",
+        [judge(
+            NEW_THREAD,
+            "verdict",
+            &["factory-10", "factory-11"],
+            true,
+        )],
+    );
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3).len(), 1);
+}
+
+#[tokio::test]
+async fn a_board_off_autopilot_gets_no_judge_where_this_device_is_no_home_or_it_is_paused() {
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut elsewhere = off_autopilot("factory");
+    elsewhere.home_devices = vec!["mac-pro".parse().unwrap()];
+    let mut homeless = off_autopilot("other");
+    homeless.home_devices = Vec::new();
+    let mut paused = off_autopilot("third");
+    paused.status = board_proto::BoardStatus::Paused;
+    let mut e = off_autopilot_env(&[elsewhere, homeless, paused], &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+    assert!(e.stub.requests_to("GET /v1/tasks").is_empty());
+    assert!(e.stub.requests_to("POST /v1/agents").is_empty());
+}
+
+#[tokio::test]
+async fn a_board_off_autopilot_at_its_usage_stop_gets_no_verdict_judge() {
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut e = off_autopilot_env(&[off_autopilot("factory")], &tasks);
+    e.stub.on("GET /v1/usage", usage_reading(95.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+
+    e.stub.on("GET /v1/usage", usage_reading(40.0, at()));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["verdict factory-10 (no parent)"]);
+}
+
+#[tokio::test]
+async fn the_boards_off_autopilot_share_two_verdict_judges_and_a_held_one_is_recorded() {
+    let tasks = [proposal("factory-10", None, 0)];
+    let boards = ["factory", "other", "third"].map(off_autopilot);
+    let mut e = off_autopilot_env(&boards, &tasks);
+    e.t3.ids
+        .lock()
+        .unwrap()
+        .extend([J1.to_owned(), J2.to_owned()]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 2);
+    for (slug, started) in [("factory", 1), ("other", 1), ("third", 0)] {
+        let path = format!("POST /v1/boards/{slug}/judges");
+        assert_eq!(e.stub.requests_to(&path).len(), started, "{slug}");
+    }
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:#?}");
+    assert_eq!(
+        (&held[0]["kind"], &held[0]["board"], &held[0]["limit"]),
+        (&json!("judge"), &json!("third"), &json!(2))
+    );
+    assert_eq!(held[0]["subject"], "verdict factory-10 (no parent)");
+    assert_eq!(
+        held[0]["cause"],
+        "2 verdict judges run on the boards that are not on autopilot"
+    );
+
+    // The same hold is not written again, and the board starts once a slot is free.
+    let minute = chrono::Duration::minutes(1);
+    for (slug, thread) in [("factory", J1), ("other", J2)] {
+        e.stub.on(
+            &format!("GET /v1/boards/{slug}/judges"),
+            [judge(thread, "verdict", &["factory-10"], true)],
+        );
+    }
+    e.daemon.reconcile(at() + minute).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 2);
+    assert_eq!(holds(&home_of(&e)).len(), 1);
+    // A paused board's judge is followed no longer, and takes none of the two.
+    let mut boards = boards;
+    boards[0].status = board_proto::BoardStatus::Paused;
+    e.stub.on("GET /v1/boards", &boards[..]);
+    e.daemon.reconcile(at() + minute * 2).await.unwrap();
+    assert_eq!(e.stub.requests_to("POST /v1/boards/third/judges").len(), 1);
+}

@@ -512,3 +512,68 @@ async fn the_sweep_leaves_the_dispatch_agent_and_a_live_judge_running() {
         ["ended", "running"]
     );
 }
+
+async fn register_judge_on(t: &T, board: &str, by: &str, body: Value) -> (u16, Value) {
+    let path = format!("/v1/boards/{board}/judges");
+    let (s, v) = t.call("POST", &path, Some(by), Some(body)).await;
+    (s.as_u16(), v)
+}
+
+async fn update_board(t: &T, board: &str, body: Value) {
+    t.ok("PATCH", &format!("/v1/boards/{board}"), None, Some(body))
+        .await;
+}
+
+#[tokio::test]
+async fn a_home_devices_dispatch_agent_registers_verdict_judges_on_a_board_off_autopilot() {
+    let t = dispatched().await;
+    let id = parked(&t, "other").await;
+    let verdict = json!({ "agent": JUDGE, "kind": "verdict", "tasks": [id] });
+
+    // `other` is not on autopilot and names no home: nobody registers a judge there.
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+
+    // Another device is its home: this device's dispatch agent still may not.
+    update_board(&t, "other", json!({ "home_devices": ["air"] })).await;
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+
+    // Its own device is a home: a verdict judge, and no other kind, nor by another agent.
+    update_board(&t, "other", json!({ "home_devices": ["air", "mac"] })).await;
+    for kind in ["review", "goal", "triage"] {
+        let body = json!({ "agent": JUDGE, "kind": kind, "tasks": [id] });
+        let (s, v) = register_judge_on(&t, "other", DISPATCH, body).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{kind}: {v}"
+        );
+    }
+    let (s, v) = register_judge_on(&t, "other", WORKER, verdict.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(!may_hand_over(&t, JUDGE, &id).await);
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["registered_by"], DISPATCH);
+    let listed = t.ok("GET", "/v1/boards/other/judges", None, None).await;
+    assert_eq!(listed[0]["agent"], JUDGE, "{listed}");
+    // The board still has no coordinator, and the judge has the rights there only.
+    assert_eq!(
+        t.ok("GET", "/v1/boards/other", None, None).await["coordinator"],
+        Value::Null
+    );
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    let elsewhere = parked(&t, "factory").await;
+    assert!(!may_hand_over(&t, JUDGE, &elsewhere).await);
+
+    // The rights end when the board pauses, or the device is no longer a home.
+    update_board(&t, "other", json!({ "status": "paused" })).await;
+    assert!(!may_hand_over(&t, JUDGE, &id).await);
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    update_board(&t, "other", json!({ "status": "active" })).await;
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    update_board(&t, "other", json!({ "home_devices": ["air"] })).await;
+    assert!(!may_hand_over(&t, JUDGE, &id).await);
+}

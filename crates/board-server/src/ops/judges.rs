@@ -1,12 +1,13 @@
 //! Judges (`docs/API.md`, "Daemon dispatch"): short-lived threads that the holder of a
 //! board's coordinator lease registers, so they have the coordinator's rights on that
-//! board while they run.
+//! board while they run. A board that is not on autopilot has no lease: there the dispatch
+//! agent of a home device registers verdict judges, and no other kind.
 
 use std::sync::LazyLock;
 
 use board_proto::{
-    AgentId, AgentState, BoardSlug, EventType, JUDGE_HOURS_MAX, JUDGE_TASKS_MAX, Judge, JudgeKind,
-    RegisterJudge,
+    AgentId, AgentState, Board, BoardSlug, BoardStatus, EventType, JUDGE_HOURS_MAX,
+    JUDGE_TASKS_MAX, Judge, JudgeKind, RegisterJudge,
 };
 use rusqlite::{Row, named_params, params};
 
@@ -18,10 +19,27 @@ use crate::store::{agent_by_id_or_handle, find_agent, get_board_uncounted, get_t
 const JUDGE_MS: i64 = JUDGE_HOURS_MAX * 3_600_000;
 
 /// A registration `j` that gives rights at `:now`: its agent has not ended, it has not
-/// expired, and the agent that registered it still holds the board's coordinator lease.
+/// expired, and the agent that registered it still holds the board's coordinator lease,
+/// or it is a verdict judge that [`registers_without_lease`] still allows.
 pub(crate) const LIVE: &str = "j.ended_at IS NULL AND j.expires_at > :now \
      AND EXISTS (SELECT 1 FROM boards jb WHERE jb.slug = j.board \
-                 AND jb.coordinator = j.registered_by AND jb.coordinator_expires_at > :now)";
+                 AND ((jb.coordinator = j.registered_by AND jb.coordinator_expires_at > :now) \
+                      OR (jb.autopilot = 0 AND jb.status = 'active' AND j.kind = 'verdict' \
+                          AND EXISTS (SELECT 1 FROM json_each(jb.home_devices) jd \
+                                      WHERE 'dispatch:' || jd.value = j.registered_by))))";
+
+/// Whether `caller` may register a judge of `kind` on `board` without the coordinator
+/// lease, which a board that is not on autopilot never gives: `caller` is the dispatch
+/// agent of one of the board's home devices, the board is active, and the judge gives
+/// verdicts on proposals. [`LIVE`] holds the same rule for the rights.
+fn registers_without_lease(board: &Board, caller: &AgentId, kind: JudgeKind) -> bool {
+    !board.autopilot
+        && board.status == BoardStatus::Active
+        && kind == JudgeKind::Verdict
+        && caller
+            .dispatch_device()
+            .is_some_and(|device| board.home_devices.contains(&device))
+}
 
 /// Whether `:agent` has the coordinator's rights on `:board`.
 static RIGHTS: LazyLock<String> = LazyLock::new(|| {
@@ -132,8 +150,9 @@ pub(crate) fn list(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Vec<Judge>> {
 }
 
 /// Registers `req.agent` (an id or handle) as a judge of `board`. Only the board's live
-/// coordinator may. A live registration of the same agent keeps its expiry, so registering
-/// again never extends the rights; one that is over is replaced.
+/// coordinator may, or, for a verdict judge on a board that is not on autopilot, the
+/// dispatch agent of a home device. A live registration of the same agent keeps its
+/// expiry, so registering again never extends the rights; one that is over is replaced.
 pub(crate) fn register(
     cx: &mut Ctx<'_>,
     caller: &AgentId,
@@ -141,11 +160,15 @@ pub(crate) fn register(
     req: RegisterJudge,
 ) -> Result<Judge> {
     let found = get_board_uncounted(cx, board)?;
-    if found.coordinator.as_ref() != Some(caller) {
+    if found.coordinator.as_ref() != Some(caller)
+        && !registers_without_lease(&found, caller, req.kind)
+    {
         return Err(forbidden(
             format!("{caller} does not hold the coordinator lease of {board}"),
-            "only the lease holder registers judges; to have a judgment made, add a note on \
-             the task (task_note) for the board's coordinator",
+            "only the lease holder registers judges, and on an active board that is not on \
+             autopilot the dispatch agent of a home device registers verdict judges; to \
+             have a judgment made, add a note on the task (task_note) for the board's \
+             coordinator",
         ));
     }
     let agent = agent_by_id_or_handle(cx, &req.agent)?;
