@@ -501,3 +501,64 @@ async fn an_ask_carries_only_the_user_only_board_settings() {
         "{v}"
     );
 }
+
+#[tokio::test]
+async fn a_late_approving_answer_never_lowers_a_setting_and_typed_text_counts() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    let (s, ask) = ask_with_change(&t, json!({ "parallel_tasks": 2, "usage_stop_at": 95 })).await;
+    assert_eq!(s.as_u16(), 200, "{ask}");
+    let id = ask["id"].as_i64().unwrap();
+    // The user raises the board past the ask before answering it.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 4 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    // The option typed as text, with spaces around it, is the option.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{id}/answer"),
+            Some(json!({ "answer": " Apply: parallel_tasks=2, usage_stop_at=95 " })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(
+        (
+            board["parallel_tasks"].as_u64(),
+            board["usage_stop_at"].as_u64()
+        ),
+        (Some(4), Some(95))
+    );
+    let payload = last_board_update(&t).await["payload"].clone();
+    assert_eq!(payload["fields"], json!(["usage_stop_at"]), "{payload}");
+    assert_eq!(payload["not_lowered"], json!(["parallel_tasks"]));
+    assert!(payload.get("parallel_tasks").is_none(), "{payload}");
+}
+
+#[tokio::test]
+async fn an_agents_own_option_may_not_read_as_the_approving_one() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+    for option in ["Apply: parallel_tasks=2", " apply: parallel_tasks=4"] {
+        let (code, err, v) = t
+            .fail(
+                "POST",
+                "/v1/asks",
+                Some(A),
+                Some(json!({
+                    "agent": A, "board": "factory", "kind": "decision",
+                    "question": "Run two tasks at once?", "options": [option],
+                    "change": { "parallel_tasks": 2 },
+                })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+    }
+}

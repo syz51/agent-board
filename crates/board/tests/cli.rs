@@ -3238,6 +3238,26 @@ fn approved_refuses_without_a_user_login_and_other_settings() {
         let out = run_approved(&e, &home, &args);
         assert!(!out.status.success(), "{args:?}");
     }
+    // Outside an agent session nobody would be named in the event.
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[("BOARD_USER_HOME", home.to_str().unwrap())],
+        &[
+            "approved",
+            "board",
+            "update",
+            "factory",
+            "--parallel-tasks",
+            "2",
+            "--said",
+            "go",
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no agent id"), "{err}");
     for args in [
         vec!["approved", "answer", "7", "yes"],
         vec!["approved", "board", "delete", "factory"],

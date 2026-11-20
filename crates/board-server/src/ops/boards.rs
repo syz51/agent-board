@@ -271,6 +271,22 @@ fn apply(
             ),
         ));
     }
+    // An ask may be answered long after it was written. Its answer never lowers a value
+    // the board has since been given: the event names what it left alone.
+    let mut not_lowered = Vec::new();
+    if let Some(Approval::Ask { .. }) = approval {
+        if req
+            .parallel_tasks
+            .is_some_and(|n| n < before.parallel_tasks)
+        {
+            req.parallel_tasks = None;
+            not_lowered.push("parallel_tasks");
+        }
+        if req.usage_stop_at.is_some_and(|n| n < before.usage_stop_at) {
+            req.usage_stop_at = None;
+            not_lowered.push("usage_stop_at");
+        }
+    }
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -319,7 +335,11 @@ fn apply(
     }
     // A status change names the new status, so a daemon sees a resumed board without
     // reading it.
+    let changed = !fields.is_empty();
     let mut payload = serde_json::json!({ "fields": fields });
+    if !not_lowered.is_empty() {
+        payload["not_lowered"] = serde_json::json!(not_lowered);
+    }
     if let Some(status) = req.status.filter(|&s| s != before.status) {
         payload["status"] = serde_json::Value::from(enum_str(&status));
     }
@@ -355,31 +375,35 @@ fn apply(
             }
         }
     }
-    // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
-    // only turns that began before it.
-    cx.db.execute(
-        "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
+    // An approval that changes no value still leaves its event, but not a write: the
+    // board's `updated_at` moves only when the board does.
+    if changed {
+        // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
+        // only turns that began before it.
+        cx.db.execute(
+            "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
          dispatch = ?11, usage_stop_at = ?12, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
                           WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
-        params![
-            slug.as_str(),
-            req.title.unwrap_or(before.title),
-            req.goal.unwrap_or(before.goal),
-            enum_str(&req.status.unwrap_or(before.status)),
-            serde_json::to_string(&req.repos.unwrap_or(before.repos)).expect("serializes"),
-            req.autopilot.unwrap_or(before.autopilot),
-            serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
-                .expect("serializes"),
-            cx.now_ms(),
-            req.temporary.unwrap_or(before.temporary),
-            req.parallel_tasks.unwrap_or(before.parallel_tasks),
-            enum_str(&req.dispatch.unwrap_or(before.dispatch)),
-            req.usage_stop_at.unwrap_or(before.usage_stop_at),
-        ],
-    )?;
+            params![
+                slug.as_str(),
+                req.title.unwrap_or(before.title),
+                req.goal.unwrap_or(before.goal),
+                enum_str(&req.status.unwrap_or(before.status)),
+                serde_json::to_string(&req.repos.unwrap_or(before.repos)).expect("serializes"),
+                req.autopilot.unwrap_or(before.autopilot),
+                serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
+                    .expect("serializes"),
+                cx.now_ms(),
+                req.temporary.unwrap_or(before.temporary),
+                req.parallel_tasks.unwrap_or(before.parallel_tasks),
+                enum_str(&req.dispatch.unwrap_or(before.dispatch)),
+                req.usage_stop_at.unwrap_or(before.usage_stop_at),
+            ],
+        )?;
+    }
     cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
 }

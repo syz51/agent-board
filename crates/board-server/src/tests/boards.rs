@@ -968,3 +968,35 @@ async fn the_refusals_of_user_only_settings_name_both_routes() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_approved_change_needs_a_registered_agent_and_writes_only_what_changed() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    let body = json!({ "said": "make it 2", "change": { "parallel_tasks": 2 } });
+    // Without an agent the event would name nobody: refused, and nothing is written.
+    let (s, v) = t.as_user("POST", APPROVED, Some(body.clone())).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+    // So is an agent the board does not know.
+    let (s, v) = approved(&t, body.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (404, Some("not_found")), "{v}");
+    assert_eq!(board_updates(&t).await.len(), 0);
+
+    t.register("t3:alpha", None, None).await;
+    let (s, v) = approved(&t, body.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    let updated_at = v["updated_at"].clone();
+    // A repeat changes no value: its event is kept, the board is not written again.
+    t.advance(TimeDelta::seconds(60));
+    let (s, v) = approved(&t, body).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["updated_at"], updated_at);
+    let events = board_updates(&t).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["payload"]["fields"], json!([]));
+    assert_eq!(events[1]["payload"]["said"], "make it 2");
+}

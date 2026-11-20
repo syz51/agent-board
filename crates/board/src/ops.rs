@@ -1631,6 +1631,8 @@ pub async fn board_approved(
             "name the setting the user approved: --parallel-tasks, --usage-stop-at or --temporary"
         );
     }
+    // The event names who used the user's login; the server refuses a request without one.
+    ctx.agent()?;
     let body = ApprovedBoardChange { said, change };
     let board = ctx.client.approved_board_change(slug, &body).await?;
     Ok(Output::new(

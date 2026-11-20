@@ -361,8 +361,11 @@ approval for another board is not one. An agent that has no such approval asks (
    applies whatever the question says; the agent may add at most 7 options of its own.
    The `[Ask]` carries `change`. When the user answers with exactly that option (web,
    Telegram button or `board answer`), the server applies the change as the user in the
-   same transaction as the answer. No agent step follows. Any other answer, free text
-   included, applies nothing. The event: actor `user`, payload `{"fields": [...],
+   same transaction as the answer. No agent step follows. An answer typed as that exact
+   text counts as the option; spaces around it are ignored. Any other answer applies
+   nothing. An approving answer never lowers `parallel_tasks` or `usage_stop_at` below
+   the board's value at that time: it leaves that setting alone and the event names it in
+   `not_lowered`. The agent's own options may not start with `Apply:`. The event: actor `user`, payload `{"fields": [...],
    "parallel_tasks": 2, "approved": "ask", "ask": <id>, "agent": "<the asker>"}`.
    `ask_user` (MCP) takes `change`; `board ask` takes `--set-parallel-tasks N`,
    `--set-usage-stop-at N` and `--set-temporary true|false`. Both say that the first option
@@ -373,10 +376,11 @@ approval for another board is not one. An agent that has no such approval asks (
    characters), and `change` (`[BoardChange]`, as above). User only: a device token gets
    403 `forbidden`, whose `next` names both routes. Unknown fields, in the body or in
    `change`, are refused (400 `invalid`), so no other board setting and no other act
-   passes through it. The event: actor the calling agent (`X-Board-Agent`, else `user`),
+   passes through it. `X-Board-Agent` is required and must name a registered agent (400 `invalid`, 404
+   `not_found`), so the event always names who applied it. The event: actor that agent,
    payload `{"fields": [...], "parallel_tasks": 2, "approved": "said", "said": "<the
    words>", "device": "<the token's device>"}`. It is recorded also when the board already
-   had the values (`fields` is then empty).
+   had the values (`fields` is then empty); the board itself is then not written.
    `board approved board update <slug> [--parallel-tasks N] [--usage-stop-at N]
    [--temporary true|false] --said "<the user's words>"` calls it. It has no other
    subcommand and takes no other setting. It sends the token of the user's login on the

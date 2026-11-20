@@ -370,16 +370,18 @@ async fn approved_board_change(
     let slug: BoardSlug = parse_path(&slug)?;
     boards::validate_approved(&req)?;
     boards::validate_change(&req.change, state.settings())?;
-    let actor = caller.actor();
+    // The event must name who used the user's login: a registered agent, never nobody.
+    let agent = caller.agent()?.clone();
     let device = caller.device().cloned();
     Ok(Json(
         state
             .write(move |cx| {
+                get_agent(cx, &agent)?;
                 let approval = boards::Approval::Said {
                     said: &req.said,
                     device: device.as_ref(),
                 };
-                boards::update_approved(cx, &actor, &slug, &req.change, approval)
+                boards::update_approved(cx, agent.as_str(), &slug, &req.change, approval)
             })
             .await?,
     ))

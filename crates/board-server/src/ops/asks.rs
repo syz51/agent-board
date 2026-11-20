@@ -39,6 +39,18 @@ pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
                 "the server puts the option that applies the change first; offer fewer others",
             ));
         }
+        // Only the server's option may read as the one that applies the change.
+        if let Some(own) = req
+            .options
+            .iter()
+            .find(|o| o.trim_start().to_lowercase().starts_with("apply:"))
+        {
+            return Err(invalid(
+                format!("option {own:?} reads like the option that applies the change"),
+                "the server writes that option itself, as \"Apply: <settings>\"; word yours \
+                 another way",
+            ));
+        }
     }
     Ok(())
 }
