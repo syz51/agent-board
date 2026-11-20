@@ -97,6 +97,27 @@ board install launchd                                   # or systemd: runs `boar
 
 `board install codex` prints the Codex `hooks.json` and `config.toml` entries.
 
+Where another tool manages the settings file (it is tracked in a dotfiles repository, or is
+a link into a git checkout), do not use `--write` there: it changes a tracked file. Run
+`board install claude --check ~/.claude/settings.json` instead. It writes nothing, lists
+each hook the file lacks (`missing:`) or holds twice (`runs more than once:`), and exits 1
+when it lists any. Make the listed changes in the tool that owns the file. Such a file may
+run board through a wrapper script, as `/bin/sh "$HOME/.claude/hooks/board-hook.sh" stop
+claude`. An entry counts for a hook when all of these hold:
+
+- Its command names a program or script whose file name holds `board` as a word of its own
+  (`board-hook.sh`; not `dashboard.sh`, and not a script in a folder `agent-board/`).
+- Its command holds the event as `board hook` takes it (`stop`, `pre-tool-use`), as a word
+  of its own. A wrapper that takes no event argument does not count.
+- It is under the same event, with the same matcher text or a matcher for every value (none,
+  `""` or `*`). Whether another pattern, such as `Bash|Edit`, covers the hook's matcher is
+  not worked out: such an entry does not count, so `--check` lists the hook as missing and
+  `--write` would add a second entry.
+
+`--write` keeps such an entry, adds no second one beside it, and removes a direct
+`board hook` entry that repeats it. `--check` compares events and matchers only, not the
+binary's path or the timeouts. `board install codex` takes `--check` the same way.
+
 On macOS the token goes to the login Keychain. Where the Keychain cannot be used without
 a desktop session (a login over SSH, or a locked Keychain), `board login` stores it in
 `$BOARD_HOME/token` (mode 0600) instead and prints that path; `board` reads it from there.
@@ -136,7 +157,9 @@ lets a launch run in that case and keeps each one in `state/unchecked-launches.j
 entry whose folder T3 has no project for is no such failure: T3 answered, so the entry
 counts as no threads, and `watch.log` names it once. After
 an upgrade that adds a hook, run `board install claude --write ~/.claude/settings.json`
-again so that Claude Code has it. Each run is an agent session of some hundred MiB, and
+again so that Claude Code has it; on a device whose settings file another tool manages, run
+`board install claude --check ~/.claude/settings.json` and add what it lists there
+(section 3, Devices). Each run is an agent session of some hundred MiB, and
 its builds take more, so lower the limit on a device you also work on:
 
 ```toml
