@@ -430,6 +430,11 @@ impl<T: T3> Daemon<T> {
             .await
             .context("listing the board's judges")?;
         self.end_judges(slug, &client, &listed, now).await;
+        // Off autopilot no lease gives the board to one device: the home device whose
+        // verdict judge is at work has its proposals, and the server refuses another's.
+        if !all && listed.iter().any(|j| j.registered_by != *agent) {
+            return self.save();
+        }
         self.state.judge_retry.retain(|_, retry| retry.until > now);
         let at_work = AtWork::of(&listed, &self.state.judges, slug);
         let mut wants = Vec::new();
@@ -621,13 +626,12 @@ impl<T: T3> Daemon<T> {
             let limit = self.run_limit();
             let verdicts = self.home_verdict_runs();
             let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
-            if capped
-                || self.load_unknown().is_some()
-                || self.runs() >= limit
-                || self.turns(judging).another_first(slug, waited)
-            {
-                // The limit that holds it, and that limit's numbers.
-                let (limit, of, cause) = if capped {
+            let full = self.load_unknown().is_some() || self.runs() >= limit;
+            if capped || full || self.turns(judging).another_first(slug, waited) {
+                // The limit that holds it, and that limit's numbers. Off autopilot, a
+                // board that waits its turn while the device has a free run waits for
+                // the boards that this cap held before it.
+                let (limit, of, cause) = if capped || (!all && !full) {
                     let cause = format!(
                         "{verdicts} verdict judges run on the boards that are not on autopilot"
                     );

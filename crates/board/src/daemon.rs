@@ -1513,8 +1513,16 @@ impl<T: T3> Daemon<T> {
             }
         }
         for board in off_autopilot {
-            if let Err(err) = self.judge_proposals(board, now).await {
-                tracing::warn!("the verdict judges of {}: {err:#}", board.slug);
+            // What keeps a board's proposals from their verdicts is written to the
+            // device's trail, once until it is over.
+            let subject = format!("the verdict judges of {}", board.slug);
+            match self.judge_proposals(board, now).await {
+                Ok(()) => self.hold_ended("verdicts", &subject),
+                Err(err) => {
+                    tracing::warn!("{subject}: {err:#}");
+                    let cause = format!("{err:#}");
+                    self.record_hold("verdicts", &board.slug, &subject, 0, &cause, now);
+                }
             }
         }
         let boards = &self.boards;
@@ -1719,12 +1727,21 @@ impl<T: T3> Daemon<T> {
     /// The server gives no lease there, so the dispatch agent registers them without one.
     async fn judge_proposals(&mut self, board: &Board, now: Timestamp) -> Result<()> {
         let agent = self.dispatch_agent();
+        // Before the agent is registered: a device that cannot host the judge's thread
+        // asks the server for nothing.
+        self.host_folder(board)?;
         if !self.dispatch_registered {
             self.register_dispatch(&agent).await?;
             self.dispatch_registered = true;
         }
-        self.judge_and_close(board, &agent, judges::Judging::Verdicts, 0, now)
-            .await
+        let judged = self
+            .judge_and_close(board, &agent, judges::Judging::Verdicts, 0, now)
+            .await;
+        if judged.is_err() {
+            // The server may have lost the agent: registered again on the next try.
+            self.dispatch_registered = false;
+        }
+        judged
     }
 
     /// Runs a home board: holds its coordinator lease as this

@@ -5805,3 +5805,103 @@ async fn the_boards_off_autopilot_share_two_verdict_judges_and_a_held_one_is_rec
     e.daemon.reconcile(at() + minute * 2).await.unwrap();
     assert_eq!(e.stub.requests_to("POST /v1/boards/third/judges").len(), 1);
 }
+
+/// No lease gives a board off autopilot to one device, so the device whose judge is at
+/// work has its proposals.
+#[tokio::test]
+async fn a_board_off_autopilot_that_another_home_device_judges_gets_no_judge_here() {
+    let tasks = [
+        proposal("factory-10", None, 0),
+        proposal("factory-11", None, 1),
+    ];
+    let mut e = off_autopilot_env(&[off_autopilot("factory")], &tasks);
+    let mut theirs = judge(J1, "verdict", &["factory-10"], true);
+    theirs["registered_by"] = json!("dispatch:another-device");
+    e.stub.on("GET /v1/boards/factory/judges", [theirs]);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+
+    e.stub.on("GET /v1/boards/factory/judges", json!([]));
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3).len(), 1);
+}
+
+/// The trail rule: what keeps a board's proposals from their verdicts is written to the
+/// device's trail, once.
+#[tokio::test]
+async fn a_failure_of_the_verdict_judges_of_a_board_off_autopilot_is_recorded_once() {
+    let tasks = [proposal("factory-10", None, 0)];
+    // The server does not answer for the board's judges.
+    let mut e = off_autopilot_env(&[], &tasks);
+    e.stub.on("GET /v1/boards", [off_autopilot("factory")]);
+    let minute = chrono::Duration::minutes(1);
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.reconcile(at() + minute).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:#?}");
+    assert_eq!(
+        (&held[0]["kind"], &held[0]["board"]),
+        (&json!("verdicts"), &json!("factory"))
+    );
+    assert_eq!(held[0]["subject"], "the verdict judges of factory");
+    let cause = held[0]["cause"].as_str().unwrap();
+    assert!(cause.contains("listing the board's judges"), "{cause}");
+    // The dispatch agent is registered again after a failure: the server may have lost it.
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 2);
+
+    e.stub.on("GET /v1/boards/factory/judges", json!([]));
+    e.stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "verdict", &[], true),
+    );
+    e.daemon.reconcile(at() + minute * 2).await.unwrap();
+    assert_eq!(titles(&e.t3), ["verdict factory-10 (no parent)"]);
+}
+
+/// A board whose autopilot is switched off while a review judge runs: that judge's
+/// rights ended with the lease, so its run is dropped and keeps no judge slot.
+#[tokio::test]
+async fn a_review_judge_of_a_board_switched_off_autopilot_keeps_no_slot() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    let parked = task_note(
+        1,
+        &task,
+        WORKER,
+        "note",
+        &format!("note: parked in review, PR {PR}"),
+    );
+    review_detail(&e, &task, vec![parked]);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Pending));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3).len(), 1);
+
+    e.stub.on("GET /v1/boards", [off_autopilot("factory")]);
+    e.stub.on(
+        "GET /v1/tasks",
+        [
+            proposal("factory-10", Some("factory-1"), 0),
+            proposal("factory-11", Some("factory-2"), 1),
+        ],
+    );
+    e.t3.ids
+        .lock()
+        .unwrap()
+        .extend([J1.to_owned(), J2.to_owned()]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    // Both of the board's judge slots go to its proposals.
+    assert_eq!(
+        titles(&e.t3)[1..],
+        [
+            "verdict factory-10 (under factory-1)",
+            "verdict factory-11 (under factory-2)"
+        ]
+    );
+}

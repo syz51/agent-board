@@ -12,7 +12,7 @@ use board_proto::{
 use rusqlite::{Row, named_params, params};
 
 use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ts};
-use crate::error::{Result, forbidden, invalid};
+use crate::error::{Result, forbidden, invalid, refused};
 use crate::store::{agent_by_id_or_handle, find_agent, get_board_uncounted, get_task};
 
 /// The longest a registration lasts.
@@ -63,6 +63,15 @@ static RIGHTS_BOARDS: LazyLock<String> = LazyLock::new(|| {
 /// A registration's columns, then whether its agent is running (or not registered yet).
 const COLUMNS: &str = "j.board, j.agent, j.kind, j.tasks, j.registered_by, j.created_at, \
      j.expires_at, COALESCE((SELECT a.state = 'running' FROM agents a WHERE a.id = j.agent), 1)";
+
+/// Whether a home device other than `:caller`'s judges the board's proposals now: one of
+/// its registrations is live.
+static OTHER_DEVICE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM judges j WHERE j.board = :board \
+                        AND j.registered_by <> :caller AND {LIVE})"
+    )
+});
 
 /// The board's live registrations, oldest first.
 static LIST: LazyLock<String> = LazyLock::new(|| {
@@ -160,9 +169,8 @@ pub(crate) fn register(
     req: RegisterJudge,
 ) -> Result<Judge> {
     let found = get_board_uncounted(cx, board)?;
-    if found.coordinator.as_ref() != Some(caller)
-        && !registers_without_lease(&found, caller, req.kind)
-    {
+    let leased = found.coordinator.as_ref() == Some(caller);
+    if !leased && !registers_without_lease(&found, caller, req.kind) {
         return Err(forbidden(
             format!("{caller} does not hold the coordinator lease of {board}"),
             "only the lease holder registers judges, and on an active board that is not on \
@@ -170,6 +178,24 @@ pub(crate) fn register(
              have a judgment made, add a note on the task (task_note) for the board's \
              coordinator",
         ));
+    }
+    // No lease gives the board's proposals to one home device: the device whose judge is
+    // live has them, so two devices never judge the same proposal.
+    if !leased {
+        let other: bool = cx.db.prepare_cached(&OTHER_DEVICE)?.query_row(
+            named_params! {
+                ":board": board.as_str(),
+                ":caller": caller.as_str(),
+                ":now": cx.now_ms(),
+            },
+            |r| r.get(0),
+        )?;
+        if other {
+            return Err(refused(
+                format!("another home device's verdict judge is at work on {board}"),
+                "start no judge here now; try again once that judge has ended",
+            ));
+        }
     }
     let agent = agent_by_id_or_handle(cx, &req.agent)?;
     if &agent == caller {

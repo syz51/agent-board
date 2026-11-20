@@ -808,8 +808,10 @@ knows two things for it:
     `X-Board-Agent` (400 `invalid` without the header; 403 `forbidden` for any other agent,
     a judge included). One more agent may, for `kind` `verdict` only: `dispatch:<device>`
     on an `active` board that is not on autopilot and lists `<device>` in `home_devices`
-    (403 `forbidden` for another kind, another agent or a paused board). `kind` is `review`, `verdict`, `goal` or `triage`. `tasks` names
-    tasks of this board: repeats are dropped, then at most 20 may remain
+    (403 `forbidden` for another kind, another agent or a paused board; 409 `claim_refused`
+    while a judge that another home device registered there is live, so one device at a
+    time judges the board's proposals). `kind` is `review`, `verdict`, `goal` or `triage`.
+    `tasks` names tasks of this board: repeats are dropped, then at most 20 may remain
     (`JUDGE_TASKS_MAX`; 400 `invalid` for more), and a `review` names at least one (400
     `invalid`). An unknown task is 404, a task of another board 400 `invalid`. `agent` is
     an id or a handle, stored as the id. The agent may not be registered yet, since its
@@ -821,8 +823,8 @@ knows two things for it:
     back), at most 2 hours have passed since it was registered (`JUDGE_HOURS_MAX`;
     `expires_at`), and the agent that registered it still holds the board's coordinator
     lease, or, for a verdict judge registered without the lease, the board is still
-    `active`, not on autopilot, and a home of the registering agent's device. Registering the same agent again before its registration ended or expired
-    replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
+    `active`, not on autopilot, and a home of the registering agent's device. Registering
+    the same agent again before its registration ended or expired replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
     registration starts afresh.
   - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first.
     `running` is true while the judge's agent is `running` or not registered yet: the

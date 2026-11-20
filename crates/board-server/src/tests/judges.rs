@@ -577,3 +577,45 @@ async fn a_home_devices_dispatch_agent_registers_verdict_judges_on_a_board_off_a
     update_board(&t, "other", json!({ "home_devices": ["air"] })).await;
     assert!(!may_hand_over(&t, JUDGE, &id).await);
 }
+
+/// No lease gives a board off autopilot to one device: the device whose judge is live has
+/// its proposals.
+#[tokio::test]
+async fn one_home_device_at_a_time_registers_verdict_judges_on_a_board_off_autopilot() {
+    const AIR: &str = "dispatch:air";
+    let t = dispatched().await;
+    let token = t
+        .state
+        .create_device(&"air".parse().unwrap(), false)
+        .unwrap();
+    let bearer = format!("Bearer {token}");
+    let as_air = [("authorization", bearer.as_str()), ("x-board-agent", AIR)];
+    let agent = json!({ "id": AIR, "runtime": "claude", "device": "air" });
+    let (s, v) = t.send("POST", "/v1/agents", &as_air, Some(agent)).await;
+    assert_eq!(s, 200, "{v}");
+    let id = parked(&t, "other").await;
+    update_board(&t, "other", json!({ "home_devices": ["air", "mac"] })).await;
+    let by_mac = json!({ "agent": JUDGE, "kind": "verdict", "tasks": [id] });
+    let by_air = json!({ "agent": WORKER, "kind": "verdict", "tasks": [id] });
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, by_mac.clone()).await;
+    assert_eq!(s, 200, "{v}");
+
+    let judges = "/v1/boards/other/judges";
+    let (s, v) = t.send("POST", judges, &as_air, Some(by_air.clone())).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    let listed = t.ok("GET", judges, None, None).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    // The device that has the board registers a further judge.
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, by_mac).await;
+    assert_eq!(s, 200, "{v}");
+
+    // Once that device's judge is over, the other device may.
+    t.advance(TimeDelta::hours(2) + TimeDelta::seconds(1));
+    let (s, v) = t.send("POST", judges, &as_air, Some(by_air)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["registered_by"], AIR);
+}

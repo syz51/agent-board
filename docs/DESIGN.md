@@ -1085,10 +1085,17 @@ got no verdict, were never claimed, and agents filed the same finding again.
   judge without the lease (`API.md`, "Daemon dispatch"). The judge has the coordinator's
   rights on that board while the board stays active, off autopilot and a home of that
   device.
+- **One device per board**: no lease gives the board to one home device. The device
+  whose verdict judge is at work has the board's proposals: the server refuses another
+  home device's registration with 409 `claim_refused` until that judge is over, and a daemon
+  that sees another device's judge listed starts none.
+- **Failures**: a failure that keeps a board's proposals from their verdicts (no project
+  folder on the device, the server refuses) is written once to
+  `state/device-holds.jsonl` with kind `verdicts` and the error as `cause`.
 - **Limits**: the board's usage stop and the weekly pace hold a new verdict judge, as on
   an autopilot board. At most 2 judges run per board, and they count in the device
-  limit. At most 2 verdict judges run at once on all the boards off autopilot together
-  (`HOME_VERDICTS_AT_ONCE`), because such a board can hold hundreds of proposals that
+  limit. Each device runs at most 2 verdict judges at once on all the boards off
+  autopilot together (`HOME_VERDICTS_AT_ONCE`), because such a board can hold hundreds of proposals that
   waited. These boards are served after the dispatched ones in each reconcile and wait
   in a queue of their own, so their backlog never holds a dispatched board's judge. A
   judge that this limit holds is written to `state/device-holds.jsonl` like one the
