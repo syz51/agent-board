@@ -1877,7 +1877,7 @@ impl<T: T3> Daemon<T> {
         {
             return Ok(());
         }
-        if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress).await? {
+        if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress, now).await? {
             return Ok(());
         }
         for task in self.next_tasks(slug, now).await? {
@@ -1938,11 +1938,15 @@ impl<T: T3> Daemon<T> {
 
     /// Whether a further worker may start on `slug` beside the tasks in progress: each of
     /// them could be read, and no agent of the board stopped on a usage limit since the
-    /// first of them started.
+    /// first of them started that still holds at `now`. A stop no longer holds once the
+    /// agent runs again or its reset has passed, or when a fresh usage reading taken after
+    /// it shows no full window of the account: then the limit was not the account's, such
+    /// as one model's limit, and does not stop the workers.
     async fn may_start_beside(
         &self,
         slug: &BoardSlug,
         in_progress: &BTreeMap<TaskId, InProgress>,
+        now: Timestamp,
     ) -> Result<bool> {
         if in_progress.values().any(|p| p.task.is_none()) {
             return Ok(false);
@@ -1950,16 +1954,32 @@ impl<T: T3> Daemon<T> {
         let Some(first) = in_progress.values().map(|p| p.since).min() else {
             return Ok(true);
         };
+        let account_not_full_since = self
+            .usage
+            .as_ref()
+            // A window at 100 percent without a reset time counts as full, and a reading
+            // without windows says nothing.
+            .filter(|u| u.fresh(now) && u.windows().next().is_some() && u.over(100, now).is_none())
+            .map(|u| u.read_at);
         for (agent, at) in &self.state.usage_stops {
-            if *at < first {
+            if *at < first || account_not_full_since.is_some_and(|read| read > *at) {
                 continue;
             }
-            let member = match self.client().agent_info(agent).await {
-                Ok(info) => info.boards.contains(slug),
+            let holds = match self.client().agent_info(agent).await {
+                // The server keeps an ended agent's `paused_until` only while its reset is
+                // ahead; a paused agent without one waits for a reset nobody knows.
+                Ok(info) => {
+                    info.boards.contains(slug)
+                        && match info.state {
+                            AgentState::Paused => info.paused_until.is_none_or(|until| until > now),
+                            AgentState::Ended => info.paused_until.is_some_and(|until| until > now),
+                            AgentState::Running | AgentState::Idle => false,
+                        }
+                }
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
                 Err(err) => return Err(err.context("reading an agent that stopped on usage")),
             };
-            if member {
+            if holds {
                 tracing::info!(
                     "{agent} stopped on a usage limit at {at}, after the tasks in progress on {slug} started; no further worker starts beside them"
                 );
