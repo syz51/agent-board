@@ -1428,9 +1428,23 @@ fn update_says_when_nothing_changed_and_when_the_task_is_closed() {
     assert!(
         text.contains(
             "factory-7 is dropped, so auto, not_before, rank and blockers do not start it"
-        ) && text.contains("board update factory-7 --status open"),
+        ) && text
+            .contains("task_update factory-7 status=open (board update factory-7 --status open)"),
         "{text}"
     );
+    // A drop reason sent late is kept as a note though no field changes.
+    let out = e.run(&[
+        "update",
+        "factory-7",
+        "--status",
+        "dropped",
+        "--reason",
+        "superseded",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("updated factory-7 dropped"), "{text}");
+    assert!(!text.contains("--status open"), "{text}");
 
     // A real change on an open task reads as one, with no closed-task hint.
     let open = task_fixture("factory-8", "Later");
