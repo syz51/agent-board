@@ -3519,6 +3519,76 @@ async fn after_a_usage_limit_stop_since_the_tasks_in_progress_started_no_further
 }
 
 #[tokio::test]
+async fn a_usage_limit_stop_ends_at_its_reset_when_the_agent_runs_or_the_account_is_not_full() {
+    use board_proto::Priority::P1;
+    let member = "t3:member";
+    let reset = at() + chrono::Duration::hours(2);
+    // A board with a task in progress since before the stop, an agent of it paused on a
+    // limit as `info` says, and the usage as `reading` says, if any.
+    let env = |info: board_proto::Agent, reading: Option<serde_json::Value>| async move {
+        let mut e = slots_env(2, &[ready_task("factory-4", P1, 0)]);
+        e.stub.on(
+            "GET /v1/tasks",
+            [
+                doing_task("factory-9", "t3:other", &[]),
+                ready_task("factory-4", P1, 0),
+            ],
+        );
+        e.stub.on(&format!("GET {}", agent_path(member)), &info);
+        if let Some(reading) = reading {
+            e.stub.on("GET /v1/usage", reading);
+        }
+        let stop = state_changed(40, member, AgentState::Paused, Some(reset));
+        e.daemon.on_event(&stop, at()).await.unwrap();
+        e
+    };
+    let mut paused = agent_fixture(member, DEVICE, AgentState::Paused);
+    paused.boards = vec![factory()];
+    paused.paused_until = Some(reset);
+
+    // Before its reset, with no reading after it, the stop holds.
+    let mut e = env(paused.clone(), None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+    // After its reset it no longer does.
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // An agent whose session ended on the limit holds until the reset too.
+    let mut ended = paused.clone();
+    ended.state = AgentState::Ended;
+    let mut e = env(ended, None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // An agent that runs again holds nothing.
+    let mut running = paused.clone();
+    running.state = AgentState::Running;
+    let mut e = env(running, None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A reading after the stop with no full window: the limit was not the account's, such
+    // as one model's, and the workers start.
+    let read = at() + chrono::Duration::minutes(1);
+    let mut e = env(paused.clone(), Some(usage_reading(50.0, read))).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A full window in that reading keeps the stop.
+    let mut e = env(paused.clone(), Some(usage_reading(100.0, read))).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // So does a reading from before the stop.
+    let before = at() - chrono::Duration::minutes(1);
+    let mut e = env(paused, Some(usage_reading(50.0, before))).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
 async fn a_task_left_open_on_a_lease_overlap_waits_until_a_task_in_progress_ends() {
     use board_proto::Priority::P1;
     let tasks = [
