@@ -1957,17 +1957,24 @@ impl<T: T3> Daemon<T> {
         let account_not_full_since = self
             .usage
             .as_ref()
-            .filter(|u| u.fresh(now) && u.full_until(now).is_none())
+            // A window at 100 percent without a reset time counts as full, and a reading
+            // without windows says nothing.
+            .filter(|u| u.fresh(now) && u.windows().next().is_some() && u.over(100, now).is_none())
             .map(|u| u.read_at);
         for (agent, at) in &self.state.usage_stops {
             if *at < first || account_not_full_since.is_some_and(|read| read > *at) {
                 continue;
             }
             let holds = match self.client().agent_info(agent).await {
+                // The server keeps an ended agent's `paused_until` only while its reset is
+                // ahead; a paused agent without one waits for a reset nobody knows.
                 Ok(info) => {
                     info.boards.contains(slug)
-                        && matches!(info.state, AgentState::Paused | AgentState::Ended)
-                        && info.paused_until.is_none_or(|until| until > now)
+                        && match info.state {
+                            AgentState::Paused => info.paused_until.is_none_or(|until| until > now),
+                            AgentState::Ended => info.paused_until.is_some_and(|until| until > now),
+                            AgentState::Running | AgentState::Idle => false,
+                        }
                 }
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
                 Err(err) => return Err(err.context("reading an agent that stopped on usage")),

@@ -932,9 +932,9 @@ first (see "Order inside a priority level"). With more slots, code checks only t
 Built: a task waits on another when either lists the other among its blockers. A task in
 progress started when its worker started, or, for one no worker here follows, at its last
 update. A usage-limit stop is an agent's move to `paused`. It holds while the agent stays
-paused or ended and its `paused_until` reset, if any, is still to come. A fresh usage
-reading taken after the stop that shows no window of the account at 100 percent ends it
-too: the limit was not the account's (one model's limit, for example), so the workers can
+paused and its `paused_until` reset, if any, is still to come, or has ended with that reset
+still to come. A fresh usage reading taken after the stop, with a window, that shows no
+window of the account at 100 percent ends it too: the limit was not the account's (one model's limit, for example), so the workers can
 still run. While a task in progress cannot be read, nothing starts beside it.
 
 **Gone asker and away owner** (built): an asker cannot be woken when it is no T3 thread

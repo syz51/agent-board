@@ -3558,9 +3558,15 @@ async fn a_usage_limit_stop_ends_at_its_reset_when_the_agent_runs_or_the_account
     // An agent whose session ended on the limit holds until the reset too.
     let mut ended = paused.clone();
     ended.state = AgentState::Ended;
-    let mut e = env(ended, None).await;
+    let mut e = env(ended.clone(), None).await;
     e.daemon.reconcile(at()).await.unwrap();
     assert!(worker_starts(&e.t3).is_empty());
+    // Ended after its reset, or after it ran again, the server keeps no `paused_until`:
+    // the stop is over.
+    ended.paused_until = None;
+    let mut e = env(ended, None).await;
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
 
     // An agent that runs again holds nothing.
     let mut running = paused.clone();
@@ -3578,6 +3584,12 @@ async fn a_usage_limit_stop_ends_at_its_reset_when_the_agent_runs_or_the_account
 
     // A full window in that reading keeps the stop.
     let mut e = env(paused.clone(), Some(usage_reading(100.0, read))).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // So does a reading without windows, which says nothing.
+    let empty = json!({ "read_at": read, "device": DEVICE });
+    let mut e = env(paused.clone(), Some(empty)).await;
     e.daemon.reconcile(read).await.unwrap();
     assert!(worker_starts(&e.t3).is_empty());
 
