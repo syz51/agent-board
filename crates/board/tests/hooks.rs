@@ -2253,6 +2253,10 @@ fn change_task(
         handles: Default::default(),
     };
     e.stub.on(&format!("GET /v1/tasks/{id}"), &detail);
+    // The server raises the version of a task it changes.
+    let mut after = after.clone();
+    after.version = before.version + 1;
+    let after = &after;
     e.stub.on(&format!("PATCH /v1/tasks/{id}"), after);
     e.stub.on(&format!("POST /v1/tasks/{id}/release"), after);
     e.stub.on(&format!("POST /v1/tasks/{id}/claim"), after);

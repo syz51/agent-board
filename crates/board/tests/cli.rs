@@ -1401,6 +1401,77 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
     );
 }
 
+/// A request the server answers with the task unchanged says so, and setting what only an
+/// open task uses on a dropped one says how to reopen it.
+#[test]
+fn update_says_when_nothing_changed_and_when_the_task_is_closed() {
+    let e = env();
+    let detail = |task: &board_proto::Task| TaskDetail {
+        task: task.clone(),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    let mut dropped = task_fixture("factory-7", "Evaluate the lessons");
+    dropped.status = board_proto::TaskStatus::Dropped;
+    dropped.auto = true;
+    e.stub.on("GET /v1/tasks/factory-7", detail(&dropped));
+    e.stub.on("PATCH /v1/tasks/factory-7", &dropped);
+    let out = e.run(&["update", "factory-7", "--auto", "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("no change to factory-7 dropped"), "{text}");
+    assert!(
+        text.contains(
+            "factory-7 is dropped, so auto, not_before, rank and blockers do not start it"
+        ) && text
+            .contains("task_update factory-7 status=open (board update factory-7 --status open)"),
+        "{text}"
+    );
+    // A drop reason sent late is kept as a note though no field changes.
+    let out = e.run(&[
+        "update",
+        "factory-7",
+        "--status",
+        "dropped",
+        "--reason",
+        "superseded",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("updated factory-7 dropped"), "{text}");
+    assert!(!text.contains("--status open"), "{text}");
+
+    // A real change on an open task reads as one, with no closed-task hint.
+    let open = task_fixture("factory-8", "Later");
+    let mut later = open.clone();
+    later.not_before = Some("2099-01-01T00:00:00Z".parse().unwrap());
+    later.version += 1;
+    e.stub.on("GET /v1/tasks/factory-8", detail(&open));
+    e.stub.on("PATCH /v1/tasks/factory-8", &later);
+    let out = e.run(&["update", "factory-8", "--not-before", "2099-01-01"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("updated factory-8"), "{text}");
+    assert!(!text.contains("--status open"), "{text}");
+
+    // A rank alone keeps the version, and is still a change.
+    let mut ranked = open.clone();
+    ranked.rank = Some(2);
+    e.stub.on("PATCH /v1/tasks/factory-8", &ranked);
+    let out = e.run(&["update", "factory-8", "--rank", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("updated factory-8"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn update_owner_hands_the_task_over_and_catches_an_old_server() {
     let e = env();
