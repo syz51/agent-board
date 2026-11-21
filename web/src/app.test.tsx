@@ -83,4 +83,16 @@ describe("board links", () => {
       .map((link) => link.getAttribute("href"));
     expect(current).toEqual([`/boards/${slug}`]);
   });
+
+  // An auto grid column grows to a nowrap title's full width and widens the sidebar.
+  test("a long title truncates inside a column that cannot grow", async () => {
+    const title = "A board title far longer than the sidebar is wide";
+    await renderInApp(<BoardLinks />, {
+      seed: (client) =>
+        client.setQueryData(queries.boards().queryKey, [{ ...state.board("web-view"), title }]),
+    });
+    const label = screen.getByText(title);
+    expect(label.className).toMatch(/(^| )truncate( |$)/);
+    expect(label.closest("ul")?.className).toMatch(/(^| )grid-cols-\[minmax\(0,1fr\)\]( |$)/);
+  });
 });
