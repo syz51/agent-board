@@ -52,11 +52,16 @@ const NOTE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Whether the tool call of `input` starts a T3 thread.
 pub(super) fn is_launch(input: &Value) -> bool {
-    input["tool_name"]
-        .as_str()
-        .and_then(|tool| tool.strip_prefix("mcp__"))
-        .and_then(|tool| tool.rsplit_once("__"))
-        .is_some_and(|(_, name)| LAUNCH_TOOLS.contains(&name))
+    let Some(tool) = input["tool_name"].as_str() else {
+        return false;
+    };
+    if let Some((_, name)) = tool.strip_prefix("mcp__").and_then(|t| t.rsplit_once("__")) {
+        return LAUNCH_TOOLS.contains(&name);
+    }
+    if let Some(rest) = tool.strip_prefix("mcp_t3-code_") {
+        return LAUNCH_TOOLS.contains(&rest);
+    }
+    false
 }
 
 /// The T3 environment a call or one thread of its list names, when it names one.

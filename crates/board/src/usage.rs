@@ -34,6 +34,10 @@ const T3_CACHES: &str = ".t3/caches";
 const T3_CLAUDE_INSTANCE: &str = "claudeAgent";
 /// The driver of T3 Code's Claude instances.
 const T3_CLAUDE_DRIVER: &str = "claudeAgent";
+/// T3 Code's default Antigravity instance.
+const T3_ANTIGRAVITY_INSTANCE: &str = "antigravity";
+/// The driver of T3 Code's Antigravity instances.
+const T3_ANTIGRAVITY_DRIVER: &str = "antigravity";
 /// A snapshot dated further ahead of this device's clock than this is not believed.
 const SNAPSHOT_SKEW: TimeDelta = TimeDelta::minutes(1);
 /// A window whose reset time moved later by more than this is a new window.
@@ -66,6 +70,10 @@ pub enum UsageSource {
     ClaudeCode {
         url: String,
         credentials: Credentials,
+        snapshots: Vec<PathBuf>,
+    },
+    /// Reads T3 Code's Antigravity usage cache files (`~/.t3/caches/<instance>.json`).
+    Antigravity {
         snapshots: Vec<PathBuf>,
     },
 }
@@ -109,6 +117,31 @@ impl UsageSource {
                         .collect()
                 })
                 .unwrap_or_default(),
+        }
+    }
+
+    /// T3 Code's Antigravity usage cache files (`~/.t3/caches/<instance>.json`).
+    pub fn antigravity(thread_instance: Option<&str>) -> Self {
+        let Some(home) = dirs::home_dir() else {
+            return Self::Server;
+        };
+        let caches = home.join(T3_CACHES);
+        let mut instances = vec![T3_ANTIGRAVITY_INSTANCE];
+        instances.extend(thread_instance.filter(|i| *i != T3_ANTIGRAVITY_INSTANCE));
+        Self::Antigravity {
+            snapshots: instances
+                .into_iter()
+                .map(|instance| caches.join(format!("{instance}.json")))
+                .collect(),
+        }
+    }
+
+    /// Chooses the usage source for `thread_instance` (from `[thread_model]`).
+    pub fn for_provider(thread_instance: Option<&str>) -> Self {
+        if thread_instance.is_some_and(|p| p.to_ascii_lowercase().starts_with("antigravity")) {
+            Self::antigravity(thread_instance)
+        } else {
+            Self::claude_code(thread_instance)
         }
     }
 }
@@ -274,16 +307,18 @@ async fn read_snapshot(path: &Path, now: Timestamp) -> Option<(ReportUsage, Opti
 
 fn snapshot_file(text: &str, now: Timestamp) -> Option<(ReportUsage, Option<String>)> {
     let file: Value = serde_json::from_str(text).ok()?;
-    if file
-        .get("driver")
-        .and_then(Value::as_str)
-        .is_some_and(|driver| driver != T3_CLAUDE_DRIVER)
-    {
+    let driver = file.get("driver").and_then(Value::as_str);
+    let is_antigravity = driver == Some(T3_ANTIGRAVITY_DRIVER);
+    if driver.is_some_and(|d| d != T3_CLAUDE_DRIVER && d != T3_ANTIGRAVITY_DRIVER) {
         return None;
     }
     let workspace = file
         .pointer("/auth/workspaceId")
         .and_then(Value::as_str)
+        .or_else(|| {
+            file.pointer("/usageLimits/credentialFingerprint")
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned);
     let limits = file.get("usageLimits")?;
     // A failed probe keeps older windows or none.
@@ -308,10 +343,18 @@ fn snapshot_file(text: &str, now: Timestamp) -> Option<(ReportUsage, Option<Stri
                 .and_then(|at| at.parse().ok()),
         })
     };
-    let report = ReportUsage {
-        five_hour: window("five_hour"),
-        seven_day: window("seven_day"),
-        read_at,
+    let report = if is_antigravity {
+        ReportUsage {
+            five_hour: window("gemini-5h"),
+            seven_day: window("gemini-weekly"),
+            read_at,
+        }
+    } else {
+        ReportUsage {
+            five_hour: window("five_hour"),
+            seven_day: window("seven_day"),
+            read_at,
+        }
     };
     (report.five_hour.is_some() || report.seven_day.is_some()).then_some((report, workspace))
 }
@@ -351,10 +394,12 @@ mod tests {
     #[test]
     fn the_thread_instance_s_file_is_read_next_to_the_default_one() {
         let names = |source: UsageSource| match source {
-            UsageSource::ClaudeCode { snapshots, .. } => snapshots
-                .iter()
-                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
+            UsageSource::ClaudeCode { snapshots, .. } | UsageSource::Antigravity { snapshots } => {
+                snapshots
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            }
             UsageSource::Server => Vec::new(),
         };
         assert_eq!(names(UsageSource::claude_code(None)), ["claudeAgent.json"]);
@@ -563,5 +608,28 @@ mod tests {
             ..known.clone()
         };
         assert!(follows(&old, &unknown));
+    }
+
+    #[test]
+    fn antigravity_snapshot_reads_gemini_windows_and_ignores_3p() {
+        let now: Timestamp = "2026-11-23T10:30:00Z".parse().unwrap();
+        let text = r#"{
+            "driver": "antigravity",
+            "instanceId": "antigravity",
+            "usageLimits": {
+                "checkedAt": "2026-11-23T10:26:44Z",
+                "credentialFingerprint": "fp-abc",
+                "windows": [
+                    {"id": "3p-5h", "kind": "session", "usedPercent": 99.0},
+                    {"id": "gemini-5h", "kind": "session", "usedPercent": 12.5, "resetsAt": "2026-11-23T14:51:17Z"},
+                    {"id": "3p-weekly", "kind": "weekly", "usedPercent": 88.0},
+                    {"id": "gemini-weekly", "kind": "weekly", "usedPercent": 3.25, "resetsAt": "2026-11-30T09:51:17Z"}
+                ]
+            }
+        }"#;
+        let (report, ws) = snapshot_file(text, now).expect("valid antigravity snapshot");
+        assert_eq!(ws.as_deref(), Some("fp-abc"));
+        assert_eq!(report.five_hour.unwrap().percent, 12.5);
+        assert_eq!(report.seven_day.unwrap().percent, 3.25);
     }
 }

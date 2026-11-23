@@ -457,10 +457,17 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     let provider = thread["providerInstanceId"].as_str().unwrap_or_default();
     ThreadInfo {
         archived: thread["archived"].as_bool().unwrap_or(false),
-        runtime: if provider.to_ascii_lowercase().contains("codex") {
-            Runtime::Codex
-        } else {
-            Runtime::Claude
+        runtime: {
+            let p = provider.to_ascii_lowercase();
+            if p.contains("codex") {
+                Runtime::Codex
+            } else if p.contains("antigravity") {
+                Runtime::Antigravity
+            } else if p.contains("opencode") {
+                Runtime::Opencode
+            } else {
+                Runtime::Claude
+            }
         },
         worktree: thread["worktreePath"]
             .as_str()

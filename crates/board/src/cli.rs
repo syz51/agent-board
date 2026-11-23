@@ -597,6 +597,8 @@ pub enum RuntimeArg {
     Codex,
     /// The opencode board plugin, which sends and reads Claude Code's hook JSON.
     Opencode,
+    /// Google Antigravity (Gemini 4 Neon) via T3 Code or standalone CLI.
+    Antigravity,
 }
 
 impl From<RuntimeArg> for board_proto::Runtime {
@@ -605,6 +607,7 @@ impl From<RuntimeArg> for board_proto::Runtime {
             RuntimeArg::Claude => Self::Claude,
             RuntimeArg::Codex => Self::Codex,
             RuntimeArg::Opencode => Self::Opencode,
+            RuntimeArg::Antigravity => Self::Antigravity,
         }
     }
 }
