@@ -30,6 +30,9 @@ pub const MIN_RUNS: usize = 2;
 /// The limit of a device whose memory could not be read.
 pub const FALLBACK_RUNS: usize = 4;
 
+/// Device turns the daemon leaves free by default for threads it did not start.
+pub const DEFAULT_RESERVE: usize = 1;
+
 /// How many of the other threads' ids a record of a hold names; the rest are counted.
 pub const THREADS_SHOWN: usize = 6;
 
@@ -43,9 +46,30 @@ pub fn default_run_limit(host_memory: Option<u64>) -> usize {
     })
 }
 
-/// How many of `limit` runs workers may take: all but the judges' slot.
+/// Device turns the daemon leaves free for launches from threads it did not start:
+/// `reserve_runs` (or alias `reserve`) of `config`, else [`DEFAULT_RESERVE`].
+pub fn reserve(config: &Config) -> usize {
+    config.reserve_runs.map_or(DEFAULT_RESERVE, |n| n as usize)
+}
+
+/// How many of `limit` device runs the daemon may take, leaving `reserve` turns free for
+/// threads it did not start. An unlimited device (`usize::MAX`) stays unlimited.
+pub fn daemon_limit(limit: usize, reserve: usize) -> usize {
+    if limit == usize::MAX {
+        usize::MAX
+    } else {
+        limit.saturating_sub(reserve)
+    }
+}
+
+/// How many of `limit` daemon runs workers may take: all but the judges' slot, or 0 when
+/// the daemon has no runs to start.
 pub fn worker_limit(limit: usize) -> usize {
-    limit.saturating_sub(1).max(1)
+    if limit == 0 {
+        0
+    } else {
+        limit.saturating_sub(1).max(1)
+    }
 }
 
 /// The memory of this host in bytes, when it can be read.
@@ -234,6 +258,25 @@ mod tests {
         assert_eq!(worker_limit(4), 3);
         assert_eq!(worker_limit(2), 1);
         assert_eq!(worker_limit(1), 1);
+        assert_eq!(worker_limit(0), 0);
+    }
+
+    #[test]
+    fn reserve_defaults_to_one_and_lowers_only_bounded_daemon_limits() {
+        let mut config = Config::default();
+        assert_eq!(reserve(&config), DEFAULT_RESERVE);
+        assert_eq!(daemon_limit(4, reserve(&config)), 3);
+        assert_eq!(daemon_limit(2, reserve(&config)), 1);
+        assert_eq!(daemon_limit(1, reserve(&config)), 0);
+        assert_eq!(daemon_limit(usize::MAX, reserve(&config)), usize::MAX);
+
+        config.reserve_runs = Some(0);
+        assert_eq!(reserve(&config), 0);
+        assert_eq!(daemon_limit(4, reserve(&config)), 4);
+
+        let parsed: Config = toml::from_str("reserve = 2\n").unwrap();
+        assert_eq!(parsed.reserve_runs, Some(2));
+        assert_eq!(daemon_limit(4, reserve(&parsed)), 2);
     }
 
     #[test]

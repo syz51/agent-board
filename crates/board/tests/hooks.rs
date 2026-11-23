@@ -3827,6 +3827,40 @@ fn a_launch_runs_while_the_device_has_a_free_slot() {
     assert_eq!(refused_launches(&e)[0]["asked"], 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn an_owner_thread_launch_is_allowed_while_the_daemon_is_at_its_reserved_limit() {
+    let e = env();
+    // 4-turn device with default reserve_runs = 1: the daemon caps itself at 3 runs, leaving
+    // the 4th turn free for a delegate_task or t3_thread_launch from an owner thread.
+    let daemon_limit = board::daemon::device::daemon_limit(
+        4,
+        board::daemon::device::reserve(&board::config::Config::default()),
+    );
+    assert_eq!(daemon_limit, 3);
+    device_with_turns(&e, 4, &["daemon-1", "daemon-2", "daemon-3"]);
+    for (runtime, tool, input) in [
+        (
+            "claude",
+            "mcp__t3-code__delegate_task",
+            json!({"task": "x"}),
+        ),
+        (
+            "antigravity",
+            "mcp_t3-code_t3_thread_launch",
+            json!({"title": "Owner child", "message": "Do it."}),
+        ),
+    ] {
+        let (reply, text) = e.hook("pre-tool-use", runtime, launch(&e, tool, input));
+        if runtime == "antigravity" {
+            assert_eq!(reply, Some(json!({"decision": "allow"})), "{}", e.ran());
+        } else {
+            assert_eq!((reply, text.as_str()), (None, ""), "{}", e.ran());
+        }
+    }
+    assert!(refused_launches(&e).is_empty(), "{}", e.ran());
+}
+
 /// A configured folder that T3 has no project for has no T3 thread: T3 answered, so the
 /// count is whole, and a launch under the limit runs as a counted one, with no record of
 /// an unchecked launch.

@@ -5361,23 +5361,24 @@ async fn the_device_limit_counts_the_runs_of_every_board_and_keeps_a_slot_for_ju
         ready_task("factory-5", P1, 1),
         ready_task("factory-6", P1, 2),
     ];
-    // Three runs at once: two of them may be workers, and the other board's judge is one.
+    // Four runs at once (default reserve 1 -> daemon limit 3): two may be workers, and the
+    // other board's judge is one.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(3);
+    e.daemon = e.daemon.with_default_run_limit(4);
     other_board_with_a_judge(&mut e, 3);
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3).len(), 2);
 
-    // Two runs at once: the judge has one, and a worker takes the other.
+    // Three runs at once (daemon limit 2): the judge has one, and a worker takes the other.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
 
     // A paused board's judge still runs, so it keeps its slot.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     let mut paused = daemon_board(Some(DISPATCH));
     paused.slug = "other".parse().unwrap();
@@ -5416,7 +5417,11 @@ async fn runs_at_once_in_the_configuration_replaces_the_default_device_limit() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(titles(&e.t3).len(), 3, "four runs leave three to workers");
+    assert_eq!(
+        titles(&e.t3).len(),
+        2,
+        "four runs with default reserve 1 leave daemon limit 3 (two workers, one judge)"
+    );
 }
 
 fn running_lists(t3: &FakeT3) -> usize {
@@ -5441,10 +5446,11 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
         ready_task("factory-5", P1, 1),
         ready_task("factory-6", P1, 2),
     ];
-    // Two threads the dispatcher did not start run on the device: one of its three runs
-    // is left, so one worker starts and the next task is held, with a note that says why.
+    // Two threads the dispatcher did not start run on the device: on a four-run device
+    // (default reserve 1 -> daemon limit 3), one slot is left so one worker starts and the
+    // next task is held, with a note that says why.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(3);
+    e.daemon = e.daemon.with_default_run_limit(4);
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "agent-child-2".to_owned()];
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
@@ -5456,7 +5462,7 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     let text = notes[0].body["text"].as_str().unwrap();
     for part in [
         "The device limit holds this task",
-        "has 3 of 3 runs: 1 of the dispatcher, 2 turns of other threads",
+        "has 3 of 4 runs (daemon limit 3, 1 reserved): 1 of the dispatcher, 2 turns of other threads",
         "agent-child-2, user-1",
     ] {
         assert!(text.contains(part), "{part}: {text}");
@@ -5471,11 +5477,14 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     assert_eq!(held[0]["others"], json!(["agent-child-2", "user-1"]));
     assert!(held[0]["at"].is_string(), "{held:?}");
     let cause = held[0]["cause"].as_str().unwrap();
-    assert!(cause.contains("has 3 of 3 runs"), "{cause}");
+    assert!(
+        cause.contains("has 3 of 4 runs (daemon limit 3, 1 reserved)"),
+        "{cause}"
+    );
 
     // The dispatcher's own run is among the running threads and counts once.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     *e.t3.running.lock().unwrap() = vec![J2.to_owned()];
     e.daemon.reconcile(at()).await.unwrap();
@@ -5654,7 +5663,7 @@ async fn a_judge_waits_while_other_threads_fill_the_device() {
     let tasks = [review_task("factory-4", 0)];
     let mut e = judges_env(&tasks);
     review_detail(&e, &tasks[0], vec![]);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(5))
@@ -5677,7 +5686,7 @@ async fn a_judge_waits_while_other_threads_fill_the_device() {
             .is_empty()
     );
 
-    // One of them ends: the judge starts.
+    // One of them ends: the judge starts (leaving 1 reserved slot on the 3-run device).
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(6))
@@ -5697,13 +5706,86 @@ async fn a_judge_waits_while_the_device_is_at_its_limit() {
         .lock()
         .unwrap()
         .extend([J1.to_owned(), J2.to_owned()]);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 1);
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(5))
         .await
         .unwrap();
     assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
+}
+
+#[tokio::test]
+async fn the_daemon_holds_workers_and_judges_for_the_reserved_turn_and_records_each_hold() {
+    use board_proto::Priority::P1;
+    // On a 4-run device with default reserve 1 (daemon limit 3), two workers and one judge
+    // can run, but a third worker or a second judge is held for the reserved turn.
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(4);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-4 Task factory-4", "factory-5 Task factory-5"]
+    );
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "worker");
+    assert_eq!(held[0]["subject"], "factory-6");
+    assert_eq!(held[0]["limit"], 2);
+    assert!(
+        held[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("has 2 of 4 runs (daemon limit 3, 1 reserved)"),
+        "{held:?}"
+    );
+
+    // Judges also yield to the reserved turn: on a 2-run device (daemon limit 1) with one
+    // judge already running, a second judge is held with a trail record.
+    let review_tasks = [review_task("factory-4", 0)];
+    let mut je = judges_env(&review_tasks);
+    review_detail(&je, &review_tasks[0], vec![]);
+    je.daemon = je.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut je, 1);
+    je.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(titles(&je.t3).is_empty());
+    let jheld = holds(&home_of(&je));
+    assert_eq!(jheld.len(), 1, "{jheld:?}");
+    assert_eq!(jheld[0]["kind"], "judge");
+    assert_eq!(jheld[0]["limit"], 1);
+    assert!(
+        jheld[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("has 1 of 2 runs (daemon limit 1, 1 reserved)"),
+        "{jheld:?}"
+    );
+
+    // Hot-reloading config.toml with reserve_runs = 0 lifts the reserve without a restart.
+    let config = Config {
+        server: Some(je.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        runs_at_once: std::num::NonZeroU32::new(2),
+        reserve_runs: Some(0),
+        ..Config::default()
+    };
+    let path = je._dir.path().join("home").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    je.daemon
+        .reconcile(at() + chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    assert_eq!(titles(&je.t3), ["review factory-4 Task factory-4"]);
 }
 
 #[tokio::test]

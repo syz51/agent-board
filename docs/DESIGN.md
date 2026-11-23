@@ -955,9 +955,13 @@ would add up without end. Each run is an agent session of some hundred MiB of me
 its builds take more. So the device has one limit on the runs it has at once, workers and
 judges together, across its daemon-dispatch boards: `runs_at_once` in `config.toml`, or
 without it one run per 4 GiB of host memory and at least 2 (4 when the memory cannot be
-read; the memory is rounded to the nearest 4 GiB). Workers take all but one slot of the
-limit, which is left to judges, since a judge ends work already in progress; with a limit
-of 1 a worker may take it. A board that was refused a slot gets the next free one before a
+read; the memory is rounded to the nearest 4 GiB). By default the daemon keeps
+`reserve_runs` (alias `reserve`, default 1) of those turns free for threads it did not
+start (such as an owner's thread calling `delegate_task` or `t3_thread_launch`), so the
+daemon's own ceiling is `runs_at_once.saturating_sub(reserve_runs)` (set `reserve_runs = 0`
+to disable the reserve). Workers take all but one slot of the daemon's ceiling, which is
+left to judges, since a judge ends work already in progress; with a daemon ceiling of 1 a
+worker may take it (and 0 starts none). A board that was refused a slot gets the next free one before a
 board that asked later, workers and judges each in their own queue. A board that gets a
 slot goes to the end of the queue, and one that did not ask again in the last reconcile
 loses its place. The runs of a paused board count while they last. A run recorded for a
