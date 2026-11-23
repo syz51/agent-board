@@ -24,17 +24,20 @@ const JUDGE_MS: i64 = JUDGE_HOURS_MAX * 3_600_000;
 pub(crate) const LIVE: &str = "j.ended_at IS NULL AND j.expires_at > :now \
      AND EXISTS (SELECT 1 FROM boards jb WHERE jb.slug = j.board \
                  AND ((jb.coordinator = j.registered_by AND jb.coordinator_expires_at > :now) \
-                      OR (jb.autopilot = 0 AND jb.status = 'active' AND j.kind = 'verdict' \
+                      OR (jb.autopilot = 0 AND jb.status = 'active' AND jb.verdict_judges = 1 \
+                          AND j.kind = 'verdict' \
                           AND EXISTS (SELECT 1 FROM json_each(jb.home_devices) jd \
                                       WHERE 'dispatch:' || jd.value = j.registered_by))))";
 
 /// Whether `caller` may register a judge of `kind` on `board` without the coordinator
 /// lease, which a board that is not on autopilot never gives: `caller` is the dispatch
-/// agent of one of the board's home devices, the board is active, and the judge gives
-/// verdicts on proposals. [`LIVE`] holds the same rule for the rights.
+/// agent of one of the board's home devices, the board is active with `verdict_judges`
+/// enabled, and the judge gives verdicts on proposals. [`LIVE`] holds the same rule for
+/// the rights.
 fn registers_without_lease(board: &Board, caller: &AgentId, kind: JudgeKind) -> bool {
     !board.autopilot
         && board.status == BoardStatus::Active
+        && board.verdict_judges
         && kind == JudgeKind::Verdict
         && caller
             .dispatch_device()
@@ -174,9 +177,9 @@ pub(crate) fn register(
         return Err(forbidden(
             format!("{caller} does not hold the coordinator lease of {board}"),
             "only the lease holder registers judges, and on an active board that is not on \
-             autopilot the dispatch agent of a home device registers verdict judges; to \
-             have a judgment made, add a note on the task (task_note) for the board's \
-             coordinator",
+             autopilot with verdict_judges enabled the dispatch agent of a home device \
+             registers verdict judges; to have a judgment made, add a note on the task \
+             (task_note) for the board's coordinator",
         ));
     }
     // No lease gives the board's proposals to one home device: the device whose judge is

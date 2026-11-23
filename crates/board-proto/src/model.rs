@@ -42,6 +42,11 @@ pub struct Board {
     /// defaults to [`USAGE_STOP_AT_DEFAULT`].
     #[serde(default = "usage_stop_at_default")]
     pub usage_stop_at: u32,
+    /// Whether a home device daemon starts automatic verdict judges for pending proposals on
+    /// this board when autopilot is off (`docs/DESIGN.md`, "Daemon dispatch", Boards off
+    /// autopilot). Absent from servers that predate it, so it defaults to `true`.
+    #[serde(default = "verdict_judges_default")]
+    pub verdict_judges: bool,
     /// The agent that holds the board's coordinator lease, if any: the dispatch agent of the
     /// device whose daemon runs the board.
     pub coordinator: Option<AgentId>,
@@ -124,6 +129,10 @@ pub const USAGE_STOP_AT_DEFAULT: u32 = 90;
 
 fn usage_stop_at_default() -> u32 {
     USAGE_STOP_AT_DEFAULT
+}
+
+fn verdict_judges_default() -> bool {
+    true
 }
 
 /// A reading older than this is not acted on: the device that read it may be asleep.

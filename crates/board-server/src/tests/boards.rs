@@ -1000,3 +1000,48 @@ async fn an_approved_change_needs_a_registered_agent_and_writes_only_what_change
     assert_eq!(events[1]["payload"]["fields"], json!([]));
     assert_eq!(events[1]["payload"]["said"], "make it 2");
 }
+
+#[tokio::test]
+async fn verdict_judges_defaults_to_true_and_toggles_with_board_updated_event() {
+    let t = T::new();
+    let board = t.board("factory", &[]).await;
+    assert_eq!(board["verdict_judges"], true);
+
+    let off = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "verdict_judges": false })),
+        )
+        .await;
+    assert_eq!(off["verdict_judges"], false);
+    let events = board_updates(&t).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["payload"]["fields"], json!(["verdict_judges"]));
+
+    // Restating the same value emits no second event.
+    let same = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "verdict_judges": false })),
+        )
+        .await;
+    assert_eq!(same["verdict_judges"], false);
+    assert_eq!(board_updates(&t).await.len(), 1);
+
+    let on = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "verdict_judges": true })),
+        )
+        .await;
+    assert_eq!(on["verdict_judges"], true);
+    let events = board_updates(&t).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["payload"]["fields"], json!(["verdict_judges"]));
+}

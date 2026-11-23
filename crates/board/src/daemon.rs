@@ -1465,12 +1465,14 @@ impl<T: T3> Daemon<T> {
         board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
-    /// An active board with this device among its homes that is not on autopilot: its
-    /// pending proposals get verdict judges, and the board gets nothing else from this
-    /// daemon (`docs/DESIGN.md`, "Daemon dispatch", Boards off autopilot).
+    /// An active board with this device among its homes that is not on autopilot and has
+    /// automatic verdict judges enabled: its pending proposals get verdict judges, and the
+    /// board gets nothing else from this daemon (`docs/DESIGN.md`, "Daemon dispatch", Boards
+    /// off autopilot).
     fn judges_proposals(&self, board: &Board) -> bool {
         !board.autopilot
             && board.status == BoardStatus::Active
+            && board.verdict_judges
             && board.home_devices.contains(&self.ctx.device)
     }
 
@@ -1507,6 +1509,11 @@ impl<T: T3> Daemon<T> {
                 }
                 if self.judges_proposals(board) {
                     off_autopilot.push(board);
+                } else if !board.autopilot && !board.verdict_judges {
+                    // Turning verdict judges off ends lease-less judge rights on the
+                    // server; drop tracked runs so they neither leak in watch.json nor
+                    // trigger a spurious JUDGE_RETRY delay if re-enabled later.
+                    self.state.judges.retain(|r| r.board != board.slug);
                 }
                 continue;
             }
