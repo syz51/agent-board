@@ -113,6 +113,9 @@ pub struct Config {
     /// The T3 provider instance and model for the threads `board watch` starts; without
     /// it they get the project's defaults.
     pub thread_model: Option<ThreadModel>,
+    /// The T3 provider instance and model for judge threads `board watch` starts; without
+    /// it they use `[thread_model]`, else the project's defaults.
+    pub judge_model: Option<ThreadModel>,
 }
 
 /// A T3 provider instance and a model of it: `t3 thread start` takes them only together.
@@ -125,6 +128,13 @@ pub struct ThreadModel {
     /// The model's slug.
     #[serde(deserialize_with = "non_empty")]
     pub model: String,
+    /// Optional model options passed as repeated `--option <key>=<value>` flags.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "model_options"
+    )]
+    pub options: BTreeMap<String, String>,
 }
 
 /// A string with text in it: an empty one would fail every thread start.
@@ -136,6 +146,32 @@ fn non_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String
         ));
     }
     Ok(text)
+}
+
+/// Model option map for `t3 thread start --option <key>=<value>`: rejects empty keys,
+/// keys containing `=`, or empty values at load time.
+fn model_options<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let options = BTreeMap::<String, String>::deserialize(deserializer)?;
+    for (key, value) in &options {
+        if key.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "option key is empty: give non-empty id = value entries",
+            ));
+        }
+        if key.contains('=') {
+            return Err(serde::de::Error::custom(format!(
+                "option key {key:?} contains '=': `--option` splits on the first '='"
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "option {key:?} has an empty value"
+            )));
+        }
+    }
+    Ok(options)
 }
 
 impl Config {
@@ -484,18 +520,90 @@ mod tests {
         let model = ThreadModel {
             provider: "claude-agents".into(),
             model: "a-model".into(),
+            options: BTreeMap::new(),
         };
         assert_eq!(config.thread_model, Some(model));
         let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("options"), "{text}");
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
 
         assert_eq!(toml::from_str::<Config>("").unwrap().thread_model, None);
+        assert_eq!(toml::from_str::<Config>("").unwrap().judge_model, None);
         let err =
             toml::from_str::<Config>("[thread_model]\nprovider = \"claude-agents\"\n").unwrap_err();
         assert!(err.to_string().contains("model"), "{err}");
         let err = toml::from_str::<Config>("[thread_model]\nprovider = \"\"\nmodel = \"m\"\n")
             .unwrap_err();
         assert!(err.to_string().contains("is empty"), "{err}");
+    }
+
+    #[test]
+    fn thread_and_judge_models_validate_options_and_round_trip() {
+        let toml = r#"
+[thread_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+
+[thread_model.options]
+thought_level = "high"
+
+[judge_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "medium", verbosity = "low" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.thread_model,
+            Some(ThreadModel {
+                provider: "antigravity".into(),
+                model: "gemini-4-neon".into(),
+                options: [("thought_level".into(), "high".into())].into(),
+            })
+        );
+        assert_eq!(
+            config.judge_model,
+            Some(ThreadModel {
+                provider: "antigravity".into(),
+                model: "gemini-4-neon".into(),
+                options: [
+                    ("thought_level".into(), "medium".into()),
+                    ("verbosity".into(), "low".into()),
+                ]
+                .into(),
+            })
+        );
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+
+        for (case, expected) in [
+            (
+                "[thread_model]\nprovider = \"p\"\nmodel = \"m\"\n[thread_model.options]\n\"\" = \"v\"\n",
+                "option key is empty",
+            ),
+            (
+                "[thread_model]\nprovider = \"p\"\nmodel = \"m\"\n[thread_model.options]\n\"  \" = \"v\"\n",
+                "option key is empty",
+            ),
+            (
+                "[thread_model]\nprovider = \"p\"\nmodel = \"m\"\n[thread_model.options]\n\"a=b\" = \"v\"\n",
+                "contains '='",
+            ),
+            (
+                "[judge_model]\nprovider = \"p\"\nmodel = \"m\"\n[judge_model.options]\nthought_level = \"\"\n",
+                "empty value",
+            ),
+            (
+                "[judge_model]\nprovider = \"p\"\nmodel = \"m\"\n[judge_model.options]\nthought_level = \"   \"\n",
+                "empty value",
+            ),
+        ] {
+            let err = toml::from_str::<Config>(case).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "case {case:?} -> {err} (expected {expected:?})"
+            );
+        }
     }
 
     #[test]
