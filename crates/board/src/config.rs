@@ -98,6 +98,11 @@ pub struct Config {
     /// device across its daemon-dispatch boards; without it, one per 4 GiB of host memory
     /// and at least 2.
     pub runs_at_once: Option<std::num::NonZeroU32>,
+    /// Device turns `board watch` leaves free for threads it did not start (such as owner
+    /// threads calling `delegate_task` or `t3_thread_launch`); without it, 1. Set 0 to let
+    /// the daemon use every slot of `runs_at_once`.
+    #[serde(alias = "reserve")]
+    pub reserve_runs: Option<u32>,
     /// Local T3 project folders by repo key, for starting worker and judge threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,

@@ -1191,6 +1191,18 @@ impl<T: T3> Daemon<T> {
         device::run_limit(&self.ctx.config, self.default_run_limit)
     }
 
+    /// How many turns this device leaves free for launches from threads the daemon did
+    /// not start.
+    fn reserve(&self) -> usize {
+        device::reserve(&self.ctx.config)
+    }
+
+    /// How many total runs on the device may be active while the daemon still starts a
+    /// new worker or judge: `run_limit` minus the owner-thread reserve.
+    fn daemon_run_limit(&self) -> usize {
+        device::daemon_limit(self.run_limit(), self.reserve())
+    }
+
     /// Whether the runs recorded for `slug` take slots of this device: it hosts the board.
     /// A paused board counts, since its threads still run. A run
     /// recorded for a board that left this device takes no slot: nothing here follows it
@@ -1265,11 +1277,19 @@ impl<T: T3> Daemon<T> {
     /// the limit holds.
     fn load(&self) -> String {
         let others = self.other_turns();
+        let limit = self.run_limit();
+        let reserve = self.reserve();
+        let daemon_limit = self.daemon_run_limit();
+        let reserved = if limit != usize::MAX && reserve > 0 {
+            format!(" (daemon limit {daemon_limit}, {reserve} reserved)")
+        } else {
+            String::new()
+        };
         let mut text = format!(
-            "device {} has {} of {} runs: {} of the dispatcher, {} turns of other threads",
+            "device {} has {} of {} runs{reserved}: {} of the dispatcher, {} turns of other threads",
             self.ctx.device,
             self.runs(),
-            self.run_limit(),
+            limit,
             self.own_runs(),
             others.len()
         );
@@ -1351,6 +1371,10 @@ impl<T: T3> Daemon<T> {
         if new.runs_at_once != current.runs_at_once {
             current.runs_at_once = new.runs_at_once;
             tracing::info!("re-read {}: runs_at_once updated", path.display());
+        }
+        if new.reserve_runs != current.reserve_runs {
+            current.reserve_runs = new.reserve_runs;
+            tracing::info!("re-read {}: reserve_runs updated", path.display());
         }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
@@ -1899,10 +1923,11 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
-            let limit = device::worker_limit(self.run_limit());
+            let daemon_limit = self.daemon_run_limit();
+            let limit = device::worker_limit(daemon_limit);
             if self.load_unknown().is_some()
                 || self.worker_runs() >= limit
-                || self.runs() >= self.run_limit()
+                || self.runs() >= daemon_limit
                 || self.worker_turns.another_first(slug, waited)
             {
                 let load = self.load();

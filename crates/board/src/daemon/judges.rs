@@ -623,7 +623,7 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
-            let limit = self.run_limit();
+            let limit = self.daemon_run_limit();
             let verdicts = self.home_verdict_runs();
             let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
             let full = self.load_unknown().is_some() || self.runs() >= limit;
