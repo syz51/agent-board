@@ -1075,19 +1075,25 @@ has not registered it yet.
 
 **Boards off autopilot** (built, agent-board-491; the user chose it on 2026-11-13, ask
 #171): a proposal gets its verdict on every active board that lists the daemon's device
-as a home, with or without autopilot. Before this, the proposals of a board off autopilot
-got no verdict, were never claimed, and agents filed the same finding again.
+as a home and has `verdict_judges` enabled (default `true`), with or without autopilot.
+Before this, the proposals of a board off autopilot got no verdict, were never claimed,
+and agents filed the same finding again. An owner-directed board can opt out with
+`board board update <slug> --verdict-judges false` while staying an active home board.
 
-- **What runs**: verdict judges only, by the Verdict rules above. Such a board gets no
-  worker, no review, goal or triage judge, no merge and no finished task, and the daemon
-  takes no coordinator lease there. Of the board it reads the judges and the pending
-  proposals, nothing else.
-- **Where**: only on a device in the board's `home_devices`. A board with no home, or a
-  paused one, gets no judge. A device that is not a home never starts one.
+- **What runs**: verdict judges only, by the Verdict rules above, while `verdict_judges` is
+  `true`. Such a board gets no worker, no review, goal or triage judge, no merge and no
+  finished task, and the daemon takes no coordinator lease there. Of the board it reads the
+  judges and the pending proposals, nothing else. When `verdict_judges` is `false`, the
+  daemon starts no verdict judges and reads nothing for the board.
+- **Where**: only on a device in the board's `home_devices`. A board with no home, a paused
+  one, or one with `verdict_judges: false` gets no judge. A device that is not a home never
+  starts one.
 - **Rights**: the server lets the dispatch agent of a home device register a verdict
   judge without the lease (`API.md`, "Daemon dispatch"). The judge has the coordinator's
-  rights on that board while the board stays active, off autopilot and a home of that
-  device.
+  rights on that board while the board stays active, off autopilot, `verdict_judges` is
+  `true`, and the registering device stays a home. Turning `verdict_judges` off refuses new
+  lease-less verdict judge registrations and immediately ends any existing lease-less
+  verdict judge's rights.
 - **One device per board**: no lease gives the board to one home device. The device
   whose verdict judge is at work has the board's proposals: the server refuses another
   home device's registration with 409 `claim_refused` until that judge is over, and a daemon

@@ -836,6 +836,10 @@ pub enum BoardCommand {
         /// starts no new task. Only the user may raise it.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
         usage_stop_at: Option<u32>,
+        /// Whether a home device daemon starts automatic verdict judges for pending proposals
+        /// when autopilot is off.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        verdict_judges: Option<bool>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1422,6 +1426,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             temporary,
             parallel_tasks,
             usage_stop_at,
+            verdict_judges,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1434,6 +1439,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 parallel_tasks,
                 dispatch: None,
                 usage_stop_at,
+                verdict_judges,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }

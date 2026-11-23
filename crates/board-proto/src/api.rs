@@ -87,6 +87,11 @@ pub struct UpdateBoard {
     /// A server that predates it ignores it, so a client checks the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_stop_at: Option<u32>,
+    /// Whether a home device daemon starts automatic verdict judges for pending proposals
+    /// when autopilot is off (see [`crate::Board::verdict_judges`]). A server that predates
+    /// it ignores it, so a client checks the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_judges: Option<bool>,
 }
 
 /// `PUT /v1/usage`: a device daemon reports the account usage it read. The server keeps
@@ -1172,14 +1177,24 @@ mod tests {
             "older servers hold no work on usage"
         );
         assert_eq!(update.usage_stop_at, None);
+        assert!(
+            board.verdict_judges,
+            "older servers run automatic verdict judges off autopilot"
+        );
+        assert_eq!(update.verdict_judges, None);
         // Older servers reject no field they do not know, and an unset one is not sent.
         let unset = serde_json::to_value(UpdateBoard::default()).unwrap();
         assert_eq!(unset["parallel_tasks"], serde_json::Value::Null);
         assert_eq!(unset["dispatch"], serde_json::Value::Null);
         assert_eq!(unset["usage_stop_at"], serde_json::Value::Null);
-        let set: UpdateBoard =
-            serde_json::from_value(serde_json::json!({ "dispatch": "daemon" })).unwrap();
+        assert!(unset.get("verdict_judges").is_none());
+        let set: UpdateBoard = serde_json::from_value(serde_json::json!({
+            "dispatch": "daemon",
+            "verdict_judges": false,
+        }))
+        .unwrap();
         assert_eq!(set.dispatch, Some(Dispatch::Daemon));
+        assert_eq!(set.verdict_judges, Some(false));
     }
 
     #[test]

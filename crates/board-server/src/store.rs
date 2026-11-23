@@ -537,7 +537,7 @@ fn count_status(counts: &mut StatusCounts, status: &str, n: u32) -> Result<()> {
 
 const BOARD_COLUMNS: &str = "slug, title, goal, status, repos, autopilot, home_devices, \
      coordinator, coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, \
-     dispatch, usage_stop_at";
+     dispatch, usage_stop_at, verdict_judges";
 
 /// A board's stored columns and its live coordinator, with nothing counted yet.
 fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
@@ -553,6 +553,7 @@ fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
         autopilot: r.get(5)?,
         parallel_tasks: r.get(12)?,
         usage_stop_at: r.get(14)?,
+        verdict_judges: r.get(15)?,
         coordinator: match (coordinator, expires) {
             (Some(c), Some(e)) if e > now_ms => Some(parse_id(&c)?),
             _ => None,

@@ -2555,6 +2555,80 @@ fn usage_stop_at_is_set_shown_and_checked() {
 }
 
 #[test]
+fn verdict_judges_is_set_shown_and_checked() {
+    let e = env();
+    let mut off = board_fixture("factory", &[]);
+    off.verdict_judges = false;
+    e.stub.on("PATCH /v1/boards/factory", &off);
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "false"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["verdict_judges"], false);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // `board boards` and `board status` show the marker only when disabled.
+    let on = board_fixture("other", &[]);
+    e.stub.on("GET /v1/boards", [&off, &on]);
+    let out = e.run(&["boards"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].ends_with(" · verdict judges off"), "{text}");
+    assert!(!lines[1].contains("verdict judges off"), "{text}");
+
+    e.stub.on("GET /v1/boards/factory", &off);
+    e.stub.on("GET /v1/agents", json!([]));
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = stdout(&out);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("factory ") && l.ends_with(" · verdict judges off")),
+        "{status}"
+    );
+
+    e.stub.on("GET /v1/boards/other", &on);
+    let out = e.run(&["status", "--board", "other"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Re-enabling omits the marker.
+    e.stub
+        .on("PATCH /v1/boards/factory", board_fixture("factory", &[]));
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // An older server that omits `verdict_judges` deserializes as `true` and is caught.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("verdict_judges");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "false"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored verdict_judges=false")
+            && err.contains("board board update factory --verdict-judges false"),
+        "{err}"
+    );
+}
+
+#[test]
 fn usage_shows_the_reading_and_the_boards_it_holds() {
     let e = env();
     e.stub.on("GET /v1/usage", serde_json::Value::Null);

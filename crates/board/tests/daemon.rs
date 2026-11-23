@@ -5987,3 +5987,34 @@ async fn a_review_judge_of_a_board_switched_off_autopilot_keeps_no_slot() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_home_board_off_autopilot_with_verdict_judges_off_gets_no_judge() {
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut board = off_autopilot("factory");
+    board.verdict_judges = false;
+    let mut e = off_autopilot_env(&[board.clone()], &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+    assert!(
+        e.stub
+            .requests_to("GET /v1/boards/factory/judges")
+            .is_empty()
+    );
+    assert!(e.stub.requests_to("GET /v1/tasks").is_empty());
+    assert!(e.stub.requests_to("POST /v1/agents").is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/judges")
+            .is_empty()
+    );
+
+    // Turning verdict judges back on dispatches the pending proposal.
+    board.verdict_judges = true;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["verdict factory-10 (no parent)"]);
+}

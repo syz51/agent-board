@@ -1600,6 +1600,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              --usage-stop-at {wanted}"
         );
     }
+    if let Some(wanted) = body.verdict_judges
+        && board.verdict_judges != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored verdict_judges={wanted}: it predates \
+             the verdict_judges setting. Upgrade the server, then run board board update {slug} \
+             --verdict-judges {wanted}"
+        );
+    }
     let mut text = format!("updated {}", render::board_line(&board));
     if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {
         text.push_str(&format!(
