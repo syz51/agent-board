@@ -73,9 +73,7 @@ pub enum UsageSource {
         snapshots: Vec<PathBuf>,
     },
     /// Reads T3 Code's Antigravity usage cache files (`~/.t3/caches/<instance>.json`).
-    Antigravity {
-        snapshots: Vec<PathBuf>,
-    },
+    Antigravity { snapshots: Vec<PathBuf> },
 }
 
 /// Where Claude Code keeps its sign-in.

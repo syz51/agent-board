@@ -190,24 +190,16 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
     let Value::Object(mut map) = input else {
         return input;
     };
-    if !map.contains_key("session_id") {
-        if let Some(id) = map.get("conversationId").cloned() {
-            map.insert("session_id".to_owned(), id);
-        }
-    }
-    if !map.contains_key("transcript_path") {
-        if let Some(path) = map.get("transcriptPath").cloned() {
-            map.insert("transcript_path".to_owned(), path);
-        }
-    }
-    if !map.contains_key("stop_hook_active") {
-        if let Some(active) = map.get("continuationActive").cloned() {
-            map.insert("stop_hook_active".to_owned(), active);
-        }
-    }
-    if !map.contains_key("prompt") {
-        if let Some(prompt) = map.get("lastUserInput").cloned() {
-            map.insert("prompt".to_owned(), prompt);
+    for (src, dst) in [
+        ("conversationId", "session_id"),
+        ("transcriptPath", "transcript_path"),
+        ("continuationActive", "stop_hook_active"),
+        ("lastUserInput", "prompt"),
+    ] {
+        if !map.contains_key(dst)
+            && let Some(val) = map.get(src).cloned()
+        {
+            map.insert(dst.to_owned(), val);
         }
     }
     if let Some(Value::Object(tool_call)) = map.get("toolCall").cloned() {
@@ -224,17 +216,18 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
             raw_name
         };
         if !mapped_name.is_empty() {
-            map.insert("tool_name".to_owned(), Value::String(mapped_name.to_owned()));
+            map.insert(
+                "tool_name".to_owned(),
+                Value::String(mapped_name.to_owned()),
+            );
         }
         if let Some(mut args) = tool_call.get("args").cloned() {
-            if raw_name == "run_command" {
-                if let Value::Object(ref mut obj) = args {
-                    if !obj.contains_key("command") {
-                        if let Some(cmd) = obj.get("CommandLine").cloned() {
-                            obj.insert("command".to_owned(), cmd);
-                        }
-                    }
-                }
+            if raw_name == "run_command"
+                && let Value::Object(ref mut obj) = args
+                && !obj.contains_key("command")
+                && let Some(cmd) = obj.get("CommandLine").cloned()
+            {
+                obj.insert("command".to_owned(), cmd);
             }
             map.insert("tool_input".to_owned(), args);
         }
@@ -2945,7 +2938,12 @@ mod tests {
             Some("{\"decision\":\"allow\"}")
         );
         assert_eq!(
-            render_reply(HookEvent::PostToolUse, Runtime::Antigravity, Reply::Context("ignored".into())).as_deref(),
+            render_reply(
+                HookEvent::PostToolUse,
+                Runtime::Antigravity,
+                Reply::Context("ignored".into())
+            )
+            .as_deref(),
             Some("{}")
         );
     }
@@ -2973,6 +2971,8 @@ mod tests {
             edited_paths("edit_file", &json!({"Path": "/tmp/a.rs"})),
             vec![PathBuf::from("/tmp/a.rs")]
         );
-        assert!(launch::is_launch(&json!({"tool_name": "mcp_t3-code_delegate_task"})));
+        assert!(launch::is_launch(
+            &json!({"tool_name": "mcp_t3-code_delegate_task"})
+        ));
     }
 }
