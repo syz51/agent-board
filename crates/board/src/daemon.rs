@@ -1321,8 +1321,8 @@ impl<T: T3> Daemon<T> {
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
     /// since a missing project may be what failed. `runs_at_once` takes effect at once
-    /// too. `server`, `device`, `t3_bin` and
-    /// `[thread_model]` are fixed while the daemon runs, so changing them asks for a
+    /// too. `server`, `device`, `t3_bin`, `[thread_model]` and
+    /// `[judge_model]` are fixed while the daemon runs, so changing them asks for a
     /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
     fn reload_config(&mut self) {
@@ -1355,16 +1355,21 @@ impl<T: T3> Daemon<T> {
             }
         };
         let current = &mut self.ctx.config;
-        if (&new.server, &new.device, &new.t3_bin, &new.thread_model)
-            != (
-                &current.server,
-                &current.device,
-                &current.t3_bin,
-                &current.thread_model,
-            )
-        {
+        if (
+            &new.server,
+            &new.device,
+            &new.t3_bin,
+            &new.thread_model,
+            &new.judge_model,
+        ) != (
+            &current.server,
+            &current.device,
+            &current.t3_bin,
+            &current.thread_model,
+            &current.judge_model,
+        ) {
             tracing::warn!(
-                "{} changes server, device, t3_bin or thread_model: restart board watch to apply them",
+                "{} changes server, device, t3_bin, thread_model or judge_model: restart board watch to apply them",
                 path.display()
             );
         }
@@ -2351,7 +2356,13 @@ impl<T: T3> Daemon<T> {
         self.save()?;
         let thread = self
             .t3
-            .start_thread(&project, &worker.title, &brief, worktree.as_ref())
+            .start_thread(
+                &project,
+                &worker.title,
+                &brief,
+                worktree.as_ref(),
+                self.ctx.config.thread_model.as_ref(),
+            )
             .await?;
         // A thread id that names no agent could never be followed, and would hold the slot.
         thread_agent(&thread)
@@ -3953,8 +3964,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
-    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref())
-        .with_thread_model(ctx.config.thread_model.clone());
+    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
     tracing::info!(
         "watching as device {} with {}",
         ctx.device,
@@ -3963,8 +3973,13 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let usage_source =
-        UsageSource::for_provider(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
+    let usage_source = UsageSource::for_provider(
+        ctx.config
+            .thread_model
+            .as_ref()
+            .or(ctx.config.judge_model.as_ref())
+            .map(|m| m.provider.as_str()),
+    );
     let host_memory = device::host_memory();
     if host_memory.is_none() {
         tracing::warn!(

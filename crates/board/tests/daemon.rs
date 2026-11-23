@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board::client::Client;
-use board::config::{Config, Home};
+use board::config::{Config, Home, ThreadModel};
 use board::daemon::{Daemon, RELEASE_GRACE};
 use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
 use board::identity::RepoInfo;
@@ -36,6 +36,7 @@ enum Call {
         title: String,
         message: String,
         worktree: Option<NewWorktree>,
+        model: Option<ThreadModel>,
     },
     Send {
         thread: String,
@@ -239,12 +240,14 @@ impl T3 for FakeT3 {
         title: &str,
         message: &str,
         worktree: Option<&NewWorktree>,
+        model: Option<&ThreadModel>,
     ) -> Result<String> {
         self.calls.lock().unwrap().push(Call::Start {
             project: project.to_path_buf(),
             title: title.to_owned(),
             message: message.to_owned(),
             worktree: worktree.cloned(),
+            model: model.cloned(),
         });
         if self
             .hang_start_in
@@ -6123,5 +6126,196 @@ async fn a_home_board_off_autopilot_with_verdict_judges_off_gets_no_judge() {
             "verdict factory-10 (no parent)",
             "verdict factory-10 (no parent)"
         ]
+    );
+}
+
+fn started_models(t3: &FakeT3) -> Vec<(String, Option<ThreadModel>)> {
+    t3.calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Start { title, model, .. } => Some((title, model)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn env_with_models(
+    tasks: &[board_proto::Task],
+    thread_model: Option<ThreadModel>,
+    judge_model: Option<ThreadModel>,
+) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let config = Config {
+        server: Some(stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        thread_model,
+        judge_model,
+        ..Config::default()
+    };
+    let home = Home::at(dir.path().join("home"));
+    config.save(&home).unwrap();
+    let daemon = daemon_configured(dir.path(), &stub, &t3, None, config);
+    let board = autopilot(Some(DISPATCH), &[DEVICE]);
+    stub.on("GET /v1/boards", [&board]);
+    stub.on("POST /v1/boards/factory/coordinator", &board);
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    stub.on("GET /v1/tasks", tasks);
+    stub.on("GET /v1/boards/factory/judges", json!([]));
+    stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "verdict", &[], true),
+    );
+    for task in tasks {
+        stub.on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
+    }
+    Env {
+        stub,
+        t3,
+        daemon,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back() {
+    let worker_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "high".into())].into(),
+    };
+    let judge_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "medium".into())].into(),
+    };
+    let tasks = [
+        ready_task("factory-1", board_proto::Priority::P1, 0),
+        proposal("factory-2", None, 1),
+    ];
+
+    // With both set, judges get [judge_model] and workers get [thread_model].
+    let mut e = env_with_models(
+        &tasks,
+        Some(worker_model.clone()),
+        Some(judge_model.clone()),
+    );
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            (
+                "verdict factory-2 (no parent)".into(),
+                Some(judge_model.clone())
+            ),
+            (
+                "factory-1 Task factory-1".into(),
+                Some(worker_model.clone())
+            ),
+        ]
+    );
+
+    // Without [judge_model], judges fall back to [thread_model].
+    let mut e = env_with_models(&tasks, Some(worker_model.clone()), None);
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            (
+                "verdict factory-2 (no parent)".into(),
+                Some(worker_model.clone())
+            ),
+            ("factory-1 Task factory-1".into(), Some(worker_model)),
+        ]
+    );
+
+    // Without either, both judges and workers leave project defaults (None).
+    let mut e = env_with_models(&tasks, None, None);
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            ("verdict factory-2 (no parent)".into(), None),
+            ("factory-1 Task factory-1".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_active_model() {
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(self.0.clone())
+        }
+    }
+
+    let original_judge = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "medium".into())].into(),
+    };
+    let updated_judge = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "low".into())].into(),
+    };
+
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut e = env_with_models(&tasks, None, Some(original_judge.clone()));
+    let home = Home::at(e._dir.path().join("home"));
+
+    // Rewrite config.toml with an updated [judge_model] before reconcile reloads it.
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        judge_model: Some(updated_judge),
+        ..Config::default()
+    }
+    .save(&home)
+    .unwrap();
+
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(buf.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    e.daemon.reconcile(at()).await.unwrap();
+    drop(_guard);
+
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("judge_model") && logs.contains("restart board watch"),
+        "expected restart warning for judge_model change, got: {logs:?}"
+    );
+    assert_eq!(
+        started_models(&e.t3),
+        [(
+            "verdict factory-10 (no parent)".into(),
+            Some(original_judge)
+        )]
     );
 }
