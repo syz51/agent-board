@@ -179,7 +179,7 @@ export const taskDetail = object({
 export const agent = object({
   id: string,
   handle: string,
-  runtime: oneOf("claude", "codex", "opencode"),
+  runtime: oneOf("claude", "codex", "opencode", "antigravity"),
   device: string,
   role: oneOf("worker", "coordinator"),
   title: nullable(string),

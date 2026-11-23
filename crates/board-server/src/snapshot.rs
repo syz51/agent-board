@@ -798,6 +798,7 @@ fn runtime_str(runtime: Runtime) -> &'static str {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
         Runtime::Opencode => "opencode",
+        Runtime::Antigravity => "antigravity",
     }
 }
 

@@ -80,6 +80,7 @@ fn new_handle(cx: &Ctx<'_>, id: &AgentId) -> Result<String> {
         AgentSource::Claude => "claude",
         AgentSource::Codex => "codex",
         AgentSource::Opencode => "opencode",
+        AgentSource::Antigravity => "antigravity",
         AgentSource::Dispatch => return Ok(id.to_string()),
     };
     let digest = hex(&Sha256::digest(id.as_str().as_bytes()));

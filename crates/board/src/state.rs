@@ -236,6 +236,7 @@ pub fn runtime_name(runtime: Runtime) -> &'static str {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
         Runtime::Opencode => "opencode",
+        Runtime::Antigravity => "antigravity",
     }
 }
 

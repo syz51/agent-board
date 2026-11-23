@@ -814,9 +814,11 @@ impl Reach {
     /// ([`Daemon::usage_full_until`]).
     fn of(seen: &Seen, device: &DeviceName, full_until: Option<Timestamp>, now: Timestamp) -> Self {
         match Self::alone(seen, device, now) {
-            // Codex and opencode agents spend other limits.
+            // Codex and opencode agents spend other limits; Claude and Antigravity respect
+            // the daemon's active usage reading.
             Self::Now | Self::Held
-                if full_until.is_some() && seen.agent.runtime == Runtime::Claude =>
+                if full_until.is_some()
+                    && matches!(seen.agent.runtime, Runtime::Claude | Runtime::Antigravity) =>
             {
                 Self::Full
             }
@@ -3361,7 +3363,7 @@ impl<T: T3> Daemon<T> {
         let full = self
             .state
             .usage_full_until
-            .filter(|_| seen.agent.runtime == Runtime::Claude);
+            .filter(|_| matches!(seen.agent.runtime, Runtime::Claude | Runtime::Antigravity));
         paused_until(seen).max(full)
     }
 
@@ -3464,6 +3466,25 @@ impl<T: T3> Daemon<T> {
                         && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
                 })
             {
+                self.usage_snapshot_at = Some(snapshot.read_at);
+                reading = Some(snapshot);
+            }
+        } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
+            let every = self.usage_poll_every(now);
+            let snapshot = crate::usage::read_snapshots(snapshots, now)
+                .await
+                .into_iter()
+                .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+                .filter(|s| {
+                    self.usage
+                        .as_ref()
+                        .is_none_or(|known| crate::usage::follows(s, known))
+                })
+                .max_by_key(|s| s.read_at);
+            if let Some(snapshot) = snapshot.filter(|s| {
+                self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                    && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+            }) {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
             }
@@ -3911,7 +3932,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
     let usage_source =
-        UsageSource::claude_code(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
+        UsageSource::for_provider(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
     let host_memory = device::host_memory();
     if host_memory.is_none() {
         tracing::warn!(

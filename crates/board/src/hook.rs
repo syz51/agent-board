@@ -180,12 +180,68 @@ enum Reply {
     Deny(String),
 }
 
+/// Normalizes an Antigravity camelCase hook payload into the snake_case shape the shared
+/// hook handlers expect (`session_id`, `transcript_path`, `tool_name`, `tool_use_id`,
+/// `tool_input`, `stop_hook_active`, `prompt`).
+pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
+    if runtime != Runtime::Antigravity {
+        return input;
+    }
+    let Value::Object(mut map) = input else {
+        return input;
+    };
+    for (src, dst) in [
+        ("conversationId", "session_id"),
+        ("transcriptPath", "transcript_path"),
+        ("continuationActive", "stop_hook_active"),
+        ("lastUserInput", "prompt"),
+    ] {
+        if !map.contains_key(dst)
+            && let Some(val) = map.get(src).cloned()
+        {
+            map.insert(dst.to_owned(), val);
+        }
+    }
+    if let Some(Value::Object(tool_call)) = map.get("toolCall").cloned() {
+        if let Some(id) = tool_call.get("id").cloned() {
+            map.insert("tool_use_id".to_owned(), id);
+        }
+        let raw_name = tool_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mapped_name = if raw_name == "run_command" {
+            SHELL_TOOL
+        } else {
+            raw_name
+        };
+        if !mapped_name.is_empty() {
+            map.insert(
+                "tool_name".to_owned(),
+                Value::String(mapped_name.to_owned()),
+            );
+        }
+        if let Some(mut args) = tool_call.get("args").cloned() {
+            if raw_name == "run_command"
+                && let Value::Object(ref mut obj) = args
+                && !obj.contains_key("command")
+                && let Some(cmd) = obj.get("CommandLine").cloned()
+            {
+                obj.insert("command".to_owned(), cmd);
+            }
+            map.insert("tool_input".to_owned(), args);
+        }
+    }
+    Value::Object(map)
+}
+
 /// Entry point: reads stdin, handles the event, prints the reply. Never fails.
 pub async fn run(event: HookEvent, runtime: Runtime, explicit_agent: Option<&str>) {
     let started = Instant::now();
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let raw_input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let input = normalize_input(runtime, raw_input);
     let guard = if event == HookEvent::PreToolUse && launch::is_launch(&input) {
         // The launch check waits for T3 to list the device's threads.
         launch::BUDGET
@@ -232,6 +288,35 @@ fn guard(elapsed: Duration, share: Option<Duration>) -> Duration {
 }
 
 fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<String> {
+    if runtime == Runtime::Antigravity {
+        return Some(match reply {
+            Reply::Context(text)
+                if matches!(event, HookEvent::SessionStart | HookEvent::UserPromptSubmit) =>
+            {
+                json!({
+                    "injectSteps": [{
+                        "systemMessage": { "systemMessage": text }
+                    }]
+                })
+                .to_string()
+            }
+            Reply::Context(_) | Reply::Plain(_) => "{}".into(),
+            Reply::Halt(reason) => json!({
+                "terminationBehavior": "terminate",
+                "injectSteps": [{ "errorMessage": { "userMessage": reason } }]
+            })
+            .to_string(),
+            Reply::Deny(reason) => json!({
+                "decision": "deny",
+                "reason": reason
+            })
+            .to_string(),
+            Reply::Nothing if matches!(event, HookEvent::PreToolUse | HookEvent::Stop) => {
+                json!({ "decision": "allow" }).to_string()
+            }
+            Reply::Nothing => "{}".into(),
+        });
+    }
     match reply {
         Reply::Context(text) => Some(
             json!({
@@ -1497,8 +1582,8 @@ impl Hook<'_> {
                     tools.len()
                 )
             }
-            // Neither has `ToolSearch`: both load every tool schema themselves.
-            Runtime::Codex | Runtime::Opencode => context,
+            // None has `ToolSearch`: all load every tool schema themselves.
+            Runtime::Codex | Runtime::Opencode | Runtime::Antigravity => context,
         }
     }
 
@@ -1611,6 +1696,7 @@ impl Hook<'_> {
                 Runtime::Claude => "claude_session",
                 Runtime::Codex => "codex_session",
                 Runtime::Opencode => "opencode_session",
+                Runtime::Antigravity => "antigravity_session",
             };
             native.insert(key.to_owned(), session.to_owned());
         }
@@ -2336,6 +2422,12 @@ pub fn edited_paths(tool: &str, input: &Value) -> Vec<PathBuf> {
             .map(PathBuf::from)
             .into_iter()
             .collect(),
+        "edit_file" | "write_file" => input["Path"]
+            .as_str()
+            .or_else(|| input["path"].as_str())
+            .map(PathBuf::from)
+            .into_iter()
+            .collect(),
         "NotebookEdit" => input["notebook_path"]
             .as_str()
             .map(PathBuf::from)
@@ -2820,5 +2912,67 @@ mod tests {
             render_reply(HookEvent::Stop, Runtime::Claude, Reply::Nothing),
             None
         );
+        // Antigravity camelCase replies
+        let agy_ctx = render_reply(
+            HookEvent::SessionStart,
+            Runtime::Antigravity,
+            Reply::Context("board-snap".into()),
+        )
+        .unwrap();
+        let av: Value = serde_json::from_str(&agy_ctx).unwrap();
+        assert_eq!(
+            av["injectSteps"][0]["systemMessage"]["systemMessage"],
+            "board-snap"
+        );
+        let agy_deny = render_reply(
+            HookEvent::PreToolUse,
+            Runtime::Antigravity,
+            Reply::Deny("run limit".into()),
+        )
+        .unwrap();
+        let dv: Value = serde_json::from_str(&agy_deny).unwrap();
+        assert_eq!(dv["decision"], "deny");
+        assert_eq!(dv["reason"], "run limit");
+        assert_eq!(
+            render_reply(HookEvent::PreToolUse, Runtime::Antigravity, Reply::Nothing).as_deref(),
+            Some("{\"decision\":\"allow\"}")
+        );
+        assert_eq!(
+            render_reply(
+                HookEvent::PostToolUse,
+                Runtime::Antigravity,
+                Reply::Context("ignored".into())
+            )
+            .as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[test]
+    fn antigravity_input_normalizes_camel_case_and_tools() {
+        let raw = json!({
+            "conversationId": "conv-42",
+            "transcriptPath": "/tmp/t.jsonl",
+            "continuationActive": true,
+            "toolCall": {
+                "id": "call-1",
+                "name": "run_command",
+                "args": { "CommandLine": "git status" }
+            }
+        });
+        let norm = normalize_input(Runtime::Antigravity, raw);
+        assert_eq!(norm["session_id"], "conv-42");
+        assert_eq!(norm["transcript_path"], "/tmp/t.jsonl");
+        assert_eq!(norm["stop_hook_active"], true);
+        assert_eq!(norm["tool_use_id"], "call-1");
+        assert_eq!(norm["tool_name"], SHELL_TOOL);
+        assert_eq!(norm["tool_input"]["command"], "git status");
+        assert_eq!(
+            edited_paths("edit_file", &json!({"Path": "/tmp/a.rs"})),
+            vec![PathBuf::from("/tmp/a.rs")]
+        );
+        assert!(launch::is_launch(
+            &json!({"tool_name": "mcp_t3-code_delegate_task"})
+        ));
     }
 }
