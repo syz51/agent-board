@@ -6017,4 +6017,29 @@ async fn a_home_board_off_autopilot_with_verdict_judges_off_gets_no_judge() {
         .await
         .unwrap();
     assert_eq!(titles(&e.t3), ["verdict factory-10 (no parent)"]);
+
+    // Disabling verdict judges while a verdict judge is tracked drops the tracked run, so
+    // re-enabling after it ended starts a new judge immediately instead of waiting JUDGE_RETRY.
+    board.verdict_judges = false;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+
+    board.verdict_judges = true;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.stub.on("GET /v1/boards/factory/judges", json!([]));
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        [
+            "verdict factory-10 (no parent)",
+            "verdict factory-10 (no parent)"
+        ]
+    );
 }

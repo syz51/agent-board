@@ -1509,6 +1509,11 @@ impl<T: T3> Daemon<T> {
                 }
                 if self.judges_proposals(board) {
                     off_autopilot.push(board);
+                } else if !board.autopilot && !board.verdict_judges {
+                    // Turning verdict judges off ends lease-less judge rights on the
+                    // server; drop tracked runs so they neither leak in watch.json nor
+                    // trigger a spurious JUDGE_RETRY delay if re-enabled later.
+                    self.state.judges.retain(|r| r.board != board.slug);
                 }
                 continue;
             }
