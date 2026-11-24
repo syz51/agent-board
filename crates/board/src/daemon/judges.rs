@@ -248,7 +248,7 @@ impl AtWork {
 
 /// What the review notes of a task say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewVerdict {
+pub(crate) enum ReviewVerdict {
     Pass,
     Fail,
     /// The dispatcher withdrew a pass: the pull request could not be merged.
@@ -257,7 +257,7 @@ enum ReviewVerdict {
 
 /// The verdict a note records: its text starts `review: pass`, `review: fail` or
 /// `review: void`, after the note's kind when the author wrote it first.
-fn review_verdict(text: &str) -> Option<ReviewVerdict> {
+pub(crate) fn review_verdict(text: &str) -> Option<ReviewVerdict> {
     let rest = after_review(text)?.to_lowercase();
     if rest.starts_with("pass") {
         Some(ReviewVerdict::Pass)
@@ -294,7 +294,7 @@ enum Reviewed<'a> {
 }
 
 /// The start of the note the dispatcher adds for the review judge it started.
-const JUDGE_NOTE: &str = "note: the dispatcher started a review judge for this task:";
+pub(crate) const JUDGE_NOTE: &str = "note: the dispatcher started a review judge for this task:";
 
 /// The standing review of `detail`'s task: its newest `review:` decision note. A pass
 /// stands only when a review judge that `dispatcher` started for the task wrote it, as
@@ -336,7 +336,7 @@ fn tagged<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 
 /// The pull request a review passed.
 #[derive(Debug, Clone, PartialEq)]
-enum PassedPr {
+pub(crate) enum PassedPr {
     Url(String),
     /// The task has none.
     None,
@@ -347,7 +347,7 @@ enum PassedPr {
 /// The pull request the review passed: the pass note's `pr:` line, else the last pull
 /// request it links, else the one in the task owner's newest note before it. `pr: none`
 /// is none. It must be in one of the board's `repos`, when the board lists any.
-fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
+pub(crate) fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
     let named = pass.text.lines().find_map(|l| tagged(l, "pr"));
     if named.is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case("none")) {
         return PassedPr::None;
@@ -382,7 +382,7 @@ fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
 
 /// The pull request the newest note of a task names, in one of the board's `repos` when
 /// the board lists any.
-fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
+pub(crate) fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
     detail
         .notes
         .iter()
@@ -406,7 +406,7 @@ fn has_pr_none(text: &str) -> bool {
 /// decision note (`pass`, `fail` or `void`), or a newer note naming a same-repo PR URL
 /// without `pr: none`, so an older round's `pr: none` never suppresses a later code attempt
 /// while a current `pr: none` overrides earlier or related PR citations.
-fn noted_pr_none(detail: &TaskDetail, repos: &[String]) -> bool {
+pub(crate) fn noted_pr_none(detail: &TaskDetail, repos: &[String]) -> bool {
     for note in detail.notes.iter().rev() {
         if note.agent.source() == AgentSource::Dispatch {
             if note.text.starts_with(WORKER_NOTE_PREFIX) {
@@ -430,7 +430,7 @@ fn noted_pr_none(detail: &TaskDetail, repos: &[String]) -> bool {
 /// The branch the dispatcher last gave a worker for `detail`'s task, from its worker-start
 /// note. Returns `Some(None)` when the newest dispatcher start note ran in-place without a
 /// branch, and `None` when no dispatcher start note exists.
-fn noted_worker_branch(detail: &TaskDetail) -> Option<Option<String>> {
+pub(crate) fn noted_worker_branch(detail: &TaskDetail) -> Option<Option<String>> {
     for note in detail.notes.iter().rev() {
         if note.agent.source() != AgentSource::Dispatch {
             continue;
@@ -451,7 +451,7 @@ fn noted_worker_branch(detail: &TaskDetail) -> Option<Option<String>> {
 
 /// When `detail`'s task last moved into `review`: its newest `task_updated` event moving to
 /// `review`, else `task.updated_at`.
-fn parked_in_review_at(detail: &TaskDetail) -> Timestamp {
+pub(crate) fn parked_in_review_at(detail: &TaskDetail) -> Timestamp {
     detail
         .history
         .iter()
@@ -462,13 +462,13 @@ fn parked_in_review_at(detail: &TaskDetail) -> Timestamp {
 
 /// Whether `now` is still inside the bounded [`REVIEW_PR_WAIT`] window after `parked_at`.
 /// Allows up to 5 minutes of forward server-clock skew without starving wildly future times.
-fn within_pr_wait(parked_at: Timestamp, now: Timestamp) -> bool {
+pub(crate) fn within_pr_wait(parked_at: Timestamp, now: Timestamp) -> bool {
     let elapsed = now - parked_at;
     elapsed >= -TimeDelta::minutes(5) && elapsed < REVIEW_PR_WAIT
 }
 
 /// The checks a pass note records, one `check: <command> => <exit code>` line each.
-fn passed_checks(pass: &str) -> Vec<NewEvidence> {
+pub(crate) fn passed_checks(pass: &str) -> Vec<NewEvidence> {
     pass.lines()
         .filter_map(|line| {
             let (command, code) = tagged(line, "check")?.rsplit_once("=>")?;
@@ -485,7 +485,7 @@ fn passed_checks(pass: &str) -> Vec<NewEvidence> {
 
 /// The judge's summary for the user: its pass note without the verdict, the check lines
 /// and the pull request line.
-fn passed_summary(pass: &str) -> String {
+pub(crate) fn passed_summary(pass: &str) -> String {
     let body = after_review(pass).unwrap_or(pass);
     let body = if body.to_lowercase().starts_with("pass") {
         &body["pass".len()..]
