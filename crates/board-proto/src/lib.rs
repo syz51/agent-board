@@ -42,8 +42,7 @@ pub const BUILT_HEADER: &str = "x-board-built";
 pub const FEATURES_HEADER: &str = "x-board-features";
 
 /// Protocol/capability feature tokens advertised by this build of the board server.
-pub const SERVER_FEATURES: &str =
-    "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1";
+pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1";
 
 /// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
 pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
@@ -68,7 +67,7 @@ pub const DISPATCH_MAX_CLAIMS_DEFAULT: u32 = 1;
 pub const DISPATCH_MAX_CLAIMS_LIMIT: u32 = 4;
 
 /// Default version tag recorded on runs leased by the built-in scheduler policy.
-pub const SCHEDULER_POLICY_VERSION_DEFAULT: &str = "v1";
+pub const SCHEDULER_POLICY_VERSION_DEFAULT: &str = "v1-default";
 
 /// Runs `GET /v1/runs` lists when the request names no `limit`.
 pub const RUNS_LIMIT_DEFAULT: u32 = 100;

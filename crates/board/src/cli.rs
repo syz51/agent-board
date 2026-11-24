@@ -107,6 +107,10 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "admin device-update",
         "the device object {name, role, status, ...}",
     ),
+    (
+        "admin replay-schedule",
+        "{since, until, days, historical_tasks, historical_runs, baseline, candidate?}",
+    ),
     ("approved", "the board object {slug, title, status, ...}"),
     (
         "approved board",
@@ -119,7 +123,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     ("log", "{events: [...], next_since}"),
     (
         "stats",
-        "{days, tasks_created, tasks_done, ..., boards: [...]}",
+        "{days, tasks_created, tasks_done, ..., boards: [...]} (or SchedulerStats with --scheduler)",
     ),
     ("errors", "{signatures: [...], since, retention_days}"),
     ("snapshot", "{kind, text, seq, at}"),
@@ -395,11 +399,20 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// Feedback-loop counts for the last N days: claims, takeovers, leases, asks, done.
+    /// Feedback-loop counts (or scheduler telemetry with --scheduler) for the last N days.
     Stats {
         /// Days to count back from now, 1 to 365.
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
         days: u32,
+        /// Show quantitative scheduler telemetry from GET /v1/stats/scheduler.
+        #[arg(long)]
+        scheduler: bool,
+        /// Limit scheduler telemetry to one board (requires --scheduler).
+        #[arg(long, requires = "scheduler")]
+        board: Option<BoardSlug>,
+        /// Limit scheduler telemetry to one policy_version cohort (requires --scheduler).
+        #[arg(long, requires = "scheduler")]
+        policy_version: Option<String>,
     },
     /// API errors the server recorded, one line per signature, most first. Counts errors
     /// under the signal threshold, such as those since a fix deployed.
@@ -962,6 +975,22 @@ pub enum AdminCommand {
         #[arg(long)]
         clear_taints: bool,
     },
+    /// Deterministically replay historical tasks/runs from a read-only SQLite database
+    /// under the active baseline policy and an optional candidate policy file (TOML or JSON).
+    ReplaySchedule {
+        /// The server's database file (opened strictly read-only).
+        #[arg(long, env = "BOARD_DB")]
+        db: std::path::PathBuf,
+        /// Candidate policy file (TOML or JSON) to compare against the active baseline policy.
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+        /// Days to replay back from now, 1 to 365 (ignored when --since is passed).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
+        days: u32,
+        /// Replay start time: an RFC 3339 timestamp, date (YYYY-MM-DD), or duration back (e.g. 7d, 48h).
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1000,7 +1029,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
+fn admin(cmd: AdminCommand, json: bool) -> anyhow::Result<()> {
     match cmd {
         AdminCommand::Device { name, user, db } => {
             let token = board_server::create_device(&db, &name, user)?;
@@ -1021,6 +1050,36 @@ fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
         AdminCommand::Backup { db, out } => {
             board_server::backup(&db, &out)?;
             eprintln!("board: wrote {}", out.display());
+        }
+        AdminCommand::ReplaySchedule {
+            db,
+            policy,
+            days,
+            since,
+        } => {
+            let now = chrono::Utc::now();
+            let since = since
+                .as_deref()
+                .map(|s| ops::parse_since(s, now))
+                .transpose()?;
+            let candidate = policy
+                .as_deref()
+                .map(board_server::load_policy_config)
+                .transpose()?;
+            let cmp = board_server::replay_schedule(
+                &db,
+                board_server::ReplayOptions {
+                    since,
+                    until: now,
+                    days,
+                    candidate,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cmp)?);
+            } else {
+                println!("{}", ops::render_replay_comparison(&cmp));
+            }
         }
         AdminCommand::DeviceUpdate { .. } => {
             unreachable!("handled over HTTP in dispatch")
@@ -1210,7 +1269,7 @@ pub async fn run(cli: Cli) -> i32 {
             return report(serve(&config).await);
         }
         Command::Admin(cmd) if !matches!(cmd, AdminCommand::DeviceUpdate { .. }) => {
-            return report(admin(cmd));
+            return report(admin(cmd, cli.json));
         }
         _ => {}
     }
@@ -1606,7 +1665,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let req = ResolveFeedback { kind, task, reason };
             ops::resolve(&ctx()?, &id, req).await?
         }
-        Command::Stats { days } => ops::stats(&ctx()?, days, chrono::Utc::now()).await?,
+        Command::Stats {
+            days,
+            scheduler,
+            board,
+            policy_version,
+        } => {
+            if scheduler {
+                ops::scheduler_stats(&ctx()?, days, board.as_ref(), policy_version.as_deref())
+                    .await?
+            } else {
+                ops::stats(&ctx()?, days, chrono::Utc::now()).await?
+            }
+        }
         Command::Errors {
             since,
             code,
@@ -2027,5 +2098,69 @@ mod tests {
         ] {
             assert!(parse_taint(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn scheduler_stats_and_replay_schedule_commands_parse_cleanly() {
+        let cli = Cli::try_parse_from([
+            "board",
+            "stats",
+            "--scheduler",
+            "--days",
+            "14",
+            "--board",
+            "factory",
+            "--policy-version",
+            "v1-default",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Command::Stats {
+            days,
+            scheduler,
+            board,
+            policy_version,
+        } = cli.command
+        else {
+            panic!("expected stats");
+        };
+        assert_eq!(days, 14);
+        assert!(scheduler);
+        assert_eq!(board.as_ref().map(BoardSlug::as_str), Some("factory"));
+        assert_eq!(policy_version.as_deref(), Some("v1-default"));
+
+        // --board without --scheduler is refused.
+        assert!(Cli::try_parse_from(["board", "stats", "--board", "factory"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "admin",
+            "replay-schedule",
+            "--db",
+            "/tmp/board.db",
+            "--policy",
+            "/tmp/candidate.toml",
+            "--days",
+            "14",
+            "--since",
+            "7d",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Command::Admin(AdminCommand::ReplaySchedule {
+            db,
+            policy,
+            days,
+            since,
+        }) = cli.command
+        else {
+            panic!("expected admin replay-schedule");
+        };
+        assert_eq!(db, PathBuf::from("/tmp/board.db"));
+        assert_eq!(policy, Some(PathBuf::from("/tmp/candidate.toml")));
+        assert_eq!(days, 14);
+        assert_eq!(since.as_deref(), Some("7d"));
     }
 }

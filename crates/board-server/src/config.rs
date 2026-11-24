@@ -344,6 +344,21 @@ pub struct Settings {
     /// Grace period before pending sticky wakes and `waiting_external` runs on a stale
     /// device fall back to the global pool.
     pub sticky_grace_secs: u64,
+    /// Ready `auto` task matching zero online untainted devices for this long fires
+    /// `signal:scheduler:unschedulable` on `feedback_board`.
+    pub unschedulable_after_secs: u64,
+    /// A board's ready `auto` task waiting this long while other boards claim runs fires
+    /// `signal:scheduler:starvation` on `feedback_board`.
+    pub starvation_after_secs: u64,
+    /// Orphaned runs on one device within a rolling 1-hour window that fire
+    /// `signal:scheduler:orphan_storm`.
+    pub orphan_storm_count: u32,
+    /// Percentage of active hours held by one `conflict_key` (with at least 3 holds) that
+    /// fires `signal:scheduler:conflict_hot`.
+    pub conflict_hot_percent: u32,
+    /// Fast `failed` runs (`running_secs <= 30` or never started) on one `(device, runner)`
+    /// within a rolling 1-hour window that fire `signal:runner:spawn_fail`.
+    pub spawn_fail_count: u32,
 }
 
 impl Default for Settings {
@@ -384,6 +399,11 @@ impl Default for Settings {
             device_stale_secs: board_proto::DEVICE_STALE_SECS_DEFAULT,
             run_lease_ttl_secs: board_proto::RUN_LEASE_TTL_SECS_DEFAULT,
             sticky_grace_secs: board_proto::STICKY_GRACE_SECS_DEFAULT,
+            unschedulable_after_secs: 3600,
+            starvation_after_secs: 6 * 3600,
+            orphan_storm_count: 3,
+            conflict_hot_percent: 30,
+            spawn_fail_count: 3,
         }
     }
 }
@@ -433,6 +453,11 @@ impl Settings {
             ("device_stale_secs", self.device_stale_secs),
             ("run_lease_ttl_secs", self.run_lease_ttl_secs),
             ("sticky_grace_secs", self.sticky_grace_secs),
+            ("unschedulable_after_secs", self.unschedulable_after_secs),
+            ("starvation_after_secs", self.starvation_after_secs),
+            ("orphan_storm_count", u64::from(self.orphan_storm_count)),
+            ("conflict_hot_percent", u64::from(self.conflict_hot_percent)),
+            ("spawn_fail_count", u64::from(self.spawn_fail_count)),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -446,6 +471,11 @@ impl Settings {
             return Err(Error::Config(
                 "defaults.snapshot_delta_chars and snapshot_alerts_chars must be at least 200"
                     .into(),
+            ));
+        }
+        if self.conflict_hot_percent > 100 {
+            return Err(Error::Config(
+                "defaults.conflict_hot_percent must be at most 100".into(),
             ));
         }
         Ok(())
@@ -503,6 +533,14 @@ impl Settings {
 
     pub(crate) fn sticky_grace_ms(&self) -> i64 {
         secs_ms(self.sticky_grace_secs)
+    }
+
+    pub(crate) fn unschedulable_after_ms(&self) -> i64 {
+        secs_ms(self.unschedulable_after_secs)
+    }
+
+    pub(crate) fn starvation_after_ms(&self) -> i64 {
+        secs_ms(self.starvation_after_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

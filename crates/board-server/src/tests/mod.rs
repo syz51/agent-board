@@ -15,6 +15,7 @@ mod leases;
 mod query_cost;
 mod reads;
 mod runs;
+mod scheduler_telemetry;
 mod snapshot;
 mod tasks;
 mod telegram;
@@ -373,6 +374,30 @@ impl T {
                 || self.state.now(),
                 self.state.settings(),
                 crate::ops::runs::sweep_expired,
+            )
+            .unwrap()
+    }
+
+    /// Runs the sweeper's automated scheduler pathology detector.
+    pub fn sweep_pathologies(&self) -> crate::PathologySweepSummary {
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                crate::ops::pathology::sweep_pathologies,
+            )
+            .unwrap()
+    }
+
+    /// Runs the sweeper's signal/hold retention pruner.
+    pub fn prune_signals(&self) -> usize {
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                |cx| crate::ops::feedback::prune_signals(cx),
             )
             .unwrap()
     }

@@ -6,11 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
-    DeviceCapacity, DeviceName, DeviceRole, Dispatch, DispatchHoldSummary, Event, Evidence,
-    EvidenceKind, FeedbackActivity, FeedbackSource, HousekeepingAction, JudgeKind, NoteKind,
-    Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunKind, RunOrigin, RunState,
-    Runtime, Said, ScoreBreakdown, Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus,
-    Timestamp, UsageWindow, default_run_cost_units,
+    DeviceCapacity, DeviceName, DeviceRole, DeviceStatus, Dispatch, DispatchHoldSummary, Event,
+    Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, HousekeepingAction, JudgeKind,
+    NoteKind, Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunKind, RunOrigin,
+    RunState, Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint,
+    TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow,
+    default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -1194,6 +1195,178 @@ pub struct DispatchClaimResponse {
     pub holds_summary: Vec<DispatchHoldSummary>,
 }
 
+/// Answer to `GET /v1/scheduler/policy`. Flattens the active [`SchedulerPolicy`] and
+/// optionally includes recent policy versions when `?history=true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerPolicyResponse {
+    #[serde(flatten)]
+    pub policy: SchedulerPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<SchedulerPolicy>,
+}
+
+/// `PUT /v1/scheduler/policy`: creates and activates a new immutable versioned policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PutSchedulerPolicy {
+    pub version: String,
+    #[serde(default)]
+    pub weights: SchedulerWeights,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_grace_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Sample count and nearest-rank percentiles (`p50`, `p90`) for a latency metric in seconds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LatencyPercentiles {
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<f64>,
+}
+
+/// Per-device utilization and reliability breakdown inside [`SchedulerStats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceSchedulerStats {
+    pub device: DeviceName,
+    pub status: DeviceStatus,
+    pub runs: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub orphaned: u32,
+    pub weight_unit_minutes: f64,
+}
+
+/// Per-board scheduling wait, fair-share, and hold breakdown inside [`SchedulerStats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardSchedulerStats {
+    pub board: BoardSlug,
+    pub runs: u32,
+    pub succeeded: u32,
+    pub orphaned: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_to_leased_p50_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_to_leased_p90_secs: Option<f64>,
+    pub weight_unit_minutes: f64,
+    /// Board's percentage of total `weight_unit_minutes` across boards in this window.
+    pub fair_share_percent: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub holds_by_reason: BTreeMap<String, u32>,
+}
+
+/// Per-`policy_version` cohort metrics inside [`SchedulerStats`] for before/after evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyVersionStats {
+    pub policy_version: String,
+    pub runs: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub orphaned: u32,
+    pub orphan_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_to_leased_p50_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_to_leased_p90_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_p50_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_pass_merge_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_cache_hit_rate: Option<f64>,
+    pub total_weight_unit_minutes: f64,
+}
+
+/// Answer to `GET /v1/stats/scheduler?days=7&board=&policy_version=`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerStats {
+    pub days: u32,
+    pub since: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSlug>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    pub runs_total: u32,
+    #[serde(default)]
+    pub runs_by_kind: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub runs_by_terminal_state: BTreeMap<String, u32>,
+    pub orphan_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_pass_merge_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_cache_hit_rate: Option<f64>,
+    pub ready_to_leased_secs: LatencyPercentiles,
+    pub leased_to_running_secs: LatencyPercentiles,
+    pub running_secs: LatencyPercentiles,
+    pub conflict_wait_secs: LatencyPercentiles,
+    pub total_weight_unit_minutes: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_ci_runs_before_merge: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_review_rounds: Option<f64>,
+    #[serde(default)]
+    pub per_device: Vec<DeviceSchedulerStats>,
+    #[serde(default)]
+    pub per_board: Vec<BoardSchedulerStats>,
+    #[serde(default)]
+    pub per_policy_version: Vec<PolicyVersionStats>,
+    #[serde(default)]
+    pub holds_by_reason: BTreeMap<String, u32>,
+}
+
+fn default_candidate_version() -> String {
+    "candidate".to_owned()
+}
+
+/// Candidate policy file format for `board admin replay-schedule --policy <file>` (TOML or JSON).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayPolicyConfig {
+    #[serde(default = "default_candidate_version")]
+    pub version: String,
+    #[serde(default)]
+    pub weights: SchedulerWeights,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_grace_secs: Option<u64>,
+}
+
+/// Metrics produced by one deterministic policy pass of `board admin replay-schedule`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayMetrics {
+    pub policy_version: String,
+    pub tasks_scheduled: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_wait_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_wait_secs: Option<f64>,
+    /// Gini coefficient of per-board scheduled `weight_unit_minutes` (`0.0` = equal, `1.0` = max skew).
+    pub fair_share_gini: f64,
+    pub conflict_blocks: u32,
+    pub backfill_count: u32,
+    pub locality_hits: u32,
+}
+
+/// Side-by-side output of `board admin replay-schedule`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayComparison {
+    pub since: Timestamp,
+    pub until: Timestamp,
+    pub days: u32,
+    pub historical_tasks: u32,
+    pub historical_runs: u32,
+    pub devices_count: u32,
+    pub boards_count: u32,
+    pub baseline: ReplayMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<ReplayMetrics>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -1922,5 +2095,56 @@ mod tests {
             backfill: 6.0,
         };
         assert!((sb.total() - 158.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scheduler_policy_telemetry_and_replay_types_preserve_compatibility() {
+        use crate::{
+            EventType, PutSchedulerPolicy, ReplayPolicyConfig, SchedulerPolicy,
+            SchedulerPolicyResponse, SchedulerWeights,
+        };
+
+        assert_eq!(
+            serde_json::to_value(EventType::SchedulerPolicyUpdated).unwrap(),
+            "scheduler_policy_updated"
+        );
+        let default_weights: SchedulerWeights =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default_weights, SchedulerWeights::default());
+        assert_eq!(default_weights.w_kind, 100.0);
+        assert_eq!(default_weights.w_backfill, 6.0);
+
+        let put: PutSchedulerPolicy =
+            serde_json::from_value(serde_json::json!({ "version": "v2-fair" })).unwrap();
+        assert_eq!(put.weights, SchedulerWeights::default());
+        assert_eq!(put.lease_ttl_secs, None);
+        assert_eq!(put.sticky_grace_secs, None);
+
+        // SchedulerPolicyResponse flattens SchedulerPolicy cleanly so older clients reading
+        // SchedulerPolicy work whether or not `history` is included.
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let resp = SchedulerPolicyResponse {
+            policy: SchedulerPolicy {
+                version: "v1-default".into(),
+                weights: SchedulerWeights::default(),
+                lease_ttl_secs: 180,
+                sticky_grace_secs: 600,
+                notes: Some("default".into()),
+                active: true,
+                created_by: Some("server".into()),
+                created_at: now,
+            },
+            history: Vec::new(),
+        };
+        let val = serde_json::to_value(&resp).unwrap();
+        assert!(val.get("history").is_none(), "{val}");
+        let plain: SchedulerPolicy = serde_json::from_value(val).unwrap();
+        assert_eq!(plain, resp.policy);
+
+        let candidate: ReplayPolicyConfig =
+            serde_json::from_value(serde_json::json!({ "weights": { "w_fair": 40.0 } })).unwrap();
+        assert_eq!(candidate.version, "candidate");
+        assert_eq!(candidate.weights.w_fair, 40.0);
+        assert_eq!(candidate.weights.w_kind, 100.0);
     }
 }

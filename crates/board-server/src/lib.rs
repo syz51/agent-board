@@ -35,6 +35,8 @@ pub use config::{ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig};
 pub use db::Db;
 pub use error::Error;
 pub use ops::devices::DeviceInfo;
+pub use ops::pathology::PathologySweepSummary;
+pub use ops::replay::{ReplayOptions, load_policy_config, replay_schedule};
 pub use state::AppState;
 pub use telegram::spawn_telegram;
 pub use text::frame_peer_text;
@@ -142,6 +144,11 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                         .await;
                     if let Err(error) = swept {
                         tracing::error!(%error, "sweep failed");
+                    }
+                    // Run pathology detection in its own isolated write transaction so a
+                    // failure never blocks leases, run expiry, notices, or pruning.
+                    if let Err(error) = state.write(ops::pathology::sweep_pathologies).await {
+                        tracing::error!(%error, "pathology sweep failed");
                     }
                     sweep_temporary(&state).await;
                     if let Err(error) = prune_history(&state).await {

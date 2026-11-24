@@ -47,6 +47,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0030_board_verdict_judges.sql"),
     include_str!("../migrations/0031_device_capabilities_and_usage.sql"),
     include_str!("../migrations/0032_runs_and_coordination.sql"),
+    include_str!("../migrations/0033_scheduler_policy.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -322,7 +323,7 @@ pub(crate) fn open_file(path: &Path) -> Result<Connection> {
 
 /// A read-only connection to a database the writer has opened and migrated, set up as the
 /// writer is, so reads can call the same SQL functions.
-fn open_reader(path: &Path) -> Result<Connection> {
+pub(crate) fn open_reader(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         // As `Connection::open` does for the writer, so both read a `file:` URI path alike.
@@ -331,6 +332,18 @@ fn open_reader(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     configure(&conn)?;
+    Ok(conn)
+}
+
+/// Opens an existing SQLite database strictly read-only (`PRAGMA query_only = ON`) without
+/// running migrations or taking a write lock. Used by offline replay tools.
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "query_only", "ON")?;
     Ok(conn)
 }
 

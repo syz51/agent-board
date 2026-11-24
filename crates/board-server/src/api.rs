@@ -15,10 +15,11 @@ use board_proto::{
     ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun,
     CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken,
     DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, FeedbackResult,
-    Handoff, Judge, LeaseResult, MarkSeen, Note, PutHandoff, PutUsageBucket, PutUsageBucketReserve,
-    RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run,
-    RunFilter, RunId, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, StickyWake,
-    Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    Handoff, Judge, LeaseResult, MarkSeen, Note, PutHandoff, PutSchedulerPolicy, PutUsageBucket,
+    PutUsageBucketReserve, RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Run, RunFilter, RunId, Said, SchedulerPolicy, SchedulerPolicyResponse,
+    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, StickyWake, Task,
+    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
     UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
@@ -28,8 +29,8 @@ use crate::auth::Caller;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
-    agents, asks, boards, devices, dispatch, feedback, judges, leases, runs, stats, tasks, updates,
-    usage,
+    agents, asks, boards, devices, dispatch, feedback, judges, leases, policy, runs, stats, tasks,
+    updates, usage,
 };
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
@@ -91,6 +92,11 @@ pub(crate) fn router(state: AppState) -> Router {
             get(list_judges).post(register_judge),
         )
         .route("/stats", get(show_stats))
+        .route("/stats/scheduler", get(show_scheduler_stats))
+        .route(
+            "/scheduler/policy",
+            get(show_scheduler_policy).put(put_scheduler_policy),
+        )
         .route("/usage", get(show_usage).put(report_usage))
         .route("/usage/reserve", get(show_reserve).put(set_reserve))
         .route("/usage/buckets", get(list_usage_buckets))
@@ -569,6 +575,67 @@ async fn show_stats(
 ) -> Result<Json<Stats>> {
     let days = stats::validate_days(q.days)?;
     Ok(Json(state.read(move |cx| stats::stats(cx, days)).await?))
+}
+
+#[derive(Deserialize)]
+struct SchedulerStatsQuery {
+    days: Option<u32>,
+    board: Option<BoardSlug>,
+    policy_version: Option<String>,
+}
+
+async fn show_scheduler_stats(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<SchedulerStatsQuery>,
+) -> Result<Json<SchedulerStats>> {
+    let days = stats::validate_days(q.days)?;
+    let policy_version = q
+        .policy_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| devices::check_token("policy_version", s, 64))
+        .transpose()?;
+    Ok(Json(
+        state
+            .read(move |cx| {
+                stats::scheduler_stats(cx, days, q.board.as_ref(), policy_version.as_deref())
+            })
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PolicyQuery {
+    #[serde(default)]
+    history: bool,
+}
+
+async fn show_scheduler_policy(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<PolicyQuery>,
+) -> Result<Json<SchedulerPolicyResponse>> {
+    Ok(Json(
+        state.read(move |cx| policy::get(cx, q.history)).await?,
+    ))
+}
+
+async fn put_scheduler_policy(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<PutSchedulerPolicy>,
+) -> Result<Json<SchedulerPolicy>> {
+    let req = policy::validate_put(req)?;
+    let actor = run_actor(&caller);
+    let by_user = caller.is_user();
+    let caller_agent = caller.agent.clone();
+    Ok(Json(
+        state
+            .write(move |cx| policy::put(cx, &actor, by_user, caller_agent.as_ref(), req))
+            .await?,
+    ))
 }
 
 /// `GET /v1/usage`: the newest account usage a device reported, or `null`.

@@ -274,6 +274,19 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   interactive runs move `running ↔ waiting_external` on `Stop`/`UserPromptSubmit`/`PostToolUse`
   and close to `succeeded` on `SessionEnd` or `end_unseen`, keep `task_id` synchronized with
   the agent's current `doing` task, and never duplicate a daemon-managed run.
+- **Scheduler telemetry, automated pathology signals, versioned policy, and offline replay**
+  (Slice 4.4 of `docs/SCHEDULER_DESIGN.md`): every terminal `Run` (via `PATCH /v1/runs/{id}`,
+  `sweep_expired`, or interactive end) atomically records a structured `run_outcomes` row in
+  the same transaction. `POST /v1/dispatch/claim` reads all 8 multifactor weights and lease
+  TTLs from the active versioned `scheduler_policies` snapshot (`GET/PUT /v1/scheduler/policy`),
+  stamps `policy_version` on every leased run, and records hourly-deduplicated
+  `scheduler_holds` (pruned after 35 days). `GET /v1/stats/scheduler` (`board stats
+  --scheduler`) aggregates latencies (`p50`/`p90`), orphan/first-pass/cache rates, holds,
+  and per-device, per-board fair-share, and per-`policy_version` cohort breakdowns. The
+  minute sweeper runs isolated pathology detection (`unschedulable`, `starvation`,
+  `orphan_storm`, `conflict_hot`, `spawn_fail`) routing deduplicated `signal` items to
+  `feedback_board`, and `board admin replay-schedule` opens a `board.db` strictly read-only
+  to deterministically simulate baseline vs. candidate policies before proposing changes.
 
 ### Order inside a priority level
 
