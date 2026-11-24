@@ -1292,6 +1292,10 @@ pub struct Daemon<T: T3 + 'static> {
     run_events_unsupported: bool,
     /// Set once the server answers 404/405 to per-provider usage bucket endpoints.
     usage_buckets_unsupported: bool,
+    /// True when `self.usage` currently holds a legacy `anthropic/default` fallback reading
+    /// rather than a reading from this daemon's own `quota_bucket()` (so `follows()` must
+    /// never reject genuine local snapshots from another provider).
+    usage_from_fallback: bool,
     /// True once startup/reconnect reconciliation of orphaned local transcript files has run.
     orphaned_transcripts_checked: bool,
     /// Run ids already archived (or confirmed not needing archival) in this daemon process.
@@ -1428,6 +1432,7 @@ impl<T: T3 + 'static> Daemon<T> {
             wakes_unsupported: false,
             run_events_unsupported: false,
             usage_buckets_unsupported: false,
+            usage_from_fallback: false,
             orphaned_transcripts_checked: false,
             archived_transcripts: BTreeSet::new(),
             merge_retry_after: None,
@@ -3103,16 +3108,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     .chain(std::iter::once(detail.task.updated_at))
                     .max()
                     .unwrap_or(detail.task.updated_at);
-                let prep = if let Some(until) =
-                    self.review_waits
-                        .active_until_for(&detail.task.id, now, observed_at)
+                let (wt, worktree_note) = match self
+                    .prepare_claimed_review_worktree(&board, detail, &project, now)
+                    .await?
                 {
-                    ReviewPrep::WaitForPr(until)
-                } else {
-                    self.prepare_claimed_review_worktree(&board, detail, &project, now)
-                        .await?
-                };
-                let (wt, worktree_note) = match prep {
                     ReviewPrep::Ready(wt, note) => (wt, note),
                     ReviewPrep::WaitForPr(until) => {
                         let reason = format!(
@@ -7302,22 +7301,23 @@ impl<T: T3 + 'static> Daemon<T> {
     /// then holds nothing.
     async fn refresh_usage(&mut self, now: Timestamp) {
         let mut reading = None;
+        let mut report_provider: Option<&'static str> = None;
+        let own_known = (!self.usage_from_fallback)
+            .then_some(self.usage.as_ref())
+            .flatten();
         if let UsageSource::ClaudeCode {
             url,
             credentials,
             snapshots,
         } = &self.usage_source
         {
+            report_provider = Some(board_proto::LEGACY_USAGE_PROVIDER);
             let every = self.usage_poll_every(now);
             let snapshot = crate::usage::read_snapshots(snapshots, now)
                 .await
                 .into_iter()
                 .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
-                .filter(|s| {
-                    self.usage
-                        .as_ref()
-                        .is_none_or(|known| crate::usage::follows(s, known))
-                })
+                .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
                 .max_by_key(|s| s.read_at);
             let wait = if snapshot.is_some() && every > USAGE_POLL_NEAR {
                 USAGE_CHECK_EVERY
@@ -7356,27 +7356,24 @@ impl<T: T3 + 'static> Daemon<T> {
             if reading.is_none()
                 && let Some(snapshot) = snapshot.filter(|s| {
                     self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
-                        && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+                        && own_known.is_none_or(|k| s.read_at > k.read_at)
                 })
             {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
             }
         } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
+            report_provider = Some("antigravity");
             let every = self.usage_poll_every(now);
             let snapshot = crate::usage::read_snapshots(snapshots, now)
                 .await
                 .into_iter()
                 .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
-                .filter(|s| {
-                    self.usage
-                        .as_ref()
-                        .is_none_or(|known| crate::usage::follows(s, known))
-                })
+                .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
                 .max_by_key(|s| s.read_at);
             if let Some(snapshot) = snapshot.filter(|s| {
                 self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
-                    && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+                    && own_known.is_none_or(|k| s.read_at > k.read_at)
             }) {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
@@ -7386,14 +7383,20 @@ impl<T: T3 + 'static> Daemon<T> {
         let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
             && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
         let mut reported = None;
-        if let Some(report) = reading {
+        if let (Some(report), Some(provider)) = (reading, report_provider) {
             let res = if self.usage_buckets_unsupported {
-                self.client().report_usage(&report).await
+                if provider == board_proto::LEGACY_USAGE_PROVIDER {
+                    self.client().report_usage(&report).await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "server does not support per-provider usage buckets for {provider}"
+                    ))
+                }
             } else {
                 let bucket_req = board_proto::PutUsageBucket::from(report.clone());
                 match self
                     .client()
-                    .put_usage_bucket(&bucket_ref.provider, &bucket_ref.account, &bucket_req)
+                    .put_usage_bucket(provider, &bucket_ref.account, &bucket_req)
                     .await
                 {
                     Ok(bucket) => Ok(bucket.as_usage().unwrap_or_else(|| Usage {
@@ -7401,7 +7404,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         seven_day: report.seven_day,
                         read_at: report.read_at,
                         device: self.ctx.device.clone(),
-                        pace: self.usage.as_ref().and_then(|u| u.pace),
+                        pace: own_known.and_then(|u| u.pace),
                     })),
                     Err(err) if is_heartbeat_unsupported(&err) => {
                         self.usage_buckets_unsupported = true;
@@ -7410,7 +7413,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Err(err) => Err(err),
                 }
             };
-            reported = Some(match res {
+            let usage = match res {
                 Ok(usage) => usage,
                 Err(err) => {
                     tracing::warn!("reporting the usage: {err:#}");
@@ -7422,45 +7425,59 @@ impl<T: T3 + 'static> Daemon<T> {
                         device: self.ctx.device.clone(),
                         // The server computes the pace: keep the last one it gave, so
                         // a failed report does not lift its hold.
-                        pace: self.usage.as_ref().and_then(|u| u.pace),
+                        pace: own_known.and_then(|u| u.pace),
                     }
                 }
-            });
+            };
+            if provider == bucket_ref.provider {
+                reported = Some(usage);
+            }
         }
         match reported {
-            Some(usage) => self.usage = Some(usage),
+            Some(usage) => {
+                self.usage = Some(usage);
+                self.usage_from_fallback = false;
+            }
             None if is_legacy_bucket || self.usage_buckets_unsupported => {
                 match self.client().usage().await {
-                    Ok(Some(usage)) => self.usage = Some(usage),
+                    Ok(Some(usage)) => {
+                        self.usage = Some(usage);
+                        self.usage_from_fallback = !is_legacy_bucket;
+                    }
                     Ok(None) => {}
                     Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
                 }
             }
             None => match self.client().list_usage_buckets().await {
                 Ok(buckets) => {
-                    let matched = buckets
+                    if let Some(usage) = buckets
                         .iter()
                         .find(|b| {
                             b.provider == bucket_ref.provider && b.account == bucket_ref.account
                         })
                         .and_then(|b| b.as_usage())
-                        .or_else(|| {
-                            buckets
-                                .iter()
-                                .find(|b| {
-                                    b.provider == board_proto::LEGACY_USAGE_PROVIDER
-                                        && b.account == board_proto::LEGACY_USAGE_ACCOUNT
-                                })
-                                .and_then(|b| b.as_usage())
-                        });
-                    if let Some(usage) = matched {
+                    {
                         self.usage = Some(usage);
+                        self.usage_from_fallback = false;
+                    } else if let Some(usage) = buckets
+                        .iter()
+                        .find(|b| {
+                            b.provider == board_proto::LEGACY_USAGE_PROVIDER
+                                && b.account == board_proto::LEGACY_USAGE_ACCOUNT
+                        })
+                        .and_then(|b| b.as_usage())
+                    {
+                        self.usage = Some(usage);
+                        self.usage_from_fallback = true;
                     }
                 }
                 Err(err) if is_heartbeat_unsupported(&err) => {
                     self.usage_buckets_unsupported = true;
                     match self.client().usage().await {
-                        Ok(Some(usage)) => self.usage = Some(usage),
+                        Ok(Some(usage)) => {
+                            self.usage = Some(usage);
+                            self.usage_from_fallback = !is_legacy_bucket;
+                        }
                         Ok(None) => {}
                         Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
                     }
@@ -7983,7 +8000,12 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let usage_source = UsageSource::for_provider(ctx.config.usage_provider());
+    let quota_provider = ctx.config.quota_bucket().provider;
+    let usage_source = UsageSource::for_provider(
+        ctx.config
+            .usage_provider()
+            .or_else(|| (quota_provider == "antigravity").then_some("antigravity")),
+    );
     let host_memory = device::host_memory();
     if host_memory.is_none() {
         tracing::warn!(
@@ -8333,23 +8355,9 @@ impl ReviewWaitBackoff {
         !self.waits.is_empty()
     }
 
-    fn active_until_for(
-        &mut self,
-        task: &TaskId,
-        now: Timestamp,
-        observed_at: Timestamp,
-    ) -> Option<Timestamp> {
-        self.waits.retain(|_, entry| now < entry.until);
-        let entry = self.waits.get(task)?;
-        if observed_at > entry.observed_at {
-            self.waits.remove(task);
-            return None;
-        }
-        Some(entry.until)
-    }
-
     /// Returns `true` when a waiting task's entry was cleared by `event` (so the caller
-    /// should reconcile promptly, e.g. right after a PR note lands on the waiting task).
+    /// should reconcile promptly, e.g. right after a PR note lands on the waiting task or
+    /// the task leaves `review`).
     fn on_event(&mut self, event: &Event) -> bool {
         let Some(task) = event.task.as_ref() else {
             return false;
@@ -8359,7 +8367,11 @@ impl ReviewWaitBackoff {
         };
         let clear = match event.event_type {
             EventType::TaskDone => true,
-            EventType::NoteAdded | EventType::TaskUpdated => event.at > entry.observed_at,
+            EventType::NoteAdded
+            | EventType::TaskUpdated
+            | EventType::TaskClaimed
+            | EventType::TaskTaken
+            | EventType::TaskReleased => event.at > entry.observed_at,
             _ => false,
         };
         if clear {
@@ -8734,16 +8746,15 @@ mod tests {
 
         backoff.record(waiting_task.clone(), until, t0);
         assert!(backoff.has_active_wait(t0 + TimeDelta::seconds(5)));
-        assert_eq!(
-            backoff.active_until_for(&waiting_task, t0 + TimeDelta::seconds(5), t0),
-            Some(until)
-        );
 
         // Events on UNRELATED tasks must never clear the wait (prevents spin-claim-cancel loop).
         for kind in [
             EventType::TaskUpdated,
             EventType::NoteAdded,
             EventType::TaskDone,
+            EventType::TaskClaimed,
+            EventType::TaskTaken,
+            EventType::TaskReleased,
         ] {
             let ev = make_event(kind, Some(other_task.clone()), t0 + TimeDelta::seconds(10));
             assert!(!backoff.on_event(&ev));
@@ -8773,21 +8784,275 @@ mod tests {
         assert!(backoff.on_event(&pr_note));
         assert!(!backoff.has_active_wait(t0 + TimeDelta::seconds(20)));
 
+        // Claiming/taking/releasing the waiting task out of review clears it immediately.
+        for kind in [
+            EventType::TaskClaimed,
+            EventType::TaskTaken,
+            EventType::TaskReleased,
+        ] {
+            backoff.record(waiting_task.clone(), until, t0 + TimeDelta::seconds(20));
+            let ev = make_event(
+                kind,
+                Some(waiting_task.clone()),
+                t0 + TimeDelta::seconds(25),
+            );
+            assert!(backoff.on_event(&ev));
+            assert!(!backoff.has_active_wait(t0 + TimeDelta::seconds(25)));
+        }
+
         // Re-record wait and verify deadline expiry clears it once `now >= until`.
         backoff.record(waiting_task.clone(), until, t0 + TimeDelta::seconds(20));
         assert!(backoff.has_active_wait(until - TimeDelta::seconds(1)));
         assert!(!backoff.has_active_wait(until));
+    }
 
-        // Re-record wait and verify active_until_for also clears if fresh TaskDetail has newer observed_at.
-        backoff.record(waiting_task.clone(), until, t0 + TimeDelta::seconds(20));
-        assert_eq!(
-            backoff.active_until_for(
-                &waiting_task,
-                t0 + TimeDelta::seconds(30),
-                t0 + TimeDelta::seconds(25)
+    #[tokio::test]
+    async fn refresh_usage_routes_by_source_avoids_fallback_follows_trap_and_downgrades_on_404() {
+        use axum::{Router, extract::State, routing::any};
+        use std::sync::{Arc, Mutex};
+
+        type StubResponses = BTreeMap<(String, String), (StatusCode, serde_json::Value)>;
+
+        #[derive(Clone, Default)]
+        struct StubState {
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+            responses: Arc<Mutex<StubResponses>>,
+        }
+
+        async fn handler(
+            State(state): State<StubState>,
+            req: axum::extract::Request,
+        ) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let key = (
+                req.method().as_str().to_owned(),
+                req.uri().path().to_owned(),
+            );
+            state.requests.lock().unwrap().push(key.clone());
+            if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
+                (status, axum::Json(body))
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({ "code": "not_found", "message": "missing" })),
+                )
+            }
+        }
+
+        let state = StubState::default();
+        let app = Router::new()
+            .route("/{*path}", any(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let antigravity_cache = dir.path().join("antigravity.json");
+        let claude_cache = dir.path().join("claudeAgent.json");
+
+        let make_daemon = |cfg: Config, source: UsageSource| {
+            let mut cfg = cfg;
+            cfg.server = Some(format!("http://{addr}"));
+            cfg.device = Some("test-mac".parse().unwrap());
+            let client = Client::new(
+                cfg.server.as_deref().unwrap(),
+                "test-token".to_owned(),
+                None,
+                None,
+            )
+            .unwrap();
+            let ctx = Ctx {
+                home: home.clone(),
+                config: cfg,
+                device: "test-mac".parse().unwrap(),
+                repo: crate::identity::RepoInfo::default(),
+                known: None,
+                client,
+            };
+            let mut daemon = Daemon::new(ctx, T3Cli::locate(None));
+            daemon.usage_source = source;
+            daemon
+        };
+
+        // 1. Antigravity daemon with no antigravity/default reading yet falls back to
+        //    anthropic/default on poll, sets usage_from_fallback=true, and then STILL accepts
+        //    a genuine lower-usage Antigravity local snapshot (not blocked by follows()).
+        state.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!([{
+                    "provider": "anthropic",
+                    "account": "default",
+                    "five_hour": { "percent": 85.0, "resets_at": "2026-11-24T16:00:00Z" },
+                    "seven_day": { "percent": 60.0, "resets_at": "2026-11-29T12:00:00Z" },
+                    "read_at": "2026-11-24T11:59:00Z",
+                    "device": "other-mac",
+                    "reserve": 5.0
+                }]),
             ),
-            None
         );
-        assert!(!backoff.has_active_wait(t0 + TimeDelta::seconds(30)));
+        state.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-24T15:00:00Z" },
+                    "seven_day": { "percent": 20.0, "resets_at": "2026-11-27T12:00:00Z" },
+                    "read_at": "2026-11-24T11:59:30Z",
+                    "device": "test-mac",
+                    "reserve": 5.0
+                }),
+            ),
+        );
+
+        let ag_cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        let mut daemon = make_daemon(
+            ag_cfg.clone(),
+            UsageSource::Antigravity {
+                snapshots: vec![antigravity_cache.clone()],
+            },
+        );
+        daemon.refresh_usage(now).await;
+        assert!(daemon.usage_from_fallback);
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().five_hour.unwrap().percent,
+            85.0
+        );
+
+        // Now write a lower-usage local Antigravity snapshot (10% / 20%, earlier reset).
+        // Because usage_from_fallback is true, follows() must NOT reject it!
+        std::fs::write(
+            &antigravity_cache,
+            serde_json::json!({
+                "driver": "antigravity",
+                "instanceId": "antigravity",
+                "usageLimits": {
+                    "checkedAt": "2026-11-24T11:59:30Z",
+                    "credentialFingerprint": "fp-test",
+                    "windows": [
+                        { "id": "gemini-5h", "kind": "session", "usedPercent": 10.0, "resetsAt": "2026-11-24T15:00:00Z" },
+                        { "id": "gemini-weekly", "kind": "weekly", "usedPercent": 20.0, "resetsAt": "2026-11-27T12:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        daemon.refresh_usage(now).await;
+        assert!(!daemon.usage_from_fallback);
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().five_hour.unwrap().percent,
+            10.0
+        );
+        assert!(
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "expected PUT /v1/usage/antigravity/default: {:?}",
+            state.requests.lock().unwrap()
+        );
+
+        // 2. A ClaudeCode usage source on a non-anthropic config must report to
+        //    /v1/usage/anthropic/default, NEVER poisoning /v1/usage/antigravity/default.
+        state.requests.lock().unwrap().clear();
+        state.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/anthropic/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "anthropic",
+                    "account": "default",
+                    "five_hour": { "percent": 42.0, "resets_at": "2026-11-24T16:00:00Z" },
+                    "read_at": "2026-11-24T11:59:40Z",
+                    "device": "test-mac"
+                }),
+            ),
+        );
+        std::fs::write(
+            &claude_cache,
+            serde_json::json!({
+                "driver": "claudeAgent",
+                "auth": { "workspaceId": "ws-1" },
+                "usageLimits": {
+                    "checkedAt": "2026-11-24T11:59:40Z",
+                    "windows": [
+                        { "id": "five_hour", "usedPercent": 42.0, "resetsAt": "2026-11-24T16:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut mixed = make_daemon(
+            ag_cfg.clone(),
+            UsageSource::ClaudeCode {
+                url: format!("http://{addr}/unused"),
+                credentials: crate::usage::Credentials::File(dir.path().join("missing-creds")),
+                snapshots: vec![claude_cache],
+            },
+        );
+        mixed.usage_polled = Some(now);
+        mixed.refresh_usage(now).await;
+        let reqs = state.requests.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&("PUT".to_owned(), "/v1/usage/anthropic/default".to_owned())),
+            "ClaudeCode source must upload to anthropic/default: {reqs:?}"
+        );
+        assert!(
+            !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "ClaudeCode source must NEVER upload to antigravity/default: {reqs:?}"
+        );
+
+        // 3. 404 on /v1/usage/antigravity/default downgrades to legacy PUT /v1/usage and
+        //    caches usage_buckets_unsupported = true.
+        state.requests.lock().unwrap().clear();
+        state
+            .responses
+            .lock()
+            .unwrap()
+            .remove(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()));
+        state.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-24T15:00:00Z" },
+                    "seven_day": { "percent": 20.0, "resets_at": "2026-11-27T12:00:00Z" },
+                    "read_at": "2026-11-24T11:59:30Z",
+                    "device": "test-mac"
+                }),
+            ),
+        );
+        let mut legacy_srv = make_daemon(
+            ag_cfg,
+            UsageSource::Antigravity {
+                snapshots: vec![antigravity_cache],
+            },
+        );
+        legacy_srv.refresh_usage(now).await;
+        assert!(legacy_srv.usage_buckets_unsupported);
+        let reqs = state.requests.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&("PUT".to_owned(), "/v1/usage".to_owned())),
+            "404 on bucket endpoint must fall back to legacy PUT /v1/usage: {reqs:?}"
+        );
+
+        server_task.abort();
     }
 }

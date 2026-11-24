@@ -2139,51 +2139,36 @@ struct PermissionDecision {
     outcome: PermissionOutcome,
 }
 
+fn first_non_empty_str<'a>(val: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        val.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
 fn decide_permission(policy: AcpPermissionPolicy, params: Option<&Value>) -> PermissionDecision {
-    let tool_call = params.and_then(|p| p.get("toolCall").or_else(|| p.get("tool_call")));
+    let tool_call = params.and_then(|p| {
+        p.get("toolCall")
+            .filter(|v| v.is_object())
+            .or_else(|| p.get("tool_call").filter(|v| v.is_object()))
+    });
+    let tool_keys = ["title", "toolName", "tool_name", "name"];
     let tool = tool_call
-        .and_then(|tc| {
-            tc.get("title")
-                .or_else(|| tc.get("toolName"))
-                .or_else(|| tc.get("tool_name"))
-                .or_else(|| tc.get("name"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            params.and_then(|p| {
-                p.get("title")
-                    .or_else(|| p.get("toolName"))
-                    .or_else(|| p.get("tool_name"))
-                    .or_else(|| p.get("name"))
-                    .and_then(Value::as_str)
-            })
-        })
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .and_then(|tc| first_non_empty_str(tc, &tool_keys))
+        .or_else(|| params.and_then(|p| first_non_empty_str(p, &tool_keys)))
         .unwrap_or("unknown tool")
         .to_owned();
 
+    let id_keys = ["toolCallId", "tool_call_id"];
     let tool_call_id = tool_call
-        .and_then(|tc| {
-            tc.get("toolCallId")
-                .or_else(|| tc.get("tool_call_id"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            params.and_then(|p| {
-                p.get("toolCallId")
-                    .or_else(|| p.get("tool_call_id"))
-                    .and_then(Value::as_str)
-            })
-        })
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .and_then(|tc| first_non_empty_str(tc, &id_keys))
+        .or_else(|| params.and_then(|p| first_non_empty_str(p, &id_keys)))
         .map(str::to_owned);
 
     let tool_kind = tool_call
-        .and_then(|tc| tc.get("kind").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .and_then(|tc| first_non_empty_str(tc, &["kind"]))
         .map(str::to_owned);
 
     let raw_options = params
@@ -2195,13 +2180,8 @@ fn decide_permission(policy: AcpPermissionPolicy, params: Option<&Value>) -> Per
         .into_iter()
         .flatten()
         .filter_map(|opt| {
-            let option_id = opt
-                .get("optionId")
-                .or_else(|| opt.get("option_id"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())?;
-            let kind = opt.get("kind").and_then(Value::as_str)?;
+            let option_id = first_non_empty_str(opt, &["optionId", "option_id"])?;
+            let kind = first_non_empty_str(opt, &["kind"])?;
             Some((option_id, kind))
         })
         .collect();
@@ -2986,6 +2966,24 @@ mod tests {
         assert_eq!(
             decide_permission(AcpPermissionPolicy::Allow, None).outcome,
             PermissionOutcome::Cancelled
+        );
+
+        // Explicit JSON null or empty fields must NOT shadow snake_case/fallback keys.
+        let null_shadow = json!({
+            "toolCall": { "title": null, "name": "bash", "toolCallId": "", "tool_call_id": "tc-42" },
+            "options": [
+                { "optionId": null, "option_id": "opt-snake", "kind": "allow_always" }
+            ]
+        });
+        let parsed = decide_permission(AcpPermissionPolicy::Allow, Some(&null_shadow));
+        assert_eq!(parsed.tool, "bash");
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("tc-42"));
+        assert_eq!(
+            parsed.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-snake".to_owned(),
+                option_kind: "allow_always",
+            }
         );
     }
 }

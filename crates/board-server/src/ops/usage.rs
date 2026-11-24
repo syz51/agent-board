@@ -466,14 +466,17 @@ pub(crate) fn set_bucket_reserve(
     }
 }
 
-/// Legacy `PUT /v1/usage/reserve`: aliases `('anthropic', 'default')`, and when setting a
-/// non-null reserve also backfills existing non-legacy buckets whose `reserve_pct` is `NULL`
-/// without overriding buckets that already have an explicit reserve.
+/// Legacy `PUT /v1/usage/reserve`: aliases `('anthropic', 'default')`. When enabling a
+/// weekly reserve for the first time (`None -> Some(reserve)`), also backfills existing
+/// non-legacy buckets whose `reserve_pct` is `NULL`, without touching buckets whose reserve
+/// was explicitly set or cleared while a reserve was already active.
 pub(crate) fn set_reserve(
     cx: &Ctx<'_>,
     req: PutUsageBucketReserve,
     by_user: bool,
 ) -> Result<UsageReserve> {
+    let before = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?
+        .and_then(|b| b.reserve);
     let new_reserve = req.reserve;
     let bucket = set_bucket_reserve(
         cx,
@@ -482,7 +485,9 @@ pub(crate) fn set_reserve(
         req,
         by_user,
     )?;
-    if let Some(reserve) = new_reserve {
+    if before.is_none()
+        && let Some(reserve) = new_reserve
+    {
         let null_buckets: Vec<(String, String, Option<f64>)> = cx
             .db
             .prepare_cached(

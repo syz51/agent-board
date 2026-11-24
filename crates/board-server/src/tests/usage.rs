@@ -865,4 +865,31 @@ async fn new_provider_buckets_inherit_legacy_reserve_and_backfill_null_reserves(
         ag_after["reserve"], 12.0,
         "explicit per-bucket reserve must not be overwritten by legacy reserve update: {ag_after}"
     );
+
+    // 5. Explicitly turning OFF pace on antigravity/default (`reserve = null`) is NOT undone
+    //    by a subsequent legacy PUT /v1/usage/reserve update.
+    let (s, disabled) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{disabled}");
+    assert!(disabled.get("reserve").is_none(), "{disabled}");
+    let (s, _) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 9.0 })))
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let ag_disabled = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "antigravity" && b["account"] == "default")
+        .unwrap();
+    assert!(
+        ag_disabled.get("reserve").is_none(),
+        "explicitly cleared per-bucket reserve must stay null after legacy reserve update: {ag_disabled}"
+    );
 }
