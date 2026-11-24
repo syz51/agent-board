@@ -623,3 +623,165 @@ async fn the_usage_holds_and_stops_only_claude_agents() {
         assert_eq!(snap["held_for_usage"], Value::Null, "{agent}: {snap}");
     }
 }
+
+#[tokio::test]
+async fn usage_buckets_isolate_providers_and_alias_legacy_anthropic_default() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+
+    // Empty at start.
+    assert_eq!(
+        t.ok("GET", "/v1/usage/buckets", None, None).await,
+        json!([])
+    );
+
+    // Invalid bucket keys are rejected.
+    for path in [
+        "/v1/usage/Anthropic/default",
+        "/v1/usage/anthropic/-bad",
+        "/v1/usage/antigravity/bad$acct",
+    ] {
+        let (code, err, v) = t
+            .fail("PUT", path, None, Some(reading(0, 10.0, 20.0)))
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{path}: {v}");
+    }
+
+    // Reserve can be set on a bucket before any reading arrives; lowering is user-only.
+    let res = t
+        .ok(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(ME),
+            Some(json!({ "reserve": 10.0 })),
+        )
+        .await;
+    assert_eq!(res["provider"], "antigravity");
+    assert_eq!(res["account"], "default");
+    assert_eq!(res["reserve"], 10.0);
+    assert!(res.get("read_at").is_none());
+
+    let (code, err, v) = t
+        .fail(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(ME),
+            Some(json!({ "reserve": 5.0 })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    let (code, err, v) = t
+        .fail(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(ME),
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+
+    // Reporting a reading preserves the pre-set reserve and computes pace for that bucket.
+    let ag = t
+        .ok(
+            "PUT",
+            "/v1/usage/antigravity/default",
+            None,
+            Some(reading(0, 15.0, 60.0)),
+        )
+        .await;
+    assert_eq!(ag["provider"], "antigravity");
+    assert_eq!(ag["device"], "mac");
+    assert_eq!(ag["reserve"], 10.0);
+    assert_eq!(ag["seven_day"]["percent"], 60.0);
+    assert_eq!(ag["pace"]["reserve"], 10.0);
+
+    // Legacy GET /v1/usage is still null: antigravity bucket does not leak into anthropic:default.
+    assert_eq!(t.ok("GET", "/v1/usage", None, None).await, Value::Null);
+
+    // Reporting to anthropic/default is visible on legacy GET /v1/usage, and vice versa.
+    let ant = t
+        .ok(
+            "PUT",
+            "/v1/usage/anthropic/default",
+            None,
+            Some(reading(1, 25.0, 50.0)),
+        )
+        .await;
+    assert_eq!(ant["seven_day"]["percent"], 50.0);
+    let legacy = t.ok("GET", "/v1/usage", None, None).await;
+    assert_eq!(legacy["seven_day"]["percent"], 50.0);
+    assert_eq!(legacy["device"], "mac");
+
+    // Legacy PUT /v1/usage/reserve aliases anthropic/default reserve.
+    t.ok(
+        "PUT",
+        "/v1/usage/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 7.5 })),
+    )
+    .await;
+    // User lowers antigravity/default reserve without affecting anthropic/default.
+    let (s, lowered) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 4.0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{lowered}");
+    assert_eq!(lowered["reserve"], 4.0);
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", None, None).await,
+        json!({ "reserve": 7.5 })
+    );
+
+    // GET /v1/usage/buckets lists both buckets sorted by (provider, account).
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let list = buckets.as_array().unwrap();
+    assert_eq!(list.len(), 2, "{buckets}");
+    assert_eq!(
+        (
+            &list[0]["provider"],
+            &list[0]["account"],
+            &list[0]["reserve"]
+        ),
+        (&json!("anthropic"), &json!("default"), &json!(7.5))
+    );
+    assert_eq!(
+        (
+            &list[1]["provider"],
+            &list[1]["account"],
+            &list[1]["reserve"]
+        ),
+        (&json!("antigravity"), &json!("default"), &json!(4.0))
+    );
+
+    // Clearing a reserve on a bucket with no reading deletes the empty row instead of
+    // leaving a ghost entry in GET /v1/usage/buckets.
+    t.ok(
+        "PUT",
+        "/v1/usage/openai/temp/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 15.0 })),
+    )
+    .await;
+    assert_eq!(
+        t.ok("GET", "/v1/usage/buckets", None, None)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let (s, cleared) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/openai/temp/reserve",
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{cleared}");
+    assert!(cleared.get("reserve").is_none());
+    let after = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    assert_eq!(after.as_array().unwrap().len(), 2, "{after}");
+}

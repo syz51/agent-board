@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, DeviceName, Dispatch,
-    Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority,
-    ResolutionKind, Runtime, Said, Task, TaskId, TaskStatus, Timestamp, UsageWindow,
+    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
+    DeviceCapacity, DeviceName, DeviceRole, Dispatch, Event, Evidence, EvidenceKind,
+    FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority, ResolutionKind,
+    ResourceWeight, Runtime, Said, Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus,
+    Timestamp, UsageWindow,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -114,6 +116,45 @@ pub struct UsageReserve {
     /// pace off.
     #[serde(deserialize_with = "Option::deserialize")]
     pub reserve: Option<f64>,
+}
+
+/// `PUT /v1/usage/{provider}/{account}`: a device daemon reports the usage windows it read
+/// for one `(provider, account)` bucket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PutUsageBucket {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    pub read_at: Timestamp,
+}
+
+impl From<ReportUsage> for PutUsageBucket {
+    fn from(req: ReportUsage) -> Self {
+        Self {
+            five_hour: req.five_hour,
+            seven_day: req.seven_day,
+            read_at: req.read_at,
+        }
+    }
+}
+
+/// `PUT /v1/usage/{provider}/{account}/reserve`: the weekly percent kept for the user's
+/// own use on one bucket, from 0 to below 100; `null` turns the pace off.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PutUsageBucketReserve {
+    /// Required: a missing field is refused rather than read as `null`, which turns the
+    /// pace off.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reserve: Option<f64>,
+}
+
+impl From<UsageReserve> for PutUsageBucketReserve {
+    fn from(req: UsageReserve) -> Self {
+        Self {
+            reserve: req.reserve,
+        }
+    }
 }
 
 /// `POST /v1/boards/{slug}/judges`: the holder of the board's coordinator lease registers a
@@ -420,6 +461,30 @@ pub struct CreateTask {
     /// the field and creates the task `open`, which the client sees in the answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claim: bool,
+    /// Target repository URL or normalized key; overrides `board.repos` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Coarse resource weight tier (`light`, `standard`, `heavy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<ResourceWeight>,
+    /// Explicit weighted capacity units overriding `weight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_units: Option<u32>,
+    /// Hard capability predicates required on the runner device.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// Explicit opt-ins for tainted runner devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<TaintToleration>,
+    /// Fleet-wide concurrency keys acquired while a run executes this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_keys: Vec<ConflictKeySpec>,
+    /// Soft locality hint preferring a device or warm repository checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<TaskAffinity>,
+    /// Optional preferred runner kind (`acp`, `t3`, `deterministic`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_runner: Option<String>,
 }
 
 fn default_priority() -> Priority {
@@ -472,6 +537,50 @@ pub struct UpdateTask {
     /// ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Absent leaves it unchanged; `null` clears it; a URL or key normalizes and sets it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub repo: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub weight: Option<Option<ResourceWeight>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub resource_units: Option<Option<u32>>,
+    /// Absent leaves it unchanged; `[]` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<Vec<String>>,
+    /// Absent leaves it unchanged; `[]` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerations: Option<Vec<TaintToleration>>,
+    /// Absent leaves it unchanged; `[]` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_keys: Option<Vec<ConflictKeySpec>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub affinity: Option<Option<TaskAffinity>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub preferred_runner: Option<Option<String>>,
 }
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
@@ -841,6 +950,43 @@ pub struct DeviceInfo {
     pub user: bool,
     pub created_at: Timestamp,
     pub revoked_at: Option<Timestamp>,
+}
+
+/// `PUT /v1/devices/{name}/heartbeat`: device-self live capability and capacity report.
+/// Only the device's own bearer token (or a `--user` token) may send it. Admin fields
+/// (`role`, `taints`, `preference`, `drain`) are never accepted here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceHeartbeat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<DeviceCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_units: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_features: Vec<String>,
+}
+
+/// `PATCH /v1/admin/devices/{name}` (user only): updates a device's plane isolation and
+/// scheduling governance metadata. Absent fields are left unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUpdateDevice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<DeviceRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taints: Option<Vec<Taint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1357,5 +1503,76 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "read_at": "2026-11-08T12:00:00Z" }))
                 .unwrap();
         assert_eq!((req.five_hour, req.seven_day), (None, None));
+    }
+
+    #[test]
+    fn scheduler_open_enums_read_future_values_as_unknown() {
+        use crate::{DeviceRole, DeviceStatus, ResourceWeight, TaintEffect};
+        assert_eq!(
+            serde_json::from_value::<DeviceRole>(serde_json::json!("edge_gpu")).unwrap(),
+            DeviceRole::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<DeviceRole>(serde_json::json!("service_host")).unwrap(),
+            DeviceRole::ServiceHost
+        );
+        assert_eq!(
+            serde_json::from_value::<DeviceStatus>(serde_json::json!("draining_future")).unwrap(),
+            DeviceStatus::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<ResourceWeight>(serde_json::json!("xlarge")).unwrap(),
+            ResourceWeight::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<TaintEffect>(serde_json::json!("no_execute")).unwrap(),
+            TaintEffect::Unknown
+        );
+        assert_eq!(
+            serde_json::to_value(crate::EventType::DeviceUpdated).unwrap(),
+            "device_updated"
+        );
+    }
+
+    #[test]
+    fn task_routing_fields_are_optional_and_distinguish_absent_from_null() {
+        let base = serde_json::json!({ "agent": "t3:a", "version": 1 });
+        let absent: UpdateTask = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.repo, None);
+        assert_eq!(absent.weight, None);
+        assert_eq!(absent.resource_units, None);
+        assert_eq!(absent.requires, None);
+        assert_eq!(absent.tolerations, None);
+        assert_eq!(absent.conflict_keys, None);
+        assert_eq!(absent.affinity, None);
+        assert_eq!(absent.preferred_runner, None);
+        let serialized = serde_json::to_value(&absent).unwrap();
+        for key in [
+            "repo",
+            "weight",
+            "resource_units",
+            "requires",
+            "tolerations",
+            "conflict_keys",
+            "affinity",
+            "preferred_runner",
+        ] {
+            assert!(serialized.get(key).is_none(), "{key} leaked: {serialized}");
+        }
+
+        let mut cleared = base;
+        cleared["repo"] = serde_json::Value::Null;
+        cleared["weight"] = serde_json::Value::Null;
+        cleared["resource_units"] = serde_json::Value::Null;
+        cleared["affinity"] = serde_json::Value::Null;
+        cleared["preferred_runner"] = serde_json::Value::Null;
+        cleared["requires"] = serde_json::json!([]);
+        let cleared: UpdateTask = serde_json::from_value(cleared).unwrap();
+        assert_eq!(cleared.repo, Some(None));
+        assert_eq!(cleared.weight, Some(None));
+        assert_eq!(cleared.resource_units, Some(None));
+        assert_eq!(cleared.affinity, Some(None));
+        assert_eq!(cleared.preferred_runner, Some(None));
+        assert_eq!(cleared.requires, Some(Vec::new()));
     }
 }

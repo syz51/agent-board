@@ -1428,6 +1428,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         rank: None,
                         owner: Some(agent.clone()),
                         reason: None,
+                        repo: None,
+                        weight: None,
+                        resource_units: None,
+                        requires: None,
+                        tolerations: None,
+                        conflict_keys: None,
+                        affinity: None,
+                        preferred_runner: None,
                     },
                 )
                 .await
