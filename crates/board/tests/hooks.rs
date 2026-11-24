@@ -3716,6 +3716,10 @@ fn a_launch_at_the_device_limit_is_refused_and_its_whole_call_is_kept() {
         "{reason}"
     );
     assert!(
+        reason.contains("board device wait --timeout 300"),
+        "{reason}"
+    );
+    assert!(
         reason.contains("Note #77 on factory-4 records the refusal."),
         "{reason}\n{}",
         e.ran()
@@ -3817,11 +3821,10 @@ fn a_launch_runs_while_the_device_has_a_free_slot() {
         launch(&e, "mcp__t3-code__create_threads", two),
     );
     let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    let reason = reason.as_str().unwrap();
+    assert!(reason.contains("this launch asks for 2 more"), "{reason}");
     assert!(
-        reason
-            .as_str()
-            .unwrap()
-            .contains("this launch asks for 2 more"),
+        reason.contains("board device wait --slots 2 --timeout 300"),
         "{reason}"
     );
     assert_eq!(refused_launches(&e)[0]["asked"], 2);
@@ -4111,6 +4114,77 @@ fn a_launch_that_can_never_fit_is_not_told_to_try_again() {
     assert!(reason.contains("can never run as it is"), "{reason}");
     assert!(reason.contains("Ask for fewer threads"), "{reason}");
     assert!(!reason.contains("make the same call again"), "{reason}");
+    assert!(!reason.contains("board device wait"), "{reason}");
+}
+
+/// `board device wait` counts the exact same device turns and limit as the launch hook:
+/// while the hook refuses a launch, wait exits nonzero; once a turn ends, wait exits 0
+/// and the same launch is allowed.
+#[cfg(unix)]
+#[test]
+fn device_wait_counts_the_same_slots_as_the_launch_hook() {
+    let e = env();
+    device_with_turns(&e, 2, &["thread-a", "thread-b"]);
+    e.stub.on("GET /v1/tasks", Vec::<Value>::new());
+    let call = json!({"task": "x", "title": "t"});
+
+    // Full (2 of 2): hook refuses and names `board device wait`, wait --timeout 0 fails.
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call.clone()),
+    );
+    let reason = reply.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].clone();
+    let reason = reason.as_str().unwrap();
+    assert!(
+        reason.contains("board device wait --timeout 300"),
+        "{reason}"
+    );
+
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[],
+        &["device", "wait", "--timeout", "0"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("still has 2 of 2 agent turns running"),
+        "{}",
+        stderr(&out)
+    );
+
+    // One turn ends (1 of 2): wait exits 0 and the same launch is now allowed.
+    std::fs::write(
+        e.home.join("t3-answer.json"),
+        json!([
+            {"threadId": "thread-a", "status": "running", "createdBy": "user"},
+            {"threadId": "thread-b", "status": "completed", "createdBy": "agent"},
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[],
+        &["device", "wait", "--timeout", "0"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("has 1 free agent-turn slot (1 of 2 running"),
+        "{}",
+        stdout(&out)
+    );
+
+    let (reply, text) = e.hook(
+        "pre-tool-use",
+        "claude",
+        launch(&e, "mcp__t3-code__delegate_task", call),
+    );
+    assert_eq!((reply, text.as_str()), (None, ""), "{}", e.ran());
 }
 
 /// A launch that names this device's own T3 environment is counted like one that names
