@@ -406,3 +406,157 @@ directory (mode 0700, owned by the container's user), so it is `root`. Devices n
 `cargo` (looked up in `~/.cargo/bin` too) and, unless they have `watch=no`, the `board
 watch` service from `board install launchd` or `board install systemd`; a service that runs another `board` binary
 than cargo's is not upgraded by this.
+
+## 6. Fleet Isolation and Linux Headless Runners
+
+In a multi-machine fleet (`docs/SCHEDULER_DESIGN.md`, Section 2), keep infrastructure hosts
+isolated from coding agent builds by assigning each registered device to one of three planes
+and enforcing Kubernetes-style taints with a `--user` token. Values below are placeholders.
+
+### 3-plane fleet isolation and taints
+
+1. **Control & Trust Plane** (`role=control`, taint `role=control:no_schedule`): hosts running
+   `board-server`, primary SQLite backups, or a secrets authority. Never run untrusted agent
+   builds here.
+2. **Elastic Runner Plane** (`role=runner`, untainted or soft-tainted): laptops and dedicated
+   disposable Linux runner nodes executing agent builds via `AcpRunner` or `T3Runner`.
+3. **Service Hosting Plane** (`role=service_host`, taint `role=service-host:no_schedule`):
+   hosts running deployed applications. Updated via CI/CD deploys, never targeted for builds.
+
+Apply roles and taints from a workstation logged in with a `--user` token (`$BOARD_USER_HOME`
+or `BOARD_HOME` holding the `--user` token):
+
+```sh
+# 1. Control & Trust Plane: hard NoSchedule isolation
+board admin device-update control-host \
+    --role control \
+    --taint role=control:no_schedule
+
+board admin device-update trust-host \
+    --role control \
+    --taint role=control:no_schedule
+
+# 2. Service Hosting Plane: hard NoSchedule isolation
+board admin device-update service-host-1 \
+    --role service_host \
+    --taint role=service-host:no_schedule
+
+# 3. Elastic Runner Plane: untainted Linux runner + soft-tainted light laptop
+board admin device-update runner-linux-1 \
+    --role runner \
+    --preference 10 \
+    --clear-taints
+
+board admin device-update laptop-light \
+    --role runner \
+    --preference 0 \
+    --taint weight=heavy:prefer_no_schedule
+
+# Verify the fleet inventory, roles, taints, and live heartbeats
+board devices
+```
+
+A device token can update only its own live heartbeat (`PUT /v1/devices/{name}/heartbeat`) and
+cannot clear taints or change its `role`; only a `--user` token can call `board admin
+device-update`.
+
+### Linux Runner Plane node setup (`AcpRunner` + systemd cgroup limits)
+
+Dedicated Linux runner nodes run headless under `board watch` using `AcpRunner` against an
+**official, unmodified** vendor binary speaking standard ACP JSON-RPC over stdio—no GUI, no
+Electron shell, and no binary patching.
+
+1. **Install `board` and log the runner in:**
+
+   ```sh
+   # On the server host (once per runner node):
+   docker compose -f /opt/agent-board/deploy/compose.yaml exec board \
+       board admin device runner-linux-1 --db /var/lib/agent-board/board.db
+
+   # On runner-linux-1 (as a dedicated non-root runner user):
+   cargo install --git https://github.com/syz51/agent-board --locked board
+   board login --server https://board-host.your-tailnet.ts.net --device runner-linux-1
+   ```
+
+2. **Install and authenticate the official ACP binary** (for example the official Antigravity
+   binary in sanctioned ACP mode, or any official ACP-compliant agent CLI) under the runner
+   user, and verify it responds on your host before enabling autopilot.
+
+3. **Configure `$BOARD_HOME/config.toml`** (default `~/.local/share/agent-board/config.toml`)
+   with `[acp_runner]` and `[acp_runner.cgroup]`:
+
+   ```toml
+   server = "https://board-host.your-tailnet.ts.net"
+   device = "runner-linux-1"
+   runs_at_once = 4
+   reserve_runs = 0
+   weight_units = 8
+   capabilities = ["os:linux", "arch:x86_64", "git:cloneable"]
+   runners = ["acp", "deterministic"]
+
+   [projects]
+   "github.com/your-org/your-repo" = "/srv/repos/your-repo"
+
+   [acp_runner]
+   # Path to the official, unmodified ACP-compliant vendor binary.
+   # Can also be overridden at runtime via BOARD_ACP_BIN.
+   bin = "/usr/local/bin/official-acp-agent"
+   args = ["acp"]
+   model = "<model-slug>"
+   turn_timeout_secs = 1800
+   cancel_grace_secs = 15
+
+   [acp_runner.options]
+   thought_level = "high"
+
+   # Optional extra environment variables passed to the child process.
+   # Values are never logged or written to transcripts; keep config.toml mode 0600 if used.
+   # [acp_runner.env]
+   # EXAMPLE_FLAG = "1"
+
+   # Linux systemd user-scope cgroup isolation: wraps each run in
+   # `systemd-run --user --scope --quiet -p MemoryMax=... -p CPUQuota=... -p TasksMax=...`
+   [acp_runner.cgroup]
+   enabled = true
+   memory_max = "4G"
+   cpu_quota = "200%"
+   tasks_max = 256
+   slice = "agent-board-runs.slice"
+   ```
+
+4. **Enable systemd user lingering, cgroup v2 delegation, and `board watch`:**
+
+   ```sh
+   # Allow the runner user's systemd --user instance to stay alive after SSH logout
+   sudo loginctl enable-linger "$USER"
+
+   # Optional: create a parent user slice to bound aggregate runner usage across all runs
+   mkdir -p ~/.config/systemd/user
+   cat <<'EOF' > ~/.config/systemd/user/agent-board-runs.slice
+   [Unit]
+   Description=Isolated slice for agent-board AcpRunner runs
+
+   [Slice]
+   MemoryHigh=12G
+   MemoryMax=14G
+   EOF
+
+   # Verify user cgroup delegation works with systemd-run --user --scope
+   systemd-run --user --scope --quiet \
+       -p MemoryMax=512M -p CPUQuota=100% -p TasksMax=64 \
+       -p Slice=agent-board-runs.slice -- true
+
+   # Install and start the board watch user service
+   board install systemd --write
+   systemctl --user daemon-reload
+   systemctl --user enable --now agent-board-watch.service
+   systemctl --user status agent-board-watch.service
+   ```
+
+   If `systemd-run --user --scope` reports missing controllers (`cpu`, `memory`, or `pids`),
+   enable user delegation in systemd (for example via `/etc/systemd/system/user@.service.d/delegate.conf`
+   with `[Service]\nDelegate=cpu cpuset io memory pids`, followed by `systemctl daemon-reload`).
+   Each run executes in its own process group inside the scope, writes its raw JSONL transcript
+   to `$BOARD_HOME/state/transcripts/<run-id>.jsonl`, persists its `session_id` and `pid` in
+   `$BOARD_HOME/state/daemon.db`, and tears down the entire process group on cancel or turn
+   timeout after writing a Trail Rule entry to `$BOARD_HOME/state/runner-cancels.jsonl`.

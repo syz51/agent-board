@@ -621,6 +621,55 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Updates a `local_runs` row's runtime state, optional `session_id`, and `pid` (`Some(pid)`
+    /// sets the OS pid; `None` clears it when `clear_pid` is true, else preserves the prior pid).
+    pub fn update_local_run_runtime(
+        &self,
+        run_id: &str,
+        state: LocalRunState,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+        clear_pid: bool,
+        updated_at: Timestamp,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE local_runs
+                SET state = ?1,
+                    session_id = COALESCE(?2, session_id),
+                    pid = CASE WHEN ?3 THEN ?4 ELSE COALESCE(?4, pid) END,
+                    updated_at = ?5
+              WHERE run_id = ?6",
+            params![
+                state.as_str(),
+                session_id,
+                clear_pid,
+                pid.map(i64::from),
+                ts_ms(updated_at),
+                run_id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reads the newest `local_runs` row matching `session_id`, for runner resume and status
+    /// recovery after restarts.
+    pub fn get_local_run_by_session(&self, session_id: &str) -> Result<Option<LocalRunRecord>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT run_id, task_id, board, kind, runner, session_id, worktree_path, branch, \
+                    cost_units, pid, state, lease_expires_at, created_at, updated_at, meta_json \
+               FROM local_runs WHERE session_id = ?1 \
+              ORDER BY updated_at DESC, run_id DESC LIMIT 1",
+            [session_id],
+            local_run_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Marks every non-terminal `local_runs` row matching `(kind, task_id)` as `state`.
     pub fn finish_local_runs_for_task(
         &self,
