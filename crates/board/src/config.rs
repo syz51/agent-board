@@ -137,6 +137,227 @@ pub struct Config {
     /// then the project's defaults.
     #[serde(default, skip_serializing_if = "JudgeModels::is_empty")]
     pub judge_models: JudgeModels,
+    /// Optional headless ACP runner configuration (`[acp_runner]`) for invoking an official,
+    /// unmodified ACP-compliant vendor binary over stdio JSON-RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_runner: Option<AcpRunnerConfig>,
+}
+
+/// Default per-turn timeout for [`AcpRunnerConfig::turn_timeout_secs`] (30 minutes).
+pub const DEFAULT_ACP_TURN_TIMEOUT_SECS: u64 = 1800;
+
+/// Default graceful cancel wait for [`AcpRunnerConfig::cancel_grace_secs`] (15 seconds).
+pub const DEFAULT_ACP_CANCEL_GRACE_SECS: u64 = 15;
+
+/// Optional `[acp_runner]` configuration in `config.toml` for headless ACP execution using an
+/// official, unmodified vendor binary (`docs/SCHEDULER_DESIGN.md`, Section 4.3).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpRunnerConfig {
+    /// Path to the official, unmodified ACP-compliant binary (overridden by `BOARD_ACP_BIN`
+    /// when set and non-empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<PathBuf>,
+    /// Arguments passed to the official binary (defaults to `["acp"]` when omitted).
+    #[serde(default = "default_acp_args")]
+    pub args: Vec<String>,
+    /// Optional extra environment variables passed to the child process. Values are never
+    /// logged or written to transcripts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Optional model slug forwarded via ACP session params/config when set.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opt_non_empty"
+    )]
+    pub model: Option<String>,
+    /// Optional session/model options forwarded via ACP session params/config when set.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "model_options"
+    )]
+    pub options: BTreeMap<String, String>,
+    /// Maximum wall-clock seconds for a single ACP turn before timeout teardown (default 1800s).
+    #[serde(
+        default = "default_acp_turn_timeout_secs",
+        deserialize_with = "positive_u64"
+    )]
+    pub turn_timeout_secs: u64,
+    /// Seconds to wait after `session/cancel` before escalating to `SIGTERM` / `SIGKILL`
+    /// (default 15s).
+    #[serde(default = "default_acp_cancel_grace_secs")]
+    pub cancel_grace_secs: u64,
+    /// Optional Linux `systemd-run --user --scope` cgroup isolation settings
+    /// (`[acp_runner.cgroup]`).
+    #[serde(default, skip_serializing_if = "CgroupConfig::is_default")]
+    pub cgroup: CgroupConfig,
+}
+
+impl Default for AcpRunnerConfig {
+    fn default() -> Self {
+        Self {
+            bin: None,
+            args: default_acp_args(),
+            env: BTreeMap::new(),
+            model: None,
+            options: BTreeMap::new(),
+            turn_timeout_secs: DEFAULT_ACP_TURN_TIMEOUT_SECS,
+            cancel_grace_secs: DEFAULT_ACP_CANCEL_GRACE_SECS,
+            cgroup: CgroupConfig::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AcpRunnerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact env values so secret credentials passed to the child are never logged.
+        let redacted_env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|k| (k.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("AcpRunnerConfig")
+            .field("bin", &self.bin)
+            .field("args", &self.args)
+            .field("env", &redacted_env)
+            .field("model", &self.model)
+            .field("options", &self.options)
+            .field("turn_timeout_secs", &self.turn_timeout_secs)
+            .field("cancel_grace_secs", &self.cancel_grace_secs)
+            .field("cgroup", &self.cgroup)
+            .finish()
+    }
+}
+
+impl AcpRunnerConfig {
+    /// Resolves the configured official ACP binary path, honoring a non-empty `BOARD_ACP_BIN`
+    /// environment override before `self.bin`.
+    pub fn resolved_bin(&self) -> Option<PathBuf> {
+        let env_bin = std::env::var_os("BOARD_ACP_BIN");
+        self.resolved_bin_with_env(env_bin.as_deref())
+    }
+
+    /// Pure binary resolver taking an explicit `BOARD_ACP_BIN` override (for unit tests).
+    pub fn resolved_bin_with_env(&self, env_bin: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+        if let Some(raw) = env_bin {
+            let text = raw.to_string_lossy();
+            if !text.trim().is_empty() {
+                return Some(PathBuf::from(raw));
+            }
+        }
+        self.bin.clone().filter(|p| !p.as_os_str().is_empty())
+    }
+}
+
+/// Optional Linux systemd user scope cgroup limits under `[acp_runner.cgroup]`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CgroupConfig {
+    /// Wrap launches with `systemd-run --user --scope` on Linux when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// systemd `MemoryMax=` property (for example `"4G"`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opt_systemd_value"
+    )]
+    pub memory_max: Option<String>,
+    /// systemd `CPUQuota=` property (for example `"200%"`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opt_systemd_value"
+    )]
+    pub cpu_quota: Option<String>,
+    /// systemd `TasksMax=` property (for example `256`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opt_positive_u32"
+    )]
+    pub tasks_max: Option<u32>,
+    /// systemd `Slice=` property (for example `"agent-board-runs.slice"`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "opt_systemd_value"
+    )]
+    pub slice: Option<String>,
+}
+
+impl CgroupConfig {
+    pub fn is_default(&self) -> bool {
+        !self.enabled
+            && self.memory_max.is_none()
+            && self.cpu_quota.is_none()
+            && self.tasks_max.is_none()
+            && self.slice.is_none()
+    }
+}
+
+fn default_acp_args() -> Vec<String> {
+    vec!["acp".to_owned()]
+}
+
+fn default_acp_turn_timeout_secs() -> u64 {
+    DEFAULT_ACP_TURN_TIMEOUT_SECS
+}
+
+fn default_acp_cancel_grace_secs() -> u64 {
+    DEFAULT_ACP_CANCEL_GRACE_SECS
+}
+
+fn opt_non_empty<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(text) if text.trim().is_empty() => Err(serde::de::Error::custom("must not be empty")),
+        Some(text) => Ok(Some(text)),
+    }
+}
+
+fn opt_systemd_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(text) => {
+            if text.is_empty()
+                || text
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "invalid systemd property value {text:?}: must be non-empty without whitespace, control characters, or '='"
+                )));
+            }
+            Ok(Some(text))
+        }
+    }
+}
+
+fn positive_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("must be greater than 0"));
+    }
+    Ok(value)
+}
+
+fn opt_positive_u32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let opt = Option::<u32>::deserialize(deserializer)?;
+    if opt == Some(0) {
+        return Err(serde::de::Error::custom("must be greater than 0"));
+    }
+    Ok(opt)
 }
 
 /// Optional per-kind judge model overrides in `config.toml` (`[judge_models.<kind>]`).
@@ -254,7 +475,16 @@ impl Config {
         std::fs::create_dir_all(home.root())
             .with_context(|| format!("creating {}", home.root().display()))?;
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        write_atomic(&home.config_path(), text.as_bytes())
+        let path = home.config_path();
+        let has_secrets = self
+            .acp_runner
+            .as_ref()
+            .is_some_and(|acp| !acp.env.is_empty());
+        if has_secrets || is_private_file(&path) {
+            write_private(&path, text.as_bytes())
+        } else {
+            write_atomic(&path, text.as_bytes())
+        }
     }
 
     pub fn feedback_board(&self) -> BoardSlug {
@@ -582,6 +812,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     drop(file);
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn is_private_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -1000,6 +1243,134 @@ protocol_features = ["v1-json", "sse-v1"]
                 .as_deref(),
             Some("locked-tok")
         );
+    }
+
+    #[test]
+    fn acp_runner_config_defaults_validates_redacts_env_and_round_trips() {
+        // Omitting [acp_runner] stays backward compatible and omitted on serialization.
+        let empty = Config::default();
+        assert_eq!(empty.acp_runner, None);
+        assert!(
+            !toml::to_string_pretty(&empty)
+                .unwrap()
+                .contains("acp_runner")
+        );
+
+        // Minimal [acp_runner] applies defaults: args = ["acp"], timeouts, cgroup disabled.
+        let minimal: Config =
+            toml::from_str("[acp_runner]\nbin = \"/usr/local/bin/official-acp\"\n").unwrap();
+        let acp = minimal.acp_runner.as_ref().unwrap();
+        assert_eq!(
+            acp.bin.as_deref(),
+            Some(Path::new("/usr/local/bin/official-acp"))
+        );
+        assert_eq!(acp.args, vec!["acp"]);
+        assert_eq!(acp.turn_timeout_secs, DEFAULT_ACP_TURN_TIMEOUT_SECS);
+        assert_eq!(acp.cancel_grace_secs, DEFAULT_ACP_CANCEL_GRACE_SECS);
+        assert!(!acp.cgroup.enabled);
+        assert_eq!(
+            acp.resolved_bin_with_env(None),
+            Some(PathBuf::from("/usr/local/bin/official-acp"))
+        );
+        assert_eq!(
+            acp.resolved_bin_with_env(Some(std::ffi::OsStr::new("/opt/override-acp"))),
+            Some(PathBuf::from("/opt/override-acp"))
+        );
+        assert_eq!(
+            acp.resolved_bin_with_env(Some(std::ffi::OsStr::new("   "))),
+            Some(PathBuf::from("/usr/local/bin/official-acp"))
+        );
+
+        // Full [acp_runner] + [acp_runner.cgroup] round-trips and redacts env in Debug.
+        let full_raw = r#"
+[acp_runner]
+bin = "/usr/local/bin/official-acp"
+args = ["acp", "--stdio"]
+model = "gemini-4-neon"
+turn_timeout_secs = 900
+cancel_grace_secs = 10
+
+[acp_runner.env]
+API_SECRET = "super-secret-value"
+
+[acp_runner.options]
+thought_level = "high"
+
+[acp_runner.cgroup]
+enabled = true
+memory_max = "4G"
+cpu_quota = "200%"
+tasks_max = 256
+slice = "agent-board-runs.slice"
+"#;
+        let full: Config = toml::from_str(full_raw).unwrap();
+        let acp = full.acp_runner.as_ref().unwrap();
+        assert_eq!(acp.args, vec!["acp", "--stdio"]);
+        assert_eq!(acp.model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(acp.turn_timeout_secs, 900);
+        assert_eq!(acp.cancel_grace_secs, 10);
+        assert!(acp.cgroup.enabled);
+        assert_eq!(acp.cgroup.memory_max.as_deref(), Some("4G"));
+        assert_eq!(acp.cgroup.cpu_quota.as_deref(), Some("200%"));
+        assert_eq!(acp.cgroup.tasks_max, Some(256));
+        assert_eq!(acp.cgroup.slice.as_deref(), Some("agent-board-runs.slice"));
+        let debug_text = format!("{acp:?}");
+        assert!(debug_text.contains("API_SECRET"), "{debug_text}");
+        assert!(debug_text.contains("<redacted>"), "{debug_text}");
+        assert!(
+            !debug_text.contains("super-secret-value"),
+            "env secret leaked in Debug: {debug_text}"
+        );
+        let serialized = toml::to_string_pretty(&full).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), full);
+
+        // Validation rejects invalid values and unknown fields.
+        for bad in [
+            "[acp_runner]\nturn_timeout_secs = 0\n",
+            "[acp_runner]\nmodel = \"  \"\n",
+            "[acp_runner]\nunknown_key = 1\n",
+            "[acp_runner.cgroup]\ntasks_max = 0\n",
+            "[acp_runner.cgroup]\nmemory_max = \"4G --evil\"\n",
+            "[acp_runner.cgroup]\nslice = \"a=b\"\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_uses_0600_for_acp_env_secrets_and_preserves_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+
+        // Saving a config with [acp_runner.env] writes mode 0600 automatically.
+        let mut cfg = Config {
+            acp_runner: Some(AcpRunnerConfig {
+                env: [("API_KEY".to_owned(), "secret-val".to_owned())].into(),
+                ..AcpRunnerConfig::default()
+            }),
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+        let mode = std::fs::metadata(home.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Subsequent saves (e.g., board login) preserve 0600 even if env is later cleared.
+        cfg.acp_runner = None;
+        cfg.server = Some("https://board.example.test".into());
+        cfg.save(&home).unwrap();
+        let mode = std::fs::metadata(home.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[cfg(unix)]
