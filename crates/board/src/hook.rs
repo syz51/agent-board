@@ -301,11 +301,14 @@ fn render_reply(event: HookEvent, runtime: Runtime, reply: Reply) -> Option<Stri
                 .to_string()
             }
             Reply::Context(_) | Reply::Plain(_) => "{}".into(),
-            Reply::Halt(reason) => json!({
+            // Only Antigravity's `PreInvocation` (`UserPromptSubmit`) proto accepts
+            // `terminationBehavior` and `injectSteps`; `PostToolHookResult` rejects them.
+            Reply::Halt(reason) if event == HookEvent::UserPromptSubmit => json!({
                 "terminationBehavior": "terminate",
                 "injectSteps": [{ "errorMessage": { "userMessage": reason } }]
             })
             .to_string(),
+            Reply::Halt(_) => "{}".into(),
             Reply::Deny(reason) => json!({
                 "decision": "deny",
                 "reason": reason
@@ -357,6 +360,9 @@ struct Hook<'a> {
     /// At `SessionStart`, the agent is a T3 thread a parent's `delegate_task` started (its
     /// own thread, not a nested session's).
     delegated: bool,
+    /// At `UserPromptSubmit` on Antigravity (`PreInvocation`), whether this invocation is a
+    /// mid-turn model call rather than a fresh user prompt.
+    mid_turn: bool,
     home: Home,
     device: board_proto::DeviceName,
     client: Client,
@@ -389,10 +395,15 @@ async fn handle(
     let shell_call = (input["tool_name"] == SHELL_TOOL)
         .then(|| input["tool_use_id"].as_str().filter(|s| !s.is_empty()))
         .flatten();
-    if event == HookEvent::PreToolUse && launch::is_launch(input) {
-        return launch::check(&home, runtime, explicit_agent, input).await;
-    }
     if event == HookEvent::PreToolUse {
+        if runtime == Runtime::Antigravity
+            && let Some(reason) = antigravity_pre_tool_halt(&home, explicit_agent, input).await?
+        {
+            return Ok(Reply::Deny(reason));
+        }
+        if launch::is_launch(input) {
+            return launch::check(&home, runtime, explicit_agent, input).await;
+        }
         // Runs before every shell call: local only, no token or server. Logged out, no
         // PostToolUse could report the call, so it leaves no mark.
         if let Some(tool_use) = shell_call
@@ -584,12 +595,15 @@ async fn handle(
     let delegated = event == HookEvent::SessionStart
         && own_thread
         && t3_thread_id().is_some_and(|id| delegated_thread(&id));
+    let mid_turn =
+        event == HookEvent::UserPromptSubmit && is_antigravity_mid_turn(runtime, input, &local);
     let mut hook = Hook {
         relayed,
         event,
         runtime,
         nested,
         delegated,
+        mid_turn,
         device: device.clone(),
         client,
         local,
@@ -606,16 +620,25 @@ async fn handle(
     // Turn boundaries hold whether or not the server answers.
     match event {
         // The prompt's snapshot sets the turn's hold anew, also when the server is not
-        // reached, so an earlier turn's hold never decides this one's halt.
-        HookEvent::UserPromptSubmit => {
+        // reached, so an earlier turn's hold never decides this one's halt. Mid-turn
+        // Antigravity `PreInvocation` calls stay within the current turn.
+        HookEvent::UserPromptSubmit if !hook.mid_turn => {
             hook.local.turn_started = Some(hook.now);
             hook.local.end_turn_hold();
+            if hook.runtime == Runtime::Antigravity {
+                hook.local.turn_initial_steps = input["initialNumSteps"].as_u64().or_else(|| {
+                    (input["hookEventName"] == "PreInvocation"
+                        || input.get("invocationNum").is_some())
+                    .then_some(0)
+                });
+            }
         }
         // A new or resumed session starts no turn. Compaction happens within a turn, so it
         // keeps the turn's start.
         HookEvent::SessionStart if input["source"] != "compact" => {
             hook.local.turn_started = None;
             hook.local.end_turn_hold();
+            hook.local.pending_context.clear();
         }
         _ => {}
     }
@@ -1544,11 +1567,40 @@ impl Hook<'_> {
                 Reply::Context(text) => Reply::Context(self.board_context(text)),
                 reply => reply,
             },
-            HookEvent::UserPromptSubmit if !self.local.offline_notified => {
-                self.cached_snapshot(failure)
+            HookEvent::UserPromptSubmit => {
+                if self.mid_turn
+                    && let Some(reason) = self.local.pending_halt.take()
+                {
+                    self.local.pending_context.clear();
+                    return Reply::Halt(reason);
+                }
+                let cached = if !self.local.offline_notified {
+                    match self.cached_snapshot(failure) {
+                        Reply::Context(text) => Some(text),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.prompt_context(cached.unwrap_or_default())
             }
             HookEvent::PreCompact => self.compact_instructions(None),
             _ => Reply::Nothing,
+        }
+    }
+
+    /// Combines a prompt's snapshot text with any queued mid-turn `PostToolUse` context,
+    /// draining the queue so each item is delivered once.
+    fn prompt_context(&mut self, snapshot: String) -> Reply {
+        let mut parts = Vec::new();
+        if !snapshot.is_empty() {
+            parts.push(snapshot);
+        }
+        parts.extend(self.local.take_pending_context());
+        if parts.is_empty() {
+            Reply::Nothing
+        } else {
+            Reply::Context(parts.join("\n"))
         }
     }
 
@@ -1800,13 +1852,36 @@ impl Hook<'_> {
     }
 
     async fn user_prompt_submit(&mut self) -> Result<Reply> {
+        if self.mid_turn
+            && let Some(reason) = self.local.pending_halt.take()
+        {
+            self.local.pending_context.clear();
+            return Ok(Reply::Halt(reason));
+        }
         // After an outage, catch up with a full snapshot instead of a delta.
         let kind = if self.local.offline_notified {
             SnapshotKind::Full
         } else {
             SnapshotKind::Delta
         };
-        let snap = if self.runtime == Runtime::Claude && is_pull_request_update(self.input) {
+        if self.mid_turn {
+            // Antigravity's `PreInvocation` runs before every mid-turn model call: fetch
+            // first so a board paused during this turn halts before the model runs without
+            // marking the agent running or overwriting `turn_seen_at` / `hold_told`.
+            let snap = self.fetch(kind).await?;
+            let reason = halt_reason(&snap);
+            let text = self.keep(snap)?;
+            if self.local.halted() {
+                self.local.pending_context.clear();
+                self.set_state(AgentState::Idle, None).await?;
+                return Ok(Reply::Halt(reason));
+            }
+            self.set_state(AgentState::Running, None).await?;
+            return Ok(self.prompt_context(text));
+        }
+        let snap = if matches!(self.runtime, Runtime::Claude | Runtime::Antigravity)
+            && is_pull_request_update(self.input)
+        {
             // A held thread's pull request watch wakes it at every check or review change,
             // for as long as the pause lasts. Such a turn ends before the model runs, and
             // the watch stays; the dispatcher checks the PRs after the resume. The
@@ -1829,11 +1904,7 @@ impl Hook<'_> {
         let text = self.keep(snap)?;
         // The snapshot's `hold:` line tells the agent; only the user's request continues.
         self.local.hold_told = self.local.held;
-        Ok(if text.is_empty() {
-            Reply::Nothing
-        } else {
-            Reply::Context(text)
-        })
+        Ok(self.prompt_context(text))
     }
 
     async fn post_tool_use(&mut self) -> Result<Reply> {
@@ -1870,6 +1941,13 @@ impl Hook<'_> {
                 // subagent's tool call, or a runtime that ignores the halt).
                 self.local.overlaps_shown = shown;
                 self.set_state(AgentState::Idle, None).await?;
+                if self.runtime == Runtime::Antigravity {
+                    // Antigravity's `PostToolHookResult` proto accepts only `{}`; record
+                    // the halt so the next `PreToolUse` denies and the next `PreInvocation`
+                    // terminates the turn cleanly.
+                    self.local.pending_halt = Some(reason.clone());
+                    self.local.pending_context.clear();
+                }
                 return Ok(Reply::Halt(reason));
             }
             if !alerts.is_empty() {
@@ -1890,6 +1968,11 @@ impl Hook<'_> {
             }
         }
         Ok(if lines.is_empty() {
+            Reply::Nothing
+        } else if self.runtime == Runtime::Antigravity {
+            // Antigravity's `PostToolHookResult` proto cannot inject steps; queue mid-turn
+            // overlap warnings, alerts and handoff reminders for the next `PreInvocation`.
+            self.local.queue_context(lines.join("\n"));
             Reply::Nothing
         } else {
             Reply::Context(lines.join("\n"))
@@ -1928,6 +2011,13 @@ impl Hook<'_> {
             self.input["last_assistant_message"]
                 .as_str()
                 .and_then(board_proto::turn_ending)
+                .or_else(|| {
+                    (self.runtime == Runtime::Antigravity)
+                        .then(|| self.input["transcript_path"].as_str())
+                        .flatten()
+                        .filter(|p| !p.is_empty())
+                        .and_then(|p| antigravity_last_assistant_message(Path::new(p)))
+                })
         };
         // The state first: it matters most within the hook's budget.
         self.client
@@ -2549,6 +2639,147 @@ fn parse_clock(text: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, m, 0)
 }
 
+/// Bytes read from the end of an Antigravity `transcript.jsonl` before falling back to the
+/// whole file: the turn's final `PLANNER_RESPONSE` is almost always on the last line.
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+/// Upper bound for a full fallback read of `transcript.jsonl` inside `Stop`'s 1.5s budget.
+const TRANSCRIPT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether a `UserPromptSubmit` hook on Antigravity (`PreInvocation`) is a mid-turn model
+/// invocation rather than the start of a new user turn.
+///
+/// Antigravity fires `PreInvocation` before every model call within a turn: `initialNumSteps`
+/// stays constant across all invocations of one turn and grows on the next user turn, while
+/// `invocationNum` increases on later invocations.
+fn is_antigravity_mid_turn(runtime: Runtime, input: &Value, local: &AgentLocal) -> bool {
+    if runtime != Runtime::Antigravity {
+        return false;
+    }
+    if let Some(prev) = local.turn_initial_steps {
+        if let Some(steps) = input["initialNumSteps"].as_u64() {
+            return steps == prev;
+        }
+        // Proto3 omits `initialNumSteps: 0`; when the turn began at 0 and `initialNumSteps`
+        // is still absent, a subsequent invocation belongs to the same turn.
+        if prev == 0 && input["invocationNum"].as_u64().is_some_and(|n| n > 0) {
+            return true;
+        }
+    }
+    if local.turn_seen_at.is_some() && input["invocationNum"].as_u64().is_some_and(|n| n > 0) {
+        return true;
+    }
+    local.pending_halt.is_some()
+}
+
+/// Checks the agent's local state before an Antigravity tool call and returns a deny reason
+/// if a paused board has halted the active turn. Local-only (no server or Keychain call).
+async fn antigravity_pre_tool_halt(
+    home: &Home,
+    explicit_agent: Option<&str>,
+    input: &Value,
+) -> Result<Option<String>> {
+    if Config::load(home)?.require_login().is_err() {
+        return Ok(None);
+    }
+    let session = input["session_id"].as_str().filter(|s| !s.is_empty());
+    let nested = nested_session(
+        home,
+        HookEvent::PreToolUse,
+        Runtime::Antigravity,
+        session,
+        explicit_agent,
+    )
+    .await?;
+    let env = |name: &str| std::env::var(name).ok();
+    let Some(agent) = resolve_agent(
+        explicit_agent,
+        env,
+        session.map(|s| (Runtime::Antigravity, s)),
+        nested,
+    )?
+    else {
+        return Ok(None);
+    };
+    let local = state::load_agent(home, &agent);
+    if let Some(reason) = local.pending_halt {
+        return Ok(Some(reason));
+    }
+    if local.halted() {
+        return Ok(Some(
+            "board: paused, so this turn stopped. `board resume` continues the work.".into(),
+        ));
+    }
+    Ok(None)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptScan {
+    Found(String),
+    TurnBoundary,
+    NotFound,
+}
+
+fn scan_antigravity_transcript(text: &str) -> TranscriptScan {
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match rec["type"].as_str() {
+            Some("USER_INPUT") => return TranscriptScan::TurnBoundary,
+            Some("PLANNER_RESPONSE") => {
+                if let Some(said) = rec["content"].as_str().and_then(board_proto::turn_ending) {
+                    return TranscriptScan::Found(said);
+                }
+            }
+            _ => {}
+        }
+    }
+    TranscriptScan::NotFound
+}
+
+/// Extracts the last non-empty `PLANNER_RESPONSE.content` of the current turn from an
+/// Antigravity JSONL transcript, cleaned and truncated by [`board_proto::turn_ending`].
+fn antigravity_last_assistant_message(path: &Path) -> Option<String> {
+    antigravity_last_assistant_message_with_tail(path, TRANSCRIPT_TAIL_BYTES)
+}
+
+fn antigravity_last_assistant_message_with_tail(path: &Path, tail: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(tail);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let slice = if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => &buf[pos + 1..],
+            None => &[],
+        }
+    } else {
+        &buf[..]
+    };
+    let text = String::from_utf8_lossy(slice);
+    match scan_antigravity_transcript(&text) {
+        TranscriptScan::Found(said) => Some(said),
+        TranscriptScan::TurnBoundary => None,
+        TranscriptScan::NotFound if start > 0 && len <= TRANSCRIPT_MAX_BYTES => {
+            let full = std::fs::read_to_string(path).ok()?;
+            match scan_antigravity_transcript(&full) {
+                TranscriptScan::Found(said) => Some(said),
+                TranscriptScan::TurnBoundary | TranscriptScan::NotFound => None,
+            }
+        }
+        TranscriptScan::NotFound => None,
+    }
+}
+
 /// Used by tests and `install`: the path of this binary.
 pub fn current_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| Path::new("board").to_path_buf())
@@ -2946,6 +3177,140 @@ mod tests {
             .as_deref(),
             Some("{}")
         );
+        // Antigravity PostToolHookResult rejects `injectSteps` and `terminationBehavior`;
+        // only `PreInvocation` (`UserPromptSubmit`) accepts them.
+        assert_eq!(
+            render_reply(
+                HookEvent::PostToolUse,
+                Runtime::Antigravity,
+                Reply::Halt("board: factory paused".into())
+            )
+            .as_deref(),
+            Some("{}")
+        );
+        assert_eq!(
+            render_reply(
+                HookEvent::PostToolUseFailure,
+                Runtime::Antigravity,
+                Reply::Halt("board: factory paused".into())
+            )
+            .as_deref(),
+            Some("{}")
+        );
+        let agy_halt = render_reply(
+            HookEvent::UserPromptSubmit,
+            Runtime::Antigravity,
+            Reply::Halt("board: factory paused".into()),
+        )
+        .unwrap();
+        let hv: Value = serde_json::from_str(&agy_halt).unwrap();
+        assert_eq!(hv["terminationBehavior"], "terminate");
+        assert_eq!(
+            hv["injectSteps"][0]["errorMessage"]["userMessage"],
+            "board: factory paused"
+        );
+    }
+
+    #[test]
+    fn antigravity_mid_turn_distinguishes_invocations_and_new_turns() {
+        let mut local = AgentLocal::default();
+        assert!(!is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({"initialNumSteps": 2}),
+            &local
+        ));
+        assert!(!is_antigravity_mid_turn(
+            Runtime::Claude,
+            &json!({"initialNumSteps": 2, "invocationNum": 2}),
+            &AgentLocal {
+                turn_initial_steps: Some(2),
+                pending_halt: Some("paused".into()),
+                ..AgentLocal::default()
+            }
+        ));
+
+        local.turn_initial_steps = Some(2);
+        assert!(is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({"initialNumSteps": 2, "invocationNum": 1}),
+            &local
+        ));
+        // Next user turn increases initialNumSteps, even if Stop was missed and pending_halt stayed.
+        local.pending_halt = Some("paused".into());
+        assert!(!is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({"initialNumSteps": 9}),
+            &local
+        ));
+
+        // Proto3 omits initialNumSteps=0 on the first turn.
+        let mut zero_turn = AgentLocal {
+            turn_initial_steps: Some(0),
+            ..AgentLocal::default()
+        };
+        assert!(is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({"invocationNum": 1}),
+            &zero_turn
+        ));
+        assert!(!is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({"initialNumSteps": 5}),
+            &zero_turn
+        ));
+
+        // Minimal payloads without step metadata fall back to pending_halt.
+        zero_turn.turn_initial_steps = None;
+        zero_turn.pending_halt = Some("paused".into());
+        assert!(is_antigravity_mid_turn(
+            Runtime::Antigravity,
+            &json!({}),
+            &zero_turn
+        ));
+    }
+
+    #[test]
+    fn antigravity_transcript_extracts_last_turn_planner_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        assert_eq!(antigravity_last_assistant_message(&path), None);
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(antigravity_last_assistant_message(&path), None);
+
+        let lines = [
+            json!({"type": "USER_INPUT", "content": "turn 1"}).to_string(),
+            json!({"type": "PLANNER_RESPONSE", "content": "first turn"}).to_string(),
+            json!({"type": "USER_INPUT", "content": "turn 2"}).to_string(),
+            json!({"type": "PLANNER_RESPONSE", "thinking": "calling tool"}).to_string(),
+            json!({"type": "GENERIC", "content": "tool output"}).to_string(),
+            "not json".to_owned(),
+            json!({"type": "PLANNER_RESPONSE", "content": "  \u{1b}[1mDone\u{1b}[0m.\n"})
+                .to_string(),
+            json!({"type": "PLANNER_RESPONSE", "content": "   "}).to_string(),
+            json!({"type": "SYSTEM_MESSAGE", "content": "hook"}).to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(
+            antigravity_last_assistant_message(&path).as_deref(),
+            Some("Done.")
+        );
+
+        // Tail-read fallback: force a tiny tail window that only sees trailing GENERIC lines.
+        let mut padded = lines.to_vec();
+        padded.push(json!({"type": "GENERIC", "content": "x".repeat(200)}).to_string());
+        std::fs::write(&path, padded.join("\n")).unwrap();
+        assert_eq!(
+            antigravity_last_assistant_message_with_tail(&path, 64).as_deref(),
+            Some("Done.")
+        );
+
+        // A newer USER_INPUT with no PLANNER_RESPONSE content returns None instead of the
+        // previous turn's response.
+        padded.push(json!({"type": "USER_INPUT", "content": "turn 3"}).to_string());
+        padded.push(json!({"type": "PLANNER_RESPONSE", "thinking": "aborted"}).to_string());
+        std::fs::write(&path, padded.join("\n")).unwrap();
+        assert_eq!(antigravity_last_assistant_message(&path), None);
     }
 
     #[test]

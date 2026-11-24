@@ -4214,3 +4214,412 @@ fn a_launch_runs_when_the_check_cannot_count_or_keep_it() {
     );
     assert!(e.stub.requests().is_empty(), "{}", e.ran());
 }
+
+const AGY_SESSION: &str = "conv-agy-1";
+const AGY_AGENT: &str = "antigravity:conv-agy-1";
+
+fn agy_state_path() -> String {
+    format!("POST /v1/agents/{}/state", enc(AGY_AGENT))
+}
+
+fn agy_handoff_route() -> String {
+    format!("GET /v1/agents/{}/handoff", enc(AGY_AGENT))
+}
+
+fn agy_base(e: &Env, event: &str, extra: Value) -> Value {
+    let mut v = json!({
+        "conversationId": AGY_SESSION,
+        "cwd": e.repo,
+        "hookEventName": event,
+    });
+    v.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    v
+}
+
+fn agy_system_message(reply: &Option<Value>) -> String {
+    reply.as_ref().expect("JSON reply")["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .expect("systemMessage text")
+        .to_owned()
+}
+
+fn agy_heartbeat_due_again(e: &Env) {
+    let path = e.home.join("state").join(format!(
+        "{}.json",
+        board::state::file_stem(&AGY_AGENT.parse().unwrap())
+    ));
+    let mut local: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    local.as_object_mut().unwrap().remove("last_heartbeat");
+    std::fs::write(&path, local.to_string()).unwrap();
+}
+
+#[test]
+fn antigravity_post_tool_use_halt_is_proto_valid_and_stops_on_pre_tool_use_and_pre_invocation() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+
+    // Turn 1 starts while the board is active.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", None);
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "lastUserInput": "continue"}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})));
+
+    // Board is paused mid-turn: PostToolUse heartbeat must emit proto-valid `{}` (no
+    // unknown `injectSteps` or `terminationBehavior`) and mark the agent idle.
+    serve_hold_at(&e, "2030-01-01T10:02:00Z", Some("2030-01-01T10:01:00Z"));
+    let (reply, _) = e.hook(
+        "post-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PostToolUse",
+            json!({"toolCall": {"id": "call-1", "name": "read_file", "args": {"Path": "/x"}}}),
+        ),
+    );
+    assert_eq!(
+        reply,
+        Some(json!({})),
+        "PostToolHookResult accepts only empty JSON: {}",
+        e.ran()
+    );
+    assert_eq!(
+        e.stub.requests_to(&agy_state_path()).last().unwrap().body["state"],
+        "idle"
+    );
+
+    // Any tool call attempted while halted is immediately denied on PreToolUse.
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreToolUse",
+            json!({"toolCall": {"id": "call-2", "name": "run_command", "args": {"CommandLine": "ls"}}}),
+        ),
+    );
+    let deny = reply.expect("PreToolUse deny");
+    assert_eq!(deny["decision"], "deny", "{deny}");
+    assert!(
+        deny["reason"].as_str().unwrap().contains("factory paused"),
+        "{deny}"
+    );
+
+    // The next mid-turn PreInvocation terminates the turn with an errorMessage.
+    let states_before = e.stub.requests_to(&agy_state_path()).len();
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 1, "lastUserInput": "continue"}),
+        ),
+    );
+    let halt = reply.expect("PreInvocation halt");
+    assert_eq!(halt["terminationBehavior"], "terminate", "{halt}");
+    assert!(
+        halt["injectSteps"][0]["errorMessage"]["userMessage"]
+            .as_str()
+            .unwrap()
+            .contains("factory paused"),
+        "{halt}"
+    );
+    assert_eq!(
+        e.stub.requests_to(&agy_state_path()).len(),
+        states_before,
+        "pending halt does not flip the idle agent back to running"
+    );
+
+    // Stop clears the turn hold.
+    let (reply, _) = e.hook("stop", "antigravity", agy_base(&e, "Stop", json!({})));
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+
+    // A new user turn begun while the board is already paused is told, not halted.
+    serve_hold_at(&e, "2030-01-01T10:05:00Z", Some("2030-01-01T10:01:00Z"));
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 10, "lastUserInput": "fix it anyway"}),
+        ),
+    );
+    assert!(
+        agy_system_message(&reply).contains("hold: factory paused"),
+        "{reply:?}"
+    );
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreToolUse",
+            json!({"toolCall": {"id": "call-3", "name": "run_command", "args": {"CommandLine": "ls"}}}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+}
+
+#[test]
+fn antigravity_mid_turn_pre_invocation_halts_newly_paused_board() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+
+    // Turn begins before the pause.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", None);
+    e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 3, "lastUserInput": "work"}),
+        ),
+    );
+
+    // Board pauses before the next 60s PostToolUse heartbeat: mid-turn PreInvocation catches
+    // it directly and terminates the turn without overwriting turn_seen_at.
+    serve_hold_at(&e, "2030-01-01T10:00:20Z", Some("2030-01-01T10:00:10Z"));
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 3, "invocationNum": 1, "lastUserInput": "work"}),
+        ),
+    );
+    let halt = reply.expect("mid-turn PreInvocation halt");
+    assert_eq!(halt["terminationBehavior"], "terminate", "{halt}");
+    assert!(
+        halt["injectSteps"][0]["errorMessage"]["userMessage"]
+            .as_str()
+            .unwrap()
+            .contains("factory paused"),
+        "{halt}"
+    );
+    assert_eq!(
+        e.stub.requests_to(&agy_state_path()).last().unwrap().body["state"],
+        "idle"
+    );
+}
+
+#[test]
+fn antigravity_post_tool_use_queues_context_and_flushes_once_on_pre_invocation() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    let mut doing = task_fixture("factory-12", "Fix hook");
+    doing.status = TaskStatus::Doing;
+    e.stub.on("GET /v1/tasks", vec![doing]);
+    let old = chrono::Utc::now() - chrono::Duration::hours(1);
+    e.stub.on(
+        &agy_handoff_route(),
+        Handoff {
+            agent: AGY_AGENT.parse().unwrap(),
+            now: "started".into(),
+            next: "finish".into(),
+            blockers: String::new(),
+            updated_at: old,
+            last_change_at: Some(old + chrono::Duration::minutes(5)),
+            version: 1,
+        },
+    );
+    e.stub.on(
+        "POST /v1/touches",
+        TouchResult {
+            overlaps: vec![Overlap {
+                path: "src/lib.rs".into(),
+                agent: "t3:a91c".parse().unwrap(),
+                handle: "t3:a91c".into(),
+                via: "touch".into(),
+                at: chrono::Utc::now() - chrono::Duration::minutes(2),
+            }],
+        },
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "! factory-9 done -> task_update", 20),
+    );
+
+    // PostToolUse returns `{}` to satisfy PostToolHookResult proto and queues context locally.
+    let (reply, _) = e.hook(
+        "post-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PostToolUse",
+            json!({
+                "toolCall": {
+                    "id": "call-edit",
+                    "name": "edit_file",
+                    "args": {"Path": e.repo.join("src/lib.rs")}
+                }
+            }),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})), "{}", e.ran());
+
+    // Next PreInvocation flushes the queued overlap warning, board alert and handoff reminder
+    // even when the delta snapshot itself is empty.
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "", 20),
+    );
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 4, "invocationNum": 1, "lastUserInput": "edit"}),
+        ),
+    );
+    let msg = agy_system_message(&reply);
+    assert!(
+        msg.contains("! t3:a91c edited \"src/lib.rs\""),
+        "overlap warning flushed: {msg}"
+    );
+    assert!(
+        msg.contains("! factory-9 done"),
+        "board alert flushed: {msg}"
+    );
+    assert!(
+        msg.contains("handoff_set"),
+        "handoff reminder flushed: {msg}"
+    );
+
+    // Subsequent PreInvocation with empty delta emits `{}`: queued context is not duplicated.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 4, "invocationNum": 2, "lastUserInput": "edit"}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})), "no duplicate delivery: {}", e.ran());
+
+    // Queued PostToolUse context combines with a non-empty delta snapshot on PreInvocation.
+    agy_heartbeat_due_again(&e);
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "! ask 5 answered -> read it", 25),
+    );
+    let (reply, _) = e.hook(
+        "post-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PostToolUse",
+            json!({"toolCall": {"id": "call-read", "name": "read_file", "args": {"Path": "/x"}}}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})));
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "<board>\ncounts: open 1\n</board>", 26),
+    );
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 4, "invocationNum": 3, "lastUserInput": "edit"}),
+        ),
+    );
+    let combined = agy_system_message(&reply);
+    assert!(combined.contains("counts: open 1"), "{combined}");
+    assert!(combined.contains("! ask 5 answered"), "{combined}");
+}
+
+#[test]
+fn antigravity_stop_populates_said_from_transcript_path() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Idle),
+    );
+    let transcript = e.home.join("transcript.jsonl");
+    let records = [
+        json!({"type": "USER_INPUT", "content": "fix the bug"}).to_string(),
+        json!({"type": "PLANNER_RESPONSE", "thinking": "reading files"}).to_string(),
+        json!({"type": "GENERIC", "content": "file contents"}).to_string(),
+        json!({"type": "PLANNER_RESPONSE", "content": "  \u{1b}[1mImplemented fix\u{1b}[0m.\n"})
+            .to_string(),
+        json!({"type": "SYSTEM_MESSAGE", "content": "hook"}).to_string(),
+    ];
+    std::fs::write(&transcript, records.join("\n")).unwrap();
+
+    let (reply, _) = e.hook(
+        "stop",
+        "antigravity",
+        agy_base(&e, "Stop", json!({"transcriptPath": transcript})),
+    );
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+    assert_eq!(
+        e.stub.requests_to(&agy_state_path()).last().unwrap().body["said"],
+        "Implemented fix."
+    );
+
+    // Continuation after another Stop hook omits `said`.
+    let (reply, _) = e.hook(
+        "stop",
+        "antigravity",
+        agy_base(
+            &e,
+            "Stop",
+            json!({"transcriptPath": transcript, "continuationActive": true}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+    assert_eq!(
+        e.stub
+            .requests_to(&agy_state_path())
+            .last()
+            .unwrap()
+            .body
+            .get("said"),
+        None
+    );
+
+    // A new turn with no PLANNER_RESPONSE.content sends no `said`.
+    let mut next_turn = records.to_vec();
+    next_turn.push(json!({"type": "USER_INPUT", "content": "cancel"}).to_string());
+    std::fs::write(&transcript, next_turn.join("\n")).unwrap();
+    let (reply, _) = e.hook(
+        "stop",
+        "antigravity",
+        agy_base(&e, "Stop", json!({"transcriptPath": transcript})),
+    );
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+    assert_eq!(
+        e.stub
+            .requests_to(&agy_state_path())
+            .last()
+            .unwrap()
+            .body
+            .get("said"),
+        None
+    );
+}
