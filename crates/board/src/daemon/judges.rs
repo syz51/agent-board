@@ -66,9 +66,19 @@ pub struct JudgeRun {
     /// The tasks it judges; none for a goal review.
     #[serde(default)]
     pub tasks: Vec<TaskId>,
-    /// Its thread; `None` until `t3 thread start` returns, as for a [`Worker`].
+    /// Its thread or runner-native session id; `None` until `Runner::spawn` returns, as for
+    /// a [`Worker`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Runner kind that owns this judge (`"t3"` when omitted in older state files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// Daemon-managed worktree record id, when [`WorktreeManager`] created the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    /// Path of the daemon-managed worktree, when [`WorktreeManager`] created it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
     pub title: String,
     pub started_at: Timestamp,
     /// Whether the server has it as a judge of the board.
@@ -516,7 +526,7 @@ fn brief_kind(kind: JudgeKind) -> crate::brief::JudgeKind {
     }
 }
 
-impl<T: T3> Daemon<T> {
+impl<T: T3 + 'static> Daemon<T> {
     /// Follows the judges started on `board`, closes its reviewed tasks, and starts the
     /// judges it needs. `in_progress` is how many tasks hold a slot. With
     /// [`Judging::Verdicts`] it follows the judges, starts verdict judges, and reads and
@@ -531,7 +541,7 @@ impl<T: T3> Daemon<T> {
     ) -> Result<()> {
         let slug = &board.slug;
         let all = judging == Judging::All;
-        let project = self.host_folder(board)?;
+        let (repo_key, project) = self.host_project(board)?;
         let client = self.client().with_agent(Some(agent.clone()));
         self.settle_judge_starts(board, &client, &project, now)
             .await;
@@ -784,7 +794,10 @@ impl<T: T3> Daemon<T> {
                 break;
             }
             let names = want.title.clone();
-            match self.start_judge(board, &client, &project, want, now).await {
+            match self
+                .start_judge(board, &client, repo_key.as_deref(), &project, want, now)
+                .await
+            {
                 Ok(StartOutcome::Started) => {
                     self.hold_ended("judge", &names);
                     self.hold_ended("review_wait", &names);
@@ -828,10 +841,13 @@ impl<T: T3> Daemon<T> {
         }
     }
 
-    /// Forgets `run`, and keeps its tasks from another judge of its kind for `wait`
-    /// unless they change.
+    /// Forgets `run`, cleans up its daemon-managed worktree when any, and keeps its tasks
+    /// from another judge of its kind for `wait` unless they change.
     async fn end_run(&mut self, run: &JudgeRun, client: &Client, now: Timestamp, wait: TimeDelta) {
         self.state.judges.retain(|r| !r.same(run));
+        if let Some(wt_id) = run.worktree_id.as_deref() {
+            self.cleanup_worktree(wt_id, now).await;
+        }
         let until = now + wait;
         if run.tasks.is_empty() {
             let retry = JudgeRetry {
@@ -912,6 +928,9 @@ impl<T: T3> Daemon<T> {
         project: &Path,
         run: &JudgeRun,
     ) -> Result<Option<String>> {
+        if run.runner.as_deref().unwrap_or(self.runner.kind()) != "t3" {
+            return Ok(None);
+        }
         let found = self
             .t3
             .threads_titled(project, &run.title)
@@ -936,7 +955,11 @@ impl<T: T3> Daemon<T> {
                 &run.tasks,
                 run.worktree_note.as_deref(),
             );
-            if let Err(err) = self.t3.send(&found.id, &brief).await {
+            if let Err(err) = self
+                .runner
+                .send(&RunHandle::t3(&found.id), &SteerMessage::new(&brief))
+                .await
+            {
                 tracing::warn!(
                     "briefing judge thread {} left by an earlier start: {err:#}; archive it in T3",
                     found.id
@@ -953,12 +976,14 @@ impl<T: T3> Daemon<T> {
         let Some(thread) = run.thread.clone() else {
             return Ok(());
         };
+        let runner_kind = run.runner.as_deref().unwrap_or(self.runner.kind());
+        let judge = RunHandle::new(runner_kind, &thread).resolve_agent_id()?;
         if !run.registered {
             client
                 .register_judge(
                     &run.board,
                     &RegisterJudge {
-                        agent: thread_agent(&thread)?,
+                        agent: judge.clone(),
                         kind: run.kind,
                         tasks: run.tasks.clone(),
                     },
@@ -967,15 +992,18 @@ impl<T: T3> Daemon<T> {
             run.registered = true;
         }
         if run.kind == JudgeKind::Review && !run.noted {
-            let link = match self.t3.thread_link(&thread).await {
-                Ok(Some(link)) => link,
-                _ => format!("thread {thread}"),
+            let link = if runner_kind == "t3" {
+                match self.t3.thread_link(&thread).await {
+                    Ok(Some(link)) => link,
+                    _ => format!("thread {thread}"),
+                }
+            } else {
+                format!("{runner_kind} run {thread}")
             };
             let Some(agent) = client.agent() else {
                 return Ok(());
             };
             // `reviewed` reads the judge's agent id at the end of this note.
-            let judge = thread_agent(&thread)?;
             for task in &run.tasks {
                 let text = format!("{JUDGE_NOTE} {link} (agent {judge})");
                 match add_note(client, task, agent, NoteKind::Note, text).await {
@@ -995,13 +1023,18 @@ impl<T: T3> Daemon<T> {
         listed: &[Judge],
         now: Timestamp,
     ) {
+        let default_runner = self.runner.kind();
         let ended: Vec<JudgeRun> = self
             .state
             .judges
             .iter()
             .filter(|r| r.board == *slug && r.registered)
             .filter(|r| {
-                let judge = r.thread.as_deref().and_then(|t| thread_agent(t).ok());
+                let runner_kind = r.runner.as_deref().unwrap_or(default_runner);
+                let judge = r
+                    .thread
+                    .as_deref()
+                    .and_then(|t| RunHandle::new(runner_kind, t).resolve_agent_id().ok());
                 !listed
                     .iter()
                     .any(|j| j.running && Some(&j.agent) == judge.as_ref())
@@ -1026,6 +1059,7 @@ impl<T: T3> Daemon<T> {
         &mut self,
         board: &Board,
         client: &Client,
+        repo_key: Option<&str>,
         project: &Path,
         want: Want,
         now: Timestamp,
@@ -1169,34 +1203,95 @@ impl<T: T3> Daemon<T> {
             &want.tasks,
             worktree_note.as_deref(),
         );
+        let run_label = want
+            .tasks
+            .first()
+            .map_or_else(|| board.slug.to_string(), ToString::to_string);
+        let run_id = format!(
+            "judge-{}-{run_label}-{}",
+            brief_kind(want.kind).as_str(),
+            now.format("%Y%m%d-%H%M%S")
+        );
+        let (workdir, spec_worktree, worktree_id, worktree_path) = if self.daemon_worktrees
+            && let Some(spec) = &worktree
+        {
+            let managed = self
+                .worktrees
+                .create(project, repo_key, &run_id, spec, now)
+                .await
+                .context("creating daemon-managed judge worktree")?;
+            (
+                managed.path.clone(),
+                None,
+                Some(managed.id),
+                Some(managed.path),
+            )
+        } else {
+            (project.to_path_buf(), worktree, None, None)
+        };
         let mut run = JudgeRun {
             board: board.slug.clone(),
             kind: want.kind,
             tasks: want.tasks,
             thread: None,
+            runner: Some(self.runner.kind().to_owned()),
+            worktree_id,
+            worktree_path,
             title: want.title,
             started_at: now,
             registered: false,
             noted: false,
             worktree_note,
         };
-        // On disk before T3 can create the thread.
+        // On disk before the runner can create the session/thread.
         self.put_run(&run);
         self.save()?;
-        let model = self.ctx.config.model_for_judge(run.kind);
-        let thread = self
-            .t3
-            .start_thread(project, &run.title, &brief, worktree.as_ref(), model)
-            .await?;
-        thread_agent(&thread)
-            .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
-        tracing::info!(
-            "started {} judge thread {thread} for {} on {}",
-            run.kind_name(),
-            run.names(),
-            board.slug
-        );
+        let model = self.ctx.config.model_for_judge(run.kind).cloned();
+        let spec = RunSpec {
+            run_id,
+            title: run.title.clone(),
+            prompt: brief,
+            model,
+            worktree: spec_worktree,
+            metadata: BTreeMap::from([
+                ("board".to_owned(), board.slug.to_string()),
+                ("kind".to_owned(), format!("judge:{}", run.kind_name())),
+            ]),
+        };
+        let handle = match self.runner.spawn(&spec, &workdir).await {
+            Ok(handle) => handle,
+            Err(err) => {
+                if let Some(wt_id) = run.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+                return Err(err);
+            }
+        };
+        let thread = handle.native_id.clone();
+        if self.runner.kind() == "t3" {
+            thread_agent(&thread)
+                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
+        } else {
+            handle.resolve_agent_id()?;
+        }
+        if handle.runner == "t3" {
+            tracing::info!(
+                "started {} judge thread {thread} for {} on {}",
+                run.kind_name(),
+                run.names(),
+                board.slug
+            );
+        } else {
+            tracing::info!(
+                "started {} judge {thread} ({}) for {} on {}",
+                run.kind_name(),
+                handle.runner,
+                run.names(),
+                board.slug
+            );
+        }
         run.thread = Some(thread);
+        run.runner = Some(handle.runner);
         if run.kind == JudgeKind::Goal {
             self.state.goal_due.remove(&board.slug);
         }

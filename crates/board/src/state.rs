@@ -420,6 +420,19 @@ pub fn append_unchecked_launch<T: Serialize>(home: &Home, record: &T) -> Result<
     append_line(home, "unchecked-launches.jsonl", record)
 }
 
+/// Adds `record` as one line to `worktree-events.jsonl` in the state directory, and gives
+/// its path: the trail of daemon-managed git worktree cleanups and dirty-worktree skips.
+/// Nothing prunes it.
+pub fn append_worktree_event<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "worktree-events.jsonl", record)
+}
+
+/// Adds `record` as one line to `runner-cancels.jsonl` in the state directory, and gives
+/// its path: the trail of `Runner::cancel` requests and outcomes. Nothing prunes it.
+pub fn append_runner_cancel<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "runner-cancels.jsonl", record)
+}
+
 /// Whether `unchecked-launches.jsonl` has a launch of `session` at or after `since`.
 pub fn unchecked_launch_since(home: &Home, session: &str, since: Timestamp) -> bool {
     let path = home.state_dir().join("unchecked-launches.jsonl");
@@ -992,5 +1005,42 @@ mod tests {
                 head: None,
             })
         );
+    }
+
+    #[test]
+    fn worktree_and_runner_cancel_trails_append_jsonl_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+
+        let wt_path =
+            append_worktree_event(&home, &serde_json::json!({"action": "removed", "id": "w1"}))
+                .unwrap();
+        let wt_path2 = append_worktree_event(
+            &home,
+            &serde_json::json!({"action": "cleanup_skipped_dirty", "id": "w2"}),
+        )
+        .unwrap();
+        assert_eq!(wt_path, wt_path2);
+        let wt_lines: Vec<serde_json::Value> = std::fs::read_to_string(&wt_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(wt_lines.len(), 2);
+        assert_eq!(wt_lines[0]["id"], "w1");
+        assert_eq!(wt_lines[1]["id"], "w2");
+
+        let cancel_path = append_runner_cancel(
+            &home,
+            &serde_json::json!({"runner": "t3", "native_id": "t-1"}),
+        )
+        .unwrap();
+        let cancel_lines: Vec<serde_json::Value> = std::fs::read_to_string(&cancel_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(cancel_lines.len(), 1);
+        assert_eq!(cancel_lines[0]["native_id"], "t-1");
     }
 }

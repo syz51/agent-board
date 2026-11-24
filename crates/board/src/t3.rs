@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -30,6 +30,7 @@ use board_proto::{
     AGENT_TITLE_CHARS_MAX as TITLE_CHARS_MAX, NATIVE_ID_CHARS_MAX, Runtime, T3_LINK_PREFIX,
     Timestamp,
 };
+use serde::{Deserialize, Serialize};
 
 /// How T3 starts the message that wakes a thread for a pull request it watches
 /// (`Update on pull request #7 (<url>), which T3 Code is watching for you: …`).
@@ -115,7 +116,7 @@ pub struct ListedThread {
 }
 
 /// A new git worktree for a thread: the `branch` T3 creates from `base` and checks out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorktree {
     pub base: String,
     pub branch: String,
@@ -160,6 +161,50 @@ pub trait T3: Send + Sync {
     /// The ids of the threads with a run in progress in the project containing `project`,
     /// whoever started them.
     fn running_threads(&self, project: &Path) -> impl Future<Output = Result<Vec<String>>> + Send;
+}
+
+impl<T: T3> T3 for Arc<T> {
+    fn start_thread(
+        &self,
+        project: &Path,
+        title: &str,
+        message: &str,
+        worktree: Option<&NewWorktree>,
+        model: Option<&ThreadModel>,
+    ) -> impl Future<Output = Result<String>> + Send {
+        (**self).start_thread(project, title, message, worktree, model)
+    }
+
+    fn send(&self, thread: &str, message: &str) -> impl Future<Output = Result<()>> + Send {
+        (**self).send(thread, message)
+    }
+
+    fn thread_info(&self, thread: &str) -> impl Future<Output = Result<Option<ThreadInfo>>> + Send {
+        (**self).thread_info(thread)
+    }
+
+    fn recent_messages(
+        &self,
+        thread: &str,
+    ) -> impl Future<Output = Result<Option<RecentMessages>>> + Send {
+        (**self).recent_messages(thread)
+    }
+
+    fn thread_link(&self, thread: &str) -> impl Future<Output = Result<Option<String>>> + Send {
+        (**self).thread_link(thread)
+    }
+
+    fn threads_titled(
+        &self,
+        project: &Path,
+        title: &str,
+    ) -> impl Future<Output = Result<Vec<ListedThread>>> + Send {
+        (**self).threads_titled(project, title)
+    }
+
+    fn running_threads(&self, project: &Path) -> impl Future<Output = Result<Vec<String>>> + Send {
+        (**self).running_threads(project)
+    }
 }
 
 /// The real `t3` binary.

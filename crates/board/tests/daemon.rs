@@ -5482,6 +5482,9 @@ fn other_board_with_a_judge(e: &mut Env, slots: u32) {
         kind: board_proto::JudgeKind::Goal,
         tasks: Vec::new(),
         thread: Some(J2.to_owned()),
+        runner: None,
+        worktree_id: None,
+        worktree_path: None,
         title: "goal review other".to_owned(),
         started_at: at(),
         registered: false,
@@ -7011,4 +7014,215 @@ async fn per_kind_judge_models_select_each_kind_and_warn_on_reload() {
             Some(fallback_judge)
         )]
     );
+}
+
+#[tokio::test]
+async fn daemon_with_non_t3_runner_owns_git_worktree_lifecycle_and_safe_cleanup() {
+    use board::runner::{FakeRunner, RunEventKind, RunnerState};
+    use board::worktree::WorktreeStatus;
+
+    let git_dir = tempfile::tempdir().unwrap();
+    let origin = git_dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "init"],
+    );
+    git(git_dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = git_dir.path().join("repo");
+
+    let mut e = env_with_projects([(REPO.to_owned(), repo.clone())].into());
+    let home = Home::at(e._dir.path().join("home"));
+    let fake = FakeRunner::new("acp")
+        .with_home(home.clone())
+        .with_clock(std::sync::Arc::new(at));
+    e.daemon = e.daemon.with_runner(fake.clone());
+    assert_eq!(e.daemon.runner_kind(), "acp");
+
+    let t1 = ready_task("factory-1", board_proto::Priority::P1, 0);
+    let t2 = ready_task("factory-2", board_proto::Priority::P2, 1);
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", [t1.clone(), t2.clone()]);
+    e.stub.on("POST /v1/tasks/factory-1/notes", note(&t1.id));
+    e.stub.on("POST /v1/tasks/factory-2/notes", note(&t2.id));
+    judges_at_work(&e, &[]);
+
+    // Reconcile 1: starts worker for `factory-1` in a daemon-owned worktree with zero T3 calls.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        e.t3.calls().is_empty(),
+        "non-T3 runner must not invoke T3 CLI: {:?}",
+        e.t3.calls()
+    );
+    let spawns = fake.spawns();
+    assert_eq!(spawns.len(), 1);
+    assert_eq!(
+        spawns[0].spec.worktree, None,
+        "daemon created worktree directly instead of delegating --worktree"
+    );
+    assert!(
+        spawns[0].workdir.starts_with(home.root().join("worktrees")),
+        "workdir must be under $BOARD_HOME/worktrees: {}",
+        spawns[0].workdir.display()
+    );
+    assert!(spawns[0].workdir.exists());
+    let wt1_path = spawns[0].workdir.clone();
+    let wt1_id = e.daemon.state.workers[&t1.id]
+        .worktree_id
+        .clone()
+        .expect("worktree_id tracked on worker");
+    assert_eq!(
+        e.daemon.worktrees().records().unwrap().len(),
+        1,
+        "WorktreeManager tracked the active worktree"
+    );
+
+    // Poll events and cancel via Daemon's Runner boundary.
+    let events = e
+        .daemon
+        .poll_run_events(&spawns[0].handle, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, RunEventKind::Phase);
+
+    e.daemon
+        .cancel_run(&spawns[0].handle, "preempted for test")
+        .await
+        .unwrap();
+    let cancel_events = e
+        .daemon
+        .poll_run_events(&spawns[0].handle, 1)
+        .await
+        .unwrap();
+    assert_eq!(cancel_events.len(), 1);
+    assert_eq!(cancel_events[0].kind, RunEventKind::Cancelled);
+    assert_eq!(fake.cancels()[0].reason, "preempted for test");
+    assert_eq!(
+        board::runner::Runner::status(&fake, &spawns[0].handle)
+            .await
+            .unwrap()
+            .state,
+        RunnerState::Cancelled
+    );
+    assert!(home.state_dir().join("runner-cancels.jsonl").exists());
+
+    // Mark `factory-1` done so the worker frees its slot and `Daemon` cleans up the clean worktree.
+    let mut done_t1 = detail("factory-1", false, &[]);
+    done_t1.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/factory-1", done_t1);
+    e.stub.on("GET /v1/tasks", [t2.clone()]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(
+        !wt1_path.exists(),
+        "clean worktree must be removed when worker ends"
+    );
+    assert_eq!(
+        e.daemon.worktrees().store().get(&wt1_id).unwrap(),
+        None,
+        "removed worktree record cleared from store"
+    );
+
+    // Second worker (`factory-2`) started; dirty its worktree before it ends -> MUST NOT delete.
+    let spawns = fake.spawns();
+    assert_eq!(spawns.len(), 2);
+    let wt2_path = spawns[1].workdir.clone();
+    let wt2_id = e.daemon.state.workers[&t2.id]
+        .worktree_id
+        .clone()
+        .expect("second worktree_id tracked");
+    std::fs::write(wt2_path.join("uncommitted.txt"), "keep me").unwrap();
+
+    let mut done_t2 = detail("factory-2", false, &[]);
+    done_t2.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/factory-2", done_t2);
+    e.stub.on("GET /v1/tasks", json!([]));
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+    assert!(
+        wt2_path.join("uncommitted.txt").exists(),
+        "dirty worktree must never be deleted silently"
+    );
+    let rec2 = e
+        .daemon
+        .worktrees()
+        .store()
+        .get(&wt2_id)
+        .unwrap()
+        .expect("dirty skipped record kept");
+    assert_eq!(rec2.status, WorktreeStatus::DirtySkipped);
+    let trail = std::fs::read_to_string(home.state_dir().join("worktree-events.jsonl")).unwrap();
+    assert!(trail.contains("cleanup_skipped_dirty"), "{trail}");
+    assert!(trail.contains("uncommitted.txt"), "{trail}");
+}
+
+#[tokio::test]
+async fn daemon_with_non_t3_runner_creates_and_cleans_up_review_judge_worktree() {
+    use board::runner::FakeRunner;
+
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(&["feat/limit"], std::slice::from_ref(&task));
+    let home = Home::at(e._dir.path().join("home"));
+    let fake = FakeRunner::new("acp")
+        .with_home(home.clone())
+        .with_clock(std::sync::Arc::new(at));
+    e.daemon = e.daemon.with_runner(fake.clone());
+
+    let parked = task_note(
+        1,
+        &task,
+        WORKER,
+        "note",
+        &format!("note: parked in review, PR {PR}"),
+    );
+    review_detail(&e, &task, vec![parked]);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Pending));
+    e.stub.on(
+        "POST /v1/boards/factory/judges",
+        json!({
+            "board": "factory",
+            "agent": "antigravity:acp-run-1",
+            "kind": "review",
+            "tasks": ["factory-4"],
+            "registered_by": DISPATCH,
+            "created_at": at(),
+            "expires_at": at() + chrono::Duration::hours(2),
+            "running": true,
+        }),
+    );
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(e.t3.calls().is_empty());
+    let spawns = fake.spawns();
+    assert_eq!(spawns.len(), 1);
+    assert_eq!(spawns[0].spec.worktree, None);
+    let wt_path = spawns[0].workdir.clone();
+    assert!(wt_path.starts_with(home.root().join("worktrees")));
+    assert!(wt_path.exists());
+
+    // Judge finishes: server no longer lists it as running -> daemon cleans up clean review worktree.
+    judges_at_work(&e, &[]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(
+        !wt_path.exists(),
+        "clean review judge worktree must be removed when judge ends"
+    );
+    assert!(e.daemon.worktrees().records().unwrap().is_empty());
 }
