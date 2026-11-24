@@ -720,7 +720,17 @@ pub fn usage(
     }
     let mut read = format!("read {} by {}", ago_at(usage.read_at, now), usage.device);
     if !usage.fresh(now) {
-        read.push_str(" (stale: it holds no board)");
+        match usage.pace_at(now) {
+            Some(p) if now >= p.next_day() => {
+                read.push_str(" (stale: weekly reserve still holds until reset)");
+            }
+            Some(_) => {
+                read.push_str(" (stale: weekly pace still holds until next day)");
+            }
+            None => {
+                read.push_str(" (stale: it holds no board)");
+            }
+        }
     }
     lines.push(read);
     // Paused boards too, as the daemon and snapshots count them: the hold outlasts a resume.
@@ -738,16 +748,24 @@ pub fn usage(
     }
     match usage.pace_at(now) {
         Some(p) => {
-            lines.push(format!(
-                "pace: reserve {:.1}% · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
-                p.reserve,
-                p.anchor,
-                p.line,
-                p.allowance(),
-                p.projected,
-                p.next_day().format("%Y-%m-%d %H:%MZ")
-            ));
-            if p.hard_since.is_some() {
+            if !usage.fresh(now) && now >= p.next_day() {
+                lines.push(format!(
+                    "pace: reserve {:.1}% · hard line {:.1}% (from a past pace day; holds until weekly reset)",
+                    p.reserve,
+                    p.hard_line()
+                ));
+            } else {
+                lines.push(format!(
+                    "pace: reserve {:.1}% · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
+                    p.reserve,
+                    p.anchor,
+                    p.line,
+                    p.allowance(),
+                    p.projected,
+                    p.next_day().format("%Y-%m-%d %H:%MZ")
+                ));
+            }
+            if usage.hard_since(now).is_some() {
                 lines.push(format!(
                     "hard line: weekly use reached {:.1}%: agents working for a board halt",
                     p.hard_line()
@@ -756,7 +774,13 @@ pub fn usage(
             let limits: Vec<String> = boards
                 .iter()
                 .filter(|b| b.status != board_proto::BoardStatus::Closed)
-                .map(|b| format!("{} {}", b.slug, p.limit(b.parallel_tasks.max(1))))
+                .map(|b| {
+                    format!(
+                        "{} {}",
+                        b.slug,
+                        usage.pace_limit(b.parallel_tasks.max(1), now)
+                    )
+                })
                 .collect();
             if !limits.is_empty() {
                 lines.push(format!("tasks at once by pace: {}", limits.join(", ")));
@@ -1579,5 +1603,101 @@ mod tests {
             line,
             "autotune: promoted (mode apply) · baseline v1-default -> v2-auto-20261124 · delta +14.2% · 42 runs/31 tasks (7d) · 2026-11-24 12:30Z"
         );
+    }
+
+    #[test]
+    fn usage_renders_stale_monotonic_pace_holds_and_past_day_hard_reserve_accurately() {
+        let read_at: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let day_start = read_at - TimeDelta::hours(2);
+        let next_day = day_start + TimeDelta::hours(24);
+        let resets_at = day_start + TimeDelta::days(6);
+        let stale_same_day = read_at + TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES + 15);
+        let stale_next_day = next_day + TimeDelta::hours(2);
+
+        let board: Board = serde_json::from_value(json!({
+            "slug": "factory",
+            "title": "Factory",
+            "goal": "",
+            "status": "active",
+            "repos": [],
+            "autopilot": true,
+            "parallel_tasks": 3,
+            "usage_stop_at": 99,
+            "coordinator": null,
+            "home_devices": [],
+            "counts": { "open": 1, "doing": 0, "blocked": 0, "review": 0, "done": 0, "dropped": 0, "ready": 1 },
+            "open_asks": 0,
+            "created_at": read_at,
+            "updated_at": read_at
+        }))
+        .unwrap();
+
+        let make_usage = |measured: f64, projected: f64, line: f64, hard: bool| Usage {
+            five_hour: None,
+            seven_day: Some(board_proto::UsageWindow {
+                percent: measured,
+                resets_at: Some(resets_at),
+            }),
+            read_at,
+            device: "air".parse().unwrap(),
+            pace: Some(board_proto::UsagePace {
+                reserve: 4.0,
+                day_start,
+                anchor: 0.0,
+                line,
+                projected,
+                hard_since: hard.then_some(read_at),
+            }),
+        };
+
+        // 1. Stale projected-only reading does not hold.
+        let not_holding = make_usage(14.0, 18.0, 16.0, false);
+        let text = usage(
+            Some(&not_holding),
+            Some(4.0),
+            std::slice::from_ref(&board),
+            stale_same_day,
+        );
+        assert!(text.contains("(stale: it holds no board)"), "{text}");
+        assert!(text.contains("pace: not applied"), "{text}");
+
+        // 2. Stale same-day measured breach holds at 0 and names next day.
+        let same_day_breach = make_usage(32.6, 32.6, 16.0, false);
+        let text = usage(
+            Some(&same_day_breach),
+            Some(4.0),
+            std::slice::from_ref(&board),
+            stale_same_day,
+        );
+        assert!(
+            text.contains("(stale: weekly pace still holds until next day)"),
+            "{text}"
+        );
+        assert!(text.contains("tasks at once by pace: factory 0"), "{text}");
+        assert!(!text.contains("hard line:"), "{text}");
+
+        // 3. Stale hard-reserve breach past next_day holds until weekly reset without emitting
+        //    an expired next-day timestamp.
+        let hard_breach = make_usage(96.0, 96.0, 16.0, true);
+        let text = usage(
+            Some(&hard_breach),
+            Some(4.0),
+            std::slice::from_ref(&board),
+            stale_next_day,
+        );
+        assert!(
+            text.contains("(stale: weekly reserve still holds until reset)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pace: reserve 4.0% · hard line 96.0% (from a past pace day; holds until weekly reset)"),
+            "{text}"
+        );
+        assert!(!text.contains("next day 2026-11-25"), "{text}");
+        assert!(
+            text.contains("hard line: weekly use reached 96.0%"),
+            "{text}"
+        );
+        assert!(text.contains("tasks at once by pace: factory 0"), "{text}");
     }
 }

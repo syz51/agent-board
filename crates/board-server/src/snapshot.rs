@@ -486,7 +486,8 @@ struct UsageView {
     /// Set when a window of a fresh reading is at or above `stop_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     over: Option<UsageOver>,
-    /// The weekly pace, while the user keeps a reserve and the reading is fresh.
+    /// The weekly pace, while the user keeps a reserve and either the reading is fresh or
+    /// measured weekly usage still holds monotonically.
     #[serde(skip_serializing_if = "Option::is_none")]
     pace: Option<PaceView>,
 }
@@ -512,6 +513,11 @@ struct PaceView {
     next_day: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<&'static str>,
+    /// Set for text formatting when a stale reading still holds on a hard-reserve breach
+    /// after `next_day` has already passed, so `usage_line` names the weekly reset instead
+    /// of an expired pace day.
+    #[serde(skip)]
+    stale_hard_reset: Option<(f64, f64, String)>,
 }
 
 /// What the `usage:` line tells an agent while the pace is 0.
@@ -561,7 +567,18 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let pace = usage.pace_at(cx.now).map(|p| {
-        let limit = p.limit(parallel_tasks);
+        let limit = usage.pace_limit(parallel_tasks, cx.now);
+        let stale_hard_reset = (!usage.fresh(cx.now) && cx.now >= p.next_day())
+            .then(|| {
+                let week = usage.seven_day?;
+                let reset = week.resets_at?;
+                Some((
+                    tenth(week.percent),
+                    tenth(p.hard_line()),
+                    reset.format("%Y-%m-%d %H:%MZ").to_string(),
+                ))
+            })
+            .flatten();
         PaceView {
             reserve: tenth(p.reserve),
             allowance: tenth(p.allowance()),
@@ -570,6 +587,7 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
             limit,
             next_day: p.next_day().format("%Y-%m-%d %H:%MZ").to_string(),
             action: (limit == 0).then_some(PACE_ACTION),
+            stale_hard_reset,
         }
     });
     Ok(UsageView {
@@ -611,6 +629,14 @@ fn usage_line(u: &UsageView) -> String {
     parts.push(format!("read {} ago", u.read));
     parts.push(format!("this board starts no new task at {}%", u.stop_at));
     if let Some(p) = &u.pace {
+        if let Some((percent, hard_line, resets)) = &p.stale_hard_reset {
+            return format!(
+                "week {percent}% >= hard line {hard_line}% (reserve {}%) -> weekly usage reached \
+                 the user's reserve: start no new task or child thread; finish or park the tasks \
+                 in doing. The week window resets {resets}.",
+                p.reserve
+            );
+        }
         if let Some(action) = p.action {
             return format!(
                 "week projected {}% >= today's line {}% -> {action} The next day's share starts {}.",

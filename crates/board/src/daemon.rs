@@ -7291,14 +7291,14 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
-    /// Takes a new usage reading and reports it to the server: T3 Code's, while one of its
-    /// files holds one that is new enough and can follow the reading known here
-    /// ([`crate::usage::follows`]), the newest such; else the endpoint's, when [`Self::usage_poll_every`] has
-    /// passed since this daemon last read it. While T3 Code's readings stand in, the endpoint
-    /// is read only every [`USAGE_CHECK_EVERY`], unless the pace is near a line. After a
-    /// refusal that says how long to wait, the endpoint is read again then. With no new
-    /// reading, takes the newest any device reported. A failure keeps the last reading, which goes stale and
-    /// then holds nothing.
+    /// Takes a new usage reading and reports it to the server: for ClaudeCode, T3 Code's
+    /// snapshot while one is new enough and can follow the reading known here
+    /// ([`crate::usage::follows`]), else the endpoint when [`Self::usage_poll_every`] has
+    /// passed (with [`USAGE_CHECK_EVERY`] while snapshots stand in unless near a line); for
+    /// Antigravity, which has no direct HTTP fallback, any newer snapshot within
+    /// `USAGE_FRESH_MINUTES`. With no new reading, takes the newest any device reported. A
+    /// failure keeps the last reading; once stale, only a measured weekly pace breach holds
+    /// monotonically until the next pace day or weekly reset.
     async fn refresh_usage(&mut self, now: Timestamp) {
         let mut reading = None;
         let mut report_provider: Option<&'static str> = None;
@@ -7364,11 +7364,12 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            let every = self.usage_poll_every(now);
+            // Antigravity has no direct HTTP fallback and T3 refreshes its cache on a slower
+            // cadence, so accept any snapshot within the server's freshness window.
             let snapshot = crate::usage::read_snapshots(snapshots, now)
                 .await
                 .into_iter()
-                .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+                .filter(|s| now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES))
                 .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
                 .max_by_key(|s| s.read_at);
             if let Some(snapshot) = snapshot.filter(|s| {
@@ -8806,57 +8807,66 @@ mod tests {
         assert!(!backoff.has_active_wait(until));
     }
 
-    #[tokio::test]
-    async fn refresh_usage_routes_by_source_avoids_fallback_follows_trap_and_downgrades_on_404() {
-        use axum::{Router, extract::State, routing::any};
-        use std::sync::{Arc, Mutex};
+    type UsageStubResponses = BTreeMap<(String, String), (StatusCode, serde_json::Value)>;
 
-        type StubResponses = BTreeMap<(String, String), (StatusCode, serde_json::Value)>;
+    struct UsageStubServer {
+        addr: std::net::SocketAddr,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        responses: std::sync::Arc<std::sync::Mutex<UsageStubResponses>>,
+        task: tokio::task::JoinHandle<()>,
+    }
 
-        #[derive(Clone, Default)]
-        struct StubState {
-            requests: Arc<Mutex<Vec<(String, String)>>>,
-            responses: Arc<Mutex<StubResponses>>,
-        }
+    impl UsageStubServer {
+        async fn start() -> Self {
+            use axum::{Router, extract::State, routing::any};
+            use std::sync::{Arc, Mutex};
 
-        async fn handler(
-            State(state): State<StubState>,
-            req: axum::extract::Request,
-        ) -> (StatusCode, axum::Json<serde_json::Value>) {
-            let key = (
-                req.method().as_str().to_owned(),
-                req.uri().path().to_owned(),
-            );
-            state.requests.lock().unwrap().push(key.clone());
-            if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
-                (status, axum::Json(body))
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({ "code": "not_found", "message": "missing" })),
-                )
+            #[derive(Clone, Default)]
+            struct StubState {
+                requests: Arc<Mutex<Vec<(String, String)>>>,
+                responses: Arc<Mutex<UsageStubResponses>>,
+            }
+
+            async fn handler(
+                State(state): State<StubState>,
+                req: axum::extract::Request,
+            ) -> (StatusCode, axum::Json<serde_json::Value>) {
+                let key = (
+                    req.method().as_str().to_owned(),
+                    req.uri().path().to_owned(),
+                );
+                state.requests.lock().unwrap().push(key.clone());
+                if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
+                    (status, axum::Json(body))
+                } else {
+                    (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(
+                            serde_json::json!({ "code": "not_found", "message": "missing" }),
+                        ),
+                    )
+                }
+            }
+
+            let state = StubState::default();
+            let app = Router::new()
+                .route("/{*path}", any(handler))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Self {
+                addr,
+                requests: state.requests,
+                responses: state.responses,
+                task,
             }
         }
 
-        let state = StubState::default();
-        let app = Router::new()
-            .route("/{*path}", any(handler))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home::at(dir.path().join("home"));
-        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
-        let antigravity_cache = dir.path().join("antigravity.json");
-        let claude_cache = dir.path().join("claudeAgent.json");
-
-        let make_daemon = |cfg: Config, source: UsageSource| {
-            let mut cfg = cfg;
-            cfg.server = Some(format!("http://{addr}"));
+        fn make_daemon(&self, home: &Home, mut cfg: Config, source: UsageSource) -> Daemon<T3Cli> {
+            cfg.server = Some(format!("http://{}", self.addr));
             cfg.device = Some("test-mac".parse().unwrap());
             let client = Client::new(
                 cfg.server.as_deref().unwrap(),
@@ -8876,12 +8886,28 @@ mod tests {
             let mut daemon = Daemon::new(ctx, T3Cli::locate(None));
             daemon.usage_source = source;
             daemon
-        };
+        }
+    }
+
+    impl Drop for UsageStubServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_usage_routes_by_source_avoids_fallback_follows_trap_and_downgrades_on_404() {
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let antigravity_cache = dir.path().join("antigravity.json");
+        let claude_cache = dir.path().join("claudeAgent.json");
 
         // 1. Antigravity daemon with no antigravity/default reading yet falls back to
         //    anthropic/default on poll, sets usage_from_fallback=true, and then STILL accepts
         //    a genuine lower-usage Antigravity local snapshot (not blocked by follows()).
-        state.responses.lock().unwrap().insert(
+        srv.responses.lock().unwrap().insert(
             ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
             (
                 StatusCode::OK,
@@ -8896,7 +8922,7 @@ mod tests {
                 }]),
             ),
         );
-        state.responses.lock().unwrap().insert(
+        srv.responses.lock().unwrap().insert(
             ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
             (
                 StatusCode::OK,
@@ -8920,7 +8946,8 @@ mod tests {
             }),
             ..Config::default()
         };
-        let mut daemon = make_daemon(
+        let mut daemon = srv.make_daemon(
+            &home,
             ag_cfg.clone(),
             UsageSource::Antigravity {
                 snapshots: vec![antigravity_cache.clone()],
@@ -8959,19 +8986,18 @@ mod tests {
             10.0
         );
         assert!(
-            state
-                .requests
+            srv.requests
                 .lock()
                 .unwrap()
                 .contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "expected PUT /v1/usage/antigravity/default: {:?}",
-            state.requests.lock().unwrap()
+            srv.requests.lock().unwrap()
         );
 
         // 2. A ClaudeCode usage source on a non-anthropic config must report to
         //    /v1/usage/anthropic/default, NEVER poisoning /v1/usage/antigravity/default.
-        state.requests.lock().unwrap().clear();
-        state.responses.lock().unwrap().insert(
+        srv.requests.lock().unwrap().clear();
+        srv.responses.lock().unwrap().insert(
             ("PUT".to_owned(), "/v1/usage/anthropic/default".to_owned()),
             (
                 StatusCode::OK,
@@ -8999,17 +9025,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let mut mixed = make_daemon(
+        let mut mixed = srv.make_daemon(
+            &home,
             ag_cfg.clone(),
             UsageSource::ClaudeCode {
-                url: format!("http://{addr}/unused"),
+                url: format!("http://{}/unused", srv.addr),
                 credentials: crate::usage::Credentials::File(dir.path().join("missing-creds")),
                 snapshots: vec![claude_cache],
             },
         );
         mixed.usage_polled = Some(now);
         mixed.refresh_usage(now).await;
-        let reqs = state.requests.lock().unwrap().clone();
+        let reqs = srv.requests.lock().unwrap().clone();
         assert!(
             reqs.contains(&("PUT".to_owned(), "/v1/usage/anthropic/default".to_owned())),
             "ClaudeCode source must upload to anthropic/default: {reqs:?}"
@@ -9021,13 +9048,12 @@ mod tests {
 
         // 3. 404 on /v1/usage/antigravity/default downgrades to legacy PUT /v1/usage and
         //    caches usage_buckets_unsupported = true.
-        state.requests.lock().unwrap().clear();
-        state
-            .responses
+        srv.requests.lock().unwrap().clear();
+        srv.responses
             .lock()
             .unwrap()
             .remove(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()));
-        state.responses.lock().unwrap().insert(
+        srv.responses.lock().unwrap().insert(
             ("PUT".to_owned(), "/v1/usage".to_owned()),
             (
                 StatusCode::OK,
@@ -9039,7 +9065,8 @@ mod tests {
                 }),
             ),
         );
-        let mut legacy_srv = make_daemon(
+        let mut legacy_srv = srv.make_daemon(
+            &home,
             ag_cfg,
             UsageSource::Antigravity {
                 snapshots: vec![antigravity_cache],
@@ -9047,12 +9074,136 @@ mod tests {
         );
         legacy_srv.refresh_usage(now).await;
         assert!(legacy_srv.usage_buckets_unsupported);
-        let reqs = state.requests.lock().unwrap().clone();
+        let reqs = srv.requests.lock().unwrap().clone();
         assert!(
             reqs.contains(&("PUT".to_owned(), "/v1/usage".to_owned())),
             "404 on bucket endpoint must fall back to legacy PUT /v1/usage: {reqs:?}"
         );
+    }
 
-        server_task.abort();
+    #[tokio::test]
+    async fn antigravity_uploads_ten_minute_old_snapshot_even_when_near_line() {
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let antigravity_cache = dir.path().join("antigravity.json");
+
+        let ag_cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        let mut daemon = srv.make_daemon(
+            &home,
+            ag_cfg,
+            UsageSource::Antigravity {
+                snapshots: vec![antigravity_cache.clone()],
+            },
+        );
+        // Seed a fresh known Antigravity reading that is near the daily pace line (within 2 pts),
+        // so `usage_poll_every(now) == USAGE_POLL_NEAR` (1m).
+        daemon.usage = Some(Usage {
+            five_hour: Some(board_proto::UsageWindow {
+                percent: 10.0,
+                resets_at: Some(now + TimeDelta::hours(4)),
+            }),
+            seven_day: Some(board_proto::UsageWindow {
+                percent: 14.5,
+                resets_at: Some(now + TimeDelta::days(5)),
+            }),
+            read_at: now - TimeDelta::minutes(15),
+            device: "test-mac".parse().unwrap(),
+            pace: Some(board_proto::UsagePace {
+                reserve: 4.0,
+                day_start: now - TimeDelta::hours(2),
+                anchor: 0.0,
+                line: 16.0,
+                projected: 15.0,
+                hard_since: None,
+            }),
+        });
+        assert_eq!(daemon.usage_poll_every(now), USAGE_POLL_NEAR);
+
+        // Write a newer snapshot dated 10 minutes ago (older than every + slack = 2m,
+        // but well within USAGE_FRESH_MINUTES = 30m).
+        let ten_min_ago = now - TimeDelta::minutes(10);
+        srv.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 12.0, "resets_at": "2026-11-24T16:00:00Z" },
+                    "seven_day": { "percent": 32.6, "resets_at": "2026-11-29T12:00:00Z" },
+                    "read_at": ten_min_ago.to_rfc3339(),
+                    "device": "test-mac",
+                    "reserve": 4.0
+                }),
+            ),
+        );
+        std::fs::write(
+            &antigravity_cache,
+            serde_json::json!({
+                "driver": "antigravity",
+                "instanceId": "antigravity",
+                "usageLimits": {
+                    "checkedAt": ten_min_ago.to_rfc3339(),
+                    "credentialFingerprint": "fp-test",
+                    "windows": [
+                        { "id": "gemini-5h", "kind": "session", "usedPercent": 12.0, "resetsAt": "2026-11-24T16:00:00Z" },
+                        { "id": "gemini-weekly", "kind": "weekly", "usedPercent": 32.6, "resetsAt": "2026-11-29T12:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        daemon.refresh_usage(now).await;
+        let reqs = srv.requests.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "10-minute-old Antigravity snapshot must upload even when near_line (every=1m): {reqs:?}"
+        );
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().seven_day.unwrap().percent,
+            32.6
+        );
+
+        // A snapshot older than USAGE_FRESH_MINUTES (31m) must NOT be uploaded.
+        srv.requests.lock().unwrap().clear();
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+        let too_old = now + TimeDelta::minutes(35);
+        std::fs::write(
+            &antigravity_cache,
+            serde_json::json!({
+                "driver": "antigravity",
+                "instanceId": "antigravity",
+                "usageLimits": {
+                    "checkedAt": (too_old - TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES + 1)).to_rfc3339(),
+                    "credentialFingerprint": "fp-test",
+                    "windows": [
+                        { "id": "gemini-5h", "kind": "session", "usedPercent": 15.0, "resetsAt": "2026-11-24T16:00:00Z" },
+                        { "id": "gemini-weekly", "kind": "weekly", "usedPercent": 35.0, "resetsAt": "2026-11-29T12:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        daemon.refresh_usage(too_old).await;
+        let reqs = srv.requests.lock().unwrap().clone();
+        assert!(
+            !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
+        );
     }
 }
