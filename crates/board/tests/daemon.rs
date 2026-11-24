@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board::client::Client;
-use board::config::{Config, Home, ThreadModel};
+use board::config::{Config, Home, JudgeModels, ThreadModel};
 use board::daemon::{Daemon, RELEASE_GRACE};
 use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
 use board::identity::RepoInfo;
@@ -6276,6 +6276,7 @@ fn env_with_models(
     tasks: &[board_proto::Task],
     thread_model: Option<ThreadModel>,
     judge_model: Option<ThreadModel>,
+    judge_models: JudgeModels,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let stub = Stub::start();
@@ -6286,6 +6287,7 @@ fn env_with_models(
         projects: projects(),
         thread_model,
         judge_model,
+        judge_models,
         ..Config::default()
     };
     let home = Home::at(dir.path().join("home"));
@@ -6337,6 +6339,7 @@ async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back(
         &tasks,
         Some(worker_model.clone()),
         Some(judge_model.clone()),
+        JudgeModels::default(),
     );
     e.t3.ids.lock().unwrap().push_back(J2.to_owned());
     e.daemon.reconcile(at()).await.unwrap();
@@ -6355,7 +6358,12 @@ async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back(
     );
 
     // Without [judge_model], judges fall back to [thread_model].
-    let mut e = env_with_models(&tasks, Some(worker_model.clone()), None);
+    let mut e = env_with_models(
+        &tasks,
+        Some(worker_model.clone()),
+        None,
+        JudgeModels::default(),
+    );
     e.t3.ids.lock().unwrap().push_back(J2.to_owned());
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(
@@ -6370,7 +6378,7 @@ async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back(
     );
 
     // Without either, both judges and workers leave project defaults (None).
-    let mut e = env_with_models(&tasks, None, None);
+    let mut e = env_with_models(&tasks, None, None, JudgeModels::default());
     e.t3.ids.lock().unwrap().push_back(J2.to_owned());
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(
@@ -6415,7 +6423,12 @@ async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_activ
     };
 
     let tasks = [proposal("factory-10", None, 0)];
-    let mut e = env_with_models(&tasks, None, Some(original_judge.clone()));
+    let mut e = env_with_models(
+        &tasks,
+        None,
+        Some(original_judge.clone()),
+        JudgeModels::default(),
+    );
     let home = Home::at(e._dir.path().join("home"));
 
     // Rewrite config.toml with an updated [judge_model] before reconcile reloads it.
@@ -6449,6 +6462,146 @@ async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_activ
         [(
             "verdict factory-10 (no parent)".into(),
             Some(original_judge)
+        )]
+    );
+}
+
+#[tokio::test]
+async fn per_kind_judge_models_select_each_kind_and_warn_on_reload() {
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(self.0.clone())
+        }
+    }
+
+    let worker_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "high".into())].into(),
+    };
+    let fallback_judge = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "medium".into())].into(),
+    };
+    let verdict_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "low".into())].into(),
+    };
+    let goal_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "high".into())].into(),
+    };
+
+    // Phase 1: pending proposal starts a verdict judge using [judge_models.verdict], and
+    // rewriting config.toml warns to restart while keeping the original selection active.
+    let tasks = [proposal("factory-12", None, 0)];
+    let mut e = env_with_models(
+        &tasks,
+        Some(worker_model),
+        Some(fallback_judge.clone()),
+        JudgeModels {
+            verdict: Some(verdict_model.clone()),
+            goal: Some(goal_model.clone()),
+            ..JudgeModels::default()
+        },
+    );
+    let mut board = autopilot(Some(DISPATCH), &[DEVICE]);
+    board.goal = "Keep latency low.".into();
+    e.stub.on("GET /v1/boards", [&board]);
+    e.stub.on("POST /v1/boards/factory/coordinator", &board);
+
+    let home = Home::at(e._dir.path().join("home"));
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        judge_model: Some(fallback_judge.clone()),
+        judge_models: JudgeModels {
+            verdict: Some(goal_model.clone()),
+            goal: Some(goal_model.clone()),
+            ..JudgeModels::default()
+        },
+        ..Config::default()
+    }
+    .save(&home)
+    .unwrap();
+
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(buf.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    e.daemon.reconcile(at()).await.unwrap();
+    drop(_guard);
+
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("judge_models") && logs.contains("restart board watch"),
+        "expected restart warning for judge_models change, got: {logs:?}"
+    );
+
+    // Phase 2: once the board rests with a done task, goal review uses [judge_models.goal].
+    e.stub.on("GET /v1/tasks", json!([]));
+    e.stub.on("GET /v1/boards/factory/judges", json!([]));
+    e.t3.threads.lock().unwrap().clear();
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    let mut done = detail("factory-11", false, &[]);
+    done.task.status = TaskStatus::Done;
+    e.stub.on("GET /v1/tasks/factory-11", done);
+    e.daemon
+        .on_event(
+            &event(40, EventType::TaskDone, Some("factory-11"), WORKER),
+            at() + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            ("verdict factory-12 (no parent)".into(), Some(verdict_model)),
+            ("goal review factory".into(), Some(goal_model.clone())),
+        ]
+    );
+
+    // Phase 3: an unset kind in [judge_models] falls back to [judge_model].
+    let mut e2 = env_with_models(
+        &tasks,
+        None,
+        Some(fallback_judge.clone()),
+        JudgeModels {
+            goal: Some(goal_model),
+            ..JudgeModels::default()
+        },
+    );
+    e2.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e2.t3),
+        [(
+            "verdict factory-12 (no parent)".into(),
+            Some(fallback_judge)
         )]
     );
 }

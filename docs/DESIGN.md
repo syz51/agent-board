@@ -627,7 +627,7 @@ Threads start in the board's project: the device's `[projects]` folder for the t
 repo; a board none of whose repos is mapped there, such as a feedback board with no repo,
 uses the folder `[board_projects]` names for its slug. Each reconcile first re-reads
 `config.toml` when its text changed: new `[projects]`, `[board_projects]` and
-`feedback_board` apply at once, and so does a new `runs_at_once`; `server`, `device`, `t3_bin`, `[thread_model]` and `[judge_model]` stay as
+`feedback_board` apply at once, and so does a new `runs_at_once`; `server`, `device`, `t3_bin`, `[thread_model]`, `[judge_model]` and `[judge_models]` stay as
 started, with a warning to restart; a file gone or invalid keeps the settings in use,
 warned once per edit.
 
@@ -636,7 +636,9 @@ the daemon starts each worker thread on that T3 provider instance, model, and re
 `--option <key>=<value>` flags (`t3 thread start --provider --model [--option ...]`);
 without it, on the project's defaults. With `[judge_model]` (`provider`, `model`, and
 optional `options`), judge threads (review, verdict, triage, goal) use that selection
-instead, falling back to `[thread_model]` and then the project's defaults when unset. T3
+instead, and optional per-kind `[judge_models.<kind>]` tables (`review`, `verdict`,
+`triage`, `goal`) override `[judge_model]` for that kind; unset kinds fall back to
+`[judge_model]`, then `[thread_model]`, then the project's defaults. T3
 gives a thread nothing else of its own to set, so the instance carries what agent threads
 need apart from the user's chats, such as environment variables.
 

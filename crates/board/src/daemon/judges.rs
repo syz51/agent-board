@@ -929,12 +929,7 @@ impl<T: T3> Daemon<T> {
         // On disk before T3 can create the thread.
         self.put_run(&run);
         self.save()?;
-        let model = self
-            .ctx
-            .config
-            .judge_model
-            .as_ref()
-            .or(self.ctx.config.thread_model.as_ref());
+        let model = self.ctx.config.model_for_judge(run.kind);
         let thread = self
             .t3
             .start_thread(project, &run.title, &brief, worktree.as_ref(), model)
