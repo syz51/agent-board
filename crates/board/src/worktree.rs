@@ -317,9 +317,20 @@ pub struct WorktreeManager {
 
 impl WorktreeManager {
     /// Creates a manager storing worktrees under `$BOARD_HOME/worktrees` and persisting
-    /// records in `$BOARD_HOME/state/worktrees.json`.
+    /// records in `$BOARD_HOME/state/daemon.db`'s `worktrees` table (importing any legacy
+    /// `state/worktrees.json` on first open; falls back to [`JsonWorktreeStore`] only if
+    /// SQLite cannot open).
     pub fn for_home(home: Home) -> Self {
-        let store = Arc::new(JsonWorktreeStore::new(home.clone()));
+        let store: Arc<dyn WorktreeStore> =
+            match crate::local_db::SqliteWorktreeStore::open_for_home(&home) {
+                Ok(sqlite) => Arc::new(sqlite),
+                Err(err) => {
+                    tracing::warn!(
+                        "opening daemon.db for worktree persistence failed ({err:#}); falling back to worktrees.json"
+                    );
+                    Arc::new(JsonWorktreeStore::new(home.clone()))
+                }
+            };
         Self::with_store(home, store)
     }
 
