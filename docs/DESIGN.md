@@ -1039,7 +1039,10 @@ the work.
 **Judges**:
 
 - **Review**:
-  - It runs in a worktree on the PR's head, or on its base branch when already merged.
+  - It runs in a worktree on the PR's head, on its base branch when already merged, on the
+    worker's task branch on `origin` when no PR is recorded yet, or (after a bounded wait,
+    for `pr: none`, or when neither resolves) on the repository's default base with its
+    brief naming that base.
   - It reads `task_show` and the diff, and runs every acceptance check.
   - On pass, it adds a `review: pass` decision note with a summary for the user. It turns
     on auto-merge where the base branch requires checks; elsewhere the merge is left to
@@ -1074,8 +1077,18 @@ has not registered it yet.
   worktree is on branch `review/<task>`, based on the head branch of the newest pull
   request the task's notes name, once fetched from `origin`; when that pull request is
   already merged, it starts from the pull request's base branch on `origin` instead (which
-  holds the merge commit, and avoids fetching a deleted or pre-squash head branch). An
-  open pull request from a fork, or none, gives the project's default base.
+  holds the merge commit, and avoids fetching a deleted or pre-squash head branch). When no
+  pull request is recorded yet (and the current review round's notes do not declare
+  `pr: none`), the dispatcher fetches the worker's task branch (`task/<id>`, or its
+  time-suffixed form from the dispatcher's worker-start note) from `origin` and names that
+  branch in the judge's brief. If that branch is not on `origin` either, it records the
+  wait once in `$BOARD_HOME/state/device-holds.jsonl` (`kind: "review_wait"`) and waits up
+  to 2 minutes (`REVIEW_PR_WAIT`) from when the task entered `review` so a worker note
+  naming the pull request can land before falling back. When `pr: none` is declared, the
+  wait expires, or a recorded pull request cannot be resolved (an open fork PR, a failed
+  read or a missing remote branch), the dispatcher logs a warning, starts on the project's
+  default base, and names that base in the judge's brief instead of saying it is on the PR
+  head.
 - **Verdict**: the pending proposals are grouped by parent task. A group with a running
   verdict judge waits. Otherwise the 5 oldest get one judge; the rest follow when it ends.
 - **Triage**: on this device's `feedback_board`, each ready feedback item (a task with a
