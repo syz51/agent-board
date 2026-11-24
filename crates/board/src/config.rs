@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use board_proto::{BoardSlug, DeviceName, JudgeKind};
+use board_proto::{
+    BoardSlug, DeviceName, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER, QuotaBucketRef,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -141,6 +143,32 @@ pub struct Config {
     /// unmodified ACP-compliant vendor binary over stdio JSON-RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_runner: Option<AcpRunnerConfig>,
+    /// How `board watch` dispatches managed work: `"auto"` (default: capability-matched pull
+    /// via `POST /v1/dispatch/claim` whenever the server supports `dispatch-claim-v1`, else
+    /// legacy board leases), `"pull"`, or `"legacy"`.
+    #[serde(default, skip_serializing_if = "DispatchMode::is_default")]
+    pub dispatch_mode: DispatchMode,
+}
+
+/// Dispatch mode for `board watch` (`docs/SCHEDULER_DESIGN.md`, Section 3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+    /// Use capability-matched pull (`POST /v1/dispatch/claim`) whenever the server advertises
+    /// or accepts `dispatch-claim-v1`, falling back to legacy 45-minute board coordinator
+    /// leases on older servers returning 404/405.
+    #[default]
+    Auto,
+    /// Always use capability-matched pull dispatch (`POST /v1/dispatch/claim`).
+    Pull,
+    /// Use legacy per-board coordinator-lease dispatch (`POST /v1/boards/{slug}/coordinator`).
+    Legacy,
+}
+
+impl DispatchMode {
+    fn is_default(&self) -> bool {
+        *self == Self::Auto
+    }
 }
 
 /// Default per-turn timeout for [`AcpRunnerConfig::turn_timeout_secs`] (30 minutes).
@@ -520,6 +548,50 @@ impl Config {
             .or(self.judge_model.as_ref())
             .or_else(|| self.judge_models.first())
             .map(|m| m.provider.as_str())
+    }
+
+    /// Target `(provider, account)` LLM quota bucket advertised to `POST /v1/dispatch/claim`,
+    /// derived from configured provider/runner settings (`antigravity:default`,
+    /// `openai:default`, or legacy `anthropic:default`).
+    pub fn quota_bucket(&self) -> QuotaBucketRef {
+        if let Some(provider) = self.usage_provider() {
+            let lower = provider.to_ascii_lowercase();
+            let bucket_provider = if lower.contains("antigravity") || lower.contains("gemini") {
+                "antigravity"
+            } else if lower.contains("codex") || lower.contains("openai") {
+                "openai"
+            } else {
+                LEGACY_USAGE_PROVIDER
+            };
+            return QuotaBucketRef {
+                provider: bucket_provider.to_owned(),
+                account: LEGACY_USAGE_ACCOUNT.to_owned(),
+            };
+        }
+        if let Some(acp) = &self.acp_runner
+            && acp.resolved_bin().is_some()
+        {
+            let hint = acp
+                .model
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let provider = if hint.contains("claude") || hint.contains("anthropic") {
+                LEGACY_USAGE_PROVIDER
+            } else if hint.contains("gpt") || hint.contains("codex") || hint.contains("openai") {
+                "openai"
+            } else {
+                "antigravity"
+            };
+            return QuotaBucketRef {
+                provider: provider.to_owned(),
+                account: LEGACY_USAGE_ACCOUNT.to_owned(),
+            };
+        }
+        QuotaBucketRef {
+            provider: LEGACY_USAGE_PROVIDER.to_owned(),
+            account: LEGACY_USAGE_ACCOUNT.to_owned(),
+        }
     }
 }
 
@@ -1382,5 +1454,56 @@ slice = "agent-board-runs.slice"
         write_private(&path, b"secret").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn dispatch_mode_and_quota_bucket_parse_and_default_cleanly() {
+        let default_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.dispatch_mode, DispatchMode::Auto);
+        assert_eq!(
+            default_cfg.quota_bucket(),
+            QuotaBucketRef {
+                provider: LEGACY_USAGE_PROVIDER.to_owned(),
+                account: LEGACY_USAGE_ACCOUNT.to_owned(),
+            }
+        );
+
+        let pull_cfg: Config = toml::from_str("dispatch_mode = \"pull\"\n").unwrap();
+        assert_eq!(pull_cfg.dispatch_mode, DispatchMode::Pull);
+
+        let legacy_cfg: Config = toml::from_str("dispatch_mode = \"legacy\"\n").unwrap();
+        assert_eq!(legacy_cfg.dispatch_mode, DispatchMode::Legacy);
+
+        let antigravity_cfg: Config = toml::from_str(
+            r#"
+[thread_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            antigravity_cfg.quota_bucket(),
+            QuotaBucketRef {
+                provider: "antigravity".to_owned(),
+                account: "default".to_owned(),
+            }
+        );
+
+        let acp_cfg: Config = toml::from_str(
+            r#"
+[acp_runner]
+bin = "/usr/local/bin/official-acp"
+model = "gemini-4-neon"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            acp_cfg.quota_bucket(),
+            QuotaBucketRef {
+                provider: "antigravity".to_owned(),
+                account: "default".to_owned(),
+            }
+        );
     }
 }

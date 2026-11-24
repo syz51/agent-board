@@ -282,6 +282,53 @@ pub fn effective_runners(config: &Config, active_runner: &str) -> Vec<String> {
     out
 }
 
+/// Advertised runner kinds for device heartbeats: explicit `config.runners` when non-empty,
+/// else all registered runners in `registered` plus `"deterministic"` (deduplicated).
+pub fn advertised_runners(config: &Config, registered: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for runner in &config.runners {
+        let trimmed = runner.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    if out.is_empty() {
+        for runner in registered {
+            let trimmed = runner.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_owned());
+            }
+        }
+        if !out.iter().any(|existing| existing == "deterministic") {
+            out.push("deterministic".to_owned());
+        }
+    }
+    out
+}
+
+/// Runner kinds sent in `POST /v1/dispatch/claim`: intersects explicit `config.runners`
+/// with runners actually registered in the daemon's `RunnerRegistry` (plus the built-in
+/// `"deterministic"` runner) so the scheduler never assigns an unconfigured runner kind.
+pub fn claim_runners(config: &Config, registered: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let advertised = advertised_runners(config, registered);
+    for runner in advertised {
+        if runner == "deterministic" || registered.iter().any(|r| r == &runner) {
+            if !out.iter().any(|existing| existing == &runner) {
+                out.push(runner);
+            }
+        } else {
+            tracing::warn!(
+                "config.toml lists runner {runner:?}, which is not configured/registered in this daemon; omitting from dispatch/claim"
+            );
+        }
+    }
+    if !out.iter().any(|existing| existing == "deterministic") {
+        out.push("deterministic".to_owned());
+    }
+    out
+}
+
 /// Advertised protocol features: configured `config.protocol_features` when non-empty, else
 /// [`DEFAULT_PROTOCOL_FEATURES`].
 pub fn effective_protocol_features(config: &Config) -> Vec<String> {
@@ -1126,8 +1173,28 @@ mod tests {
 
         // Runners and protocol features default cleanly and honor overrides.
         assert_eq!(effective_runners(&config, "t3"), vec!["t3"]);
+        assert_eq!(
+            advertised_runners(&config, &["acp".into(), "t3".into()]),
+            vec!["acp", "t3", "deterministic"]
+        );
+        assert_eq!(
+            claim_runners(&config, &["t3".into()]),
+            vec!["t3", "deterministic"]
+        );
         config.runners = vec!["acp".into(), "t3".into(), "acp".into()];
         assert_eq!(effective_runners(&config, "t3"), vec!["acp", "t3"]);
+        assert_eq!(
+            advertised_runners(&config, &["t3".into()]),
+            vec!["acp", "t3"]
+        );
+        assert_eq!(
+            claim_runners(&config, &["t3".into()]),
+            vec!["t3", "deterministic"]
+        );
+        assert_eq!(
+            claim_runners(&config, &["acp".into(), "t3".into()]),
+            vec!["acp", "t3", "deterministic"]
+        );
 
         assert_eq!(
             effective_protocol_features(&config),

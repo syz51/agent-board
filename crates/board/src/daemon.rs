@@ -44,24 +44,30 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use board_proto::{
     AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
-    ClaimCoordinator, DeviceHeartbeat, DeviceName, ErrorCode, Event, EventType, NoteKind,
-    RegisterAgent, Runtime, Task, TaskId, TaskStatus, Timestamp, Usage,
+    ClaimCoordinator, ClaimedRun, DeviceHeartbeat, DeviceName, DispatchClaimRequest, ErrorCode,
+    Event, EventType, JudgeKind, NoteKind, RUN_LEASE_TTL_SECS_DEFAULT, RegisterAgent, RunId,
+    RunKind, RunState, Runtime, StickyWake, Task, TaskId, TaskStatus, Timestamp, UpdateRun, Usage,
+    normalize_repo,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
+use crate::acp_runner::AcpRunner;
 use crate::client::{Client, RelayFailure, ServerError, TaskQuery, error_code, is_unreachable};
-use crate::config::{Config, Home};
-use crate::gh::{Gh, GhCli};
+use crate::config::{Config, DispatchMode, Home};
+use crate::deterministic_runner::{
+    DETERMINISTIC_RUNNER_KIND, DeterministicRunner, HousekeepingOutcome, MergeOutcome,
+};
+use crate::gh::{Gh, GhCli, PrState};
 use crate::local_db::{
     LocalDb, LocalRunRecord, LocalRunState, ResourceEntry, ResourceOrigin, SqliteWorktreeStore,
 };
 use crate::ops::Ctx;
 use crate::runner::{
-    RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerState, SteerMessage, T3Runner,
-    runner_agent_source,
+    Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerRegistry, RunnerState,
+    SteerMessage, T3Runner, runner_agent_source, system_clock,
 };
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
@@ -120,6 +126,8 @@ pub const THREAD_CHECKS_AT_ONCE: usize = 2;
 /// How long a worker thread may take to claim its task: one that has not by then, or whose
 /// session ended first, no longer holds a slot.
 pub const WORKER_CLAIM_WAIT: TimeDelta = TimeDelta::minutes(20);
+/// Brief startup grace before an idle session with zero completed turns is considered failed.
+const RUN_START_GRACE: TimeDelta = TimeDelta::seconds(60);
 /// How long a task whose worker never claimed it, whose start failed, or that its worker
 /// gave back to `open` while no other task was in progress, waits before the dispatcher
 /// starts another worker for it, so a worker that stops at once (a failing session) is not
@@ -155,6 +163,12 @@ const STREAM_HEALTHY: Duration = Duration::from_secs(60);
 
 /// How often `board watch` sends `PUT /v1/devices/{name}/heartbeat` (`docs/SCHEDULER_DESIGN.md`).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
+
+/// How often active managed runs renew their server-side 3-minute lease.
+pub const RUN_LEASE_RENEW_EVERY: TimeDelta = TimeDelta::seconds(30);
+
+/// Safety cap on how many pull claims a single reconcile pass may perform.
+const PULL_CLAIMS_PER_TICK_MAX: usize = 16;
 
 /// How often the daemon acts, and how long each step may take, so a server or `t3` that
 /// stops answering holds up only that step. Tests shorten them.
@@ -322,10 +336,54 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub merges: BTreeMap<TaskId, Merge>,
+    /// Active pull-claimed managed runs supervised by this daemon until completion or
+    /// failure (`docs/SCHEDULER_DESIGN.md`, Section 3.3). Read leniently like `wakes`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_managed_runs",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub managed_runs: BTreeMap<RunId, ManagedRun>,
     /// Boards this device dispatches where a task was finished since the last goal
     /// review: their goal review is due once nothing is ready or in progress.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub goal_due: BTreeSet<BoardSlug>,
+}
+
+/// One pull-claimed managed [`board_proto::Run`] currently supervised by this daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedRun {
+    pub run_id: RunId,
+    pub board: BoardSlug,
+    pub kind: RunKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskId>,
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub cost_units: u32,
+    pub title: String,
+    pub started_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_renewed_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<Timestamp>,
+    #[serde(default)]
+    pub noted: bool,
+    /// True while the server `Run` is in `waiting_external` (e.g., a blocked worker waiting
+    /// on an ask answer) so `renew_runs` transitions it back to `running` once active again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_external: bool,
 }
 
 /// The server's first notice that a task's owner is away from it.
@@ -590,6 +648,9 @@ pub enum WakeAbout {
         since: Timestamp,
         noticed: Timestamp,
     },
+    /// A server-routed sticky wake (`GET /v1/devices/{name}/wakes`) persisted in
+    /// `daemon.db`'s `unsure_sends` before delivery via `Runner::send`.
+    Sticky { wake_id: i64, wake_kind: String },
 }
 
 impl WakeAbout {
@@ -599,6 +660,7 @@ impl WakeAbout {
             Self::Unblocked { .. } => "unblocked",
             Self::Answered { .. } => "answered",
             Self::Idle { .. } => "idle",
+            Self::Sticky { .. } => "sticky",
         }
     }
 }
@@ -693,6 +755,16 @@ fn lenient_idle_notices<'de, D: serde::Deserializer<'de>>(
     Ok(lenient_by_key(
         serde_json::Value::deserialize(d)?,
         "the idle notice",
+    ))
+}
+
+/// Each managed run read on its own, like [`lenient_queues`].
+fn lenient_managed_runs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<RunId, ManagedRun>, D::Error> {
+    Ok(lenient_by_key(
+        serde_json::Value::deserialize(d)?,
+        "the managed run",
     ))
 }
 
@@ -1156,8 +1228,13 @@ pub struct Daemon<T: T3 + 'static> {
     /// Non-`None` when opening `$BOARD_HOME/state/daemon.db` failed and we fell back to an
     /// in-memory DB so `Daemon::new` never panics while `save()` surfaces the failure.
     db_open_error: Option<String>,
-    /// Runtime-agnostic execution boundary for spawn/send/status/cancel/poll_events.
-    runner: Box<dyn Runner>,
+    /// Default runtime-agnostic execution boundary for legacy dispatch and wake delivery.
+    runner: Arc<dyn Runner>,
+    /// Multi-runner registry (`"t3"`, `"acp"`, `"fake"`, ...) used by capability-matched
+    /// pull dispatch (`docs/SCHEDULER_DESIGN.md`, Section 4.3).
+    runners: RunnerRegistry,
+    /// Zero-LLM native Rust executor for `RunKind::Merge` and `RunKind::Housekeeping`.
+    deterministic: DeterministicRunner,
     /// Daemon-owned git worktree lifecycle manager (`$BOARD_HOME/worktrees/<repo-slug>/<id>`).
     worktrees: WorktreeManager,
     /// Whether this daemon creates worktrees directly via `worktrees` (true for all non-T3
@@ -1166,6 +1243,23 @@ pub struct Daemon<T: T3 + 'static> {
     daemon_worktrees: bool,
     /// How the dispatcher reads, updates and merges pull requests.
     gh: Box<dyn Gh>,
+    /// Injectable clock for periodic ticks, lease renewals, and Trail Rule records.
+    clock: Clock,
+    /// Whether the connected server supports `POST /v1/dispatch/claim` (`dispatch-claim-v1`):
+    /// `None` until detected via `/healthz` or the first claim call.
+    dispatch_claim_supported: Option<bool>,
+    /// Set once the server answers 404/405 to `GET /v1/devices/{name}/wakes`.
+    wakes_unsupported: bool,
+    /// Earliest time to re-claim `RunKind::Merge` after a deferred merge (`PR_READ_EVERY`),
+    /// preventing rapid re-polling when PR checks are pending or failing.
+    merge_retry_after: Option<Timestamp>,
+    /// Earliest time to re-claim `RunKind::Review` after deferring for `REVIEW_PR_WAIT`.
+    review_wait_until: Option<Timestamp>,
+    /// Sticky wake ids that timed out once, were verified missing from the runner, and are
+    /// allowed at most one resend before being held/dropped with a Trail Rule record.
+    sticky_resent: BTreeSet<i64>,
+    /// Sticky wake ids already resent once after a timeout so they are never sent a third time.
+    sticky_exhausted: BTreeSet<i64>,
     pub state: WatchState,
     boards: BTreeMap<BoardSlug, Board>,
     /// Boards where a worker failed to start here, by board.
@@ -1240,7 +1334,33 @@ impl<T: T3 + 'static> Daemon<T> {
         };
         let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
         let t3 = Arc::new(t3);
-        let runner: Box<dyn Runner> = Box::new(T3Runner::new(Arc::clone(&t3), ctx.home.clone()));
+        let acp_runner: Option<Arc<dyn Runner>> = ctx
+            .config
+            .acp_runner
+            .as_ref()
+            .filter(|acp_cfg| acp_cfg.resolved_bin().is_some())
+            .map(|acp_cfg| {
+                Arc::new(AcpRunner::new(
+                    acp_cfg.clone(),
+                    ctx.home.clone(),
+                    db.clone(),
+                )) as Arc<dyn Runner>
+            });
+        let explicit_excludes_t3 =
+            !ctx.config.runners.is_empty() && !ctx.config.runners.iter().any(|r| r.trim() == "t3");
+        let (default_runner, runners, daemon_worktrees) =
+            if explicit_excludes_t3 && let Some(acp) = acp_runner {
+                let registry = RunnerRegistry::new().with_runner(Arc::clone(&acp));
+                (acp, registry, true)
+            } else {
+                let t3_runner: Arc<dyn Runner> =
+                    Arc::new(T3Runner::new(Arc::clone(&t3), ctx.home.clone()));
+                let mut registry = RunnerRegistry::new().with_runner(Arc::clone(&t3_runner));
+                if let Some(acp) = acp_runner {
+                    registry.register(acp);
+                }
+                (t3_runner, registry, false)
+            };
         let worktrees = WorktreeManager::with_store(
             ctx.home.clone(),
             Arc::new(SqliteWorktreeStore::new(db.clone())),
@@ -1250,10 +1370,19 @@ impl<T: T3 + 'static> Daemon<T> {
             t3,
             db,
             db_open_error,
-            runner,
+            runner: default_runner,
+            runners,
+            deterministic: DeterministicRunner::new(),
             worktrees,
-            daemon_worktrees: false,
+            daemon_worktrees,
             gh: Box::new(GhCli::locate()),
+            clock: system_clock(),
+            dispatch_claim_supported: None,
+            wakes_unsupported: false,
+            merge_retry_after: None,
+            review_wait_until: None,
+            sticky_resent: BTreeSet::new(),
+            sticky_exhausted: BTreeSet::new(),
             state,
             boards: BTreeMap::new(),
             failures: BTreeMap::new(),
@@ -1297,9 +1426,52 @@ impl<T: T3 + 'static> Daemon<T> {
     /// daemon-owned git worktrees created by [`WorktreeManager`].
     #[must_use]
     pub fn with_runner(mut self, runner: impl Runner + 'static) -> Self {
+        let runner: Arc<dyn Runner> = Arc::new(runner);
         self.daemon_worktrees = runner.kind() != "t3";
-        self.runner = Box::new(runner);
+        self.runners = RunnerRegistry::new().with_runner(Arc::clone(&runner));
+        self.runner = runner;
         self
+    }
+
+    /// Replaces the daemon's [`RunnerRegistry`] (for multi-runner setups or pull-dispatch
+    /// integration tests). The registry's default runner also becomes the fallback runner.
+    #[must_use]
+    pub fn with_runner_registry(mut self, registry: RunnerRegistry) -> Self {
+        if let Some(default) = registry.default_runner() {
+            self.daemon_worktrees = default.kind() != "t3";
+            self.runner = default;
+        }
+        self.runners = registry;
+        self
+    }
+
+    /// Overrides the configured [`DispatchMode`] (`auto`, `pull`, or `legacy`).
+    #[must_use]
+    pub fn with_dispatch_mode(mut self, mode: DispatchMode) -> Self {
+        self.ctx.config.dispatch_mode = mode;
+        self
+    }
+
+    /// Replaces the clock used by `follow()`, `step()`, `save()`, and Trail Rule records.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Pre-populates whether the server advertises `dispatch-claim-v1` (e.g. from `/healthz`).
+    pub fn set_dispatch_claim_supported(&mut self, supported: bool) {
+        self.dispatch_claim_supported = Some(supported);
+    }
+
+    /// Whether this daemon currently uses capability-matched pull dispatch rather than legacy
+    /// 45-minute board coordinator leases.
+    pub fn is_pull_mode(&self) -> bool {
+        match self.ctx.config.dispatch_mode {
+            DispatchMode::Pull => true,
+            DispatchMode::Legacy => false,
+            DispatchMode::Auto => self.dispatch_claim_supported != Some(false),
+        }
     }
 
     /// Replaces the daemon's [`WorktreeManager`] (for custom persistence backends such as
@@ -1403,6 +1575,13 @@ impl<T: T3 + 'static> Daemon<T> {
         let own: BTreeSet<&str> = workers
             .filter_map(|(_, worker)| worker.thread.as_deref())
             .chain(judges.filter_map(|run| run.thread.as_deref()))
+            .chain(
+                self.state
+                    .managed_runs
+                    .values()
+                    .filter(|run| run.runner == "t3")
+                    .filter_map(|run| run.native_id.as_deref()),
+            )
             .collect();
         let running = self.running.iter().flat_map(|r| &r.threads);
         let running = running.map(String::as_str);
@@ -1571,6 +1750,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 path.display()
             );
         }
+        if new.dispatch_mode != current.dispatch_mode {
+            current.dispatch_mode = new.dispatch_mode;
+            self.dispatch_claim_supported = None;
+            tracing::info!(
+                "re-read {}: dispatch_mode updated to {:?}",
+                path.display(),
+                current.dispatch_mode
+            );
+        }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
                 &current.projects,
@@ -1668,7 +1856,7 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     pub fn save(&self) -> Result<()> {
-        self.save_at(Utc::now())
+        self.save_at((self.clock)())
     }
 
     pub(super) fn save_at(&self, now: Timestamp) -> Result<()> {
@@ -1752,6 +1940,16 @@ impl<T: T3 + 'static> Daemon<T> {
                 agent_id,
                 run_id: judge.run_id.clone(),
                 cost_units: device::cost_units_for_judge(judge.kind),
+                updated_at: now,
+            });
+        }
+        for run in self.state.managed_runs.values() {
+            managed.push(ResourceEntry {
+                entry_id: format!("run:{}", run.run_id),
+                origin: ResourceOrigin::Managed,
+                agent_id: run.agent_id.as_ref().map(ToString::to_string),
+                run_id: Some(run.run_id.to_string()),
+                cost_units: run.cost_units,
                 updated_at: now,
             });
         }
@@ -1865,23 +2063,28 @@ impl<T: T3 + 'static> Daemon<T> {
             capacity: Some(capacity),
             free_units: Some(free_units),
             capabilities: device::effective_capabilities(&self.ctx.config),
-            runners: device::effective_runners(&self.ctx.config, self.runner.kind()),
+            runners: device::advertised_runners(&self.ctx.config, &self.runners.kinds()),
             repos: device::configured_repos(&self.ctx.config),
             protocol_features: device::effective_protocol_features(&self.ctx.config),
         }
     }
 
-    /// Sends one `PUT /v1/devices/{name}/heartbeat` update. Refreshes live interactive thread
-    /// load for T3 runners before computing `free_units` so ended or newly started interactive
-    /// turns never leave stale entries in `resource_ledger`. Returns `Ok(true)` when accepted,
-    /// `Ok(false)` when gracefully disabled after a 404/405 from an older server, or `Err` on
-    /// transient/auth failures (callers in the daemon loop log and continue without blocking
-    /// dispatch).
+    /// Sends one `PUT /v1/devices/{name}/heartbeat` update, renewing active managed run
+    /// leases first. Refreshes live interactive thread load for T3 runners before computing
+    /// `free_units` so ended or newly started interactive turns never leave stale entries in
+    /// `resource_ledger`. Returns `Ok(true)` when accepted, `Ok(false)` when gracefully
+    /// disabled after a 404/405 from an older server, or `Err` on transient/auth failures
+    /// (callers in the daemon loop log and continue without blocking dispatch).
     pub async fn send_heartbeat(&mut self, now: Timestamp) -> Result<bool> {
+        if !self.state.managed_runs.is_empty()
+            && let Err(err) = self.renew_runs(now).await
+        {
+            tracing::warn!("renewing managed run leases during heartbeat: {err:#}");
+        }
         if self.heartbeat_unsupported {
             return Ok(false);
         }
-        if self.runner.kind() == "t3" {
+        if self.runner.kind() == "t3" && self.runners.get("t3").is_some() {
             let running = device::running_threads(&*self.t3, &self.ctx.config).await;
             if running.unknown().is_none() {
                 self.running = Some(running);
@@ -1930,7 +2133,12 @@ impl<T: T3 + 'static> Daemon<T> {
             && board.home_devices.contains(&self.ctx.device)
     }
 
-    /// Dispatches the boards this device runs: each one's lease, workers, judges and merges.
+    /// Dispatches the boards this device runs: in pull mode (default when the server supports
+    /// `dispatch-claim-v1`), renews active managed run leases, pulls capability-matched work
+    /// via `POST /v1/dispatch/claim`, executes zero-LLM merges/housekeeping via
+    /// [`DeterministicRunner`], and delivers device sticky wakes. Falls back cleanly to
+    /// legacy 45-minute board-lease dispatch against older servers returning 404/405 (or when
+    /// `dispatch_mode = "legacy"`).
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
         // A board that did not ask for a slot again in the last pass lost its place.
         if let Some(last) = self.last_pass.replace(now) {
@@ -1947,6 +2155,13 @@ impl<T: T3 + 'static> Daemon<T> {
         let boards = self.client().boards().await?;
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         self.refresh_usage(now).await;
+
+        if self.is_pull_mode() && self.reconcile_pull(&boards, now).await? {
+            return Ok(());
+        }
+
+        // Legacy board-lease dispatch path (used when `dispatch_mode = "legacy"` or when an
+        // older server returns 404/405 for `POST /v1/dispatch/claim`).
         // The boards off autopilot come after the dispatched ones, which so get the
         // device's free runs first.
         let mut off_autopilot = Vec::new();
@@ -2141,6 +2356,1753 @@ impl<T: T3 + 'static> Daemon<T> {
         self.save_at(now)
     }
 
+    // -------------------------------------------------------------------------
+    // Capability-matched pull dispatch (`POST /v1/dispatch/claim`, Slice 2.2)
+    // -------------------------------------------------------------------------
+
+    /// Available weighted resource units for `POST /v1/dispatch/claim` from `daemon.db`.
+    fn free_units_for_claim(&self) -> u32 {
+        let capacity =
+            device::device_capacity(&self.ctx.config, self.default_run_limit, self.host_memory);
+        let reserve = device::reserve_units(&self.ctx.config);
+        self.db
+            .free_units(capacity.weight_units, reserve)
+            .unwrap_or(0)
+    }
+
+    /// Ensures this device's `dispatch:<device>` agent is registered with the server.
+    async fn ensure_dispatch_registered(&mut self) -> Result<AgentId> {
+        let agent = self.dispatch_agent();
+        if !self.dispatch_registered {
+            self.register_dispatch(&agent).await?;
+            self.dispatch_registered = true;
+        }
+        Ok(agent)
+    }
+
+    /// Runs one capability-matched pull-dispatch reconcile pass. Returns `Ok(true)` when
+    /// handled in pull mode, or `Ok(false)` in `DispatchMode::Auto` when the server returns
+    /// 404/405 for `POST /v1/dispatch/claim` so the caller immediately falls back to legacy
+    /// board-lease dispatch.
+    async fn reconcile_pull(&mut self, boards: &[Board], now: Timestamp) -> Result<bool> {
+        let pull_confirmed = self.dispatch_claim_supported == Some(true)
+            || self.ctx.config.dispatch_mode == DispatchMode::Pull;
+        if let Err(err) = self.renew_runs(now).await {
+            tracing::warn!("renewing managed runs: {err:#}");
+        }
+        if pull_confirmed && (!self.state.workers.is_empty() || !self.state.judges.is_empty()) {
+            self.retire_legacy_runs(now).await;
+        }
+        let track_t3_load = pull_confirmed
+            || device::run_limit(&self.ctx.config, self.default_run_limit) < usize::MAX
+            || self.ctx.config.weight_units.is_some();
+        if track_t3_load && self.runner.kind() == "t3" && self.runners.get("t3").is_some() {
+            let running = device::running_threads(&*self.t3, &self.ctx.config).await;
+            if pull_confirmed && let Some(unknown) = running.unknown() {
+                tracing::warn!(
+                    "{unknown}; holding LLM pull claims in this pass to protect device memory"
+                );
+                let hold_board = boards
+                    .first()
+                    .map(|b| b.slug.clone())
+                    .unwrap_or_else(|| self.ctx.config.feedback_board());
+                self.record_hold(
+                    "pull",
+                    &hold_board,
+                    "pull_dispatch",
+                    self.run_limit(),
+                    &unknown,
+                    now,
+                );
+            }
+            self.running = Some(running);
+        }
+        let t3_load_unknown = self.load_unknown().is_some();
+        self.sync_resource_ledger(now);
+
+        let mut deferred_merge = self.merge_retry_after.is_some_and(|at| now < at);
+        let mut deferred_review = self.review_wait_until.is_some_and(|at| now < at);
+        let mut deferred_housekeeping = false;
+        let mut claimed_any = false;
+        let has_llm_runner = !self.runners.is_empty();
+
+        for _ in 0..PULL_CLAIMS_PER_TICK_MAX {
+            let free_units = self.free_units_for_claim();
+            let needs_probe = self.dispatch_claim_supported.is_none()
+                && self.ctx.config.dispatch_mode == DispatchMode::Auto;
+            if free_units == 0 && !needs_probe {
+                break;
+            }
+            let mut supported_kinds = Vec::new();
+            if has_llm_runner && !t3_load_unknown {
+                supported_kinds.push(RunKind::Worker);
+                if !deferred_review {
+                    supported_kinds.push(RunKind::Review);
+                }
+                supported_kinds.extend([
+                    RunKind::Verdict,
+                    RunKind::Triage,
+                    RunKind::Goal,
+                    RunKind::Command,
+                ]);
+            }
+            if !deferred_merge {
+                supported_kinds.push(RunKind::Merge);
+            }
+            if !deferred_housekeeping {
+                supported_kinds.push(RunKind::Housekeeping);
+            }
+            if supported_kinds.is_empty() {
+                if !needs_probe {
+                    break;
+                }
+                supported_kinds.push(RunKind::Housekeeping);
+            }
+
+            let req = DispatchClaimRequest {
+                device: self.ctx.device.clone(),
+                free_units: if t3_load_unknown && !needs_probe {
+                    free_units.min(1)
+                } else {
+                    free_units
+                },
+                runners: device::claim_runners(&self.ctx.config, &self.runners.kinds()),
+                capabilities: device::effective_capabilities(&self.ctx.config),
+                repos: device::configured_repos(&self.ctx.config),
+                supported_kinds,
+                quota_bucket: Some(self.ctx.config.quota_bucket()),
+                max_claims: Some(1),
+            };
+            let resp = match self.client().dispatch_claim(&req).await {
+                Ok(resp) => {
+                    self.dispatch_claim_supported = Some(true);
+                    resp
+                }
+                Err(err)
+                    if is_heartbeat_unsupported(&err)
+                        && self.ctx.config.dispatch_mode == DispatchMode::Auto =>
+                {
+                    self.dispatch_claim_supported = Some(false);
+                    tracing::info!(
+                        "server does not support POST /v1/dispatch/claim ({err:#}); falling back to legacy board-lease dispatch"
+                    );
+                    return Ok(false);
+                }
+                Err(err) => {
+                    return Err(err.context("claiming work via POST /v1/dispatch/claim"));
+                }
+            };
+            if resp.claimed.is_empty() {
+                if !resp.holds_summary.is_empty() && !claimed_any {
+                    tracing::debug!(
+                        "dispatch/claim returned 0 runs (free_units={free_units}): {:?}",
+                        resp.holds_summary
+                    );
+                }
+                break;
+            }
+            claimed_any = true;
+            for claimed in resp.claimed {
+                let exec = self.execute_claimed_run(claimed, now).await;
+                deferred_merge |= exec.deferred_merge;
+                deferred_review |= exec.deferred_review;
+                deferred_housekeeping |= exec.deferred_housekeeping;
+            }
+            self.sync_resource_ledger(now);
+        }
+
+        // Once pull mode is confirmed active, retire any carried-over legacy runs and release
+        // any stale legacy 45m board coordinator leases held by this device so no board remains
+        // pinned to one machine.
+        if self.dispatch_claim_supported == Some(true) {
+            if !pull_confirmed && (!self.state.workers.is_empty() || !self.state.judges.is_empty())
+            {
+                self.retire_legacy_runs(now).await;
+            }
+            if !pull_confirmed && let Some(unknown) = self.load_unknown() {
+                let hold_board = boards
+                    .first()
+                    .map(|b| b.slug.clone())
+                    .unwrap_or_else(|| self.ctx.config.feedback_board());
+                self.record_hold(
+                    "pull",
+                    &hold_board,
+                    "pull_dispatch",
+                    self.run_limit(),
+                    &unknown,
+                    now,
+                );
+            }
+            let dispatch_agent = self.dispatch_agent();
+            for board in boards {
+                if board.coordinator.as_ref() == Some(&dispatch_agent) {
+                    self.release(&board.slug).await;
+                }
+            }
+            self.state.owed.retain(|step| now - step.at() < WAKE_TTL);
+            self.state
+                .idle_notices
+                .retain(|_, n| now - n.noticed < USAGE_STOP_KEPT);
+        }
+
+        if let Err(err) = self.poll_sticky_wakes(now).await {
+            tracing::warn!("polling device sticky wakes: {err:#}");
+        }
+        self.cleanup_ended_worktrees(now).await;
+        self.state
+            .merges
+            .retain(|task, _| self.boards.contains_key(&task.board()));
+        self.sync_resource_ledger(now);
+        self.save_at(now)?;
+        Ok(true)
+    }
+
+    /// Retires finished legacy `state.workers` and `state.judges` carried across an upgrade
+    /// from legacy board-lease dispatch into pull mode so their `cost_units` and worktrees do
+    /// not stay leaked in `daemon.db`.
+    async fn retire_legacy_runs(&mut self, now: Timestamp) {
+        let worker_tasks: Vec<TaskId> = self.state.workers.keys().cloned().collect();
+        for task_id in worker_tasks {
+            let Some(worker) = self.state.workers.get(&task_id).cloned() else {
+                continue;
+            };
+            let Some(thread) = worker.thread.as_deref() else {
+                if now - worker.started_at >= RUN_START_GRACE {
+                    self.state.workers.remove(&task_id);
+                    if let Some(wt_id) = worker.worktree_id.as_deref() {
+                        self.cleanup_worktree(wt_id, now).await;
+                    }
+                }
+                continue;
+            };
+            let runner_kind = worker.runner.as_deref().unwrap_or(self.runner.kind());
+            let runner = match self.runners.resolve(Some(runner_kind)) {
+                Ok(r) => r,
+                Err(_) => Arc::clone(&self.runner),
+            };
+            let mut handle = RunHandle::new(runner.kind(), thread);
+            if let Some(wd) = &worker.worktree_path {
+                handle = handle.with_workdir(wd);
+            }
+            let ended = match tokio::time::timeout(self.timing.thread_check, runner.status(&handle))
+                .await
+            {
+                Ok(Ok(status)) => {
+                    !status.runnable || (!status.busy && status.runs.unwrap_or(0) > 0)
+                }
+                _ => false,
+            };
+            if ended {
+                if let Some(run_id) = worker.run_id.as_deref() {
+                    let _ =
+                        self.db
+                            .update_local_run_state(run_id, LocalRunState::Finished, None, now);
+                } else {
+                    let _ = self.db.finish_local_runs_for_task(
+                        "worker",
+                        &task_id,
+                        LocalRunState::Finished,
+                        now,
+                    );
+                }
+                self.state.workers.remove(&task_id);
+                if let Some(wt_id) = worker.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+            }
+        }
+        let judges = self.state.judges.clone();
+        let mut keep = Vec::with_capacity(judges.len());
+        for judge in judges {
+            let Some(thread) = judge.thread.as_deref() else {
+                if now - judge.started_at < RUN_START_GRACE {
+                    keep.push(judge);
+                } else if let Some(wt_id) = judge.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+                continue;
+            };
+            let runner_kind = judge.runner.as_deref().unwrap_or(self.runner.kind());
+            let runner = match self.runners.resolve(Some(runner_kind)) {
+                Ok(r) => r,
+                Err(_) => Arc::clone(&self.runner),
+            };
+            let mut handle = RunHandle::new(runner.kind(), thread);
+            if let Some(wd) = &judge.worktree_path {
+                handle = handle.with_workdir(wd);
+            }
+            let ended = match tokio::time::timeout(self.timing.thread_check, runner.status(&handle))
+                .await
+            {
+                Ok(Ok(status)) => {
+                    !status.runnable || (!status.busy && status.runs.unwrap_or(0) > 0)
+                }
+                _ => false,
+            };
+            if ended {
+                if let Some(run_id) = judge.run_id.as_deref() {
+                    let _ =
+                        self.db
+                            .update_local_run_state(run_id, LocalRunState::Finished, None, now);
+                } else {
+                    let _ =
+                        self.db
+                            .finish_local_run_by_session(thread, LocalRunState::Finished, now);
+                }
+                if let Some(wt_id) = judge.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+            } else {
+                keep.push(judge);
+            }
+        }
+        self.state.judges = keep;
+    }
+
+    /// Executes one `ClaimedRun` returned by `POST /v1/dispatch/claim` with write-before-act
+    /// intent persistence in `daemon.db` (`local_runs` + `resource_ledger`).
+    async fn execute_claimed_run(
+        &mut self,
+        claimed: ClaimedRun,
+        now: Timestamp,
+    ) -> ClaimedExecution {
+        let run_id = claimed.run.id.clone();
+        let run_id_str = run_id.as_str().to_owned();
+        let resource_entry_id = format!("run:{run_id}");
+        let mut local_run = LocalRunRecord {
+            run_id: run_id_str.clone(),
+            task_id: claimed.task_id.clone(),
+            board: claimed.board.clone(),
+            kind: run_kind_str(claimed.run.kind).to_owned(),
+            runner: claimed.run.runner.clone(),
+            session_id: None,
+            worktree_path: None,
+            branch: None,
+            cost_units: claimed.run.cost_units,
+            pid: None,
+            state: LocalRunState::Intent,
+            lease_expires_at: claimed.run.lease_expires_at,
+            created_at: now,
+            updated_at: now,
+            meta_json: serde_json::to_string(&claimed).ok(),
+        };
+        if let Err(err) = self.db.upsert_local_run(&local_run) {
+            tracing::warn!("persisting intent for claimed run {run_id}: {err:#}");
+            self.fail_claimed_run(
+                &claimed,
+                &format!("failed to persist local run intent: {err:#}"),
+                now,
+            )
+            .await;
+            return ClaimedExecution::default();
+        }
+        let ledger_entry = ResourceEntry {
+            entry_id: resource_entry_id.clone(),
+            origin: ResourceOrigin::Managed,
+            agent_id: None,
+            run_id: Some(run_id_str.clone()),
+            cost_units: claimed.run.cost_units,
+            updated_at: now,
+        };
+        if let Err(err) = self.db.upsert_resource(&ledger_entry) {
+            tracing::warn!("recording resource_ledger intent for run {run_id}: {err:#}");
+        }
+
+        match claimed.run.kind {
+            RunKind::Merge => {
+                self.execute_claimed_merge(&claimed, &mut local_run, now)
+                    .await
+            }
+            RunKind::Housekeeping => {
+                self.execute_claimed_housekeeping(&claimed, &mut local_run, now)
+                    .await
+            }
+            RunKind::Worker
+            | RunKind::Review
+            | RunKind::Verdict
+            | RunKind::Triage
+            | RunKind::Goal
+            | RunKind::Command => {
+                match self
+                    .spawn_claimed_llm_run(&claimed, &mut local_run, now)
+                    .await
+                {
+                    Ok(exec) => exec,
+                    Err(err) => {
+                        tracing::warn!(
+                            "spawning claimed {} run {run_id} on {}: {err:#}",
+                            run_kind_str(claimed.run.kind),
+                            claimed.board
+                        );
+                        self.fail_claimed_run(&claimed, &format!("{err:#}"), now)
+                            .await;
+                        ClaimedExecution::default()
+                    }
+                }
+            }
+            RunKind::Interactive | RunKind::Unknown => {
+                self.fail_claimed_run(
+                    &claimed,
+                    "unsupported run kind returned by dispatch/claim",
+                    now,
+                )
+                .await;
+                ClaimedExecution::default()
+            }
+        }
+    }
+
+    async fn execute_claimed_merge(
+        &mut self,
+        claimed: &ClaimedRun,
+        local_run: &mut LocalRunRecord,
+        now: Timestamp,
+    ) -> ClaimedExecution {
+        let run_id = &claimed.run.id;
+        let Some(task_id) = claimed.task_id.as_ref() else {
+            self.fail_claimed_run(claimed, "merge run has no task_id", now)
+                .await;
+            return ClaimedExecution::default();
+        };
+        let agent = match self.ensure_dispatch_registered().await {
+            Ok(agent) => agent,
+            Err(err) => {
+                self.fail_claimed_run(
+                    claimed,
+                    &format!("registering dispatch agent: {err:#}"),
+                    now,
+                )
+                .await;
+                return ClaimedExecution::default();
+            }
+        };
+        if let Err(err) = self
+            .transition_run_starting_to_running(run_id, Some(&agent), None, None)
+            .await
+        {
+            self.fail_claimed_run(
+                claimed,
+                &format!("transitioning merge run to running: {err:#}"),
+                now,
+            )
+            .await;
+            return ClaimedExecution::default();
+        }
+        local_run.runner = DETERMINISTIC_RUNNER_KIND.to_owned();
+        local_run.state = LocalRunState::Running;
+        local_run.updated_at = now;
+        let _ = self.db.upsert_local_run(local_run);
+
+        let board = match self.boards.get(&claimed.board).cloned() {
+            Some(board) => board,
+            None => match self.client().board(&claimed.board).await {
+                Ok(board) => {
+                    self.boards.insert(board.slug.clone(), board.clone());
+                    board
+                }
+                Err(err) => {
+                    self.fail_claimed_run(claimed, &format!("reading board: {err:#}"), now)
+                        .await;
+                    return ClaimedExecution::default();
+                }
+            },
+        };
+        let config_snapshot = self.ctx.config.clone();
+        let home_root = self.ctx.home.root().to_path_buf();
+        let agent_client = self.client().with_agent(Some(agent.clone()));
+        let result = self
+            .deterministic
+            .execute_merge(
+                &board,
+                task_id,
+                &agent,
+                &agent_client,
+                &*self.gh,
+                |task| {
+                    project_for_task_config(&config_snapshot, &board, Some(task))
+                        .map(|(_, p)| p)
+                        .unwrap_or_else(|| home_root.clone())
+                },
+                &mut self.state.merges,
+                now,
+            )
+            .await;
+
+        let mut exec = ClaimedExecution::default();
+        match result {
+            Ok(MergeOutcome::Unclear { reason }) => {
+                self.fail_claimed_run(claimed, &reason, now).await;
+                self.merge_retry_after = Some(now + PR_READ_EVERY);
+                exec.deferred_merge = true;
+            }
+            Ok(outcome) => {
+                let deferred =
+                    outcome.is_deferred() || matches!(outcome, MergeOutcome::Noop { .. });
+                exec.deferred_merge = deferred;
+                if deferred {
+                    self.merge_retry_after = Some(now + PR_READ_EVERY);
+                } else {
+                    self.merge_retry_after = None;
+                }
+                let update = UpdateRun {
+                    state: Some(RunState::Succeeded),
+                    outcome: Some(Some(outcome.to_outcome_json())),
+                    ..UpdateRun::default()
+                };
+                if let Err(err) = self.client().update_run(run_id, &update).await {
+                    tracing::warn!("marking merge run {run_id} succeeded: {err:#}");
+                }
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Finished,
+                    None,
+                    now,
+                );
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+            }
+            Err(err) => {
+                exec.deferred_merge = true;
+                self.merge_retry_after = Some(now + PR_READ_EVERY);
+                self.fail_claimed_run(claimed, &format!("{err:#}"), now)
+                    .await;
+            }
+        }
+        exec
+    }
+
+    async fn execute_claimed_housekeeping(
+        &mut self,
+        claimed: &ClaimedRun,
+        local_run: &mut LocalRunRecord,
+        now: Timestamp,
+    ) -> ClaimedExecution {
+        let run_id = &claimed.run.id;
+        let Some(action) = claimed.housekeeping_action.as_ref() else {
+            self.fail_claimed_run(claimed, "housekeeping run has no housekeeping_action", now)
+                .await;
+            return ClaimedExecution {
+                deferred_merge: false,
+                deferred_review: false,
+                deferred_housekeeping: true,
+            };
+        };
+        let agent = match self.ensure_dispatch_registered().await {
+            Ok(agent) => agent,
+            Err(err) => {
+                self.fail_claimed_run(
+                    claimed,
+                    &format!("registering dispatch agent: {err:#}"),
+                    now,
+                )
+                .await;
+                return ClaimedExecution {
+                    deferred_merge: false,
+                    deferred_review: false,
+                    deferred_housekeeping: true,
+                };
+            }
+        };
+        if let Err(err) = self
+            .transition_run_starting_to_running(run_id, Some(&agent), None, None)
+            .await
+        {
+            self.fail_claimed_run(
+                claimed,
+                &format!("transitioning housekeeping run to running: {err:#}"),
+                now,
+            )
+            .await;
+            return ClaimedExecution {
+                deferred_merge: false,
+                deferred_review: false,
+                deferred_housekeeping: true,
+            };
+        }
+        local_run.runner = DETERMINISTIC_RUNNER_KIND.to_owned();
+        local_run.state = LocalRunState::Running;
+        local_run.updated_at = now;
+        let _ = self.db.upsert_local_run(local_run);
+
+        let agent_client = self.client().with_agent(Some(agent.clone()));
+        let result = self
+            .deterministic
+            .execute_housekeeping(action, &agent, &agent_client, &self.state.workers)
+            .await;
+        let mut exec = ClaimedExecution::default();
+        match result {
+            Ok(outcome) => {
+                if let HousekeepingOutcome::Opened { ref task_id, .. } = outcome {
+                    if let Some(worker) = self.state.workers.remove(task_id)
+                        && let Some(wt_id) = worker.worktree_id.as_deref()
+                    {
+                        self.cleanup_worktree(wt_id, now).await;
+                    }
+                    self.state.worker_skips.remove(task_id);
+                    self.state.worker_retry.remove(task_id);
+                    self.state.idle_notices.remove(task_id);
+                } else {
+                    exec.deferred_housekeeping = true;
+                }
+                let update = UpdateRun {
+                    state: Some(RunState::Succeeded),
+                    outcome: Some(Some(outcome.to_outcome_json())),
+                    ..UpdateRun::default()
+                };
+                if let Err(err) = self.client().update_run(run_id, &update).await {
+                    tracing::warn!("marking housekeeping run {run_id} succeeded: {err:#}");
+                }
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Finished,
+                    None,
+                    now,
+                );
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+            }
+            Err(err) => {
+                exec.deferred_housekeeping = true;
+                self.fail_claimed_run(claimed, &format!("{err:#}"), now)
+                    .await;
+            }
+        }
+        exec
+    }
+
+    async fn spawn_claimed_llm_run(
+        &mut self,
+        claimed: &ClaimedRun,
+        local_run: &mut LocalRunRecord,
+        now: Timestamp,
+    ) -> Result<ClaimedExecution> {
+        let run_id = &claimed.run.id;
+        let runner = self.runners.resolve(Some(&claimed.run.runner))?;
+        let runner_kind = runner.kind().to_owned();
+        let board = match self.boards.get(&claimed.board).cloned() {
+            Some(board) => board,
+            None => {
+                let board = self.client().board(&claimed.board).await?;
+                self.boards.insert(board.slug.clone(), board.clone());
+                board
+            }
+        };
+        let task_detail = match &claimed.task_id {
+            Some(tid) => Some(self.client().task(tid).await?),
+            None => None,
+        };
+        let (repo_key, project) =
+            self.host_project_for_run(&board, task_detail.as_ref().map(|d| &d.task))?;
+
+        let (worktree_spec, prompt, model, title) = match claimed.run.kind {
+            RunKind::Worker => {
+                let task_id = claimed
+                    .task_id
+                    .as_ref()
+                    .context("worker run missing task_id")?;
+                let wt = crate::worktree::worker_worktree(&project, task_id, now)
+                    .await
+                    .context("preparing worker worktree")?;
+                let title = claimed.run.title.clone().unwrap_or_else(|| {
+                    task_detail
+                        .as_ref()
+                        .map(|d| format!("{} {}", d.task.id, d.task.title))
+                        .unwrap_or_else(|| format!("work {task_id}"))
+                });
+                let brief =
+                    crate::brief::worker_brief(&board.slug, task_id, crate::brief::WORKER_CLOSER);
+                (wt, brief, self.ctx.config.thread_model.clone(), title)
+            }
+            RunKind::Review => {
+                let detail = task_detail
+                    .as_ref()
+                    .context("review run missing task detail")?;
+                let (wt, worktree_note) = match self
+                    .prepare_claimed_review_worktree(&board, detail, &project, now)
+                    .await?
+                {
+                    ReviewPrep::Ready(wt, note) => (wt, note),
+                    ReviewPrep::WaitForPr(until) => {
+                        let reason = format!(
+                            "waiting for PR or branch push for {} until {}",
+                            detail.task.id,
+                            until.to_rfc3339()
+                        );
+                        tracing::info!("{}: {reason}", detail.task.id);
+                        let _ = self
+                            .client()
+                            .update_run(
+                                run_id,
+                                &UpdateRun {
+                                    state: Some(RunState::Cancelled),
+                                    reason: Some(reason),
+                                    ..UpdateRun::default()
+                                },
+                            )
+                            .await;
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Cancelled,
+                            None,
+                            now,
+                        );
+                        let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                        self.review_wait_until = Some(until);
+                        return Ok(ClaimedExecution {
+                            deferred_merge: false,
+                            deferred_review: true,
+                            deferred_housekeeping: false,
+                        });
+                    }
+                };
+                let tasks = if claimed.tasks.is_empty() {
+                    vec![detail.task.id.clone()]
+                } else {
+                    claimed.tasks.clone()
+                };
+                let brief = crate::brief::judge_brief_with_worktree(
+                    crate::brief::JudgeKind::Review,
+                    &board.slug,
+                    &tasks,
+                    worktree_note.as_deref(),
+                );
+                let title =
+                    claimed.run.title.clone().unwrap_or_else(|| {
+                        format!("review {} {}", detail.task.id, detail.task.title)
+                    });
+                (
+                    wt,
+                    brief,
+                    self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
+                    title,
+                )
+            }
+            RunKind::Verdict | RunKind::Triage | RunKind::Goal => {
+                let (judge_kind, brief_kind) = match claimed.run.kind {
+                    RunKind::Verdict => (JudgeKind::Verdict, crate::brief::JudgeKind::Verdict),
+                    RunKind::Triage => (JudgeKind::Triage, crate::brief::JudgeKind::Triage),
+                    RunKind::Goal => (JudgeKind::Goal, crate::brief::JudgeKind::Goal),
+                    _ => unreachable!(),
+                };
+                let brief = crate::brief::judge_brief_with_worktree(
+                    brief_kind,
+                    &board.slug,
+                    &claimed.tasks,
+                    None,
+                );
+                let title = claimed
+                    .run
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("{} {}", brief_kind.as_str(), board.slug));
+                (
+                    None,
+                    brief,
+                    self.ctx.config.model_for_judge(judge_kind).cloned(),
+                    title,
+                )
+            }
+            RunKind::Command => {
+                let title = claimed
+                    .run
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("command {run_id}"));
+                let prompt = title.clone();
+                (None, prompt, self.ctx.config.thread_model.clone(), title)
+            }
+            _ => anyhow::bail!("unsupported LLM run kind {:?}", claimed.run.kind),
+        };
+
+        let use_daemon_worktree = runner_kind != "t3";
+        let mut worktree_id: Option<String> = None;
+        let mut worktree_path: Option<PathBuf> = None;
+        let mut branch: Option<String> = worktree_spec.as_ref().map(|w| w.branch.clone());
+
+        let (workdir, spec_worktree) = if use_daemon_worktree && let Some(spec) = &worktree_spec {
+            let managed = self
+                .worktrees
+                .create(&project, repo_key.as_deref(), run_id.as_str(), spec, now)
+                .await
+                .context("creating daemon-managed worktree")?;
+            worktree_id = Some(managed.id);
+            worktree_path = Some(managed.path.clone());
+            branch = Some(managed.branch);
+            (managed.path, None)
+        } else {
+            (project.clone(), worktree_spec)
+        };
+
+        // Transition local + server state to `starting` before spawning.
+        local_run.runner = runner_kind.clone();
+        local_run.worktree_path = worktree_path.clone().or_else(|| Some(workdir.clone()));
+        local_run.branch = branch.clone();
+        local_run.state = LocalRunState::Starting;
+        local_run.updated_at = now;
+        self.db.upsert_local_run(local_run)?;
+
+        let cwd_str = workdir.to_string_lossy().into_owned();
+        if let Err(err) = self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Starting),
+                    worktree_branch: branch.clone().map(Some),
+                    cwd: Some(Some(cwd_str.clone())),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+        {
+            if let Some(wt_id) = worktree_id.as_deref() {
+                self.cleanup_worktree(wt_id, now).await;
+            }
+            return Err(err.context("marking claimed run starting"));
+        }
+
+        let mut metadata = BTreeMap::from([
+            ("board".to_owned(), claimed.board.to_string()),
+            ("kind".to_owned(), run_kind_str(claimed.run.kind).to_owned()),
+            ("run_id".to_owned(), run_id.to_string()),
+        ]);
+        if let Some(tid) = &claimed.task_id {
+            metadata.insert("task".to_owned(), tid.to_string());
+        }
+        let spec = RunSpec {
+            run_id: run_id.to_string(),
+            title: title.clone(),
+            prompt,
+            model,
+            worktree: spec_worktree,
+            metadata,
+        };
+        let handle = match runner.spawn(&spec, &workdir).await {
+            Ok(handle) => handle,
+            Err(err) => {
+                if let Some(wt_id) = worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+                return Err(err.context(format!("spawning {runner_kind} runner for {run_id}")));
+            }
+        };
+        let agent_id = match handle.resolve_agent_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.cancel_and_maybe_cleanup_after_spawn(
+                    &*runner,
+                    &handle,
+                    worktree_id.as_deref(),
+                    claimed,
+                    "invalid agent id",
+                    now,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let updated = match self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Running),
+                    agent_id: Some(Some(agent_id.clone())),
+                    worktree_branch: branch.clone().map(Some),
+                    cwd: Some(Some(cwd_str)),
+                    lease_ttl_secs: Some(RUN_LEASE_TTL_SECS_DEFAULT),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+            .context("marking claimed run running")
+        {
+            Ok(updated) => updated,
+            Err(err) => {
+                self.cancel_and_maybe_cleanup_after_spawn(
+                    &*runner,
+                    &handle,
+                    worktree_id.as_deref(),
+                    claimed,
+                    "marking claimed run running failed",
+                    now,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let managed = ManagedRun {
+            run_id: run_id.clone(),
+            board: claimed.board.clone(),
+            kind: claimed.run.kind,
+            task_id: claimed.task_id.clone(),
+            tasks: claimed.tasks.clone(),
+            runner: handle.runner.clone(),
+            native_id: Some(handle.native_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            worktree_id: worktree_id.clone(),
+            worktree_path: handle.workdir.clone().or(worktree_path).or(Some(workdir)),
+            branch: branch.clone(),
+            cost_units: claimed.run.cost_units,
+            title,
+            started_at: now,
+            last_renewed_at: Some(now),
+            lease_expires_at: updated.lease_expires_at,
+            noted: false,
+            waiting_external: false,
+        };
+        local_run.runner = handle.runner.clone();
+        local_run.session_id = Some(handle.native_id.clone());
+        local_run.state = LocalRunState::Running;
+        local_run.lease_expires_at = updated.lease_expires_at;
+        local_run.updated_at = now;
+        local_run.meta_json = serde_json::to_string(&managed).ok();
+        if let Err(err) = self.db.upsert_local_run(local_run).and_then(|()| {
+            self.state.managed_runs.insert(run_id.clone(), managed);
+            self.sync_resource_ledger(now);
+            self.save_at(now)
+        }) {
+            self.state.managed_runs.remove(run_id);
+            self.cancel_and_maybe_cleanup_after_spawn(
+                &*runner,
+                &handle,
+                worktree_id.as_deref(),
+                claimed,
+                "persisting running state failed",
+                now,
+            )
+            .await;
+            return Err(err);
+        }
+
+        // Best-effort start note on the task for human & cross-tool visibility.
+        if let Some(tid) = claimed.task_id.as_ref()
+            && matches!(claimed.run.kind, RunKind::Worker | RunKind::Review)
+            && let Ok(dispatch_agent) = self.ensure_dispatch_registered().await
+        {
+            let link = if handle.runner == "t3" {
+                match self.t3.thread_link(&handle.native_id).await {
+                    Ok(Some(link)) => link,
+                    _ => format!("thread {}", handle.native_id),
+                }
+            } else {
+                format!("{} run {}", handle.runner, handle.native_id)
+            };
+            let text = match claimed.run.kind {
+                RunKind::Worker => {
+                    let branch_part = branch
+                        .as_ref()
+                        .map(|b| format!(" on branch {b}"))
+                        .unwrap_or_default();
+                    format!("{WORKER_NOTE_PREFIX}{branch_part}: {link}")
+                }
+                RunKind::Review => {
+                    format!("{} {link} (agent {agent_id})", judges::JUDGE_NOTE)
+                }
+                _ => String::new(),
+            };
+            if !text.is_empty() {
+                let agent_client = self.client().with_agent(Some(dispatch_agent.clone()));
+                if add_note(&agent_client, tid, &dispatch_agent, NoteKind::Note, text)
+                    .await
+                    .is_ok()
+                    && let Some(entry) = self.state.managed_runs.get_mut(run_id)
+                {
+                    entry.noted = true;
+                }
+            }
+        }
+        tracing::info!(
+            "pull-started {} run {run_id} ({}:{}) on {}",
+            run_kind_str(claimed.run.kind),
+            handle.runner,
+            handle.native_id,
+            claimed.board
+        );
+        Ok(ClaimedExecution::default())
+    }
+
+    async fn cancel_and_maybe_cleanup_after_spawn(
+        &mut self,
+        runner: &dyn Runner,
+        handle: &RunHandle,
+        worktree_id: Option<&str>,
+        claimed: &ClaimedRun,
+        reason: &str,
+        now: Timestamp,
+    ) {
+        match runner.cancel(handle, reason).await {
+            Ok(()) => {
+                if let Some(wt_id) = worktree_id {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+            }
+            Err(cancel_err) => {
+                tracing::warn!(
+                    "post-spawn cancel of {} ({}) failed ({cancel_err:#}); preserving worktree {:?} so the live agent is not disrupted",
+                    claimed.run.id,
+                    handle.native_id,
+                    worktree_id
+                );
+                self.record_drop(
+                    "pull_post_spawn_cancel_failed",
+                    Some(&claimed.board),
+                    claimed.task_id.as_ref(),
+                    handle.agent_id.as_ref(),
+                    &format!(
+                        "could not cancel spawned {} session {} after {reason}: {cancel_err:#}; worktree preserved",
+                        handle.runner, handle.native_id
+                    ),
+                    serde_json::json!({
+                        "run_id": claimed.run.id,
+                        "native_id": handle.native_id,
+                        "worktree_id": worktree_id,
+                        "reason": reason,
+                    }),
+                    now,
+                );
+            }
+        }
+    }
+
+    async fn prepare_claimed_review_worktree(
+        &self,
+        board: &Board,
+        detail: &board_proto::TaskDetail,
+        project: &Path,
+        now: Timestamp,
+    ) -> Result<ReviewPrep> {
+        use crate::worktree::{ReviewBase, ReviewTarget};
+        let task = &detail.task.id;
+        let no_code = judges::noted_pr_none(detail, &board.repos);
+        let pr = if no_code {
+            None
+        } else {
+            judges::noted_pr(detail, &board.repos)
+        };
+        let worker_branch = if pr.is_none() && !no_code {
+            match judges::noted_worker_branch(detail) {
+                Some(branch) => branch,
+                None => Some(crate::worktree::worker_branch(task)),
+            }
+        } else {
+            None
+        };
+        let pr_ref = if let Some(pr_url) = &pr {
+            match self.gh.view(project, pr_url).await {
+                Ok(view) if view.state == PrState::Merged && !view.base_ref.is_empty() => {
+                    Some(view.base_ref)
+                }
+                Ok(view) if !view.cross_repository && !view.head_ref.is_empty() => {
+                    Some(view.head_ref)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let target = if let Some(branch) = pr_ref.as_deref() {
+            ReviewTarget::PullRequest(branch)
+        } else if pr.is_none() && !no_code {
+            match worker_branch.as_deref() {
+                Some(branch) => ReviewTarget::TaskBranch(branch),
+                None => ReviewTarget::None,
+            }
+        } else {
+            ReviewTarget::None
+        };
+        let prepared = crate::worktree::review_worktree(project, task, target, now)
+            .await
+            .context("preparing review judge worktree")?;
+        Ok(match prepared {
+            None => ReviewPrep::Ready(None, None),
+            Some(prepared) => match prepared.source {
+                ReviewBase::PullRequest => ReviewPrep::Ready(Some(prepared.worktree), None),
+                ReviewBase::TaskBranch => {
+                    let note = crate::brief::review_task_branch_note(&prepared.worktree.base);
+                    ReviewPrep::Ready(Some(prepared.worktree), Some(note))
+                }
+                ReviewBase::DefaultBase => {
+                    let parked_at = judges::parked_in_review_at(detail);
+                    if !no_code && pr.is_none() && judges::within_pr_wait(parked_at, now) {
+                        return Ok(ReviewPrep::WaitForPr(parked_at + judges::REVIEW_PR_WAIT));
+                    }
+                    let note =
+                        crate::brief::review_default_base_note(&prepared.worktree.base, no_code);
+                    ReviewPrep::Ready(Some(prepared.worktree), Some(note))
+                }
+            },
+        })
+    }
+
+    async fn transition_run_starting_to_running(
+        &self,
+        run_id: &RunId,
+        agent: Option<&AgentId>,
+        branch: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<board_proto::Run> {
+        self.client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Starting),
+                    agent_id: agent.cloned().map(Some),
+                    worktree_branch: branch.map(|b| Some(b.to_owned())),
+                    cwd: cwd.map(|c| Some(c.to_owned())),
+                    ..UpdateRun::default()
+                },
+            )
+            .await?;
+        self.client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Running),
+                    agent_id: agent.cloned().map(Some),
+                    lease_ttl_secs: Some(RUN_LEASE_TTL_SECS_DEFAULT),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+    }
+
+    async fn fail_claimed_run(&mut self, claimed: &ClaimedRun, reason: &str, now: Timestamp) {
+        let run_id = &claimed.run.id;
+        let clipped = clip_run_reason(reason);
+        self.record_drop(
+            "pull_run_failed",
+            Some(&claimed.board),
+            claimed.task_id.as_ref(),
+            None,
+            &clipped,
+            serde_json::json!({
+                "run_id": run_id,
+                "kind": claimed.run.kind,
+                "runner": claimed.run.runner,
+            }),
+            now,
+        );
+        if let Err(err) = self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Failed),
+                    reason: Some(clipped),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!("marking failed run {run_id} on server: {err:#}");
+        }
+        let _ = self
+            .db
+            .update_local_run_state(run_id.as_str(), LocalRunState::Failed, None, now);
+        let _ = self.db.remove_resource(&format!("run:{run_id}"));
+        self.state.managed_runs.remove(run_id);
+    }
+
+    /// Checks every active pull-claimed [`ManagedRun`] via [`Runner::status`]:
+    /// - still live (`starting | running | waiting_external | idle` and `runnable`): renews
+    ///   its server lease (`lease_ttl_secs = 180`) via `PATCH /v1/runs/{id}`;
+    /// - ended/failed/cancelled/gone: transitions the server `Run` to `succeeded`/`failed`/
+    ///   `cancelled`, updates `daemon.db`, frees `resource_ledger`, and cleans up worktrees.
+    pub async fn renew_runs(&mut self, now: Timestamp) -> Result<()> {
+        let run_ids: Vec<RunId> = self.state.managed_runs.keys().cloned().collect();
+        for run_id in run_ids {
+            let Some(mut run) = self.state.managed_runs.get(&run_id).cloned() else {
+                continue;
+            };
+            let Some(native_id) = run.native_id.clone() else {
+                continue;
+            };
+            let runner = match self.runners.resolve(Some(&run.runner)) {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::warn!("monitoring run {run_id}: {err:#}");
+                    continue;
+                }
+            };
+            let mut handle = RunHandle::new(&run.runner, &native_id);
+            if let Some(wd) = &run.worktree_path {
+                handle = handle.with_workdir(wd);
+            }
+            if let Some(aid) = &run.agent_id {
+                handle = handle.with_agent_id(aid.clone());
+            }
+            let status = match tokio::time::timeout(
+                self.timing.thread_check,
+                runner.status(&handle),
+            )
+            .await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => {
+                    tracing::warn!("checking status of managed run {run_id}: {err:#}");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "checking status of managed run {run_id} timed out after {}s",
+                        self.timing.thread_check.as_secs()
+                    );
+                    continue;
+                }
+            };
+
+            let (keep_live, next_server_state) = match status.state {
+                RunnerState::Starting | RunnerState::Running if status.runnable => {
+                    let state_update = if run.waiting_external {
+                        Some(RunState::Running)
+                    } else {
+                        None
+                    };
+                    (true, state_update)
+                }
+                RunnerState::WaitingExternal if status.runnable => {
+                    let state_update = if !run.waiting_external {
+                        Some(RunState::WaitingExternal)
+                    } else {
+                        None
+                    };
+                    (true, state_update)
+                }
+                RunnerState::Idle if status.runnable => {
+                    if status.busy {
+                        let state_update = if run.waiting_external {
+                            Some(RunState::Running)
+                        } else {
+                            None
+                        };
+                        (true, state_update)
+                    } else if run.kind == RunKind::Worker
+                        && let Some(tid) = run.task_id.as_ref()
+                        && let Some(aid) = run.agent_id.as_ref()
+                        && self.is_task_blocked_for_agent(tid, aid).await
+                    {
+                        let state_update = if !run.waiting_external {
+                            Some(RunState::WaitingExternal)
+                        } else {
+                            None
+                        };
+                        (true, state_update)
+                    } else if status.runs.unwrap_or(0) == 0
+                        && now - run.started_at < RUN_START_GRACE
+                    {
+                        (true, None)
+                    } else {
+                        (false, None)
+                    }
+                }
+                _ => (false, None),
+            };
+            if keep_live {
+                match self
+                    .client()
+                    .update_run(
+                        &run_id,
+                        &UpdateRun {
+                            state: next_server_state,
+                            lease_ttl_secs: Some(RUN_LEASE_TTL_SECS_DEFAULT),
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(updated) => {
+                        run.waiting_external = updated.state == RunState::WaitingExternal;
+                        run.last_renewed_at = Some(now);
+                        run.lease_expires_at = updated.lease_expires_at;
+                        let _ = self.db.update_local_run_lease(
+                            run_id.as_str(),
+                            updated.lease_expires_at,
+                            now,
+                        );
+                        self.state.managed_runs.insert(run_id, run);
+                    }
+                    Err(err)
+                        if matches!(
+                            error_code(&err),
+                            Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                        ) =>
+                    {
+                        tracing::info!(
+                            "managed run {run_id} is already terminal on server ({err:#}); cleaning up locally"
+                        );
+                        self.record_drop(
+                            "managed_run_server_terminal",
+                            Some(&run.board),
+                            run.task_id.as_ref(),
+                            run.agent_id.as_ref(),
+                            &format!("server already closed run {run_id}: {err:#}"),
+                            serde_json::to_value(&run).unwrap_or_default(),
+                            now,
+                        );
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Cancelled,
+                            None,
+                            now,
+                        );
+                        let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                        self.state.managed_runs.remove(&run_id);
+                        if let Some(wt_id) = run.worktree_id.as_deref() {
+                            self.cleanup_worktree(wt_id, now).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("renewing lease for managed run {run_id}: {err:#}");
+                    }
+                }
+            } else {
+                let (server_state, local_state, reason) = match status.state {
+                    RunnerState::Succeeded => (RunState::Succeeded, LocalRunState::Finished, None),
+                    RunnerState::Failed => (
+                        RunState::Failed,
+                        LocalRunState::Failed,
+                        Some("runner reported failed state".to_owned()),
+                    ),
+                    RunnerState::Cancelled => (
+                        RunState::Cancelled,
+                        LocalRunState::Cancelled,
+                        Some("runner reported cancelled state".to_owned()),
+                    ),
+                    RunnerState::Gone
+                    | RunnerState::Starting
+                    | RunnerState::Running
+                    | RunnerState::WaitingExternal
+                    | RunnerState::Idle
+                    | RunnerState::Unknown => {
+                        if status.runs.unwrap_or(0) > 0 {
+                            (RunState::Succeeded, LocalRunState::Finished, None)
+                        } else {
+                            (
+                                RunState::Failed,
+                                LocalRunState::Failed,
+                                Some("runner session ended before running".to_owned()),
+                            )
+                        }
+                    }
+                };
+                if let Err(err) = self
+                    .client()
+                    .update_run(
+                        &run_id,
+                        &UpdateRun {
+                            state: Some(server_state),
+                            reason,
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                    && !matches!(
+                        error_code(&err),
+                        Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                    )
+                {
+                    tracing::warn!(
+                        "updating ended managed run {run_id} to {server_state:?}: {err:#}"
+                    );
+                }
+                let _ = self
+                    .db
+                    .update_local_run_state(run_id.as_str(), local_state, None, now);
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                self.state.managed_runs.remove(&run_id);
+                if let Some(wt_id) = run.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+            }
+        }
+        self.sync_resource_ledger(now);
+        self.cleanup_ended_worktrees(now).await;
+        let _ = self.save_at(now);
+        Ok(())
+    }
+
+    /// Polls `GET /v1/devices/{name}/wakes`, verifies any previously timed-out sticky wakes
+    /// in `daemon.db`'s `unsure_sends` (acknowledging ones confirmed delivered, allowing at
+    /// most one resend for ones confirmed missing), delivers new pending sticky wakes via
+    /// [`Runner::send`] (persisting `unsure_sends` BEFORE sending), and acknowledges delivered
+    /// wakes via `POST /v1/wakes/{id}/ack`.
+    pub async fn poll_sticky_wakes(&mut self, now: Timestamp) -> Result<usize> {
+        if self.wakes_unsupported {
+            return Ok(0);
+        }
+        let mut delivered = self.verify_unsure_sticky_wakes(now).await;
+        let wakes = match self.client().list_device_wakes(&self.ctx.device).await {
+            Ok(wakes) => wakes,
+            Err(err) if is_heartbeat_unsupported(&err) => {
+                self.wakes_unsupported = true;
+                return Ok(delivered);
+            }
+            Err(err) => return Err(err.context("listing device sticky wakes")),
+        };
+        for wake in wakes {
+            if self.is_sticky_wake_unsure(wake.id) || self.sticky_exhausted.contains(&wake.id) {
+                continue;
+            }
+            let Some((runner, handle, agent_id)) = self.resolve_sticky_wake_target(&wake) else {
+                tracing::debug!(
+                    "sticky wake #{} ({}) has no live local runner target; leaving pending",
+                    wake.id,
+                    wake.kind
+                );
+                continue;
+            };
+            let base_msg = format_sticky_wake_message(&wake);
+            let digest = wake_digest(&base_msg, now);
+            let marked_msg = format!("{base_msg}\n{}", wake_marker(&digest));
+            let board_slug: BoardSlug = wake
+                .payload
+                .get("board")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    wake.run_id
+                        .as_ref()
+                        .and_then(|id| self.state.managed_runs.get(id))
+                        .map(|r| r.board.clone())
+                })
+                .unwrap_or_else(|| self.ctx.config.feedback_board());
+
+            let is_resend = self.sticky_resent.contains(&wake.id);
+            let wake_record = Wake {
+                board: board_slug,
+                about: WakeAbout::Sticky {
+                    wake_id: wake.id,
+                    wake_kind: wake.kind.clone(),
+                },
+                queued_at: now,
+                forwarded: false,
+                resent: is_resend,
+            };
+            // Write-before-send: durably record digest in daemon.db's `unsure_sends` BEFORE
+            // calling `Runner::send` so a crash mid-send leaves a durable trail.
+            self.state
+                .unsure_wakes
+                .entry(agent_id.clone())
+                .or_default()
+                .messages
+                .push(UnsureMessage {
+                    digest: digest.clone(),
+                    wakes: vec![wake_record],
+                    since: now,
+                });
+            if let Err(err) = self.save_at(now) {
+                self.remove_unsure_digest(&agent_id, &digest);
+                tracing::warn!(
+                    "sticky wake #{}: persisting unsure_sends before send failed: {err:#}",
+                    wake.id
+                );
+                continue;
+            }
+
+            let steer = SteerMessage::new(marked_msg).with_digest(digest.clone());
+            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.send(&handle, &steer)).await {
+                Ok(Ok(())) => {
+                    self.remove_unsure_digest(&agent_id, &digest);
+                    self.sticky_resent.remove(&wake.id);
+                    let _ = self.save_at(now);
+                    if let Err(err) = self.client().ack_wake(wake.id).await {
+                        tracing::warn!("acking delivered sticky wake #{}: {err:#}", wake.id);
+                    } else {
+                        delivered += 1;
+                    }
+                }
+                Ok(Err(err)) if err.downcast_ref::<TimedOut>().is_some() => {
+                    if is_resend {
+                        self.sticky_exhausted.insert(wake.id);
+                    }
+                    tracing::warn!(
+                        "sticky wake #{} to {agent_id} timed out ({err:#}); kept in unsure_sends without ack",
+                        wake.id
+                    );
+                }
+                Err(_) => {
+                    if is_resend {
+                        self.sticky_exhausted.insert(wake.id);
+                    }
+                    tracing::warn!(
+                        "sticky wake #{} to {agent_id} timed out after {}s; kept in unsure_sends without ack",
+                        wake.id,
+                        WAKE_SEND_TIMEOUT.as_secs()
+                    );
+                }
+                Ok(Err(err)) => {
+                    self.remove_unsure_digest(&agent_id, &digest);
+                    let _ = self.save_at(now);
+                    self.record_drop(
+                        "sticky_wake_send_failed",
+                        None,
+                        None,
+                        Some(&agent_id),
+                        &format!("delivering sticky wake #{} failed: {err:#}", wake.id),
+                        serde_json::to_value(&wake).unwrap_or_default(),
+                        now,
+                    );
+                    tracing::warn!("delivering sticky wake #{} to {agent_id}: {err:#}", wake.id);
+                }
+            }
+        }
+        Ok(delivered)
+    }
+
+    async fn is_task_blocked_for_agent(&self, task_id: &TaskId, agent_id: &AgentId) -> bool {
+        match self.client().task(task_id).await {
+            Ok(detail) => {
+                detail.task.status == TaskStatus::Blocked
+                    && detail.task.owner.as_ref() == Some(agent_id)
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn is_sticky_wake_unsure(&self, wake_id: i64) -> bool {
+        self.state.unsure_wakes.values().any(|u| {
+            u.messages.iter().any(|m| {
+                m.wakes.iter().any(
+                    |w| matches!(w.about, WakeAbout::Sticky { wake_id: id, .. } if id == wake_id),
+                )
+            })
+        })
+    }
+
+    /// Checks previously timed-out `WakeAbout::Sticky` entries in `state.unsure_wakes` once
+    /// `SEND_CHECK_AFTER` has elapsed, using each agent's actual runner:
+    /// - confirmed delivered -> calls `POST /v1/wakes/{id}/ack` and removes from `unsure_wakes`;
+    /// - confirmed missing -> removes from `unsure_wakes` and marks for at most one resend;
+    ///   if already resent once, records a Trail Rule drop and adds to `sticky_exhausted`.
+    async fn verify_unsure_sticky_wakes(&mut self, now: Timestamp) -> usize {
+        let sticky_agents: Vec<AgentId> = self
+            .state
+            .unsure_wakes
+            .iter()
+            .filter(|(_, u)| {
+                u.read_due(now)
+                    && u.messages.iter().any(|m| {
+                        m.wakes
+                            .iter()
+                            .any(|w| matches!(w.about, WakeAbout::Sticky { .. }))
+                    })
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        let mut acked = 0usize;
+        for agent in sticky_agents {
+            let Some(unsure_snapshot) = self.state.unsure_wakes.get(&agent).cloned() else {
+                continue;
+            };
+            let sticky_only = UnsureWakes {
+                messages: unsure_snapshot
+                    .messages
+                    .into_iter()
+                    .filter(|m| {
+                        m.wakes
+                            .iter()
+                            .any(|w| matches!(w.about, WakeAbout::Sticky { .. }))
+                    })
+                    .collect(),
+                read_after: unsure_snapshot.read_after,
+                failed_delay_secs: unsure_snapshot.failed_delay_secs,
+            };
+            if sticky_only.messages.is_empty() {
+                continue;
+            }
+            match self.read_messages(&agent).await {
+                Ok(recent) => {
+                    let sorted = sort_unsure(&sticky_only, recent.as_ref(), now);
+                    let mut to_ack = Vec::new();
+                    let mut exhausted = Vec::new();
+                    if let Some(unsure) = self.state.unsure_wakes.get_mut(&agent) {
+                        unsure.failed_delay_secs = None;
+                        unsure.read_after = sorted.waiting.then(|| now + SEND_CHECK_AFTER);
+                        for msg in &unsure.messages {
+                            if sorted.arrived.contains(&msg.digest) {
+                                for w in &msg.wakes {
+                                    if let WakeAbout::Sticky { wake_id, .. } = w.about {
+                                        to_ack.push(wake_id);
+                                    }
+                                }
+                            } else if sorted.missing.iter().any(|x| x.digest == msg.digest) {
+                                for w in &msg.wakes {
+                                    if let WakeAbout::Sticky { wake_id, .. } = w.about {
+                                        if w.resent {
+                                            exhausted.push((wake_id, msg.clone()));
+                                        } else {
+                                            self.sticky_resent.insert(wake_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        unsure.messages.retain(|m| {
+                            !sorted.arrived.contains(&m.digest)
+                                && !sorted.missing.iter().any(|x| x.digest == m.digest)
+                        });
+                        if unsure.messages.is_empty() {
+                            self.state.unsure_wakes.remove(&agent);
+                        }
+                    }
+                    for wake_id in to_ack {
+                        self.sticky_resent.remove(&wake_id);
+                        self.sticky_exhausted.remove(&wake_id);
+                        if let Err(err) = self.client().ack_wake(wake_id).await {
+                            tracing::warn!(
+                                "acking confirmed timed-out sticky wake #{wake_id}: {err:#}"
+                            );
+                        } else {
+                            acked += 1;
+                        }
+                    }
+                    for (wake_id, msg) in exhausted {
+                        self.sticky_exhausted.insert(wake_id);
+                        self.record_drop(
+                            "sticky_wake_resend_missing",
+                            msg.wakes.first().map(|w| &w.board),
+                            None,
+                            Some(&agent),
+                            &format!(
+                                "sticky wake #{wake_id} timed out and was missing after retry; not resending again"
+                            ),
+                            serde_json::to_value(&msg).unwrap_or_default(),
+                            now,
+                        );
+                    }
+                    let _ = self.save_at(now);
+                }
+                Err(err) => {
+                    if let Some(unsure) = self.state.unsure_wakes.get_mut(&agent) {
+                        let last = unsure.failed_delay_secs.map(TimeDelta::seconds);
+                        let delay = next_delay(last, WAKE_RETRY_FIRST, WAKE_RETRY_MAX);
+                        tracing::warn!(
+                            "verifying timed-out sticky wake for {agent}: {err:#}; trying again in {}s",
+                            delay.num_seconds()
+                        );
+                        unsure.failed_delay_secs = Some(delay.num_seconds());
+                        unsure.read_after = Some(now + delay);
+                    }
+                }
+            }
+        }
+        acked
+    }
+
+    fn resolve_sticky_wake_target(
+        &self,
+        wake: &StickyWake,
+    ) -> Option<(Arc<dyn Runner>, RunHandle, AgentId)> {
+        let managed = wake
+            .run_id
+            .as_ref()
+            .and_then(|id| self.state.managed_runs.get(id))
+            .or_else(|| {
+                wake.agent_id.as_ref().and_then(|aid| {
+                    self.state
+                        .managed_runs
+                        .values()
+                        .find(|r| r.agent_id.as_ref() == Some(aid))
+                })
+            });
+        if let Some(run) = managed
+            && let Some(native_id) = &run.native_id
+            && let Ok(runner) = self.runners.resolve(Some(&run.runner))
+        {
+            let mut handle = RunHandle::new(&run.runner, native_id);
+            if let Some(wd) = &run.worktree_path {
+                handle = handle.with_workdir(wd);
+            }
+            let agent_id = run
+                .agent_id
+                .clone()
+                .or_else(|| wake.agent_id.clone())
+                .or_else(|| handle.resolve_agent_id().ok())?;
+            handle = handle.with_agent_id(agent_id.clone());
+            return Some((runner, handle, agent_id));
+        }
+        let agent_id = wake.agent_id.clone()?;
+        let runner_kind = match agent_id.source() {
+            AgentSource::T3 => "t3",
+            AgentSource::Antigravity => "acp",
+            _ => self.runner.kind(),
+        };
+        let runner = self
+            .runners
+            .resolve(Some(runner_kind))
+            .or_else(|_| self.runners.resolve(None))
+            .ok()?;
+        let handle =
+            RunHandle::new(runner.kind(), agent_id.native()).with_agent_id(agent_id.clone());
+        Some((runner, handle, agent_id))
+    }
+
+    fn remove_unsure_digest(&mut self, agent: &AgentId, digest: &str) {
+        if let Some(unsure) = self.state.unsure_wakes.get_mut(agent) {
+            unsure.messages.retain(|m| m.digest != digest);
+            if unsure.messages.is_empty() {
+                self.state.unsure_wakes.remove(agent);
+            }
+        }
+    }
+
+    fn project_for_run(
+        &self,
+        board: &Board,
+        task: Option<&Task>,
+    ) -> Option<(Option<String>, PathBuf)> {
+        project_for_task_config(&self.ctx.config, board, task)
+    }
+
+    /// Resolves the [`Runner`] and [`RunHandle`] responsible for `agent`, checking active
+    /// `managed_runs` first and then falling back to `AgentSource` in `self.runners`.
+    fn resolve_runner_for_agent(&self, agent: &AgentId) -> (Arc<dyn Runner>, RunHandle) {
+        if let Some(run) = self
+            .state
+            .managed_runs
+            .values()
+            .find(|r| r.agent_id.as_ref() == Some(agent))
+            && let Some(native_id) = &run.native_id
+            && let Ok(runner) = self.runners.resolve(Some(&run.runner))
+        {
+            let mut handle = RunHandle::new(&run.runner, native_id).with_agent_id(agent.clone());
+            if let Some(wd) = &run.worktree_path {
+                handle = handle.with_workdir(wd);
+            }
+            return (runner, handle);
+        }
+        let kind = match agent.source() {
+            AgentSource::T3 => "t3",
+            AgentSource::Antigravity => "acp",
+            _ => self.runner.kind(),
+        };
+        let runner = self
+            .runners
+            .resolve(Some(kind))
+            .unwrap_or_else(|_| Arc::clone(&self.runner));
+        let handle = RunHandle::new(runner.kind(), agent.native()).with_agent_id(agent.clone());
+        (runner, handle)
+    }
+
+    fn host_project_for_run(
+        &self,
+        board: &Board,
+        task: Option<&Task>,
+    ) -> Result<(Option<String>, PathBuf)> {
+        let (repo, project) = self
+            .project_for_run(board, task)
+            .with_context(|| no_project(board))?;
+        if folder_gone(&project) {
+            anyhow::bail!(
+                "the project folder {} of board {} is missing on this device: restore it or update [projects] in config.toml",
+                project.display(),
+                board.slug
+            );
+        }
+        Ok((repo, project))
+    }
+
     /// Whether the active [`Runner`] has `thread` and can run it: not archived/cancelled,
     /// and its folder (its worktree, else `project` when given) still exists.
     async fn thread_live(&self, thread: &str, project: Option<&Path>) -> Result<bool> {
@@ -2163,8 +4125,9 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
-    /// Reconciles all tracked daemon-managed worktrees not owned by any live worker or judge
-    /// (including worktrees orphaned by a hard crash or transient cleanup error).
+    /// Reconciles all tracked daemon-managed worktrees not owned by any live worker, judge,
+    /// or pull-claimed managed run (including worktrees orphaned by a hard crash or transient
+    /// cleanup error).
     async fn cleanup_ended_worktrees(&self, now: Timestamp) {
         let active: BTreeSet<String> = self
             .state
@@ -2175,6 +4138,12 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.state
                     .judges
                     .iter()
+                    .filter_map(|r| r.worktree_id.clone()),
+            )
+            .chain(
+                self.state
+                    .managed_runs
+                    .values()
                     .filter_map(|r| r.worktree_id.clone()),
             )
             .collect();
@@ -2203,19 +4172,23 @@ impl<T: T3 + 'static> Daemon<T> {
     /// `agent`'s recent messages for checking timed-out wake-up deliveries, read within
     /// [`Timing::thread_check`]; `None` when the runner no longer knows the run/thread.
     async fn read_messages(&self, agent: &AgentId) -> Result<Option<crate::t3::RecentMessages>> {
-        let thread = agent.native();
-        if self.runner.kind() == "t3" {
-            return tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
-                .await
-                .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()));
+        let (runner, handle) = self.resolve_runner_for_agent(agent);
+        if runner.kind() == "t3" {
+            return tokio::time::timeout(
+                self.timing.thread_check,
+                self.t3.recent_messages(&handle.native_id),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(TimedOut(format!("t3 thread show {}", handle.native_id)).into())
+            });
         }
-        let handle = RunHandle::new(self.runner.kind(), thread).with_agent_id(agent.clone());
         let check = async {
-            let status = self.runner.status(&handle).await?;
+            let status = runner.status(&handle).await?;
             if status.state == RunnerState::Gone && !status.runnable {
                 return Ok(None);
             }
-            let events = self.runner.poll_events(&handle, 0).await?;
+            let events = runner.poll_events(&handle, 0).await?;
             let user = events
                 .into_iter()
                 .filter(|ev| ev.kind == RunEventKind::Message)
@@ -2238,7 +4211,12 @@ impl<T: T3 + 'static> Daemon<T> {
         tokio::time::timeout(self.timing.thread_check, check)
             .await
             .unwrap_or_else(|_| {
-                Err(TimedOut(format!("{} poll_events {thread}", self.runner.kind())).into())
+                Err(TimedOut(format!(
+                    "{} poll_events {}",
+                    runner.kind(),
+                    handle.native_id
+                ))
+                .into())
             })
     }
 
@@ -3292,6 +5270,13 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.state.wakes.retain(|_, queue| !queue.wakes.is_empty());
             }
         }
+        if matches!(
+            event.event_type,
+            EventType::TaskUpdated | EventType::TaskDone | EventType::NoteAdded
+        ) {
+            self.merge_retry_after = None;
+            self.review_wait_until = None;
+        }
         let (mut reconcile, wakes) = self.examine(event).await?;
         reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
@@ -3313,6 +5298,13 @@ impl<T: T3 + 'static> Daemon<T> {
     /// server's idle notices, whose repeat for an owner still away releases the task.
     /// Returns true when a step is owed.
     fn note_for_dispatch(&mut self, event: &Event, now: Timestamp) -> bool {
+        // In pull mode, server-scheduled Housekeeping & Goal runs replace local owed steps
+        // and idle_notices tracking so state.owed/idle_notices never leak on home devices.
+        if self.dispatch_claim_supported == Some(true)
+            || self.ctx.config.dispatch_mode == DispatchMode::Pull
+        {
+            return false;
+        }
         let Some(slug) = event.board.as_ref().filter(|s| self.dispatching(s)) else {
             return false;
         };
@@ -3658,8 +5650,11 @@ impl<T: T3 + 'static> Daemon<T> {
             return Ok((false, wakes));
         };
         // On a daemon-dispatch board run here, a task that changes may become ready or free
-        // a slot: the reconcile it asks for starts the next worker.
-        let mut reconcile = self.dispatches_here(slug)
+        // a slot: the reconcile it asks for starts the next worker. In pull mode, any active
+        // board's task/run/ask lifecycle change triggers a pull check.
+        let pull_active = self.dispatch_claim_supported == Some(true)
+            || self.ctx.config.dispatch_mode == DispatchMode::Pull;
+        let mut reconcile = (self.dispatches_here(slug) || pull_active)
             && matches!(
                 event.event_type,
                 EventType::TaskCreated
@@ -3667,6 +5662,15 @@ impl<T: T3 + 'static> Daemon<T> {
                     | EventType::TaskUpdated
                     | EventType::TaskDone
             );
+        if pull_active
+            && (matches!(
+                event.event_type,
+                EventType::RunOrphaned | EventType::AskAnswered
+            ) || (event.event_type == EventType::RunCreated
+                && event.payload.get("state").and_then(|v| v.as_str()) == Some("queued")))
+        {
+            reconcile = true;
+        }
         match event.event_type {
             EventType::BoardCreated => return Ok((true, wakes)),
             // A board paused and active again: the reconcile this asks for dispatches it.
@@ -3754,7 +5758,16 @@ impl<T: T3 + 'static> Daemon<T> {
                     );
                     return Ok((false, wakes));
                 };
-                if let Some(to) = self.wakeable(Some(&asker), event).cloned() {
+                // In pull mode, live managed runs receive their answered-ask wake via the
+                // server's `sticky_wakes` queue (`poll_sticky_wakes`), avoiding double delivery.
+                let handled_by_sticky = pull_active
+                    && self
+                        .state
+                        .managed_runs
+                        .values()
+                        .any(|r| r.agent_id.as_ref() == Some(&asker));
+                if !handled_by_sticky && let Some(to) = self.wakeable(Some(&asker), event).cloned()
+                {
                     wakes.push((slug.clone(), to, WakeAbout::Answered { ask, asker }));
                 }
             }
@@ -3810,6 +5823,13 @@ impl<T: T3 + 'static> Daemon<T> {
     /// agent's next lines wait, and its wake-ups are queued again, once, when the thread
     /// never got it (see [`UnsureWakes`]).
     pub async fn flush(&mut self, now: Timestamp) {
+        if (self.dispatch_claim_supported == Some(true)
+            || self.ctx.config.dispatch_mode == DispatchMode::Pull)
+            && !self.wakes_unsupported
+            && let Err(err) = self.poll_sticky_wakes(now).await
+        {
+            tracing::warn!("flush: polling device sticky wakes: {err:#}");
+        }
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
         match self.usage.as_ref().map(|usage| usage.full_until(now)) {
             Some(Some(until)) => self.state.usage_full_until = Some(until),
@@ -3856,15 +5876,41 @@ impl<T: T3 + 'static> Daemon<T> {
             .state
             .wakes
             .keys()
-            .chain(self.state.unsure_wakes.keys())
+            .chain(self.state.unsure_wakes.iter().filter_map(|(agent, u)| {
+                u.messages
+                    .iter()
+                    .any(|m| {
+                        m.wakes
+                            .iter()
+                            .any(|w| !matches!(w.about, WakeAbout::Sticky { .. }))
+                    })
+                    .then_some(agent)
+            }))
             .collect();
         let queues: Vec<(AgentId, WakeQueue, Option<UnsureWakes>)> = agents
             .into_iter()
             .map(|agent| {
+                let non_sticky_unsure = self.state.unsure_wakes.get(agent).and_then(|u| {
+                    let messages: Vec<UnsureMessage> = u
+                        .messages
+                        .iter()
+                        .filter(|m| {
+                            m.wakes
+                                .iter()
+                                .any(|w| !matches!(w.about, WakeAbout::Sticky { .. }))
+                        })
+                        .cloned()
+                        .collect();
+                    (!messages.is_empty()).then_some(UnsureWakes {
+                        messages,
+                        read_after: u.read_after,
+                        failed_delay_secs: u.failed_delay_secs,
+                    })
+                });
                 (
                     agent.clone(),
                     self.state.wakes.get(agent).cloned().unwrap_or_default(),
-                    self.state.unsure_wakes.get(agent).cloned(),
+                    non_sticky_unsure,
                 )
             })
             .collect();
@@ -4729,8 +6775,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     )
                 })
             }
-            // Queued for another agent than the one it is about.
-            WakeAbout::Idle { .. } | WakeAbout::Answered { .. } => None,
+            // Queued for another agent than the one it is about (or handled via sticky wakes).
+            WakeAbout::Idle { .. } | WakeAbout::Answered { .. } | WakeAbout::Sticky { .. } => None,
         };
         Ok(line)
     }
@@ -4918,7 +6964,7 @@ async fn gone(client: &Client, agent: &AgentId) -> Result<bool> {
 }
 
 /// `text` cut to the server's note limit, ending in an ellipsis when cut.
-fn clip_note(text: String) -> String {
+pub(crate) fn clip_note(text: String) -> String {
     let max = crate::ops::limits().note_chars;
     if text.chars().count() <= max {
         return text;
@@ -4928,7 +6974,7 @@ fn clip_note(text: String) -> String {
     cut
 }
 
-async fn add_note(
+pub(crate) async fn add_note(
     client: &Client,
     task: &TaskId,
     agent: &AgentId,
@@ -5162,10 +7208,20 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         .with_default_run_limit(device::default_run_limit(host_memory))
         .with_host_memory(host_memory);
     daemon.usage_source = usage_source;
-    if daemon.state.last_seq.is_none() {
-        // Start from now: history is not news.
-        let health = daemon.client().health().await?;
-        daemon.state.last_seq = health["seq"].as_i64();
+    // Probe `/healthz` for initial cursor (when missing) and `dispatch-claim-v1` capability.
+    match daemon.client().health().await {
+        Ok(health) => {
+            if daemon.state.last_seq.is_none() {
+                daemon.state.last_seq = health["seq"].as_i64();
+            }
+            if daemon.ctx.config.dispatch_mode == DispatchMode::Auto {
+                daemon.set_dispatch_claim_supported(health_supports_dispatch_claim(&health));
+            }
+        }
+        Err(err) if daemon.state.last_seq.is_none() => return Err(err),
+        Err(err) => {
+            tracing::debug!("probing /healthz on startup: {err:#}");
+        }
     }
     if once {
         daemon.reconcile(Utc::now()).await?;
@@ -5381,24 +7437,25 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     async fn step(&mut self, step: Step, reconcile_needed: &mut bool) -> Result<()> {
+        let now = (self.clock)();
         match step {
             Step::Event(data) => match serde_json::from_str::<Event>(&data) {
-                Ok(event) => *reconcile_needed |= self.handle(&event, Utc::now()).await,
+                Ok(event) => *reconcile_needed |= self.handle(&event, now).await,
                 Err(err) => tracing::warn!("unreadable event: {err}"),
             },
             Step::Flush => {
                 if std::mem::take(reconcile_needed) {
                     self.reconcile_logged().await;
                 }
-                self.flush(Utc::now()).await;
+                self.flush((self.clock)()).await;
                 self.save()?;
             }
             Step::Reconcile => {
-                *reconcile_needed |= self.retry_failed(Utc::now()).await;
+                *reconcile_needed |= self.retry_failed(now).await;
                 self.reconcile_logged().await;
             }
             Step::Heartbeat => {
-                if let Err(err) = self.send_heartbeat(Utc::now()).await {
+                if let Err(err) = self.send_heartbeat(now).await {
                     tracing::warn!("device heartbeat: {err:#}");
                 }
             }
@@ -5413,10 +7470,8 @@ impl<T: T3 + 'static> Daemon<T> {
         tracing::info!("stopping");
         self.note_cut_sends();
         let budget = self.timing.stop_budget;
-        if tokio::time::timeout(budget, self.flush(Utc::now()))
-            .await
-            .is_err()
-        {
+        let now = (self.clock)();
+        if tokio::time::timeout(budget, self.flush(now)).await.is_err() {
             tracing::warn!(
                 "stopping: sending the queued wake-ups took over {}s; the rest wait for the next start",
                 budget.as_secs()
@@ -5438,7 +7493,8 @@ impl<T: T3 + 'static> Daemon<T> {
 
     async fn reconcile_logged(&mut self) {
         let budget = self.timing.reconcile_budget;
-        match tokio::time::timeout(budget, self.reconcile(Utc::now())).await {
+        let now = (self.clock)();
+        match tokio::time::timeout(budget, self.reconcile(now)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => tracing::warn!("reconcile: {err:#}"),
             Err(_) => tracing::warn!(
@@ -5447,6 +7503,110 @@ impl<T: T3 + 'static> Daemon<T> {
             ),
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ClaimedExecution {
+    deferred_merge: bool,
+    deferred_review: bool,
+    deferred_housekeeping: bool,
+}
+
+enum ReviewPrep {
+    Ready(Option<crate::t3::NewWorktree>, Option<String>),
+    WaitForPr(Timestamp),
+}
+
+fn project_for_task_config(
+    config: &Config,
+    board: &Board,
+    task: Option<&Task>,
+) -> Option<(Option<String>, PathBuf)> {
+    if let Some(task_repo) = task.and_then(|t| t.repo.as_deref())
+        && let Some(found) = lookup_project_repo(config, task_repo)
+    {
+        return Some(found);
+    }
+    for repo in &board.repos {
+        if let Some(found) = lookup_project_repo(config, repo) {
+            return Some(found);
+        }
+    }
+    config
+        .board_projects
+        .get(&board.slug)
+        .map(|path| (None, path.clone()))
+}
+
+fn run_kind_str(kind: RunKind) -> &'static str {
+    match kind {
+        RunKind::Worker => "worker",
+        RunKind::Review => "review",
+        RunKind::Verdict => "verdict",
+        RunKind::Triage => "triage",
+        RunKind::Goal => "goal",
+        RunKind::Merge => "merge",
+        RunKind::Housekeeping => "housekeeping",
+        RunKind::Command => "command",
+        RunKind::Interactive => "interactive",
+        RunKind::Unknown => "unknown",
+    }
+}
+
+fn clip_run_reason(reason: &str) -> String {
+    const MAX: usize = 500;
+    if reason.chars().count() <= MAX {
+        return reason.to_owned();
+    }
+    let mut cut: String = reason.chars().take(MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+fn health_supports_dispatch_claim(health: &serde_json::Value) -> bool {
+    health["features"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("dispatch-claim-v1")))
+}
+
+fn lookup_project_repo(config: &Config, repo: &str) -> Option<(Option<String>, PathBuf)> {
+    if let Some(path) = config.projects.get(repo) {
+        return Some((Some(repo.to_owned()), path.clone()));
+    }
+    let target = normalize_repo(repo)?;
+    config.projects.iter().find_map(|(key, path)| {
+        normalize_repo(key)
+            .filter(|norm| norm == &target)
+            .map(|norm| (Some(norm), path.clone()))
+    })
+}
+
+fn format_sticky_wake_message(wake: &StickyWake) -> String {
+    if wake.kind == "answered" {
+        let ask_id = wake.payload["ask_id"].as_i64().unwrap_or(0);
+        let about = wake.payload["task_id"]
+            .as_str()
+            .map(|t| format!(" about {t}"))
+            .unwrap_or_default();
+        let raw_answer = wake.payload["answer"].as_str().unwrap_or_default();
+        let answer = serde_json::to_string(raw_answer)
+            .unwrap_or_else(|_| format!("{raw_answer:?}"))
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e");
+        return format!("the user answered ask #{ask_id}{about}: {answer}\n{WAKE_END}");
+    }
+    if let Some(text) = wake
+        .payload
+        .get("message")
+        .or_else(|| wake.payload.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        return format!("{text}\n{WAKE_END}");
+    }
+    format!(
+        "sticky wake #{} ({}): {}\n{WAKE_END}",
+        wake.id, wake.kind, wake.payload
+    )
 }
 
 /// The body of an event stream, ending in an error once no bytes (events or keep-alives)
