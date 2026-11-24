@@ -7,12 +7,13 @@ use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
     ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
-    CreateBoard, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceEntry,
+    CreateBoard, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry,
     DeviceHeartbeat, DeviceName, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult,
     Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff, PutUsageBucket,
-    PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Snapshot,
-    SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
-    Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage, UsageBucket, UsageReserve,
+    PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run,
+    RunFilter, RunId, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
+    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Usage,
+    UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -852,6 +853,29 @@ impl Client {
     ) -> Result<DeviceEntry> {
         let path = format!("/v1/admin/devices/{name}");
         self.with_body(Method::PATCH, &path, body).await
+    }
+
+    // Runs
+
+    /// Creates or submits a new run (`POST /v1/runs`).
+    pub async fn create_run(&self, body: &CreateRun) -> Result<Run> {
+        self.with_body(Method::POST, "/v1/runs", body).await
+    }
+
+    /// Lists runs matching `filter`, newest first (`GET /v1/runs`).
+    pub async fn list_runs(&self, filter: &RunFilter) -> Result<Vec<Run>> {
+        self.get_query("/v1/runs", filter).await
+    }
+
+    /// Reads one run by id (`GET /v1/runs/{id}`).
+    pub async fn get_run(&self, id: &RunId) -> Result<Run> {
+        self.get(&format!("/v1/runs/{id}")).await
+    }
+
+    /// Transitions a run's state, renews its lease, or updates its metadata (`PATCH /v1/runs/{id}`).
+    pub async fn update_run(&self, id: &RunId, body: &UpdateRun) -> Result<Run> {
+        self.with_body(Method::PATCH, &format!("/v1/runs/{id}"), body)
+            .await
     }
 
     /// Deletes a closed board (user tokens only); the server answers 204.

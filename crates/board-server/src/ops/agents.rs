@@ -371,8 +371,10 @@ pub(crate) fn end_unseen(cx: &mut Ctx<'_>) -> Result<usize> {
            AND NOT EXISTS (SELECT 1 FROM boards b \
                            WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
            AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
+           AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.agent_id = a.id AND {}) \
          ORDER BY a.id",
-        crate::ops::judges::LIVE
+        crate::ops::judges::LIVE,
+        crate::ops::runs::LIVE_RUN_RIGHTS
     );
     let unseen: Vec<(AgentId, i64)> = cx
         .db

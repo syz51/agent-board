@@ -322,7 +322,13 @@ async fn every_response_and_healthz_advertise_x_board_features() {
     let health = t.ok("GET", "/healthz", None, None).await;
     assert_eq!(
         health["features"],
-        json!(["v1-json", "sse-v1", "device-caps-v1", "usage-buckets-v1"])
+        json!([
+            "v1-json",
+            "sse-v1",
+            "device-caps-v1",
+            "usage-buckets-v1",
+            "runs-v1"
+        ])
     );
 
     for path in ["/healthz", "/v1/devices", "/v1/boards"] {

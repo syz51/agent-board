@@ -99,6 +99,14 @@ string_id!(
     check_slug
 );
 
+string_id!(
+    /// A run identifier: 1–64 characters of `a-z`, `0-9`, `-` and `_`, starting with a
+    /// letter or digit. Example: `run-0193a8b4c5d6e7f8`.
+    RunId,
+    "run id",
+    check_run_id
+);
+
 /// Where an agent id comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSource {
@@ -172,6 +180,23 @@ fn check_slug(value: &str) -> Result<(), &'static str> {
         return Err("only a-z, 0-9 and - are allowed");
     }
     if bytes[0] == b'-' {
+        return Err("must start with a letter or digit");
+    }
+    Ok(())
+}
+
+fn check_run_id(value: &str) -> Result<(), &'static str> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return Err("must be 1-64 characters");
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_')
+    {
+        return Err("only a-z, 0-9, - and _ are allowed");
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
         return Err("must start with a letter or digit");
     }
     Ok(())
@@ -292,5 +317,23 @@ mod tests {
         assert!(serde_json::from_str::<TaskId>("\"factory-0\"").is_err());
         let id: AgentId = serde_json::from_str("\"claude:abc-123\"").unwrap();
         assert_eq!(serde_json::to_string(&id).unwrap(), "\"claude:abc-123\"");
+    }
+
+    #[test]
+    fn run_ids_validate_format() {
+        for good in ["run-0193a8b4c5d6e7f8", "r1", "0_abc-def"] {
+            assert!(good.parse::<RunId>().is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "-run",
+            "_run",
+            "Run-1",
+            "run 1",
+            "run:1",
+            &"a".repeat(65),
+        ] {
+            assert!(bad.parse::<RunId>().is_err(), "{bad}");
+        }
     }
 }

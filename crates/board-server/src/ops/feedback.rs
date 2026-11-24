@@ -1308,6 +1308,12 @@ const EXPECTED_ERRORS: &[(ErrorCode, &str, &str)] = &[
         "POST /v1/boards/{slug}/coordinator",
         "",
     ),
+    (ErrorCode::ClaimRefused, "POST /v1/runs", "conflict lock "),
+    (
+        ErrorCode::ClaimRefused,
+        "PATCH /v1/runs/{id}",
+        "conflict lock ",
+    ),
 ];
 
 /// Whether an error answered to `route` (method and route template) is an expected answer,

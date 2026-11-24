@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, BoardSlug, DeviceName, TaskId};
+use crate::{AgentId, BoardSlug, DeviceName, RunId, TaskId};
 
 pub type Timestamp = DateTime<Utc>;
 
@@ -513,6 +513,214 @@ pub struct DeviceEntry {
     pub protocol_features: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_at: Option<Timestamp>,
+}
+
+/// What kind of execution a [`Run`] performs (`docs/SCHEDULER_DESIGN.md`, Section 3.3).
+/// Open enum: unknown values from a newer server deserialize as `Unknown`, which the server
+/// refuses in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    Worker,
+    Review,
+    Verdict,
+    Triage,
+    Goal,
+    Merge,
+    Housekeeping,
+    Command,
+    Interactive,
+    #[serde(other)]
+    Unknown,
+}
+
+impl RunKind {
+    /// Whether a live managed run of this kind grants its registered `agent_id` coordinator
+    /// rights on the run's board without requiring a per-board coordinator lease.
+    pub fn grants_coordinator_rights(self) -> bool {
+        matches!(
+            self,
+            Self::Review
+                | Self::Verdict
+                | Self::Triage
+                | Self::Goal
+                | Self::Merge
+                | Self::Housekeeping
+        )
+    }
+}
+
+/// Whether a [`Run`] was dispatched by the scheduler (`managed`) or started manually by
+/// the user (`interactive`). Open enum for forward compatibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOrigin {
+    #[default]
+    Managed,
+    Interactive,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lifecycle state of a [`Run`] (`docs/SCHEDULER_DESIGN.md`, Section 3.3). Open enum:
+/// unknown values deserialize as `Unknown`, which the server refuses in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Queued,
+    Leased,
+    Starting,
+    Running,
+    WaitingExternal,
+    Succeeded,
+    Failed,
+    Preempted,
+    Orphaned,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+impl RunState {
+    /// Whether this state is terminal (no further transitions are allowed and any held
+    /// conflict locks are released).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Preempted | Self::Orphaned | Self::Cancelled
+        )
+    }
+
+    /// Whether this state is non-terminal (`queued`, `leased`, `starting`, `running`,
+    /// `waiting_external`).
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Leased | Self::Starting | Self::Running | Self::WaitingExternal
+        )
+    }
+
+    /// Whether a run in this state holds an active execution lease (`leased`, `starting`,
+    /// `running`, `waiting_external`).
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Leased | Self::Starting | Self::Running | Self::WaitingExternal
+        )
+    }
+
+    /// Whether a transition from `self` to `next` is valid under the Run state machine.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        use RunState::*;
+        matches!(
+            (self, next),
+            (Queued, Leased | Cancelled)
+                | (Leased, Starting | Running | Failed | Orphaned | Cancelled)
+                | (Starting, Running | Failed | Orphaned | Cancelled)
+                | (
+                    Running,
+                    WaitingExternal | Succeeded | Failed | Preempted | Orphaned | Cancelled
+                )
+                | (
+                    WaitingExternal,
+                    Running | Succeeded | Failed | Preempted | Orphaned | Cancelled
+                )
+        )
+    }
+}
+
+/// Kind of structured live event attached to a [`Run`] (`run_events`). Open enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEventKind {
+    Phase,
+    Tool,
+    Note,
+    Pr,
+    Error,
+    Done,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One fleet-wide concurrency lock currently held by an active [`Run`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictLock {
+    pub key: String,
+    pub run_id: RunId,
+    pub max_holders: u32,
+    pub acquired_at: Timestamp,
+}
+
+/// A queued wake-up message routed to the device hosting an active session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StickyWake {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub device: DeviceName,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+}
+
+/// Default weighted capacity units consumed by a [`Run`].
+pub fn default_run_cost_units() -> u32 {
+    1
+}
+
+/// One concrete execution attempt on a fleet device (`GET /v1/runs`, `POST /v1/runs`,
+/// `GET /v1/runs/{id}`, `PATCH /v1/runs/{id}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSlug>,
+    pub kind: RunKind,
+    #[serde(default)]
+    pub origin: RunOrigin,
+    pub device: DeviceName,
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub state: RunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_hint: Option<String>,
+    #[serde(default = "default_run_cost_units")]
+    pub cost_units: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_sha256: Option<String>,
+    /// Conflict locks currently held by this run; empty once terminal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_locks: Vec<ConflictLock>,
+    pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,6 +1308,14 @@ pub enum EventType {
     AskWithdrawn,
     /// Admin changed a device's plane metadata (`role`, `taints`, `preference`, `drain`).
     DeviceUpdated,
+    /// A new run was created or submitted (`POST /v1/runs`).
+    RunCreated,
+    /// A run's state or metadata changed (`PATCH /v1/runs/{id}`).
+    RunUpdated,
+    /// A run's lease expired or it was marked `orphaned` (Trail Rule record).
+    RunOrphaned,
+    /// A run was cancelled (`PATCH /v1/runs/{id}` to `cancelled`).
+    RunCancelled,
     /// A type added by a newer server, read by a client that predates it. The server never
     /// records it (`docs/API.md`, "Compatibility").
     #[serde(other)]
