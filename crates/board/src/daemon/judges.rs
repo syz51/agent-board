@@ -335,13 +335,15 @@ fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
     }
 }
 
-/// The pull request the newest note of a task names.
-fn noted_pr(detail: &TaskDetail) -> Option<String> {
-    detail
-        .notes
-        .iter()
-        .rev()
-        .find_map(|n| pull_request_url(&n.text))
+/// The pull request the newest note of a task names, in one of the board's `repos` when
+/// the board lists any.
+fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
+    detail.notes.iter().rev().find_map(|n| {
+        let url = pull_request_url(&n.text)?;
+        let known = repos.is_empty()
+            || repo_of(&url).is_some_and(|r| repos.iter().any(|k| k.eq_ignore_ascii_case(&r)));
+        known.then_some(url)
+    })
 }
 
 /// The checks a pass note records, one `check: <command> => <exit code>` line each.
@@ -492,7 +494,7 @@ impl<T: T3> Daemon<T> {
                         tasks: vec![task.id.clone()],
                         title: format!("review {} {}", task.id, task.title),
                         since: task.updated_at,
-                        pr: noted_pr(&detail),
+                        pr: noted_pr(&detail, &board.repos),
                     });
                 }
             }
@@ -889,8 +891,13 @@ impl<T: T3> Daemon<T> {
     ) -> Result<()> {
         let worktree = match (want.kind, want.tasks.first()) {
             (JudgeKind::Review, Some(task)) => {
-                let head = match &want.pr {
+                let base = match &want.pr {
                     Some(pr) => match self.gh.view(project, pr).await {
+                        // A merged pull request's head branch may be deleted or pre-squash:
+                        // review the landed code on its base branch instead.
+                        Ok(pr) if pr.state == PrState::Merged => {
+                            (!pr.base_ref.is_empty()).then_some(pr.base_ref)
+                        }
                         // A fork's branch is not on `origin`.
                         Ok(pr) => (!pr.cross_repository).then_some(pr.head_ref),
                         Err(err) => {
@@ -900,7 +907,7 @@ impl<T: T3> Daemon<T> {
                     },
                     None => None,
                 };
-                crate::worktree::review_worktree(project, task, head.as_deref(), now)
+                crate::worktree::review_worktree(project, task, base.as_deref(), now)
                     .await
                     .context("preparing the review judge's worktree")?
             }
@@ -1432,5 +1439,40 @@ mod tests {
         let summary = passed_summary(&text);
         assert_eq!(summary.chars().count(), SUMMARY_CHARS_MAX);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn noted_pr_picks_the_newest_url_in_the_boards_repositories() {
+        let repos = ["github.com/o/r".to_owned()];
+        let own = note(
+            1,
+            "t3:worker",
+            NoteKind::Finding,
+            "PR https://github.com/o/r/pull/38 opened",
+            "2026-11-13T08:37:00Z",
+        );
+        let short = note(
+            2,
+            "t3:worker",
+            NoteKind::Decision,
+            "PR o/r#38 squash-merged as 22b65998f3",
+            "2026-11-13T09:05:00Z",
+        );
+        let other = note(
+            3,
+            "t3:worker",
+            NoteKind::Note,
+            "related https://github.com/o/other/pull/99",
+            "2026-11-13T09:10:00Z",
+        );
+        let d = detail(vec![own, short, other], serde_json::json!([]));
+        assert_eq!(
+            noted_pr(&d, &repos).as_deref(),
+            Some("https://github.com/o/r/pull/38")
+        );
+        assert_eq!(
+            noted_pr(&d, &[]).as_deref(),
+            Some("https://github.com/o/other/pull/99")
+        );
     }
 }

@@ -1261,7 +1261,7 @@ async fn a_quiet_review_on_a_board_nobody_runs_goes_to_who_can_finish_it() {
         told(agent).await;
     }
     let orphan = format!(
-        "{id} has sat in review for 25h; its owner is gone and its board has no coordinator \
+        "{id} has sat in review for 25h; its owner is gone and autopilot is off \
          -> check its PR; once merged, task_claim {id} take=true, then task_done {id}"
     );
 
@@ -1346,7 +1346,7 @@ async fn a_quiet_review_of_a_left_owner_names_the_one_step_close() {
     assert_eq!(sweep_quiet_reviews(&t), 1);
     let delta = snapshot(&t, peer, "kind=delta").await;
     let want = format!(
-        "{id} has sat in review for 25h; its owner is gone and its board has no coordinator \
+        "{id} has sat in review for 25h; its owner is gone and autopilot is off \
          -> check its PR; once merged, close it with task_done {id} take=true and a pr or a \
          passed check, or board done {id} --take; if it will not merge, drop it with \
          task_update {id} status=dropped reason=<why>, or board update {id} --status dropped \
@@ -1378,7 +1378,7 @@ async fn a_full_snapshot_names_the_reviews_nobody_is_left_to_close() {
     let review = json!({ "status": "review" });
     assert!(t.patch(owner, &id, review).await.0.is_success());
     let left = format!(
-        "{id} is in review; its owner is gone and its board has no coordinator -> check its \
+        "{id} is in review; its owner is gone and autopilot is off -> check its \
          PR; once merged, close it with task_done {id} take=true"
     );
     let full = |agent: &'static str, repo: &'static str| async {
@@ -1504,6 +1504,148 @@ async fn a_quiet_review_is_not_passed_on_while_the_board_is_run_or_paused() {
         )
         .await;
     assert_eq!(taken["owner"], maker);
+}
+
+#[tokio::test]
+async fn a_stood_down_coordinator_never_gets_an_unrun_review_alert() {
+    let t = T::new();
+    let (stood, worker, peer) = ("t3:stood", "t3:worker", "t3:peer");
+    for agent in [stood, worker, peer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    // Start on autopilot (daemon dispatch), then stand down `stood` and switch autopilot off,
+    // reproducing t3code-140 on 2026-11-13.
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({ "slug": "auto", "title": "Auto", "autopilot": true, "repos": [REPO] })),
+    )
+    .await;
+    t.exec(
+        "INSERT INTO stood_down (board, agent, since, reason) \
+         VALUES ('auto', 't3:stood', 1000, 'the board is set to daemon dispatch')",
+    );
+    // Even when the stood-down thread created the task, it must never be asked to close it,
+    // and must not block a live peer on the repo from seeing the alert.
+    let id = t.task(stood, "auto", "Merged without a verdict").await;
+    assert!(t.claim(worker, &id).await.0.is_success());
+    assert!(
+        t.patch(worker, &id, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    set_state(&t, worker, "ended").await;
+
+    // While autopilot is on (daemon-dispatched, even with no coordinator lease), neither a full
+    // snapshot nor a quiet-review sweep emits the unrun-review alert.
+    let full = snapshot(&t, peer, "kind=full").await;
+    assert!(!text(&full).contains("is in review"), "{}", text(&full));
+    assert!(
+        !text(&full).contains("has no coordinator"),
+        "{}",
+        text(&full)
+    );
+    t.advance(TimeDelta::hours(25));
+    for agent in [stood, peer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    for agent in [stood, peer] {
+        let delta = snapshot(&t, agent, "kind=delta").await;
+        assert!(
+            !text(&delta).contains("has sat in review")
+                && !text(&delta).contains("has no coordinator"),
+            "{agent}: {}",
+            text(&delta)
+        );
+    }
+
+    // Autopilot switched off: the alert names autopilot off (never "has no coordinator"),
+    // never goes to the stood-down coordinator (full snapshot or quiet-review delta), and
+    // reaches the live peer on the repo instead.
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "autopilot": false })),
+    )
+    .await;
+    let stood_full = snapshot(&t, stood, "kind=full").await;
+    assert!(
+        !text(&stood_full).contains("is in review")
+            && !text(&stood_full).contains("task_done")
+            && !text(&stood_full).contains("task_claim"),
+        "{}",
+        text(&stood_full)
+    );
+    let peer_full = snapshot(&t, peer, "kind=full").await;
+    assert!(
+        text(&peer_full).contains(&format!(
+            "{id} is in review; its owner is gone and autopilot is off"
+        )),
+        "{}",
+        text(&peer_full)
+    );
+    assert!(
+        !text(&peer_full).contains("has no coordinator"),
+        "{}",
+        text(&peer_full)
+    );
+
+    t.advance(TimeDelta::hours(25));
+    for agent in [stood, peer] {
+        t.register(agent, Some(REPO), None).await;
+    }
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let stood_delta = snapshot(&t, stood, "kind=delta").await;
+    assert!(
+        !text(&stood_delta).contains("has sat in review")
+            && !text(&stood_delta).contains("task_done")
+            && !text(&stood_delta).contains("task_claim"),
+        "{}",
+        text(&stood_delta)
+    );
+    let peer_delta = snapshot(&t, peer, "kind=delta").await;
+    assert!(
+        text(&peer_delta).contains(&format!(
+            "{id} has sat in review for 2d; its owner is gone and autopilot is off"
+        )),
+        "{}",
+        text(&peer_delta)
+    );
+    assert!(
+        !text(&peer_delta).contains("has no coordinator"),
+        "{}",
+        text(&peer_delta)
+    );
+
+    // Even if a pre-migration lease still names the stood-down thread as coordinator,
+    // stands_in_for_owner must not send it a quiet-review reminder either.
+    t.ok(
+        "PATCH",
+        "/v1/boards/auto",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/auto/coordinator",
+        Some(stood),
+        Some(json!({ "device": "mac", "agent": stood })),
+    )
+    .await;
+    t.advance(TimeDelta::hours(25));
+    t.register(stood, Some(REPO), None).await;
+    assert_eq!(sweep_quiet_reviews(&t), 1);
+    let stood_delta = snapshot(&t, stood, "kind=delta").await;
+    assert!(
+        !text(&stood_delta).contains("has sat in review"),
+        "{}",
+        text(&stood_delta)
+    );
 }
 
 async fn told_nothing_yet(t: &T, agent: &str) {

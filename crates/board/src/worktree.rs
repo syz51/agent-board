@@ -59,8 +59,9 @@ pub fn review_branch(task: &TaskId) -> String {
 }
 
 /// The worktree to start the review judge of `task` in, as [`worker_worktree`]: on
-/// `head`, the branch of the task's pull request, fetched first. Without a pull request,
-/// or when its branch cannot be fetched (a fork's), it starts from the default branch.
+/// `head`, the branch of the task's pull request (or its base branch when already merged),
+/// fetched first. Without a pull request, or when its branch cannot be fetched (a fork's),
+/// it starts from the default branch.
 pub async fn review_worktree(
     project: &Path,
     task: &TaskId,
