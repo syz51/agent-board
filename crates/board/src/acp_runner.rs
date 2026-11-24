@@ -5,8 +5,8 @@
 //! `[acp_runner]` in `config.toml` (or `BOARD_ACP_BIN`) over standard newline-delimited
 //! JSON-RPC 2.0 stdio:
 //! - `initialize` -> `session/new` -> `session/prompt` on [`Runner::spawn`],
-//! - live `session/prompt` (with queueing while busy) or respawn + `session/load` (falling back
-//!   to `session/new` with a Trail Rule record when unsupported) on [`Runner::send`],
+//! - live `session/prompt` (with queueing while busy) or respawn + `session/load` (recording a
+//!   Trail Rule entry before falling back to `session/new` when unsupported) on [`Runner::send`],
 //! - `session/cancel` + process-group `SIGTERM` -> `SIGKILL` teardown on [`Runner::cancel`] and
 //!   turn timeouts, always writing a Trail Rule record to `$BOARD_HOME/state/runner-cancels.jsonl`
 //!   before acting,
@@ -118,8 +118,20 @@ struct AcpRunnerInner {
     cancel_grace: Duration,
     handshake_timeout: Duration,
     /// Map from handle `native_id` (and any replacement `session_id` after `session/load`
-    /// fallback) to its shared session slot.
+    /// fallback) to its shared session slot. Never referenced by `run_supervisor`, preventing
+    /// `Arc` reference cycles so [`Drop`] always runs when the last [`AcpRunner`] is dropped.
     sessions: Mutex<BTreeMap<String, Arc<SessionSlot>>>,
+}
+
+/// Detached context owned by each background [`run_supervisor`] task (holding no reference to
+/// [`AcpRunnerInner`] so dropping the last [`AcpRunner`] tears down live child processes).
+#[derive(Clone)]
+struct SupervisorContext {
+    home: Home,
+    local_db: LocalDb,
+    clock: Clock,
+    turn_timeout: Duration,
+    cancel_grace: Duration,
 }
 
 impl Drop for AcpRunnerInner {
@@ -137,10 +149,11 @@ impl Drop for AcpRunnerInner {
             if let Some(pg) = pgid {
                 let _ = signal_process_group(pg, rustix::process::Signal::KILL);
             }
-            if let Ok(mut control) = slot.control.try_lock()
-                && let Some(task) = control.supervisor.take()
-            {
-                task.abort();
+            if let Ok(mut control) = slot.control.try_lock() {
+                control.cmd_tx = None;
+                if let Some(task) = control.supervisor.take() {
+                    task.abort();
+                }
             }
         }
     }
@@ -242,6 +255,16 @@ impl AcpRunner {
         &self.inner.config
     }
 
+    fn supervisor_ctx(&self) -> SupervisorContext {
+        SupervisorContext {
+            home: self.inner.home.clone(),
+            local_db: self.inner.local_db.clone(),
+            clock: Arc::clone(&self.inner.clock),
+            turn_timeout: self.inner.turn_timeout,
+            cancel_grace: self.inner.cancel_grace,
+        }
+    }
+
     fn resolve_bin(&self) -> Result<PathBuf> {
         self.inner.config.resolved_bin().ok_or_else(|| {
             anyhow::anyhow!(
@@ -284,27 +307,43 @@ impl AcpRunner {
             .clone()
             .or(rec.worktree_path.clone())
             .unwrap_or_else(|| PathBuf::from("."));
-        let (state, runnable) = match rec.state {
-            LocalRunState::Cancelled => (RunnerState::Cancelled, false),
-            LocalRunState::Failed => (RunnerState::Failed, false),
+        let live_pre_restart = rec.pid.filter(|&pid| process_group_alive(Some(pid)));
+        let (state, runnable, busy, pid, pgid) = match rec.state {
+            LocalRunState::Cancelled => (RunnerState::Cancelled, false, false, None, None),
+            LocalRunState::Failed => (RunnerState::Failed, false, false, None, None),
+            LocalRunState::Running | LocalRunState::Starting | LocalRunState::Intent
+                if live_pre_restart.is_some() =>
+            {
+                // A process from before restart is still running in its own process group.
+                // Keep its pgid so cancel() terminates it cleanly, and refuse concurrent
+                // respawn in send() until it finishes or is cancelled.
+                (
+                    RunnerState::Running,
+                    false,
+                    true,
+                    live_pre_restart,
+                    live_pre_restart,
+                )
+            }
             LocalRunState::Finished
             | LocalRunState::Running
             | LocalRunState::Starting
-            | LocalRunState::Intent => (RunnerState::Idle, true),
+            | LocalRunState::Intent => (RunnerState::Idle, true, false, None, None),
         };
+        let active_session_id = rec.session_id.unwrap_or_else(|| handle.native_id.clone());
         let slot = Arc::new(SessionSlot {
             shared: Mutex::new(SessionShared {
                 run_id: rec.run_id,
                 handle_native_id: handle.native_id.clone(),
-                active_session_id: rec.session_id.unwrap_or_else(|| handle.native_id.clone()),
+                active_session_id: active_session_id.clone(),
                 workdir,
                 model: None,
                 state,
                 runnable,
-                busy: false,
+                busy,
                 runs: 1,
-                pid: None,
-                pgid: None,
+                pid,
+                pgid,
                 next_seq: 1,
                 events: VecDeque::new(),
             }),
@@ -318,7 +357,13 @@ impl AcpRunner {
         let entry = guard
             .entry(handle.native_id.clone())
             .or_insert_with(|| Arc::clone(&slot));
-        Ok(Some(Arc::clone(entry)))
+        let chosen = Arc::clone(entry);
+        if active_session_id != handle.native_id {
+            guard
+                .entry(active_session_id)
+                .or_insert_with(|| Arc::clone(&chosen));
+        }
+        Ok(Some(chosen))
     }
 }
 
@@ -373,6 +418,19 @@ impl SessionShared {
         event
     }
 
+    fn push_user_message(&mut self, at: Timestamp, msg: &SteerMessage) -> RunEvent {
+        let mut meta = BTreeMap::new();
+        meta.insert("role".to_owned(), "user".to_owned());
+        if let Some(digest) = msg
+            .digest
+            .as_deref()
+            .or_else(|| extract_wake_digest(&msg.text))
+        {
+            meta.insert("wake_digest".to_owned(), digest.to_owned());
+        }
+        self.push_event(at, RunEventKind::Message, &msg.text, meta)
+    }
+
     fn status(&self) -> RunnerStatus {
         RunnerStatus {
             state: self.state,
@@ -394,6 +452,7 @@ struct SessionControl {
 enum SendAttempt {
     Delivered,
     ProcessGone,
+    Rejected(String),
 }
 
 enum SupervisorCommand {
@@ -526,6 +585,7 @@ impl AcpRunner {
         );
         let resp = read_rpc_response(
             &mut proc.stdout,
+            &mut proc.stdin,
             rpc_id,
             self.inner.handshake_timeout,
             &self.inner.home,
@@ -591,6 +651,7 @@ impl AcpRunner {
         );
         let resp = read_rpc_response(
             &mut proc.stdout,
+            &mut proc.stdin,
             rpc_id,
             self.inner.handshake_timeout,
             &self.inner.home,
@@ -641,6 +702,7 @@ impl AcpRunner {
         );
         let resp = read_rpc_response(
             &mut proc.stdout,
+            &mut proc.stdin,
             rpc_id,
             self.inner.handshake_timeout,
             &self.inner.home,
@@ -728,9 +790,9 @@ impl AcpRunner {
         tokio::task::JoinHandle<()>,
     ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let inner = Arc::clone(&self.inner);
+        let ctx = self.supervisor_ctx();
         let task = tokio::spawn(async move {
-            run_supervisor(inner, slot, proc, initial_prompt_id, next_rpc_id, cmd_rx).await;
+            run_supervisor(ctx, slot, proc, initial_prompt_id, next_rpc_id, cmd_rx).await;
         });
         (cmd_tx, task)
     }
@@ -748,11 +810,13 @@ impl Runner for AcpRunner {
     ) -> BoxFuture<'a, Result<RunHandle>> {
         Box::pin(async move {
             let mut proc = self.spawn_child(workdir, &spec.run_id)?;
-            let handshake = async {
+            let setup = async {
                 let _supports_load = self.rpc_initialize(&mut proc, &spec.run_id, 1).await?;
                 let session_id = self
                     .rpc_session_new(&mut proc, &spec.run_id, workdir, spec.model.as_ref(), 2)
                     .await?;
+                let now = (self.inner.clock)();
+                self.persist_spawn_in_db(spec, workdir, &session_id, proc.pid, now)?;
                 send_session_prompt(
                     &mut proc.stdin,
                     &self.inner.home,
@@ -763,12 +827,12 @@ impl Runner for AcpRunner {
                     &self.inner.clock,
                 )
                 .await?;
-                Ok::<String, anyhow::Error>(session_id)
+                Ok::<(String, Timestamp), anyhow::Error>((session_id, now))
             }
             .await;
 
-            let session_id = match handshake {
-                Ok(id) => id,
+            let (session_id, now) = match setup {
+                Ok(pair) => pair,
                 Err(err) => {
                     let _ = teardown_process_group(
                         &mut proc.child,
@@ -779,9 +843,6 @@ impl Runner for AcpRunner {
                     return Err(err);
                 }
             };
-
-            let now = (self.inner.clock)();
-            self.persist_spawn_in_db(spec, workdir, &session_id, proc.pid, now)?;
 
             let slot = Arc::new(SessionSlot {
                 shared: Mutex::new(SessionShared {
@@ -810,6 +871,7 @@ impl Runner for AcpRunner {
                     format!("started {}", spec.title),
                     BTreeMap::new(),
                 );
+                shared.push_user_message(now, &SteerMessage::new(&spec.prompt));
             }
 
             let (cmd_tx, supervisor) = self.launch_supervisor(Arc::clone(&slot), proc, 3, 4);
@@ -846,6 +908,20 @@ impl Runner for AcpRunner {
 
             let mut control = slot.control.lock().await;
 
+            // Reject terminal runs before touching the live supervisor channel.
+            {
+                let shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                if matches!(shared.state, RunnerState::Cancelled | RunnerState::Failed)
+                    || (!shared.runnable && control.cmd_tx.is_none())
+                {
+                    bail!(
+                        "ACP session {} is not runnable (state: {:?})",
+                        handle.native_id,
+                        shared.state
+                    );
+                }
+            }
+
             // Fast path: live supervisor process.
             if let Some(tx) = control.cmd_tx.clone() {
                 let (ack_tx, ack_rx) = oneshot::channel();
@@ -858,6 +934,7 @@ impl Runner for AcpRunner {
                 {
                     match ack_rx.await {
                         Ok(SendAttempt::Delivered) => return Ok(()),
+                        Ok(SendAttempt::Rejected(reason)) => bail!("{reason}"),
                         Ok(SendAttempt::ProcessGone) | Err(_) => {
                             // Fall through to await supervisor exit and respawn if idle.
                         }
@@ -871,7 +948,7 @@ impl Runner for AcpRunner {
                 let _ = task.await;
             }
 
-            let (run_id, prev_session_id, workdir, model, state, runnable) = {
+            let (run_id, prev_session_id, workdir, model, state, runnable, existing_pgid) = {
                 let shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     shared.run_id.clone(),
@@ -883,9 +960,18 @@ impl Runner for AcpRunner {
                     shared.model.clone(),
                     shared.state,
                     shared.runnable,
+                    shared.pgid,
                 )
             };
 
+            if process_group_alive(existing_pgid) {
+                bail!(
+                    "ACP session {} still has a live pre-restart process group ({:?}); cancel it \
+                     or wait for it to exit before resuming",
+                    handle.native_id,
+                    existing_pgid
+                );
+            }
             if !runnable || matches!(state, RunnerState::Cancelled | RunnerState::Failed) {
                 bail!(
                     "ACP session {} is not runnable (state: {:?})",
@@ -901,12 +987,13 @@ impl Runner for AcpRunner {
                 );
             }
 
-            // Respawn official binary and resume via session/load (or fall back with Trail Rule).
+            // Respawn official binary and resume via session/load (writing a Trail Rule record
+            // BEFORE falling back to session/new when session/load is unsupported).
             let mut proc = self.spawn_child(&workdir, &run_id)?;
             let resume_result = async {
                 let supports_load = self.rpc_initialize(&mut proc, &run_id, 1).await?;
                 let mut next_id = 2u64;
-                let (active_session_id, fallback_reason) = if supports_load {
+                let (active_session_id, fallback_info) = if supports_load {
                     match self
                         .rpc_session_load(&mut proc, &run_id, &prev_session_id, &workdir, next_id)
                         .await
@@ -917,6 +1004,21 @@ impl Runner for AcpRunner {
                         }
                         Err(err) => {
                             next_id += 1;
+                            let err_text = format!("{err:#}");
+                            let trail_now = (self.inner.clock)();
+                            // Trail Rule: write fallback record BEFORE acting on session/new.
+                            let pre_record = json!({
+                                "at": trail_now,
+                                "runner": self.kind(),
+                                "run_id": run_id,
+                                "previous_session_id": prev_session_id,
+                                "workdir": workdir,
+                                "reason": "session_load_unsupported",
+                                "error": err_text,
+                            });
+                            let trail_path =
+                                state::append_acp_fallback(&self.inner.home, &pre_record)
+                                    .context("recording ACP session/load fallback trail entry")?;
                             let new_id = self
                                 .rpc_session_new(
                                     &mut proc,
@@ -927,19 +1029,47 @@ impl Runner for AcpRunner {
                                 )
                                 .await?;
                             next_id += 1;
-                            (new_id, Some(format!("{err:#}")))
+                            (new_id, Some((err_text, trail_path, trail_now)))
                         }
                     }
                 } else {
+                    let err_text =
+                        "agent declared agentCapabilities.loadSession = false".to_owned();
+                    let trail_now = (self.inner.clock)();
+                    let pre_record = json!({
+                        "at": trail_now,
+                        "runner": self.kind(),
+                        "run_id": run_id,
+                        "previous_session_id": prev_session_id,
+                        "workdir": workdir,
+                        "reason": "session_load_unsupported",
+                        "error": err_text,
+                    });
+                    let trail_path = state::append_acp_fallback(&self.inner.home, &pre_record)
+                        .context("recording ACP session/load fallback trail entry")?;
                     let new_id = self
                         .rpc_session_new(&mut proc, &run_id, &workdir, model.as_ref(), next_id)
                         .await?;
                     next_id += 1;
-                    (
-                        new_id,
-                        Some("agent declared agentCapabilities.loadSession = false".to_owned()),
-                    )
+                    (new_id, Some((err_text, trail_path, trail_now)))
                 };
+
+                let now = (self.inner.clock)();
+                if active_session_id != prev_session_id {
+                    self.inner.local_db.record_local_run_session_alias(
+                        &run_id,
+                        &prev_session_id,
+                        now,
+                    )?;
+                }
+                self.inner.local_db.update_local_run_runtime(
+                    &run_id,
+                    LocalRunState::Running,
+                    Some(&active_session_id),
+                    proc.pid,
+                    false,
+                    now,
+                )?;
 
                 let prompt_id = next_id;
                 send_session_prompt(
@@ -952,32 +1082,42 @@ impl Runner for AcpRunner {
                     &self.inner.clock,
                 )
                 .await?;
-                Ok::<(String, Option<String>, u64, u64), anyhow::Error>((
+                Ok::<
+                    (
+                        String,
+                        Option<(String, PathBuf, Timestamp)>,
+                        u64,
+                        u64,
+                        Timestamp,
+                    ),
+                    anyhow::Error,
+                >((
                     active_session_id,
-                    fallback_reason,
+                    fallback_info,
                     prompt_id,
                     prompt_id + 1,
+                    now,
                 ))
             }
             .await;
 
-            let (active_session_id, fallback_reason, prompt_id, next_rpc_id) = match resume_result {
-                Ok(res) => res,
-                Err(err) => {
-                    let _ = teardown_process_group(
-                        &mut proc.child,
-                        proc.pgid,
-                        self.inner.cancel_grace.min(Duration::from_secs(2)),
-                    )
-                    .await;
-                    return Err(err);
-                }
-            };
+            let (active_session_id, fallback_info, prompt_id, next_rpc_id, now) =
+                match resume_result {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let _ = teardown_process_group(
+                            &mut proc.child,
+                            proc.pgid,
+                            self.inner.cancel_grace.min(Duration::from_secs(2)),
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
 
-            let now = (self.inner.clock)();
-            if let Some(reason) = fallback_reason {
-                let record = json!({
-                    "at": now,
+            if let Some((reason, trail_path, trail_now)) = fallback_info {
+                let transcript_record = json!({
+                    "at": trail_now,
                     "runner": self.kind(),
                     "run_id": run_id,
                     "previous_session_id": prev_session_id,
@@ -985,16 +1125,15 @@ impl Runner for AcpRunner {
                     "workdir": workdir,
                     "reason": "session_load_unsupported",
                     "error": reason,
+                    "trail_path": trail_path,
                 });
-                let trail_path = state::append_acp_fallback(&self.inner.home, &record)
-                    .context("recording ACP session/load fallback trail entry")?;
                 let _ = append_transcript(
                     &self.inner.home,
                     &run_id,
                     now,
                     "runner",
                     Some(&active_session_id),
-                    record,
+                    transcript_record,
                 );
                 let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 shared.active_session_id = active_session_id.clone();
@@ -1031,25 +1170,8 @@ impl Runner for AcpRunner {
                 shared.runs += 1;
                 shared.pid = proc.pid;
                 shared.pgid = proc.pgid;
-                if let Some(digest) = msg
-                    .digest
-                    .as_deref()
-                    .or_else(|| extract_wake_digest(&msg.text))
-                {
-                    let mut meta = BTreeMap::new();
-                    meta.insert("wake_digest".to_owned(), digest.to_owned());
-                    shared.push_event(now, RunEventKind::Note, &msg.text, meta);
-                }
+                shared.push_user_message(now, msg);
             }
-
-            self.inner.local_db.update_local_run_runtime(
-                &run_id,
-                LocalRunState::Running,
-                Some(&active_session_id),
-                proc.pid,
-                false,
-                now,
-            )?;
 
             if active_session_id != handle.native_id {
                 self.insert_slot(active_session_id, Arc::clone(&slot));
@@ -1133,6 +1255,16 @@ impl Runner for AcpRunner {
                 let _ = task.await;
             }
 
+            // If this session was recovered from LocalDb with a still-live pre-restart pgid,
+            // terminate that process group cleanly too.
+            let orphan_pgid = {
+                let shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                shared.pgid
+            };
+            if process_group_alive(orphan_pgid) {
+                terminate_detached_process_group(orphan_pgid, self.inner.cancel_grace).await;
+            }
+
             // Ensure state + LocalDb reflect cancellation even if process had already exited idle.
             let run_id = {
                 let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1182,7 +1314,7 @@ impl Runner for AcpRunner {
 }
 
 async fn run_supervisor(
-    inner: Arc<AcpRunnerInner>,
+    ctx: SupervisorContext,
     slot: Arc<SessionSlot>,
     mut proc: SpawnedProcess,
     initial_prompt_id: u64,
@@ -1201,7 +1333,7 @@ async fn run_supervisor(
     let mut in_flight_prompt_id: Option<u64> = Some(initial_prompt_id);
     let mut pending_prompts: VecDeque<SteerMessage> = VecDeque::new();
     let mut turn_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> =
-        Some(Box::pin(tokio::time::sleep(inner.turn_timeout)));
+        Some(Box::pin(tokio::time::sleep(ctx.turn_timeout)));
     let mut line_buf = String::new();
 
     loop {
@@ -1209,67 +1341,141 @@ async fn run_supervisor(
             read_res = proc.stdout.read_line(&mut line_buf) => {
                 match read_res {
                     Ok(0) => {
-                        // EOF on stdout: child is exiting or closed its output stream.
-                        let exit_status = proc.child.wait().await.ok();
-                        let now = (inner.clock)();
-                        let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
-                        shared.pid = None;
-                        shared.pgid = None;
-                        if in_flight_prompt_id.is_some() {
-                            let detail = format_exit_detail(exit_status, &proc.stderr_tail);
-                            shared.push_event(
-                                now,
-                                RunEventKind::Error,
-                                format!("ACP process exited mid-turn ({detail})"),
-                                BTreeMap::new(),
-                            );
-                            shared.state = RunnerState::Failed;
-                            shared.runnable = false;
-                            shared.busy = false;
-                            drop(shared);
-                            let _ = inner.local_db.update_local_run_runtime(
+                        // EOF on stdout: wait boundedly for the child to exit (while still
+                        // honoring Cancel) and ensure any surviving grandchildren in proc.pgid
+                        // are torn down so nothing leaks.
+                        let wait_limit = ctx.cancel_grace.clamp(
+                            Duration::from_millis(200),
+                            Duration::from_secs(2),
+                        );
+                        let mut cancel_req: Option<(String, oneshot::Sender<()>)> = None;
+                        let exit_status = tokio::select! {
+                            res = tokio::time::timeout(wait_limit, proc.child.wait()) => {
+                                res.ok().and_then(Result::ok)
+                            }
+                            cmd = cmd_rx.recv() => {
+                                match cmd {
+                                    Some(SupervisorCommand::Cancel { reason, done }) => {
+                                        cancel_req = Some((reason, done));
+                                    }
+                                    Some(SupervisorCommand::SendPrompt { ack, .. }) => {
+                                        let _ = ack.send(SendAttempt::ProcessGone);
+                                    }
+                                    None => {}
+                                }
+                                None
+                            }
+                        };
+
+                        if let Some((reason, done)) = cancel_req {
+                            record_dropped_prompts(
+                                &ctx,
+                                &slot,
                                 &run_id,
-                                LocalRunState::Failed,
+                                &session_id,
+                                "cancelled",
+                                &mut pending_prompts,
+                            );
+                            let outcome = teardown_process_group(
+                                &mut proc.child,
+                                proc.pgid,
+                                ctx.cancel_grace,
+                            )
+                            .await;
+                            let now = (ctx.clock)();
+                            {
+                                let mut shared =
+                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                shared.state = RunnerState::Cancelled;
+                                shared.runnable = false;
+                                shared.busy = false;
+                                shared.pid = None;
+                                shared.pgid = None;
+                                let mut meta = BTreeMap::new();
+                                meta.insert("reason".to_owned(), reason.clone());
+                                meta.insert("teardown".to_owned(), outcome.to_owned());
+                                shared.push_event(now, RunEventKind::Cancelled, &reason, meta);
+                            }
+                            let _ = ctx.local_db.update_local_run_runtime(
+                                &run_id,
+                                LocalRunState::Cancelled,
                                 None,
                                 None,
                                 true,
                                 now,
                             );
-                        } else if exit_status.is_some_and(|s| s.success()) {
-                            // Clean idle exit: session remains resumable via session/load.
-                            shared.state = RunnerState::Idle;
-                            shared.runnable = true;
-                            shared.busy = false;
-                            drop(shared);
-                            let _ = inner.local_db.update_local_run_runtime(
+                            let _ = done.send(());
+                            break;
+                        }
+
+                        // Tear down any lingering child or surviving grandchildren in the group.
+                        let had_lingering = exit_status.is_none() || process_group_alive(proc.pgid);
+                        if had_lingering {
+                            let _ = teardown_process_group(
+                                &mut proc.child,
+                                proc.pgid,
+                                ctx.cancel_grace.min(Duration::from_secs(2)),
+                            )
+                            .await;
+                        }
+
+                        if !pending_prompts.is_empty() {
+                            record_dropped_prompts(
+                                &ctx,
+                                &slot,
                                 &run_id,
-                                LocalRunState::Finished,
-                                None,
-                                None,
-                                true,
-                                now,
-                            );
-                        } else {
-                            let detail = format_exit_detail(exit_status, &proc.stderr_tail);
-                            shared.push_event(
-                                now,
-                                RunEventKind::Error,
-                                format!("ACP process exited unexpectedly ({detail})"),
-                                BTreeMap::new(),
-                            );
-                            shared.state = RunnerState::Failed;
-                            shared.runnable = false;
-                            shared.busy = false;
-                            drop(shared);
-                            let _ = inner.local_db.update_local_run_runtime(
-                                &run_id,
-                                LocalRunState::Failed,
-                                None,
-                                None,
-                                true,
-                                now,
+                                &session_id,
+                                "process_exited_with_queued_prompts",
+                                &mut pending_prompts,
                             );
                         }
+
+                        let now = (ctx.clock)();
+                        let final_db_state = {
+                            let mut shared =
+                                slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                            shared.pid = None;
+                            shared.pgid = None;
+                            if in_flight_prompt_id.is_some() {
+                                let detail = format_exit_detail(exit_status, &proc.stderr_tail);
+                                shared.push_event(
+                                    now,
+                                    RunEventKind::Error,
+                                    format!("ACP process exited mid-turn ({detail})"),
+                                    BTreeMap::new(),
+                                );
+                                shared.state = RunnerState::Failed;
+                                shared.runnable = false;
+                                shared.busy = false;
+                                LocalRunState::Failed
+                            } else if exit_status.is_some_and(|s| s.success()) {
+                                // Clean idle exit: session remains resumable via session/load.
+                                shared.state = RunnerState::Idle;
+                                shared.runnable = true;
+                                shared.busy = false;
+                                LocalRunState::Finished
+                            } else {
+                                let detail = format_exit_detail(exit_status, &proc.stderr_tail);
+                                shared.push_event(
+                                    now,
+                                    RunEventKind::Error,
+                                    format!("ACP process exited unexpectedly ({detail})"),
+                                    BTreeMap::new(),
+                                );
+                                shared.state = RunnerState::Failed;
+                                shared.runnable = false;
+                                shared.busy = false;
+                                LocalRunState::Failed
+                            }
+                        };
+                        let _ = ctx.local_db.update_local_run_runtime(
+                            &run_id,
+                            final_db_state,
+                            None,
+                            None,
+                            true,
+                            now,
+                        );
                         break;
                     }
                     Ok(_) => {
@@ -1278,12 +1484,12 @@ async fn run_supervisor(
                         if raw.is_empty() {
                             continue;
                         }
-                        let now = (inner.clock)();
+                        let now = (ctx.clock)();
                         let parsed: Value = match serde_json::from_str(&raw) {
                             Ok(val) => val,
                             Err(_) => {
                                 let _ = append_transcript(
-                                    &inner.home,
+                                    &ctx.home,
                                     &run_id,
                                     now,
                                     "stdout_raw",
@@ -1294,7 +1500,7 @@ async fn run_supervisor(
                             }
                         };
                         let _ = append_transcript(
-                            &inner.home,
+                            &ctx.home,
                             &run_id,
                             now,
                             "agent",
@@ -1309,23 +1515,16 @@ async fn run_supervisor(
                             if let Some(req_id) = parsed.get("id") {
                                 // Agent-to-client JSON-RPC request: answer cleanly so the agent
                                 // never deadlocks waiting for an interactive UI prompt.
-                                let err_resp = json!({
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "error": {
-                                        "code": -32601,
-                                        "message": format!("client method `{method}` is not supported by headless AcpRunner"),
-                                    }
-                                });
-                                let _ = write_json_line(&mut proc.stdin, &err_resp).await;
-                                let _ = append_transcript(
-                                    &inner.home,
+                                let _ = decline_client_request(
+                                    &mut proc.stdin,
+                                    &ctx.home,
                                     &run_id,
-                                    now,
-                                    "client",
                                     Some(&session_id),
-                                    err_resp,
-                                );
+                                    req_id,
+                                    method,
+                                    now,
+                                )
+                                .await;
                                 let mut shared =
                                     slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
                                 let mut meta = BTreeMap::new();
@@ -1350,50 +1549,69 @@ async fn run_supervisor(
                             in_flight_prompt_id = None;
                             turn_deadline = None;
                             if let Some(err_obj) = parsed.get("error") {
-                                let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(-1);
+                                let code =
+                                    err_obj.get("code").and_then(Value::as_i64).unwrap_or(-1);
                                 let msg = err_obj
                                     .get("message")
                                     .and_then(Value::as_str)
                                     .unwrap_or("ACP session/prompt error");
-                                let mut shared =
-                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
-                                let mut meta = BTreeMap::new();
-                                meta.insert("rpc_error_code".to_owned(), code.to_string());
-                                shared.push_event(
-                                    now,
-                                    RunEventKind::Error,
-                                    format!("ACP prompt error ({code}): {msg}"),
-                                    meta,
+                                {
+                                    let mut shared =
+                                        slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let mut meta = BTreeMap::new();
+                                    meta.insert("rpc_error_code".to_owned(), code.to_string());
+                                    shared.push_event(
+                                        now,
+                                        RunEventKind::Error,
+                                        format!("ACP prompt error ({code}): {msg}"),
+                                        meta,
+                                    );
+                                    shared.state = RunnerState::Failed;
+                                    shared.runnable = false;
+                                    shared.busy = false;
+                                    shared.pid = None;
+                                    shared.pgid = None;
+                                }
+                                record_dropped_prompts(
+                                    &ctx,
+                                    &slot,
+                                    &run_id,
+                                    &session_id,
+                                    "rpc_error",
+                                    &mut pending_prompts,
                                 );
-                                shared.state = RunnerState::Failed;
-                                shared.runnable = false;
-                                shared.busy = false;
-                                drop(shared);
-                                let _ = inner.local_db.update_local_run_runtime(
+                                let _ = proc.stdin.shutdown().await;
+                                let _ = teardown_process_group(
+                                    &mut proc.child,
+                                    proc.pgid,
+                                    ctx.cancel_grace.min(Duration::from_secs(2)),
+                                )
+                                .await;
+                                let _ = ctx.local_db.update_local_run_runtime(
                                     &run_id,
                                     LocalRunState::Failed,
                                     None,
                                     None,
-                                    false,
+                                    true,
                                     now,
                                 );
-                                pending_prompts.clear();
-                            } else {
-                                let stop_reason = parsed
-                                    .get("result")
-                                    .and_then(|r| {
-                                        r.get("stopReason").or_else(|| r.get("stop_reason"))
-                                    })
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("end_turn");
+                                break;
+                            }
 
+                            let stop_reason = parsed
+                                .get("result")
+                                .and_then(|r| {
+                                    r.get("stopReason").or_else(|| r.get("stop_reason"))
+                                })
+                                .and_then(Value::as_str)
+                                .unwrap_or("end_turn");
+
+                            {
+                                let mut shared =
+                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                let mut meta = BTreeMap::new();
+                                meta.insert("stop_reason".to_owned(), stop_reason.to_owned());
                                 if stop_reason == "cancelled" {
-                                    let mut shared =
-                                        slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
-                                    shared.state = RunnerState::Idle;
-                                    shared.busy = false;
-                                    let mut meta = BTreeMap::new();
-                                    meta.insert("stop_reason".to_owned(), stop_reason.to_owned());
                                     shared.push_event(
                                         now,
                                         RunEventKind::Cancelled,
@@ -1401,73 +1619,74 @@ async fn run_supervisor(
                                         meta,
                                     );
                                 } else {
-                                    {
-                                        let mut shared = slot
-                                            .shared
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner);
-                                        let mut meta = BTreeMap::new();
-                                        meta.insert(
-                                            "stop_reason".to_owned(),
-                                            stop_reason.to_owned(),
-                                        );
-                                        shared.push_event(
-                                            now,
-                                            RunEventKind::Done,
-                                            format!("turn completed ({stop_reason})"),
-                                            meta,
-                                        );
-                                    }
-
-                                    if let Some(next_msg) = pending_prompts.pop_front() {
-                                        let id = next_rpc_id;
-                                        next_rpc_id += 1;
-                                        if send_session_prompt(
-                                            &mut proc.stdin,
-                                            &inner.home,
-                                            &run_id,
-                                            &session_id,
-                                            id,
-                                            &next_msg.text,
-                                            &inner.clock,
-                                        )
-                                        .await
-                                        .is_ok()
-                                        {
-                                            in_flight_prompt_id = Some(id);
-                                            turn_deadline = Some(Box::pin(tokio::time::sleep(
-                                                inner.turn_timeout,
-                                            )));
-                                            let mut shared = slot
-                                                .shared
-                                                .lock()
-                                                .unwrap_or_else(PoisonError::into_inner);
-                                            shared.state = RunnerState::Running;
-                                            shared.busy = true;
-                                            shared.runs += 1;
-                                        } else {
-                                            let mut shared = slot
-                                                .shared
-                                                .lock()
-                                                .unwrap_or_else(PoisonError::into_inner);
-                                            shared.state = RunnerState::Idle;
-                                            shared.busy = false;
-                                        }
-                                    } else {
-                                        let mut shared = slot
-                                            .shared
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner);
-                                        shared.state = RunnerState::Idle;
-                                        shared.runnable = true;
-                                        shared.busy = false;
-                                    }
+                                    shared.push_event(
+                                        now,
+                                        RunEventKind::Done,
+                                        format!("turn completed ({stop_reason})"),
+                                        meta,
+                                    );
                                 }
+                            }
+
+                            if let Some(next_msg) = pending_prompts.pop_front() {
+                                let id = next_rpc_id;
+                                next_rpc_id += 1;
+                                if send_session_prompt(
+                                    &mut proc.stdin,
+                                    &ctx.home,
+                                    &run_id,
+                                    &session_id,
+                                    id,
+                                    &next_msg.text,
+                                    &ctx.clock,
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    in_flight_prompt_id = Some(id);
+                                    turn_deadline = Some(Box::pin(tokio::time::sleep(
+                                        ctx.turn_timeout,
+                                    )));
+                                    let sent_at = (ctx.clock)();
+                                    let mut shared = slot
+                                        .shared
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    shared.state = RunnerState::Running;
+                                    shared.runnable = true;
+                                    shared.busy = true;
+                                    shared.runs += 1;
+                                    shared.push_user_message(sent_at, &next_msg);
+                                } else {
+                                    // Write failed (e.g., process exited right after turn 1):
+                                    // record Trail Rule drops for this and any remaining prompts.
+                                    pending_prompts.push_front(next_msg);
+                                    record_dropped_prompts(
+                                        &ctx,
+                                        &slot,
+                                        &run_id,
+                                        &session_id,
+                                        "stdin_closed_before_queued_prompt",
+                                        &mut pending_prompts,
+                                    );
+                                    let mut shared = slot
+                                        .shared
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    shared.state = RunnerState::Idle;
+                                    shared.busy = false;
+                                }
+                            } else {
+                                let mut shared =
+                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                shared.state = RunnerState::Idle;
+                                shared.runnable = true;
+                                shared.busy = false;
                             }
                         }
                     }
                     Err(err) => {
-                        let now = (inner.clock)();
+                        let now = (ctx.clock)();
                         {
                             let mut shared =
                                 slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1483,13 +1702,21 @@ async fn run_supervisor(
                             shared.pid = None;
                             shared.pgid = None;
                         }
+                        record_dropped_prompts(
+                            &ctx,
+                            &slot,
+                            &run_id,
+                            &session_id,
+                            "stdout_read_error",
+                            &mut pending_prompts,
+                        );
                         let _ = teardown_process_group(
                             &mut proc.child,
                             proc.pgid,
-                            inner.cancel_grace.min(Duration::from_secs(2)),
+                            ctx.cancel_grace.min(Duration::from_secs(2)),
                         )
                         .await;
-                        let _ = inner.local_db.update_local_run_runtime(
+                        let _ = ctx.local_db.update_local_run_runtime(
                             &run_id,
                             LocalRunState::Failed,
                             None,
@@ -1505,6 +1732,18 @@ async fn run_supervisor(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SupervisorCommand::SendPrompt { msg, ack }) => {
+                        let not_runnable = {
+                            let shared =
+                                slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                            matches!(shared.state, RunnerState::Cancelled | RunnerState::Failed)
+                                || !shared.runnable
+                        };
+                        if not_runnable {
+                            let _ = ack.send(SendAttempt::Rejected(format!(
+                                "ACP session {session_id} is not runnable"
+                            )));
+                            continue;
+                        }
                         if in_flight_prompt_id.is_some() {
                             pending_prompts.push_back(msg);
                             let _ = ack.send(SendAttempt::Delivered);
@@ -1514,21 +1753,21 @@ async fn run_supervisor(
                         next_rpc_id += 1;
                         match send_session_prompt(
                             &mut proc.stdin,
-                            &inner.home,
+                            &ctx.home,
                             &run_id,
                             &session_id,
                             id,
                             &msg.text,
-                            &inner.clock,
+                            &ctx.clock,
                         )
                         .await
                         {
                             Ok(()) => {
                                 in_flight_prompt_id = Some(id);
                                 turn_deadline = Some(Box::pin(tokio::time::sleep(
-                                    inner.turn_timeout,
+                                    ctx.turn_timeout,
                                 )));
-                                let now = (inner.clock)();
+                                let now = (ctx.clock)();
                                 {
                                     let mut shared = slot
                                         .shared
@@ -1538,17 +1777,9 @@ async fn run_supervisor(
                                     shared.runnable = true;
                                     shared.busy = true;
                                     shared.runs += 1;
-                                    if let Some(digest) = msg
-                                        .digest
-                                        .as_deref()
-                                        .or_else(|| extract_wake_digest(&msg.text))
-                                    {
-                                        let mut meta = BTreeMap::new();
-                                        meta.insert("wake_digest".to_owned(), digest.to_owned());
-                                        shared.push_event(now, RunEventKind::Note, &msg.text, meta);
-                                    }
+                                    shared.push_user_message(now, &msg);
                                 }
-                                let _ = inner.local_db.update_local_run_runtime(
+                                let _ = ctx.local_db.update_local_run_runtime(
                                     &run_id,
                                     LocalRunState::Running,
                                     None,
@@ -1564,7 +1795,14 @@ async fn run_supervisor(
                         }
                     }
                     Some(SupervisorCommand::Cancel { reason, done }) => {
-                        pending_prompts.clear();
+                        record_dropped_prompts(
+                            &ctx,
+                            &slot,
+                            &run_id,
+                            &session_id,
+                            "cancelled",
+                            &mut pending_prompts,
+                        );
 
                         let cancel_notif = json!({
                             "jsonrpc": "2.0",
@@ -1575,24 +1813,21 @@ async fn run_supervisor(
                         });
                         let _ = write_json_line(&mut proc.stdin, &cancel_notif).await;
                         let _ = append_transcript(
-                            &inner.home,
+                            &ctx.home,
                             &run_id,
-                            (inner.clock)(),
+                            (ctx.clock)(),
                             "client",
                             Some(&session_id),
                             cancel_notif,
                         );
                         let _ = proc.stdin.shutdown().await;
 
-                        let outcome = teardown_process_group(
-                            &mut proc.child,
-                            proc.pgid,
-                            inner.cancel_grace,
-                        )
-                        .await;
-                        let now = (inner.clock)();
+                        let outcome =
+                            teardown_process_group(&mut proc.child, proc.pgid, ctx.cancel_grace)
+                                .await;
+                        let now = (ctx.clock)();
                         let _ = append_transcript(
-                            &inner.home,
+                            &ctx.home,
                             &run_id,
                             now,
                             "runner",
@@ -1616,7 +1851,7 @@ async fn run_supervisor(
                             meta.insert("teardown".to_owned(), outcome.to_owned());
                             shared.push_event(now, RunEventKind::Cancelled, &reason, meta);
                         }
-                        let _ = inner.local_db.update_local_run_runtime(
+                        let _ = ctx.local_db.update_local_run_runtime(
                             &run_id,
                             LocalRunState::Cancelled,
                             None,
@@ -1629,10 +1864,18 @@ async fn run_supervisor(
                     }
                     None => {
                         // Control channel closed (runner dropped); clean up process group.
+                        record_dropped_prompts(
+                            &ctx,
+                            &slot,
+                            &run_id,
+                            &session_id,
+                            "runner_dropped",
+                            &mut pending_prompts,
+                        );
                         let _ = teardown_process_group(
                             &mut proc.child,
                             proc.pgid,
-                            inner.cancel_grace.min(Duration::from_secs(2)),
+                            ctx.cancel_grace.min(Duration::from_secs(2)),
                         )
                         .await;
                         break;
@@ -1647,20 +1890,28 @@ async fn run_supervisor(
                     std::future::pending::<()>().await;
                 }
             } => {
-                let now = (inner.clock)();
+                let now = (ctx.clock)();
                 let reason = format!(
                     "ACP turn exceeded {}ms timeout",
-                    inner.turn_timeout.as_millis()
+                    ctx.turn_timeout.as_millis()
                 );
                 // Trail Rule record BEFORE cancelling/killing on timeout.
                 let _ = record_cancel_trail(
-                    &inner.home,
+                    &ctx.home,
                     now,
                     "acp",
                     &handle,
                     &reason,
                     "turn_timeout",
                     true,
+                );
+                record_dropped_prompts(
+                    &ctx,
+                    &slot,
+                    &run_id,
+                    &session_id,
+                    "turn_timeout",
+                    &mut pending_prompts,
                 );
                 let cancel_notif = json!({
                     "jsonrpc": "2.0",
@@ -1672,9 +1923,9 @@ async fn run_supervisor(
                 let _ = write_json_line(&mut proc.stdin, &cancel_notif).await;
                 let _ = proc.stdin.shutdown().await;
                 let outcome =
-                    teardown_process_group(&mut proc.child, proc.pgid, inner.cancel_grace).await;
+                    teardown_process_group(&mut proc.child, proc.pgid, ctx.cancel_grace).await;
                 let _ = append_transcript(
-                    &inner.home,
+                    &ctx.home,
                     &run_id,
                     now,
                     "runner",
@@ -1696,7 +1947,7 @@ async fn run_supervisor(
                     shared.pid = None;
                     shared.pgid = None;
                 }
-                let _ = inner.local_db.update_local_run_runtime(
+                let _ = ctx.local_db.update_local_run_runtime(
                     &run_id,
                     LocalRunState::Failed,
                     None,
@@ -1707,6 +1958,45 @@ async fn run_supervisor(
                 break;
             }
         }
+    }
+}
+
+fn record_dropped_prompts(
+    ctx: &SupervisorContext,
+    slot: &SessionSlot,
+    run_id: &str,
+    session_id: &str,
+    reason: &str,
+    pending_prompts: &mut VecDeque<SteerMessage>,
+) {
+    while let Some(dropped) = pending_prompts.pop_front() {
+        let now = (ctx.clock)();
+        let record = json!({
+            "at": now,
+            "runner": "acp",
+            "run_id": run_id,
+            "session_id": session_id,
+            "reason": reason,
+            "digest": dropped.digest,
+            "prompt": dropped.text,
+        });
+        let trail_path = state::append_acp_drop(&ctx.home, &record).ok();
+        let _ = append_transcript(&ctx.home, run_id, now, "runner", Some(session_id), record);
+        let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut meta = BTreeMap::new();
+        meta.insert("dropped_reason".to_owned(), reason.to_owned());
+        if let Some(digest) = dropped.digest {
+            meta.insert("wake_digest".to_owned(), digest);
+        }
+        if let Some(path) = trail_path {
+            meta.insert("trail_path".to_owned(), path.display().to_string());
+        }
+        shared.push_event(
+            now,
+            RunEventKind::Error,
+            format!("dropped queued ACP prompt ({reason})"),
+            meta,
+        );
     }
 }
 
@@ -1738,6 +2028,28 @@ async fn send_session_prompt(
     Ok(())
 }
 
+async fn decline_client_request(
+    stdin: &mut ChildStdin,
+    home: &Home,
+    run_id: &str,
+    session_id: Option<&str>,
+    req_id: &Value,
+    method: &str,
+    at: Timestamp,
+) -> Result<()> {
+    let err_resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32601,
+            "message": format!("client method `{method}` is not supported by headless AcpRunner"),
+        }
+    });
+    write_json_line(stdin, &err_resp).await?;
+    let _ = append_transcript(home, run_id, at, "client", session_id, err_resp);
+    Ok(())
+}
+
 async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec(value).context("serializing ACP JSON-RPC message")?;
     bytes.push(b'\n');
@@ -1752,6 +2064,7 @@ async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn read_rpc_response(
     stdout: &mut BufReader<ChildStdout>,
+    stdin: &mut ChildStdin,
     expected_id: u64,
     timeout: Duration,
     home: &Home,
@@ -1792,21 +2105,29 @@ async fn read_rpc_response(
         if trimmed.is_empty() {
             continue;
         }
+        let now = (clock)();
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             let _ = append_transcript(
                 home,
                 run_id,
-                (clock)(),
+                now,
                 "stdout_raw",
                 session_id,
                 json!({ "line": trimmed }),
             );
             continue;
         };
-        let _ = append_transcript(home, run_id, (clock)(), "agent", session_id, value.clone());
-        if value.get("method").is_none()
-            && value.get("id").and_then(Value::as_u64) == Some(expected_id)
-        {
+        let _ = append_transcript(home, run_id, now, "agent", session_id, value.clone());
+        if let Some(method) = value.get("method").and_then(Value::as_str) {
+            if let Some(req_id) = value.get("id") {
+                // Decline agent-to-client requests during handshake so the agent never deadlocks.
+                let _ =
+                    decline_client_request(stdin, home, run_id, session_id, req_id, method, now)
+                        .await;
+            }
+            continue;
+        }
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(value);
         }
     }
@@ -2057,6 +2378,31 @@ async fn teardown_process_group(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     "sigkill"
+}
+
+/// Terminates a detached process group recovered from `daemon.db` after a restart (`SIGTERM`,
+/// grace wait, then `SIGKILL`).
+async fn terminate_detached_process_group(pgid: Option<u32>, grace: Duration) {
+    #[cfg(unix)]
+    if let Some(pg) = pgid {
+        let _ = signal_process_group(pg, rustix::process::Signal::TERM);
+        let sigterm_wait = grace.clamp(Duration::from_millis(80), Duration::from_secs(2));
+        let deadline = tokio::time::Instant::now() + sigterm_wait;
+        while process_group_alive(Some(pg)) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        if process_group_alive(Some(pg)) {
+            let _ = signal_process_group(pg, rustix::process::Signal::KILL);
+            let kill_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            while process_group_alive(Some(pg)) && tokio::time::Instant::now() < kill_deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, grace);
+    }
 }
 
 #[cfg(unix)]

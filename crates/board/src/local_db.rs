@@ -654,20 +654,101 @@ impl LocalDb {
         Ok(())
     }
 
-    /// Reads the newest `local_runs` row matching `session_id`, for runner resume and status
-    /// recovery after restarts.
+    /// Records a previous `session_id` alias inside `local_runs.meta_json`
+    /// (`previous_session_ids`) so [`Self::get_local_run_by_session`] can still locate the run
+    /// using an earlier handle `native_id` after a `session/load` fallback replaces `session_id`.
+    pub fn record_local_run_session_alias(
+        &self,
+        run_id: &str,
+        alias_session_id: &str,
+        updated_at: Timestamp,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT meta_json FROM local_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(meta_raw) = existing else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let mut obj = meta_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let mut aliases: Vec<String> = obj
+            .get("previous_session_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !aliases.iter().any(|s| s == alias_session_id) {
+            aliases.push(alias_session_id.to_owned());
+        }
+        obj.insert(
+            "previous_session_ids".to_owned(),
+            serde_json::Value::Array(aliases.into_iter().map(serde_json::Value::String).collect()),
+        );
+        let next_meta = serde_json::to_string(&serde_json::Value::Object(obj))?;
+        tx.execute(
+            "UPDATE local_runs SET meta_json = ?1, updated_at = ?2 WHERE run_id = ?3",
+            params![next_meta, ts_ms(updated_at), run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reads the newest `local_runs` row matching `session_id` (or having `session_id` recorded
+    /// in `meta_json.previous_session_ids` after a `session/load` fallback), for runner resume
+    /// and status recovery after restarts.
     pub fn get_local_run_by_session(&self, session_id: &str) -> Result<Option<LocalRunRecord>> {
         let conn = self.lock();
-        conn.query_row(
+        if let Some(direct) = conn
+            .query_row(
+                "SELECT run_id, task_id, board, kind, runner, session_id, worktree_path, branch, \
+                        cost_units, pid, state, lease_expires_at, created_at, updated_at, meta_json \
+                   FROM local_runs WHERE session_id = ?1 \
+                  ORDER BY updated_at DESC, run_id DESC LIMIT 1",
+                [session_id],
+                local_run_from_row,
+            )
+            .optional()?
+        {
+            return Ok(Some(direct));
+        }
+
+        let mut stmt = conn.prepare(
             "SELECT run_id, task_id, board, kind, runner, session_id, worktree_path, branch, \
                     cost_units, pid, state, lease_expires_at, created_at, updated_at, meta_json \
-               FROM local_runs WHERE session_id = ?1 \
-              ORDER BY updated_at DESC, run_id DESC LIMIT 1",
-            [session_id],
-            local_run_from_row,
-        )
-        .optional()
-        .map_err(Into::into)
+               FROM local_runs WHERE meta_json IS NOT NULL \
+              ORDER BY updated_at DESC, run_id DESC",
+        )?;
+        let rows = stmt.query_map([], local_run_from_row)?;
+        for row in rows {
+            let rec = row?;
+            let matches_alias = rec
+                .meta_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|v| {
+                    v.get("previous_session_ids")
+                        .and_then(|arr| arr.as_array())
+                        .map(|arr| arr.iter().any(|item| item.as_str() == Some(session_id)))
+                })
+                .unwrap_or(false);
+            if matches_alias {
+                return Ok(Some(rec));
+            }
+        }
+        Ok(None)
     }
 
     /// Marks every non-terminal `local_runs` row matching `(kind, task_id)` as `state`.

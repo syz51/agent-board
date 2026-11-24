@@ -440,6 +440,13 @@ pub fn append_acp_fallback<T: Serialize>(home: &Home, record: &T) -> Result<Path
     append_line(home, "acp-fallbacks.jsonl", record)
 }
 
+/// Adds `record` as one line to `acp-dropped-prompts.jsonl` in the state directory, and gives
+/// its path: the Trail Rule record when queued ACP prompts cannot be delivered (cancellation,
+/// RPC error, timeout, or process exit). Nothing prunes it.
+pub fn append_acp_drop<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "acp-dropped-prompts.jsonl", record)
+}
+
 /// Path to the local raw JSONL transcript for `run_id` under
 /// `$BOARD_HOME/state/transcripts/<run-id>.jsonl`.
 pub fn transcript_path(home: &Home, run_id: &str) -> PathBuf {

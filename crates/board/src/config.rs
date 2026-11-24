@@ -475,7 +475,16 @@ impl Config {
         std::fs::create_dir_all(home.root())
             .with_context(|| format!("creating {}", home.root().display()))?;
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        write_atomic(&home.config_path(), text.as_bytes())
+        let path = home.config_path();
+        let has_secrets = self
+            .acp_runner
+            .as_ref()
+            .is_some_and(|acp| !acp.env.is_empty());
+        if has_secrets || is_private_file(&path) {
+            write_private(&path, text.as_bytes())
+        } else {
+            write_atomic(&path, text.as_bytes())
+        }
     }
 
     pub fn feedback_board(&self) -> BoardSlug {
@@ -803,6 +812,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     drop(file);
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn is_private_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -1316,6 +1338,39 @@ slice = "agent-board-runs.slice"
                 "expected error for {bad:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_uses_0600_for_acp_env_secrets_and_preserves_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+
+        // Saving a config with [acp_runner.env] writes mode 0600 automatically.
+        let mut cfg = Config {
+            acp_runner: Some(AcpRunnerConfig {
+                env: [("API_KEY".to_owned(), "secret-val".to_owned())].into(),
+                ..AcpRunnerConfig::default()
+            }),
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+        let mode = std::fs::metadata(home.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Subsequent saves (e.g., board login) preserve 0600 even if env is later cleared.
+        cfg.acp_runner = None;
+        cfg.server = Some("https://board.example.test".into());
+        cfg.save(&home).unwrap();
+        let mode = std::fs::metadata(home.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[cfg(unix)]

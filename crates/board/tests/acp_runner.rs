@@ -78,6 +78,11 @@ while IFS= read -r line; do
     case "$line" in
         *'"method":"initialize"'*)
             id=$(extract_id "$line")
+            if [ "${FAKE_ACP_HANDSHAKE_CLIENT_REQ:-0}" = "1" ]; then
+                printf '{"jsonrpc":"2.0","id":999,"method":"client/ping","params":{}}\n'
+                IFS= read -r client_resp
+                printf '%s\n' "$client_resp" > "$STATE_DIR/handshake_client_resp.json"
+            fi
             printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
             ;;
         *'"method":"session/new"'*)
@@ -108,7 +113,13 @@ while IFS= read -r line; do
         *'"method":"session/prompt"'*)
             id=$(extract_id "$line")
             turn=$((turn + 1))
-            if [ "${FAKE_ACP_IGNORE_CANCEL:-0}" = "1" ] || [ "${FAKE_ACP_HANG_PROMPT:-0}" = "1" ]; then
+            if [ "${FAKE_ACP_PROMPT_ERROR:-0}" = "1" ]; then
+                if [ -n "${FAKE_ACP_TURN_DELAY:-}" ]; then
+                    sleep "$FAKE_ACP_TURN_DELAY"
+                fi
+                printf '%s\n' "$$" > "$STATE_DIR/child.pid"
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"simulated prompt failure"}}\n' "$id"
+            elif [ "${FAKE_ACP_IGNORE_CANCEL:-0}" = "1" ] || [ "${FAKE_ACP_HANG_PROMPT:-0}" = "1" ]; then
                 (
                     trap '' TERM
                     sleep 30
@@ -401,6 +412,15 @@ async fn send_queues_on_live_process_and_resumes_idle_exited_session_via_session
             .filter(|e| e.kind == RunEventKind::Done)
             .count();
         assert_eq!(done_count, 3, "expected 3 Done events, got {events:#?}");
+        // Queued steering message was recorded as RunEventKind::Message with wake_digest for
+        // daemon::read_messages verification.
+        assert!(
+            events.iter().any(|e| {
+                e.kind == RunEventKind::Message
+                    && e.metadata.get("wake_digest").map(String::as_str) == Some("abc123")
+            }),
+            "missing RunEventKind::Message with wake_digest: {events:#?}"
+        );
 
         runner.cancel(&handle, "test cleanup").await.unwrap();
     }
@@ -543,24 +563,41 @@ async fn send_queues_on_live_process_and_resumes_idle_exited_session_via_session
         })
         .await;
 
-        // Trail Rule fallback entry written to state/acp-fallbacks.jsonl.
+        // Trail Rule fallback entry written to state/acp-fallbacks.jsonl BEFORE session/new.
         let fallback_path = home.state_dir().join("acp-fallbacks.jsonl");
         assert!(fallback_path.exists());
         let line: serde_json::Value =
             serde_json::from_str(std::fs::read_to_string(&fallback_path).unwrap().trim()).unwrap();
         assert_eq!(line["reason"], "session_load_unsupported");
         assert_eq!(line["previous_session_id"], "acp-sess-1");
-        assert_eq!(line["new_session_id"], "acp-sess-2");
 
-        // LocalDb updated to replacement session_id, and events include the fallback Note.
+        // LocalDb updated to replacement session_id and recorded alias so a fresh runner after
+        // restart can still resolve the original handle.native_id ("acp-sess-1").
         let row = db.get_local_run("run-load-fallback").unwrap().unwrap();
         assert_eq!(row.session_id.as_deref(), Some("acp-sess-2"));
+        assert_eq!(
+            db.get_local_run_by_session("acp-sess-1")
+                .unwrap()
+                .unwrap()
+                .run_id,
+            "run-load-fallback"
+        );
         let events = runner.poll_events(&handle, 0).await.unwrap();
         assert!(events.iter().any(|e| {
             e.kind == RunEventKind::Note
                 && e.metadata.get("fallback").map(String::as_str)
                     == Some("session_load_unsupported")
         }));
+        wait_for(Duration::from_secs(5), || async {
+            db.get_local_run("run-load-fallback")
+                .unwrap()
+                .is_some_and(|r| r.state == LocalRunState::Finished && r.pid.is_none())
+        })
+        .await;
+        let fresh_runner = AcpRunner::new(runner.config().clone(), home, db);
+        let recovered = fresh_runner.status(&handle).await.unwrap();
+        assert_eq!(recovered.state, RunnerState::Idle);
+        assert!(recovered.runnable);
     }
 }
 
@@ -878,4 +915,156 @@ async fn runner_registry_selects_acp_vs_t3_dynamically() {
         .cancel(&acp_handle, "registry cleanup")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn rpc_prompt_error_terminates_child_records_dropped_prompts_and_blocks_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path().join("home"));
+    let workdir = dir.path().join("workdir");
+    let fake_state = dir.path().join("fake-state");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let bin = write_fake_acp_server(dir.path());
+    let db = LocalDb::open_for_home(&home).unwrap();
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_ACP_DIR".to_owned(),
+        fake_state.to_string_lossy().into_owned(),
+    );
+    env.insert("FAKE_ACP_PROMPT_ERROR".to_owned(), "1".to_owned());
+    env.insert("FAKE_ACP_TURN_DELAY".to_owned(), "0.2".to_owned());
+
+    let runner = AcpRunner::new(
+        AcpRunnerConfig {
+            bin: Some(bin),
+            args: vec![],
+            env,
+            ..AcpRunnerConfig::default()
+        },
+        home.clone(),
+        db.clone(),
+    )
+    .with_cancel_grace(Duration::from_millis(100));
+
+    let spec = RunSpec {
+        run_id: "run-rpc-err".to_owned(),
+        title: "RPC error cleanup".to_owned(),
+        prompt: "Trigger error".to_owned(),
+        model: None,
+        worktree: None,
+        metadata: BTreeMap::new(),
+    };
+    let handle = runner.spawn(&spec, &workdir).await.unwrap();
+    // Queue a prompt while the failing turn is in flight.
+    runner
+        .send(
+            &handle,
+            &SteerMessage::new("queued before error").with_digest("dropme123"),
+        )
+        .await
+        .unwrap();
+
+    wait_for(Duration::from_secs(5), || async {
+        runner.status(&handle).await.unwrap().state == RunnerState::Failed
+    })
+    .await;
+
+    // Child exited and LocalDb cleared pid with Failed state.
+    let child_pid: u32 = std::fs::read_to_string(fake_state.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_for(Duration::from_secs(3), || async { !pid_alive(child_pid) }).await;
+    let row = db.get_local_run("run-rpc-err").unwrap().unwrap();
+    assert_eq!(row.state, LocalRunState::Failed);
+    assert_eq!(row.pid, None);
+
+    // Trail Rule recorded the dropped queued prompt.
+    let drop_path = home.state_dir().join("acp-dropped-prompts.jsonl");
+    assert!(drop_path.exists());
+    let line: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&drop_path).unwrap().trim()).unwrap();
+    assert_eq!(line["reason"], "rpc_error");
+    assert_eq!(line["digest"], "dropme123");
+    assert_eq!(line["prompt"], "queued before error");
+
+    // Failed run cannot be resurrected by send().
+    assert!(
+        runner
+            .send(&handle, &SteerMessage::new("should fail"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dropping_runner_kills_live_process_group_and_handshake_declines_client_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path().join("home"));
+    let workdir = dir.path().join("workdir");
+    let fake_state = dir.path().join("fake-state");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let bin = write_fake_acp_server(dir.path());
+    let db = LocalDb::open_for_home(&home).unwrap();
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_ACP_DIR".to_owned(),
+        fake_state.to_string_lossy().into_owned(),
+    );
+    env.insert("FAKE_ACP_HANDSHAKE_CLIENT_REQ".to_owned(), "1".to_owned());
+    env.insert("FAKE_ACP_HANG_PROMPT".to_owned(), "1".to_owned());
+
+    let runner = AcpRunner::new(
+        AcpRunnerConfig {
+            bin: Some(bin),
+            args: vec![],
+            env,
+            ..AcpRunnerConfig::default()
+        },
+        home,
+        db,
+    )
+    .with_handshake_timeout(Duration::from_secs(5));
+
+    let spec = RunSpec {
+        run_id: "run-drop-cleanup".to_owned(),
+        title: "Drop cleans up process group".to_owned(),
+        prompt: "Hang until drop".to_owned(),
+        model: None,
+        worktree: None,
+        metadata: BTreeMap::new(),
+    };
+    let _handle = runner.spawn(&spec, &workdir).await.unwrap();
+
+    // Handshake declined the agent's client/ping request with -32601 instead of hanging.
+    let resp: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(fake_state.join("handshake_client_resp.json"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(resp["id"], 999);
+    assert_eq!(resp["error"]["code"], -32601);
+
+    wait_for(Duration::from_secs(5), || async {
+        fake_state.join("grandchild.pid").exists()
+    })
+    .await;
+    let grandchild_pid: u32 = std::fs::read_to_string(fake_state.join("grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid_alive(grandchild_pid));
+
+    // Dropping the last AcpRunner must run AcpRunnerInner::drop (no Arc cycle!) and kill
+    // the entire process group including the grandchild.
+    drop(runner);
+    wait_for(Duration::from_secs(3), || async {
+        !pid_alive(grandchild_pid)
+    })
+    .await;
 }
