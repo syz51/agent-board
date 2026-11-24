@@ -3347,6 +3347,163 @@ fn approved_applies_the_change_with_the_users_login_and_quotes_their_words() {
 }
 
 #[test]
+fn approved_usage_and_timed_flags_work_and_status_usage_show_end_times() {
+    let e = env();
+    let home = user_home(&e, Some("user-token"));
+    let now = chrono::Utc::now();
+    let resets = now + chrono::Duration::hours(18);
+    let resets_fmt = resets.format("%Y-%m-%d %H:%MZ").to_string();
+
+    e.stub.on(
+        "GET /v1/usage",
+        json!({
+            "five_hour": { "percent": 15.0, "resets_at": now + chrono::Duration::hours(2) },
+            "seven_day": { "percent": 82.0, "resets_at": resets },
+            "read_at": now - chrono::Duration::minutes(2),
+            "device": "mac",
+            "reserve_until": resets,
+            "reserve_prev": 5.5,
+        }),
+    );
+
+    // 1. `board approved board update --until-reset` resolves seven_day.resets_at and sends until.
+    let mut timed_board = board_fixture("factory", &[]);
+    timed_board.parallel_tasks = 3;
+    timed_board.parallel_tasks_until = Some(resets);
+    timed_board.parallel_tasks_prev = Some(1);
+    timed_board.usage_stop_at = 99;
+    timed_board.usage_stop_at_until = Some(resets);
+    timed_board.usage_stop_at_prev = Some(90);
+    e.stub.on("POST /v1/boards/factory/approved", &timed_board);
+    e.stub.on("GET /v1/boards/factory", &timed_board);
+    e.stub.on("GET /v1/boards", [&timed_board]);
+    e.stub.on("GET /v1/agents", json!([]));
+
+    let out = run_approved(
+        &e,
+        &home,
+        &[
+            "factory",
+            "--parallel-tasks",
+            "3",
+            "--usage-stop-at",
+            "99",
+            "--until-reset",
+            "--said",
+            "just for today",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = &e.stub.requests_to("POST /v1/boards/factory/approved")[0];
+    assert_eq!(
+        sent.body,
+        json!({
+            "said": "just for today",
+            "change": {
+                "parallel_tasks": 3,
+                "usage_stop_at": 99,
+                "until": resets,
+            }
+        })
+    );
+    assert!(
+        stdout(&out).contains(&format!("until {resets_fmt}")),
+        "{}",
+        stdout(&out)
+    );
+
+    // 2. `board approved usage --reserve off --until-reset --said ...` sends to /v1/usage/approved.
+    e.stub.on(
+        "POST /v1/usage/approved",
+        json!({ "reserve": null, "until": resets, "previous": 5.5 }),
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[
+            ("T3CODE_THREAD_ID", "thread-1"),
+            ("BOARD_USER_HOME", home.to_str().unwrap()),
+        ],
+        &[
+            "approved",
+            "usage",
+            "--reserve",
+            "off",
+            "--until-reset",
+            "--said",
+            "turn off reserve today",
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sent = &e.stub.requests_to("POST /v1/usage/approved")[0];
+    assert_eq!(sent.auth.as_deref(), Some("Bearer user-token"));
+    assert_eq!(sent.agent.as_deref(), Some(ME));
+    assert_eq!(
+        sent.body,
+        json!({
+            "said": "turn off reserve today",
+            "reserve": null,
+            "until": resets,
+        })
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "applied usage reserve off until {resets_fmt} (then 5.5%)"
+        )),
+        "{text}"
+    );
+
+    // 3. `board status` shows the end times of timed board limits.
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status_text = stdout(&out);
+    assert!(
+        status_text.contains(&format!("3 tasks at once (until {resets_fmt}, then 1)")),
+        "{status_text}"
+    );
+    assert!(
+        status_text.contains(&format!(
+            "new work stops at 99% usage (until {resets_fmt}, then 90%)"
+        )),
+        "{status_text}"
+    );
+
+    // 4. `board usage` shows the end time of a timed reserve.
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let usage_text = stdout(&out);
+    assert!(
+        usage_text.contains(&format!("pace: off (until {resets_fmt}, then 5.5%)")),
+        "{usage_text}"
+    );
+
+    // 5. `board usage --reserve 10 --until 2h` sends a future `until` to PUT /v1/usage/reserve.
+    let two_hours = now + chrono::Duration::hours(2);
+    e.stub.on(
+        "PUT /v1/usage/reserve",
+        json!({ "reserve": 10.0, "until": two_hours, "previous": 5.5 }),
+    );
+    let out = e.run(&["usage", "--reserve", "10", "--until", "2h"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let put = e.stub.requests_to("PUT /v1/usage/reserve");
+    let last = put.last().unwrap();
+    assert_eq!(last.body["reserve"], 10.0);
+    assert!(last.body["until"].is_string(), "{}", last.body);
+
+    // 6. `--until-reset` with no usage reading fails cleanly before sending a write.
+    e.stub.on("GET /v1/usage", serde_json::Value::Null);
+    let out = e.run(&["usage", "--reserve", "10", "--until-reset"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no usage reading with a future reset time"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn approved_refuses_without_a_user_login_and_other_settings() {
     let e = env();
     // No token in the user home: refused before any request, with both ways on.

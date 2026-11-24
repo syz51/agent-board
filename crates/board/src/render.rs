@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use board_proto::{
     Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
     LeaseResult, Note, NoteKind, Run, RunEventRecord, SchedulerEvaluation, Stats, Task, TaskDetail,
-    TaskId, TaskStatus, Timestamp, TouchResult, Usage,
+    TaskId, TaskStatus, Timestamp, TouchResult, Usage, UsageReserve,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -645,11 +645,40 @@ pub fn board_line(board: &Board) -> String {
             None => line.push_str(" (no coordinator)"),
         }
     }
-    if board.parallel_tasks > 1 {
-        let _ = write!(line, " · {} tasks at once", board.parallel_tasks);
+    if board.parallel_tasks > 1 || board.parallel_tasks_until.is_some() {
+        let noun = if board.parallel_tasks == 1 {
+            "task"
+        } else {
+            "tasks"
+        };
+        let _ = write!(line, " · {} {noun} at once", board.parallel_tasks);
+        if let Some(until) = board.parallel_tasks_until {
+            let at = until.format("%Y-%m-%d %H:%MZ");
+            match board.parallel_tasks_prev {
+                Some(prev) => {
+                    let _ = write!(line, " (until {at}, then {prev})");
+                }
+                None => {
+                    let _ = write!(line, " (until {at})");
+                }
+            }
+        }
     }
-    if board.usage_stop_at != board_proto::USAGE_STOP_AT_DEFAULT {
+    if board.usage_stop_at != board_proto::USAGE_STOP_AT_DEFAULT
+        || board.usage_stop_at_until.is_some()
+    {
         let _ = write!(line, " · new work stops at {}% usage", board.usage_stop_at);
+        if let Some(until) = board.usage_stop_at_until {
+            let at = until.format("%Y-%m-%d %H:%MZ");
+            match board.usage_stop_at_prev {
+                Some(prev) => {
+                    let _ = write!(line, " (until {at}, then {prev}%)");
+                }
+                None => {
+                    let _ = write!(line, " (until {at})");
+                }
+            }
+        }
     }
     if !board.verdict_judges {
         line.push_str(" · verdict judges off");
@@ -688,25 +717,37 @@ pub fn board_list(boards: &[Board]) -> String {
     boards.iter().map(board_line).collect::<Vec<_>>().join("\n")
 }
 
-/// `board usage`: the reading, one line per window, then the active boards it stops from
-/// starting new work.
-/// `board usage`: the reading, the boards it holds and the pace; `reserve` is the reserve
-/// set, `None` while the pace is off.
+fn timed_reserve_suffix(reserve: &UsageReserve) -> String {
+    let Some(until) = reserve.until else {
+        return String::new();
+    };
+    let at = until.format("%Y-%m-%d %H:%MZ");
+    match reserve.previous {
+        Some(prev) => format!(" (until {at}, then {prev:.1}%)"),
+        None => format!(" (until {at}, then off)"),
+    }
+}
+
+/// `board usage`: the reading, the boards it holds and the pace; `reserve` carries the
+/// current reserve setting and any timed expiry.
 pub fn usage(
     usage: Option<&Usage>,
-    reserve: Option<f64>,
+    reserve: &UsageReserve,
     boards: &[Board],
     now: Timestamp,
 ) -> String {
+    let until_suffix = timed_reserve_suffix(reserve);
     let Some(usage) = usage else {
         let mut text = String::from(
             "no usage reading yet: a daemon (board watch) reports one every 5 minutes",
         );
-        if let Some(r) = reserve {
+        if let Some(r) = reserve.reserve {
             let _ = write!(
                 text,
-                "\npace: reserve {r:.1}% set; it applies from the first reading"
+                "\npace: reserve {r:.1}%{until_suffix} set; it applies from the first reading"
             );
+        } else if !until_suffix.is_empty() {
+            let _ = write!(text, "\npace: off{until_suffix}");
         }
         return text;
     };
@@ -750,13 +791,13 @@ pub fn usage(
         Some(p) => {
             if !usage.fresh(now) && now >= p.next_day() {
                 lines.push(format!(
-                    "pace: reserve {:.1}% · hard line {:.1}% (from a past pace day; holds until weekly reset)",
+                    "pace: reserve {:.1}%{until_suffix} · hard line {:.1}% (from a past pace day; holds until weekly reset)",
                     p.reserve,
                     p.hard_line()
                 ));
             } else {
                 lines.push(format!(
-                    "pace: reserve {:.1}% · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
+                    "pace: reserve {:.1}%{until_suffix} · today from {:.1}% to {:.1}% (allows {:.1}) · projected {:.1}% · next day {}",
                     p.reserve,
                     p.anchor,
                     p.line,
@@ -787,13 +828,17 @@ pub fn usage(
             }
         }
         None if usage.pace.is_some() => {
-            lines.push("pace: not applied (the reading is stale or its week has reset)".into())
+            lines.push(format!(
+                "pace: not applied (the reading is stale or its week has reset){until_suffix}"
+            ))
         }
-        None => match reserve {
+        None => match reserve.reserve {
             Some(r) => lines.push(format!(
-                "pace: reserve {r:.1}% set; not applied (the reading gives no weekly reset time)"
+                "pace: reserve {r:.1}%{until_suffix} set; not applied (the reading gives no weekly reset time)"
             )),
-            None => lines.push("pace: off (`board usage --reserve 5.5` turns it on)".into()),
+            None => lines.push(format!(
+                "pace: off{until_suffix} (`board usage --reserve 5.5` turns it on)"
+            )),
         },
     }
     lines.join("\n")
@@ -1648,13 +1693,20 @@ mod tests {
                 projected,
                 hard_since: hard.then_some(read_at),
             }),
+            reserve_until: None,
+            reserve_prev: None,
+        };
+        let reserve_4 = UsageReserve {
+            reserve: Some(4.0),
+            until: None,
+            previous: None,
         };
 
         // 1. Stale projected-only reading does not hold.
         let not_holding = make_usage(14.0, 18.0, 16.0, false);
         let text = usage(
             Some(&not_holding),
-            Some(4.0),
+            &reserve_4,
             std::slice::from_ref(&board),
             stale_same_day,
         );
@@ -1665,7 +1717,7 @@ mod tests {
         let same_day_breach = make_usage(32.6, 32.6, 16.0, false);
         let text = usage(
             Some(&same_day_breach),
-            Some(4.0),
+            &reserve_4,
             std::slice::from_ref(&board),
             stale_same_day,
         );
@@ -1681,7 +1733,7 @@ mod tests {
         let hard_breach = make_usage(96.0, 96.0, 16.0, true);
         let text = usage(
             Some(&hard_breach),
-            Some(4.0),
+            &reserve_4,
             std::slice::from_ref(&board),
             stale_next_day,
         );
@@ -1699,5 +1751,104 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("tasks at once by pace: factory 0"), "{text}");
+    }
+
+    #[test]
+    fn board_line_and_usage_render_timed_end_times() {
+        let now: Timestamp = "2026-11-21T12:00:00Z".parse().unwrap();
+        let until: Timestamp = "2026-11-22T01:02:00Z".parse().unwrap();
+        let mut board: Board = serde_json::from_value(json!({
+            "slug": "guwen",
+            "title": "Guwen",
+            "goal": "",
+            "status": "active",
+            "repos": [],
+            "autopilot": true,
+            "parallel_tasks": 3,
+            "parallel_tasks_until": until,
+            "parallel_tasks_prev": 1,
+            "usage_stop_at": 99,
+            "usage_stop_at_until": until,
+            "usage_stop_at_prev": 90,
+            "coordinator": null,
+            "home_devices": [],
+            "counts": { "open": 1, "doing": 0, "blocked": 0, "review": 0, "done": 0, "dropped": 0, "ready": 1 },
+            "open_asks": 0,
+            "created_at": now,
+            "updated_at": now
+        }))
+        .unwrap();
+        let line = board_line(&board);
+        assert!(
+            line.contains("3 tasks at once (until 2026-11-22 01:02Z, then 1)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("new work stops at 99% usage (until 2026-11-22 01:02Z, then 90%)"),
+            "{line}"
+        );
+
+        // A timed override that currently holds a default value (1 task) still renders.
+        board.parallel_tasks = 1;
+        board.parallel_tasks_prev = Some(2);
+        let line = board_line(&board);
+        assert!(
+            line.contains("1 task at once (until 2026-11-22 01:02Z, then 2)"),
+            "{line}"
+        );
+
+        // Usage with timed reserve temporarily off (pace = None, reading present).
+        let reading = Usage {
+            five_hour: None,
+            seven_day: Some(board_proto::UsageWindow {
+                percent: 82.0,
+                resets_at: Some(until),
+            }),
+            read_at: now - TimeDelta::minutes(2),
+            device: "air".parse().unwrap(),
+            pace: None,
+            reserve_until: Some(until),
+            reserve_prev: Some(5.5),
+        };
+        let off_timed = UsageReserve {
+            reserve: None,
+            until: Some(until),
+            previous: Some(5.5),
+        };
+        let text = usage(Some(&reading), &off_timed, &[board.clone()], now);
+        assert!(
+            text.contains("pace: off (until 2026-11-22 01:02Z, then 5.5%)"),
+            "{text}"
+        );
+
+        // Usage without any reading yet still shows timed reserve end time.
+        let text = usage(None, &off_timed, &[], now);
+        assert!(
+            text.contains("pace: off (until 2026-11-22 01:02Z, then 5.5%)"),
+            "{text}"
+        );
+
+        // Usage with active timed reserve on.
+        let active_reading = Usage {
+            pace: Some(board_proto::UsagePace {
+                reserve: 2.0,
+                day_start: now - TimeDelta::hours(2),
+                anchor: 80.0,
+                line: 98.0,
+                projected: 82.0,
+                hard_since: None,
+            }),
+            ..reading
+        };
+        let lower_timed = UsageReserve {
+            reserve: Some(2.0),
+            until: Some(until),
+            previous: Some(5.5),
+        };
+        let text = usage(Some(&active_reading), &lower_timed, &[board], now);
+        assert!(
+            text.contains("pace: reserve 2.0% (until 2026-11-22 01:02Z, then 5.5%)"),
+            "{text}"
+        );
     }
 }

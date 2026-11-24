@@ -7,13 +7,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
-    ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CancelRunRequest,
-    CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName,
-    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
-    RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent, ReplayComparison,
-    ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState, Runtime,
-    SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
+    ApprovedBoardChange, ApprovedUsageReserve, AskKind, Board, BoardChange, BoardSlug, BoardStatus,
+    CancelRunRequest, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
+    DeviceEntry, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind,
+    Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent,
+    ReplayComparison, ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState,
+    Runtime, SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
     TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    UsageReserve,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1469,12 +1470,21 @@ pub async fn boards(ctx: &Ctx, repo: Option<&str>) -> Result<Output> {
 }
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
-pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
+pub async fn usage(
+    ctx: &Ctx,
+    reserve: Option<Option<f64>>,
+    until: Option<Timestamp>,
+    now: Timestamp,
+) -> Result<Output> {
     let mut set = None;
     if let Some(reserve) = reserve {
         set = Some(
             ctx.client
-                .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                .set_usage_reserve(&UsageReserve {
+                    reserve,
+                    until,
+                    previous: None,
+                })
                 .await?,
         );
     }
@@ -1483,22 +1493,69 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
-    // A reading without a pace may still have a reserve, waiting for a weekly reset time.
-    let reserve = match (set, usage.as_ref().and_then(|u| u.pace)) {
-        (Some(set), _) => set.reserve,
-        (None, Some(p)) => Some(p.reserve),
-        (None, None) => match ctx.client.usage_reserve().await {
-            Ok(r) => r.reserve,
+    // A reading without a pace may still have a reserve or a timed override.
+    let reserve_state = match (set, &usage) {
+        (Some(set), _) => set,
+        (None, Some(u)) if u.pace.is_some() || u.reserve_until.is_some() => UsageReserve {
+            reserve: u.pace.map(|p| p.reserve),
+            until: u.reserve_until,
+            previous: u.reserve_prev,
+        },
+        (None, _) => match ctx.client.usage_reserve().await {
+            Ok(r) => r,
             Err(err) => {
                 // A server that predates the reserve: render it as off.
                 tracing::debug!("reading the usage reserve: {err:#}");
-                None
+                UsageReserve {
+                    reserve: None,
+                    until: None,
+                    previous: None,
+                }
             }
         },
     };
     Ok(Output::new(
-        render::usage(usage.as_ref(), reserve, &boards, now),
+        render::usage(usage.as_ref(), &reserve_state, &boards, now),
         &usage,
+    ))
+}
+
+/// Applies a usage reserve change the user approved in their own words (`board approved
+/// usage`), with the user's login; `ctx` comes from [`Ctx::load_user_login`].
+pub async fn usage_approved(
+    ctx: &Ctx,
+    reserve: Option<f64>,
+    until: Option<Timestamp>,
+    said: String,
+) -> Result<Output> {
+    // The event names who used the user's login; the server refuses a request without one.
+    ctx.agent()?;
+    let body = ApprovedUsageReserve {
+        said,
+        reserve,
+        until,
+    };
+    let res = ctx.client.approved_usage_reserve(&body).await?;
+    let mut desc = match res.reserve {
+        Some(n) => format!("{n:.1}%"),
+        None => "off".to_owned(),
+    };
+    if let Some(at) = res.until {
+        let then = match res.previous {
+            Some(prev) => format!("{prev:.1}%"),
+            None => "off".to_owned(),
+        };
+        desc.push_str(&format!(
+            " until {} (then {then})",
+            at.format("%Y-%m-%d %H:%MZ")
+        ));
+    }
+    Ok(Output::new(
+        format!(
+            "applied usage reserve {desc} as the user approved; the event log records you and \
+             their words"
+        ),
+        &res,
     ))
 }
 
@@ -1754,6 +1811,67 @@ pub fn parse_since(value: &str, now: Timestamp) -> Result<Timestamp> {
         Ok(Some(Some(at))) => Ok(at),
         _ => bail!(
             "since {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now (30m, 12h, 14d)"
+        ),
+    }
+}
+
+/// An `--until` argument: a future RFC 3339 time, a date (`YYYY-MM-DD`, midnight UTC), or
+/// a positive duration ahead of `now` (`30m`, `2h`, `1d`).
+pub fn parse_until(value: &str, now: Timestamp) -> Result<Timestamp> {
+    let value = value.trim();
+    let ahead = value
+        .strip_suffix(['m', 'h', 'd'])
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| match value.as_bytes()[value.len() - 1] {
+            b'm' => chrono::TimeDelta::minutes(n.into()),
+            b'h' => chrono::TimeDelta::hours(n.into()),
+            _ => chrono::TimeDelta::days(n.into()),
+        });
+    let at = if let Some(ahead) = ahead {
+        now.checked_add_signed(ahead).with_context(|| {
+            format!("until {value:?} reaches too far ahead; send a shorter duration")
+        })?
+    } else {
+        match parse_not_before(Some(value)) {
+            Ok(Some(Some(at))) => at,
+            _ => bail!(
+                "until {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration ahead (30m, 2h, 1d)"
+            ),
+        }
+    };
+    if at <= now {
+        bail!("until {value:?} is not in the future; send a future time or duration ahead");
+    }
+    Ok(at)
+}
+
+/// Resolves `--until <time>` or `--until-reset` (using the current usage reading's weekly
+/// `resets_at`, or 5-hour `resets_at` if no future weekly reset is reported).
+pub async fn resolve_until(
+    ctx: &Ctx,
+    until: Option<&str>,
+    until_reset: bool,
+    now: Timestamp,
+) -> Result<Option<Timestamp>> {
+    if let Some(raw) = until {
+        return Ok(Some(parse_until(raw, now)?));
+    }
+    if !until_reset {
+        return Ok(None);
+    }
+    let reading = ctx.client.usage().await?;
+    let reset = reading.as_ref().and_then(|u| {
+        u.seven_day
+            .and_then(|w| w.resets_at)
+            .filter(|t| *t > now)
+            .or_else(|| u.five_hour.and_then(|w| w.resets_at).filter(|t| *t > now))
+    });
+    match reset {
+        Some(at) => Ok(Some(at)),
+        None => bail!(
+            "cannot resolve --until-reset: no usage reading with a future reset time; pass \
+             --until <time> instead"
         ),
     }
 }
@@ -2577,6 +2695,35 @@ mod tests {
         }
         for bad in ["", "d", "14w", "-3d", "none", "yesterday", "100000000d"] {
             assert!(parse_since(bad, now).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn until_takes_a_future_time_date_or_duration_ahead() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        for (until, want) in [
+            ("30m", "2026-11-08T12:30:00Z"),
+            ("2h", "2026-11-08T14:00:00Z"),
+            ("1d", "2026-11-09T12:00:00Z"),
+            ("2026-11-09", "2026-11-09T00:00:00Z"),
+            ("2026-11-08T12:01:00Z", "2026-11-08T12:01:00Z"),
+        ] {
+            assert_eq!(parse_until(until, now).unwrap(), at(want), "{until}");
+        }
+        for bad in [
+            "",
+            "0m",
+            "0h",
+            "-2h",
+            "none",
+            "2026-11-08T12:00:00Z",
+            "2026-11-08T11:59:00Z",
+            "2026-11-08",
+            "tomorrow",
+            "100000000d",
+        ] {
+            assert!(parse_until(bad, now).is_err(), "{bad}");
         }
     }
 

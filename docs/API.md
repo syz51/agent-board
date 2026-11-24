@@ -272,6 +272,18 @@ server's minute sweep deletes older ones.
   `forbidden` otherwise); anyone may restate or lower it. A `Board` from a server that
   predates it reads as 90. `board board update <slug> --usage-stop-at N` sets it, and
   `board boards` shows ` · new work stops at N% usage` when it is not 90.
+  `until` (optional future RFC 3339 timestamp; 400 `invalid` if not in the future or sent
+  without `parallel_tasks` or `usage_stop_at`) makes the `parallel_tasks` and/or
+  `usage_stop_at` change temporary: the server stores the earlier baseline and expiry on
+  the board (`parallel_tasks_until`, `parallel_tasks_prev`, `usage_stop_at_until`,
+  `usage_stop_at_prev`, omitted when permanent). Extending an already-timed limit keeps the
+  original baseline; updating a limit without `until` clears its timer. The server's minute
+  sweep restores expired limits, updates live worker write locks when `parallel_tasks`
+  reverts, and records a `board_updated` event with actor `server`, `expired: true` and
+  `restored`. `board status` and `board boards` show `(until YYYY-MM-DD HH:MMZ, then <prev>)`
+  next to timed limits; the CLI accepts `--until <time>` (RFC 3339, `YYYY-MM-DD` or a
+  duration ahead such as `2h` or `1d`) or `--until-reset` (from the current usage reading's
+  `resets_at`).
   `verdict_judges` (default `true`) controls whether a home device daemon starts automatic
   verdict judges for pending proposals on the board while autopilot is off, and whether the
   server grants lease-less verdict judge registration and rights there (see "Daemon
@@ -390,17 +402,19 @@ setting with that value on that board. A general go-ahead, an older approval or 
 approval for another board is not one. An agent that has no such approval asks (route 1).
 
 1. **Approval through an ask.** `[CreateAsk]` takes `change` (`[BoardChange]`:
-   `parallel_tasks`, `usage_stop_at`, `temporary`; at least one, in range, and no other
+   `parallel_tasks`, `usage_stop_at`, `temporary`, optional future `until` for
+   `parallel_tasks`/`usage_stop_at`; at least one setting, in range, and no other
    field, else 400 `invalid`). The change is for the ask's board. The server writes the
    approving option itself, `Apply: parallel_tasks=2` (the settings as `name=value`,
-   joined by `, `), and puts it first in `options`, so the user reads what the answer
+   joined by `, `, with ` until YYYY-MM-DD HH:MMZ` when timed), and puts it first in `options`, so the user reads what the answer
    applies whatever the question says; the agent may add at most 7 options of its own.
    The `[Ask]` carries `change`. When the user answers with exactly that option (web,
    Telegram button or `board answer`), the server applies the change as the user in the
    same transaction as the answer. No agent step follows. An answer typed as that exact
    text counts as the option; spaces around it are ignored. Any other answer applies
    nothing. An approving answer never lowers `parallel_tasks` or `usage_stop_at` below
-   the board's value at that time: it leaves that setting alone and the event names it in
+   the board's value at that time, and never applies a timed limit whose `until` has
+   already passed (`expired_before_answer: true`): it leaves that setting alone and the event names it in
    `not_lowered`. The agent's own options may not start with `Apply:`. The event: actor `user`, payload `{"fields": [...],
    "parallel_tasks": 2, "approved": "ask", "ask": <id>, "agent": "<the asker>"}`.
    `ask_user` (MCP) takes `change`; `board ask` takes `--set-parallel-tasks N`,
@@ -409,17 +423,25 @@ approval for another board is not one. An agent that has no such approval asks (
    no answer applies it.
 2. **Approval in chat.** `POST /v1/boards/{slug}/approved` `[ApprovedBoardChange]` →
    `[Board]`: `said`, the user's words that approve the change (required, at most 500
-   characters), and `change` (`[BoardChange]`, as above). User only: a device token gets
+   characters), and `change` (`[BoardChange]`, as above, including optional `until`). User only: a device token gets
    403 `forbidden`, whose `next` names both routes. Unknown fields, in the body or in
    `change`, are refused (400 `invalid`), so no other board setting and no other act
    passes through it. `X-Board-Agent` is required and must name a registered agent (400 `invalid`, 404
    `not_found`), so the event always names who applied it. The event: actor that agent,
    payload `{"fields": [...], "parallel_tasks": 2, "approved": "said", "said": "<the
-   words>", "device": "<the token's device>"}`. It is recorded also when the board already
+   words>", "device": "<the token's device>"}` (plus `"until"` when timed). It is recorded also when the board already
    had the values (`fields` is then empty); the board itself is then not written.
    `board approved board update <slug> [--parallel-tasks N] [--usage-stop-at N]
-   [--temporary true|false] --said "<the user's words>"` calls it. It has no other
-   subcommand and takes no other setting. It sends the token of the user's login on the
+   [--temporary true|false] [--until <time> | --until-reset] --said "<the user's words>"`
+   calls it.
+   For lowering or turning off the account's weekly usage reserve, `POST /v1/usage/approved`
+   `[ApprovedUsageReserve]` `{said, reserve, until?}` → `[UsageReserve]` applies the same
+   user-token, registered-agent and `deny_unknown_fields` rules, records a
+   `usage_reserve_updated` event (`provider`, `account`, `from`, `to`, `by_user`, optional
+   `until`/`previous`, `approved: "said"`, `said`, `device`), and is called by
+   `board approved usage --reserve <n|off> [--until <time> | --until-reset] --said "<the
+   user's words>"`.
+   Both commands send the token of the user's login on the
    device, not the session's: the login in the user home, `$BOARD_USER_HOME`, else the
    default home's path with `-user` added (`~/.local/share/agent-board-user`), never
    `BOARD_TOKEN`. The user sets that login up once, with a token created with `--user`
@@ -1191,23 +1213,36 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   clients still hold (`0`) while `resets_at` is ahead if measured `seven_day.percent >= 100 -
   reserve` (until `resets_at`) or if still within the same pace day (`now < day_start + 24h`)
   and measured `seven_day.percent >= line`; stale `projected` burn rate alone never holds.
-- `GET /v1/usage/reserve` → `[UsageReserve]` `{reserve}`, `null` while the pace is off.
-- `PUT /v1/usage/reserve` `[UsageReserve]` → `[UsageReserve]`. `reserve` is a weekly
-  percent from 0 to below 100 that agents leave to the user, or `null` to turn the pace
-  off. Anyone may turn it on or raise it; 403 `forbidden` when an agent lowers it or turns
-  it off, which only the user may do. 400 `invalid` for a value out of range.
-- Multi-provider usage buckets (legacy `/v1/usage` and `/v1/usage/reserve` alias the
-  `('anthropic', 'default')` bucket):
+- `GET /v1/usage/reserve` → `[UsageReserve]` `{reserve, until?, previous?}`, `reserve: null`
+  while the pace is off, with `until` and `previous` present while a timed reserve override
+  is active (also carried on `[Usage]` and `[UsageBucket]` as `reserve_until` and
+  `reserve_prev`).
+- `PUT /v1/usage/reserve` `[UsageReserve]` `{reserve, until?}` → `[UsageReserve]`. `reserve`
+  is a weekly percent from 0 to below 100 that agents leave to the user, or `null` to turn
+  the pace off. Anyone may turn it on or raise it; 403 `forbidden` when an agent lowers it
+  or turns it off, which only the user may do (or an agent quoting the user through
+  `POST /v1/usage/approved`). 400 `invalid` for a value out of range or a non-future `until`.
+  When `until` is set, the server stores the earlier baseline and restores it in its minute
+  sweep (recomputing `hard_since` when a weekly reading exists), recording a
+  `usage_reserve_updated` event with actor `server`, `expired: true`, `from`, `to` and
+  `until`. Every reserve change (and every `POST /v1/usage/approved` call) records a
+  `usage_reserve_updated` event (`board: null`). `board usage` prints the timed end time
+  and restore target next to the pace status, and `board usage --reserve <n|off>` accepts
+  `--until <time>` or `--until-reset`.
+- `POST /v1/usage/approved` `[ApprovedUsageReserve]` `{said, reserve, until?}` →
+  `[UsageReserve]`. Applies a user-approved reserve change (see "Approved board changes").
+- Multi-provider usage buckets (legacy `/v1/usage`, `/v1/usage/reserve` and
+  `/v1/usage/approved` alias the `('anthropic', 'default')` bucket):
   - `GET /v1/usage/buckets` → `[UsageBucket]` list, ordered by `(provider, account)`, each
     carrying `provider`, `account`, optional `five_hour`, `seven_day`, `read_at`, `device`,
-    `reserve` and computed `pace`.
+    `reserve`, computed `pace`, and optional `reserve_until`/`reserve_prev`.
   - `PUT /v1/usage/{provider}/{account}` `[PutUsageBucket]` → `[UsageBucket]`. Device
     tokens only (403 `forbidden` otherwise). `provider` and `account` are 1 to 64
     characters of `a-z 0-9 . _ -` starting with a letter or digit (400 `invalid`
     otherwise). Validation and newest-`read_at` rules match `PUT /v1/usage`.
-  - `PUT /v1/usage/{provider}/{account}/reserve` `[PutUsageBucketReserve]` →
-    `[UsageBucket]`. Same validation and user-only lower/disable rule as
-    `PUT /v1/usage/reserve`.
+  - `PUT /v1/usage/{provider}/{account}/reserve` `[PutUsageBucketReserve]` `{reserve, until?}` →
+    `[UsageBucket]`. Same validation, timed expiry, event recording and user-only
+    lower/disable rule as `PUT /v1/usage/reserve`.
 
 ### Devices (fleet registry)
 

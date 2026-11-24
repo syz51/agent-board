@@ -1045,3 +1045,164 @@ async fn verdict_judges_defaults_to_true_and_toggles_with_board_updated_event() 
     assert_eq!(events.len(), 2);
     assert_eq!(events[1]["payload"]["fields"], json!(["verdict_judges"]));
 }
+
+#[tokio::test]
+async fn timed_board_limits_expire_and_restore_with_an_event() {
+    let t = T::new();
+    let at = |minutes: i64| super::iso(super::start() + TimeDelta::minutes(minutes));
+    t.board("factory", &[]).await;
+    t.register("t3:alpha", None, None).await;
+
+    // Invalid until: not in the future, or sent without parallel_tasks/usage_stop_at.
+    for body in [
+        json!({ "said": "lift", "change": { "parallel_tasks": 2, "until": at(0) } }),
+        json!({ "said": "lift", "change": { "parallel_tasks": 2, "until": at(-5) } }),
+        json!({ "said": "temp", "change": { "temporary": true, "until": at(60) } }),
+    ] {
+        let (s, v) = approved(&t, body.clone()).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (400, Some("invalid")),
+            "{body} {v}"
+        );
+    }
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "goal": "No limit", "until": at(60) })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+
+    // Approved timed raise of both parallel_tasks and usage_stop_at until +60m.
+    let (s, board) = approved(
+        &t,
+        json!({
+            "said": "lift limits until reset",
+            "change": { "parallel_tasks": 3, "usage_stop_at": 99, "until": at(60) }
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{board}");
+    assert_eq!(board["parallel_tasks"], 3);
+    assert_eq!(board["parallel_tasks_prev"], 1);
+    assert_eq!(board["parallel_tasks_until"], at(60));
+    assert_eq!(board["usage_stop_at"], 99);
+    assert_eq!(board["usage_stop_at_prev"], 90);
+    assert_eq!(board["usage_stop_at_until"], at(60));
+
+    let events = board_updates(&t).await;
+    let last = events.last().unwrap();
+    assert_eq!(last["actor"], "t3:alpha");
+    assert_eq!(last["payload"]["approved"], "said");
+    assert_eq!(last["payload"]["said"], "lift limits until reset");
+    assert_eq!(last["payload"]["until"], at(60));
+
+    // Before expiry (+30m): sweep changes nothing.
+    t.advance(TimeDelta::minutes(30));
+    let swept = t
+        .state
+        .write(crate::ops::boards::sweep_expired_limits)
+        .await
+        .unwrap();
+    assert_eq!(swept, 0);
+
+    // Extending parallel_tasks to 4 until +120m keeps the original permanent baseline (1).
+    let (s, extended) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 4, "until": at(120) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{extended}");
+    assert_eq!(extended["parallel_tasks"], 4);
+    assert_eq!(extended["parallel_tasks_prev"], 1);
+    assert_eq!(extended["parallel_tasks_until"], at(120));
+    assert_eq!(extended["usage_stop_at"], 99);
+    assert_eq!(extended["usage_stop_at_until"], at(60));
+
+    // At +60m: usage_stop_at expires back to 90; parallel_tasks stays 4 until +120m.
+    t.advance(TimeDelta::minutes(30));
+    let swept = t
+        .state
+        .write(crate::ops::boards::sweep_expired_limits)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    let mid = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(mid["usage_stop_at"], 90);
+    assert!(mid.get("usage_stop_at_until").is_none(), "{mid}");
+    assert!(mid.get("usage_stop_at_prev").is_none(), "{mid}");
+    assert_eq!(mid["parallel_tasks"], 4);
+    assert_eq!(mid["parallel_tasks_prev"], 1);
+    assert_eq!(mid["parallel_tasks_until"], at(120));
+
+    let events = board_updates(&t).await;
+    let ev = events.last().unwrap();
+    assert_eq!(ev["actor"], "server", "{ev}");
+    assert_eq!(ev["payload"]["expired"], true);
+    assert_eq!(ev["payload"]["usage_stop_at"], 90);
+    assert_eq!(
+        ev["payload"]["restored"]["usage_stop_at"],
+        json!({ "from": 99, "to": 90, "until": at(60) })
+    );
+
+    // At +120m: parallel_tasks expires back to 1.
+    t.advance(TimeDelta::minutes(60));
+    let swept = t
+        .state
+        .write(crate::ops::boards::sweep_expired_limits)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    let done = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(done["parallel_tasks"], 1);
+    assert!(done.get("parallel_tasks_until").is_none(), "{done}");
+    assert!(done.get("parallel_tasks_prev").is_none(), "{done}");
+
+    let events = board_updates(&t).await;
+    let ev = events.last().unwrap();
+    assert_eq!(ev["actor"], "server", "{ev}");
+    assert_eq!(ev["payload"]["expired"], true);
+    assert_eq!(ev["payload"]["parallel_tasks"], 1);
+    assert_eq!(
+        ev["payload"]["restored"]["parallel_tasks"],
+        json!({ "from": 4, "to": 1, "until": at(120) })
+    );
+
+    // A permanent update clears an active timer so the sweep does not revert it.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 2, "until": at(180) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, perm) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{perm}");
+    assert!(perm.get("parallel_tasks_until").is_none(), "{perm}");
+    t.advance(TimeDelta::minutes(90));
+    let swept = t
+        .state
+        .write(crate::ops::boards::sweep_expired_limits)
+        .await
+        .unwrap();
+    assert_eq!(swept, 0);
+    assert_eq!(
+        t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
+        2
+    );
+}

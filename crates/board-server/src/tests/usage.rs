@@ -934,3 +934,288 @@ async fn stale_hard_reserve_snapshot_names_weekly_reset_after_pace_day_passes() 
         "must not print a past next_day timestamp: {line}"
     );
 }
+
+async fn approved_reserve(t: &T, agent: Option<&str>, body: Value) -> (u16, Value) {
+    let bearer = format!("Bearer {}", t.user_token);
+    let mut headers = vec![("authorization", bearer.as_str())];
+    if let Some(agent) = agent {
+        headers.push(("x-board-agent", agent));
+    }
+    let (s, v) = t
+        .send("POST", "/v1/usage/approved", &headers, Some(body))
+        .await;
+    (s.as_u16(), v)
+}
+
+async fn reserve_events(t: &T) -> Vec<Value> {
+    let page = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "usage_reserve_updated")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn approved_usage_reserve_applies_lowering_records_words_and_expires_on_sweep() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    let reset = 3 * 24 * 60;
+    t.ok("PUT", "/v1/usage", None, Some(week_reading(0, 96.0, reset)))
+        .await;
+    t.ok(
+        "PUT",
+        "/v1/usage/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 5.5 })),
+    )
+    .await;
+    let initial = t.ok("GET", "/v1/usage", None, None).await;
+    assert!(
+        initial["pace"]["hard_since"].is_string(),
+        "96% >= 94.5% sets hard_since: {initial}"
+    );
+
+    // Lowering with a device token is refused and points to `board approved usage`.
+    let (code, err, v) = t
+        .fail(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(ME),
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("board approved usage"),
+        "{v}"
+    );
+
+    // POST /v1/usage/approved requires the user login, a registered agent, valid said/reserve/until.
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            "/v1/usage/approved",
+            Some(ME),
+            Some(json!({ "said": "turn it off", "reserve": null })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+
+    let (s, v) = approved_reserve(&t, None, json!({ "said": "off", "reserve": null })).await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    let (s, v) = approved_reserve(
+        &t,
+        Some("t3:unknown"),
+        json!({ "said": "off", "reserve": null }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (404, Some("not_found")), "{v}");
+
+    for bad in [
+        json!({ "said": " ", "reserve": null }),
+        json!({ "said": "x".repeat(501), "reserve": null }),
+        json!({ "said": "off" }),
+        json!({ "said": "off", "reserve": 100.0 }),
+        json!({ "said": "off", "reserve": null, "until": at(0) }),
+        json!({ "said": "off", "reserve": null, "extra": true }),
+    ] {
+        let (s, v) = approved_reserve(&t, Some(ME), bad.clone()).await;
+        assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{bad} {v}");
+    }
+
+    // Apply timed approved reserve turn-off until +60m.
+    let (s, res) = approved_reserve(
+        &t,
+        Some(ME),
+        json!({
+            "said": "turn off reserve until weekly reset",
+            "reserve": null,
+            "until": at(60),
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{res}");
+    assert_eq!(
+        res,
+        json!({ "reserve": null, "until": at(60), "previous": 5.5 })
+    );
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", None, None).await,
+        json!({ "reserve": null, "until": at(60), "previous": 5.5 })
+    );
+    let usage = t.ok("GET", "/v1/usage", None, None).await;
+    assert!(usage.get("pace").is_none(), "{usage}");
+    assert_eq!(usage["reserve_until"], at(60));
+    assert_eq!(usage["reserve_prev"], 5.5);
+
+    let evs = reserve_events(&t).await;
+    let ev = evs.last().unwrap();
+    assert_eq!(ev["actor"], ME);
+    assert!(ev["board"].is_null());
+    assert_eq!(
+        ev["payload"],
+        json!({
+            "provider": "anthropic",
+            "account": "default",
+            "from": 5.5,
+            "to": null,
+            "by_user": true,
+            "until": at(60),
+            "previous": 5.5,
+            "approved": "said",
+            "said": "turn off reserve until weekly reset",
+            "device": "phone",
+        })
+    );
+
+    // Repeating the same approved call still records its event.
+    let count_before = evs.len();
+    let (s, _) = approved_reserve(
+        &t,
+        Some(ME),
+        json!({
+            "said": "turn off reserve until weekly reset",
+            "reserve": null,
+            "until": at(60),
+        }),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(reserve_events(&t).await.len(), count_before + 1);
+
+    // Before expiry (+30m): sweep changes nothing.
+    t.advance(TimeDelta::minutes(30));
+    let swept = t
+        .state
+        .write(crate::ops::usage::sweep_expired_reserves)
+        .await
+        .unwrap();
+    assert_eq!(swept, 0);
+
+    // At +60m: sweep restores 5.5%, recomputes hard_since, clears timer, and writes event.
+    t.advance(TimeDelta::minutes(30));
+    let swept = t
+        .state
+        .write(crate::ops::usage::sweep_expired_reserves)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", None, None).await,
+        json!({ "reserve": 5.5 })
+    );
+    let restored = t.ok("GET", "/v1/usage", None, None).await;
+    assert_eq!(restored["pace"]["reserve"], 5.5);
+    assert!(
+        restored["pace"]["hard_since"].is_string(),
+        "restoring 5.5% with 96% weekly use recomputes hard_since: {restored}"
+    );
+    assert!(restored.get("reserve_until").is_none(), "{restored}");
+    assert!(restored.get("reserve_prev").is_none(), "{restored}");
+
+    let evs = reserve_events(&t).await;
+    let ev = evs.last().unwrap();
+    assert_eq!(ev["actor"], "server", "{ev}");
+    assert_eq!(
+        ev["payload"],
+        json!({
+            "provider": "anthropic",
+            "account": "default",
+            "from": null,
+            "to": 5.5,
+            "until": at(60),
+            "expired": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn timed_reserve_without_reading_preserves_baseline_and_cleans_up_ghost_rows() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+
+    // 1. Set 5.5% with no reading yet, then temporarily turn off until +60m: row must stay!
+    let (s, _) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.5 })))
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, off) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": null, "until": at(60) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{off}");
+    assert_eq!(
+        off,
+        json!({ "reserve": null, "until": at(60), "previous": 5.5 })
+    );
+
+    // Extending to 2.0% until +120m keeps the original 5.5% baseline.
+    let (s, ext) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": 2.0, "until": at(120) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{ext}");
+    assert_eq!(
+        ext,
+        json!({ "reserve": 2.0, "until": at(120), "previous": 5.5 })
+    );
+    t.advance(TimeDelta::minutes(120));
+    let swept = t
+        .state
+        .write(crate::ops::usage::sweep_expired_reserves)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    assert_eq!(
+        t.ok("GET", "/v1/usage/reserve", None, None).await,
+        json!({ "reserve": 5.5 })
+    );
+
+    // 2. Temporarily turn on reserve on a bucket with no reading (None -> 10.0 until +180m),
+    //    then sweep restores None and deletes the empty ghost row.
+    t.ok(
+        "PUT",
+        "/v1/usage/openai/temp/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 10.0, "until": at(180) })),
+    )
+    .await;
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let temp = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "openai" && b["account"] == "temp")
+        .expect("temp bucket exists while timed");
+    assert_eq!(temp["reserve"], 10.0);
+    assert_eq!(temp["reserve_until"], at(180));
+    assert!(temp.get("reserve_prev").is_none());
+
+    t.advance(TimeDelta::minutes(60));
+    let swept = t
+        .state
+        .write(crate::ops::usage::sweep_expired_reserves)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    assert!(
+        !buckets
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["provider"] == "openai" && b["account"] == "temp"),
+        "empty ghost bucket removed on revert to null: {buckets}"
+    );
+}
