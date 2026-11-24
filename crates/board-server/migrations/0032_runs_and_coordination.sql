@@ -92,8 +92,11 @@ CREATE TABLE conflict_locks (
     PRIMARY KEY (key, run_id)
 ) STRICT;
 
-CREATE INDEX conflict_locks_key ON conflict_locks (key);
 CREATE INDEX conflict_locks_run_id ON conflict_locks (run_id);
+
+-- Partial index for legacy judge-registration lookups in standing review verification.
+CREATE INDEX events_board_judge ON events (board, json_extract(payload, '$.judge'))
+    WHERE type = 'board_updated' AND json_extract(payload, '$.judge') IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Sticky wakes: per-device wake-up queue for active sessions

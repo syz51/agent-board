@@ -1206,7 +1206,10 @@ Section 3.3).
 - `POST /v1/runs` `[CreateRun]` → `[Run]`. Creates or submits a run. A device token may
   only create runs for its own `device` (403 `forbidden` otherwise); `--user` tokens and
   browser users may name any active device (404 `not_found` for unknown or revoked
-  devices). `kind` is one of `worker`, `review`, `verdict`, `triage`, `goal`, `merge`,
+  devices). Creating or mutating `origin: managed` runs requires the user, a device token
+  without `X-Board-Agent`, or that device's own `dispatch:<device>` header (403
+  `forbidden` for ordinary worker agents, preventing self-escalation to managed
+  judge/merger rights). `kind` is one of `worker`, `review`, `verdict`, `triage`, `goal`, `merge`,
   `housekeeping`, `command` or `interactive`; `origin` defaults to `managed` (or
   `interactive`). `state` defaults to `leased` for `managed` runs and `running` for
   `interactive` runs (allowed initial states: `queued`, `leased`, `starting`, `running`).
@@ -1228,7 +1231,8 @@ Section 3.3).
 - `GET /v1/runs/{id}` → `[Run]` with its currently held `conflict_locks` (404 `not_found`
   when missing).
 - `PATCH /v1/runs/{id}` `[UpdateRun]` → `[Run]`. Authorized for the run's owning device
-  token or the user (403 `forbidden` for any other device). Enforces the strict state
+  token or the user (403 `forbidden` for any other device, and for ordinary worker agents
+  attempting to mutate a `managed` run). Enforces the strict state
   machine (400 `invalid_transition` otherwise):
   - `queued` → `leased`, `cancelled`
   - `leased` → `starting`, `running`, `failed`, `orphaned`, `cancelled`

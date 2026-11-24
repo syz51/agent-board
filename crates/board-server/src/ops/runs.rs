@@ -192,9 +192,7 @@ struct OptionalRunFields<'a> {
     cwd: Option<&'a str>,
     title: Option<&'a str>,
     attach_hint: Option<&'a str>,
-    policy_version: Option<&'a str>,
     transcript_uri: Option<&'a str>,
-    transcript_sha256: Option<&'a str>,
     outcome: Option<&'a serde_json::Value>,
 }
 
@@ -211,14 +209,8 @@ fn check_optional_fields(fields: &OptionalRunFields<'_>) -> Result<()> {
     if let Some(hint) = fields.attach_hint {
         check_line("attach_hint", hint, 500)?;
     }
-    if let Some(pv) = fields.policy_version {
-        check_token("policy_version", pv, 64)?;
-    }
     if let Some(uri) = fields.transcript_uri {
         check_line("transcript_uri", uri, 1000)?;
-    }
-    if let Some(sha) = fields.transcript_sha256 {
-        check_token("transcript_sha256", sha, 128)?;
     }
     if let Some(val) = fields.outcome {
         let len = serde_json::to_string(val)
@@ -288,12 +280,16 @@ pub(crate) fn validate_create(mut req: CreateRun) -> Result<CreateRun> {
             ),
         ));
     }
+    req.policy_version = req
+        .policy_version
+        .as_deref()
+        .map(|pv| check_token("policy_version", pv, 64))
+        .transpose()?;
     check_optional_fields(&OptionalRunFields {
         worktree_branch: req.worktree_branch.as_deref(),
         cwd: req.cwd.as_deref(),
         title: req.title.as_deref(),
         attach_hint: req.attach_hint.as_deref(),
-        policy_version: req.policy_version.as_deref(),
         ..OptionalRunFields::default()
     })?;
     req.conflict_keys = check_conflict_keys(req.conflict_keys)?;
@@ -350,14 +346,26 @@ pub(crate) fn validate_update(mut req: UpdateRun) -> Result<UpdateRun> {
     if let Some(reason) = &req.reason {
         check_text("reason", reason, RUN_REASON_CHARS_MAX)?;
     }
+    if let Some(pv) = req.policy_version.take() {
+        req.policy_version = Some(
+            pv.as_deref()
+                .map(|s| check_token("policy_version", s, 64))
+                .transpose()?,
+        );
+    }
+    if let Some(sha) = req.transcript_sha256.take() {
+        req.transcript_sha256 = Some(
+            sha.as_deref()
+                .map(|s| check_token("transcript_sha256", s, 128))
+                .transpose()?,
+        );
+    }
     check_optional_fields(&OptionalRunFields {
         worktree_branch: req.worktree_branch.as_ref().and_then(|o| o.as_deref()),
         cwd: req.cwd.as_ref().and_then(|o| o.as_deref()),
         title: req.title.as_ref().and_then(|o| o.as_deref()),
         attach_hint: req.attach_hint.as_ref().and_then(|o| o.as_deref()),
-        policy_version: req.policy_version.as_ref().and_then(|o| o.as_deref()),
         transcript_uri: req.transcript_uri.as_ref().and_then(|o| o.as_deref()),
-        transcript_sha256: req.transcript_sha256.as_ref().and_then(|o| o.as_deref()),
         outcome: req.outcome.as_ref().and_then(|o| o.as_ref()),
     })?;
     req.conflict_keys = check_conflict_keys(req.conflict_keys)?;
@@ -664,6 +672,7 @@ pub(crate) fn update(
     id: &RunId,
     actor: &str,
     caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
     by_user: bool,
     req: UpdateRun,
 ) -> Result<Run> {
@@ -674,6 +683,22 @@ pub(crate) fn update(
             format!(
                 "only device {} or the user may update run {id}",
                 before.device
+            ),
+        ));
+    }
+    if !by_user
+        && before.origin == RunOrigin::Managed
+        && let Some(agent) = caller_agent
+        && agent.dispatch_device().as_ref() != Some(&before.device)
+    {
+        return Err(forbidden(
+            format!(
+                "agent {agent} cannot update managed run {id} on device {}",
+                before.device
+            ),
+            format!(
+                "only the user or device {}'s daemon (dispatch:{}) may update managed runs",
+                before.device, before.device
             ),
         ));
     }
@@ -691,40 +716,45 @@ pub(crate) fn update(
         ));
     }
 
-    if before.state.is_terminal() {
+    if before.state.is_terminal() || before.state == RunState::Unknown {
         if let Some(target) = req.state {
             return Err(bad_transition(
-                format!(
-                    "run {id} is already in terminal state {} and cannot transition to {}",
-                    state_str(before.state),
-                    state_str(target)
-                ),
-                "terminal runs cannot transition; create a new run instead",
+                if before.state == RunState::Unknown {
+                    format!(
+                        "run {id} is in an unknown state from a newer server and cannot transition"
+                    )
+                } else {
+                    format!(
+                        "run {id} is already in terminal state {} and cannot transition to {}",
+                        state_str(before.state),
+                        state_str(target)
+                    )
+                },
+                if before.state == RunState::Unknown {
+                    "upgrade the server before transitioning this run"
+                } else {
+                    "terminal runs cannot transition; create a new run instead"
+                },
             ));
         }
         if req.lease_ttl_secs.is_some() || req.lease_expires_at.is_some() {
             return Err(bad_transition(
                 format!(
-                    "cannot renew lease on terminal run {id} ({})",
+                    "cannot renew lease on run {id} in state {}",
                     state_str(before.state)
                 ),
-                "terminal runs hold no lease; omit lease_ttl_secs and lease_expires_at",
+                "omit lease_ttl_secs and lease_expires_at on terminal or unknown-state runs",
             ));
         }
         if !req.conflict_keys.is_empty() {
             return Err(bad_transition(
                 format!(
-                    "cannot acquire conflict locks on terminal run {id} ({})",
+                    "cannot acquire conflict locks on run {id} in state {}",
                     state_str(before.state)
                 ),
-                "terminal runs hold no conflict locks",
+                "terminal or unknown-state runs cannot acquire conflict locks",
             ));
         }
-    } else if before.state == RunState::Unknown && req.state.is_some() {
-        return Err(bad_transition(
-            format!("run {id} is in an unknown state from a newer server and cannot transition"),
-            "upgrade the server before transitioning this run",
-        ));
     }
 
     let (next_state, state_changed) = match req.state {
@@ -1101,23 +1131,29 @@ fn review_verdict(text: &str) -> Option<ReviewVerdict> {
     }
 }
 
-/// Whether `agent` was registered as a review runner or legacy review judge for `task_id` on
-/// `board` (on any device).
+/// Legacy dispatcher note prefix written when starting a review judge thread.
+const LEGACY_JUDGE_NOTE_PREFIX: &str = "note: the dispatcher started a review judge for this task:";
+
+/// Whether `agent` was registered as a managed review runner or legacy review judge for
+/// `task_id` on `board` (on any device).
 fn is_registered_reviewer(
     cx: &Ctx<'_>,
     board: &BoardSlug,
     task_id: &TaskId,
     agent: &AgentId,
 ) -> Result<bool> {
-    // 1. Registered `review` Run for this task (any device, excluding unstarted `queued` runs).
+    // 1. Registered managed `review` Run for this task (any device) that was actually
+    //    leased/started (excluding `queued` and `queued -> cancelled` runs).
     let by_run: bool = cx
         .db
         .prepare_cached(
             "SELECT EXISTS ( \
-             SELECT 1 FROM runs r \
-             WHERE r.task_id = ?1 AND r.kind = 'review' AND r.agent_id = ?2 \
-               AND r.state != 'queued' \
-         )",
+                 SELECT 1 FROM runs r \
+                 WHERE r.task_id = ?1 AND r.kind = 'review' AND r.origin = 'managed' \
+                   AND r.agent_id = ?2 \
+                   AND r.state != 'queued' \
+                   AND (r.state != 'cancelled' OR r.started_at IS NOT NULL) \
+             )",
         )?
         .query_row(params![task_id.as_str(), agent.as_str()], |r| r.get(0))?;
     if by_run {
@@ -1125,32 +1161,41 @@ fn is_registered_reviewer(
     }
 
     // 2. Legacy registered review judge (live row in `judges`, or durable `board_updated`
-    //    judge-registration event after `judges` cleanup, or legacy dispatcher start note).
+    //    judge-registration event via `events_board_judge` partial index, or exact-match
+    //    legacy dispatcher start note — never SQLite LIKE against untrusted agent ids).
+    let suffix = format!("(agent {agent})");
     let by_legacy_judge: bool = cx
         .db
         .prepare_cached(
             "SELECT EXISTS ( \
-             SELECT 1 FROM judges j \
-             WHERE j.board = ?1 AND j.agent = ?2 AND j.kind = 'review' \
-               AND EXISTS (SELECT 1 FROM json_each(j.tasks) jt WHERE jt.value = ?3) \
-         ) OR EXISTS ( \
-             SELECT 1 FROM events e \
-             WHERE e.board = ?1 AND e.type = 'board_updated' \
-               AND json_extract(e.payload, '$.judge') = ?2 \
-               AND json_extract(e.payload, '$.kind') = 'review' \
-               AND EXISTS ( \
-                   SELECT 1 FROM json_each(json_extract(e.payload, '$.tasks')) jt \
-                   WHERE jt.value = ?3 \
-               ) \
-         ) OR EXISTS ( \
-             SELECT 1 FROM notes n \
-             WHERE n.task = ?3 AND n.agent LIKE 'dispatch:%' \
-               AND n.text LIKE 'note: the dispatcher started a review judge for this task:%' \
-               AND n.text LIKE '%(agent ' || ?2 || ')' \
-         )",
+                 SELECT 1 FROM judges j \
+                 WHERE j.board = ?1 AND j.agent = ?2 AND j.kind = 'review' \
+                   AND EXISTS (SELECT 1 FROM json_each(j.tasks) jt WHERE jt.value = ?3) \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM events e \
+                 WHERE e.board = ?1 AND e.type = 'board_updated' \
+                   AND json_extract(e.payload, '$.judge') = ?2 \
+                   AND json_extract(e.payload, '$.kind') = 'review' \
+                   AND EXISTS ( \
+                       SELECT 1 FROM json_each(json_extract(e.payload, '$.tasks')) jt \
+                       WHERE jt.value = ?3 \
+                   ) \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM notes n \
+                 WHERE n.task = ?3 AND substr(n.agent, 1, 9) = 'dispatch:' \
+                   AND substr(n.text, 1, length(?4)) = ?4 \
+                   AND length(n.text) >= length(?4) + length(?5) \
+                   AND substr(n.text, -length(?5)) = ?5 \
+             )",
         )?
         .query_row(
-            params![board.as_str(), agent.as_str(), task_id.as_str()],
+            params![
+                board.as_str(),
+                agent.as_str(),
+                task_id.as_str(),
+                LEGACY_JUDGE_NOTE_PREFIX,
+                suffix,
+            ],
             |r| r.get(0),
         )?;
     Ok(by_legacy_judge)

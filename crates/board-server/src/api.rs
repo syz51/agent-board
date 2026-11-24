@@ -1173,6 +1173,28 @@ fn run_actor(caller: &Caller) -> String {
     "user".to_owned()
 }
 
+/// Checks that `caller` may create or mutate a `managed` run on `device`: the user, a
+/// device daemon without `X-Board-Agent`, or that device's own `dispatch:<device>` agent.
+/// Ordinary worker sessions (`X-Board-Agent: t3:...`, etc.) may only manage `interactive`
+/// runs, so they cannot escalate themselves to managed judge/merger rights.
+fn require_managed_run_caller(caller: &Caller, device: &DeviceName) -> Result<()> {
+    if caller.is_user() {
+        return Ok(());
+    }
+    if let Some(agent) = &caller.agent
+        && agent.dispatch_device().as_ref() != Some(device)
+    {
+        return Err(forbidden(
+            format!("agent {agent} cannot create or update managed runs on device {device}"),
+            format!(
+                "only the user or device {device}'s daemon (dispatch:{device}) may manage \
+                 managed runs; interactive sessions use origin=interactive"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn create_run(
     State(state): State<AppState>,
     caller: Caller,
@@ -1180,6 +1202,9 @@ async fn create_run(
 ) -> Result<Json<Run>> {
     caller.act_for_device(&req.device)?;
     let req = runs::validate_create(req)?;
+    if req.origin == board_proto::RunOrigin::Managed {
+        require_managed_run_caller(&caller, &req.device)?;
+    }
     let actor = run_actor(&caller);
     Ok(Json(
         state.write(move |cx| runs::create(cx, &actor, req)).await?,
@@ -1214,10 +1239,21 @@ async fn update_run(
     let req = runs::validate_update(req)?;
     let actor = run_actor(&caller);
     let device = caller.device().cloned();
+    let caller_agent = caller.agent.clone();
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| runs::update(cx, &id, &actor, device.as_ref(), by_user, req))
+            .write(move |cx| {
+                runs::update(
+                    cx,
+                    &id,
+                    &actor,
+                    device.as_ref(),
+                    caller_agent.as_ref(),
+                    by_user,
+                    req,
+                )
+            })
             .await?,
     ))
 }

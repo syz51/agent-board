@@ -11,6 +11,8 @@ const WORKER: &str = "t3:worker";
 const REVIEWER: &str = "t3:reviewer";
 const MERGER: &str = "t3:merger";
 const OUTSIDER: &str = "t3:outsider";
+const DISPATCH_MAC: &str = "dispatch:mac";
+const DISPATCH_LINUX: &str = "dispatch:linux-runner";
 
 async fn create_device(t: &T, name: &str) -> String {
     let (s, v) = t
@@ -104,13 +106,32 @@ async fn runs_crud_auth_filtering_and_open_enum_validation() {
         assert_eq!((code, err.as_str()), (400, "invalid"), "{query}: {v}");
     }
 
-    // Create a managed worker run on `mac` (board derived automatically from task_id,
-    // agent_id resolved from short handle, default 3m lease).
+    // An ordinary worker agent cannot create a managed run (prevents self-escalation to
+    // managed judge/merger rights), while an interactive run is allowed.
+    let (code, err, v) = t
+        .fail(
+            "POST",
+            "/v1/runs",
+            Some(WORKER),
+            Some(json!({
+                "task_id": task_id,
+                "kind": "merge",
+                "origin": "managed",
+                "device": "mac",
+                "runner": "acp",
+                "agent_id": WORKER,
+            })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+
+    // Create a managed worker run on `mac` as `dispatch:mac` (board derived automatically
+    // from task_id, agent_id resolved from short handle, policy_version trimmed, default 3m lease).
     let run1 = t
         .ok(
             "POST",
             "/v1/runs",
-            Some(WORKER),
+            Some(DISPATCH_MAC),
             Some(json!({
                 "task_id": task_id,
                 "kind": "worker",
@@ -121,7 +142,7 @@ async fn runs_crud_auth_filtering_and_open_enum_validation() {
                 "cwd": "/tmp/wt",
                 "title": "Worker run 1",
                 "cost_units": 2,
-                "policy_version": "v1"
+                "policy_version": " v1\n"
             })),
         )
         .await;
@@ -133,8 +154,20 @@ async fn runs_crud_auth_filtering_and_open_enum_validation() {
     assert_eq!(run1["state"], "leased");
     assert_eq!(run1["agent_id"], WORKER);
     assert_eq!(run1["cost_units"], 2);
+    assert_eq!(run1["policy_version"], "v1");
     assert!(run1["lease_expires_at"].is_string());
     assert!(run1.get("started_at").is_none());
+
+    // An ordinary worker agent cannot PATCH a managed run even on the same device.
+    let (code, err, v) = t
+        .fail(
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            Some(WORKER),
+            Some(json!({ "state": "starting" })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
 
     // Advance clock 1s and create a second interactive run on `linux-runner` via user token.
     t.advance(TimeDelta::seconds(1));
@@ -406,7 +439,8 @@ async fn run_state_machine_transitions_archival_and_rollback_safety() {
         assert_eq!((code, err.as_str()), (400, "invalid_transition"), "{v}");
     }
 
-    // Post-terminal transcript archival upload succeeds without altering terminal state.
+    // Post-terminal transcript archival upload succeeds without altering terminal state
+    // and stores trimmed token values.
     let archived = t
         .ok(
             "PATCH",
@@ -414,7 +448,7 @@ async fn run_state_machine_transitions_archival_and_rollback_safety() {
             None,
             Some(json!({
                 "transcript_uri": "s3://archive-bucket/runs/factory/run-1.tar.zst",
-                "transcript_sha256": "deadbeef0123456789"
+                "transcript_sha256": "\tdeadbeef0123456789\r\n"
             })),
         )
         .await;
@@ -426,19 +460,21 @@ async fn run_state_machine_transitions_archival_and_rollback_safety() {
     assert_eq!(archived["transcript_sha256"], "deadbeef0123456789");
 
     // Rollback safety: an unknown future state stored in SQLite is preserved on partial
-    // metadata PATCH and refused on state transition.
+    // metadata PATCH and refused on state transition, lease renewal, or lock acquisition.
     t.exec(&format!(
         "UPDATE runs SET state = 'draining_future' WHERE id = '{id}'"
     ));
-    let (code, err, _) = t
-        .fail(
-            "PATCH",
-            &format!("/v1/runs/{id}"),
-            None,
-            Some(json!({ "state": "cancelled" })),
-        )
-        .await;
-    assert_eq!((code, err.as_str()), (400, "invalid_transition"));
+    for bad in [
+        json!({ "state": "cancelled" }),
+        json!({ "lease_ttl_secs": 120 }),
+        json!({ "conflict_keys": [{ "key": "repo:example/app:write", "max": 1 }] }),
+    ] {
+        let (code, err, v) = t
+            .fail("PATCH", &format!("/v1/runs/{id}"), None, Some(bad))
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid_transition"), "{v}");
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 0);
     let patched = t
         .ok(
             "PATCH",
@@ -484,14 +520,15 @@ async fn conflict_locks_enforce_atomic_contention_and_release_on_terminal_state(
     let run1_id = run1["id"].as_str().unwrap().to_owned();
     assert_eq!(run1["conflict_locks"].as_array().unwrap().len(), 2);
 
-    // Run 2 on another device requests both `write_key` (available) AND `merge_key`
-    // (at capacity 1/1): entire request rolls back atomically with 409 claim_refused!
+    // Run 2 on another device (acting as dispatch:linux-runner) requests both `write_key`
+    // (available) AND `merge_key` (at capacity 1/1): entire request rolls back atomically
+    // with 409 claim_refused, and expected lock contention is never recorded in api_errors!
     let (s, v) = send_as_device(
         &t,
         &linux_token,
         "POST",
         "/v1/runs",
-        None,
+        Some(DISPATCH_LINUX),
         Some(json!({
             "board": "factory",
             "kind": "merge",
@@ -512,6 +549,11 @@ async fn conflict_locks_enforce_atomic_contention_and_release_on_terminal_state(
         t.count("SELECT COUNT(*) FROM conflict_locks"),
         2,
         "no leaked locks from refused run"
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM api_errors"),
+        0,
+        "expected conflict lock 409 must not record as signal friction"
     );
 
     // Run 2 requesting only `write_key` (max=2) succeeds (now 2/2).
@@ -611,7 +653,7 @@ async fn sweeper_orphans_expired_managed_runs_releases_locks_and_writes_trail_ru
         .ok(
             "POST",
             "/v1/runs",
-            Some(WORKER),
+            Some(DISPATCH_MAC),
             Some(json!({
                 "task_id": task_id,
                 "kind": "worker",
@@ -784,7 +826,7 @@ async fn live_judge_and_merger_runs_grant_coordinator_rights_across_devices_with
         &linux_token,
         "POST",
         "/v1/runs",
-        Some(OUTSIDER),
+        Some(DISPATCH_LINUX),
         Some(json!({
             "board": "factory",
             "kind": "worker",
@@ -814,7 +856,7 @@ async fn live_judge_and_merger_runs_grant_coordinator_rights_across_devices_with
         &linux_token,
         "POST",
         "/v1/runs",
-        Some(REVIEWER),
+        Some(DISPATCH_LINUX),
         Some(json!({
             "task_id": task_id,
             "kind": "review",
@@ -895,7 +937,7 @@ async fn live_judge_and_merger_runs_grant_coordinator_rights_across_devices_with
         &linux_token,
         "PATCH",
         &format!("/v1/runs/{review_run_id}"),
-        Some(REVIEWER),
+        Some(DISPATCH_LINUX),
         Some(json!({ "state": "succeeded" })),
     )
     .await;
@@ -919,7 +961,7 @@ async fn live_judge_and_merger_runs_grant_coordinator_rights_across_devices_with
         &linux_token,
         "POST",
         "/v1/runs",
-        Some(MERGER),
+        Some(DISPATCH_LINUX),
         Some(json!({
             "task_id": task_id,
             "kind": "merge",
@@ -1041,7 +1083,7 @@ async fn standing_review_pass_verifies_registered_review_run_across_devices_and_
         &linux_token,
         "POST",
         "/v1/runs",
-        Some(REVIEWER),
+        Some(DISPATCH_LINUX),
         Some(json!({
             "task_id": task_id,
             "kind": "review",
@@ -1075,7 +1117,7 @@ async fn standing_review_pass_verifies_registered_review_run_across_devices_and_
         &linux_token,
         "PATCH",
         &format!("/v1/runs/{review_run_id}"),
-        Some(REVIEWER),
+        Some(DISPATCH_LINUX),
         Some(json!({ "state": "succeeded" })),
     )
     .await;
@@ -1248,4 +1290,143 @@ async fn standing_review_pass_preserves_backward_compatibility_with_legacy_judge
         t.standing_review_pass(&task_id).is_some(),
         "standing pass survives legacy judges table cleanup"
     );
+}
+
+#[tokio::test]
+async fn standing_review_pass_rejects_interactive_queued_cancelled_and_like_wildcards() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(DISPATCH_MAC, None, None).await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(OUTSIDER, None, None).await;
+    const WILDCARD: &str = "t3:%";
+    const WRONG_CASE: &str = "t3:Real-Judge";
+    t.register(WILDCARD, None, None).await;
+    t.register(WRONG_CASE, None, None).await;
+
+    let task_id = t.task(WORKER, "factory", "Hardened review check").await;
+    assert_eq!(t.claim(WORKER, &task_id).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &task_id, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+
+    // 1. Interactive run of kind=review must NOT qualify as a managed review run.
+    t.ok(
+        "POST",
+        "/v1/runs",
+        Some(OUTSIDER),
+        Some(json!({
+            "task_id": task_id,
+            "kind": "review",
+            "origin": "interactive",
+            "device": "mac",
+            "runner": "t3",
+            "agent_id": OUTSIDER
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task_id}/notes"),
+        Some(OUTSIDER),
+        Some(json!({ "agent": OUTSIDER, "kind": "decision", "text": "review: pass. Fake" })),
+    )
+    .await;
+    assert_eq!(t.standing_review_pass(&task_id), None);
+
+    // 2. Managed review run cancelled directly from `queued` (never leased/started) must NOT qualify.
+    let q = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "task_id": task_id,
+                "kind": "review",
+                "origin": "managed",
+                "device": "mac",
+                "runner": "acp",
+                "agent_id": OUTSIDER,
+                "state": "queued"
+            })),
+        )
+        .await;
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{}", q["id"].as_str().unwrap()),
+        Some(DISPATCH_MAC),
+        Some(json!({ "state": "cancelled" })),
+    )
+    .await;
+    assert_eq!(t.standing_review_pass(&task_id), None);
+
+    // 3. Legacy dispatcher note ending in `(agent t3:real-judge)` must NOT match SQLite LIKE
+    //    wildcard agent `t3:%` or case-variant `t3:Real-Judge`.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task_id}/notes"),
+        Some(DISPATCH_MAC),
+        Some(json!({
+            "agent": DISPATCH_MAC,
+            "kind": "note",
+            "text": "note: the dispatcher started a review judge for this task: Review (agent t3:real-judge)"
+        })),
+    )
+    .await;
+    for impostor in [WILDCARD, WRONG_CASE] {
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{task_id}/notes"),
+            Some(impostor),
+            Some(json!({ "agent": impostor, "kind": "decision", "text": "review: pass. Spoofed" })),
+        )
+        .await;
+        assert_eq!(
+            t.standing_review_pass(&task_id),
+            None,
+            "{impostor} must not match legacy judge note"
+        );
+    }
+}
+
+#[tokio::test]
+async fn end_unseen_skips_agent_with_live_managed_judge_run_until_expiry() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, None, None).await;
+
+    // Create a managed review run with a 2-hour lease so it outlives `owner_left_secs` (1h).
+    t.ok(
+        "POST",
+        "/v1/runs",
+        Some(DISPATCH_MAC),
+        Some(json!({
+            "board": "factory",
+            "kind": "review",
+            "device": "mac",
+            "runner": "acp",
+            "agent_id": REVIEWER,
+            "state": "running",
+            "lease_ttl_secs": 7200
+        })),
+    )
+    .await;
+
+    // After 61m unseen: WORKER ends, while REVIEWER is protected by its live managed run.
+    t.advance(TimeDelta::minutes(61));
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(
+        [WORKER, REVIEWER].map(|a| t.state_of(a)),
+        ["ended", "running"]
+    );
+
+    // Once the run's 2h lease expires and is swept, `end_unseen` ends REVIEWER too.
+    t.advance(TimeDelta::minutes(60));
+    assert_eq!(t.sweep_runs(), 1);
+    assert_eq!(t.end_unseen(), 1);
+    assert_eq!(t.state_of(REVIEWER), "ended");
 }
