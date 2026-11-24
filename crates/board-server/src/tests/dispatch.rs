@@ -1643,3 +1643,595 @@ async fn kind_priority_drains_wip_before_workers_and_pace_limit_zero_holds_llm_o
         r["holds_summary"]
     );
 }
+
+#[tokio::test]
+async fn diff_review_edge_cases_wakes_auth_goal_retry_spells_locks_and_cross_device_command() {
+    let t = T::new();
+    let tok_a = create_device(&t, "mac-a").await;
+    let tok_b = create_device(&t, "mac-b").await;
+    let tok_never_hb = create_device(&t, "mac-silent").await;
+    // Give mac-a and mac-b fresh heartbeats; leave mac-silent without any heartbeat.
+    for (dev, tok) in [("mac-a", &tok_a), ("mac-b", &tok_b)] {
+        let (s, _) = send_as(
+            &t,
+            tok,
+            "PUT",
+            &format!("/v1/devices/{dev}/heartbeat"),
+            None,
+            Some(json!({ "runners": ["acp", "deterministic"], "repos": [REPO] })),
+        )
+        .await;
+        assert_eq!(s, 200);
+    }
+
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(ASKER, Some(REPO), None).await;
+    autopilot_board(&t, "edge", &[REPO], 2).await;
+
+    // 1. Live managed run + pending sticky wake protects against premature AnswerGoneAsker,
+    //    worker agents cannot read/ack device wakes (403), and terminal run update expires wakes.
+    let ask_task = t.task(ASKER, "edge", "Waiting external ask").await;
+    assert_eq!(t.claim(ASKER, &ask_task).await.0, 200);
+    assert_eq!(
+        t.patch(
+            ASKER,
+            &ask_task,
+            json!({ "status": "blocked", "blocked_reason": "need decision" })
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, run_v) = send_as(
+        &t,
+        &tok_a,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "edge",
+            "task_id": ask_task,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "mac-a",
+            "runner": "acp",
+            "agent_id": ASKER,
+            "state": "running"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{run_v}");
+    let run_id = run_v["id"].as_str().unwrap().to_owned();
+    let (s, _) = send_as(
+        &t,
+        &tok_a,
+        "PATCH",
+        &format!("/v1/runs/{run_id}"),
+        None,
+        Some(json!({ "state": "waiting_external", "lease_ttl_secs": 3600 })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let ask_id = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(ASKER),
+            Some(json!({
+                "agent": ASKER,
+                "board": "edge",
+                "task": ask_task,
+                "kind": "decision",
+                "question": "Pick one",
+                "options": ["A", "B"]
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    // Mark ASKER turn ended (simulating turn finishing while run stays in waiting_external).
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{ASKER}/state"),
+        Some(ASKER),
+        Some(json!({ "state": "ended", "paused_until": null })),
+    )
+    .await;
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{ask_id}/answer"),
+            Some(json!({ "answer": "A" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+
+    // Ordinary worker agent on mac-a is forbidden from reading or acking mac-a's wakes!
+    let (s, wakes) = send_as(
+        &t,
+        &tok_a,
+        "GET",
+        "/v1/devices/mac-a/wakes",
+        Some(WORKER),
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "worker must not read device wakes: {wakes}");
+    let (s, wakes) = send_as(&t, &tok_a, "GET", "/v1/devices/mac-a/wakes", None, None).await;
+    assert_eq!(s, 200, "{wakes}");
+    let wake_id = wakes[0]["id"].as_i64().unwrap();
+    let (s, ack_err) = send_as(
+        &t,
+        &tok_a,
+        "POST",
+        &format!("/v1/wakes/{wake_id}/ack"),
+        Some(WORKER),
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "worker must not ack device wakes: {ack_err}");
+
+    // Another device cannot hijack AnswerGoneAsker while mac-a's managed run is live!
+    let (s, resp) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 4,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["housekeeping"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "live waiting_external run must suppress AnswerGoneAsker: {resp}"
+    );
+
+    // Cancelling the run immediately expires its pending sticky wake (visible immediately
+    // without waiting for sweep_expired).
+    let (s, _) = send_as(
+        &t,
+        &tok_a,
+        "PATCH",
+        &format!("/v1/runs/{run_id}"),
+        None,
+        Some(json!({ "state": "cancelled" })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, wakes) = send_as(&t, &tok_a, "GET", "/v1/devices/mac-a/wakes", None, None).await;
+    assert_eq!(s, 200);
+    assert!(
+        wakes.as_array().unwrap().is_empty(),
+        "terminal run transition must expire pending wakes immediately: {wakes}"
+    );
+
+    // 2. Two gone-asker answered asks on the SAME task: max_claims=4 leases at most ONE
+    //    housekeeping run for that task in a single dispatch call.
+    let ask_id_2 = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(ASKER),
+            Some(json!({
+                "agent": ASKER,
+                "board": "edge",
+                "task": ask_task,
+                "kind": "decision",
+                "question": "Pick second",
+                "options": ["C", "D"]
+            })),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{ask_id_2}/answer"),
+            Some(json!({ "answer": "C" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    // Creating ask_id_2 touched ASKER; mark ASKER ended again so both answered asks are orphaned.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{ASKER}/state"),
+        Some(ASKER),
+        Some(json!({ "state": "ended", "paused_until": null })),
+    )
+    .await;
+    let (s, resp) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 8,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["housekeeping"],
+            "max_claims": 4
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(
+        resp["claimed"].as_array().unwrap().len(),
+        1,
+        "must not lease two concurrent housekeeping runs for the same task: {resp}"
+    );
+
+    // 3. Quota-paused waiting_external run is preserved past sticky_grace_secs while a
+    //    never-heartbeated device's waiting_external run IS orphaned.
+    let paused_agent = "t3:paused-quota";
+    t.register(paused_agent, Some(REPO), None).await;
+    let reset_at = t.state.now() + TimeDelta::hours(2);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{paused_agent}/state"),
+        Some(paused_agent),
+        Some(json!({ "state": "paused", "paused_until": super::iso(reset_at) })),
+    )
+    .await;
+    let (s, paused_run) = send_as(
+        &t,
+        &tok_a,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "edge",
+            "kind": "worker",
+            "origin": "managed",
+            "device": "mac-a",
+            "runner": "acp",
+            "agent_id": paused_agent,
+            "state": "running"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{paused_run}");
+    let paused_run_id = paused_run["id"].as_str().unwrap().to_owned();
+    let (s, _) = send_as(
+        &t,
+        &tok_a,
+        "PATCH",
+        &format!("/v1/runs/{paused_run_id}"),
+        None,
+        Some(json!({ "state": "waiting_external", "lease_ttl_secs": 3600 })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, silent_run) = send_as(
+        &t,
+        &tok_never_hb,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "edge",
+            "kind": "worker",
+            "origin": "managed",
+            "device": "mac-silent",
+            "runner": "acp",
+            "state": "running"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{silent_run}");
+    let silent_run_id = silent_run["id"].as_str().unwrap().to_owned();
+    let (s, _) = send_as(
+        &t,
+        &tok_never_hb,
+        "PATCH",
+        &format!("/v1/runs/{silent_run_id}"),
+        None,
+        Some(json!({ "state": "waiting_external", "lease_ttl_secs": 3600 })),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // Advance 11m (> sticky_grace_secs=10m, < paused_until=2h): sweep_expired must keep
+    // paused_run_id alive and orphan silent_run_id!
+    t.advance(TimeDelta::minutes(11));
+    let swept = t
+        .state
+        .write(crate::ops::runs::sweep_expired)
+        .await
+        .expect("sweep");
+    assert!(swept >= 1);
+    let (_, paused_after) = send_as(
+        &t,
+        &tok_a,
+        "GET",
+        &format!("/v1/runs/{paused_run_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        paused_after["state"], "waiting_external",
+        "quota-paused waiting_external run must survive sticky grace"
+    );
+    let (_, silent_after) = send_as(
+        &t,
+        &tok_never_hb,
+        "GET",
+        &format!("/v1/runs/{silent_run_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        silent_after["state"], "orphaned",
+        "never-heartbeated stale device run must trigger sticky fallback"
+    );
+
+    // 4. Failed/orphaned goal run does NOT suppress retrying goal review on another device.
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({
+            "slug": "goal-retry",
+            "title": "Goal Retry",
+            "goal": "Ship v1",
+            "autopilot": true,
+            "repos": [REPO]
+        })),
+    )
+    .await;
+    let gtask = t.task(WORKER, "goal-retry", "Only task").await;
+    assert_eq!(t.claim(WORKER, &gtask).await.0, 200);
+    assert_eq!(t.done(WORKER, &gtask, check(0)).await.0, 200);
+    // Refresh mac-b heartbeat and claim goal run.
+    let (s, _) = send_as(
+        &t,
+        &tok_b,
+        "PUT",
+        "/v1/devices/mac-b/heartbeat",
+        None,
+        Some(json!({ "runners": ["acp", "deterministic"], "repos": [REPO] })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, r) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let goal_run_1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    // Fail the first goal run -> goal review must become claimable again!
+    let (s, _) = send_as(
+        &t,
+        &tok_b,
+        "PATCH",
+        &format!("/v1/runs/{goal_run_1}"),
+        None,
+        Some(json!({ "state": "starting" })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = send_as(
+        &t,
+        &tok_b,
+        "PATCH",
+        &format!("/v1/runs/{goal_run_1}"),
+        None,
+        Some(json!({ "state": "failed" })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, r) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(
+        r["claimed"][0]["run"]["kind"], "goal",
+        "failed goal run must not suppress retry: {r}"
+    );
+    assert_ne!(r["claimed"][0]["run"]["id"], goal_run_1);
+
+    // 5. ReleaseAwayOwner does not sum idle_doing notices across two distinct spells for a
+    //    running agent that heartbeats in between.
+    autopilot_board(&t, "spells", &[REPO], 2).await;
+    let runner_agent = "t3:spell-runner";
+    t.register(runner_agent, Some(REPO), None).await;
+    let stask = t.task(runner_agent, "spells", "Spell task").await;
+    assert_eq!(t.claim(runner_agent, &stask).await.0, 200);
+    // Spell 1: silent 31m -> 1st idle_doing notice.
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    // Heartbeat -> starts a fresh spell without emitting agent_state_changed.
+    t.advance(TimeDelta::minutes(4));
+    t.register(runner_agent, Some(REPO), None).await;
+    // Spell 2: silent 31m -> 1st notice of spell 2, then wait 6m (> 5m release grace).
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    t.advance(TimeDelta::minutes(6));
+    let (s, r) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 8,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["housekeeping"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["task_id"] != stask),
+        "must not sum idle_doing across distinct spells: {r}"
+    );
+
+    // 6. Claiming a queued command run from another device clears cross-device `dispatch:<other>`.
+    let (s, qcmd) = send_as(
+        &t,
+        &tok_a,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "spells",
+            "kind": "command",
+            "origin": "managed",
+            "device": "mac-a",
+            "runner": "deterministic",
+            "agent_id": "dispatch:mac-a",
+            "state": "queued",
+            "cost_units": 1,
+            "title": "Cross-device queued cmd"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{qcmd}");
+    let qcmd_id = qcmd["id"].as_str().unwrap().to_owned();
+    let (s, r) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 4,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["command"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["run"]["id"], qcmd_id);
+    assert_eq!(r["claimed"][0]["run"]["device"], "mac-b");
+    assert!(
+        r["claimed"][0]["run"]["agent_id"].is_null(),
+        "claiming queued command on another device must clear cross-device dispatch agent_id: {r}"
+    );
+
+    // 7. Raising board.parallel_tasks preserves explicit cross-repo locks and stricter run locks.
+    let other_repo = "github.com/example/other-repo";
+    autopilot_board(&t, "lock-sync", &[REPO], 2).await;
+    let ltask = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lock-sync",
+                "title": "Explicit lock task",
+                "conflict_keys": [{ "key": format!("repo:{other_repo}:write"), "max": 4 }]
+            }),
+        )
+        .await;
+    let (s, lrun) = send_as(
+        &t,
+        &tok_a,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "lock-sync",
+            "task_id": ltask,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "mac-a",
+            "runner": "acp",
+            "state": "running",
+            "conflict_keys": [
+                { "key": format!("repo:{REPO}:write"), "max": 1 },
+                { "key": format!("repo:{other_repo}:write"), "max": 4 }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{lrun}");
+    // Raise parallel_tasks 2 -> 4, then lower 4 -> 1:
+    // - stricter run-level lock on REPO (max=1) must NEVER widen to 4
+    // - explicit cross-repo lock on other_repo (max=4) must NEVER shrink to 1
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/lock-sync",
+            Some(json!({ "parallel_tasks": 4 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let read_locks = || async {
+        t.state
+            .read(move |cx| {
+                let mut stmt = cx.db.prepare(
+                    "SELECT key, max_holders FROM conflict_locks \
+                     WHERE key IN (?1, ?2) ORDER BY key",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![
+                            format!("repo:{REPO}:write"),
+                            format!("repo:{other_repo}:write")
+                        ],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+    };
+    let expected_locks = vec![
+        (format!("repo:{REPO}:write"), 1),
+        (format!("repo:{other_repo}:write"), 4),
+    ];
+    assert_eq!(
+        read_locks().await,
+        expected_locks,
+        "raising parallel_tasks must not widen stricter run-level lock"
+    );
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/lock-sync",
+            Some(json!({ "parallel_tasks": 1 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    assert_eq!(
+        read_locks().await,
+        expected_locks,
+        "lowering parallel_tasks must not shrink explicit cross-repo lock"
+    );
+}

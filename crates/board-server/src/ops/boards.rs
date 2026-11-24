@@ -384,6 +384,7 @@ fn apply(
     // board's `updated_at` moves only when the board does.
     if changed {
         let new_parallel = req.parallel_tasks.unwrap_or(before.parallel_tasks);
+        let next_repos = req.repos.unwrap_or(before.repos);
         // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
         // only turns that began before it.
         cx.db.execute(
@@ -398,7 +399,7 @@ fn apply(
                 req.title.unwrap_or(before.title),
                 req.goal.unwrap_or(before.goal),
                 enum_str(&req.status.unwrap_or(before.status)),
-                serde_json::to_string(&req.repos.unwrap_or(before.repos)).expect("serializes"),
+                serde_json::to_string(&next_repos).expect("serializes"),
                 req.autopilot.unwrap_or(before.autopilot),
                 serde_json::to_string(&req.home_devices.unwrap_or(before.home_devices))
                     .expect("serializes"),
@@ -410,24 +411,56 @@ fn apply(
                 req.verdict_judges.unwrap_or(before.verdict_judges),
             ],
         )?;
-        // Keep derived `repo:<repo>:write` semaphore bounds on live managed worker runs in sync
-        // with `board.parallel_tasks`, while preserving any stricter explicit task conflict_key.
+        // Keep only the task's derived `repo:<effective_repo>:write` semaphore bound on live
+        // managed worker runs in sync with `board.parallel_tasks`, without touching explicit
+        // cross-repo locks or widening stricter run-level locks.
         if new_parallel != before.parallel_tasks {
-            let rows: Vec<(String, String, Option<String>)> = cx
+            struct WorkerWriteLock {
+                key: String,
+                run_id: String,
+                cur_max: u32,
+                task_repo: Option<String>,
+                task_keys_json: Option<String>,
+            }
+            let rows: Vec<WorkerWriteLock> = cx
                 .db
                 .prepare_cached(
-                    "SELECT cl.key, cl.run_id, t.conflict_keys_json \
+                    "SELECT cl.key, cl.run_id, cl.max_holders, t.repo, t.conflict_keys_json \
                      FROM conflict_locks cl \
                      JOIN runs r ON r.id = cl.run_id \
-                     LEFT JOIN tasks t ON t.id = r.task_id \
+                     JOIN tasks t ON t.id = r.task_id \
                      WHERE r.board = ?1 \
                        AND r.kind = 'worker' \
                        AND r.origin = 'managed' \
                        AND cl.key LIKE 'repo:%:write'",
                 )?
-                .query_map([slug.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map([slug.as_str()], |r| {
+                    Ok(WorkerWriteLock {
+                        key: r.get(0)?,
+                        run_id: r.get(1)?,
+                        cur_max: r.get(2)?,
+                        task_repo: r.get(3)?,
+                        task_keys_json: r.get(4)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<_>>()?;
-            for (key, run_id, task_keys_json) in rows {
+            for WorkerWriteLock {
+                key,
+                run_id,
+                cur_max,
+                task_repo,
+                task_keys_json,
+            } in rows
+            {
+                let effective_repo = task_repo
+                    .as_deref()
+                    .or_else(|| next_repos.first().map(String::as_str));
+                let Some(repo) = effective_repo else {
+                    continue;
+                };
+                if key != format!("repo:{repo}:write") {
+                    continue;
+                }
                 let explicit_min = task_keys_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<Vec<ConflictKeySpec>>(s).ok())
@@ -436,11 +469,24 @@ fn apply(
                     .filter(|spec| spec.key == key)
                     .map(|spec| spec.max)
                     .min();
-                let next_max = explicit_min.map_or(new_parallel, |m| m.min(new_parallel));
-                cx.db.execute(
-                    "UPDATE conflict_locks SET max_holders = ?1 WHERE key = ?2 AND run_id = ?3",
-                    params![next_max, key, run_id],
-                )?;
+                let prev_expected =
+                    explicit_min.map_or(before.parallel_tasks, |m| m.min(before.parallel_tasks));
+                if new_parallel > before.parallel_tasks && cur_max < prev_expected {
+                    // Run holds a stricter lock than the board's previous derived cap; keep it.
+                    continue;
+                }
+                let derived_next = explicit_min.map_or(new_parallel, |m| m.min(new_parallel));
+                let next_max = if new_parallel < before.parallel_tasks {
+                    cur_max.min(derived_next)
+                } else {
+                    derived_next
+                };
+                if next_max != cur_max {
+                    cx.db.execute(
+                        "UPDATE conflict_locks SET max_holders = ?1 WHERE key = ?2 AND run_id = ?3",
+                        params![next_max, key, run_id],
+                    )?;
+                }
             }
         }
     }

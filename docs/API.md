@@ -1255,19 +1255,24 @@ Section 3.3).
   releases all held `conflict_locks`, expires any pending `sticky_wakes` for that run, and
   records a `run_orphaned` Trail Rule event carrying `run_id`, `device`, `worktree_branch`,
   `task`, `cause: "lease_expired"`, `lease_expires_at`, `expired_by_ms`, `released_locks`,
-  and `expired_wakes`. Managed `waiting_external` runs whose hosting device's `heartbeat_at`
-  is stale beyond `sticky_grace_secs` (default 600s / 10m) are similarly orphaned with
-  `cause: "device_stale_sticky_fallback"`, and any remaining pending `sticky_wakes` for
-  terminal runs or stale devices past `sticky_grace_secs` are marked expired with a Trail
-  Rule `run_updated` fallback event so recovery becomes immediately claimable by another
-  awake device.
+  and `expired_wakes`. Managed `waiting_external` runs whose hosting device was revoked or
+  whose heartbeat (falling back to device `created_at`) is stale beyond `sticky_grace_secs`
+  (default 600s / 10m) — unless paused for a quota reset (`paused_until > now`) on an
+  unrevoked device — are similarly orphaned (`cause: "device_stale_sticky_fallback"` or
+  `"device_revoked_sticky_fallback"`), and any remaining pending `sticky_wakes` for
+  terminal runs, revoked devices, or stale devices past `sticky_grace_secs` are marked
+  expired with a Trail Rule `run_updated` fallback event so recovery becomes immediately
+  claimable by another awake device.
 - **Sticky wakes**:
   - `GET /v1/devices/{name}/wakes` → `[StickyWake]` list (oldest first) of undelivered,
-    unexpired wakes routed to `{name}`. Device-self only (or `--user` token; 403 `forbidden`
-    for another device token; 404 `not_found` for unknown or revoked devices).
+    unexpired wakes for non-terminal runs routed to `{name}`. Authorized only for `{name}`'s
+    device daemon (no `X-Board-Agent` or `dispatch:{name}`) or a `--user` token (403
+    `forbidden` for other devices or ordinary worker agents; 404 `not_found` for unknown or
+    revoked devices).
   - `POST /v1/wakes/{id}/ack` → `[StickyWake]`. Marks `delivered_at` (idempotent once set).
-    Authorized for the wake's owning device token or a `--user` token (403 `forbidden`
-    otherwise; 404 `not_found` when missing).
+    Authorized only for the wake's owning device daemon (no `X-Board-Agent` or
+    `dispatch:{device}`) or a `--user` token (403 `forbidden` otherwise; 404 `not_found`
+    when missing).
 - **Atomic pull dispatch (`POST /v1/dispatch/claim`)**:
   - `POST /v1/dispatch/claim` `[DispatchClaimRequest]` → `[DispatchClaimResponse]`
     `{claimed, holds_summary}`. Authorized for the named device's own bearer token (or a

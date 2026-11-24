@@ -403,6 +403,7 @@ pub(crate) fn claim(
 
     let mut remaining_units = req.free_units;
     let mut claimed_keys: HashSet<String> = HashSet::new();
+    let mut claimed_task_kinds: HashSet<(TaskId, RunKind)> = HashSet::new();
     let mut claimed: Vec<ClaimedRun> = Vec::new();
     let mut first_pass_holds: Vec<(String, DispatchHoldReason, String)> = Vec::new();
 
@@ -412,6 +413,12 @@ pub(crate) fn claim(
 
         for cand in &candidates {
             if claimed_keys.contains(&cand.key) {
+                continue;
+            }
+            if cand.kind != RunKind::Command
+                && let Some(ref tid) = cand.task_id
+                && claimed_task_kinds.contains(&(tid.clone(), cand.kind))
+            {
                 continue;
             }
             if !req.supported_kinds.contains(&cand.kind) {
@@ -506,6 +513,14 @@ pub(crate) fn claim(
         let granted = grant_candidate(cx, actor, &req.device, winner, &chosen_runner, breakdown)?;
         remaining_units = remaining_units.saturating_sub(winner.cost_units);
         claimed_keys.insert(winner.key.clone());
+        if winner.kind != RunKind::Command {
+            if let Some(ref tid) = winner.task_id {
+                claimed_task_kinds.insert((tid.clone(), winner.kind));
+            }
+            for tid in &winner.tasks {
+                claimed_task_kinds.insert((tid.clone(), winner.kind));
+            }
+        }
 
         // Update in-transaction accounting for subsequent rounds in this same call.
         for spec in &winner.conflict_keys {
@@ -1199,7 +1214,8 @@ fn enumerate_housekeeping(
     let cutoff = cx.stale_cutoff();
 
     // (a) Answered asks on active autopilot boards whose asking agent is gone/unreachable
-    //     while the task is still held (`doing | blocked | review`).
+    //     while the task is still held (`doing | blocked | review`) and no live managed run
+    //     or pending sticky wake is actively handling wake-up for that agent.
     let gone_asks: Vec<(i64, BoardSlug, TaskId, AgentId, Priority, i64)> = cx
         .db
         .prepare_cached(
@@ -1217,6 +1233,19 @@ fn enumerate_housekeeping(
                    ag.id IS NULL \
                    OR (ag.state = 'ended' AND (ag.paused_until IS NULL OR ag.paused_until <= ?1)) \
                    OR (ag.last_seen <= ?2 AND NOT (ag.state = 'paused' AND ag.paused_until > ?1)) \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM runs r \
+                   WHERE r.agent_id = a.agent \
+                     AND r.origin = 'managed' \
+                     AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
+                     AND (r.lease_expires_at IS NULL OR r.lease_expires_at > ?1) \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM sticky_wakes sw \
+                   WHERE sw.agent_id = a.agent \
+                     AND sw.delivered_at IS NULL \
+                     AND (sw.expires_at IS NULL OR sw.expires_at > ?1) \
                ) \
              ORDER BY a.answered_at, a.id",
         )?
@@ -1328,20 +1357,33 @@ fn enumerate_housekeeping(
             .db
             .prepare_cached(ENTERED_DOING)?
             .query_row([task.id.as_str()], |r| r.get(0))?;
-        let (count, last_notice_at, idle_since): (i64, Option<i64>, Option<String>) = cx
+        let running = state == "running";
+        // Match `ops::tasks::announce_idle_doing` spell boundaries: group by `idle_doing`
+        // spell timestamp and, when `running`, only count notices at/after `last_seen`.
+        let spell: Option<(i64, i64, String)> = cx
             .db
             .prepare_cached(
-                "SELECT COUNT(*), MAX(at), MAX(json_extract(payload, '$.idle_doing')) \
+                "SELECT COUNT(*), MAX(at), json_extract(payload, '$.idle_doing') AS spell \
                  FROM events \
                  WHERE task = ?1 AND seq > ?2 AND type = 'task_updated' \
                    AND json_extract(payload, '$.idle_doing') IS NOT NULL \
-                   AND json_extract(payload, '$.away') = ?3",
+                   AND json_extract(payload, '$.away') = ?3 \
+                   AND (?4 IS NULL OR at >= ?4) \
+                 GROUP BY spell \
+                 ORDER BY MAX(seq) DESC \
+                 LIMIT 1",
             )?
             .query_row(
-                params![task.id.as_str(), last_run.max(entered), owner.as_str()],
+                params![
+                    task.id.as_str(),
+                    last_run.max(entered),
+                    owner.as_str(),
+                    running.then_some(last_seen)
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-        let Some(noticed_at) = last_notice_at else {
+            )
+            .optional()?;
+        let Some((count, noticed_at, idle_since)) = spell else {
             continue;
         };
         if count < 2 {
@@ -1354,9 +1396,8 @@ fn enumerate_housekeeping(
         if last_seen > noticed_at {
             continue;
         }
-        let away_since = idle_since
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        let away_since = DateTime::parse_from_rfc3339(&idle_since)
+            .ok()
             .map(|dt| dt.to_utc());
         out.push(Candidate {
             key: lock_key.clone(),
@@ -1403,7 +1444,10 @@ fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i
 fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
     let run_at: Option<i64> = cx
         .db
-        .prepare_cached("SELECT MAX(created_at) FROM runs WHERE board = ?1 AND kind = 'goal'")?
+        .prepare_cached(
+            "SELECT MAX(created_at) FROM runs \
+             WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
+        )?
         .query_row([board.as_str()], |r| r.get(0))?;
     let event_at: Option<i64> = cx
         .db
@@ -1791,31 +1835,47 @@ fn grant_candidate(
     let score = breakdown.total();
     let policy_version = SCHEDULER_POLICY_VERSION_DEFAULT;
 
-    let (run_id, event_type) = if let Some(ref existing_id) = cand.existing_queued_run {
-        let updated = cx.db.execute(
-            "UPDATE runs SET state = 'leased', device = ?2, runner = ?3, \
-             lease_expires_at = ?4, policy_version = ?5, updated_at = ?6 \
+    let (run_id, event_type, cleared_agent) =
+        if let Some(ref existing_id) = cand.existing_queued_run {
+            // Clear any cross-device `dispatch:<other>` agent_id before reassigning device so the
+            // run never violates the device/dispatch-agent invariant.
+            let existing_agent: Option<String> = cx
+                .db
+                .prepare_cached("SELECT agent_id FROM runs WHERE id = ?1 AND state = 'queued'")?
+                .query_row([existing_id.as_str()], |r| r.get(0))
+                .optional()?
+                .flatten();
+            let clear_agent = existing_agent
+                .as_deref()
+                .and_then(|s| s.parse::<AgentId>().ok())
+                .and_then(|a| a.dispatch_device())
+                .is_some_and(|d| d != *device);
+            let updated = cx.db.execute(
+                "UPDATE runs SET state = 'leased', device = ?2, runner = ?3, \
+             agent_id = CASE WHEN ?4 THEN NULL ELSE agent_id END, \
+             lease_expires_at = ?5, policy_version = ?6, updated_at = ?7 \
              WHERE id = ?1 AND state = 'queued'",
-            params![
-                existing_id.as_str(),
-                device.as_str(),
-                chosen_runner,
-                lease_expires_at,
-                policy_version,
-                now,
-            ],
-        )?;
-        if updated == 0 {
-            return Err(crate::error::refused(
-                format!("queued run {existing_id} was already claimed"),
-                "retry POST /v1/dispatch/claim",
-            ));
-        }
-        (existing_id.clone(), EventType::RunUpdated)
-    } else {
-        let id = new_run_id(cx)?;
-        cx.db.execute(
-            "INSERT INTO runs ( \
+                params![
+                    existing_id.as_str(),
+                    device.as_str(),
+                    chosen_runner,
+                    clear_agent,
+                    lease_expires_at,
+                    policy_version,
+                    now,
+                ],
+            )?;
+            if updated == 0 {
+                return Err(crate::error::refused(
+                    format!("queued run {existing_id} was already claimed"),
+                    "retry POST /v1/dispatch/claim",
+                ));
+            }
+            (existing_id.clone(), EventType::RunUpdated, clear_agent)
+        } else {
+            let id = new_run_id(cx)?;
+            cx.db.execute(
+                "INSERT INTO runs ( \
                  id, task_id, board, kind, origin, device, runner, agent_id, state, \
                  lease_expires_at, worktree_branch, cwd, title, attach_hint, cost_units, \
                  policy_version, created_at, started_at, ended_at, updated_at \
@@ -1824,23 +1884,23 @@ fn grant_candidate(
                  ?8, NULL, NULL, ?9, NULL, ?10, \
                  ?11, ?12, NULL, NULL, ?12 \
              )",
-            params![
-                id.as_str(),
-                cand.task_id.as_ref().map(TaskId::as_str),
-                cand.board.as_str(),
-                enum_str(&cand.kind),
-                enum_str(&RunOrigin::Managed),
-                device.as_str(),
-                chosen_runner,
-                lease_expires_at,
-                cand.title,
-                cand.cost_units,
-                policy_version,
-                now,
-            ],
-        )?;
-        (id, EventType::RunCreated)
-    };
+                params![
+                    id.as_str(),
+                    cand.task_id.as_ref().map(TaskId::as_str),
+                    cand.board.as_str(),
+                    enum_str(&cand.kind),
+                    enum_str(&RunOrigin::Managed),
+                    device.as_str(),
+                    chosen_runner,
+                    lease_expires_at,
+                    cand.title,
+                    cand.cost_units,
+                    policy_version,
+                    now,
+                ],
+            )?;
+            (id, EventType::RunCreated, false)
+        };
 
     let acquired = acquire_conflict_locks(cx, &run_id, &cand.conflict_keys)?;
 
@@ -1861,7 +1921,11 @@ fn grant_candidate(
     if cand.existing_queued_run.is_some() {
         payload["from"] = serde_json::json!(RunState::Queued);
         payload["to"] = serde_json::json!(RunState::Leased);
-        payload["fields"] = serde_json::json!(["state", "device", "runner"]);
+        let mut fields = vec!["state", "device", "runner"];
+        if cleared_agent {
+            fields.push("agent_id");
+        }
+        payload["fields"] = serde_json::json!(fields);
     }
     if !acquired.is_empty() {
         payload["conflict_keys"] = serde_json::json!(acquired);

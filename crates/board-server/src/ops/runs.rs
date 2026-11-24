@@ -940,10 +940,13 @@ pub(crate) fn update(
         fields.push("conflict_keys");
     }
 
-    let released_locks = if state_changed && next_state.is_terminal() {
-        release_conflict_locks(cx, id)?
+    let (released_locks, expired_wakes) = if state_changed && next_state.is_terminal() {
+        (
+            release_conflict_locks(cx, id)?,
+            expire_run_wakes(cx, id, now)?,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     if fields.is_empty() && !lease_changed {
@@ -1030,6 +1033,9 @@ pub(crate) fn update(
         if !released_locks.is_empty() {
             payload["released_locks"] = serde_json::json!(released_locks);
         }
+        if !expired_wakes.is_empty() {
+            payload["expired_wakes"] = serde_json::json!(expired_wakes);
+        }
         cx.emit(
             before.board.as_ref(),
             actor,
@@ -1109,23 +1115,55 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         )?;
     }
 
-    // 2. Managed `waiting_external` runs whose hosting device's heartbeat is stale beyond
-    //    `sticky_grace_secs`: orphan them and expire their sticky wakes so another awake
-    //    device can pick up recovery immediately.
-    let stale_waiting: Vec<(Run, i64)> = cx
+    // 2. Managed `waiting_external` runs whose hosting device was revoked or whose heartbeat
+    //    (falling back to `created_at` if never heartbeated) is stale beyond `sticky_grace_secs`:
+    //    orphan them and expire their sticky wakes so another awake device can pick up recovery.
+    //    Runs paused on quota (`agents.state IN ('paused', 'ended') AND paused_until > now`)
+    //    stay intact while their device is merely asleep/stale (not revoked).
+    struct StaleWaiting {
+        run: Run,
+        heartbeat_at: Option<i64>,
+        device_created_at: i64,
+        device_revoked_at: Option<i64>,
+    }
+    let stale_waiting: Vec<StaleWaiting> = cx
         .db
         .prepare_cached(&format!(
-            "SELECT {RUN_COLUMNS}, d.heartbeat_at FROM runs r \
+            "SELECT {RUN_COLUMNS}, d.heartbeat_at, d.created_at, d.revoked_at FROM runs r \
              JOIN devices d ON d.name = r.device \
+             LEFT JOIN agents ag ON ag.id = r.agent_id \
              WHERE r.origin = 'managed' \
                AND r.state = 'waiting_external' \
-               AND d.heartbeat_at IS NOT NULL \
-               AND d.heartbeat_at <= ?1 \
-             ORDER BY d.heartbeat_at, r.id"
+               AND ( \
+                   d.revoked_at IS NOT NULL \
+                   OR ( \
+                       COALESCE(d.heartbeat_at, d.created_at) <= ?1 \
+                       AND NOT ( \
+                           ag.id IS NOT NULL \
+                           AND ag.state IN ('paused', 'ended') \
+                           AND ag.paused_until IS NOT NULL \
+                           AND ag.paused_until > ?2 \
+                       ) \
+                   ) \
+               ) \
+             ORDER BY COALESCE(d.heartbeat_at, d.created_at), r.id"
         ))?
-        .query_map([sticky_cutoff], |r| Ok((run_row(r)?, r.get(23)?)))?
+        .query_map(params![sticky_cutoff, now], |r| {
+            Ok(StaleWaiting {
+                run: run_row(r)?,
+                heartbeat_at: r.get(23)?,
+                device_created_at: r.get(24)?,
+                device_revoked_at: r.get(25)?,
+            })
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    for (run, heartbeat_at) in &stale_waiting {
+    for StaleWaiting {
+        run,
+        heartbeat_at,
+        device_created_at,
+        device_revoked_at,
+    } in &stale_waiting
+    {
         let released = release_conflict_locks(cx, &run.id)?;
         let expired_wakes = expire_run_wakes(cx, &run.id, now)?;
         cx.db.execute(
@@ -1133,7 +1171,13 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
              ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
             params![run.id.as_str(), now],
         )?;
-        let stale_by_ms = now.saturating_sub(*heartbeat_at);
+        let last_seen_ms = heartbeat_at.unwrap_or(*device_created_at);
+        let stale_by_ms = now.saturating_sub(last_seen_ms);
+        let cause = if device_revoked_at.is_some() {
+            "device_revoked_sticky_fallback"
+        } else {
+            "device_stale_sticky_fallback"
+        };
         let mut payload = serde_json::json!({
             "run_id": run.id,
             "kind": run.kind,
@@ -1141,10 +1185,15 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
             "to": RunState::Orphaned,
             "device": run.device,
             "runner": run.runner,
-            "cause": "device_stale_sticky_fallback",
-            "heartbeat_at": ts(*heartbeat_at),
+            "cause": cause,
             "stale_by_ms": stale_by_ms,
         });
+        if let Some(hb) = heartbeat_at {
+            payload["heartbeat_at"] = serde_json::json!(ts(*hb));
+        }
+        if let Some(rev) = device_revoked_at {
+            payload["revoked_at"] = serde_json::json!(ts(*rev));
+        }
         if let Some(ref agent) = run.agent_id {
             payload["agent_id"] = serde_json::json!(agent);
         }
@@ -1166,29 +1215,44 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         )?;
     }
 
-    // 3. Pending sticky wakes whose run is already terminal or whose device's heartbeat is
-    //    stale beyond `sticky_grace_secs`: mark expired with a Trail Rule fallback event.
+    // 3. Pending sticky wakes whose run is already terminal, whose device is revoked/missing,
+    //    or whose device's heartbeat (falling back to `created_at`) is stale beyond
+    //    `sticky_grace_secs` (unless the target run is waiting on a quota reset): mark expired
+    //    with a Trail Rule fallback event.
     struct FallbackWake {
         wake: StickyWake,
         board: Option<BoardSlug>,
         task_id: Option<TaskId>,
         run_state: Option<String>,
         heartbeat_at: Option<i64>,
+        device_revoked_at: Option<i64>,
     }
     let fallback_wakes: Vec<FallbackWake> = cx
         .db
         .prepare_cached(
             "SELECT sw.id, sw.run_id, sw.agent_id, sw.device, sw.kind, sw.payload_json, \
                     sw.created_at, sw.delivered_at, sw.expires_at, \
-                    r.board, r.task_id, r.state, d.heartbeat_at \
+                    r.board, r.task_id, r.state, d.heartbeat_at, d.revoked_at \
              FROM sticky_wakes sw \
              LEFT JOIN runs r ON r.id = sw.run_id \
              LEFT JOIN devices d ON d.name = sw.device \
+             LEFT JOIN agents ag ON ag.id = COALESCE(sw.agent_id, r.agent_id) \
              WHERE sw.delivered_at IS NULL \
                AND (sw.expires_at IS NULL OR sw.expires_at > ?1) \
                AND ( \
                    r.state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
-                   OR (d.heartbeat_at IS NOT NULL AND d.heartbeat_at <= ?2) \
+                   OR d.name IS NULL \
+                   OR d.revoked_at IS NOT NULL \
+                   OR ( \
+                       COALESCE(d.heartbeat_at, d.created_at) <= ?2 \
+                       AND NOT ( \
+                           r.state = 'waiting_external' \
+                           AND ag.id IS NOT NULL \
+                           AND ag.state IN ('paused', 'ended') \
+                           AND ag.paused_until IS NOT NULL \
+                           AND ag.paused_until > ?1 \
+                       ) \
+                   ) \
                ) \
              ORDER BY sw.created_at, sw.id",
         )?
@@ -1205,6 +1269,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
                     .transpose()?,
                 run_state: r.get::<_, Option<String>>(11)?,
                 heartbeat_at: r.get::<_, Option<i64>>(12)?,
+                device_revoked_at: r.get::<_, Option<i64>>(13)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -1214,6 +1279,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         task_id,
         run_state,
         heartbeat_at,
+        device_revoked_at,
     } in &fallback_wakes
     {
         cx.db.execute(
@@ -1227,6 +1293,8 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
             )
         }) {
             "sticky_wake_run_terminal"
+        } else if device_revoked_at.is_some() {
+            "sticky_wake_device_revoked"
         } else {
             "sticky_wake_device_stale"
         };
@@ -1238,6 +1306,9 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
             "cause": cause,
             "expired_at": ts(now),
         });
+        if let Some(rev) = device_revoked_at {
+            payload["revoked_at"] = serde_json::json!(ts(*rev));
+        }
         if let Some(ref run_id) = wake.run_id {
             payload["run_id"] = serde_json::json!(run_id);
         }
@@ -1346,8 +1417,8 @@ pub(crate) fn enqueue_sticky_wake_for_agent(
     Ok(Some(cx.db.last_insert_rowid()))
 }
 
-/// Lists undelivered, unexpired sticky wakes for `device`, oldest first
-/// (`GET /v1/devices/{name}/wakes`).
+/// Lists undelivered, unexpired sticky wakes for `device` whose target run (if any) is still
+/// non-terminal, oldest first (`GET /v1/devices/{name}/wakes`).
 pub(crate) fn list_device_wakes(cx: &Ctx<'_>, device: &DeviceName) -> Result<Vec<StickyWake>> {
     if !cx.exists(
         "SELECT 1 FROM devices WHERE name = ?1 AND revoked_at IS NULL",
@@ -1361,22 +1432,28 @@ pub(crate) fn list_device_wakes(cx: &Ctx<'_>, device: &DeviceName) -> Result<Vec
     let now = cx.now_ms();
     Ok(cx
         .db
-        .prepare_cached(&format!(
-            "SELECT {STICKY_WAKE_COLUMNS} FROM sticky_wakes \
-             WHERE device = ?1 AND delivered_at IS NULL \
-               AND (expires_at IS NULL OR expires_at > ?2) \
-             ORDER BY created_at, id"
-        ))?
+        .prepare_cached(
+            "SELECT sw.id, sw.run_id, sw.agent_id, sw.device, sw.kind, sw.payload_json, \
+                    sw.created_at, sw.delivered_at, sw.expires_at \
+             FROM sticky_wakes sw \
+             LEFT JOIN runs r ON r.id = sw.run_id \
+             WHERE sw.device = ?1 AND sw.delivered_at IS NULL \
+               AND (sw.expires_at IS NULL OR sw.expires_at > ?2) \
+               AND (r.id IS NULL OR r.state NOT IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled')) \
+             ORDER BY sw.created_at, sw.id",
+        )?
         .query_map(params![device.as_str(), now], sticky_wake_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Marks sticky wake `id` delivered (`POST /v1/wakes/{id}/ack`). Authorized for the wake's
-/// owning device token or a user token; idempotent once delivered.
+/// owning device daemon (no `X-Board-Agent` or `dispatch:<device>`) or a user token;
+/// idempotent once delivered.
 pub(crate) fn ack_wake(
     cx: &mut Ctx<'_>,
     id: i64,
     caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
     by_user: bool,
 ) -> Result<StickyWake> {
     let wake = cx
@@ -1392,14 +1469,30 @@ pub(crate) fn ack_wake(
                 "GET /v1/devices/{name}/wakes lists pending wakes for your device",
             )
         })?;
-    if !by_user && caller_device != Some(&wake.device) {
-        return Err(forbidden(
-            format!("sticky wake {id} belongs to device {}", wake.device),
-            format!(
-                "only device {} or the user may acknowledge sticky wake {id}",
-                wake.device
-            ),
-        ));
+    if !by_user {
+        if caller_device != Some(&wake.device) {
+            return Err(forbidden(
+                format!("sticky wake {id} belongs to device {}", wake.device),
+                format!(
+                    "only device {} or the user may acknowledge sticky wake {id}",
+                    wake.device
+                ),
+            ));
+        }
+        if let Some(agent) = caller_agent
+            && agent.dispatch_device().as_ref() != Some(&wake.device)
+        {
+            return Err(forbidden(
+                format!(
+                    "agent {agent} cannot acknowledge sticky wake {id} on device {}",
+                    wake.device
+                ),
+                format!(
+                    "only the user or device {}'s daemon (dispatch:{}) may acknowledge sticky wakes",
+                    wake.device, wake.device
+                ),
+            ));
+        }
     }
     if wake.delivered_at.is_none() {
         cx.db.execute(

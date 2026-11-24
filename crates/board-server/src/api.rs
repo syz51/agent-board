@@ -1169,6 +1169,7 @@ async fn list_device_wakes(
 ) -> Result<Json<Vec<StickyWake>>> {
     let name: DeviceName = parse_path(&name)?;
     caller.act_for_device(&name)?;
+    require_managed_run_caller(&caller, &name)?;
     Ok(Json(
         state
             .read(move |cx| runs::list_device_wakes(cx, &name))
@@ -1182,10 +1183,11 @@ async fn ack_wake(
     Path(id): Path<i64>,
 ) -> Result<Json<StickyWake>> {
     let device = caller.device().cloned();
+    let agent = caller.agent.clone();
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| runs::ack_wake(cx, id, device.as_ref(), by_user))
+            .write(move |cx| runs::ack_wake(cx, id, device.as_ref(), agent.as_ref(), by_user))
             .await?,
     ))
 }
