@@ -51,6 +51,22 @@ pub struct AgentLocal {
     /// fetched still reach the agent. A subagent asks from the later of the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_seq: Option<i64>,
+    /// Mid-turn context queued by `PostToolUse` for runtimes whose `PostToolUse` hook cannot
+    /// inject context directly (Antigravity): flushed on the next `UserPromptSubmit` /
+    /// `PreInvocation` hook.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_context: Vec<String>,
+    /// Halt reason queued by `PostToolUse` for runtimes whose `PostToolUse` hook cannot stop
+    /// a turn directly (Antigravity): enforced on the next `PreToolUse` (`decision: "deny"`)
+    /// and `UserPromptSubmit` / `PreInvocation` (`terminationBehavior: "terminate"`).
+    /// Cleared at turn boundaries ([`AgentLocal::end_turn_hold`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_halt: Option<String>,
+    /// Antigravity `PreInvocation` `initialNumSteps` for the active turn: constant across
+    /// every model invocation within one turn and larger on the next user turn, so mid-turn
+    /// `PreInvocation` hooks do not reset `turn_seen_at` / `hold_told`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_initial_steps: Option<u64>,
 }
 
 /// An overlap alert the hooks showed: a peer's lease or edit of a path, as of `at`.
@@ -69,13 +85,42 @@ pub const OVERLAP_REPEAT: TimeDelta = TimeDelta::hours(1);
 /// Shown alerts are remembered this long, and at most this many.
 const OVERLAP_MEMORY: TimeDelta = TimeDelta::days(1);
 const OVERLAPS_KEPT: usize = 200;
+/// Maximum queued `PostToolUse` context messages retained before a `PreInvocation` flush.
+const PENDING_CONTEXT_MAX: usize = 20;
 
 impl AgentLocal {
-    /// Forgets what the current turn knew of the hold: its prompt's time and whether the
-    /// prompt showed the hold. For a new prompt, a new session, and the end of a turn.
+    /// Forgets what the current turn knew of the hold: its prompt's time, whether the
+    /// prompt showed the hold, and any pending Antigravity halt or turn step marker.
+    /// For a new prompt, a new session, and the end of a turn.
     pub fn end_turn_hold(&mut self) {
         self.turn_seen_at = None;
         self.hold_told = false;
+        self.pending_halt = None;
+        self.turn_initial_steps = None;
+    }
+
+    /// Queues mid-turn context for delivery on the next `UserPromptSubmit` / `PreInvocation`
+    /// hook, skipping empty or already-queued entries and bounding the queue.
+    pub fn queue_context(&mut self, text: String) {
+        if text.is_empty()
+            || self
+                .pending_context
+                .iter()
+                .any(|existing| existing == &text)
+        {
+            return;
+        }
+        self.pending_context.push(text);
+        let excess = self
+            .pending_context
+            .len()
+            .saturating_sub(PENDING_CONTEXT_MAX);
+        self.pending_context.drain(..excess);
+    }
+
+    /// Drains all queued mid-turn context messages so they are delivered once.
+    pub fn take_pending_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_context)
     }
 
     /// The agent is held, as of the last heartbeat, by a pause that came after its turn
@@ -236,6 +281,7 @@ pub fn runtime_name(runtime: Runtime) -> &'static str {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
         Runtime::Opencode => "opencode",
+        Runtime::Antigravity => "antigravity",
     }
 }
 
@@ -729,6 +775,39 @@ mod tests {
         };
         save_agent(&home, &agent, &state).unwrap();
         assert_eq!(load_agent(&home, &agent), state);
+    }
+
+    #[test]
+    fn pending_context_deduplicates_bounds_and_drains_once() {
+        let mut local = AgentLocal::default();
+        local.queue_context(String::new());
+        assert!(local.pending_context.is_empty());
+        local.queue_context("first".into());
+        local.queue_context("first".into());
+        local.queue_context("second".into());
+        assert_eq!(local.pending_context, vec!["first", "second"]);
+        assert_eq!(local.take_pending_context(), vec!["first", "second"]);
+        assert!(local.take_pending_context().is_empty());
+
+        for i in 0..(PENDING_CONTEXT_MAX + 5) {
+            local.queue_context(format!("msg-{i}"));
+        }
+        assert_eq!(local.pending_context.len(), PENDING_CONTEXT_MAX);
+        assert_eq!(local.pending_context.first().unwrap(), "msg-5");
+        assert_eq!(
+            local.pending_context.last().unwrap(),
+            &format!("msg-{}", PENDING_CONTEXT_MAX + 4)
+        );
+
+        local.turn_seen_at = Some("2030-01-01T10:00:00Z".parse().unwrap());
+        local.hold_told = true;
+        local.pending_halt = Some("paused".into());
+        local.turn_initial_steps = Some(7);
+        local.end_turn_hold();
+        assert_eq!(local.turn_seen_at, None);
+        assert!(!local.hold_told);
+        assert_eq!(local.pending_halt, None);
+        assert_eq!(local.turn_initial_steps, None);
     }
 
     #[test]

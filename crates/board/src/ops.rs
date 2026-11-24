@@ -174,8 +174,9 @@ impl Ctx {
                 let runtime = match agent.source() {
                     AgentSource::Codex => Runtime::Codex,
                     AgentSource::Opencode => Runtime::Opencode,
+                    AgentSource::Antigravity => Runtime::Antigravity,
                     // A dispatch agent runs no model: it names the runtime of the threads
-                    // it starts, Claude.
+                    // it starts, or Claude by default.
                     AgentSource::T3 | AgentSource::Claude | AgentSource::Dispatch => {
                         Runtime::Claude
                     }
@@ -987,6 +988,15 @@ pub struct TaskChanges {
 pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result<Output> {
     let before = ctx.client.task(id).await?.task;
     let wanted_owner = changes.owner.clone();
+    // The server keeps a drop reason as a note even when the task changes no field.
+    let sends_reason = changes.reason.is_some();
+    // These fields only decide when an open task may start, so on a closed task they wait
+    // for a reopen.
+    let sets_readiness = changes.status.is_none()
+        && (changes.auto.is_some()
+            || changes.not_before.is_some()
+            || changes.rank.is_some()
+            || changes.blockers.is_some());
     let task = ctx
         .client
         .update_task(
@@ -1012,7 +1022,18 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
     if let Some(wanted) = &wanted_owner {
         check_owner(ctx, &task, wanted).await?;
     }
-    let mut text = format!("updated {}", render::task_line(&task));
+    // Every change but a rank alone raises the version; the server answers a request that
+    // changes nothing with the task as it was.
+    let changed = task.version != before.version || task.rank != before.rank || sends_reason;
+    let verb = if changed { "updated" } else { "no change to" };
+    let mut text = format!("{verb} {}", render::task_line(&task));
+    if sets_readiness && task.status.is_closed() {
+        text.push_str(&format!(
+            "\n{id} is {}, so auto, not_before, rank and blockers do not start it. If the \
+             work is still wanted, reopen it: task_update {id} status=open (board update {id} --status open)",
+            render::enum_str(&task.status)
+        ));
+    }
     if released(ctx, Some(&before), &task) {
         text.push('\n');
         text.push_str(RELEASE_REMINDER);
@@ -1577,6 +1598,15 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
             "updated board {slug}, but the server ignored usage_stop_at={wanted}: it predates \
              usage awareness. Upgrade the server, then run board board update {slug} \
              --usage-stop-at {wanted}"
+        );
+    }
+    if let Some(wanted) = body.verdict_judges
+        && board.verdict_judges != wanted
+    {
+        bail!(
+            "updated board {slug}, but the server ignored verdict_judges={wanted}: it predates \
+             the verdict_judges setting. Upgrade the server, then run board board update {slug} \
+             --verdict-judges {wanted}"
         );
     }
     let mut text = format!("updated {}", render::board_line(&board));

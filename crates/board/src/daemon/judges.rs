@@ -4,7 +4,7 @@
 //! Each reconcile reads what the board needs judged, and starts a judge thread for each
 //! need while fewer than [`JUDGES_AT_ONCE`] run:
 //! - a task in `review` with no standing `review: pass` gets a review judge, in a worktree
-//!   on the head of its pull request;
+//!   on the head of its pull request (or on its base branch when already merged);
 //! - pending proposals get a verdict judge per parent task, at most
 //!   [`JUDGE_TASKS_AT_ONCE`] proposals each;
 //! - ready items on the feedback board get a triage judge;
@@ -24,7 +24,10 @@ use board_proto::{
 };
 
 use super::*;
-use crate::gh::{Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, repo_of};
+use crate::gh::{
+    Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, pull_request_url_in,
+    repo_of,
+};
 
 /// The most judges of one board at work at once; the rest wait, the oldest need first.
 pub const JUDGES_AT_ONCE: usize = 2;
@@ -335,13 +338,14 @@ fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
     }
 }
 
-/// The pull request the newest note of a task names.
-fn noted_pr(detail: &TaskDetail) -> Option<String> {
+/// The pull request the newest note of a task names, in one of the board's `repos` when
+/// the board lists any.
+fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
     detail
         .notes
         .iter()
         .rev()
-        .find_map(|n| pull_request_url(&n.text))
+        .find_map(|n| pull_request_url_in(&n.text, repos))
 }
 
 /// The checks a pass note records, one `check: <command> => <exit code>` line each.
@@ -492,7 +496,7 @@ impl<T: T3> Daemon<T> {
                         tasks: vec![task.id.clone()],
                         title: format!("review {} {}", task.id, task.title),
                         since: task.updated_at,
-                        pr: noted_pr(&detail),
+                        pr: noted_pr(&detail, &board.repos),
                     });
                 }
             }
@@ -623,7 +627,7 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
-            let limit = self.run_limit();
+            let limit = self.daemon_run_limit();
             let verdicts = self.home_verdict_runs();
             let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
             let full = self.load_unknown().is_some() || self.runs() >= limit;
@@ -889,8 +893,13 @@ impl<T: T3> Daemon<T> {
     ) -> Result<()> {
         let worktree = match (want.kind, want.tasks.first()) {
             (JudgeKind::Review, Some(task)) => {
-                let head = match &want.pr {
+                let base = match &want.pr {
                     Some(pr) => match self.gh.view(project, pr).await {
+                        // A merged pull request's head branch may be deleted or pre-squash:
+                        // review the landed code on its base branch instead.
+                        Ok(pr) if pr.state == PrState::Merged => {
+                            (!pr.base_ref.is_empty()).then_some(pr.base_ref)
+                        }
                         // A fork's branch is not on `origin`.
                         Ok(pr) => (!pr.cross_repository).then_some(pr.head_ref),
                         Err(err) => {
@@ -900,7 +909,7 @@ impl<T: T3> Daemon<T> {
                     },
                     None => None,
                 };
-                crate::worktree::review_worktree(project, task, head.as_deref(), now)
+                crate::worktree::review_worktree(project, task, base.as_deref(), now)
                     .await
                     .context("preparing the review judge's worktree")?
             }
@@ -920,9 +929,15 @@ impl<T: T3> Daemon<T> {
         // On disk before T3 can create the thread.
         self.put_run(&run);
         self.save()?;
+        let model = self
+            .ctx
+            .config
+            .judge_model
+            .as_ref()
+            .or(self.ctx.config.thread_model.as_ref());
         let thread = self
             .t3
-            .start_thread(project, &run.title, &brief, worktree.as_ref())
+            .start_thread(project, &run.title, &brief, worktree.as_ref(), model)
             .await?;
         thread_agent(&thread)
             .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
@@ -1426,5 +1441,55 @@ mod tests {
         let summary = passed_summary(&text);
         assert_eq!(summary.chars().count(), SUMMARY_CHARS_MAX);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn noted_pr_picks_the_newest_url_in_the_boards_repositories() {
+        let repos = ["github.com/o/r".to_owned()];
+        let own = note(
+            1,
+            "t3:worker",
+            NoteKind::Finding,
+            "PR https://github.com/o/r/pull/38 opened",
+            "2026-11-13T08:37:00Z",
+        );
+        let short = note(
+            2,
+            "t3:worker",
+            NoteKind::Decision,
+            "PR o/r#38 squash-merged as 22b65998f3",
+            "2026-11-13T09:05:00Z",
+        );
+        let other = note(
+            3,
+            "t3:worker",
+            NoteKind::Note,
+            "related https://github.com/o/other/pull/99",
+            "2026-11-13T09:10:00Z",
+        );
+        let d = detail(vec![own, short, other], serde_json::json!([]));
+        assert_eq!(
+            noted_pr(&d, &repos).as_deref(),
+            Some("https://github.com/o/r/pull/38")
+        );
+        assert_eq!(
+            noted_pr(&d, &[]).as_deref(),
+            Some("https://github.com/o/other/pull/99")
+        );
+
+        // A note naming both the board's PR and a later PR in another repo still picks the
+        // board's PR.
+        let mixed = note(
+            4,
+            "t3:worker",
+            NoteKind::Note,
+            "PR https://github.com/o/r/pull/41 opened; related https://github.com/o/other/pull/99",
+            "2026-11-13T09:15:00Z",
+        );
+        let d = detail(vec![mixed], serde_json::json!([]));
+        assert_eq!(
+            noted_pr(&d, &repos).as_deref(),
+            Some("https://github.com/o/r/pull/41")
+        );
     }
 }

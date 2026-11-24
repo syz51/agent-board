@@ -651,6 +651,9 @@ pub fn board_line(board: &Board) -> String {
     if board.usage_stop_at != board_proto::USAGE_STOP_AT_DEFAULT {
         let _ = write!(line, " · new work stops at {}% usage", board.usage_stop_at);
     }
+    if !board.verdict_judges {
+        line.push_str(" · verdict judges off");
+    }
     line
 }
 

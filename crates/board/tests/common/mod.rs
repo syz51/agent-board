@@ -568,6 +568,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         autopilot: false,
         parallel_tasks: 1,
         usage_stop_at: board_proto::USAGE_STOP_AT_DEFAULT,
+        verdict_judges: true,
         coordinator: None,
         dispatch: Default::default(),
         home_devices: Vec::new(),

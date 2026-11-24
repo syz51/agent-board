@@ -619,3 +619,40 @@ async fn one_home_device_at_a_time_registers_verdict_judges_on_a_board_off_autop
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["registered_by"], AIR);
 }
+
+#[tokio::test]
+async fn disabling_verdict_judges_refuses_leaseless_registration_and_ends_rights() {
+    let t = dispatched().await;
+    let id = parked(&t, "other").await;
+    update_board(&t, "other", json!({ "home_devices": ["mac"] })).await;
+    let verdict = json!({ "agent": JUDGE, "kind": "verdict", "tasks": [id] });
+
+    // Default `verdict_judges: true` allows lease-less verdict judge registration and rights.
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    let listed = t.ok("GET", "/v1/boards/other/judges", None, None).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+
+    // Opting out ends existing lease-less rights and refuses new lease-less registration.
+    update_board(&t, "other", json!({ "verdict_judges": false })).await;
+    assert!(!may_hand_over(&t, JUDGE, &id).await);
+    let listed = t.ok("GET", "/v1/boards/other/judges", None, None).await;
+    assert_eq!(listed, json!([]), "{listed}");
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict.clone()).await;
+    assert_eq!((s, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+
+    // Re-enabling restores both rights and registration.
+    update_board(&t, "other", json!({ "verdict_judges": true })).await;
+    assert!(may_hand_over(&t, JUDGE, &id).await);
+    let (s, v) = register_judge_on(&t, "other", DISPATCH, verdict).await;
+    assert_eq!(s, 200, "{v}");
+
+    // On an autopilot board, the coordinator lease holder still registers verdict judges.
+    let factory_task = parked(&t, "factory").await;
+    update_board(&t, "factory", json!({ "verdict_judges": false })).await;
+    let factory_verdict = json!({ "agent": JUDGE, "kind": "verdict", "tasks": [factory_task] });
+    let (s, v) = register_judge_on(&t, "factory", DISPATCH, factory_verdict).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(may_hand_over(&t, JUDGE, &factory_task).await);
+}

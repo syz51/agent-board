@@ -1401,6 +1401,77 @@ fn ask_warns_of_open_asks_on_its_task_and_withdraw_closes_one() {
     );
 }
 
+/// A request the server answers with the task unchanged says so, and setting what only an
+/// open task uses on a dropped one says how to reopen it.
+#[test]
+fn update_says_when_nothing_changed_and_when_the_task_is_closed() {
+    let e = env();
+    let detail = |task: &board_proto::Task| TaskDetail {
+        task: task.clone(),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    let mut dropped = task_fixture("factory-7", "Evaluate the lessons");
+    dropped.status = board_proto::TaskStatus::Dropped;
+    dropped.auto = true;
+    e.stub.on("GET /v1/tasks/factory-7", detail(&dropped));
+    e.stub.on("PATCH /v1/tasks/factory-7", &dropped);
+    let out = e.run(&["update", "factory-7", "--auto", "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("no change to factory-7 dropped"), "{text}");
+    assert!(
+        text.contains(
+            "factory-7 is dropped, so auto, not_before, rank and blockers do not start it"
+        ) && text
+            .contains("task_update factory-7 status=open (board update factory-7 --status open)"),
+        "{text}"
+    );
+    // A drop reason sent late is kept as a note though no field changes.
+    let out = e.run(&[
+        "update",
+        "factory-7",
+        "--status",
+        "dropped",
+        "--reason",
+        "superseded",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("updated factory-7 dropped"), "{text}");
+    assert!(!text.contains("--status open"), "{text}");
+
+    // A real change on an open task reads as one, with no closed-task hint.
+    let open = task_fixture("factory-8", "Later");
+    let mut later = open.clone();
+    later.not_before = Some("2099-01-01T00:00:00Z".parse().unwrap());
+    later.version += 1;
+    e.stub.on("GET /v1/tasks/factory-8", detail(&open));
+    e.stub.on("PATCH /v1/tasks/factory-8", &later);
+    let out = e.run(&["update", "factory-8", "--not-before", "2099-01-01"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("updated factory-8"), "{text}");
+    assert!(!text.contains("--status open"), "{text}");
+
+    // A rank alone keeps the version, and is still a change.
+    let mut ranked = open.clone();
+    ranked.rank = Some(2);
+    e.stub.on("PATCH /v1/tasks/factory-8", &ranked);
+    let out = e.run(&["update", "factory-8", "--rank", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("updated factory-8"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn update_owner_hands_the_task_over_and_catches_an_old_server() {
     let e = env();
@@ -2484,6 +2555,80 @@ fn usage_stop_at_is_set_shown_and_checked() {
 }
 
 #[test]
+fn verdict_judges_is_set_shown_and_checked() {
+    let e = env();
+    let mut off = board_fixture("factory", &[]);
+    off.verdict_judges = false;
+    e.stub.on("PATCH /v1/boards/factory", &off);
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "false"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["verdict_judges"], false);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // `board boards` and `board status` show the marker only when disabled.
+    let on = board_fixture("other", &[]);
+    e.stub.on("GET /v1/boards", [&off, &on]);
+    let out = e.run(&["boards"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].ends_with(" · verdict judges off"), "{text}");
+    assert!(!lines[1].contains("verdict judges off"), "{text}");
+
+    e.stub.on("GET /v1/boards/factory", &off);
+    e.stub.on("GET /v1/agents", json!([]));
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = stdout(&out);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("factory ") && l.ends_with(" · verdict judges off")),
+        "{status}"
+    );
+
+    e.stub.on("GET /v1/boards/other", &on);
+    let out = e.run(&["status", "--board", "other"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Re-enabling omits the marker.
+    e.stub
+        .on("PATCH /v1/boards/factory", board_fixture("factory", &[]));
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("verdict judges off"),
+        "{}",
+        stdout(&out)
+    );
+
+    // An older server that omits `verdict_judges` deserializes as `true` and is caught.
+    let mut old = serde_json::to_value(board_fixture("factory", &[])).unwrap();
+    old.as_object_mut().unwrap().remove("verdict_judges");
+    e.stub.on("PATCH /v1/boards/factory", &old);
+    let out = e.run(&["board", "update", "factory", "--verdict-judges", "false"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("server ignored verdict_judges=false")
+            && err.contains("board board update factory --verdict-judges false"),
+        "{err}"
+    );
+}
+
+#[test]
 fn usage_shows_the_reading_and_the_boards_it_holds() {
     let e = env();
     e.stub.on("GET /v1/usage", serde_json::Value::Null);
@@ -3333,5 +3478,205 @@ fn ask_sends_a_board_change_and_says_who_applies_it() {
     assert!(
         text.contains("warning: the server ignored the change (parallel_tasks=2)"),
         "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "uses debug-only BOARD_DEVICE_WAIT_POLL_MS"
+)]
+#[test]
+fn device_wait_exits_zero_once_a_slot_frees_and_nonzero_on_timeout() {
+    let e = env();
+    let project = e.cwd.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let t3 = e.home.join("fake-t3");
+    let count_file = e.home.join("polls");
+    // Polls 1 and 2 report 2/2 running; poll 3 drops to 1/2 running (+ 1 completed).
+    common::script::write_script(
+        &t3,
+        &format!(
+            r#"#!/bin/sh
+n=0
+if [ -f "{count}" ]; then n=$(cat "{count}"); fi
+n=$((n + 1))
+echo "$n" > "{count}"
+if [ "$n" -lt 3 ]; then
+  printf '[{{"threadId":"t1","status":"running"}},{{"threadId":"t2","status":"waiting"}}]\n'
+else
+  printf '[{{"threadId":"t1","status":"running"}},{{"threadId":"t2","status":"completed"}}]\n'
+fi
+"#,
+            count = count_file.display()
+        ),
+    );
+    let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "{config}runs_at_once = 2\nt3_bin = {t3:?}\n[projects]\n\"github.com/syz51/agent-board\" = {project:?}\n"
+        ),
+    )
+    .unwrap();
+
+    // Polls until poll 3 frees a slot, exits 0, and makes no board server request.
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[(board::daemon::device::WAIT_POLL_ENV, "30")],
+        &["device", "wait", "--timeout", "5", "--json"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.stub.requests().is_empty(), "{:?}", e.stub.requests());
+    let parsed: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(parsed["device"], DEVICE);
+    assert_eq!(parsed["running"], 1);
+    assert_eq!(parsed["limit"], 2);
+    assert_eq!(parsed["slots"], 1);
+    assert_eq!(parsed["free"], 1);
+    assert!(parsed["waited_secs"].is_u64(), "{parsed}");
+    let polls: usize = std::fs::read_to_string(&count_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(polls, 3);
+
+    // Staying full until timeout exits nonzero with a clear message on stderr.
+    common::script::write_script(
+        &t3,
+        r#"#!/bin/sh
+printf '[{"threadId":"t1","status":"running"},{"threadId":"t2","status":"preparing"}]\n'
+"#,
+    );
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[(board::daemon::device::WAIT_POLL_ENV, "50")],
+        &["device", "wait", "--timeout", "1"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(err.contains("timed out after 1s"), "{err}");
+    assert!(
+        err.contains("still has 2 of 2 agent turns running"),
+        "{err}"
+    );
+
+    // Asking for more slots than the device limit fails fast without waiting.
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[],
+        &["device", "wait", "--slots", "3", "--timeout", "30"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("exceeds this device's limit of 2"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn device_wait_counts_projects_board_projects_reserve_and_t3_env_like_launch_hook() {
+    let e = env();
+    let proj_a = e.cwd.join("proj-a");
+    let proj_b = e.cwd.join("proj-b");
+    let proj_missing = e.cwd.join("proj-missing");
+    std::fs::create_dir_all(&proj_a).unwrap();
+    std::fs::create_dir_all(&proj_b).unwrap();
+    std::fs::create_dir_all(&proj_missing).unwrap();
+
+    // Fake t3 configured via T3CODE_CLI_PATH (overrides broken t3_bin in config.toml).
+    let broken_t3 = e.home.join("broken-t3");
+    common::script::write_script(&broken_t3, "#!/bin/sh\nexit 1\n");
+    let env_t3 = e.home.join("env-t3");
+    common::script::write_script(
+        &env_t3,
+        &format!(
+            r#"#!/bin/sh
+case "$*" in
+  *"{a}"*)
+    printf '[{{"threadId":"t1","status":"running"}},{{"threadId":"t2","status":"starting"}},{{"threadId":"done-1","status":"completed"}}]\n'
+    ;;
+  *"{b}"*)
+    printf '[{{"threadId":"t2","status":"starting"}},{{"threadId":"t3","status":"queued"}}]\n'
+    ;;
+  *"{missing}"*)
+    echo "No T3 Code project matches '{missing}'." >&2
+    exit 1
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+            a = proj_a.display(),
+            b = proj_b.display(),
+            missing = proj_missing.display()
+        ),
+    );
+    let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "{config}runs_at_once = 4\nt3_bin = {broken_t3:?}\n\
+             [projects]\n\"github.com/syz51/a\" = {proj_a:?}\n\"github.com/syz51/missing\" = {proj_missing:?}\n\
+             [board_projects]\nfeedback = {proj_b:?}\n"
+        ),
+    )
+    .unwrap();
+
+    // Union of {t1, t2} and {t2, t3} is 3 unique running threads; unknown project counts as 0.
+    // On a 4-slot device (with default reserve_runs = 1, daemon ceiling = 3), 1 owner slot is
+    // free, so `--slots 1` exits 0 and `--slots 2` exits nonzero.
+    let env_override = [(board::daemon::device::T3_CLI_ENV, env_t3.to_str().unwrap())];
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &env_override,
+        &["device", "wait", "--timeout", "0"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("has 1 free agent-turn slot (3 of 4 running"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &env_override,
+        &["device", "wait", "--slots", "2", "--timeout", "0"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("still has 3 of 4 agent turns running"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &env_override,
+        &["device", "wait", "--slots", "5", "--timeout", "0"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("exceeds this device's limit of 4"),
+        "{}",
+        stderr(&out)
     );
 }

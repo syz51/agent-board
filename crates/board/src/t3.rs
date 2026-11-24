@@ -123,13 +123,15 @@ pub struct NewWorktree {
 
 pub trait T3: Send + Sync {
     /// Starts a thread in the project containing `project`, in a new `worktree` when one is
-    /// given, else in the project folder, and returns its id.
+    /// given, else in the project folder, with `model` when one is given, else the project's
+    /// defaults, and returns its id.
     fn start_thread(
         &self,
         project: &Path,
         title: &str,
         message: &str,
         worktree: Option<&NewWorktree>,
+        model: Option<&ThreadModel>,
     ) -> impl Future<Output = Result<String>> + Send;
 
     /// Sends a message to a thread.
@@ -164,9 +166,6 @@ pub trait T3: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct T3Cli {
     pub bin: PathBuf,
-    /// The provider instance and model new threads start with; `None` leaves the
-    /// project's defaults.
-    pub thread_model: Option<ThreadModel>,
 }
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -193,16 +192,7 @@ impl T3Cli {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from("t3"))
         });
-        Self {
-            bin,
-            thread_model: None,
-        }
-    }
-
-    /// Starts new threads with `thread_model` when one is given.
-    pub fn with_thread_model(mut self, thread_model: Option<ThreadModel>) -> Self {
-        self.thread_model = thread_model;
-        self
+        Self { bin }
     }
 
     /// What T3 says of `thread`: its parent, title and link; `None` when T3 does not know
@@ -290,14 +280,24 @@ impl T3 for T3Cli {
         title: &str,
         message: &str,
         worktree: Option<&NewWorktree>,
+        model: Option<&ThreadModel>,
     ) -> Result<String> {
         let project = project.to_string_lossy();
         let mut args = vec!["thread", "start", "--json", "--title", title];
         if let Some(worktree) = worktree {
             args.extend(["--worktree", &worktree.base, "--branch", &worktree.branch]);
         }
-        if let Some(ThreadModel { provider, model }) = &self.thread_model {
+        let option_args: Vec<String> = model
+            .map(|m| m.options.iter().map(|(k, v)| format!("{k}={v}")).collect())
+            .unwrap_or_default();
+        if let Some(ThreadModel {
+            provider, model, ..
+        }) = model
+        {
             args.extend(["--provider", provider, "--model", model]);
+            for option in &option_args {
+                args.extend(["--option", option.as_str()]);
+            }
         }
         args.extend([&*project, "-"]);
         let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
@@ -457,10 +457,17 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
     let provider = thread["providerInstanceId"].as_str().unwrap_or_default();
     ThreadInfo {
         archived: thread["archived"].as_bool().unwrap_or(false),
-        runtime: if provider.to_ascii_lowercase().contains("codex") {
-            Runtime::Codex
-        } else {
-            Runtime::Claude
+        runtime: {
+            let p = provider.to_ascii_lowercase();
+            if p.contains("codex") {
+                Runtime::Codex
+            } else if p.contains("antigravity") {
+                Runtime::Antigravity
+            } else if p.contains("opencode") {
+                Runtime::Opencode
+            } else {
+                Runtime::Claude
+            }
         },
         worktree: thread["worktreePath"]
             .as_str()
@@ -591,6 +598,7 @@ mod tests {
                 "factory coordinator",
                 "hi",
                 Some(&worktree),
+                None,
             )
             .await
             .unwrap();
@@ -601,7 +609,7 @@ mod tests {
              --branch\ncoordinator/factory\n/src/p\n-\n"
         );
 
-        t3.start_thread(Path::new("/src/p"), "factory coordinator", "hi", None)
+        t3.start_thread(Path::new("/src/p"), "factory coordinator", "hi", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -610,22 +618,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn threads_start_on_the_configured_provider_instance_and_model() {
+    async fn threads_start_on_the_configured_provider_instance_model_and_options() {
         let dir = tempfile::tempdir().unwrap();
         let (t3, log) = recording_t3(dir.path());
-        let t3 = t3.with_thread_model(Some(ThreadModel {
+        let plain = ThreadModel {
             provider: "claude-agents".into(),
             model: "a-model".into(),
-        }));
+            options: Default::default(),
+        };
 
-        t3.start_thread(Path::new("/src/p"), "factory coordinator", "hi", None)
-            .await
-            .unwrap();
+        t3.start_thread(
+            Path::new("/src/p"),
+            "factory coordinator",
+            "hi",
+            None,
+            Some(&plain),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "thread\nstart\n--json\n--title\nfactory coordinator\n--provider\nclaude-agents\n\
              --model\na-model\n/src/p\n-\n"
+        );
+
+        let with_options = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [
+                ("thought_level".into(), "medium".into()),
+                ("effort".into(), "low".into()),
+            ]
+            .into(),
+        };
+        t3.start_thread(
+            Path::new("/src/p"),
+            "verdict judge",
+            "hi",
+            None,
+            Some(&with_options),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "thread\nstart\n--json\n--title\nverdict judge\n--provider\nantigravity\n\
+             --model\ngemini-4-neon\n--option\neffort=low\n--option\nthought_level=medium\n\
+             /src/p\n-\n"
         );
     }
 

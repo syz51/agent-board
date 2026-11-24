@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use board::client::Client;
-use board::config::{Config, Home};
+use board::config::{Config, Home, ThreadModel};
 use board::daemon::{Daemon, RELEASE_GRACE};
 use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
 use board::identity::RepoInfo;
@@ -36,6 +36,7 @@ enum Call {
         title: String,
         message: String,
         worktree: Option<NewWorktree>,
+        model: Option<ThreadModel>,
     },
     Send {
         thread: String,
@@ -239,12 +240,14 @@ impl T3 for FakeT3 {
         title: &str,
         message: &str,
         worktree: Option<&NewWorktree>,
+        model: Option<&ThreadModel>,
     ) -> Result<String> {
         self.calls.lock().unwrap().push(Call::Start {
             project: project.to_path_buf(),
             title: title.to_owned(),
             message: message.to_owned(),
             worktree: worktree.cloned(),
+            model: model.cloned(),
         });
         if self
             .hang_start_in
@@ -3519,6 +3522,88 @@ async fn after_a_usage_limit_stop_since_the_tasks_in_progress_started_no_further
 }
 
 #[tokio::test]
+async fn a_usage_limit_stop_ends_at_its_reset_when_the_agent_runs_or_the_account_is_not_full() {
+    use board_proto::Priority::P1;
+    let member = "t3:member";
+    let reset = at() + chrono::Duration::hours(2);
+    // A board with a task in progress since before the stop, an agent of it paused on a
+    // limit as `info` says, and the usage as `reading` says, if any.
+    let env = |info: board_proto::Agent, reading: Option<serde_json::Value>| async move {
+        let mut e = slots_env(2, &[ready_task("factory-4", P1, 0)]);
+        e.stub.on(
+            "GET /v1/tasks",
+            [
+                doing_task("factory-9", "t3:other", &[]),
+                ready_task("factory-4", P1, 0),
+            ],
+        );
+        e.stub.on(&format!("GET {}", agent_path(member)), &info);
+        if let Some(reading) = reading {
+            e.stub.on("GET /v1/usage", reading);
+        }
+        let stop = state_changed(40, member, AgentState::Paused, Some(reset));
+        e.daemon.on_event(&stop, at()).await.unwrap();
+        e
+    };
+    let mut paused = agent_fixture(member, DEVICE, AgentState::Paused);
+    paused.boards = vec![factory()];
+    paused.paused_until = Some(reset);
+
+    // Before its reset, with no reading after it, the stop holds.
+    let mut e = env(paused.clone(), None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+    // After its reset it no longer does.
+    let later = reset + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // An agent whose session ended on the limit holds until the reset too.
+    let mut ended = paused.clone();
+    ended.state = AgentState::Ended;
+    let mut e = env(ended.clone(), None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+    // Ended after its reset, or after it ran again, the server keeps no `paused_until`:
+    // the stop is over.
+    ended.paused_until = None;
+    let mut e = env(ended, None).await;
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // An agent that runs again holds nothing.
+    let mut running = paused.clone();
+    running.state = AgentState::Running;
+    let mut e = env(running, None).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A reading after the stop with no full window: the limit was not the account's, such
+    // as one model's, and the workers start.
+    let read = at() + chrono::Duration::minutes(1);
+    let mut e = env(paused.clone(), Some(usage_reading(50.0, read))).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
+
+    // A full window in that reading keeps the stop.
+    let mut e = env(paused.clone(), Some(usage_reading(100.0, read))).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // So does a reading without windows, which says nothing.
+    let empty = json!({ "read_at": read, "device": DEVICE });
+    let mut e = env(paused.clone(), Some(empty)).await;
+    e.daemon.reconcile(read).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+
+    // So does a reading from before the stop.
+    let before = at() - chrono::Duration::minutes(1);
+    let mut e = env(paused, Some(usage_reading(50.0, before))).await;
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(worker_starts(&e.t3).is_empty());
+}
+
+#[tokio::test]
 async fn a_task_left_open_on_a_lease_overlap_waits_until_a_task_in_progress_ends() {
     use board_proto::Priority::P1;
     let tasks = [
@@ -4417,6 +4502,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         url: PR.to_owned(),
         state: PrState::Open,
         draft: false,
+        base_ref: "main".to_owned(),
         head_ref: "feat/limit".to_owned(),
         head_oid: "9c1e44d0a7b2c3".to_owned(),
         cross_repository: false,
@@ -4938,6 +5024,138 @@ async fn a_passed_task_is_merged_once_its_checks_pass_and_finished_with_the_judg
 }
 
 #[tokio::test]
+async fn a_review_task_whose_pr_merged_without_a_verdict_is_reviewed_on_base_and_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=trunk"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    git(&origin, &["branch", "fork"]);
+    git(&origin, &["branch", "feat/merged"]);
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let task = review_task("factory-4", 0);
+    let mut e = env_with_projects([(REPO.to_owned(), repo)].into());
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", std::slice::from_ref(&task));
+    e.stub.on("POST /v1/tasks/factory-4/notes", note(&task.id));
+    judges_at_work(&e, &[]);
+    e.stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "review", &["factory-4"], true),
+    );
+    let parked = task_note(
+        1,
+        &task,
+        WORKER,
+        "finding",
+        &format!("PR {PR} opened; squash-merged as {MERGE_COMMIT} at user request"),
+    );
+    review_detail(&e, &task, vec![parked.clone()]);
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Ended),
+    );
+    let mut handed = task.clone();
+    handed.owner = Some(DISPATCH.parse().unwrap());
+    handed.version = 4;
+    e.stub.on("PATCH /v1/tasks/factory-4", &handed);
+    let mut done = handed.clone();
+    done.status = TaskStatus::Done;
+    e.stub.on("POST /v1/tasks/factory-4/done", &done);
+
+    // Even when the merged PR came from a fork and its head branch still exists on origin,
+    // the review judge starts on the PR's base branch (`origin/fork`), which holds the merge.
+    let mut merged = open_pr(MergeState::Waits, Checks::Passed);
+    merged.state = PrState::Merged;
+    merged.base_ref = "fork".to_owned();
+    merged.head_ref = "feat/merged".to_owned();
+    merged.cross_repository = true;
+    merged.merge_commit = Some(MERGE_COMMIT.to_owned());
+    e.t3.gh.put(merged);
+
+    // Reconcile 1: no pass verdict yet -> daemon routes it to a review judge on `origin/fork`.
+    e.daemon.reconcile(at()).await.unwrap();
+    let starts: Vec<Option<NewWorktree>> =
+        e.t3.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Start { worktree, .. } => Some(worktree),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        starts,
+        [Some(NewWorktree {
+            base: "origin/fork".into(),
+            branch: "review/factory-4".into(),
+        })]
+    );
+    assert_eq!(registered(&e).len(), 1);
+    assert!(finishes(&e).is_empty());
+
+    // Reconcile 2: the review judge passes the already-merged PR and ends -> daemon closes
+    // the task directly with the PR, merge commit, checks and summary, with no merge call.
+    judges_at_work(&e, &[judge(NEW_THREAD, "review", &["factory-4"], false)]);
+    let started = task_note(
+        2,
+        &task,
+        DISPATCH,
+        "note",
+        &format!(
+            "note: the dispatcher started a review judge for this task: thread j (agent t3:{NEW_THREAD})"
+        ),
+    );
+    let mut pass = pass_note(&task, PR);
+    pass.id = 3;
+    pass.agent = format!("t3:{NEW_THREAD}").parse().unwrap();
+    review_detail(&e, &task, vec![parked, started, pass]);
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert_eq!(e.t3.gh.ran("update-branch"), 0);
+    let done = finishes(&e);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(done[0].body["summary"], "The limit is now 80 characters.");
+    let evidence: Vec<(&str, &str, Option<i64>)> = done[0].body["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ev| {
+            (
+                ev["kind"].as_str().unwrap(),
+                ev["value"].as_str().unwrap(),
+                ev["exit_code"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        evidence,
+        [
+            ("pr", PR, None),
+            ("commit", MERGE_COMMIT, None),
+            ("check", "cargo test --workspace", Some(0)),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_passed_task_whose_pull_request_conflicts_is_set_open_with_a_note() {
     for behind in [false, true] {
         let mut e = passed_env(PR, AgentState::Idle);
@@ -5279,23 +5497,24 @@ async fn the_device_limit_counts_the_runs_of_every_board_and_keeps_a_slot_for_ju
         ready_task("factory-5", P1, 1),
         ready_task("factory-6", P1, 2),
     ];
-    // Three runs at once: two of them may be workers, and the other board's judge is one.
+    // Four runs at once (default reserve 1 -> daemon limit 3): two may be workers, and the
+    // other board's judge is one.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(3);
+    e.daemon = e.daemon.with_default_run_limit(4);
     other_board_with_a_judge(&mut e, 3);
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3).len(), 2);
 
-    // Two runs at once: the judge has one, and a worker takes the other.
+    // Three runs at once (daemon limit 2): the judge has one, and a worker takes the other.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
 
     // A paused board's judge still runs, so it keeps its slot.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     let mut paused = daemon_board(Some(DISPATCH));
     paused.slug = "other".parse().unwrap();
@@ -5334,7 +5553,11 @@ async fn runs_at_once_in_the_configuration_replaces_the_default_device_limit() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     e.daemon.reconcile(at()).await.unwrap();
-    assert_eq!(titles(&e.t3).len(), 3, "four runs leave three to workers");
+    assert_eq!(
+        titles(&e.t3).len(),
+        2,
+        "four runs with default reserve 1 leave daemon limit 3 (two workers, one judge)"
+    );
 }
 
 fn running_lists(t3: &FakeT3) -> usize {
@@ -5359,10 +5582,11 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
         ready_task("factory-5", P1, 1),
         ready_task("factory-6", P1, 2),
     ];
-    // Two threads the dispatcher did not start run on the device: one of its three runs
-    // is left, so one worker starts and the next task is held, with a note that says why.
+    // Two threads the dispatcher did not start run on the device: on a four-run device
+    // (default reserve 1 -> daemon limit 3), one slot is left so one worker starts and the
+    // next task is held, with a note that says why.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(3);
+    e.daemon = e.daemon.with_default_run_limit(4);
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "agent-child-2".to_owned()];
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
@@ -5374,7 +5598,7 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     let text = notes[0].body["text"].as_str().unwrap();
     for part in [
         "The device limit holds this task",
-        "has 3 of 3 runs: 1 of the dispatcher, 2 turns of other threads",
+        "has 3 of 4 runs (daemon limit 3, 1 reserved): 1 of the dispatcher, 2 turns of other threads",
         "agent-child-2, user-1",
     ] {
         assert!(text.contains(part), "{part}: {text}");
@@ -5389,11 +5613,14 @@ async fn the_turns_of_other_threads_take_the_slots_of_the_device() {
     assert_eq!(held[0]["others"], json!(["agent-child-2", "user-1"]));
     assert!(held[0]["at"].is_string(), "{held:?}");
     let cause = held[0]["cause"].as_str().unwrap();
-    assert!(cause.contains("has 3 of 3 runs"), "{cause}");
+    assert!(
+        cause.contains("has 3 of 4 runs (daemon limit 3, 1 reserved)"),
+        "{cause}"
+    );
 
     // The dispatcher's own run is among the running threads and counts once.
     let mut e = slots_env(3, &tasks);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 3);
     *e.t3.running.lock().unwrap() = vec![J2.to_owned()];
     e.daemon.reconcile(at()).await.unwrap();
@@ -5572,7 +5799,7 @@ async fn a_judge_waits_while_other_threads_fill_the_device() {
     let tasks = [review_task("factory-4", 0)];
     let mut e = judges_env(&tasks);
     review_detail(&e, &tasks[0], vec![]);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned(), "user-2".to_owned()];
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(5))
@@ -5595,7 +5822,7 @@ async fn a_judge_waits_while_other_threads_fill_the_device() {
             .is_empty()
     );
 
-    // One of them ends: the judge starts.
+    // One of them ends: the judge starts (leaving 1 reserved slot on the 3-run device).
     *e.t3.running.lock().unwrap() = vec!["user-1".to_owned()];
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(6))
@@ -5615,13 +5842,86 @@ async fn a_judge_waits_while_the_device_is_at_its_limit() {
         .lock()
         .unwrap()
         .extend([J1.to_owned(), J2.to_owned()]);
-    e.daemon = e.daemon.with_default_run_limit(2);
+    e.daemon = e.daemon.with_default_run_limit(3);
     other_board_with_a_judge(&mut e, 1);
     e.daemon
         .reconcile(at() + chrono::Duration::minutes(5))
         .await
         .unwrap();
     assert_eq!(titles(&e.t3), ["review factory-4 Task factory-4"]);
+}
+
+#[tokio::test]
+async fn the_daemon_holds_workers_and_judges_for_the_reserved_turn_and_records_each_hold() {
+    use board_proto::Priority::P1;
+    // On a 4-run device with default reserve 1 (daemon limit 3), two workers and one judge
+    // can run, but a third worker or a second judge is held for the reserved turn.
+    let tasks = [
+        ready_task("factory-4", P1, 0),
+        ready_task("factory-5", P1, 1),
+        ready_task("factory-6", P1, 2),
+    ];
+    let mut e = slots_env(3, &tasks);
+    e.daemon = e.daemon.with_default_run_limit(4);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-4 Task factory-4", "factory-5 Task factory-5"]
+    );
+    let held = holds(&home_of(&e));
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["kind"], "worker");
+    assert_eq!(held[0]["subject"], "factory-6");
+    assert_eq!(held[0]["limit"], 2);
+    assert!(
+        held[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("has 2 of 4 runs (daemon limit 3, 1 reserved)"),
+        "{held:?}"
+    );
+
+    // Judges also yield to the reserved turn: on a 2-run device (daemon limit 1) with one
+    // judge already running, a second judge is held with a trail record.
+    let review_tasks = [review_task("factory-4", 0)];
+    let mut je = judges_env(&review_tasks);
+    review_detail(&je, &review_tasks[0], vec![]);
+    je.daemon = je.daemon.with_default_run_limit(2);
+    other_board_with_a_judge(&mut je, 1);
+    je.daemon
+        .reconcile(at() + chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(titles(&je.t3).is_empty());
+    let jheld = holds(&home_of(&je));
+    assert_eq!(jheld.len(), 1, "{jheld:?}");
+    assert_eq!(jheld[0]["kind"], "judge");
+    assert_eq!(jheld[0]["limit"], 1);
+    assert!(
+        jheld[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("has 1 of 2 runs (daemon limit 1, 1 reserved)"),
+        "{jheld:?}"
+    );
+
+    // Hot-reloading config.toml with reserve_runs = 0 lifts the reserve without a restart.
+    let config = Config {
+        server: Some(je.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        runs_at_once: std::num::NonZeroU32::new(2),
+        reserve_runs: Some(0),
+        ..Config::default()
+    };
+    let path = je._dir.path().join("home").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    je.daemon
+        .reconcile(at() + chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    assert_eq!(titles(&je.t3), ["review factory-4 Task factory-4"]);
 }
 
 #[tokio::test]
@@ -5903,5 +6203,252 @@ async fn a_review_judge_of_a_board_switched_off_autopilot_keeps_no_slot() {
             "verdict factory-10 (under factory-1)",
             "verdict factory-11 (under factory-2)"
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_home_board_off_autopilot_with_verdict_judges_off_gets_no_judge() {
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut board = off_autopilot("factory");
+    board.verdict_judges = false;
+    let mut e = off_autopilot_env(&[board.clone()], &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(titles(&e.t3).is_empty());
+    assert!(
+        e.stub
+            .requests_to("GET /v1/boards/factory/judges")
+            .is_empty()
+    );
+    assert!(e.stub.requests_to("GET /v1/tasks").is_empty());
+    assert!(e.stub.requests_to("POST /v1/agents").is_empty());
+    assert!(
+        e.stub
+            .requests_to("POST /v1/boards/factory/judges")
+            .is_empty()
+    );
+
+    // Turning verdict judges back on dispatches the pending proposal.
+    board.verdict_judges = true;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(titles(&e.t3), ["verdict factory-10 (no parent)"]);
+
+    // Disabling verdict judges while a verdict judge is tracked drops the tracked run, so
+    // re-enabling after it ended starts a new judge immediately instead of waiting JUDGE_RETRY.
+    board.verdict_judges = false;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(2))
+        .await
+        .unwrap();
+
+    board.verdict_judges = true;
+    e.stub.on("GET /v1/boards", [&board]);
+    e.stub.on("GET /v1/boards/factory/judges", json!([]));
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        [
+            "verdict factory-10 (no parent)",
+            "verdict factory-10 (no parent)"
+        ]
+    );
+}
+
+fn started_models(t3: &FakeT3) -> Vec<(String, Option<ThreadModel>)> {
+    t3.calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Start { title, model, .. } => Some((title, model)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn env_with_models(
+    tasks: &[board_proto::Task],
+    thread_model: Option<ThreadModel>,
+    judge_model: Option<ThreadModel>,
+) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let config = Config {
+        server: Some(stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        thread_model,
+        judge_model,
+        ..Config::default()
+    };
+    let home = Home::at(dir.path().join("home"));
+    config.save(&home).unwrap();
+    let daemon = daemon_configured(dir.path(), &stub, &t3, None, config);
+    let board = autopilot(Some(DISPATCH), &[DEVICE]);
+    stub.on("GET /v1/boards", [&board]);
+    stub.on("POST /v1/boards/factory/coordinator", &board);
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    stub.on("GET /v1/tasks", tasks);
+    stub.on("GET /v1/boards/factory/judges", json!([]));
+    stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "verdict", &[], true),
+    );
+    for task in tasks {
+        stub.on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
+    }
+    Env {
+        stub,
+        t3,
+        daemon,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back() {
+    let worker_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "high".into())].into(),
+    };
+    let judge_model = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "medium".into())].into(),
+    };
+    let tasks = [
+        ready_task("factory-1", board_proto::Priority::P1, 0),
+        proposal("factory-2", None, 1),
+    ];
+
+    // With both set, judges get [judge_model] and workers get [thread_model].
+    let mut e = env_with_models(
+        &tasks,
+        Some(worker_model.clone()),
+        Some(judge_model.clone()),
+    );
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            (
+                "verdict factory-2 (no parent)".into(),
+                Some(judge_model.clone())
+            ),
+            (
+                "factory-1 Task factory-1".into(),
+                Some(worker_model.clone())
+            ),
+        ]
+    );
+
+    // Without [judge_model], judges fall back to [thread_model].
+    let mut e = env_with_models(&tasks, Some(worker_model.clone()), None);
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            (
+                "verdict factory-2 (no parent)".into(),
+                Some(worker_model.clone())
+            ),
+            ("factory-1 Task factory-1".into(), Some(worker_model)),
+        ]
+    );
+
+    // Without either, both judges and workers leave project defaults (None).
+    let mut e = env_with_models(&tasks, None, None);
+    e.t3.ids.lock().unwrap().push_back(J2.to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        started_models(&e.t3),
+        [
+            ("verdict factory-2 (no parent)".into(), None),
+            ("factory-1 Task factory-1".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_active_model() {
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(self.0.clone())
+        }
+    }
+
+    let original_judge = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "medium".into())].into(),
+    };
+    let updated_judge = ThreadModel {
+        provider: "antigravity".into(),
+        model: "gemini-4-neon".into(),
+        options: [("thought_level".into(), "low".into())].into(),
+    };
+
+    let tasks = [proposal("factory-10", None, 0)];
+    let mut e = env_with_models(&tasks, None, Some(original_judge.clone()));
+    let home = Home::at(e._dir.path().join("home"));
+
+    // Rewrite config.toml with an updated [judge_model] before reconcile reloads it.
+    Config {
+        server: Some(e.stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: projects(),
+        judge_model: Some(updated_judge),
+        ..Config::default()
+    }
+    .save(&home)
+    .unwrap();
+
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(buf.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    e.daemon.reconcile(at()).await.unwrap();
+    drop(_guard);
+
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("judge_model") && logs.contains("restart board watch"),
+        "expected restart warning for judge_model change, got: {logs:?}"
+    );
+    assert_eq!(
+        started_models(&e.t3),
+        [(
+            "verdict factory-10 (no parent)".into(),
+            Some(original_judge)
+        )]
     );
 }

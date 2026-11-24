@@ -96,6 +96,11 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "the board object {slug, title, status, ...}",
     ),
     ("board delete", "{deleted: slug}"),
+    ("device", "see each subcommand's --help"),
+    (
+        "device wait",
+        "{device?, running, limit, slots, free, waited_secs}",
+    ),
     ("approved", "the board object {slug, title, status, ...}"),
     (
         "approved board",
@@ -370,6 +375,9 @@ pub enum Command {
     /// Create or change a board.
     #[command(subcommand)]
     Board(BoardCommand),
+    /// Device-level turn limit commands.
+    #[command(subcommand)]
+    Device(DeviceCommand),
     /// Show the event log.
     Log {
         #[arg(long)]
@@ -597,6 +605,8 @@ pub enum RuntimeArg {
     Codex,
     /// The opencode board plugin, which sends and reads Claude Code's hook JSON.
     Opencode,
+    /// Google Antigravity (Gemini 4 Neon) via T3 Code or standalone CLI.
+    Antigravity,
 }
 
 impl From<RuntimeArg> for board_proto::Runtime {
@@ -605,6 +615,7 @@ impl From<RuntimeArg> for board_proto::Runtime {
             RuntimeArg::Claude => Self::Claude,
             RuntimeArg::Codex => Self::Codex,
             RuntimeArg::Opencode => Self::Opencode,
+            RuntimeArg::Antigravity => Self::Antigravity,
         }
     }
 }
@@ -833,10 +844,32 @@ pub enum BoardCommand {
         /// starts no new task. Only the user may raise it.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
         usage_stop_at: Option<u32>,
+        /// Whether a home device daemon starts automatic verdict judges for pending proposals
+        /// when autopilot is off.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        verdict_judges: Option<bool>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
     Delete { slug: BoardSlug },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeviceCommand {
+    /// Wait until this device has enough free agent-turn slots for a launch, counted the
+    /// same way as the launch hook, or exit nonzero at the timeout.
+    Wait(DeviceWaitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeviceWaitArgs {
+    /// How long to wait before exiting nonzero: seconds such as 300, or a duration such
+    /// as 30s or 5m (0 checks once without waiting).
+    #[arg(long, default_value = "300", value_parser = parse_timeout)]
+    pub timeout: std::time::Duration,
+    /// How many free agent-turn slots to wait for.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..).map(|n| n as usize))]
+    pub slots: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1231,6 +1264,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", brief(&board, kind, &tasks)?);
             return Ok(());
         }
+        Command::Device(DeviceCommand::Wait(a)) => device_wait(&home, a).await?,
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
         Command::Ls(a) => {
             let query = TaskQuery {
@@ -1419,6 +1453,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             temporary,
             parallel_tasks,
             usage_stop_at,
+            verdict_judges,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1431,6 +1466,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 parallel_tasks,
                 dispatch: None,
                 usage_stop_at,
+                verdict_judges,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
@@ -1546,6 +1582,70 @@ fn parse_reserve(value: &str) -> Result<Reserve> {
         anyhow::bail!("expected a percent from 0 to below 100, or off");
     }
     Ok(Reserve(Some(n)))
+}
+
+fn parse_timeout(value: &str) -> Result<std::time::Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("expected seconds such as 300, or a duration such as 30s or 5m");
+    }
+    let (digits, mult) = if let Some(n) = trimmed.strip_suffix('s') {
+        (n, 1u64)
+    } else if let Some(n) = trimmed.strip_suffix('m') {
+        (n, 60u64)
+    } else if let Some(n) = trimmed.strip_suffix('h') {
+        (n, 3600u64)
+    } else {
+        (trimmed, 1u64)
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!("expected seconds such as 300, or a duration such as 30s or 5m")
+    })?;
+    let secs = n
+        .checked_mul(mult)
+        .filter(|&s| s <= crate::daemon::device::MAX_WAIT_TIMEOUT.as_secs())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "timeout {value:?} is too large; pass at most {}s (24h)",
+                crate::daemon::device::MAX_WAIT_TIMEOUT.as_secs()
+            )
+        })?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+fn device_wait_poll() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(crate::daemon::device::WAIT_POLL_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    crate::daemon::device::DEFAULT_WAIT_POLL
+}
+
+async fn device_wait(home: &Home, args: DeviceWaitArgs) -> Result<Output> {
+    use crate::daemon::device;
+    let config = Config::load(home)?;
+    let limit = device::effective_run_limit(&config);
+    let t3 = device::t3_cli(&config);
+    let ready = device::wait_for_slot(
+        &t3,
+        &config,
+        limit,
+        device::WaitOptions {
+            slots: args.slots,
+            timeout: args.timeout,
+            poll: device_wait_poll(),
+            count_budget: device::COUNT_BUDGET,
+        },
+    )
+    .await?;
+    Ok(Output {
+        text: ready.summary(),
+        json: serde_json::to_value(&ready)?,
+    })
 }
 
 fn parse_task_list(list: &str) -> Result<Vec<TaskId>> {
@@ -1710,5 +1810,56 @@ mod tests {
         let about = parse(&["feedback", "--about", long, "x"]);
         let err = about.command.check_text_limits().unwrap_err();
         assert!(err.downcast_ref::<ops::Refused>().is_none(), "{err}");
+    }
+
+    #[test]
+    fn device_wait_parses_seconds_and_durations_and_rejects_zero_slots() {
+        assert_eq!(parse_timeout("0").unwrap(), std::time::Duration::ZERO);
+        assert_eq!(
+            parse_timeout("300").unwrap(),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_timeout("30s").unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_timeout("5m").unwrap(),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_timeout("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        for bad in [
+            "",
+            "-1",
+            "abc",
+            "5d",
+            "100000",
+            "25h",
+            "18446744073709551615m",
+        ] {
+            assert!(parse_timeout(bad).is_err(), "{bad:?}");
+        }
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "device",
+            "wait",
+            "--timeout",
+            "120",
+            "--slots",
+            "2",
+        ])
+        .unwrap();
+        let Command::Device(DeviceCommand::Wait(args)) = cli.command else {
+            panic!("expected device wait");
+        };
+        assert_eq!(args.timeout, std::time::Duration::from_secs(120));
+        assert_eq!(args.slots, 2);
+
+        // --slots 0 is refused by clap.
+        assert!(Cli::try_parse_from(["board", "device", "wait", "--slots", "0"]).is_err());
     }
 }

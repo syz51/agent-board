@@ -25,7 +25,7 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{HookEvent, Reply, direct_client, nested_session, spawn_token, t3_cli};
+use super::{HookEvent, Reply, direct_client, nested_session, spawn_token};
 use crate::client::{Client, TaskQuery};
 use crate::config::{Config, Home};
 use crate::daemon::device;
@@ -35,13 +35,13 @@ use crate::state;
 /// The T3 tools that start a thread, as their MCP server names them.
 const LAUNCH_TOOLS: [&str; 3] = ["delegate_task", "t3_thread_launch", "create_threads"];
 
-/// What the hook of a launch may take in all: [`COUNT_BUDGET`], [`NOTE_BUDGET`] and the
+/// What the hook of a launch may take in all: [`device::COUNT_BUDGET`], [`NOTE_BUDGET`] and the
 /// local steps. `board install` gives the hook more than this.
 pub(super) const BUDGET: Duration = Duration::from_secs(8);
 
 /// How long T3 has to list the running threads; later, the launch runs unchecked, with a
 /// record.
-const COUNT_BUDGET: Duration = Duration::from_millis(4500);
+const COUNT_BUDGET: Duration = device::COUNT_BUDGET;
 
 /// A session whose launches run unchecked gets one note in this time; the file has each
 /// launch.
@@ -52,11 +52,16 @@ const NOTE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Whether the tool call of `input` starts a T3 thread.
 pub(super) fn is_launch(input: &Value) -> bool {
-    input["tool_name"]
-        .as_str()
-        .and_then(|tool| tool.strip_prefix("mcp__"))
-        .and_then(|tool| tool.rsplit_once("__"))
-        .is_some_and(|(_, name)| LAUNCH_TOOLS.contains(&name))
+    let Some(tool) = input["tool_name"].as_str() else {
+        return false;
+    };
+    if let Some((_, name)) = tool.strip_prefix("mcp__").and_then(|t| t.rsplit_once("__")) {
+        return LAUNCH_TOOLS.contains(&name);
+    }
+    if let Some(rest) = tool.strip_prefix("mcp_t3-code_") {
+        return LAUNCH_TOOLS.contains(&rest);
+    }
+    false
 }
 
 /// The T3 environment a call or one thread of its list names, when it names one.
@@ -160,15 +165,14 @@ pub(super) async fn check(
     let Ok((server, device_name)) = config.require_login() else {
         return Ok(Reply::Nothing);
     };
-    let default = device::default_run_limit(device::host_memory());
-    let limit = device::run_limit(&config, Some(default));
+    let limit = device::effective_run_limit(&config);
     let session = input["session_id"].as_str().filter(|s| !s.is_empty());
     let local = local_environment(home, runtime, session);
     let asked = threads_asked(&input["tool_input"], local.as_deref());
     if asked == 0 {
         return Ok(Reply::Nothing);
     }
-    let t3 = t3_cli(home);
+    let t3 = device::t3_cli(&config);
     let counted = tokio::time::timeout(COUNT_BUDGET, device::running_threads(&t3, &config)).await;
     // What T3 did not count: everything, when it did not answer in time, else the projects
     // it could not list.
@@ -187,7 +191,7 @@ pub(super) async fn check(
     let thread = thread.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let tool = input["tool_name"].as_str().unwrap_or_default();
     let tool_use = input["tool_use_id"].as_str().filter(|s| !s.is_empty());
-    if running.len().saturating_add(asked) <= limit {
+    if device::fits(running.len(), asked, limit) {
         let Some(cause) = unknown else {
             return Ok(Reply::Nothing);
         };
@@ -301,6 +305,7 @@ pub(super) async fn check(
 /// What the agent of a refused launch does next. The device runs `limit` turns at most and
 /// the agent's own turn is one of them, so a call for `limit` threads or more never fits.
 fn advice(asked: usize, limit: usize) -> String {
+    let wait_timeout = device::DEFAULT_WAIT_TIMEOUT.as_secs();
     if asked >= limit {
         let fewer = if asked > 1 {
             "Ask for fewer threads, or do the work in this thread."
@@ -312,13 +317,16 @@ fn advice(asked: usize, limit: usize) -> String {
              {limit} at most, your own turn among them. {fewer}"
         )
     } else if asked > 1 {
-        "Do the work in this thread, ask for fewer threads, or make the same call again \
-         when turns on the device have ended."
-            .to_owned()
+        format!(
+            "Do the work in this thread, ask for fewer threads, or wait for free slots with \
+             `board device wait --slots {asked} --timeout {wait_timeout}` and make the same \
+             call again."
+        )
     } else {
-        "Do the work in this thread, or make the same call again when a turn on the device \
-         has ended."
-            .to_owned()
+        format!(
+            "Do the work in this thread, or wait for a free slot with `board device wait \
+             --timeout {wait_timeout}` and make the same call again."
+        )
     }
 }
 
@@ -549,15 +557,27 @@ mod tests {
 
     #[test]
     fn the_advice_of_a_refusal_fits_what_was_asked() {
-        assert!(advice(1, 4).contains("make the same call again"));
-        assert!(advice(2, 4).contains("ask for fewer threads"));
+        let single = advice(1, 4);
+        assert!(single.contains("make the same call again"), "{single}");
+        assert!(
+            single.contains("board device wait --timeout 300"),
+            "{single}"
+        );
+        let multi = advice(2, 4);
+        assert!(multi.contains("ask for fewer threads"), "{multi}");
+        assert!(
+            multi.contains("board device wait --slots 2 --timeout 300"),
+            "{multi}"
+        );
         let never = advice(4, 4);
         assert!(never.contains("can never run as it is"), "{never}");
         assert!(never.contains("Ask for fewer threads"), "{never}");
         assert!(!never.contains("again"), "{never}");
+        assert!(!never.contains("board device wait"), "{never}");
         let one = advice(1, 1);
         assert!(one.contains("can never run"), "{one}");
         assert!(!one.contains("fewer"), "{one}");
+        assert!(!one.contains("board device wait"), "{one}");
     }
 
     #[test]

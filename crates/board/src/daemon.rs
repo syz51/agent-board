@@ -814,9 +814,11 @@ impl Reach {
     /// ([`Daemon::usage_full_until`]).
     fn of(seen: &Seen, device: &DeviceName, full_until: Option<Timestamp>, now: Timestamp) -> Self {
         match Self::alone(seen, device, now) {
-            // Codex and opencode agents spend other limits.
+            // Codex and opencode agents spend other limits; Claude and Antigravity respect
+            // the daemon's active usage reading.
             Self::Now | Self::Held
-                if full_until.is_some() && seen.agent.runtime == Runtime::Claude =>
+                if full_until.is_some()
+                    && matches!(seen.agent.runtime, Runtime::Claude | Runtime::Antigravity) =>
             {
                 Self::Full
             }
@@ -1189,6 +1191,18 @@ impl<T: T3> Daemon<T> {
         device::run_limit(&self.ctx.config, self.default_run_limit)
     }
 
+    /// How many turns this device leaves free for launches from threads the daemon did
+    /// not start.
+    fn reserve(&self) -> usize {
+        device::reserve(&self.ctx.config)
+    }
+
+    /// How many total runs on the device may be active while the daemon still starts a
+    /// new worker or judge: `run_limit` minus the owner-thread reserve.
+    fn daemon_run_limit(&self) -> usize {
+        device::daemon_limit(self.run_limit(), self.reserve())
+    }
+
     /// Whether the runs recorded for `slug` take slots of this device: it hosts the board.
     /// A paused board counts, since its threads still run. A run
     /// recorded for a board that left this device takes no slot: nothing here follows it
@@ -1263,11 +1277,19 @@ impl<T: T3> Daemon<T> {
     /// the limit holds.
     fn load(&self) -> String {
         let others = self.other_turns();
+        let limit = self.run_limit();
+        let reserve = self.reserve();
+        let daemon_limit = self.daemon_run_limit();
+        let reserved = if limit != usize::MAX && reserve > 0 {
+            format!(" (daemon limit {daemon_limit}, {reserve} reserved)")
+        } else {
+            String::new()
+        };
         let mut text = format!(
-            "device {} has {} of {} runs: {} of the dispatcher, {} turns of other threads",
+            "device {} has {} of {} runs{reserved}: {} of the dispatcher, {} turns of other threads",
             self.ctx.device,
             self.runs(),
-            self.run_limit(),
+            limit,
             self.own_runs(),
             others.len()
         );
@@ -1299,8 +1321,8 @@ impl<T: T3> Daemon<T> {
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
     /// since a missing project may be what failed. `runs_at_once` takes effect at once
-    /// too. `server`, `device`, `t3_bin` and
-    /// `[thread_model]` are fixed while the daemon runs, so changing them asks for a
+    /// too. `server`, `device`, `t3_bin`, `[thread_model]` and
+    /// `[judge_model]` are fixed while the daemon runs, so changing them asks for a
     /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
     fn reload_config(&mut self) {
@@ -1333,22 +1355,31 @@ impl<T: T3> Daemon<T> {
             }
         };
         let current = &mut self.ctx.config;
-        if (&new.server, &new.device, &new.t3_bin, &new.thread_model)
-            != (
-                &current.server,
-                &current.device,
-                &current.t3_bin,
-                &current.thread_model,
-            )
-        {
+        if (
+            &new.server,
+            &new.device,
+            &new.t3_bin,
+            &new.thread_model,
+            &new.judge_model,
+        ) != (
+            &current.server,
+            &current.device,
+            &current.t3_bin,
+            &current.thread_model,
+            &current.judge_model,
+        ) {
             tracing::warn!(
-                "{} changes server, device, t3_bin or thread_model: restart board watch to apply them",
+                "{} changes server, device, t3_bin, thread_model or judge_model: restart board watch to apply them",
                 path.display()
             );
         }
         if new.runs_at_once != current.runs_at_once {
             current.runs_at_once = new.runs_at_once;
             tracing::info!("re-read {}: runs_at_once updated", path.display());
+        }
+        if new.reserve_runs != current.reserve_runs {
+            current.reserve_runs = new.reserve_runs;
+            tracing::info!("re-read {}: reserve_runs updated", path.display());
         }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
@@ -1463,12 +1494,14 @@ impl<T: T3> Daemon<T> {
         board.autopilot && board.home_devices.contains(&self.ctx.device)
     }
 
-    /// An active board with this device among its homes that is not on autopilot: its
-    /// pending proposals get verdict judges, and the board gets nothing else from this
-    /// daemon (`docs/DESIGN.md`, "Daemon dispatch", Boards off autopilot).
+    /// An active board with this device among its homes that is not on autopilot and has
+    /// automatic verdict judges enabled: its pending proposals get verdict judges, and the
+    /// board gets nothing else from this daemon (`docs/DESIGN.md`, "Daemon dispatch", Boards
+    /// off autopilot).
     fn judges_proposals(&self, board: &Board) -> bool {
         !board.autopilot
             && board.status == BoardStatus::Active
+            && board.verdict_judges
             && board.home_devices.contains(&self.ctx.device)
     }
 
@@ -1505,6 +1538,11 @@ impl<T: T3> Daemon<T> {
                 }
                 if self.judges_proposals(board) {
                     off_autopilot.push(board);
+                } else if !board.autopilot && !board.verdict_judges {
+                    // Turning verdict judges off ends lease-less judge rights on the
+                    // server; drop tracked runs so they neither leak in watch.json nor
+                    // trigger a spurious JUDGE_RETRY delay if re-enabled later.
+                    self.state.judges.retain(|r| r.board != board.slug);
                 }
                 continue;
             }
@@ -1877,7 +1915,7 @@ impl<T: T3> Daemon<T> {
         {
             return Ok(());
         }
-        if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress).await? {
+        if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress, now).await? {
             return Ok(());
         }
         for task in self.next_tasks(slug, now).await? {
@@ -1890,10 +1928,11 @@ impl<T: T3> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
-            let limit = device::worker_limit(self.run_limit());
+            let daemon_limit = self.daemon_run_limit();
+            let limit = device::worker_limit(daemon_limit);
             if self.load_unknown().is_some()
                 || self.worker_runs() >= limit
-                || self.runs() >= self.run_limit()
+                || self.runs() >= daemon_limit
                 || self.worker_turns.another_first(slug, waited)
             {
                 let load = self.load();
@@ -1938,11 +1977,15 @@ impl<T: T3> Daemon<T> {
 
     /// Whether a further worker may start on `slug` beside the tasks in progress: each of
     /// them could be read, and no agent of the board stopped on a usage limit since the
-    /// first of them started.
+    /// first of them started that still holds at `now`. A stop no longer holds once the
+    /// agent runs again or its reset has passed, or when a fresh usage reading taken after
+    /// it shows no full window of the account: then the limit was not the account's, such
+    /// as one model's limit, and does not stop the workers.
     async fn may_start_beside(
         &self,
         slug: &BoardSlug,
         in_progress: &BTreeMap<TaskId, InProgress>,
+        now: Timestamp,
     ) -> Result<bool> {
         if in_progress.values().any(|p| p.task.is_none()) {
             return Ok(false);
@@ -1950,16 +1993,32 @@ impl<T: T3> Daemon<T> {
         let Some(first) = in_progress.values().map(|p| p.since).min() else {
             return Ok(true);
         };
+        let account_not_full_since = self
+            .usage
+            .as_ref()
+            // A window at 100 percent without a reset time counts as full, and a reading
+            // without windows says nothing.
+            .filter(|u| u.fresh(now) && u.windows().next().is_some() && u.over(100, now).is_none())
+            .map(|u| u.read_at);
         for (agent, at) in &self.state.usage_stops {
-            if *at < first {
+            if *at < first || account_not_full_since.is_some_and(|read| read > *at) {
                 continue;
             }
-            let member = match self.client().agent_info(agent).await {
-                Ok(info) => info.boards.contains(slug),
+            let holds = match self.client().agent_info(agent).await {
+                // The server keeps an ended agent's `paused_until` only while its reset is
+                // ahead; a paused agent without one waits for a reset nobody knows.
+                Ok(info) => {
+                    info.boards.contains(slug)
+                        && match info.state {
+                            AgentState::Paused => info.paused_until.is_none_or(|until| until > now),
+                            AgentState::Ended => info.paused_until.is_some_and(|until| until > now),
+                            AgentState::Running | AgentState::Idle => false,
+                        }
+                }
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
                 Err(err) => return Err(err.context("reading an agent that stopped on usage")),
             };
-            if member {
+            if holds {
                 tracing::info!(
                     "{agent} stopped on a usage limit at {at}, after the tasks in progress on {slug} started; no further worker starts beside them"
                 );
@@ -2297,7 +2356,13 @@ impl<T: T3> Daemon<T> {
         self.save()?;
         let thread = self
             .t3
-            .start_thread(&project, &worker.title, &brief, worktree.as_ref())
+            .start_thread(
+                &project,
+                &worker.title,
+                &brief,
+                worktree.as_ref(),
+                self.ctx.config.thread_model.as_ref(),
+            )
             .await?;
         // A thread id that names no agent could never be followed, and would hold the slot.
         thread_agent(&thread)
@@ -3341,7 +3406,7 @@ impl<T: T3> Daemon<T> {
         let full = self
             .state
             .usage_full_until
-            .filter(|_| seen.agent.runtime == Runtime::Claude);
+            .filter(|_| matches!(seen.agent.runtime, Runtime::Claude | Runtime::Antigravity));
         paused_until(seen).max(full)
     }
 
@@ -3444,6 +3509,25 @@ impl<T: T3> Daemon<T> {
                         && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
                 })
             {
+                self.usage_snapshot_at = Some(snapshot.read_at);
+                reading = Some(snapshot);
+            }
+        } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
+            let every = self.usage_poll_every(now);
+            let snapshot = crate::usage::read_snapshots(snapshots, now)
+                .await
+                .into_iter()
+                .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+                .filter(|s| {
+                    self.usage
+                        .as_ref()
+                        .is_none_or(|known| crate::usage::follows(s, known))
+                })
+                .max_by_key(|s| s.read_at);
+            if let Some(snapshot) = snapshot.filter(|s| {
+                self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                    && self.usage.as_ref().is_none_or(|k| s.read_at > k.read_at)
+            }) {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
             }
@@ -3880,8 +3964,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
-    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref())
-        .with_thread_model(ctx.config.thread_model.clone());
+    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
     tracing::info!(
         "watching as device {} with {}",
         ctx.device,
@@ -3890,8 +3973,13 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let usage_source =
-        UsageSource::claude_code(t3.thread_model.as_ref().map(|m| m.provider.as_str()));
+    let usage_source = UsageSource::for_provider(
+        ctx.config
+            .thread_model
+            .as_ref()
+            .or(ctx.config.judge_model.as_ref())
+            .map(|m| m.provider.as_str()),
+    );
     let host_memory = device::host_memory();
     if host_memory.is_none() {
         tracing::warn!(

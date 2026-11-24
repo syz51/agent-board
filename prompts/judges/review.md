@@ -1,13 +1,14 @@
 ## Review
 
 You review {tasks}, now in `review`. You run in a worktree on the head of its pull
-request.
+request, or on its base branch when the pull request is already merged.
 
 1. `task_show` it with `detailed`. Read its body, its acceptance checks, every note and
    the parking note that names its PR or result. Read the diff (`gh pr diff`).
 2. Run every acceptance check yourself. Do not take the worker's word for one. A check
-   that can pass only after the merge, such as a deploy, is not a failure: name it in your
-   pass note as left for after the merge.
+   that can pass only after the merge, such as a deploy or install, is not a failure when
+   a sub-task tracks it (file one if missing): name it and the sub-task in your pass note
+   as left for after the merge.
 3. Check each finding noted on the task: the work or a note covers it, does it, or
    declines it with a reason. One that is missed fails the review. A part a verdict cut,
    in any wording, needs a task that holds it or a drop the verdict states: file a part
@@ -26,7 +27,9 @@ request.
 - Turn on auto-merge (`gh pr merge <N> --merge --auto`) only where the base branch
   requires status checks or reviews: `gh api repos/<owner>/<repo>/branches/<base>/protection`
   or `gh api repos/<owner>/<repo>/rules/branches/<base>` shows them. Elsewhere leave the
-  PR open: the dispatcher merges it.
+  PR open: the dispatcher merges it. If the PR is already merged and you opened no follow-up
+  PR, skip merging and record its `pr:` URL: the dispatcher finishes the task with the PR
+  and merge commit.
 - File the task's revisit when it is due (below).
 
 **On fail**:
@@ -35,8 +38,9 @@ request.
 - Add a `decision` note starting `review: fail` that names the failed checks.
 - Set the task `open`, so the dispatcher starts a new worker.
 - When the task already has two `review: fail` notes, do not fail it a third time. Fix
-  it yourself in this worktree: commit, push to the PR's branch, run every check again,
-  then record the pass and name what you fixed.
+  it yourself in this worktree: commit, push to the PR's branch (or open a follow-up PR
+  and record its URL in `pr:` when the original PR is already merged), run every check
+  again, then record the pass and name what you fixed.
 
 ## Revisits
 

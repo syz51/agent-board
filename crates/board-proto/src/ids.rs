@@ -106,6 +106,7 @@ pub enum AgentSource {
     Claude,
     Codex,
     Opencode,
+    Antigravity,
     /// A device daemon dispatching a board's work (`docs/API.md`, "Daemon dispatch").
     Dispatch,
 }
@@ -117,6 +118,7 @@ impl AgentId {
             Some("claude") => AgentSource::Claude,
             Some("dispatch") => AgentSource::Dispatch,
             Some("opencode") => AgentSource::Opencode,
+            Some("antigravity") => AgentSource::Antigravity,
             _ => AgentSource::Codex,
         }
     }
@@ -191,8 +193,11 @@ fn check_agent_id(value: &str) -> Result<(), &'static str> {
     let (source, native) = value
         .split_once(':')
         .ok_or("must be <source>:<native id>")?;
-    if !matches!(source, "t3" | "claude" | "codex" | "opencode" | "dispatch") {
-        return Err("source must be t3, claude, codex, opencode or dispatch");
+    if !matches!(
+        source,
+        "t3" | "claude" | "codex" | "opencode" | "antigravity" | "dispatch"
+    ) {
+        return Err("source must be t3, claude, codex, opencode, antigravity or dispatch");
     }
     if source == "dispatch" {
         return check_slug(native)
@@ -258,6 +263,13 @@ mod tests {
         let id: AgentId = "opencode:ses_abc123".parse().unwrap();
         assert_eq!(id.source(), AgentSource::Opencode);
         assert_eq!(id.native(), "ses_abc123");
+    }
+
+    #[test]
+    fn antigravity_agent_ids_have_their_own_source() {
+        let id: AgentId = "antigravity:conv-123".parse().unwrap();
+        assert_eq!(id.source(), AgentSource::Antigravity);
+        assert_eq!(id.native(), "conv-123");
     }
 
     #[test]

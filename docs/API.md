@@ -244,6 +244,14 @@ server's minute sweep deletes older ones.
   `forbidden` otherwise); anyone may restate or lower it. A `Board` from a server that
   predates it reads as 90. `board board update <slug> --usage-stop-at N` sets it, and
   `board boards` shows ` · new work stops at N% usage` when it is not 90.
+  `verdict_judges` (default `true`) controls whether a home device daemon starts automatic
+  verdict judges for pending proposals on the board while autopilot is off, and whether the
+  server grants lease-less verdict judge registration and rights there (see "Daemon
+  dispatch"). Anyone may toggle it (`board board update <slug> --verdict-judges
+  <true|false>`, recording `board_updated` with `fields: ["verdict_judges"]`). A `Board`
+  from a server that predates it reads as `true`, and `UpdateBoard` leaves the field out
+  unless set; the CLI checks the answer and refuses if an older server ignored it.
+  `board boards` and `board status` show ` · verdict judges off` when it is `false`.
   `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
   the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
   sets it on every new board and drops `dispatch` from an update: `thread`, the
@@ -807,10 +815,11 @@ knows two things for it:
     agent holding the board's coordinator lease may call it, acting as itself in
     `X-Board-Agent` (400 `invalid` without the header; 403 `forbidden` for any other agent,
     a judge included). One more agent may, for `kind` `verdict` only: `dispatch:<device>`
-    on an `active` board that is not on autopilot and lists `<device>` in `home_devices`
-    (403 `forbidden` for another kind, another agent or a paused board; 409 `claim_refused`
-    while a judge that another home device registered there is live, so one device at a
-    time judges the board's proposals). `kind` is `review`, `verdict`, `goal` or `triage`.
+    on an `active` board that is not on autopilot, has `verdict_judges` enabled, and lists
+    `<device>` in `home_devices` (403 `forbidden` for another kind, another agent, a paused
+    board, or a board with `verdict_judges: false`; 409 `claim_refused` while a judge that
+    another home device registered there is live, so one device at a time judges the
+    board's proposals). `kind` is `review`, `verdict`, `goal` or `triage`.
     `tasks` names tasks of this board: repeats are dropped, then at most 20 may remain
     (`JUDGE_TASKS_MAX`; 400 `invalid` for more), and a `review` names at least one (400
     `invalid`). An unknown task is 404, a task of another board 400 `invalid`. `agent` is
@@ -823,7 +832,8 @@ knows two things for it:
     back), at most 2 hours have passed since it was registered (`JUDGE_HOURS_MAX`;
     `expires_at`), and the agent that registered it still holds the board's coordinator
     lease, or, for a verdict judge registered without the lease, the board is still
-    `active`, not on autopilot, and a home of the registering agent's device. Registering
+    `active`, not on autopilot, has `verdict_judges` enabled, and is a home of the
+    registering agent's device. Registering
     the same agent again before its registration ended or expired replaces `kind`, `tasks` and `registered_by` and keeps `expires_at`; once it is over, a
     registration starts afresh.
   - `GET /v1/boards/{slug}/judges` → the registrations that give rights now, oldest first.

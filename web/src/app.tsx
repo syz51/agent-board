@@ -190,7 +190,8 @@ export function BoardLinks() {
         ) : (
           <p className="px-2.5 py-1 text-meta text-muted-foreground">Loading…</p>
         ))}
-      <ul className="grid gap-px">
+      {/* minmax(0,1fr): an auto column would grow to a long nowrap title and defeat its truncate. */}
+      <ul className="grid grid-cols-[minmax(0,1fr)] gap-px">
         {list.map((board) => {
           const href = `/boards/${encodeURIComponent(board.slug)}`;
           const here = path === href || board.slug === taskBoard;

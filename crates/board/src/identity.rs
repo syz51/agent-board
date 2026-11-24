@@ -44,6 +44,7 @@ pub fn resolve_agent(
                     Runtime::Claude => "claude",
                     Runtime::Codex => "codex",
                     Runtime::Opencode => "opencode",
+                    Runtime::Antigravity => "antigravity",
                 };
                 format!("{source}:{session}")
             })
@@ -97,7 +98,7 @@ impl ProcessTable for std::collections::HashMap<u32, ProcessEntry> {
 /// Agent runtimes whose sessions may run inside one another.
 fn is_runtime(name: &str) -> bool {
     let base = name.rsplit('/').next().unwrap_or(name);
-    matches!(base, "claude" | "codex")
+    matches!(base, "claude" | "codex" | "antigravity")
 }
 
 /// Is `pid` part of a session nested in another agent session? Walks up from `pid`'s
