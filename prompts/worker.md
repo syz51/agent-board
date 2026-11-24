@@ -21,8 +21,8 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    change (including disjoint additive sections in shared docs such as `README.md` or
    `CLAUDE.md`, or a file under a broad glob that the other task's diff and scope do not
    touch): record a `decision` note on {task} naming the other task, each overlapping
-   file and the disjoint sections or hunks, add a note on the other task, and merge
-   `origin/main` (or the base branch) before finishing to resolve any conflict. When both
+   file and the disjoint sections or hunks, add a note on the other task, and fetch and
+   merge `origin/main` (or the base branch) before finishing to resolve any conflict. When both
    tasks change the same sections or hunks, or when the other branch's diff cannot be
    read (including when the other task has not yet edited a file its scope covers, so its
    hunks are unknown), stop: set {task} `open` with a note naming that task, and end. The

@@ -1075,8 +1075,8 @@ The file rules are left to the worker's lease check. A worker whose lease overla
 another task in progress reads the other task's branch or local worktree diff of the
 overlapping files: if the edits touch only different sections or hunks (or a file under a
 broad glob that the other task's diff and scope do not touch), it may proceed with a
-`decision` note naming that task, file and hunks, a note on the other task, and a merge
-of the base branch before finishing. Otherwise — when both tasks change the same hunks or
+`decision` note naming that task, file and hunks, a note on the other task, and a fetch
+and merge of the base branch before finishing. Otherwise — when both tasks change the same hunks or
 the other diff cannot be read — it stops and leaves its task `open`. The dispatcher skips
 that task until a task in progress ends (built: it skips a task its worker gave back while
 other tasks were in progress, until one of those leaves `doing`). The rules a coordinator

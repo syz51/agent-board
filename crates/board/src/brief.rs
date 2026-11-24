@@ -242,7 +242,7 @@ mod tests {
             "touches only different sections or hunks than the ones factory-7 will change",
             "record a `decision` note on factory-7 naming the other task, each overlapping file and the disjoint sections or hunks",
             "add a note on the other task",
-            "merge `origin/main` (or the base branch) before finishing",
+            "fetch and merge `origin/main` (or the base branch) before finishing",
             "When both tasks change the same sections or hunks, or when the other branch's diff cannot be read",
             "stop: set factory-7 `open` with a note naming that task, and end.",
         ] {
