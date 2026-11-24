@@ -58,41 +58,120 @@ pub fn review_branch(task: &TaskId) -> String {
     format!("review/{task}")
 }
 
+/// What branch [`review_worktree`] should try to fetch from `origin` before falling back
+/// to the repository's default base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTarget<'a> {
+    /// The pull request's head branch (or its base branch when already merged).
+    PullRequest(&'a str),
+    /// The worker's task branch (`task/<id>` or its time-suffixed form) when no pull
+    /// request is recorded yet.
+    TaskBranch(&'a str),
+    /// No branch to fetch (for example, `pr: none`, an open fork PR, or a failed PR read).
+    None,
+}
+
+/// How [`review_worktree`] chose its worktree's base ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewBase {
+    /// Started on the requested pull request head (or base branch for a merged PR).
+    PullRequest,
+    /// Started on the worker's task branch fetched from `origin`.
+    TaskBranch,
+    /// Fell back to the repository's default base because no PR head or task branch
+    /// resolved.
+    DefaultBase,
+}
+
+/// The worktree prepared for a review judge, and how its base ref was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewWorktree {
+    pub worktree: NewWorktree,
+    pub source: ReviewBase,
+    /// Why a requested branch could not be fetched, when `source` fell back to
+    /// [`ReviewBase::DefaultBase`].
+    pub fetch_error: Option<String>,
+}
+
+/// Whether `name` is a safe git branch name to use in a fetch refspec.
+pub(crate) fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && !name.contains(':')
+        && !name.contains("@{")
+        && !name.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | '?' | '*' | '[' | '\\')
+        })
+}
+
 /// The worktree to start the review judge of `task` in, as [`worker_worktree`]: on
-/// `head`, the branch of the task's pull request (or its base branch when already merged),
-/// fetched first. Without a pull request, or when its branch cannot be fetched (a fork's),
-/// it starts from the default branch.
+/// `target`, fetched from `origin`, or on the repository's default base when no target was
+/// given or fetching it failed (recorded in [`ReviewWorktree::source`] and
+/// [`ReviewWorktree::fetch_error`]).
 pub async fn review_worktree(
     project: &Path,
     task: &TaskId,
-    head: Option<&str>,
+    target: ReviewTarget<'_>,
     now: Timestamp,
-) -> Result<Option<NewWorktree>> {
+) -> Result<Option<ReviewWorktree>> {
     let Some(mut worktree) = new_worktree(project, review_branch(task), now).await? else {
         return Ok(None);
     };
-    // A name git would read as an option is no branch. Skip a second fetch when `default_base`
-    // already fetched the same `origin/<head>` branch.
-    if let Some(head) = head.filter(|h| !h.is_empty() && !h.starts_with('-')) {
-        let target = format!("origin/{head}");
-        if worktree.base != target {
-            match git(project, &["fetch", "--quiet", "origin", head], FETCH).await {
-                Ok(out) if out.ok => worktree.base = target,
-                Ok(out) => tracing::warn!(
-                    "fetching {head} in {}: {}; the review of {task} starts from {}",
-                    project.display(),
-                    out.stderr.trim(),
-                    worktree.base
-                ),
-                Err(err) => tracing::warn!(
-                    "fetching {head} in {}: {err:#}; the review of {task} starts from {}",
-                    project.display(),
-                    worktree.base
-                ),
-            }
+    let (head, resolved_source) = match target {
+        ReviewTarget::PullRequest(head) => (head, ReviewBase::PullRequest),
+        ReviewTarget::TaskBranch(head) => (head, ReviewBase::TaskBranch),
+        ReviewTarget::None => {
+            return Ok(Some(ReviewWorktree {
+                worktree,
+                source: ReviewBase::DefaultBase,
+                fetch_error: None,
+            }));
         }
+    };
+    if !valid_branch_name(head) {
+        return Ok(Some(ReviewWorktree {
+            worktree,
+            source: ReviewBase::DefaultBase,
+            fetch_error: Some(format!("invalid branch name {head:?}")),
+        }));
     }
-    Ok(Some(worktree))
+    let remote_ref = format!("origin/{head}");
+    // Skip a second fetch when `default_base` already fetched the same `origin/<head>`.
+    if worktree.base == remote_ref {
+        return Ok(Some(ReviewWorktree {
+            worktree,
+            source: resolved_source,
+            fetch_error: None,
+        }));
+    }
+    let refspec = format!("+refs/heads/{head}:refs/remotes/origin/{head}");
+    match git(project, &["fetch", "--quiet", "origin", &refspec], FETCH).await {
+        Ok(out) if out.ok => {
+            worktree.base = remote_ref;
+            Ok(Some(ReviewWorktree {
+                worktree,
+                source: resolved_source,
+                fetch_error: None,
+            }))
+        }
+        Ok(out) => Ok(Some(ReviewWorktree {
+            worktree,
+            source: ReviewBase::DefaultBase,
+            fetch_error: Some(format!(
+                "fetching {head} in {}: {}",
+                project.display(),
+                out.stderr.trim()
+            )),
+        })),
+        Err(err) => Ok(Some(ReviewWorktree {
+            worktree,
+            source: ReviewBase::DefaultBase,
+            fetch_error: Some(format!("fetching {head} in {}: {err:#}", project.display())),
+        })),
+    }
 }
 
 /// A worktree on `branch`, or on `branch` with the time when that one exists, from the
@@ -605,27 +684,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = clone(dir.path(), "main");
         let task: TaskId = "factory-7".parse().unwrap();
-        // The branch exists on the remote only: the clone has not fetched it.
+        // The branches exist on the remote only: the clone has not fetched them.
         run(
             &dir.path().join("origin"),
             &["branch", "task/factory-7", "main"],
         );
-        let on_head = review_worktree(&repo, &task, Some("task/factory-7"), at())
-            .await
-            .unwrap();
+        run(
+            &dir.path().join("origin"),
+            &["branch", "task/factory-7-20261108-132005", "main"],
+        );
+        let on_pr = review_worktree(
+            &repo,
+            &task,
+            ReviewTarget::PullRequest("task/factory-7"),
+            at(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            on_head,
-            Some(NewWorktree {
+            on_pr.worktree,
+            NewWorktree {
                 base: "origin/task/factory-7".into(),
                 branch: "review/factory-7".into()
-            })
+            }
         );
+        assert_eq!(on_pr.source, ReviewBase::PullRequest);
+        assert_eq!(on_pr.fetch_error, None);
         run(&repo, &["rev-parse", "--verify", "origin/task/factory-7"]);
-        // No pull request, a branch the remote lacks, or a name that is an option: the
-        // default branch.
-        for head in [None, Some("task/gone"), Some("--upload-pack=x")] {
-            let worktree = review_worktree(&repo, &task, head, at()).await.unwrap();
-            assert_eq!(worktree.unwrap().base, "origin/main", "{head:?}");
+
+        // Task branch fallback (including time-suffixed worker branches).
+        let on_task = review_worktree(
+            &repo,
+            &task,
+            ReviewTarget::TaskBranch("task/factory-7-20261108-132005"),
+            at(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            on_task.worktree.base,
+            "origin/task/factory-7-20261108-132005"
+        );
+        assert_eq!(on_task.source, ReviewBase::TaskBranch);
+        assert_eq!(on_task.fetch_error, None);
+
+        // A merged PR whose base is the default branch still counts as resolved PullRequest.
+        let on_merged_default =
+            review_worktree(&repo, &task, ReviewTarget::PullRequest("main"), at())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(on_merged_default.worktree.base, "origin/main");
+        assert_eq!(on_merged_default.source, ReviewBase::PullRequest);
+        assert_eq!(on_merged_default.fetch_error, None);
+
+        // No target, a branch the remote lacks, or an invalid/option name: default base.
+        for (target, expects_err) in [
+            (ReviewTarget::None, false),
+            (ReviewTarget::PullRequest("task/gone"), true),
+            (ReviewTarget::TaskBranch("task/gone"), true),
+            (ReviewTarget::PullRequest("--upload-pack=x"), true),
+            (ReviewTarget::PullRequest("a:b"), true),
+        ] {
+            let prepared = review_worktree(&repo, &task, target, at())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.worktree.base, "origin/main", "{target:?}");
+            assert_eq!(prepared.source, ReviewBase::DefaultBase, "{target:?}");
+            assert_eq!(prepared.fetch_error.is_some(), expects_err, "{target:?}");
         }
     }
 

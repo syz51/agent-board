@@ -73,13 +73,52 @@ pub fn worker_brief(board: &BoardSlug, task: &TaskId, closer: &str) -> String {
         .replace("{closer}", closer)
 }
 
+/// The default worktree sentence in a review judge's brief.
+const REVIEW_PR_WORKTREE: &str = "You run in a worktree on the head of its pull request, or on its base branch when the pull request is already merged.";
+
+/// The worktree sentence for a review judge started on the worker's task branch fetched
+/// from `origin` when no pull request was recorded yet.
+pub fn review_task_branch_note(base: &str) -> String {
+    format!(
+        "You run in a worktree on `{base}`, the head of the task's branch fetched from origin (no pull request was recorded yet when this review started)."
+    )
+}
+
+/// The worktree sentence for a review judge whose worktree started on the repository's
+/// default base because no pull request head or task branch resolved (or because the task
+/// declared `pr: none`).
+pub fn review_default_base_note(base: &str, no_code: bool) -> String {
+    if no_code {
+        format!(
+            "You run in a worktree on `{base}` (the repository's default base), because the task's notes declare `pr: none` (no pull request)."
+        )
+    } else {
+        format!(
+            "You run in a worktree on `{base}` (the repository's default base), not on the pull request head: no pull request head or task branch resolved when this review started. Check the task's notes and fetch the PR or branch yourself before checking code, unless this task has no code changes."
+        )
+    }
+}
+
 /// The brief of a `kind` judge of `board`, for `tasks`: the shared rules, then the kind's
 /// section. A goal judge names no tasks.
 pub fn judge_brief(kind: JudgeKind, board: &BoardSlug, tasks: &[TaskId]) -> String {
+    judge_brief_with_worktree(kind, board, tasks, None)
+}
+
+/// Like [`judge_brief`], with an optional worktree sentence replacing `{worktree}` in a
+/// review judge's brief.
+pub fn judge_brief_with_worktree(
+    kind: JudgeKind,
+    board: &BoardSlug,
+    tasks: &[TaskId],
+    worktree: Option<&str>,
+) -> String {
+    let worktree = worktree.unwrap_or(REVIEW_PR_WORKTREE);
     format!("{JUDGE_SHARED_PROMPT}\n{}", kind.section())
         .replace("{board}", board.as_str())
         .replace("{kind}", kind.as_str())
         .replace("{tasks}", &list(tasks))
+        .replace("{worktree}", worktree)
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -182,6 +221,24 @@ mod tests {
             assert!(
                 chars < JUDGE_BRIEF_CHARS_MAX,
                 "{kind:?} brief has {chars} characters"
+            );
+        }
+        for note in [
+            review_task_branch_note("origin/task/factory-1000-20261108-132005"),
+            review_default_base_note("origin/main", false),
+            review_default_base_note("origin/main", true),
+        ] {
+            let brief =
+                judge_brief_with_worktree(JudgeKind::Review, &board(), &[task(1000)], Some(&note));
+            assert!(!brief.contains('{'), "{brief}");
+            assert!(
+                brief.chars().count() < JUDGE_BRIEF_CHARS_MAX,
+                "custom review brief has {} characters",
+                brief.chars().count()
+            );
+            assert!(
+                !flat(&brief).contains("on the head of its pull request"),
+                "{brief}"
             );
         }
     }

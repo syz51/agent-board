@@ -54,6 +54,10 @@ pub const JUDGE_REGISTER_WAIT: TimeDelta = TimeDelta::minutes(10);
 /// The shortest time between two reads of one task's pull request.
 pub const PR_READ_EVERY: TimeDelta = TimeDelta::minutes(2);
 
+/// How long the dispatcher waits for a task in `review` without a recorded PR or pushed
+/// worker branch on `origin` before falling back to the repository's default base.
+pub const REVIEW_PR_WAIT: TimeDelta = TimeDelta::minutes(2);
+
 /// A judge thread the dispatcher started, until its judge ends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeRun {
@@ -73,6 +77,10 @@ pub struct JudgeRun {
     /// Whether its thread is noted on the task it reviews.
     #[serde(default)]
     pub noted: bool,
+    /// Custom worktree sentence for a review judge that did not start on a PR head, kept
+    /// so a recovered start sends the same brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_note: Option<String>,
 }
 
 impl JudgeRun {
@@ -161,6 +169,27 @@ pub(super) enum Judging {
     Verdicts,
 }
 
+/// Extra context needed to choose the worktree base and brief for a review judge.
+#[derive(Debug, Clone)]
+struct ReviewWant {
+    /// The pull request URL recorded on the task, if any.
+    pr: Option<String>,
+    /// Whether the current review attempt's notes explicitly declare `pr: none`.
+    no_code: bool,
+    /// The branch the dispatcher gave the worker (`task/<id>` or its time-suffixed form),
+    /// tried on `origin` when no PR is recorded yet.
+    worker_branch: Option<String>,
+    /// When the task last moved to `review`.
+    parked_at: Timestamp,
+}
+
+/// Whether `start_judge` actually launched a judge thread or deferred it for a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartOutcome {
+    Started,
+    Waited,
+}
+
 /// A judgment the board needs.
 #[derive(Debug, Clone)]
 struct Want {
@@ -169,8 +198,8 @@ struct Want {
     title: String,
     /// Since when it has waited: the oldest goes first.
     since: Timestamp,
-    /// The pull request of a task to review.
-    pr: Option<String>,
+    /// Present for [`JudgeKind::Review`].
+    review: Option<ReviewWant>,
 }
 
 /// The judges at work on a board.
@@ -348,6 +377,106 @@ fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
         .find_map(|n| pull_request_url_in(&n.text, repos))
 }
 
+/// Whether `text` explicitly declares `pr: none` (either on a `pr:` line or inline).
+fn has_pr_none(text: &str) -> bool {
+    text.lines().any(|line| {
+        if tagged(line, "pr").is_some_and(|v| {
+            v.trim_end_matches(['.', ',', ';', ')'])
+                .eq_ignore_ascii_case("none")
+        }) {
+            return true;
+        }
+        let lower = line.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut pos = 0;
+        while let Some(found) = lower[pos..].find("pr:") {
+            let at = pos + found;
+            let before_ok =
+                at == 0 || (!bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_');
+            if before_ok {
+                let rest = lower[at + 3..].trim_start();
+                if let Some(after) = rest.strip_prefix("none") {
+                    let after_ok = after
+                        .as_bytes()
+                        .first()
+                        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+                    if after_ok {
+                        return true;
+                    }
+                }
+            }
+            pos = at + 3;
+        }
+        false
+    })
+}
+
+/// Whether the current review attempt's notes declare `pr: none`. Scans backward until the
+/// newest dispatcher worker-start note or `review: fail`/`review: void` decision note so an
+/// older round's `pr: none` never suppresses a later code attempt.
+fn noted_pr_none(detail: &TaskDetail) -> bool {
+    for note in detail.notes.iter().rev() {
+        if note.agent.source() == AgentSource::Dispatch {
+            if note.text.starts_with(WORKER_NOTE_PREFIX) {
+                break;
+            }
+            continue;
+        }
+        if note.kind == NoteKind::Decision
+            && matches!(
+                review_verdict(&note.text),
+                Some(ReviewVerdict::Fail | ReviewVerdict::Void)
+            )
+        {
+            break;
+        }
+        if has_pr_none(&note.text) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The branch the dispatcher last gave a worker for `detail`'s task, from its worker-start
+/// note. Returns `Some(None)` when the newest dispatcher start note ran in-place without a
+/// branch, and `None` when no dispatcher start note exists.
+fn noted_worker_branch(detail: &TaskDetail) -> Option<Option<String>> {
+    for note in detail.notes.iter().rev() {
+        if note.agent.source() != AgentSource::Dispatch {
+            continue;
+        }
+        if let Some(rest) = note.text.strip_prefix(WORKER_NOTE_BRANCH) {
+            let branch = rest.split_once(": ").map(|(b, _)| b.trim())?;
+            if crate::worktree::valid_branch_name(branch) {
+                return Some(Some(branch.to_owned()));
+            }
+            return Some(None);
+        }
+        if note.text.starts_with(WORKER_NOTE_IN_PLACE) {
+            return Some(None);
+        }
+    }
+    None
+}
+
+/// When `detail`'s task last moved into `review`: its newest `task_updated` event moving to
+/// `review`, else `task.updated_at`.
+fn parked_in_review_at(detail: &TaskDetail) -> Timestamp {
+    detail
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.event_type == EventType::TaskUpdated && e.payload["to"] == "review")
+        .map_or(detail.task.updated_at, |e| e.at)
+}
+
+/// Whether `now` is still inside the bounded [`REVIEW_PR_WAIT`] window after `parked_at`.
+/// Allows up to 5 minutes of forward server-clock skew without starving wildly future times.
+fn within_pr_wait(parked_at: Timestamp, now: Timestamp) -> bool {
+    let elapsed = now - parked_at;
+    elapsed >= -TimeDelta::minutes(5) && elapsed < REVIEW_PR_WAIT
+}
+
 /// The checks a pass note records, one `check: <command> => <exit code>` line each.
 fn passed_checks(pass: &str) -> Vec<NewEvidence> {
     pass.lines()
@@ -491,12 +620,32 @@ impl<T: T3> Daemon<T> {
                     if self.judge_waits(&retry_key(JudgeKind::Review, &task.id), task) {
                         continue;
                     }
+                    let pr = noted_pr(&detail, &board.repos);
+                    let no_code = pr.is_none() && noted_pr_none(&detail);
+                    let worker_branch = if pr.is_none() && !no_code {
+                        match noted_worker_branch(&detail) {
+                            Some(branch) => branch,
+                            None => self
+                                .state
+                                .workers
+                                .get(&task.id)
+                                .and_then(|w| w.branch.clone())
+                                .or_else(|| Some(crate::worktree::worker_branch(&task.id))),
+                        }
+                    } else {
+                        None
+                    };
                     wants.push(Want {
                         kind: JudgeKind::Review,
                         tasks: vec![task.id.clone()],
                         title: format!("review {} {}", task.id, task.title),
                         since: task.updated_at,
-                        pr: noted_pr(&detail, &board.repos),
+                        review: Some(ReviewWant {
+                            pr,
+                            no_code,
+                            worker_branch,
+                            parked_at: parked_in_review_at(&detail),
+                        }),
                     });
                 }
             }
@@ -558,7 +707,7 @@ impl<T: T3> Daemon<T> {
                 title: format!("verdict {} ({under})", first.id),
                 since: first.created_at,
                 tasks: batch.iter().map(|t| t.id.clone()).collect(),
-                pr: None,
+                review: None,
             });
         }
 
@@ -576,7 +725,7 @@ impl<T: T3> Daemon<T> {
                     title: format!("triage {}", batch[0].id),
                     since: batch[0].created_at,
                     tasks: batch.iter().map(|t| t.id.clone()).collect(),
-                    pr: None,
+                    review: None,
                 });
             }
         }
@@ -600,7 +749,7 @@ impl<T: T3> Daemon<T> {
                 tasks: Vec::new(),
                 title: format!("goal review {slug}"),
                 since: now,
-                pr: None,
+                review: None,
             });
         }
 
@@ -656,14 +805,18 @@ impl<T: T3> Daemon<T> {
                 break;
             }
             let names = want.title.clone();
-            self.hold_ended("judge", &names);
             match self.start_judge(board, &client, &project, want, now).await {
-                Ok(()) => {
+                Ok(StartOutcome::Started) => {
+                    self.hold_ended("judge", &names);
                     started += 1;
                     // Served: a further judge of this board waits behind the others.
                     waited = None;
                 }
-                Err(err) => tracing::warn!("starting the judge `{names}`: {err:#}"),
+                Ok(StartOutcome::Waited) => {}
+                Err(err) => {
+                    self.hold_ended("judge", &names);
+                    tracing::warn!("starting the judge `{names}`: {err:#}");
+                }
             }
         }
         self.save()
@@ -796,7 +949,12 @@ impl<T: T3> Daemon<T> {
             return Ok(None);
         };
         if !found.ran {
-            let brief = crate::brief::judge_brief(brief_kind(run.kind), &board.slug, &run.tasks);
+            let brief = crate::brief::judge_brief_with_worktree(
+                brief_kind(run.kind),
+                &board.slug,
+                &run.tasks,
+                run.worktree_note.as_deref(),
+            );
             if let Err(err) = self.t3.send(&found.id, &brief).await {
                 tracing::warn!(
                     "briefing judge thread {} left by an earlier start: {err:#}; archive it in T3",
@@ -890,32 +1048,113 @@ impl<T: T3> Daemon<T> {
         project: &Path,
         want: Want,
         now: Timestamp,
-    ) -> Result<()> {
-        let worktree = match (want.kind, want.tasks.first()) {
-            (JudgeKind::Review, Some(task)) => {
-                let base = match &want.pr {
-                    Some(pr) => match self.gh.view(project, pr).await {
+    ) -> Result<StartOutcome> {
+        let (worktree, worktree_note) = match (want.kind, want.tasks.first(), &want.review) {
+            (JudgeKind::Review, Some(task), Some(review)) => {
+                use crate::worktree::{ReviewBase, ReviewTarget};
+                let (pr_ref, fallback_reason) = if let Some(pr_url) = &review.pr {
+                    match self.gh.view(project, pr_url).await {
                         // A merged pull request's head branch may be deleted or pre-squash:
                         // review the landed code on its base branch instead.
                         Ok(pr) if pr.state == PrState::Merged => {
-                            (!pr.base_ref.is_empty()).then_some(pr.base_ref)
+                            if !pr.base_ref.is_empty() {
+                                (Some(pr.base_ref), None)
+                            } else {
+                                (
+                                    None,
+                                    Some(format!(
+                                        "merged pull request {pr_url} has no base branch"
+                                    )),
+                                )
+                            }
                         }
                         // A fork's branch is not on `origin`.
-                        Ok(pr) => (!pr.cross_repository).then_some(pr.head_ref),
-                        Err(err) => {
-                            tracing::warn!("reading {pr} for the review of {task}: {err:#}");
-                            None
+                        Ok(pr) if !pr.cross_repository => {
+                            if !pr.head_ref.is_empty() {
+                                (Some(pr.head_ref), None)
+                            } else {
+                                (
+                                    None,
+                                    Some(format!("pull request {pr_url} has no head branch")),
+                                )
+                            }
                         }
-                    },
-                    None => None,
+                        Ok(_) => (
+                            None,
+                            Some(format!(
+                                "pull request {pr_url} is from a fork and not on origin"
+                            )),
+                        ),
+                        Err(err) => (None, Some(format!("reading {pr_url}: {err:#}"))),
+                    }
+                } else if review.no_code {
+                    (None, Some("task notes declare pr: none".to_owned()))
+                } else {
+                    (None, None)
                 };
-                crate::worktree::review_worktree(project, task, base.as_deref(), now)
+                let target = if let Some(branch) = pr_ref.as_deref() {
+                    ReviewTarget::PullRequest(branch)
+                } else if review.pr.is_none() && !review.no_code {
+                    match review.worker_branch.as_deref() {
+                        Some(branch) => ReviewTarget::TaskBranch(branch),
+                        None => ReviewTarget::None,
+                    }
+                } else {
+                    ReviewTarget::None
+                };
+                match crate::worktree::review_worktree(project, task, target, now)
                     .await
                     .context("preparing the review judge's worktree")?
+                {
+                    None => (None, None),
+                    Some(prepared) => match prepared.source {
+                        ReviewBase::PullRequest => (Some(prepared.worktree), None),
+                        ReviewBase::TaskBranch => {
+                            tracing::info!(
+                                "review of {task}: no PR recorded yet; starting on worker branch {}",
+                                prepared.worktree.base
+                            );
+                            let note =
+                                crate::brief::review_task_branch_note(&prepared.worktree.base);
+                            (Some(prepared.worktree), Some(note))
+                        }
+                        ReviewBase::DefaultBase => {
+                            if review.pr.is_none()
+                                && !review.no_code
+                                && within_pr_wait(review.parked_at, now)
+                            {
+                                tracing::info!(
+                                    "review of {task}: no PR recorded yet and no worker branch resolved on origin; waiting until {} before starting on {}",
+                                    review.parked_at + REVIEW_PR_WAIT,
+                                    prepared.worktree.base
+                                );
+                                return Ok(StartOutcome::Waited);
+                            }
+                            let reason = prepared
+                                .fetch_error
+                                .or(fallback_reason)
+                                .unwrap_or_else(|| "no PR or worker branch resolved".to_owned());
+                            tracing::warn!(
+                                "review of {task}: {reason}; starting from {}",
+                                prepared.worktree.base
+                            );
+                            let note = crate::brief::review_default_base_note(
+                                &prepared.worktree.base,
+                                review.no_code,
+                            );
+                            (Some(prepared.worktree), Some(note))
+                        }
+                    },
+                }
             }
-            _ => None,
+            _ => (None, None),
         };
-        let brief = crate::brief::judge_brief(brief_kind(want.kind), &board.slug, &want.tasks);
+        let brief = crate::brief::judge_brief_with_worktree(
+            brief_kind(want.kind),
+            &board.slug,
+            &want.tasks,
+            worktree_note.as_deref(),
+        );
         let mut run = JudgeRun {
             board: board.slug.clone(),
             kind: want.kind,
@@ -925,6 +1164,7 @@ impl<T: T3> Daemon<T> {
             started_at: now,
             registered: false,
             noted: false,
+            worktree_note,
         };
         // On disk before T3 can create the thread.
         self.put_run(&run);
@@ -962,7 +1202,7 @@ impl<T: T3> Daemon<T> {
             );
         }
         self.put_run(&run);
-        Ok(())
+        Ok(StartOutcome::Started)
     }
 
     /// Closes a task in `review` that a judge passed: merges its pull request once it can
@@ -1491,5 +1731,140 @@ mod tests {
             noted_pr(&d, &repos).as_deref(),
             Some("https://github.com/o/r/pull/41")
         );
+    }
+
+    #[test]
+    fn noted_worker_branch_picks_the_newest_dispatcher_start_note() {
+        let first = note(
+            1,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task on branch task/factory-7: https://t3.example.test/threads/1",
+            "2026-11-13T08:00:00Z",
+        );
+        let second = note(
+            2,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task on branch task/factory-7-20261113-083000: https://t3.example.test/threads/2",
+            "2026-11-13T08:30:00Z",
+        );
+        let spoofed = note(
+            3,
+            "t3:worker",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task on branch task/fake: https://t3.example.test/threads/3",
+            "2026-11-13T08:35:00Z",
+        );
+        let d = detail(
+            vec![first.clone(), second.clone(), spoofed],
+            serde_json::json!([]),
+        );
+        assert_eq!(
+            noted_worker_branch(&d),
+            Some(Some("task/factory-7-20261113-083000".to_owned()))
+        );
+
+        // An in-place dispatcher start stops scanning so an older branch is not reused.
+        let in_place = note(
+            4,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task: https://t3.example.test/threads/4",
+            "2026-11-13T09:00:00Z",
+        );
+        let d = detail(vec![first, second, in_place], serde_json::json!([]));
+        assert_eq!(noted_worker_branch(&d), Some(None));
+
+        // Without any dispatcher start note: None.
+        let d = detail(vec![], serde_json::json!([]));
+        assert_eq!(noted_worker_branch(&d), None);
+    }
+
+    #[test]
+    fn noted_pr_none_matches_current_round_and_stops_at_reopen_or_new_worker() {
+        let start1 = note(
+            1,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task on branch task/factory-7: https://t3.example.test/threads/1",
+            "2026-11-13T08:00:00Z",
+        );
+        let none_line = note(
+            2,
+            "t3:worker",
+            NoteKind::Note,
+            "Done.\npr: none",
+            "2026-11-13T08:10:00Z",
+        );
+        assert!(noted_pr_none(&detail(
+            vec![start1.clone(), none_line.clone()],
+            serde_json::json!([])
+        )));
+
+        let none_inline = note(
+            2,
+            "t3:worker",
+            NoteKind::Note,
+            "Report written (pr: none).",
+            "2026-11-13T08:10:00Z",
+        );
+        assert!(noted_pr_none(&detail(
+            vec![none_inline],
+            serde_json::json!([])
+        )));
+
+        // Non-matching words do not trigger.
+        let other = note(
+            2,
+            "t3:worker",
+            NoteKind::Note,
+            "expr: none and pr: none_yet",
+            "2026-11-13T08:10:00Z",
+        );
+        assert!(!noted_pr_none(&detail(vec![other], serde_json::json!([]))));
+
+        // A later review: fail or a newer worker start clears an older round's pr: none.
+        let fail = note(
+            3,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: fail: needs a code fix",
+            "2026-11-13T08:20:00Z",
+        );
+        let start2 = note(
+            4,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: the dispatcher started a worker for this task on branch task/factory-7-20261113-082500: https://t3.example.test/threads/2",
+            "2026-11-13T08:25:00Z",
+        );
+        assert!(!noted_pr_none(&detail(
+            vec![start1.clone(), none_line.clone(), fail],
+            serde_json::json!([])
+        )));
+        assert!(!noted_pr_none(&detail(
+            vec![start1, none_line, start2],
+            serde_json::json!([])
+        )));
+    }
+
+    #[test]
+    fn parked_in_review_at_and_within_pr_wait_respect_bounds() {
+        let d = detail(vec![], serde_json::json!([parked("2026-11-08T11:30:00Z")]));
+        let t: Timestamp = "2026-11-08T11:30:00Z".parse().unwrap();
+        assert_eq!(parked_in_review_at(&d), t);
+        assert!(within_pr_wait(t, t));
+        assert!(within_pr_wait(
+            t,
+            t + REVIEW_PR_WAIT - TimeDelta::seconds(1)
+        ));
+        assert!(!within_pr_wait(t, t + REVIEW_PR_WAIT));
+        assert!(within_pr_wait(t, t - TimeDelta::minutes(1)));
+        assert!(!within_pr_wait(t, t - TimeDelta::minutes(10)));
+
+        // Falls back to task.updated_at when history lacks a review transition.
+        let empty = detail(vec![], serde_json::json!([]));
+        assert_eq!(parked_in_review_at(&empty), empty.task.updated_at);
     }
 }

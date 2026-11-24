@@ -1,7 +1,6 @@
 ## Review
 
-You review {tasks}, now in `review`. You run in a worktree on the head of its pull
-request, or on its base branch when the pull request is already merged.
+You review {tasks}, now in `review`. {worktree}
 
 1. `task_show` it with `detailed`. Read its body, its acceptance checks, every note and
    the parking note that names its PR or result. Read the diff (`gh pr diff`).
