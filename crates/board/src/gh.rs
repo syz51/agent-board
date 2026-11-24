@@ -296,6 +296,12 @@ fn parse_checks(rollup: &Value) -> Checks {
 
 /// The last pull request URL in `text` (`https://<host>/<owner>/<repo>/pull/<number>`).
 pub fn pull_request_url(text: &str) -> Option<String> {
+    pull_request_url_in(text, &[])
+}
+
+/// The last pull request URL in `text` belonging to one of `repos` (or any repository when
+/// `repos` is empty).
+pub fn pull_request_url_in(text: &str, repos: &[String]) -> Option<String> {
     let mut found = None;
     let mut rest = text;
     while let Some(at) = rest.find("https://") {
@@ -306,7 +312,8 @@ pub fn pull_request_url(text: &str) -> Option<String> {
         let url = &from[..end];
         if let Some((repo, number)) = url["https://".len()..].split_once("/pull/") {
             let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
-            if repo.split('/').count() == 3 && !digits.is_empty() {
+            let known = repos.is_empty() || repos.iter().any(|k| k.eq_ignore_ascii_case(repo));
+            if repo.split('/').count() == 3 && !digits.is_empty() && known {
                 found = Some(format!("https://{repo}/pull/{digits}"));
             }
         }

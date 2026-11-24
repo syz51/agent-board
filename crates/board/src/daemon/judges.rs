@@ -4,7 +4,7 @@
 //! Each reconcile reads what the board needs judged, and starts a judge thread for each
 //! need while fewer than [`JUDGES_AT_ONCE`] run:
 //! - a task in `review` with no standing `review: pass` gets a review judge, in a worktree
-//!   on the head of its pull request;
+//!   on the head of its pull request (or on its base branch when already merged);
 //! - pending proposals get a verdict judge per parent task, at most
 //!   [`JUDGE_TASKS_AT_ONCE`] proposals each;
 //! - ready items on the feedback board get a triage judge;
@@ -24,7 +24,10 @@ use board_proto::{
 };
 
 use super::*;
-use crate::gh::{Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, repo_of};
+use crate::gh::{
+    Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, pull_request_url_in,
+    repo_of,
+};
 
 /// The most judges of one board at work at once; the rest wait, the oldest need first.
 pub const JUDGES_AT_ONCE: usize = 2;
@@ -338,12 +341,11 @@ fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> PassedPr {
 /// The pull request the newest note of a task names, in one of the board's `repos` when
 /// the board lists any.
 fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
-    detail.notes.iter().rev().find_map(|n| {
-        let url = pull_request_url(&n.text)?;
-        let known = repos.is_empty()
-            || repo_of(&url).is_some_and(|r| repos.iter().any(|k| k.eq_ignore_ascii_case(&r)));
-        known.then_some(url)
-    })
+    detail
+        .notes
+        .iter()
+        .rev()
+        .find_map(|n| pull_request_url_in(&n.text, repos))
 }
 
 /// The checks a pass note records, one `check: <command> => <exit code>` line each.
@@ -1473,6 +1475,21 @@ mod tests {
         assert_eq!(
             noted_pr(&d, &[]).as_deref(),
             Some("https://github.com/o/other/pull/99")
+        );
+
+        // A note naming both the board's PR and a later PR in another repo still picks the
+        // board's PR.
+        let mixed = note(
+            4,
+            "t3:worker",
+            NoteKind::Note,
+            "PR https://github.com/o/r/pull/41 opened; related https://github.com/o/other/pull/99",
+            "2026-11-13T09:15:00Z",
+        );
+        let d = detail(vec![mixed], serde_json::json!([]));
+        assert_eq!(
+            noted_pr(&d, &repos).as_deref(),
+            Some("https://github.com/o/r/pull/41")
         );
     }
 }

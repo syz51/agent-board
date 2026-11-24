@@ -1816,10 +1816,10 @@ fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str])
     };
     let board: BoardSlug = parse_id(&board)?;
     Ok(gone
-        && !is_stood_down(cx, &board, me)?
         && get_board_uncounted(cx, &board)?
             .coordinator
-            .is_some_and(|c| c.as_str() == me))
+            .is_some_and(|c| c.as_str() == me)
+        && !is_stood_down(cx, &board, me)?)
 }
 
 /// Whether `agent` was stood down as coordinator of `board`.
@@ -2147,7 +2147,8 @@ fn idle_notice_for(
     Ok((!t3 || long)
         && get_board_uncounted(cx, &board)?
             .coordinator
-            .is_some_and(|c| c.as_str() == me))
+            .is_some_and(|c| c.as_str() == me)
+        && !is_stood_down(cx, &board, me)?)
 }
 
 fn record_change(

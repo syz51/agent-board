@@ -27,8 +27,9 @@ request, or on its base branch when the pull request is already merged.
 - Turn on auto-merge (`gh pr merge <N> --merge --auto`) only where the base branch
   requires status checks or reviews: `gh api repos/<owner>/<repo>/branches/<base>/protection`
   or `gh api repos/<owner>/<repo>/rules/branches/<base>` shows them. Elsewhere leave the
-  PR open: the dispatcher merges it. If the PR is already merged, skip merging and record
-  its `pr:` URL: the dispatcher finishes the task with the PR and merge commit.
+  PR open: the dispatcher merges it. If the PR is already merged and you opened no follow-up
+  PR, skip merging and record its `pr:` URL: the dispatcher finishes the task with the PR
+  and merge commit.
 - File the task's revisit when it is due (below).
 
 **On fail**:
@@ -38,8 +39,8 @@ request, or on its base branch when the pull request is already merged.
 - Set the task `open`, so the dispatcher starts a new worker.
 - When the task already has two `review: fail` notes, do not fail it a third time. Fix
   it yourself in this worktree: commit, push to the PR's branch (or open a follow-up PR
-  when the PR is already merged), run every check again, then record the pass and name
-  what you fixed.
+  and record its URL in `pr:` when the original PR is already merged), run every check
+  again, then record the pass and name what you fixed.
 
 ## Revisits
 

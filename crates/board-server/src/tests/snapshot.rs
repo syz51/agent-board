@@ -1513,8 +1513,7 @@ async fn a_stood_down_coordinator_never_gets_an_unrun_review_alert() {
     for agent in [stood, worker, peer] {
         t.register(agent, Some(REPO), None).await;
     }
-    // Start on autopilot (daemon dispatch), then stand down `stood` and switch autopilot off,
-    // reproducing t3code-140 on 2026-11-13.
+    // Start on autopilot (daemon dispatch), then stand down `stood` and switch autopilot off.
     t.ok(
         "POST",
         "/v1/boards",
@@ -1622,7 +1621,9 @@ async fn a_stood_down_coordinator_never_gets_an_unrun_review_alert() {
     );
 
     // Even if a pre-migration lease still names the stood-down thread as coordinator,
-    // stands_in_for_owner must not send it a quiet-review reminder either.
+    // stands_in_for_owner must not send it a quiet-review reminder either. Advance first so
+    // the 45m coordinator lease is still live when the quiet-review sweep and snapshot run.
+    t.advance(TimeDelta::hours(25));
     t.ok(
         "PATCH",
         "/v1/boards/auto",
@@ -1637,7 +1638,6 @@ async fn a_stood_down_coordinator_never_gets_an_unrun_review_alert() {
         Some(json!({ "device": "mac", "agent": stood })),
     )
     .await;
-    t.advance(TimeDelta::hours(25));
     t.register(stood, Some(REPO), None).await;
     assert_eq!(sweep_quiet_reviews(&t), 1);
     let stood_delta = snapshot(&t, stood, "kind=delta").await;

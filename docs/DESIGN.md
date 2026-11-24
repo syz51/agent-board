@@ -1037,7 +1037,7 @@ the work.
 **Judges**:
 
 - **Review**:
-  - It runs in a worktree on the PR's head.
+  - It runs in a worktree on the PR's head, or on its base branch when already merged.
   - It reads `task_show` and the diff, and runs every acceptance check.
   - On pass, it adds a `review: pass` decision note with a summary for the user. It turns
     on auto-merge where the base branch requires checks; elsewhere the merge is left to
