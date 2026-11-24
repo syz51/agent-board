@@ -186,7 +186,8 @@ fn to_usage_bucket(cx: &Ctx<'_>, row: StoredBucket) -> Result<UsageBucket> {
 }
 
 /// Stores the reading for `(provider, account)` unless a newer one is already stored, and
-/// returns the resulting bucket.
+/// returns the resulting bucket. Brand-new non-legacy buckets inherit `reserve_pct` from
+/// `('anthropic', 'default')` when set so weekly pace activates on their first reading.
 pub(crate) fn report_bucket(
     cx: &mut Ctx<'_>,
     provider: &str,
@@ -194,11 +195,17 @@ pub(crate) fn report_bucket(
     device: &DeviceName,
     req: PutUsageBucket,
 ) -> Result<UsageBucket> {
+    let inherited_reserve = if provider != LEGACY_USAGE_PROVIDER || account != LEGACY_USAGE_ACCOUNT
+    {
+        load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| b.reserve)
+    } else {
+        None
+    };
     let stored = cx.db.execute(
         "INSERT INTO usage_buckets ( \
              provider, account, five_hour_pct, five_hour_resets_at, \
-             seven_day_pct, seven_day_resets_at, read_at, device \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             seven_day_pct, seven_day_resets_at, read_at, device, reserve_pct \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT (provider, account) DO UPDATE SET \
              five_hour_pct = excluded.five_hour_pct, \
              five_hour_resets_at = excluded.five_hour_resets_at, \
@@ -220,6 +227,7 @@ pub(crate) fn report_bucket(
                 .map(|t| t.timestamp_millis()),
             req.read_at.timestamp_millis(),
             device.as_str(),
+            inherited_reserve,
         ],
     )?;
     if stored > 0
@@ -458,12 +466,18 @@ pub(crate) fn set_bucket_reserve(
     }
 }
 
-/// Legacy `PUT /v1/usage/reserve`: aliases `('anthropic', 'default')`.
+/// Legacy `PUT /v1/usage/reserve`: aliases `('anthropic', 'default')`. When enabling a
+/// weekly reserve for the first time (`None -> Some(reserve)`), also backfills existing
+/// non-legacy buckets whose `reserve_pct` is `NULL`, without touching buckets whose reserve
+/// was explicitly set or cleared while a reserve was already active.
 pub(crate) fn set_reserve(
     cx: &Ctx<'_>,
     req: PutUsageBucketReserve,
     by_user: bool,
 ) -> Result<UsageReserve> {
+    let before = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?
+        .and_then(|b| b.reserve);
+    let new_reserve = req.reserve;
     let bucket = set_bucket_reserve(
         cx,
         LEGACY_USAGE_PROVIDER,
@@ -471,6 +485,31 @@ pub(crate) fn set_reserve(
         req,
         by_user,
     )?;
+    if before.is_none()
+        && let Some(reserve) = new_reserve
+    {
+        let null_buckets: Vec<(String, String, Option<f64>)> = cx
+            .db
+            .prepare_cached(
+                "SELECT provider, account, seven_day_pct FROM usage_buckets \
+                 WHERE reserve_pct IS NULL \
+                   AND NOT (provider = ?1 AND account = ?2)",
+            )?
+            .query_map(params![LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (provider, account, seven_day_pct) in null_buckets {
+            cx.db.execute(
+                "UPDATE usage_buckets SET reserve_pct = ?3 \
+                 WHERE provider = ?1 AND account = ?2 AND reserve_pct IS NULL",
+                params![provider, account, reserve],
+            )?;
+            if let Some(pct) = seven_day_pct {
+                mark_hard(cx, &provider, &account, cx.now, pct)?;
+            }
+        }
+    }
     Ok(UsageReserve {
         reserve: bucket.reserve,
     })

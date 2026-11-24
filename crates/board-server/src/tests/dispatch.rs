@@ -2235,3 +2235,272 @@ async fn diff_review_edge_cases_wakes_auth_goal_retry_spells_locks_and_cross_dev
         "lowering parallel_tasks must not shrink explicit cross-repo lock"
     );
 }
+
+#[tokio::test]
+async fn dispatch_claim_honors_device_runners_preference_order() {
+    let t = T::new();
+    let t3_first_tok = create_device(&t, "mac-t3-first").await;
+    let acp_first_tok = create_device(&t, "mac-acp-first").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "runner-order", &[REPO], 4).await;
+
+    // 1. Device advertising ["t3", "acp", "deterministic"] gets "t3" when task has no preferred_runner.
+    let task_a = t
+        .task(WORKER, "runner-order", "Task A (default runner)")
+        .await;
+    let (s, resp) = claim_as(
+        &t,
+        &t3_first_tok,
+        json!({
+            "device": "mac-t3-first",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], task_a);
+    assert_eq!(
+        resp["claimed"][0]["run"]["runner"], "t3",
+        "must honor device runners order [\"t3\", \"acp\", \"deterministic\"]"
+    );
+
+    // 2. Device advertising ["acp", "t3", "deterministic"] gets "acp".
+    let task_b = t
+        .task(WORKER, "runner-order", "Task B (default runner)")
+        .await;
+    let (s, resp) = claim_as(
+        &t,
+        &acp_first_tok,
+        json!({
+            "device": "mac-acp-first",
+            "free_units": 4,
+            "runners": ["acp", "t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], task_b);
+    assert_eq!(
+        resp["claimed"][0]["run"]["runner"], "acp",
+        "must honor device runners order [\"acp\", \"t3\", \"deterministic\"]"
+    );
+
+    // 3. Explicit task preferred_runner still wins when available; falls back to device order
+    //    when unavailable (skipping non-LLM runners like "deterministic").
+    let task_c = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "runner-order",
+                "title": "Task C (explicit acp)",
+                "preferred_runner": "acp",
+            }),
+        )
+        .await;
+    let (s, resp) = claim_as(
+        &t,
+        &t3_first_tok,
+        json!({
+            "device": "mac-t3-first",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], task_c);
+    assert_eq!(resp["claimed"][0]["run"]["runner"], "acp");
+
+    let task_d = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "runner-order",
+                "title": "Task D (unavailable preferred_runner)",
+                "preferred_runner": "other",
+            }),
+        )
+        .await;
+    let (s, resp) = claim_as(
+        &t,
+        &t3_first_tok,
+        json!({
+            "device": "mac-t3-first",
+            "free_units": 4,
+            "runners": ["deterministic", "t3", "acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], task_d);
+    assert_eq!(
+        resp["claimed"][0]["run"]["runner"], "t3",
+        "must skip deterministic and pick first supported LLM runner in slice order"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_claim_enforces_usage_buckets_pace_limit_and_legacy_fallback() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-ag").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "quota-test", &[REPO], 2).await;
+
+    // Set board usage_stop_at = 80 and legacy reserve = 5.0%.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/quota-test",
+            Some(json!({ "usage_stop_at": 80 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.0 })))
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    let _worker_task = t.task(WORKER, "quota-test", "LLM task held by quota").await;
+    let merge_task = make_reviewed_task(
+        &t,
+        "quota-test",
+        "Reviewed PR ready to merge",
+        Some("review: pass\nPR: https://github.com/example/repo/pull/99"),
+    )
+    .await;
+
+    let now = t.state.now();
+    let week_reset = (now + TimeDelta::days(3)).to_rfc3339();
+    let five_reset = (now + TimeDelta::hours(4)).to_rfc3339();
+
+    // 1. Legacy fallback: antigravity/default has NO reading yet, while anthropic/default
+    //    is at 85% five_hour (>= usage_stop_at=80). Claiming with quota_bucket=antigravity/default
+    //    MUST fall back to anthropic/default and hold LLM worker with Quota!
+    let (s, v) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 85.0, "resets_at": five_reset },
+            "seven_day": { "percent": 20.0, "resets_at": week_reset },
+            "read_at": now.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    let claim_llm_only = json!({
+        "device": "mac-ag",
+        "free_units": 4,
+        "runners": ["acp", "deterministic"],
+        "capabilities": ["git:cloneable"],
+        "repos": [REPO],
+        "supported_kinds": ["worker"],
+        "quota_bucket": { "provider": "antigravity", "account": "default" },
+    });
+    let (s, resp) = claim_as(&t, &tok, claim_llm_only.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "fallback to legacy bucket must hold LLM work over usage_stop_at: {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+
+    // 2. Raise usage_stop_at to 98 so weekly pace (not usage_stop_at) is what holds at 96%.
+    //    Report antigravity/default at 96% seven_day (>= 100 - 5.0 = 95% hard line -> pace_limit=0).
+    //    First reading inherits legacy 5.0% reserve so pace activates immediately!
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/quota-test",
+            Some(json!({ "usage_stop_at": 98 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, bucket) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 10.0, "resets_at": five_reset },
+            "seven_day": { "percent": 96.0, "resets_at": week_reset },
+            "read_at": now.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{bucket}");
+    assert_eq!(bucket["reserve"], 5.0, "{bucket}");
+    assert!(bucket["pace"]["hard_since"].is_string(), "{bucket}");
+
+    // LLM worker is held by weekly pace_limit = 0 (`DispatchHoldReason::Quota`).
+    let (s, resp) = claim_as(&t, &tok, claim_llm_only.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(resp["claimed"].as_array().unwrap().is_empty(), "{resp}");
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+    assert!(
+        resp["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pace limit (0)"),
+        "expected pace_limit=0 hold detail: {resp}"
+    );
+
+    // Zero-LLM deterministic merge run MUST STILL BE CLAIMED even while pace_limit = 0!
+    let (s, resp) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-ag",
+            "free_units": 4,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker", "merge"],
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "merge", "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], merge_task, "{resp}");
+
+    // 3. Once antigravity/default drops below both usage_stop_at and pace line, LLM worker proceeds
+    //    even though legacy anthropic/default is still at 85% (target bucket overrides legacy).
+    t.advance(TimeDelta::minutes(1));
+    let later = t.state.now();
+    let (s, bucket) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 15.0, "resets_at": five_reset },
+            "seven_day": { "percent": 20.0, "resets_at": week_reset },
+            "read_at": later.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{bucket}");
+    let (s, resp) = claim_as(&t, &tok, claim_llm_only).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
+}

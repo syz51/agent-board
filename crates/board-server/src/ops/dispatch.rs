@@ -256,7 +256,15 @@ pub(crate) fn claim(
     let active_runs = load_active_managed_runs(cx)?;
     let live_judges = load_live_judges(cx)?;
     let conflict_locks = load_conflict_locks(cx)?;
-    let usage = get_bucket(cx, &req.quota_provider, &req.quota_account)?.and_then(|b| b.as_usage());
+    let mut usage =
+        get_bucket(cx, &req.quota_provider, &req.quota_account)?.and_then(|b| b.as_usage());
+    if usage.is_none()
+        && (req.quota_provider != LEGACY_USAGE_PROVIDER
+            || req.quota_account != LEGACY_USAGE_ACCOUNT)
+    {
+        usage =
+            get_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| b.as_usage());
+    }
     let (recent_board_units, total_recent_units) = load_recent_consumption(cx)?;
 
     // Doing tasks across active boards (for parallel_tasks union and blocker independence).
@@ -1758,10 +1766,9 @@ fn filter_candidate(
                 && runners.iter().any(|r| r == pref)
             {
                 pref.clone()
-            } else if runners.iter().any(|r| r == "acp") {
-                "acp".to_owned()
-            } else if runners.iter().any(|r| r == "t3") {
-                "t3".to_owned()
+            } else if let Some(runner) = runners.iter().find(|r| matches!(r.as_str(), "acp" | "t3"))
+            {
+                runner.clone()
             } else {
                 return Err((
                     DispatchHoldReason::Runner,

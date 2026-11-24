@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-use crate::config::{AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
+use crate::config::{AcpPermissionPolicy, AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
 use crate::local_db::{LocalDb, LocalRunRecord, LocalRunState};
 use crate::runner::{
     Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerState, RunnerStatus,
@@ -132,6 +132,7 @@ struct SupervisorContext {
     clock: Clock,
     turn_timeout: Duration,
     cancel_grace: Duration,
+    permission_policy: AcpPermissionPolicy,
 }
 
 impl Drop for AcpRunnerInner {
@@ -262,6 +263,7 @@ impl AcpRunner {
             clock: Arc::clone(&self.inner.clock),
             turn_timeout: self.inner.turn_timeout,
             cancel_grace: self.inner.cancel_grace,
+            permission_policy: self.inner.config.permission_policy,
         }
     }
 
@@ -575,6 +577,7 @@ impl AcpRunner {
         proc: &mut SpawnedProcess,
         run_id: &str,
         rpc_id: u64,
+        handshake_events: &mut Vec<PendingRunEvent>,
     ) -> Result<bool> {
         let req = json!({
             "jsonrpc": "2.0",
@@ -608,6 +611,8 @@ impl AcpRunner {
             &self.inner.clock,
             None,
             &proc.stderr_tail,
+            self.inner.config.permission_policy,
+            handshake_events,
         )
         .await
         .context("ACP initialize handshake failed")?;
@@ -627,6 +632,7 @@ impl AcpRunner {
         workdir: &Path,
         spec_model: Option<&ThreadModel>,
         rpc_id: u64,
+        handshake_events: &mut Vec<PendingRunEvent>,
     ) -> Result<String> {
         let mut params = Map::new();
         params.insert("cwd".to_owned(), json!(workdir.to_string_lossy()));
@@ -674,6 +680,8 @@ impl AcpRunner {
             &self.inner.clock,
             None,
             &proc.stderr_tail,
+            self.inner.config.permission_policy,
+            handshake_events,
         )
         .await
         .context("ACP session/new failed")?;
@@ -695,6 +703,7 @@ impl AcpRunner {
         session_id: &str,
         workdir: &Path,
         rpc_id: u64,
+        handshake_events: &mut Vec<PendingRunEvent>,
     ) -> Result<()> {
         let req = json!({
             "jsonrpc": "2.0",
@@ -725,6 +734,8 @@ impl AcpRunner {
             &self.inner.clock,
             Some(session_id),
             &proc.stderr_tail,
+            self.inner.config.permission_policy,
+            handshake_events,
         )
         .await
         .context("ACP session/load failed")?;
@@ -825,10 +836,20 @@ impl Runner for AcpRunner {
     ) -> BoxFuture<'a, Result<RunHandle>> {
         Box::pin(async move {
             let mut proc = self.spawn_child(workdir, &spec.run_id)?;
+            let mut handshake_events = Vec::new();
             let setup = async {
-                let _supports_load = self.rpc_initialize(&mut proc, &spec.run_id, 1).await?;
+                let _supports_load = self
+                    .rpc_initialize(&mut proc, &spec.run_id, 1, &mut handshake_events)
+                    .await?;
                 let session_id = self
-                    .rpc_session_new(&mut proc, &spec.run_id, workdir, spec.model.as_ref(), 2)
+                    .rpc_session_new(
+                        &mut proc,
+                        &spec.run_id,
+                        workdir,
+                        spec.model.as_ref(),
+                        2,
+                        &mut handshake_events,
+                    )
                     .await?;
                 let now = (self.inner.clock)();
                 self.persist_spawn_in_db(spec, workdir, &session_id, proc.pid, now)?;
@@ -886,6 +907,9 @@ impl Runner for AcpRunner {
                     format!("started {}", spec.title),
                     BTreeMap::new(),
                 );
+                for ev in handshake_events {
+                    shared.push_event(ev.at, ev.kind, ev.summary, ev.metadata);
+                }
                 shared.push_user_message(now, &SteerMessage::new(&spec.prompt));
             }
 
@@ -1005,12 +1029,22 @@ impl Runner for AcpRunner {
             // Respawn official binary and resume via session/load (writing a Trail Rule record
             // BEFORE falling back to session/new when session/load is unsupported).
             let mut proc = self.spawn_child(&workdir, &run_id)?;
+            let mut handshake_events = Vec::new();
             let resume_result = async {
-                let supports_load = self.rpc_initialize(&mut proc, &run_id, 1).await?;
+                let supports_load = self
+                    .rpc_initialize(&mut proc, &run_id, 1, &mut handshake_events)
+                    .await?;
                 let mut next_id = 2u64;
                 let (active_session_id, fallback_info) = if supports_load {
                     match self
-                        .rpc_session_load(&mut proc, &run_id, &prev_session_id, &workdir, next_id)
+                        .rpc_session_load(
+                            &mut proc,
+                            &run_id,
+                            &prev_session_id,
+                            &workdir,
+                            next_id,
+                            &mut handshake_events,
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -1041,6 +1075,7 @@ impl Runner for AcpRunner {
                                     &workdir,
                                     model.as_ref(),
                                     next_id,
+                                    &mut handshake_events,
                                 )
                                 .await?;
                             next_id += 1;
@@ -1063,7 +1098,14 @@ impl Runner for AcpRunner {
                     let trail_path = state::append_acp_fallback(&self.inner.home, &pre_record)
                         .context("recording ACP session/load fallback trail entry")?;
                     let new_id = self
-                        .rpc_session_new(&mut proc, &run_id, &workdir, model.as_ref(), next_id)
+                        .rpc_session_new(
+                            &mut proc,
+                            &run_id,
+                            &workdir,
+                            model.as_ref(),
+                            next_id,
+                            &mut handshake_events,
+                        )
                         .await?;
                     next_id += 1;
                     (new_id, Some((err_text, trail_path, trail_now)))
@@ -1120,6 +1162,13 @@ impl Runner for AcpRunner {
                 match resume_result {
                     Ok(res) => res,
                     Err(err) => {
+                        if !handshake_events.is_empty() {
+                            let mut shared =
+                                slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                            for ev in handshake_events {
+                                shared.push_event(ev.at, ev.kind, ev.summary, ev.metadata);
+                            }
+                        }
                         let _ = teardown_process_group(
                             &mut proc.child,
                             proc.pgid,
@@ -1185,6 +1234,9 @@ impl Runner for AcpRunner {
                 shared.runs += 1;
                 shared.pid = proc.pid;
                 shared.pgid = proc.pgid;
+                for ev in handshake_events {
+                    shared.push_event(ev.at, ev.kind, ev.summary, ev.metadata);
+                }
                 shared.push_user_message(now, msg);
             }
 
@@ -1528,28 +1580,47 @@ async fn run_supervisor(
 
                         if let Some(method) = method {
                             if let Some(req_id) = parsed.get("id") {
-                                // Agent-to-client JSON-RPC request: answer cleanly so the agent
-                                // never deadlocks waiting for an interactive UI prompt.
-                                let _ = decline_client_request(
-                                    &mut proc.stdin,
-                                    &ctx.home,
-                                    &run_id,
-                                    Some(&session_id),
-                                    req_id,
-                                    method,
-                                    now,
-                                )
-                                .await;
-                                let mut shared =
-                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
-                                let mut meta = BTreeMap::new();
-                                meta.insert("client_method".to_owned(), method.to_owned());
-                                shared.push_event(
-                                    now,
-                                    RunEventKind::Note,
-                                    format!("declined unsupported agent client request `{method}`"),
-                                    meta,
-                                );
+                                if method == "session/request_permission" {
+                                    let ev = handle_permission_request(
+                                        &mut proc.stdin,
+                                        &ctx.home,
+                                        &run_id,
+                                        Some(&session_id),
+                                        req_id,
+                                        parsed.get("params"),
+                                        ctx.permission_policy,
+                                        now,
+                                    )
+                                    .await;
+                                    let mut shared =
+                                        slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                    shared.push_event(ev.at, ev.kind, ev.summary, ev.metadata);
+                                } else {
+                                    // Agent-to-client JSON-RPC request: answer cleanly so the agent
+                                    // never deadlocks waiting for an interactive UI prompt.
+                                    let _ = decline_client_request(
+                                        &mut proc.stdin,
+                                        &ctx.home,
+                                        &run_id,
+                                        Some(&session_id),
+                                        req_id,
+                                        method,
+                                        now,
+                                    )
+                                    .await;
+                                    let mut shared =
+                                        slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let mut meta = BTreeMap::new();
+                                    meta.insert("client_method".to_owned(), method.to_owned());
+                                    shared.push_event(
+                                        now,
+                                        RunEventKind::Note,
+                                        format!(
+                                            "declined unsupported agent client request `{method}`"
+                                        ),
+                                        meta,
+                                    );
+                                }
                             } else if method == "session/update"
                                 && let Some(params) = parsed.get("params")
                             {
@@ -2043,6 +2114,221 @@ async fn send_session_prompt(
     Ok(())
 }
 
+struct PendingRunEvent {
+    at: Timestamp,
+    kind: RunEventKind,
+    summary: String,
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PermissionOutcome {
+    Selected {
+        option_id: String,
+        option_kind: &'static str,
+    },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionDecision {
+    tool: String,
+    tool_call_id: Option<String>,
+    tool_kind: Option<String>,
+    options_count: usize,
+    outcome: PermissionOutcome,
+}
+
+fn first_non_empty_str<'a>(val: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        val.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn decide_permission(policy: AcpPermissionPolicy, params: Option<&Value>) -> PermissionDecision {
+    let tool_call = params.and_then(|p| {
+        p.get("toolCall")
+            .filter(|v| v.is_object())
+            .or_else(|| p.get("tool_call").filter(|v| v.is_object()))
+    });
+    let tool_keys = ["title", "toolName", "tool_name", "name"];
+    let tool = tool_call
+        .and_then(|tc| first_non_empty_str(tc, &tool_keys))
+        .or_else(|| params.and_then(|p| first_non_empty_str(p, &tool_keys)))
+        .unwrap_or("unknown tool")
+        .to_owned();
+
+    let id_keys = ["toolCallId", "tool_call_id"];
+    let tool_call_id = tool_call
+        .and_then(|tc| first_non_empty_str(tc, &id_keys))
+        .or_else(|| params.and_then(|p| first_non_empty_str(p, &id_keys)))
+        .map(str::to_owned);
+
+    let tool_kind = tool_call
+        .and_then(|tc| first_non_empty_str(tc, &["kind"]))
+        .map(str::to_owned);
+
+    let raw_options = params
+        .and_then(|p| p.get("options"))
+        .and_then(Value::as_array);
+    let options_count = raw_options.map_or(0, Vec::len);
+
+    let parsed_options: Vec<(&str, &str)> = raw_options
+        .into_iter()
+        .flatten()
+        .filter_map(|opt| {
+            let option_id = first_non_empty_str(opt, &["optionId", "option_id"])?;
+            let kind = first_non_empty_str(opt, &["kind"])?;
+            Some((option_id, kind))
+        })
+        .collect();
+
+    let preferred_kinds: &[&str] = match policy {
+        AcpPermissionPolicy::Allow => &["allow_always", "allow_once"],
+        AcpPermissionPolicy::Deny => &["reject_once", "reject_always"],
+    };
+
+    let outcome = preferred_kinds
+        .iter()
+        .find_map(|&want| {
+            parsed_options
+                .iter()
+                .find(|(_, kind)| *kind == want)
+                .map(|(option_id, _)| PermissionOutcome::Selected {
+                    option_id: (*option_id).to_owned(),
+                    option_kind: want,
+                })
+        })
+        .unwrap_or(PermissionOutcome::Cancelled);
+
+    PermissionDecision {
+        tool,
+        tool_call_id,
+        tool_kind,
+        options_count,
+        outcome,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_permission_request(
+    stdin: &mut ChildStdin,
+    home: &Home,
+    run_id: &str,
+    session_id: Option<&str>,
+    req_id: &Value,
+    params: Option<&Value>,
+    policy: AcpPermissionPolicy,
+    at: Timestamp,
+) -> PendingRunEvent {
+    let decision = decide_permission(policy, params);
+    let (outcome_label, option_id, option_kind, rpc_outcome) = match &decision.outcome {
+        PermissionOutcome::Selected {
+            option_id,
+            option_kind,
+        } => (
+            "selected",
+            Some(option_id.as_str()),
+            Some(*option_kind),
+            json!({
+                "outcome": "selected",
+                "optionId": option_id,
+            }),
+        ),
+        PermissionOutcome::Cancelled => (
+            "cancelled",
+            None,
+            None,
+            json!({
+                "outcome": "cancelled",
+            }),
+        ),
+    };
+
+    // Trail Rule: record every permission decision in the raw JSONL transcript BEFORE acting.
+    let trail_record = json!({
+        "event": "permission_decision",
+        "method": "session/request_permission",
+        "request_id": req_id,
+        "policy": policy.as_str(),
+        "tool": decision.tool,
+        "tool_call_id": decision.tool_call_id,
+        "tool_kind": decision.tool_kind,
+        "outcome": outcome_label,
+        "option_id": option_id,
+        "option_kind": option_kind,
+        "options_count": decision.options_count,
+    });
+    let _ = append_transcript(home, run_id, at, "runner", session_id, trail_record);
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "outcome": rpc_outcome,
+        },
+    });
+    let write_err = match write_json_line(stdin, &resp).await {
+        Ok(()) => {
+            let _ = append_transcript(home, run_id, at, "client", session_id, resp);
+            None
+        }
+        Err(err) => {
+            tracing::warn!("writing ACP session/request_permission response for {run_id}: {err:#}");
+            Some(format!("{err:#}"))
+        }
+    };
+
+    let mut meta = BTreeMap::new();
+    meta.insert(
+        "client_method".to_owned(),
+        "session/request_permission".to_owned(),
+    );
+    meta.insert("policy".to_owned(), policy.as_str().to_owned());
+    meta.insert("tool".to_owned(), decision.tool.clone());
+    meta.insert("outcome".to_owned(), outcome_label.to_owned());
+    if let Some(id) = option_id {
+        meta.insert("option_id".to_owned(), id.to_owned());
+    }
+    if let Some(kind) = option_kind {
+        meta.insert("option_kind".to_owned(), kind.to_owned());
+    }
+    if let Some(tc_id) = &decision.tool_call_id {
+        meta.insert("tool_call_id".to_owned(), tc_id.clone());
+    }
+    if let Some(tc_kind) = &decision.tool_kind {
+        meta.insert("tool_kind".to_owned(), tc_kind.clone());
+    }
+    if let Some(err) = write_err {
+        meta.insert("write_error".to_owned(), err);
+    }
+
+    let summary = match (option_id, option_kind) {
+        (Some(id), Some(kind)) => format!(
+            "permission {} for {}: selected {} ({})",
+            policy.as_str(),
+            decision.tool,
+            id,
+            kind
+        ),
+        _ => format!(
+            "permission {} for {}: cancelled",
+            policy.as_str(),
+            decision.tool
+        ),
+    };
+
+    PendingRunEvent {
+        at,
+        kind: RunEventKind::Note,
+        summary,
+        metadata: meta,
+    }
+}
+
 async fn decline_client_request(
     stdin: &mut ChildStdin,
     home: &Home,
@@ -2087,6 +2373,8 @@ async fn read_rpc_response(
     clock: &Clock,
     session_id: Option<&str>,
     stderr_tail: &Mutex<VecDeque<String>>,
+    permission_policy: AcpPermissionPolicy,
+    handshake_events: &mut Vec<PendingRunEvent>,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut line = String::new();
@@ -2135,10 +2423,27 @@ async fn read_rpc_response(
         let _ = append_transcript(home, run_id, now, "agent", session_id, value.clone());
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             if let Some(req_id) = value.get("id") {
-                // Decline agent-to-client requests during handshake so the agent never deadlocks.
-                let _ =
-                    decline_client_request(stdin, home, run_id, session_id, req_id, method, now)
-                        .await;
+                if method == "session/request_permission" {
+                    let ev = handle_permission_request(
+                        stdin,
+                        home,
+                        run_id,
+                        session_id,
+                        req_id,
+                        value.get("params"),
+                        permission_policy,
+                        now,
+                    )
+                    .await;
+                    handshake_events.push(ev);
+                } else {
+                    // Decline unsupported agent-to-client requests during handshake so the agent
+                    // never deadlocks.
+                    let _ = decline_client_request(
+                        stdin, home, run_id, session_id, req_id, method, now,
+                    )
+                    .await;
+                }
             }
             continue;
         }
@@ -2561,5 +2866,124 @@ mod tests {
         }));
         assert_eq!(kind, RunEventKind::Error);
         assert_eq!(summary, "rate limit exceeded");
+    }
+
+    #[test]
+    fn decide_permission_honors_allow_and_deny_policies_and_fallbacks() {
+        let full_params = json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "toolCallId": "tc-9",
+                "title": "Run cargo test",
+                "kind": "execute"
+            },
+            "options": [
+                { "optionId": "opt-once", "kind": "allow_once", "name": "Allow once" },
+                { "optionId": "opt-always", "kind": "allow_always", "name": "Always allow" },
+                { "optionId": "opt-reject-always", "kind": "reject_always", "name": "Always deny" },
+                { "optionId": "opt-reject-once", "kind": "reject_once", "name": "Deny once" }
+            ]
+        });
+
+        // Allow prefers allow_always over allow_once regardless of input order.
+        let allow_pref = decide_permission(AcpPermissionPolicy::Allow, Some(&full_params));
+        assert_eq!(allow_pref.tool, "Run cargo test");
+        assert_eq!(allow_pref.tool_call_id.as_deref(), Some("tc-9"));
+        assert_eq!(allow_pref.tool_kind.as_deref(), Some("execute"));
+        assert_eq!(allow_pref.options_count, 4);
+        assert_eq!(
+            allow_pref.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-always".to_owned(),
+                option_kind: "allow_always",
+            }
+        );
+
+        // Allow falls back to allow_once when allow_always is absent.
+        let once_only = json!({
+            "toolCall": { "name": "bash" },
+            "options": [
+                { "optionId": "opt-reject", "kind": "reject_once" },
+                { "optionId": "opt-once", "kind": "allow_once" }
+            ]
+        });
+        let allow_once = decide_permission(AcpPermissionPolicy::Allow, Some(&once_only));
+        assert_eq!(allow_once.tool, "bash");
+        assert_eq!(
+            allow_once.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-once".to_owned(),
+                option_kind: "allow_once",
+            }
+        );
+
+        // Allow returns Cancelled when no allow option is offered.
+        let reject_only = json!({
+            "toolCall": { "title": "Dangerous write" },
+            "options": [
+                { "optionId": "opt-reject-once", "kind": "reject_once" },
+                { "optionId": "opt-reject-always", "kind": "reject_always" }
+            ]
+        });
+        assert_eq!(
+            decide_permission(AcpPermissionPolicy::Allow, Some(&reject_only)).outcome,
+            PermissionOutcome::Cancelled
+        );
+
+        // Deny prefers reject_once over reject_always, falls back to reject_always, else Cancelled.
+        let deny_pref = decide_permission(AcpPermissionPolicy::Deny, Some(&full_params));
+        assert_eq!(
+            deny_pref.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-reject-once".to_owned(),
+                option_kind: "reject_once",
+            }
+        );
+
+        let reject_always_only = json!({
+            "options": [
+                { "optionId": "opt-allow", "kind": "allow_always" },
+                { "option_id": "opt-ra", "kind": "reject_always" }
+            ]
+        });
+        let deny_fallback = decide_permission(AcpPermissionPolicy::Deny, Some(&reject_always_only));
+        assert_eq!(deny_fallback.tool, "unknown tool");
+        assert_eq!(
+            deny_fallback.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-ra".to_owned(),
+                option_kind: "reject_always",
+            }
+        );
+
+        let allow_only = json!({
+            "options": [{ "optionId": "opt-allow", "kind": "allow_once" }]
+        });
+        assert_eq!(
+            decide_permission(AcpPermissionPolicy::Deny, Some(&allow_only)).outcome,
+            PermissionOutcome::Cancelled
+        );
+        assert_eq!(
+            decide_permission(AcpPermissionPolicy::Allow, None).outcome,
+            PermissionOutcome::Cancelled
+        );
+
+        // Explicit JSON null or empty fields must NOT shadow snake_case/fallback keys.
+        let null_shadow = json!({
+            "toolCall": { "title": null, "name": "bash", "toolCallId": "", "tool_call_id": "tc-42" },
+            "options": [
+                { "optionId": null, "option_id": "opt-snake", "kind": "allow_always" }
+            ]
+        });
+        let parsed = decide_permission(AcpPermissionPolicy::Allow, Some(&null_shadow));
+        assert_eq!(parsed.tool, "bash");
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("tc-42"));
+        assert_eq!(
+            parsed.outcome,
+            PermissionOutcome::Selected {
+                option_id: "opt-snake".to_owned(),
+                option_kind: "allow_always",
+            }
+        );
     }
 }

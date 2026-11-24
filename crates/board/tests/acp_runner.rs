@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use board::acp_runner::{AcpRunner, build_launch_command};
-use board::config::{AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
+use board::config::{AcpPermissionPolicy, AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
 use board::local_db::{LocalDb, LocalRunState};
 use board::runner::{
     Clock, FakeRunner, RunEventKind, RunSpec, Runner, RunnerRegistry, RunnerState, SteerMessage,
@@ -83,6 +83,12 @@ while IFS= read -r line; do
                 IFS= read -r client_resp
                 printf '%s\n' "$client_resp" > "$STATE_DIR/handshake_client_resp.json"
             fi
+            if [ "${FAKE_ACP_HANDSHAKE_PERM_REQ:-0}" = "1" ]; then
+                perm_opts="${FAKE_ACP_HANDSHAKE_PERM_OPTIONS:-"[{\"optionId\":\"allow-once\",\"kind\":\"allow_once\"},{\"optionId\":\"allow-always\",\"kind\":\"allow_always\"},{\"optionId\":\"reject-once\",\"kind\":\"reject_once\"}]"}"
+                printf '{"jsonrpc":"2.0","id":998,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"hs-1","title":"Read workspace","kind":"read"},"options":%s}}\n' "$perm_opts"
+                IFS= read -r perm_resp
+                printf '%s\n' "$perm_resp" > "$STATE_DIR/handshake_perm_resp.json"
+            fi
             printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
             ;;
         *'"method":"session/new"'*)
@@ -130,6 +136,12 @@ while IFS= read -r line; do
             else
                 if [ -n "${FAKE_ACP_TURN_DELAY:-}" ]; then
                     sleep "$FAKE_ACP_TURN_DELAY"
+                fi
+                if [ "${FAKE_ACP_TURN_PERM_REQ:-0}" = "1" ]; then
+                    perm_opts="${FAKE_ACP_TURN_PERM_OPTIONS:-"[{\"optionId\":\"allow-once\",\"kind\":\"allow_once\"},{\"optionId\":\"allow-always\",\"kind\":\"allow_always\"},{\"optionId\":\"reject-once\",\"kind\":\"reject_once\"}]"}"
+                    printf '{"jsonrpc":"2.0","id":997,"method":"session/request_permission","params":{"sessionId":"%s","toolCall":{"toolCallId":"tc-perm-%s","title":"Run shell command","kind":"execute"},"options":%s}}\n' "$current_session" "$turn" "$perm_opts"
+                    IFS= read -r perm_resp
+                    printf '%s\n' "$perm_resp" > "$STATE_DIR/turn_perm_resp.json"
                 fi
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Planning turn %s"}}}}\n' "$current_session" "$turn"
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"tool_call","toolCallId":"tc-%s","title":"cargo check","kind":"execute","status":"in_progress"}}}\n' "$current_session" "$turn"
@@ -208,6 +220,7 @@ async fn spawn_streams_normalized_events_writes_transcript_and_persists_session_
         options: [("verbosity".to_owned(), "low".to_owned())].into(),
         turn_timeout_secs: 30,
         cancel_grace_secs: 1,
+        permission_policy: AcpPermissionPolicy::Allow,
         cgroup: CgroupConfig::default(),
     };
     let runner = AcpRunner::new(cfg, home.clone(), db.clone())
@@ -1067,4 +1080,234 @@ async fn dropping_runner_kills_live_process_group_and_handshake_declines_client_
         !pid_alive(grandchild_pid)
     })
     .await;
+}
+
+#[tokio::test]
+async fn permission_requests_are_handled_in_handshake_and_turn_with_trail_records() {
+    struct Case<'a> {
+        name: &'a str,
+        policy: AcpPermissionPolicy,
+        handshake_opts: &'a str,
+        turn_opts: &'a str,
+        expect_hs_outcome: &'a str,
+        expect_hs_opt: Option<&'a str>,
+        expect_turn_outcome: &'a str,
+        expect_turn_opt: Option<&'a str>,
+    }
+
+    let cases = [
+        Case {
+            name: "allow-prefers-always-and-falls-back-to-once",
+            policy: AcpPermissionPolicy::Allow,
+            handshake_opts: r#"[{"optionId":"hs-once","kind":"allow_once"},{"optionId":"hs-always","kind":"allow_always"},{"optionId":"hs-reject","kind":"reject_once"}]"#,
+            turn_opts: r#"[{"optionId":"t-reject","kind":"reject_once"},{"optionId":"t-once","kind":"allow_once"}]"#,
+            expect_hs_outcome: "selected",
+            expect_hs_opt: Some("hs-always"),
+            expect_turn_outcome: "selected",
+            expect_turn_opt: Some("t-once"),
+        },
+        Case {
+            name: "allow-missing-allow-cancels",
+            policy: AcpPermissionPolicy::Allow,
+            handshake_opts: r#"[{"optionId":"hs-reject","kind":"reject_once"}]"#,
+            turn_opts: r#"[{"optionId":"t-reject-always","kind":"reject_always"}]"#,
+            expect_hs_outcome: "cancelled",
+            expect_hs_opt: None,
+            expect_turn_outcome: "cancelled",
+            expect_turn_opt: None,
+        },
+        Case {
+            name: "deny-selects-reject-or-cancels",
+            policy: AcpPermissionPolicy::Deny,
+            handshake_opts: r#"[{"optionId":"hs-allow","kind":"allow_always"},{"optionId":"hs-reject-always","kind":"reject_always"},{"optionId":"hs-reject-once","kind":"reject_once"}]"#,
+            turn_opts: r#"[{"optionId":"t-allow","kind":"allow_once"}]"#,
+            expect_hs_outcome: "selected",
+            expect_hs_opt: Some("hs-reject-once"),
+            expect_turn_outcome: "cancelled",
+            expect_turn_opt: None,
+        },
+    ];
+
+    for case in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let workdir = dir.path().join("workdir");
+        let fake_state = dir.path().join("fake-state");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let bin = write_fake_acp_server(dir.path());
+        let db = LocalDb::open_for_home(&home).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "FAKE_ACP_DIR".to_owned(),
+            fake_state.to_string_lossy().into_owned(),
+        );
+        env.insert("FAKE_ACP_HANDSHAKE_PERM_REQ".to_owned(), "1".to_owned());
+        env.insert(
+            "FAKE_ACP_HANDSHAKE_PERM_OPTIONS".to_owned(),
+            case.handshake_opts.to_owned(),
+        );
+        env.insert("FAKE_ACP_TURN_PERM_REQ".to_owned(), "1".to_owned());
+        env.insert(
+            "FAKE_ACP_TURN_PERM_OPTIONS".to_owned(),
+            case.turn_opts.to_owned(),
+        );
+
+        let runner = AcpRunner::new(
+            AcpRunnerConfig {
+                bin: Some(bin),
+                args: vec![],
+                env,
+                permission_policy: case.policy,
+                ..AcpRunnerConfig::default()
+            },
+            home.clone(),
+            db,
+        )
+        .with_clock(fixed_clock("2026-11-24T12:00:00Z"))
+        .with_handshake_timeout(Duration::from_secs(5));
+
+        let run_id = format!("run-perm-{}", case.name);
+        let spec = RunSpec {
+            run_id: run_id.clone(),
+            title: format!("Permission test {}", case.name),
+            prompt: "Run tests".to_owned(),
+            model: None,
+            worktree: None,
+            metadata: BTreeMap::new(),
+        };
+        let handle = runner.spawn(&spec, &workdir).await.unwrap();
+
+        wait_for(Duration::from_secs(5), || async {
+            runner
+                .status(&handle)
+                .await
+                .is_ok_and(|s| s.state == RunnerState::Idle)
+        })
+        .await;
+
+        // Verify JSON-RPC replies delivered to the child in BOTH handshake and turn loops.
+        let hs_resp: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(fake_state.join("handshake_perm_resp.json"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(hs_resp["id"], 998, "{}: {hs_resp}", case.name);
+        assert!(hs_resp.get("error").is_none(), "{}: {hs_resp}", case.name);
+        assert_eq!(
+            hs_resp["result"]["outcome"]["outcome"], case.expect_hs_outcome,
+            "{}: {hs_resp}",
+            case.name
+        );
+        assert_eq!(
+            hs_resp["result"]["outcome"]["optionId"].as_str(),
+            case.expect_hs_opt,
+            "{}: {hs_resp}",
+            case.name
+        );
+
+        let turn_resp: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(fake_state.join("turn_perm_resp.json"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(turn_resp["id"], 997, "{}: {turn_resp}", case.name);
+        assert!(
+            turn_resp.get("error").is_none(),
+            "{}: {turn_resp}",
+            case.name
+        );
+        assert_eq!(
+            turn_resp["result"]["outcome"]["outcome"], case.expect_turn_outcome,
+            "{}: {turn_resp}",
+            case.name
+        );
+        assert_eq!(
+            turn_resp["result"]["outcome"]["optionId"].as_str(),
+            case.expect_turn_opt,
+            "{}: {turn_resp}",
+            case.name
+        );
+
+        // Trail Rule check 1: raw JSONL transcript has both runner permission_decision entries.
+        let transcript_path = home
+            .state_dir()
+            .join("transcripts")
+            .join(format!("{run_id}.jsonl"));
+        let transcript_lines: Vec<serde_json::Value> = std::fs::read_to_string(&transcript_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let decisions: Vec<&serde_json::Value> = transcript_lines
+            .iter()
+            .filter(|l| l["dir"] == "runner" && l["payload"]["event"] == "permission_decision")
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "{}: expected 2 permission_decision records in transcript: {transcript_lines:?}",
+            case.name
+        );
+        assert_eq!(decisions[0]["payload"]["tool"], "Read workspace");
+        assert_eq!(decisions[0]["payload"]["policy"], case.policy.as_str());
+        assert_eq!(decisions[0]["payload"]["outcome"], case.expect_hs_outcome);
+        assert_eq!(
+            decisions[0]["payload"]["option_id"].as_str(),
+            case.expect_hs_opt
+        );
+        assert_eq!(decisions[1]["payload"]["tool"], "Run shell command");
+        assert_eq!(decisions[1]["payload"]["policy"], case.policy.as_str());
+        assert_eq!(decisions[1]["payload"]["outcome"], case.expect_turn_outcome);
+        assert_eq!(
+            decisions[1]["payload"]["option_id"].as_str(),
+            case.expect_turn_opt
+        );
+
+        // Trail Rule check 2: RunEvent stream carries both handshake and turn permission events.
+        let events = runner.poll_events(&handle, 0).await.unwrap();
+        let perm_events: Vec<_> = events
+            .iter()
+            .filter(|ev| {
+                ev.metadata.get("client_method").map(String::as_str)
+                    == Some("session/request_permission")
+            })
+            .collect();
+        assert_eq!(
+            perm_events.len(),
+            2,
+            "{}: expected 2 permission RunEvents: {events:?}",
+            case.name
+        );
+        assert_eq!(
+            perm_events[0].metadata.get("tool").map(String::as_str),
+            Some("Read workspace")
+        );
+        assert_eq!(
+            perm_events[0].metadata.get("policy").map(String::as_str),
+            Some(case.policy.as_str())
+        );
+        assert_eq!(
+            perm_events[0].metadata.get("outcome").map(String::as_str),
+            Some(case.expect_hs_outcome)
+        );
+        assert_eq!(
+            perm_events[0].metadata.get("option_id").map(String::as_str),
+            case.expect_hs_opt
+        );
+        assert_eq!(
+            perm_events[1].metadata.get("tool").map(String::as_str),
+            Some("Run shell command")
+        );
+        assert_eq!(
+            perm_events[1].metadata.get("outcome").map(String::as_str),
+            Some(case.expect_turn_outcome)
+        );
+        assert_eq!(
+            perm_events[1].metadata.get("option_id").map(String::as_str),
+            case.expect_turn_opt
+        );
+    }
 }

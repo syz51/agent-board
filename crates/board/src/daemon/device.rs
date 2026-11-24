@@ -1195,6 +1195,11 @@ mod tests {
             claim_runners(&config, &["acp".into(), "t3".into()]),
             vec!["acp", "t3", "deterministic"]
         );
+        config.runners = vec!["t3".into(), "acp".into(), "deterministic".into()];
+        assert_eq!(
+            claim_runners(&config, &["acp".into(), "t3".into()]),
+            vec!["t3", "acp", "deterministic"]
+        );
 
         assert_eq!(
             effective_protocol_features(&config),
