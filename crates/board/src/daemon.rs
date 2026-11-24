@@ -5410,8 +5410,18 @@ impl<T: T3 + 'static> Daemon<T> {
                     continue;
                 }
             };
-            if !independent(&task, &in_progress) {
-                continue;
+            let fresh_units = device::cost_units_for_task(&task);
+            if fresh_units > needed_units && self.weighted_full(fresh_units) {
+                let (limit, load) = self.weighted_load(fresh_units);
+                if self.worker_turns.wait(slug, waited, now) {
+                    tracing::info!(
+                        "{slug}: {} waits for one of the {limit} worker slots of this device; {load}",
+                        task.id
+                    );
+                }
+                self.record_hold("worker", slug, task.id.as_str(), limit, &load, now);
+                self.note_held(&task.id, &agent, limit, &load, now).await;
+                break;
             }
             self.state.hold_notes.remove(&task.id);
             self.hold_ended("worker", task.id.as_str());
