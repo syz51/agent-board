@@ -61,6 +61,7 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
                 lease(87, "t3:gone", Some("acme-9"), "src/b.rs"),
                 lease(88, PEER, None, "src/c.rs"),
             ],
+            later_conflicts: vec![],
             warning: None,
         },
     );
@@ -142,6 +143,7 @@ fn renewing_an_earlier_lease_says_earlier_lease_holds_over_a_later_peer() {
         LeaseResult {
             leases: vec![mine],
             conflicts: vec![theirs],
+            later_conflicts: vec![55],
             warning: None,
         },
     );

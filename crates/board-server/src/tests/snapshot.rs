@@ -3033,13 +3033,14 @@ async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
     )
     .await;
 
-    // Alpha (the earlier holder) is told beta's lease is later and alpha's earlier lease holds.
+    // Alpha (the earlier holder) is told beta's lease is later and alpha's earlier lease holds,
+    // keeping LEASE_OVERLAP_ACTION so older clients' subagent filters still pass it through.
     let alpha_alerts = snapshot(&t, "t3:alpha", "kind=alerts").await;
     let alpha_text = text(&alpha_alerts);
     assert!(
         alpha_text.contains(&format!(
-            "leased research/papers/** for {late_task} <1m ago (later than your lease research/papers/a.md) -> {}",
-            board_proto::LATER_LEASE_OVERLAP_ACTION
+            "leased research/papers/** for {late_task} <1m ago (later than your lease research/papers/a.md; your earlier lease holds — note the later task and go on) -> {}",
+            board_proto::LEASE_OVERLAP_ACTION
         )),
         "{alpha_text}"
     );
@@ -3049,8 +3050,8 @@ async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
     let beta_text = text(&beta_alerts);
     assert!(
         beta_text.contains(&format!(
-            "leased research/papers/a.md for {early_task} 2m ago (earlier than your lease research/papers/**) -> {}",
-            board_proto::EARLIER_LEASE_OVERLAP_ACTION
+            "leased research/papers/a.md for {early_task} 2m ago (earlier than your lease research/papers/**; earlier lease holds — stop or narrow your globs) -> {}",
+            board_proto::LEASE_OVERLAP_ACTION
         )),
         "{beta_text}"
     );

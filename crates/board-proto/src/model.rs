@@ -1750,4 +1750,31 @@ mod tests {
         assert_eq!(no_reset.pace_limit(3, stale_same_day), 3);
         assert_eq!(no_reset.hard_since(stale_same_day), None);
     }
+
+    #[test]
+    fn lease_created_at_is_optional_and_omitted_when_none() {
+        let legacy: Lease = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "agent": "t3:alpha",
+            "task": "acme-1",
+            "repo": "github.com/acme/app",
+            "glob": "src/lib.rs",
+            "expires_at": "2026-11-24T13:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.created_at, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("created_at")
+                .is_none()
+        );
+
+        let dated = Lease {
+            created_at: Some("2026-11-24T12:15:00Z".parse().unwrap()),
+            ..legacy
+        };
+        let round: Lease = serde_json::from_value(serde_json::to_value(&dated).unwrap()).unwrap();
+        assert_eq!(round, dated);
+    }
 }

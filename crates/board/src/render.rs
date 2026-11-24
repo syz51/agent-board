@@ -951,20 +951,25 @@ fn overlap_line(lease: &Lease, holders: &LeaseHolders) -> String {
     )
 }
 
-/// Whether lease `a` was taken strictly earlier than lease `b`. Uses `created_at` when
-/// both carry it and differ; falls back to the monotonic lease `id` (for older servers or
-/// leases created in the same millisecond).
+/// Whether lease `a` was taken strictly earlier than lease `b`. Requires `created_at` on
+/// both leases (with `id` as same-millisecond tie-breaker): older servers without
+/// `created_at` could reuse expired lease ids, so we never claim seniority from `id` alone.
 fn lease_is_earlier(a: &Lease, b: &Lease) -> bool {
     match (a.created_at, b.created_at) {
-        (Some(ca), Some(cb)) if ca != cb => ca < cb,
-        _ => a.id < b.id,
+        (Some(ca), Some(cb)) => (ca, a.id) < (cb, b.id),
+        _ => false,
     }
 }
 
-/// Whether the caller holds an overlapping lease in `mine` that predates `conflict`.
-fn caller_lease_is_earlier(mine: &[Lease], conflict: &Lease) -> bool {
+/// Whether the caller holds a live overlapping lease that predates `conflict`: either
+/// reported directly by the server in `later_conflicts` (which covers live leases from
+/// earlier calls too) or visible in `result.leases`.
+fn caller_lease_is_earlier(result: &LeaseResult, conflict: &Lease) -> bool {
+    if result.later_conflicts.contains(&conflict.id) {
+        return true;
+    }
     let mut matched = false;
-    for lease in mine {
+    for lease in &result.leases {
         if board_server::globs_overlap(&lease.glob, &conflict.glob) {
             matched = true;
             if lease_is_earlier(lease, conflict) {
@@ -975,14 +980,17 @@ fn caller_lease_is_earlier(mine: &[Lease], conflict: &Lease) -> bool {
     if matched {
         return false;
     }
-    mine.iter().any(|lease| lease_is_earlier(lease, conflict))
+    result
+        .leases
+        .iter()
+        .any(|lease| lease_is_earlier(lease, conflict))
 }
 
 pub fn lease_result(result: &LeaseResult, holders: &LeaseHolders) -> String {
     let mut lines: Vec<String> = result.leases.iter().map(lease_line).collect();
     for conflict in &result.conflicts {
         let holder = short(&holders.handles, conflict.agent.as_str());
-        if caller_lease_is_earlier(&result.leases, conflict) {
+        if caller_lease_is_earlier(result, conflict) {
             let target = conflict.task.as_ref().map_or(holder, |t| t.as_str());
             lines.push(format!(
                 "! overlaps later {} -> your earlier lease holds; note {target} and go on",
@@ -1634,6 +1642,7 @@ mod tests {
                 lease(91, None, "web/**"),
             ],
             conflicts: vec![],
+            later_conflicts: vec![],
             warning: None,
         };
         let text = lease_result(&result, &LeaseHolders::default());
@@ -1680,6 +1689,7 @@ mod tests {
                 // Peer took src/b.rs earlier (10m ago).
                 make(70, "t3:early", Some("acme-3"), "src/b.rs", 10),
             ],
+            later_conflicts: vec![],
             warning: None,
         };
         let text = lease_result(&result, &LeaseHolders::default());
@@ -1694,6 +1704,44 @@ mod tests {
                 "! overlaps earlier lease #70 github.com/acme/web \"src/b.rs\" for acme-3 by t3:early"
             ) && text.contains("-> earlier lease holds (t3:early on acme-3): stop or narrow your globs"),
             "{text}"
+        );
+
+        // Server `later_conflicts` marks a conflict later even when this call only added a
+        // newer sub-glob under an earlier live lease.
+        let narrowed = LeaseResult {
+            leases: vec![make(95, "t3:me", Some("acme-1"), "src/a.rs", 0)],
+            conflicts: vec![make(80, "t3:late", Some("acme-2"), "src/a.rs", 5)],
+            later_conflicts: vec![80],
+            warning: None,
+        };
+        let narrowed_text = lease_result(&narrowed, &LeaseHolders::default());
+        assert!(
+            narrowed_text.contains(
+                "! overlaps later lease #80 github.com/acme/web \"src/a.rs\" for acme-2 by t3:late"
+            ) && narrowed_text.contains("-> your earlier lease holds; note acme-2 and go on"),
+            "{narrowed_text}"
+        );
+
+        // Older servers omit `created_at` and `later_conflicts`: a lower reused id must not
+        // make a later taker claim seniority over an existing peer lease.
+        let mut legacy_mine = make(10, "t3:me", Some("acme-1"), "src/a.rs", 0);
+        legacy_mine.created_at = None;
+        let mut legacy_peer = make(20, "t3:peer", Some("acme-2"), "src/a.rs", 0);
+        legacy_peer.created_at = None;
+        let legacy = LeaseResult {
+            leases: vec![legacy_mine],
+            conflicts: vec![legacy_peer],
+            later_conflicts: vec![],
+            warning: None,
+        };
+        let legacy_text = lease_result(&legacy, &LeaseHolders::default());
+        assert!(
+            legacy_text.contains(
+                "! overlaps earlier lease #20 github.com/acme/web \"src/a.rs\" for acme-2 by t3:peer"
+            ) && legacy_text.contains(
+                "-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs"
+            ),
+            "{legacy_text}"
         );
     }
 

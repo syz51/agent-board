@@ -938,6 +938,21 @@ async fn lease_created_at_and_touch_overlaps_identify_the_earlier_lease() {
         a_renewed["conflicts"][0]["created_at"],
         iso(start() + TimeDelta::minutes(2))
     );
+    let b_lease_id = b_second["leases"][0]["id"].as_i64().unwrap();
+    assert_eq!(a_renewed["later_conflicts"], json!([b_lease_id]));
+    assert!(b_second.get("later_conflicts").is_none());
+
+    // Taking a new sub-glob while already holding an earlier live lease still reports B in
+    // later_conflicts (covering narrowed globs as well as direct renewals).
+    let a_broad = lease_for(&t, A, &first_task, &["research/texts/**"]).await;
+    assert!(a_broad.get("later_conflicts").is_none());
+    t.advance(TimeDelta::minutes(1));
+    let b_text = lease_for(&t, B, &second_task, &["research/texts/shijing.md"]).await;
+    let b_text_id = b_text["leases"][0]["id"].as_i64().unwrap();
+    assert!(b_text.get("later_conflicts").is_none());
+    t.advance(TimeDelta::minutes(1));
+    let a_narrow = lease_for(&t, A, &first_task, &["research/texts/shijing.md"]).await;
+    assert_eq!(a_narrow["later_conflicts"], json!([b_text_id]));
 
     // When A edits the file, POST /v1/touches reports B's lease with your_lease_earlier = true.
     let a_touch = t
@@ -999,7 +1014,41 @@ async fn lease_created_at_and_touch_overlaps_identify_the_earlier_lease() {
 
     // Re-leasing an expired row before the sweeper deletes it resets created_at to now.
     t.advance(lease_ttl() + TimeDelta::minutes(1));
-    let now_after_expiry = start() + TimeDelta::minutes(7) + lease_ttl() + TimeDelta::minutes(1);
+    let now_after_expiry = start() + TimeDelta::minutes(9) + lease_ttl() + TimeDelta::minutes(1);
     let a_fresh = lease_for(&t, A, &first_task, &["research/papers/a.md"]).await;
     assert_eq!(a_fresh["leases"][0]["created_at"], iso(now_after_expiry));
+
+    // When a peer holds both an earlier live lease (higher id) and a reused expired row
+    // (lower id, newer created_at), POST /v1/touches orders peer leases by (created_at, id)
+    // so the genuinely earlier peer lease comes first and is never masked by first_sight.
+    let b_expired = lease_for(&t, B, &second_task, &["src/ordered.rs"]).await;
+    let reused_id = b_expired["leases"][0]["id"].as_i64().unwrap();
+    t.advance(lease_ttl() + TimeDelta::minutes(1));
+    let b_early = lease_for(&t, B, &second_task, &["src/**"]).await;
+    assert!(b_early["leases"][0]["id"].as_i64().unwrap() > reused_id);
+    t.advance(TimeDelta::minutes(2));
+    lease_for(&t, A, &first_task, &["src/ordered.rs"]).await;
+    t.advance(TimeDelta::minutes(2));
+    let b_reused = lease_for(&t, B, &second_task, &["src/ordered.rs"]).await;
+    assert_eq!(b_reused["leases"][0]["id"].as_i64().unwrap(), reused_id);
+    let a_ordered_touch = t
+        .ok(
+            "POST",
+            "/v1/touches",
+            Some(A),
+            Some(json!({ "agent": A, "repo": REPO, "paths": ["src/ordered.rs"] })),
+        )
+        .await;
+    let b_overlaps: Vec<&Value> = a_ordered_touch["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["via"] == "lease" && o["agent"] == B)
+        .collect();
+    assert_eq!(b_overlaps.len(), 2, "{b_overlaps:?}");
+    assert_eq!(
+        b_overlaps[0]["your_lease_earlier"], false,
+        "peer's genuinely earlier live lease must come first: {b_overlaps:?}"
+    );
+    assert_eq!(b_overlaps[1]["your_lease_earlier"], true);
 }

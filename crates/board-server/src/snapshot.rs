@@ -1737,41 +1737,32 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         .as_deref()
                         .map_or(String::new(), |t| format!(" for {t}"));
                     let theirs = Glob::new(&glob);
-                    let (alert, action) = if let Some((_, mine, _, my_at, my_id)) = my_globs
+                    let alert = if let Some((_, mine, _, my_at, my_id)) = my_globs
                         .iter()
                         .find(|(r, _, g, _, _)| *r == repo && g.overlaps(&theirs))
                     {
                         if (*my_at, *my_id) < (their_at, their_id) {
-                            (
-                                format!(
-                                    "{actor} leased {}{task_tag} {when} ago (later than your lease {})",
-                                    path(&glob),
-                                    path(mine)
-                                ),
-                                board_proto::LATER_LEASE_OVERLAP_ACTION.to_owned(),
+                            format!(
+                                "{actor} leased {}{task_tag} {when} ago (later than your lease {}; your earlier lease holds — note the later task and go on)",
+                                path(&glob),
+                                path(mine)
                             )
                         } else {
-                            (
-                                format!(
-                                    "{actor} leased {}{task_tag} {when} ago (earlier than your lease {})",
-                                    path(&glob),
-                                    path(mine)
-                                ),
-                                board_proto::EARLIER_LEASE_OVERLAP_ACTION.to_owned(),
+                            format!(
+                                "{actor} leased {}{task_tag} {when} ago (earlier than your lease {}; earlier lease holds — stop or narrow your globs)",
+                                path(&glob),
+                                path(mine)
                             )
                         }
                     } else if let Some((_, p, at)) = my_touches
                         .iter()
                         .find(|(r, p, _)| r == repo && theirs.matches(p))
                     {
-                        (
-                            format!(
-                                "{actor} leased {}{task_tag} {when} ago; you edited {} {} ago",
-                                path(&glob),
-                                path(p),
-                                since_ms(cx, *at)
-                            ),
-                            board_proto::LEASE_OVERLAP_ACTION.to_owned(),
+                        format!(
+                            "{actor} leased {}{task_tag} {when} ago; you edited {} {} ago",
+                            path(&glob),
+                            path(p),
+                            since_ms(cx, *at)
                         )
                     } else {
                         continue;
@@ -1780,7 +1771,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         (OVERLAP, format!("{}|{glob}", event.actor)),
                         Alert {
                             alert,
-                            action,
+                            action: board_proto::LEASE_OVERLAP_ACTION.to_owned(),
                             rank: rank(OVERLAP),
                         },
                     );

@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use board_proto::{
-    AgentId, AgentState, AgentStateUpdate, EARLIER_LEASE_OVERLAP_ACTION, EDIT_OVERLAP_ACTION,
-    LATER_LEASE_OVERLAP_ACTION, LEASE_OVERLAP_ACTION, PATH_CHARS_MAX, Runtime, Snapshot,
-    SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus, Timestamp, Touches,
+    AgentId, AgentState, AgentStateUpdate, EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION,
+    PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus,
+    Timestamp, Touches,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -793,17 +793,12 @@ fn subagent_hold(text: &str, cause: &str) -> String {
 /// alone can act on them. Empty when no such line is left.
 fn subagent_alerts(text: &str) -> String {
     let overlap = |line: &str| {
-        [
-            EDIT_OVERLAP_ACTION,
-            LEASE_OVERLAP_ACTION,
-            EARLIER_LEASE_OVERLAP_ACTION,
-            LATER_LEASE_OVERLAP_ACTION,
-        ]
-        .iter()
-        .any(|action| {
-            line.strip_suffix(action)
-                .is_some_and(|l| l.ends_with(" -> "))
-        })
+        [EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION]
+            .iter()
+            .any(|action| {
+                line.strip_suffix(action)
+                    .is_some_and(|l| l.ends_with(" -> "))
+            })
     };
     let mut useful = false;
     let lines: Vec<&str> = text

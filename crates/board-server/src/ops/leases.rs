@@ -295,9 +295,16 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         ));
     }
     let mut conflicts: Vec<Lease> = Vec::new();
+    let mut later_conflicts: Vec<i64> = Vec::new();
     let family = delegation_family(cx, req.agent.as_str())?;
     let globs: Vec<Glob<'_>> = req.globs.iter().map(|g| Glob::new(g)).collect();
-    for lease in live_leases(cx, &req.repo)? {
+    let all_live = live_leases(cx, &req.repo)?;
+    let my_live: Vec<(&Lease, Glob<'_>)> = all_live
+        .iter()
+        .filter(|l| l.agent == req.agent)
+        .map(|l| (l, Glob::new(&l.glob)))
+        .collect();
+    for lease in &all_live {
         if lease.agent == req.agent
             || !is_live(cx, lease.agent.as_str())?
             || family.contains(lease.agent.as_str())
@@ -306,8 +313,15 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
         }
         let theirs = Glob::new(&lease.glob);
         if globs.iter().any(|g| g.overlaps(&theirs)) {
+            let caller_earlier = my_live.iter().any(|(mine, my_glob)| {
+                my_glob.overlaps(&theirs)
+                    && (mine.created_at, mine.id) < (lease.created_at, lease.id)
+            });
+            if caller_earlier {
+                later_conflicts.push(lease.id);
+            }
             drop(theirs);
-            conflicts.push(lease);
+            conflicts.push(lease.clone());
         }
     }
     cx.emit(
@@ -325,6 +339,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
     Ok(LeaseResult {
         leases,
         conflicts,
+        later_conflicts,
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
@@ -544,7 +559,7 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
         .db
         .prepare_cached(
             "SELECT agent, glob, created_at, id, task FROM leases \
-             WHERE repo = ?1 AND expires_at > ?2 AND agent != ?3 ORDER BY id",
+             WHERE repo = ?1 AND expires_at > ?2 AND agent != ?3 ORDER BY created_at, id",
         )?
         .query_map(params![repo, now, me.as_str()], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -642,10 +657,6 @@ mod tests {
 
     fn glob_matches(glob: &str, path: &str) -> bool {
         Glob::new(glob).matches(path)
-    }
-
-    fn globs_overlap(a: &str, b: &str) -> bool {
-        Glob::new(a).overlaps(&Glob::new(b))
     }
 
     #[test]

@@ -890,12 +890,14 @@ knows two things for it:
   peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
   `globs` is leased once. Each lease in the answer names its repo and carries `created_at`
   (when the lease was first taken; kept across live renewals, updated when re-leasing an
-  expired row, and absent from servers that predate it). `lease_paths` (MCP) and `board lease`
-  compare each conflict's `(created_at, id)` against the caller's overlapping lease (falling
-  back to `id` on older servers): when the peer holds the earlier lease, the output names the
-  earlier holder and task and tells the caller to stop or narrow its globs; when the caller's
-  renewed lease is earlier, it tells the caller its earlier lease holds and to note the later
-  task and go on. With a `task` whose
+  expired row, and absent from servers that predate it). `later_conflicts` (omitted when
+  empty or from older servers) lists the ids of conflicts that are later than one of the
+  caller's live overlapping leases (including live leases from earlier calls). `lease_paths`
+  (MCP) and `board lease` use `later_conflicts` and `(created_at, id)` (requiring `created_at`
+  on both leases so older servers without it never misclassify reused ids): when the peer
+  holds the earlier lease, the output names the earlier holder and task and tells the caller
+  to stop or narrow its globs; when the caller holds an earlier lease, it tells the caller its
+  earlier lease holds and to note the later task and go on. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
   `warning` (absent otherwise) names the board's repos: peers working the task there get no
   warning from this lease. With a `task` that is `done` or `dropped`, the leases are taken
@@ -1113,11 +1115,10 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   agent for alerts; past that, `seq` is the last one checked and the first alert says how
   many wait for the next request. Alerts read only the last 10,000 events; an alert names
   the older ones skipped. An alert about a peer's edit or lease that overlaps the agent's
-  ends with the action `re-read before editing`, `coordinate before editing those files`,
-  `earlier lease holds: stop or narrow your globs`, or `your earlier lease holds; note the later task and go on`
-  (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION`, `EARLIER_LEASE_OVERLAP_ACTION`,
-  `LATER_LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
-  subagent only the `lines` alerts that end so. `json` is
+  ends with the action `re-read before editing` or `coordinate before editing those files`
+  (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
+  subagent only the `lines` alerts that end so (lease-vs-lease alerts state which lease is
+  older before ` -> ` so older clients' subagent filters keep passing them through). `json` is
   compact, so all three formats share the same size caps.
   `held_by` lists the held boards the agent works for: paused ones, and at the weekly hard
   line active ones too (as their coordinator, a thread it
