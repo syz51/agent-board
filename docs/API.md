@@ -1181,8 +1181,12 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   already be stale). The server keeps
   one reading, the newest by `read_at`: an older report changes nothing, and the answer is
   the reading kept.
-- `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` prints it, with
-  the boards it stops from new work, paused ones included.
+- `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` reads the configured
+  `quota_bucket()` from `GET /v1/usage/buckets` (falling back to `GET /v1/usage` when the
+  server returns 404/405 or that bucket has no reading yet) and prints it with the boards it
+  stops from new work, paused ones included; `board usage --reserve` updates that bucket's
+  reserve via `PUT /v1/usage/{provider}/{account}/reserve` (or `PUT /v1/usage/reserve` for
+  `anthropic/default` or on 404/405).
 - A reading is fresh for 30 minutes after `read_at`. A board is over when a window of a
   fresh reading has `percent` at or above its `usage_stop_at` and its `resets_at`, when
   known, is still ahead.
@@ -1356,7 +1360,12 @@ Section 3.3).
        tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
        (tasks in `review` lacking a standing `review: pass` and active review run/judge),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
-       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1), `housekeeping`
+       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1; suppressed for a
+       standing pass that already returned `outcome.status = "unclear"` until a newer
+       `review: pass` note or newer move to `review`, and cooled down per task for 60s after
+       `deferred`/`noop`, 300s after `deferred` with `reason` starting `"checks failed"`, or
+       120s after `failed` unless a newer `note_added`/`task_updated` event lands on the task),
+       `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
        with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to
@@ -1368,7 +1377,9 @@ Section 3.3).
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
        deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
        (counting `doing` tasks union unclaimed `leased | starting | running` worker runs;
-       never starving judges, merges, or housekeeping), judge caps (`JUDGES_AT_ONCE = 2` per
+       never starving judges, merges, or housekeeping) and worker-only review-backlog
+       backpressure (holding `worker` with `capacity` while a board has at least
+       `max(3, parallel_tasks * 2)` tasks in `review`), judge caps (`JUDGES_AT_ONCE = 2` per
        board and `HOME_VERDICTS_AT_ONCE = 2` across off-autopilot boards), and fleet-wide
        `conflict_keys` capacity.
     3. **Filter**: enforces device `NoSchedule` taints (including control/service-host plane

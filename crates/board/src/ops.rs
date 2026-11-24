@@ -19,7 +19,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code};
+use crate::client::{
+    Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code, is_endpoint_unsupported,
+};
 use crate::config::{Config, Home, load_stored_token, load_token};
 use crate::identity::RepoInfo;
 use crate::render;
@@ -1558,23 +1560,86 @@ pub async fn boards(ctx: &Ctx, repo: Option<&str>) -> Result<Output> {
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
 pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
-    let mut set = None;
+    let bucket_ref = ctx.config.quota_bucket();
+    let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
+        && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
+
+    let mut set_reserve: Option<Option<f64>> = None;
+    let mut updated_non_legacy_bucket = false;
     if let Some(reserve) = reserve {
-        set = Some(
-            ctx.client
+        if is_legacy_bucket {
+            let res = ctx
+                .client
                 .set_usage_reserve(&board_proto::UsageReserve { reserve })
-                .await?,
-        );
+                .await?;
+            set_reserve = Some(res.reserve);
+        } else {
+            let req = board_proto::PutUsageBucketReserve { reserve };
+            match ctx
+                .client
+                .put_usage_bucket_reserve(&bucket_ref.provider, &bucket_ref.account, &req)
+                .await
+            {
+                Ok(bucket) => {
+                    set_reserve = Some(bucket.reserve);
+                    updated_non_legacy_bucket = true;
+                }
+                Err(err) if is_endpoint_unsupported(&err) => {
+                    let res = ctx
+                        .client
+                        .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                        .await?;
+                    set_reserve = Some(res.reserve);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
-    let usage = ctx.client.usage().await?;
+
+    let mut matched_bucket = false;
+    let mut used_fallback = false;
+    let mut bucket_reserve: Option<f64> = None;
+    let usage = match ctx.client.list_usage_buckets().await {
+        Ok(buckets) => {
+            if let Some(bucket) = buckets
+                .into_iter()
+                .find(|b| b.provider == bucket_ref.provider && b.account == bucket_ref.account)
+            {
+                matched_bucket = true;
+                bucket_reserve = bucket.reserve;
+                match bucket.as_usage() {
+                    Some(u) => Some(u),
+                    None if is_legacy_bucket || updated_non_legacy_bucket => None,
+                    None => {
+                        used_fallback = true;
+                        ctx.client.usage().await?
+                    }
+                }
+            } else if updated_non_legacy_bucket {
+                None
+            } else {
+                used_fallback = true;
+                ctx.client.usage().await?
+            }
+        }
+        Err(err) if is_endpoint_unsupported(&err) => {
+            used_fallback = true;
+            ctx.client.usage().await?
+        }
+        Err(err) => return Err(err),
+    };
+
     let boards = match &usage {
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
     // A reading without a pace may still have a reserve, waiting for a weekly reset time.
-    let reserve = match (set, usage.as_ref().and_then(|u| u.pace)) {
-        (Some(set), _) => set.reserve,
+    // Never pair a configured non-legacy bucket's reserve with a fallback legacy reading.
+    let reserve = match (set_reserve, usage.as_ref().and_then(|u| u.pace)) {
+        (Some(set), _) => set,
         (None, Some(p)) => Some(p.reserve),
+        (None, None) if !used_fallback && bucket_reserve.is_some() => bucket_reserve,
+        (None, None) if !used_fallback && matched_bucket => None,
         (None, None) => match ctx.client.usage_reserve().await {
             Ok(r) => r.reserve,
             Err(err) => {

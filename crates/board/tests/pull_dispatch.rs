@@ -14,7 +14,7 @@ use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, DispatchMode, Home};
 use board::daemon::Daemon;
-use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
+use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated};
 use board::identity::RepoInfo;
 use board::local_db::LocalRunState;
 use board::ops::Ctx;
@@ -85,6 +85,7 @@ struct FakeGh {
     prs: Arc<Mutex<BTreeMap<String, PullRequest>>>,
     calls: Arc<Mutex<Vec<String>>>,
     conflicts: Arc<AtomicBool>,
+    ready_fails: Arc<AtomicBool>,
 }
 
 impl FakeGh {
@@ -113,6 +114,9 @@ impl Gh for FakeGh {
     fn ready<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("ready {pr}"));
+            if self.ready_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("gh pr ready failed: permission denied");
+            }
             let mut prs = self.prs.lock().unwrap();
             let entry = prs.get_mut(pr).expect("pr present");
             entry.draft = false;
@@ -529,6 +533,7 @@ fn open_pr(url: &str, head_oid: &str, merge_state: MergeState, checks: Checks) -
         cross_repository: false,
         merge_commit: None,
         merge_state,
+        review_decision: ReviewDecision::None,
         checks,
     }
 }
@@ -702,6 +707,8 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
 
     // Tick 2: checks fail on new head -> finding note posted once across BOTH mac-pro AND
     // mac-air (cross-device deduplication via board notes, not just local merges state!).
+    // Advance past the 300s server-side checks-failed cooldown between attempts so both
+    // devices actually execute a merge pass.
     shared_gh.put(open_pr(
         &pr_url,
         "head-bbb222",
@@ -710,7 +717,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
     ));
     server.advance(TimeDelta::minutes(1));
     mac_pro.daemon.reconcile(server.now()).await.unwrap();
-    server.advance(TimeDelta::minutes(1));
+    server.advance(TimeDelta::minutes(5));
     mac_air.daemon.reconcile(server.now()).await.unwrap();
     let notes = server.user_client().task(&pr_task).await.unwrap().notes;
     let failed_findings: Vec<_> = notes
@@ -730,7 +737,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
         MergeState::Clean,
         Checks::Passed,
     ));
-    server.advance(TimeDelta::minutes(1));
+    server.advance(TimeDelta::minutes(5));
     mac_pro.daemon.reconcile(server.now()).await.unwrap();
     assert!(mac_pro.runner.spawns().is_empty());
     assert!(
@@ -1446,5 +1453,657 @@ async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
             .notes
             .iter()
             .any(|n| n.kind == NoteKind::Decision && n.text.starts_with("decision: review: void"))
+    );
+}
+
+#[tokio::test]
+async fn deterministic_runner_reopens_after_failed_checks_persistent_draft_and_waits_hold() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. Failed checks hold for PR_HOLD_WAIT -> finding noted once, then pass voided & task opened.
+    let pr1_url = format!("https://{REPO}/pull/201");
+    shared_gh.put(open_pr(
+        &pr1_url,
+        "head-fail-1",
+        MergeState::Clean,
+        Checks::Failed(vec!["rust".into(), "docker".into()]),
+    ));
+    let t1 = make_reviewed_task(
+        &server,
+        &board,
+        "Persistent red checks",
+        &format!("review: pass. Verified.\npr: {pr1_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let mid = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(mid.task.status, TaskStatus::Review);
+    assert_eq!(
+        mid.notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::Finding)
+            .count(),
+        1
+    );
+
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(reopened.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains("rust, docker")
+    }));
+    // Close t1 so it does not compete with subsequent tasks.
+    server
+        .user_client()
+        .update_task(
+            &t1,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // 2. Persistent draft (gh pr ready fails) reopens after PR_HOLD_WAIT.
+    let pr2_url = format!("https://{REPO}/pull/202");
+    let mut draft = open_pr(
+        &pr2_url,
+        "head-draft-stuck",
+        MergeState::Waits,
+        Checks::Passed,
+    );
+    draft.draft = true;
+    shared_gh.put(draft);
+    shared_gh.ready_fails.store(true, Ordering::SeqCst);
+    let t2 = make_reviewed_task(
+        &server,
+        &board,
+        "Persistent draft PR",
+        &format!("review: pass. Verified.\npr: {pr2_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t2).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened2 = server.user_client().task(&t2).await.unwrap();
+    assert_eq!(reopened2.task.status, TaskStatus::Open);
+    assert!(reopened2.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains("draft")
+    }));
+    server
+        .user_client()
+        .update_task(
+            &t2,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened2.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // 3. MergeState::Waits (generic hold after checks passed) reopens after PR_HOLD_WAIT.
+    let pr3_url = format!("https://{REPO}/pull/203");
+    shared_gh.put(open_pr(
+        &pr3_url,
+        "head-waits-1",
+        MergeState::Waits,
+        Checks::Passed,
+    ));
+    let t3 = make_reviewed_task(
+        &server,
+        &board,
+        "Stuck MergeState::Waits PR",
+        &format!("review: pass. Verified.\npr: {pr3_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t3).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened3 = server.user_client().task(&t3).await.unwrap();
+    assert_eq!(reopened3.task.status, TaskStatus::Open);
+    assert!(reopened3.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains(&pr3_url)
+    }));
+}
+
+#[tokio::test]
+async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answer() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // Task 1: human review missing -> wakes user with Action ask + blocks task;
+    // answering "Approved — resume merge" returns the task to review.
+    let pr1_url = format!("https://{REPO}/pull/210");
+    let mut pr1 = open_pr(&pr1_url, "head-rev-1", MergeState::Waits, Checks::Passed);
+    pr1.review_decision = ReviewDecision::ReviewRequired;
+    shared_gh.put(pr1);
+    let t1 = make_reviewed_task(
+        &server,
+        &board,
+        "Needs human review approval",
+        &format!("review: pass. Verified.\npr: {pr1_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    // First read starts the hold timer without creating an ask.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t1).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    assert!(
+        server
+            .user_client()
+            .asks(Some("open"), Some(&board), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // At PR_HOLD_WAIT: creates Action ask and moves task to blocked.
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let blocked = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    let asks = server
+        .user_client()
+        .asks(Some("open"), Some(&board), None)
+        .await
+        .unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].task.as_ref(), Some(&t1));
+    assert!(asks[0].question.contains("Reason: only-me"));
+    assert!(
+        blocked
+            .task
+            .blocked_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("ask #{}", asks[0].id))
+    );
+
+    // User approves on GitHub and answers the ask -> housekeeping returns the task to review
+    // while preserving the standing pass, then the next reconcile merges directly with ZERO
+    // new LLM review judge spawns and closes the task Done!
+    let mut pr1_approved = open_pr(&pr1_url, "head-rev-1", MergeState::Clean, Checks::Passed);
+    pr1_approved.review_decision = ReviewDecision::Approved;
+    shared_gh.put(pr1_approved);
+    server
+        .user_client()
+        .answer(asks[0].id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let finished = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(
+        finished.task.status,
+        TaskStatus::Done,
+        "resumed task must merge and finish Done without re-review: {finished:?}"
+    );
+    assert!(
+        mac_pro.runner.spawns().is_empty(),
+        "must not spawn a new LLM review judge after human-review approval: {:?}",
+        mac_pro.runner.spawns()
+    );
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {pr1_url} head-rev-1")),
+        "expected merge after approval: {:?}",
+        shared_gh.calls()
+    );
+    assert!(finished.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.contains(&format!("ask #{}", asks[0].id))
+            && n.text.contains("Approved — resume merge")
+    }));
+
+    // Task 2: answering "Reopen for a worker" voids the pass and sets the task open.
+    let pr2_url = format!("https://{REPO}/pull/211");
+    let mut pr2 = open_pr(&pr2_url, "head-rev-2", MergeState::Waits, Checks::Passed);
+    pr2.review_decision = ReviewDecision::ReviewRequired;
+    shared_gh.put(pr2);
+    let t2 = make_reviewed_task(
+        &server,
+        &board,
+        "Needs human review reopen",
+        &format!("review: pass. Verified.\npr: {pr2_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let asks2 = server
+        .user_client()
+        .asks(Some("open"), Some(&board), None)
+        .await
+        .unwrap();
+    assert_eq!(asks2.len(), 1);
+    assert_eq!(asks2[0].task.as_ref(), Some(&t2));
+
+    server
+        .user_client()
+        .answer(asks2[0].id, "Reopen for a worker")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened = server.user_client().task(&t2).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(reopened.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains(&format!("ask #{}", asks2[0].id))
+    }));
+    server
+        .user_client()
+        .update_task(
+            &t2,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task 3: an unowned blocked task with an answered dispatch:* ask cleanly moves to Open
+    // via update_task (no 403 release), and an unrelated blocked_reason is never unblocked.
+    let t3 = server
+        .add_ready_task(&board, "Unowned dispatch ask reopen")
+        .await;
+    let t3_detail = server.user_client().task(&t3).await.unwrap();
+    let dispatch_client =
+        server.device_client(&mac_pro.token, Some("dispatch:mac-pro".parse().unwrap()));
+    let ask3 = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t3.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Approve PR".to_owned(),
+            options: vec!["Approved — resume merge".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_task(
+            &t3,
+            &UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                blocked_reason: Some(format!(
+                    "waiting on ask #{}: required human review",
+                    ask3.ask.id
+                )),
+                ..update_task_base("t3:admin".parse().unwrap(), t3_detail.task.version)
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .answer(ask3.ask.id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let t3_after = server.user_client().task(&t3).await.unwrap();
+    assert_eq!(
+        t3_after.task.status,
+        TaskStatus::Open,
+        "unowned blocked task must move to Open without 403 release: {t3_after:?}"
+    );
+    server
+        .user_client()
+        .update_task(
+            &t3,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), t3_after.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task 4: answered dispatch ask must NOT unblock a task whose blocked_reason is for a
+    // different ask or has another open ask.
+    let t4 = server
+        .add_ready_task(&board, "Do not unblock unrelated ask")
+        .await;
+    let t4_detail = server.user_client().task(&t4).await.unwrap();
+    let ask4a = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t4.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Old ask".to_owned(),
+            options: vec!["Approved — resume merge".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    let ask4b = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t4.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Newer open ask".to_owned(),
+            options: vec!["Yes".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_task(
+            &t4,
+            &UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                blocked_reason: Some(format!("waiting on ask #{}: unrelated", ask4b.ask.id)),
+                ..update_task_base("t3:admin".parse().unwrap(), t4_detail.task.version)
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .answer(ask4a.ask.id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let t4_after = server.user_client().task(&t4).await.unwrap();
+    assert_eq!(
+        t4_after.task.status,
+        TaskStatus::Blocked,
+        "answered old dispatch ask must not unblock task held by another ask"
+    );
+}
+
+#[tokio::test]
+async fn merge_hol_unclear_and_deferred_do_not_starve_other_merges() {
+    let server = TestServer::start().await;
+    let alpha = server.create_autopilot_board("alpha", 2).await;
+
+    // Create a second autopilot board `beta` with its own repository so we verify
+    // zero cross-board Head-of-Line blocking in a single reconcile tick.
+    const BETA_REPO: &str = "github.com/org/beta";
+    let user = server.user_client();
+    let beta_board = user
+        .create_board(&CreateBoard {
+            slug: "beta".parse().unwrap(),
+            title: "Board beta".to_owned(),
+            goal: String::new(),
+            repos: vec![BETA_REPO.to_owned()],
+            autopilot: false,
+            home_devices: Vec::new(),
+            temporary: false,
+        })
+        .await
+        .unwrap();
+    user.update_board(
+        &beta_board.slug,
+        &UpdateBoard {
+            autopilot: Some(true),
+            parallel_tasks: Some(2),
+            ..UpdateBoard::default()
+        },
+    )
+    .await
+    .unwrap();
+    let beta = beta_board.slug;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. p1 unclear task on alpha (foreign PR outside alpha's repos -> MergeOutcome::Unclear).
+    let unclear_task = make_reviewed_task(
+        &server,
+        &alpha,
+        "Foreign PR unclear task",
+        "review: pass. Verified.\npr: https://github.com/other/foreign/pull/37",
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let u_detail = user.task(&unclear_task).await.unwrap();
+    user.update_task(
+        &unclear_task,
+        &UpdateTask {
+            priority: Some(Priority::P1),
+            ..update_task_base("t3:admin".parse().unwrap(), u_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // 2. p1 failing-CI task on alpha (-> MergeOutcome::Deferred with "checks failed ...").
+    let failing_pr = format!("https://{REPO}/pull/500");
+    shared_gh.put(open_pr(
+        &failing_pr,
+        "head-red-500",
+        MergeState::Waits,
+        Checks::Failed(vec!["rust".into()]),
+    ));
+    let failing_task = make_reviewed_task(
+        &server,
+        &alpha,
+        "Failing CI p1 task",
+        &format!("review: pass. LGTM.\npr: {failing_pr}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let f_detail = user.task(&failing_task).await.unwrap();
+    user.update_task(
+        &failing_task,
+        &UpdateTask {
+            priority: Some(Priority::P1),
+            ..update_task_base("t3:admin".parse().unwrap(), f_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // 3. p2 clean ready PR on beta (scores BELOW both p1 tasks!).
+    let ready_pr = format!("https://{BETA_REPO}/pull/42");
+    shared_gh.put(open_pr(
+        &ready_pr,
+        "head-clean-42",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let ready_task = make_reviewed_task(
+        &server,
+        &beta,
+        "Ready clean PR on beta",
+        &format!("review: pass. Ship it.\npr: {ready_pr}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let r_detail = user.task(&ready_task).await.unwrap();
+    user.update_task(
+        &ready_task,
+        &UpdateTask {
+            repo: Some(Some(BETA_REPO.to_owned())),
+            ..update_task_base("t3:admin".parse().unwrap(), r_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // ONE single reconcile tick must process unclear_task, failing_task, AND merge ready_task!
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+
+    let ready_after = user.task(&ready_task).await.unwrap();
+    assert_eq!(
+        ready_after.task.status,
+        TaskStatus::Done,
+        "clean p2 PR on beta must merge in the very same tick despite p1 unclear/deferred tasks: {ready_after:?}"
+    );
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {ready_pr} head-clean-42")),
+        "expected beta PR merge: {:?}",
+        shared_gh.calls()
+    );
+
+    // unclear_task must complete as RunState::Succeeded with outcome status "unclear" (NEVER
+    // Failed!) and post exactly ONE finding note.
+    let unclear_runs = user
+        .list_runs(&RunFilter {
+            task: Some(unclear_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(unclear_runs.len(), 1, "{unclear_runs:?}");
+    assert_eq!(unclear_runs[0].state, RunState::Succeeded);
+    assert_eq!(
+        unclear_runs[0]
+            .outcome
+            .as_ref()
+            .and_then(|o| o.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("unclear"),
+        "{:?}",
+        unclear_runs[0].outcome
+    );
+    let unclear_after = user.task(&unclear_task).await.unwrap();
+    assert_eq!(unclear_after.task.status, TaskStatus::Review);
+    let unclear_findings: Vec<_> = unclear_after
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Finding && n.text.contains("unclear pr:"))
+        .collect();
+    assert_eq!(
+        unclear_findings.len(),
+        1,
+        "expected exactly one finding note for unclear PR: {:?}",
+        unclear_after.notes
+    );
+
+    // Reconcile again 30s later and run sweeper: NO repeat merge runs for unclear_task or
+    // failing_task, NO duplicate finding note, NO Failed runs, NO spawn_fail signal!
+    server.advance(TimeDelta::seconds(30));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    server.run_sweeper_once().await;
+
+    let unclear_runs_after = user
+        .list_runs(&RunFilter {
+            task: Some(unclear_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        unclear_runs_after.len(),
+        1,
+        "unclear merge must stay suppressed with no retry loop: {unclear_runs_after:?}"
+    );
+    let failing_runs_after = user
+        .list_runs(&RunFilter {
+            task: Some(failing_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        failing_runs_after.len(),
+        1,
+        "checks-failed merge must stay in 300s cooldown at 30s: {failing_runs_after:?}"
+    );
+    let all_failed = user
+        .list_runs(&RunFilter {
+            state: Some(RunState::Failed),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        all_failed.is_empty(),
+        "MergeOutcome::Unclear must never record Failed runs: {all_failed:?}"
+    );
+
+    // Posting a newer `review: pass` note with `pr: none` re-offers unclear_task and finishes it!
+    let reviewer_id: AgentId = "antigravity:reviewer-1".parse().unwrap();
+    let reviewer_client = server.device_client(&mac_pro.token, Some(reviewer_id.clone()));
+    reviewer_client
+        .add_note(
+            &unclear_task,
+            &AddNote {
+                agent: reviewer_id,
+                kind: NoteKind::Decision,
+                text: "review: pass. Corrected PR line.\npr: none".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let unclear_done = user.task(&unclear_task).await.unwrap();
+    assert_eq!(
+        unclear_done.task.status,
+        TaskStatus::Done,
+        "newer review: pass note must re-offer and finish previously unclear task: {unclear_done:?}"
     );
 }

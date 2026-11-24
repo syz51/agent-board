@@ -2729,6 +2729,173 @@ fn usage_shows_the_reading_and_the_boards_it_holds() {
 }
 
 #[test]
+fn usage_reads_configured_quota_bucket_and_falls_back() {
+    let e = env();
+    // Configure `antigravity` as the active provider so `config.quota_bucket()` is
+    // `antigravity/default`.
+    let cfg_path = e.home.join("config.toml");
+    let mut cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    cfg.push_str("\n[thread_model]\nprovider = \"antigravity\"\nmodel = \"gemini-4-neon\"\n");
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    let now = chrono::Utc::now();
+    let stale_read = now - chrono::Duration::hours(6);
+    let fresh_read = now - chrono::Duration::minutes(2);
+    let resets = fresh_read + chrono::Duration::hours(48);
+    let day_start = resets - chrono::Duration::hours(48);
+
+    // Legacy `/v1/usage` holds a stale high `anthropic/default` reading (95%).
+    let stale_legacy = json!({
+        "five_hour": { "percent": 95.0 },
+        "seven_day": { "percent": 95.0, "resets_at": resets },
+        "read_at": stale_read,
+        "device": "old-mac",
+    });
+    e.stub.on("GET /v1/usage", stale_legacy.clone());
+    e.stub.on("GET /v1/boards", [board_fixture("factory", &[])]);
+
+    // `/v1/usage/buckets` holds both the stale anthropic/default bucket and the fresh
+    // antigravity/default bucket with pace.
+    e.stub.on(
+        "GET /v1/usage/buckets",
+        json!([
+            {
+                "provider": "anthropic",
+                "account": "default",
+                "five_hour": { "percent": 95.0 },
+                "seven_day": { "percent": 95.0, "resets_at": resets },
+                "read_at": stale_read,
+                "device": "old-mac",
+                "reserve": 5.5,
+            },
+            {
+                "provider": "antigravity",
+                "account": "default",
+                "five_hour": { "percent": 18.0 },
+                "seven_day": { "percent": 32.0, "resets_at": resets },
+                "read_at": fresh_read,
+                "device": "mac-pro",
+                "reserve": 10.0,
+                "pace": {
+                    "reserve": 10.0,
+                    "day_start": day_start,
+                    "anchor": 20.0,
+                    "line": 55.0,
+                    "projected": 34.0,
+                },
+            }
+        ]),
+    );
+
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("5h 18%")
+            && text.contains("week 32%")
+            && text.contains("by mac-pro")
+            && text.contains("pace: reserve 10.0%"),
+        "expected antigravity/default bucket reading & pace, got:\n{text}"
+    );
+    assert!(
+        !text.contains("old-mac") && !text.contains("95%"),
+        "must not display stale anthropic/default row:\n{text}"
+    );
+
+    let out = e.run(&["--json", "usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["seven_day"]["percent"], 32.0);
+    assert_eq!(v["device"], "mac-pro");
+
+    // `--reserve` updates `PUT /v1/usage/antigravity/default/reserve` for non-legacy buckets.
+    e.stub.on(
+        "PUT /v1/usage/antigravity/default/reserve",
+        json!({
+            "provider": "antigravity",
+            "account": "default",
+            "five_hour": { "percent": 18.0 },
+            "seven_day": { "percent": 32.0, "resets_at": resets },
+            "read_at": fresh_read,
+            "device": "mac-pro",
+            "reserve": 12.5,
+        }),
+    );
+    let out = e.run(&["usage", "--reserve", "12.5"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bucket_puts = e
+        .stub
+        .requests_to("PUT /v1/usage/antigravity/default/reserve");
+    assert_eq!(bucket_puts.len(), 1);
+    assert_eq!(bucket_puts[0].body, json!({ "reserve": 12.5 }));
+
+    // Fallback: when the configured bucket has no reading yet in `/v1/usage/buckets`, fall
+    // back to legacy `GET /v1/usage` on a plain read, but never mix the legacy reading/pace
+    // into `board usage --reserve` for the configured non-legacy bucket.
+    e.stub.on(
+        "GET /v1/usage/buckets",
+        json!([
+            {
+                "provider": "anthropic",
+                "account": "default",
+                "five_hour": { "percent": 95.0 },
+                "seven_day": { "percent": 95.0, "resets_at": resets },
+                "read_at": stale_read,
+                "device": "old-mac",
+            }
+        ]),
+    );
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("by old-mac"),
+        "expected fallback to legacy GET /v1/usage when configured bucket is absent:\n{}",
+        stdout(&out)
+    );
+
+    // Updating reserve on an unread non-legacy bucket must report that reserve without
+    // showing the stale legacy `anthropic/default` reading.
+    e.stub.on(
+        "PUT /v1/usage/antigravity/default/reserve",
+        json!({
+            "provider": "antigravity",
+            "account": "default",
+            "reserve": 15.0,
+        }),
+    );
+    e.stub.on(
+        "GET /v1/usage/buckets",
+        json!([
+            {
+                "provider": "anthropic",
+                "account": "default",
+                "five_hour": { "percent": 95.0 },
+                "seven_day": { "percent": 95.0, "resets_at": resets },
+                "read_at": stale_read,
+                "device": "old-mac",
+                "reserve": 5.5,
+            },
+            {
+                "provider": "antigravity",
+                "account": "default",
+                "reserve": 15.0,
+            }
+        ]),
+    );
+    let out = e.run(&["usage", "--reserve", "15.0"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("no usage reading yet") && text.contains("reserve 15.0% set"),
+        "expected unread non-legacy bucket reserve message:\n{text}"
+    );
+    assert!(
+        !text.contains("old-mac") && !text.contains("95%"),
+        "must not mix legacy anthropic reading into antigravity --reserve output:\n{text}"
+    );
+}
+
+#[test]
 fn ls_without_a_board_names_the_boards_and_open_leaves_closed_tasks_out() {
     let e = env();
     let mut done = task_fixture("web-3", "Ship the page");
