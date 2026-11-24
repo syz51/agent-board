@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod ops;
 pub mod relay;
 pub mod render;
+pub mod runner;
 pub mod state;
 pub mod t3;
 pub mod usage;
