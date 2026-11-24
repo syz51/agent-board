@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use board_proto::{
     AgentId, BoardSlug, ConflictKeySpec, ConflictLock, CreateRun, DeviceName, EventType, Note,
     RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunFilter, RunId, RunKind, RunOrigin, RunState,
-    TaskId, TaskStatus, Timestamp, UpdateRun,
+    StickyWake, TaskId, TaskStatus, Timestamp, UpdateRun,
 };
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -37,12 +37,12 @@ pub(crate) const LIVE_RUN_RIGHTS: &str = "r.origin = 'managed' \
      AND r.lease_expires_at IS NOT NULL \
      AND r.lease_expires_at > :now";
 
-const RUN_COLUMNS: &str = "r.id, r.task_id, r.board, r.kind, r.origin, r.device, r.runner, \
+pub(crate) const RUN_COLUMNS: &str = "r.id, r.task_id, r.board, r.kind, r.origin, r.device, r.runner, \
      r.agent_id, r.state, r.lease_expires_at, r.worktree_branch, r.cwd, r.title, \
      r.attach_hint, r.cost_units, r.policy_version, r.outcome_json, r.transcript_uri, \
      r.transcript_sha256, r.created_at, r.started_at, r.ended_at, r.updated_at";
 
-fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
+pub(crate) fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
         id: parse_id(&r.get::<_, String>(0)?)?,
         task_id: r
@@ -372,7 +372,7 @@ pub(crate) fn validate_update(mut req: UpdateRun) -> Result<UpdateRun> {
     Ok(req)
 }
 
-fn new_run_id(cx: &Ctx<'_>) -> Result<RunId> {
+pub(crate) fn new_run_id(cx: &Ctx<'_>) -> Result<RunId> {
     for _ in 0..8 {
         let candidate: RunId = format!("run-{}", random_hex::<12>())
             .parse()
@@ -386,7 +386,7 @@ fn new_run_id(cx: &Ctx<'_>) -> Result<RunId> {
 
 /// Atomically acquires `specs` in `conflict_locks` for `run_id`, refusing with `409
 /// claim_refused` if any key is already at capacity. Skips keys already held by `run_id`.
-fn acquire_conflict_locks(
+pub(crate) fn acquire_conflict_locks(
     cx: &Ctx<'_>,
     run_id: &RunId,
     specs: &[ConflictKeySpec],
@@ -1043,11 +1043,18 @@ pub(crate) fn update(
 }
 
 /// Sweeps managed runs whose renewable lease has expired (`lease_expires_at <= now`) while
-/// in `leased | starting | running | waiting_external`: transitions each atomically to
-/// `orphaned`, releases its `conflict_locks`, and emits a `run_orphaned` Trail Rule event
-/// naming the device, branch, task, cause, and lease expiry time.
+/// in `leased | starting | running | waiting_external`, managed `waiting_external` runs
+/// whose hosting device went stale beyond `sticky_grace_secs`, and pending `sticky_wakes`
+/// targeting orphaned/terminal runs or devices stale beyond `sticky_grace_secs`.
+///
+/// Each transitioned run is marked `orphaned`, releases its `conflict_locks`, expires any
+/// pending `sticky_wakes`, and emits a Trail Rule `run_orphaned` event. Standalone expired
+/// sticky wakes emit a Trail Rule `run_updated` fallback event carrying the wake payload.
 pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
+    let sticky_cutoff = now.saturating_sub(cx.s.sticky_grace_ms());
+
+    // 1. Managed live runs whose renewable lease expired (`lease_expires_at <= now`).
     let expired: Vec<Run> = cx
         .db
         .prepare_cached(&format!(
@@ -1062,6 +1069,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         .collect::<rusqlite::Result<_>>()?;
     for run in &expired {
         let released = release_conflict_locks(cx, &run.id)?;
+        let expired_wakes = expire_run_wakes(cx, &run.id, now)?;
         cx.db.execute(
             "UPDATE runs SET state = 'orphaned', lease_expires_at = NULL, \
              ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
@@ -1089,6 +1097,9 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         if !released.is_empty() {
             payload["released_locks"] = serde_json::json!(released);
         }
+        if !expired_wakes.is_empty() {
+            payload["expired_wakes"] = serde_json::json!(expired_wakes);
+        }
         cx.emit(
             run.board.as_ref(),
             "server",
@@ -1097,7 +1108,311 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
             payload,
         )?;
     }
-    Ok(expired.len())
+
+    // 2. Managed `waiting_external` runs whose hosting device's heartbeat is stale beyond
+    //    `sticky_grace_secs`: orphan them and expire their sticky wakes so another awake
+    //    device can pick up recovery immediately.
+    let stale_waiting: Vec<(Run, i64)> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS}, d.heartbeat_at FROM runs r \
+             JOIN devices d ON d.name = r.device \
+             WHERE r.origin = 'managed' \
+               AND r.state = 'waiting_external' \
+               AND d.heartbeat_at IS NOT NULL \
+               AND d.heartbeat_at <= ?1 \
+             ORDER BY d.heartbeat_at, r.id"
+        ))?
+        .query_map([sticky_cutoff], |r| Ok((run_row(r)?, r.get(23)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (run, heartbeat_at) in &stale_waiting {
+        let released = release_conflict_locks(cx, &run.id)?;
+        let expired_wakes = expire_run_wakes(cx, &run.id, now)?;
+        cx.db.execute(
+            "UPDATE runs SET state = 'orphaned', lease_expires_at = NULL, \
+             ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
+            params![run.id.as_str(), now],
+        )?;
+        let stale_by_ms = now.saturating_sub(*heartbeat_at);
+        let mut payload = serde_json::json!({
+            "run_id": run.id,
+            "kind": run.kind,
+            "from": run.state,
+            "to": RunState::Orphaned,
+            "device": run.device,
+            "runner": run.runner,
+            "cause": "device_stale_sticky_fallback",
+            "heartbeat_at": ts(*heartbeat_at),
+            "stale_by_ms": stale_by_ms,
+        });
+        if let Some(ref agent) = run.agent_id {
+            payload["agent_id"] = serde_json::json!(agent);
+        }
+        if let Some(ref branch) = run.worktree_branch {
+            payload["worktree_branch"] = serde_json::json!(branch);
+        }
+        if !released.is_empty() {
+            payload["released_locks"] = serde_json::json!(released);
+        }
+        if !expired_wakes.is_empty() {
+            payload["expired_wakes"] = serde_json::json!(expired_wakes);
+        }
+        cx.emit(
+            run.board.as_ref(),
+            "server",
+            EventType::RunOrphaned,
+            run.task_id.as_ref(),
+            payload,
+        )?;
+    }
+
+    // 3. Pending sticky wakes whose run is already terminal or whose device's heartbeat is
+    //    stale beyond `sticky_grace_secs`: mark expired with a Trail Rule fallback event.
+    struct FallbackWake {
+        wake: StickyWake,
+        board: Option<BoardSlug>,
+        task_id: Option<TaskId>,
+        run_state: Option<String>,
+        heartbeat_at: Option<i64>,
+    }
+    let fallback_wakes: Vec<FallbackWake> = cx
+        .db
+        .prepare_cached(
+            "SELECT sw.id, sw.run_id, sw.agent_id, sw.device, sw.kind, sw.payload_json, \
+                    sw.created_at, sw.delivered_at, sw.expires_at, \
+                    r.board, r.task_id, r.state, d.heartbeat_at \
+             FROM sticky_wakes sw \
+             LEFT JOIN runs r ON r.id = sw.run_id \
+             LEFT JOIN devices d ON d.name = sw.device \
+             WHERE sw.delivered_at IS NULL \
+               AND (sw.expires_at IS NULL OR sw.expires_at > ?1) \
+               AND ( \
+                   r.state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+                   OR (d.heartbeat_at IS NOT NULL AND d.heartbeat_at <= ?2) \
+               ) \
+             ORDER BY sw.created_at, sw.id",
+        )?
+        .query_map(params![now, sticky_cutoff], |r| {
+            Ok(FallbackWake {
+                wake: sticky_wake_row(r)?,
+                board: r
+                    .get::<_, Option<String>>(9)?
+                    .map(|s| parse_id(&s))
+                    .transpose()?,
+                task_id: r
+                    .get::<_, Option<String>>(10)?
+                    .map(|s| parse_id(&s))
+                    .transpose()?,
+                run_state: r.get::<_, Option<String>>(11)?,
+                heartbeat_at: r.get::<_, Option<i64>>(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for FallbackWake {
+        wake,
+        board,
+        task_id,
+        run_state,
+        heartbeat_at,
+    } in &fallback_wakes
+    {
+        cx.db.execute(
+            "UPDATE sticky_wakes SET expires_at = ?2 WHERE id = ?1",
+            params![wake.id, now],
+        )?;
+        let cause = if run_state.as_deref().is_some_and(|s| {
+            matches!(
+                s,
+                "succeeded" | "failed" | "preempted" | "orphaned" | "cancelled"
+            )
+        }) {
+            "sticky_wake_run_terminal"
+        } else {
+            "sticky_wake_device_stale"
+        };
+        let mut payload = serde_json::json!({
+            "wake_id": wake.id,
+            "device": wake.device,
+            "wake_kind": wake.kind,
+            "wake_payload": wake.payload,
+            "cause": cause,
+            "expired_at": ts(now),
+        });
+        if let Some(ref run_id) = wake.run_id {
+            payload["run_id"] = serde_json::json!(run_id);
+        }
+        if let Some(ref agent_id) = wake.agent_id {
+            payload["agent_id"] = serde_json::json!(agent_id);
+        }
+        if let Some(hb) = heartbeat_at {
+            payload["heartbeat_at"] = serde_json::json!(ts(*hb));
+            payload["stale_by_ms"] = serde_json::json!(now.saturating_sub(*hb));
+        }
+        cx.emit(
+            board.as_ref(),
+            "server",
+            EventType::RunUpdated,
+            task_id.as_ref(),
+            payload,
+        )?;
+    }
+
+    Ok(expired.len() + stale_waiting.len() + fallback_wakes.len())
+}
+
+// ---------------------------------------------------------------------------------------
+// Sticky wakes
+
+const STICKY_WAKE_COLUMNS: &str = "id, run_id, agent_id, device, kind, payload_json, \
+     created_at, delivered_at, expires_at";
+
+fn sticky_wake_row(r: &Row<'_>) -> rusqlite::Result<StickyWake> {
+    Ok(StickyWake {
+        id: r.get(0)?,
+        run_id: r
+            .get::<_, Option<String>>(1)?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        agent_id: r
+            .get::<_, Option<String>>(2)?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        device: parse_id(&r.get::<_, String>(3)?)?,
+        kind: r.get(4)?,
+        payload: parse_json(&r.get::<_, String>(5)?)?,
+        created_at: ts(r.get(6)?),
+        delivered_at: r.get::<_, Option<i64>>(7)?.map(ts),
+        expires_at: r.get::<_, Option<i64>>(8)?.map(ts),
+    })
+}
+
+fn expire_run_wakes(cx: &Ctx<'_>, run_id: &RunId, now: i64) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = cx
+        .db
+        .prepare_cached(
+            "SELECT id FROM sticky_wakes \
+             WHERE run_id = ?1 AND delivered_at IS NULL \
+               AND (expires_at IS NULL OR expires_at > ?2) \
+             ORDER BY id",
+        )?
+        .query_map(params![run_id.as_str(), now], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !ids.is_empty() {
+        cx.db.execute(
+            "UPDATE sticky_wakes SET expires_at = ?2 \
+             WHERE run_id = ?1 AND delivered_at IS NULL \
+               AND (expires_at IS NULL OR expires_at > ?2)",
+            params![run_id.as_str(), now],
+        )?;
+    }
+    Ok(ids)
+}
+
+/// Routes a follow-up wake into `sticky_wakes` when `agent` currently has a live managed
+/// run (`starting | running | waiting_external` with unexpired lease).
+pub(crate) fn enqueue_sticky_wake_for_agent(
+    cx: &Ctx<'_>,
+    agent: &AgentId,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<Option<i64>> {
+    let now = cx.now_ms();
+    let target: Option<(String, String)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, device FROM runs \
+             WHERE agent_id = ?1 AND origin = 'managed' \
+               AND state IN ('starting', 'running', 'waiting_external') \
+               AND (lease_expires_at IS NULL OR lease_expires_at > ?2) \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )?
+        .query_row(params![agent.as_str(), now], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((run_id, device)) = target else {
+        return Ok(None);
+    };
+    cx.db.execute(
+        "INSERT INTO sticky_wakes (run_id, agent_id, device, kind, payload_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            run_id,
+            agent.as_str(),
+            device,
+            kind,
+            payload.to_string(),
+            now
+        ],
+    )?;
+    Ok(Some(cx.db.last_insert_rowid()))
+}
+
+/// Lists undelivered, unexpired sticky wakes for `device`, oldest first
+/// (`GET /v1/devices/{name}/wakes`).
+pub(crate) fn list_device_wakes(cx: &Ctx<'_>, device: &DeviceName) -> Result<Vec<StickyWake>> {
+    if !cx.exists(
+        "SELECT 1 FROM devices WHERE name = ?1 AND revoked_at IS NULL",
+        [device.as_str()],
+    )? {
+        return Err(not_found(
+            format!("no active device named {device}"),
+            "GET /v1/devices lists the active devices",
+        ));
+    }
+    let now = cx.now_ms();
+    Ok(cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {STICKY_WAKE_COLUMNS} FROM sticky_wakes \
+             WHERE device = ?1 AND delivered_at IS NULL \
+               AND (expires_at IS NULL OR expires_at > ?2) \
+             ORDER BY created_at, id"
+        ))?
+        .query_map(params![device.as_str(), now], sticky_wake_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Marks sticky wake `id` delivered (`POST /v1/wakes/{id}/ack`). Authorized for the wake's
+/// owning device token or a user token; idempotent once delivered.
+pub(crate) fn ack_wake(
+    cx: &mut Ctx<'_>,
+    id: i64,
+    caller_device: Option<&DeviceName>,
+    by_user: bool,
+) -> Result<StickyWake> {
+    let wake = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {STICKY_WAKE_COLUMNS} FROM sticky_wakes WHERE id = ?1"
+        ))?
+        .query_row([id], sticky_wake_row)
+        .optional()?
+        .ok_or_else(|| {
+            not_found(
+                format!("sticky wake {id} does not exist"),
+                "GET /v1/devices/{name}/wakes lists pending wakes for your device",
+            )
+        })?;
+    if !by_user && caller_device != Some(&wake.device) {
+        return Err(forbidden(
+            format!("sticky wake {id} belongs to device {}", wake.device),
+            format!(
+                "only device {} or the user may acknowledge sticky wake {id}",
+                wake.device
+            ),
+        ));
+    }
+    if wake.delivered_at.is_none() {
+        cx.db.execute(
+            "UPDATE sticky_wakes SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL",
+            params![id, cx.now_ms()],
+        )?;
+    }
+    Ok(cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {STICKY_WAKE_COLUMNS} FROM sticky_wakes WHERE id = ?1"
+        ))?
+        .query_row([id], sticky_wake_row)?)
 }
 
 // ---------------------------------------------------------------------------------------

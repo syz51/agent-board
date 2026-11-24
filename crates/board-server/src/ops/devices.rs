@@ -62,7 +62,7 @@ fn device_entry_row(r: &Row<'_>, now_ms: i64, stale_ms: i64) -> rusqlite::Result
     })
 }
 
-fn get_active_entry(cx: &Ctx<'_>, name: &DeviceName) -> Result<DeviceEntry> {
+pub(crate) fn get_active_entry(cx: &Ctx<'_>, name: &DeviceName) -> Result<DeviceEntry> {
     let now_ms = cx.now_ms();
     let stale_ms = cx.s.device_stale_ms();
     cx.db
@@ -103,7 +103,7 @@ pub(crate) fn check_token(field: &str, value: &str, max: usize) -> Result<String
     Ok(trimmed.to_owned())
 }
 
-fn check_token_list(
+pub(crate) fn check_token_list(
     field: &str,
     items: Vec<String>,
     max_items: usize,

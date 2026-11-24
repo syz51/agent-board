@@ -223,6 +223,20 @@ pub(crate) fn answer(cx: &mut Ctx<'_>, id: i64, answer: &str, via: &str) -> Resu
         };
         boards::update_approved(cx, "user", &ask.board, change, approval)?;
     }
+    // Route an answered-ask wake into the sticky wake queue when the asking agent has a
+    // live managed run so its hosting device delivers it via `GET /v1/devices/{name}/wakes`.
+    crate::ops::runs::enqueue_sticky_wake_for_agent(
+        cx,
+        &ask.agent,
+        "answered",
+        serde_json::json!({
+            "ask_id": id,
+            "board": ask.board,
+            "task_id": ask.task,
+            "answer": answer,
+            "via": via,
+        }),
+    )?;
     get_ask(cx, id)
 }
 

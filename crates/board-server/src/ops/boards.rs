@@ -1,6 +1,6 @@
 use board_proto::{
     AgentId, ApprovedBoardChange, Board, BoardChange, BoardSlug, BoardStatus, ClaimCoordinator,
-    CreateBoard, DeviceName, EventType, TaskId, UpdateBoard,
+    ConflictKeySpec, CreateBoard, DeviceName, EventType, TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -383,6 +383,7 @@ fn apply(
     // An approval that changes no value still leaves its event, but not a write: the
     // board's `updated_at` moves only when the board does.
     if changed {
+        let new_parallel = req.parallel_tasks.unwrap_or(before.parallel_tasks);
         // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
         // only turns that began before it.
         cx.db.execute(
@@ -403,12 +404,45 @@ fn apply(
                     .expect("serializes"),
                 cx.now_ms(),
                 req.temporary.unwrap_or(before.temporary),
-                req.parallel_tasks.unwrap_or(before.parallel_tasks),
+                new_parallel,
                 enum_str(&req.dispatch.unwrap_or(before.dispatch)),
                 req.usage_stop_at.unwrap_or(before.usage_stop_at),
                 req.verdict_judges.unwrap_or(before.verdict_judges),
             ],
         )?;
+        // Keep derived `repo:<repo>:write` semaphore bounds on live managed worker runs in sync
+        // with `board.parallel_tasks`, while preserving any stricter explicit task conflict_key.
+        if new_parallel != before.parallel_tasks {
+            let rows: Vec<(String, String, Option<String>)> = cx
+                .db
+                .prepare_cached(
+                    "SELECT cl.key, cl.run_id, t.conflict_keys_json \
+                     FROM conflict_locks cl \
+                     JOIN runs r ON r.id = cl.run_id \
+                     LEFT JOIN tasks t ON t.id = r.task_id \
+                     WHERE r.board = ?1 \
+                       AND r.kind = 'worker' \
+                       AND r.origin = 'managed' \
+                       AND cl.key LIKE 'repo:%:write'",
+                )?
+                .query_map([slug.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (key, run_id, task_keys_json) in rows {
+                let explicit_min = task_keys_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<ConflictKeySpec>>(s).ok())
+                    .into_iter()
+                    .flatten()
+                    .filter(|spec| spec.key == key)
+                    .map(|spec| spec.max)
+                    .min();
+                let next_max = explicit_min.map_or(new_parallel, |m| m.min(new_parallel));
+                cx.db.execute(
+                    "UPDATE conflict_locks SET max_holders = ?1 WHERE key = ?2 AND run_id = ?3",
+                    params![next_max, key, run_id],
+                )?;
+            }
+        }
     }
     cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
