@@ -513,21 +513,49 @@ kind, also when nothing else changed. The hooks act on it:
   prompt's snapshot showed the hold. The turn's time and that mark are cleared at each
   prompt and when the turn ends.
 - `UserPromptSubmit` while held injects the `hold:` line (do the work when the user's
-  own message asks for it; in every other turn, end the turn) and does not stop the turn, since the hook cannot tell
-  the user's message from a T3 notification. That turn is not stopped later either. One
-  notification is recognized: a pull request watch's wake-up, whose prompt starts with
-  `Update on pull request`. T3 sends one at every check or review change, so a held
-  thread would run (and spend usage) for each one while paused. In Claude Code the hook
-  ends that prompt before the model runs, with the same halt and stop reason as a
-  heartbeat, and keeps the watch. It fetches the snapshot before marking the agent
-  running, so an ended prompt changes no state: the agent stays idle (or paused for a
-  usage limit), it is not registered again, and its sequence stays, so the next snapshot
-  brings again the alerts the ended one had. Codex is told of the hold instead, since it
-  may not honor `continue: false` at a prompt. This also ends updates for a watch the
-  user's own request started while paused, and updates about another board's task the
-  thread holds; the stop reason in the thread shows each.
+  own message asks for it; in every other turn, end the turn) and does not stop the turn,
+  since the hook cannot in general tell the user's message from another sender's. That turn
+  is not stopped later either. Recognized automatic T3 notifications and continuations
+  (`t3::is_notification_prompt`) are ended before the model runs in Claude Code (`continue:
+  false` with the same stop reason as a heartbeat) and Antigravity (`terminationBehavior:
+  "terminate"`), unwrapping T3's `<t3_code_instructions>` /
+  `<t3_code_orchestration_instructions>` `<user_request>` envelope when present:
+  - pull request watch wakes (`Update on pull request`, `T3 Code stopped watching pull
+    request #`, and `Pull request #…` lines containing `, so T3 Code stopped watching it.`),
+    keeping any active watch;
+  - delegated task completion, terminal-state and question wakes (`Delegated task `,
+    `Delegated tasks `);
+  - background task completion wakes (`Background task completed`);
+  - T3 server restart and rate-limit recovery continuations (`Continue where you left off.
+    Your last turn was cut short,`, `Continue where you left off. Your last turn stopped
+    because the provider hit a rate limit.`, `Note: the T3 server restarted, and this
+    background work was cancelled before it finished.`, and `Note: the agent runtime process
+    exited, and this background work was cancelled before it finished.`).
+  The hook fetches the snapshot before marking the agent running, so an ended prompt changes
+  no state: the agent stays idle (or paused for a usage limit), it is not registered again,
+  its sequence stays so the next snapshot brings again the alerts the ended one had, and its
+  turn state is cleared so a following user prompt is not mistaken for a mid-turn call. This
+  also ends notifications for a watch or child the user's own request started while paused,
+  and notifications about another board's task the thread holds; the stop reason in the
+  thread shows each.
 - A halted turn gets no handoff reminder: its heartbeat gives the halt alone. A turn
   begun while held gets it as any other.
+- What stays uncovered by hooks alone:
+  - **Long-running tool calls** already in flight when a board is paused: hooks cannot fire
+    inside a tool call, so the turn runs until that tool call returns and the next
+    `PostToolUse` heartbeat (or Antigravity `PreToolUse` / `PreInvocation`) halts it.
+    Stopping an in-flight call immediately requires the daemon to interrupt the running turn
+    via T3 once T3's CLI exposes an interrupt command.
+  - **Other non-user prompts without a recognized notification prefix**: other agents'
+    `t3_thread_send` messages, bare `Continue where you left off.` usage-limit resumes
+    (indistinguishable from a user typing that phrase), and any future T3 notification
+    wording not listed above; these still get the `hold:` line instead of a halt.
+  - **Codex and opencode** at `UserPromptSubmit`: both are told of the hold via the `hold:`
+    line rather than halted at the prompt (Codex may not honor `continue: false` there, and
+    the opencode plugin does not halt there).
+  - **Offline or slow server** at `UserPromptSubmit`: when the server cannot be reached
+    within the hook budget, the hook falls back to the cached snapshot (`hold:` line) rather
+    than halting on potentially stale hold state.
 
 The daemon starts nothing on a paused board (see "Autopilot", A paused board). While a
 board is paused, the daemon drops every wake-up about it (answers, unblocked tasks, idle
@@ -671,7 +699,7 @@ exits 0 without output, so a configuration newer than the binary never blocks a 
 |---|---|
 | `SessionStart` (startup, resume, compact, clear) | Register the agent; inject the full snapshot, or nothing when the agent has no board and its repo has none. On Claude Code, the snapshot (cached too) or the `board_join` hint ends with the `ToolSearch` call (`select:mcp__board__…`, with `max_results` set to the tool count) that loads the seven tools a session calls first, `board_join` first in the hint, for when the tools show by name only, and says that any other loads the same way (`mcp__board__<tool>`); Codex and opencode, which load every schema themselves, get the context alone. A thread a parent's `delegate_task` started (its T3 thread id, not a nested session) gets one line after the snapshot (cached too) for a PR waiting on checks, unless its brief says otherwise: turn on auto-merge only where the base branch requires status checks or reviews, park the task in `review` with a note naming the PR, report and end, since T3 gives such a child no PR watch and forbids polling. Remove agents' hook state and cached snapshots (`state/<agent>.json`, `cache/<agent>.json`) not written for a week. In a T3 thread (not a nested session), one `t3 thread show` (0.2 to 0.7 seconds measured, at most 0.4 here) reads the thread's title, link and parent once per session; when T3 answers too slowly, the hook registers the agent without them and starts a background read (see the row below); the hook registers the title as the agent's `title` and the link as native id `t3_link` (only an `https://` link; a title becomes one line of at most 200 characters), and a thread started by a parent's `delegate_task` (id `thread:delegated-task:…`) its parent as native id `t3_parent` (`parentThreadId`). Once registered they are kept in the session's local cache, so a later `SessionStart` of the session (compaction) asks T3 nothing |
 | Background read of a T3 thread | When `t3 thread show` misses a hook's 0.4 seconds (at `SessionStart` or a `Stop` title check), the hook starts `board read-thread` on its own (its own process group, not waited for), so the hook takes no longer. It gives `t3 thread show` 30 seconds and leaves the answer, with the time it asked, in `$BOARD_HOME/state/thread-reads/<runtime>-<session>.json`; what goes wrong goes to `$BOARD_HOME/state/read-thread.log` (started over at 256 KiB). A later hook of the session registers a read that holds a title, link or parent other than the registered ones: `UserPromptSubmit`, a `PostToolUse` with a heartbeat due (so at most once a minute), or a `Stop` with no title check due. It registers after its own work, in what is left of its budget (at `Stop`, then marks the agent idle again). The read goes once the server took it or refused it as invalid; a read that tells nothing new, asked T3 before the registered facts were read, is over an hour old or is of another thread is dropped. A session starts a read at most every 45 seconds and logs its first at info level; while one may run, `SessionStart` and a due `Stop` check do not ask T3. Registering a read counts no title check. `SessionEnd` and the week-old pruning of session caches remove the read too |
-| `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped, except a T3 pull request update in Claude Code, which ends before the model runs (see "Pausing work") |
+| `UserPromptSubmit` | Inject the delta; nothing when nothing changed. While a paused board holds the agent, the delta starts with the `hold:` line, and the turn is not stopped, except recognized T3 notification turns in Claude Code and Antigravity, which end before the model runs (see "Pausing work") |
 | `PreToolUse` on `Bash` (both runtimes) | Mark when the call started and the work tree's `HEAD` (one `git rev-parse`, at most 0.3 seconds), in a local file, when logged in; no server call |
 | `PreToolUse` on a T3 launch (`mcp__<server>__delegate_task`, `t3_thread_launch`, `create_threads`; Claude Code) | The launch check of the device limit (see "Daemon dispatch", Device limit). The hook asks T3 for the running threads of the configured projects (at most 4.5 seconds; all projects at once, about 1.4 seconds measured for 15) and lets the call run while the running turns plus the threads asked for (each of `create_threads`' list, else one) stay within the limit. Past it, the hook first writes the whole call to `$BOARD_HOME/state/refused-launches/<hash>.json` (time, cause, device, limit, running threads, asking thread and session, tool and its full input; never pruned; the hash is of the session, the tool and the input), then adds one note to the task the agent has in `doing`, when it has one and the server answers within 2 seconds (cause, tool, title, asking thread and the file), and refuses the call (`permissionDecision: deny`) with the cause, the file, the note's id and what can work: do the work in the thread, ask for fewer threads, or wait for a slot with `board device wait --timeout <s>` and call again; a call for as many threads as the limit is told that it can never run. The same call refused again adds its time, cause and running threads to the `again` list of the same file, and no second note. A thread the call starts in another T3 environment (`environmentId`, of the call, its `target` or one thread of the list) runs on another device and is not counted; this device's environment is the one in the T3 link of the session's thread, and until the session knows that link no thread that names an environment is counted. The hook lets the call run when no limit applies, no thread of it starts on this device, T3 fails or does not answer in time, or the file cannot be written. A call that runs while T3 failed for a project or did not answer in time, and that the threads T3 did list leave room for, first gets a line in `$BOARD_HOME/state/unchecked-launches.jsonl` (time, cause, device, limit, listed threads, threads asked for, asking thread and session, tool, title; never pruned) and then one note on the task the agent has in `doing` that names the file, under the same 2 seconds and at most once an hour for a session; a call past the limit by the threads T3 did list is refused as above, and its cause says that the count was not whole. The hook has 8 seconds in all; `board install` gives it 10 |
 | `PostToolUse` on file edits (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`; Codex `apply_patch`) | Record touches; renew leases; warn on overlap with a live peer. The server reports every overlap on every call, and counts each in stats; the hook shows one path, peer and kind (lease or edit) at most once an hour, and after that only for a newer lease or edit than the one shown (remembered in the agent's local state for a day) |
