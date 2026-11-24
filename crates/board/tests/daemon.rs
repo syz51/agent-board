@@ -6390,27 +6390,27 @@ async fn workers_use_thread_model_while_judges_prefer_judge_model_and_fall_back(
     );
 }
 
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+struct BufWriter(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for BufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = BufWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        BufWriter(self.0.clone())
+    }
+}
+
 #[tokio::test]
 async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_active_model() {
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-    struct BufWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = BufWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            BufWriter(self.0.clone())
-        }
-    }
-
     let original_judge = ThreadModel {
         provider: "antigravity".into(),
         model: "gemini-4-neon".into(),
@@ -6468,25 +6468,6 @@ async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_activ
 
 #[tokio::test]
 async fn per_kind_judge_models_select_each_kind_and_warn_on_reload() {
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-    struct BufWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = BufWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            BufWriter(self.0.clone())
-        }
-    }
-
     let worker_model = ThreadModel {
         provider: "antigravity".into(),
         model: "gemini-4-neon".into(),
@@ -6513,7 +6494,7 @@ async fn per_kind_judge_models_select_each_kind_and_warn_on_reload() {
     let tasks = [proposal("factory-12", None, 0)];
     let mut e = env_with_models(
         &tasks,
-        Some(worker_model),
+        Some(worker_model.clone()),
         Some(fallback_judge.clone()),
         JudgeModels {
             verdict: Some(verdict_model.clone()),
@@ -6531,6 +6512,7 @@ async fn per_kind_judge_models_select_each_kind_and_warn_on_reload() {
         server: Some(e.stub.url.clone()),
         device: Some(DEVICE.parse().unwrap()),
         projects: projects(),
+        thread_model: Some(worker_model),
         judge_model: Some(fallback_judge.clone()),
         judge_models: JudgeModels {
             verdict: Some(goal_model.clone()),

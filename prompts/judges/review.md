@@ -4,7 +4,7 @@ You review {tasks}, now in `review`. You run in a worktree on the head of its pu
 request, or on its base branch when the pull request is already merged.
 
 1. `task_show` it with `detailed` (body, acceptance checks, notes, PR parking note).
-   Run `gh pr diff --stat`, then check `gh pr diff` only for acceptance scope,
+   Run `gh pr diff --name-only`, then check `gh pr diff` only for acceptance scope,
    invariants, and late edits—do not redo style/refactor diff review the worker ran.
 2. Run every acceptance check yourself. Do not take the worker's word for one. A check
    that can pass only after the merge, such as a deploy or install, is not a failure when
