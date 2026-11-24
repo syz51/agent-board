@@ -504,3 +504,165 @@ async fn a_relay_too_busy_to_accept_costs_no_hook_its_answer() {
     stop.send(()).unwrap();
     driver.join().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_passively_accounts_interactive_sessions_in_daemon_db_without_extra_roundtrips() {
+    use board::local_db::{LocalDb, LocalRunRecord, LocalRunState, ResourceOrigin};
+
+    let e = env();
+    e.stub
+        .on(
+            "POST /v1/agents",
+            agent_fixture(AGENT, DEVICE, AgentState::Running),
+        )
+        .on("GET /v1/runs", json!([]));
+    let relay = e.relay().await;
+    let http = http(relay.path());
+
+    // 1. SessionStart (`POST /v1/agents`) passively inserts an interactive entry into daemon.db
+    //    with zero extra upstream requests.
+    let text = e
+        .hook(
+            "session-start",
+            json!({
+                "session_id": SESSION,
+                "cwd": e.repo,
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }),
+            "",
+        )
+        .await;
+    assert!(text.contains("alerts: x"), "{text}");
+    let routes: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(
+        routes,
+        ["POST /v1/agents", "GET /v1/snapshot"],
+        "zero extra round-trips on SessionStart"
+    );
+
+    let db = LocalDb::open_path(&LocalDb::path_for(&e.home())).unwrap();
+    let entries = db.list_resources().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].entry_id, format!("interactive:{AGENT}"));
+    assert_eq!(entries[0].origin, ResourceOrigin::Interactive);
+    assert_eq!(entries[0].agent_id.as_deref(), Some(AGENT));
+    assert_eq!(entries[0].cost_units, 2);
+    assert_eq!(db.active_units().unwrap(), 2);
+
+    // 2. Stop (`idle`) immediately removes the interactive entry so autopilot capacity is freed.
+    e.stub.clear();
+    let _ = e
+        .hook(
+            "stop",
+            json!({
+                "session_id": SESSION,
+                "cwd": e.repo,
+                "hook_event_name": "Stop",
+            }),
+            "",
+        )
+        .await;
+    assert_eq!(
+        e.stub.requests().len(),
+        1,
+        "Stop sends only POST /v1/agents/{{id}}/state"
+    );
+    assert!(
+        db.list_resources().unwrap().is_empty(),
+        "idle session must release local resource_ledger weight"
+    );
+    assert_eq!(db.active_units().unwrap(), 0);
+
+    // 3. UserPromptSubmit (`running`) re-adds the interactive entry; SessionEnd (`ended`) removes it.
+    let _ = e.hook("user-prompt-submit", e.prompt(), "").await;
+    assert_eq!(db.active_units().unwrap(), 2);
+
+    let _ = e
+        .hook(
+            "session-end",
+            json!({
+                "session_id": SESSION,
+                "cwd": e.repo,
+                "hook_event_name": "SessionEnd",
+            }),
+            "",
+        )
+        .await;
+    assert!(db.list_resources().unwrap().is_empty());
+
+    // 4. An agent already tracked as a managed run in `local_runs` must NOT be double-counted
+    //    as an interactive entry in `resource_ledger`.
+    let managed_thread = "thread-managed-99";
+    let managed_agent = format!("t3:{managed_thread}");
+    let now = chrono::Utc::now();
+    db.upsert_local_run(&LocalRunRecord {
+        run_id: "run-managed-99".to_owned(),
+        task_id: Some("factory-1".parse().unwrap()),
+        board: "factory".parse().unwrap(),
+        kind: "worker".to_owned(),
+        runner: "t3".to_owned(),
+        session_id: Some(managed_thread.to_owned()),
+        worktree_path: None,
+        branch: Some("task/factory-1".to_owned()),
+        cost_units: 2,
+        pid: None,
+        state: LocalRunState::Running,
+        lease_expires_at: None,
+        created_at: now,
+        updated_at: now,
+        meta_json: None,
+    })
+    .unwrap();
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(&managed_agent)),
+        agent_fixture(&managed_agent, DEVICE, AgentState::Running),
+    );
+    let resp = http
+        .post(url("/v1/agents"))
+        .header("x-board-agent", &managed_agent)
+        .json(&json!({
+            "id": managed_agent,
+            "runtime": "claude",
+            "device": DEVICE,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let resp = http
+        .post(url(&format!("/v1/agents/{}/state", enc(&managed_agent))))
+        .header("x-board-agent", &managed_agent)
+        .json(&json!({ "state": "running" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert!(
+        db.list_resources().unwrap().is_empty(),
+        "managed local_runs agent must not be added as an interactive resource_ledger entry"
+    );
+
+    // 5. GET /v1/runs is allowed through hook.sock, while POST /v1/runs is refused.
+    let ok = http
+        .get(url("/v1/runs?origin=interactive"))
+        .header("x-board-agent", AGENT)
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "{}", ok.status());
+    let denied = http
+        .post(url("/v1/runs"))
+        .header("x-board-agent", AGENT)
+        .json(&json!({ "kind": "interactive", "device": DEVICE, "runner": "t3" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.headers()[relay::RELAY_HEADER], "refused");
+}

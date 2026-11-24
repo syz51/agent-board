@@ -1152,6 +1152,14 @@ pub(crate) fn resolve(
         takes_reports = (&live != id).then_some(live);
     }
     crate::ops::leases::release_for_task(cx, id, &task.board, &by)?;
+    if let Some(ref resolver) = agent {
+        crate::ops::runs::sync_agent_doing_task(cx, resolver)?;
+    }
+    if let Some(ref prev_owner) = task.owner
+        && task.owner.as_ref() != agent.as_ref()
+    {
+        crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+    }
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",
         [id.as_str()],

@@ -188,17 +188,32 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
     let Value::Object(mut map) = input else {
         return input;
     };
+    let is_blank = |v: &Value| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty());
     for (src, dst) in [
         ("conversationId", "session_id"),
         ("transcriptPath", "transcript_path"),
         ("continuationActive", "stop_hook_active"),
         ("lastUserInput", "prompt"),
+        ("conversationTitle", "title"),
+        ("sessionTitle", "title"),
+        ("workingDirectory", "cwd"),
+        ("workspacePath", "cwd"),
     ] {
-        if !map.contains_key(dst)
-            && let Some(val) = map.get(src).cloned()
-        {
+        let missing = map.get(dst).is_none_or(is_blank);
+        if missing && let Some(val) = map.get(src).filter(|v| !is_blank(v)).cloned() {
             map.insert(dst.to_owned(), val);
         }
+    }
+    if map
+        .get("cwd")
+        .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()))
+        && let Some(first) = map
+            .get("workspacePaths")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find_map(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+    {
+        map.insert("cwd".to_owned(), Value::String(first.to_owned()));
     }
     if let Some(Value::Object(tool_call)) = map.get("toolCall").cloned() {
         if let Some(id) = tool_call.get("id").cloned() {
@@ -1158,13 +1173,48 @@ async fn nested_session(
     Ok(nested)
 }
 
-/// The directory a hook's tool call runs in: the payload's `cwd`, else this process's.
+/// The directory a hook's tool call runs in: the payload's non-empty `cwd`, else this
+/// process's working directory.
 fn input_cwd(input: &Value) -> PathBuf {
     input["cwd"]
         .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default()
+}
+
+/// Optional session title for standalone / non-T3 launchers: read without subprocesses from
+/// the hook payload (`title`, `session_title`, `conversation_title`) or
+/// `BOARD_SESSION_TITLE`, skipping blank values and sanitizing to a single line within
+/// `AGENT_TITLE_CHARS_MAX`.
+fn session_title(input: &Value) -> Option<String> {
+    let clean = |raw: &str| -> Option<String> {
+        let cleaned: String = raw
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            return None;
+        }
+        Some(
+            collapsed
+                .chars()
+                .take(board_proto::AGENT_TITLE_CHARS_MAX)
+                .collect(),
+        )
+    };
+    ["title", "session_title", "conversation_title"]
+        .iter()
+        .find_map(|key| input[key].as_str().and_then(clean))
+        .or_else(|| {
+            std::env::var("BOARD_SESSION_TITLE")
+                .ok()
+                .as_deref()
+                .and_then(clean)
+        })
 }
 
 /// This agent's T3 thread, as the hooks register it.
@@ -1774,16 +1824,20 @@ impl Hook<'_> {
         if let Some(link) = facts.and_then(|f| f.link.clone()) {
             native.insert("t3_link".to_owned(), link);
         }
+        let title = facts
+            .and_then(|f| f.title.clone())
+            .or_else(|| session_title(self.input));
+        let cwd = (!repo.cwd.as_os_str().is_empty()).then(|| repo.cwd.display().to_string());
         self.client
             .register(&board_proto::RegisterAgent {
                 id: self.agent.clone(),
                 runtime: self.runtime,
                 device: self.device.clone(),
                 role: board_proto::AgentRole::Worker,
-                title: facts.and_then(|f| f.title.clone()),
+                title,
                 repo: repo.key.clone(),
                 branch: repo.branch.clone(),
-                cwd: Some(repo.cwd.display().to_string()),
+                cwd,
                 native_ids: native,
                 forked_from: None,
             })

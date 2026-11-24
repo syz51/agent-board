@@ -1871,6 +1871,12 @@ fn grant_candidate(
                     "retry POST /v1/dispatch/claim",
                 ));
             }
+            if !clear_agent
+                && let Some(ref agent_raw) = existing_agent
+                && let Ok(agent_id) = agent_raw.parse::<AgentId>()
+            {
+                crate::ops::runs::absorb_auto_interactive_runs(cx, existing_id, &agent_id)?;
+            }
             (existing_id.clone(), EventType::RunUpdated, clear_agent)
         } else {
             let id = new_run_id(cx)?;
