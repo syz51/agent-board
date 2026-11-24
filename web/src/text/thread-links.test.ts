@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import type { Agent } from "@/api/schema.ts";
 import { threadBases, threadUrl } from "./thread-links.ts";
 

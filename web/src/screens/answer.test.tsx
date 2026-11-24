@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
 import { renderInApp } from "../../test/render.tsx";
@@ -40,7 +40,9 @@ describe("answer form", () => {
   test("sends the chosen option to the ask's answer endpoint", async () => {
     const requests: { url: string; body: unknown }[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const raw = typeof init?.body === "string" ? init.body : "";
+      requests.push({ url, body: JSON.parse(raw) });
       return Response.json(state.ask(withOptions.id));
     }) as typeof fetch;
     await renderInApp(<AnswerForm ask={withOptions} />);
@@ -50,14 +52,15 @@ describe("answer form", () => {
     );
     await act(() => fireEvent.click(screen.getByRole("button", { name: "Send answer" })));
     await waitFor(() => expect(requests.length).toBe(1));
-    expect(requests[0]!.url).toEndWith(`/v1/asks/${withOptions.id}/answer`);
+    expect(requests[0]!.url.endsWith(`/v1/asks/${withOptions.id}/answer`)).toBe(true);
     expect(requests[0]!.body).toEqual({ answer: option });
   });
 
   test("Cmd or Ctrl with Enter in the field sends the text; Enter alone does not", async () => {
     const requests: unknown[] = [];
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push(JSON.parse(String(init?.body)));
+      const raw = typeof init?.body === "string" ? init.body : "";
+      requests.push(JSON.parse(raw));
       return Response.json(state.ask(withOptions.id));
     }) as typeof fetch;
     await renderInApp(<AnswerForm ask={withOptions} />);

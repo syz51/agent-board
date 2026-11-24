@@ -229,7 +229,11 @@ export function detail(event: BoardEvent): string {
 /** A one-line text view of an event's payload; values written by agents stay text. */
 export function summarize(payload: unknown): string {
   if (payload === null || payload === undefined) return "";
-  if (typeof payload !== "object") return String(payload);
+  if (typeof payload === "string") return payload;
+  if (typeof payload === "number" || typeof payload === "boolean" || typeof payload === "bigint") {
+    return String(payload);
+  }
+  if (typeof payload !== "object") return "";
   if (Array.isArray(payload)) return payload.map(summarize).join(", ");
   const record = payload as Record<string, unknown>;
   if (typeof record.from === "string" && typeof record.to === "string") {

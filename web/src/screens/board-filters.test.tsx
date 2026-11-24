@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
@@ -23,7 +23,9 @@ afterEach(() => {
 /** Board tasks come from the fixtures, or fail when `down`; the shell's data is seeded. */
 function serve(down = false) {
   globalThis.fetch = (async (input: RequestInfo | URL) => {
-    const url = new URL(String(input), "http://localhost");
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = new URL(rawUrl, "http://localhost");
     if (down) {
       return Response.json(
         { code: "unavailable", message: "The board server is down.", next: "Try again." },
@@ -101,7 +103,7 @@ describe("a board's filter bar", () => {
     unmount();
     await outage();
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(title);
-    expect(document.title).toStartWith(title);
+    expect(document.title.startsWith(title)).toBe(true);
   });
 
   test("stays while filters are set, so they can be cleared", async () => {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { act, fireEvent, screen } from "@testing-library/react";
 import { useState } from "react";
 import { renderInApp } from "../../test/render.tsx";

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { Agent } from "../api/schema.ts";
 import { DevState } from "../../dev/state.ts";

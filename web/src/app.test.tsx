@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { screen } from "@testing-library/react";
 import { renderInApp } from "../test/render.tsx";
@@ -32,7 +32,7 @@ describe("navigation", () => {
     await renderInApp(<Nav />, { path, seed });
     const links = marked("page");
     expect(links.length).toBe(1);
-    expect(links[0]).toStartWith(label);
+    expect(links[0]?.startsWith(label)).toBe(true);
     expect(marked("true")).toEqual([]);
   });
 
@@ -43,7 +43,7 @@ describe("navigation", () => {
       expect(marked("page")).toEqual([]);
       const holders = marked("true");
       expect(holders.length).toBe(1);
-      expect(holders[0]).toStartWith("Home");
+      expect(holders[0]?.startsWith("Home")).toBe(true);
     },
   );
 

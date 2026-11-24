@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { Glob } from "bun";
+import { readdir, readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, test } from "vite-plus/test";
 import { HOSTILE_BODY, HOSTILE_TITLE } from "../../dev/fixtures.ts";
 import { Markdown, PlainText, safeHref } from "./markdown.tsx";
 import { ThreadBasesContext } from "./thread-links.ts";
@@ -220,14 +221,14 @@ describe("safeHref", () => {
 
 describe("source", () => {
   test("never injects HTML strings", async () => {
+    const srcDir = resolve(import.meta.dirname, "..");
+    const entries = await readdir(srcDir, { recursive: true });
     const offenders: string[] = [];
-    for await (const file of new Glob("src/**/*.{ts,tsx}").scan({
-      cwd: `${import.meta.dir}/../..`,
-    })) {
-      if (file.endsWith(".test.tsx")) continue;
-      const text = await Bun.file(`${import.meta.dir}/../../${file}`).text();
+    for (const entry of entries) {
+      if (!/\.(?:ts|tsx)$/.test(entry) || entry.endsWith(".test.tsx")) continue;
+      const text = await readFile(join(srcDir, entry), "utf8");
       if (/dangerouslySetInnerHTML|\.innerHTML\s*=|insertAdjacentHTML|document\.write/.test(text))
-        offenders.push(file);
+        offenders.push(`src/${entry}`);
     }
     expect(offenders).toEqual([]);
   });

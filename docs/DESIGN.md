@@ -627,7 +627,7 @@ Threads start in the board's project: the device's `[projects]` folder for the t
 repo; a board none of whose repos is mapped there, such as a feedback board with no repo,
 uses the folder `[board_projects]` names for its slug. Each reconcile first re-reads
 `config.toml` when its text changed: new `[projects]`, `[board_projects]` and
-`feedback_board` apply at once, and so does a new `runs_at_once`; `server`, `device`, `t3_bin`, `[thread_model]` and `[judge_model]` stay as
+`feedback_board` apply at once, and so does a new `runs_at_once`; `server`, `device`, `t3_bin`, `[thread_model]`, `[judge_model]` and `[judge_models]` stay as
 started, with a warning to restart; a file gone or invalid keeps the settings in use,
 warned once per edit.
 
@@ -636,7 +636,9 @@ the daemon starts each worker thread on that T3 provider instance, model, and re
 `--option <key>=<value>` flags (`t3 thread start --provider --model [--option ...]`);
 without it, on the project's defaults. With `[judge_model]` (`provider`, `model`, and
 optional `options`), judge threads (review, verdict, triage, goal) use that selection
-instead, falling back to `[thread_model]` and then the project's defaults when unset. T3
+instead, and optional per-kind `[judge_models.<kind>]` tables (`review`, `verdict`,
+`triage`, `goal`) override `[judge_model]` for that kind; unset kinds fall back to
+`[judge_model]`, then `[thread_model]`, then the project's defaults. T3
 gives a thread nothing else of its own to set, so the instance carries what agent threads
 need apart from the user's chats, such as environment variables.
 
@@ -1161,8 +1163,13 @@ Built, with these rules:
 - **Merge**: `gh pr merge` with a merge commit where the repository allows one, else
   squashed, else rebased, with `--match-head-commit` set to the head whose checks were
   read. Nothing is merged while the task's worker still runs, since it may still push. The dispatcher merges only when GitHub reports the pull request
-  as clean and every check as passed. While checks run, or GitHub holds the merge for
-  another reason, it reads again 2 minutes later.
+  as clean and every check as passed. When every failed check is a failed GitHub Actions
+  job, one GraphQL read checks whether GitHub never started those jobs for billing (zero
+  steps and only `.github` annotations with a single billing-refusal `FAILURE` and
+  optional `NOTICE`s); such a job passes when an unambiguous non-Actions check named
+  `<context>: <job>` passed on the same head commit, and waits while one is pending.
+  While checks run, or GitHub holds the merge for another reason, it reads again 2
+  minutes later.
 - **Failed checks**: the dispatcher adds one `finding` note per head commit and waits. It
   does not set the task `open`: a check may be run again.
 - **Conflict or closed PR**: the dispatcher adds a `decision` note starting

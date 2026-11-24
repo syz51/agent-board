@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use board_proto::{BoardSlug, DeviceName};
+use board_proto::{BoardSlug, DeviceName, JudgeKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -116,6 +116,53 @@ pub struct Config {
     /// The T3 provider instance and model for judge threads `board watch` starts; without
     /// it they use `[thread_model]`, else the project's defaults.
     pub judge_model: Option<ThreadModel>,
+    /// Optional per-kind judge overrides (`[judge_models.review]`, `verdict`, `triage`,
+    /// `goal`); each unset kind falls back to `[judge_model]`, then `[thread_model]`,
+    /// then the project's defaults.
+    #[serde(default, skip_serializing_if = "JudgeModels::is_empty")]
+    pub judge_models: JudgeModels,
+}
+
+/// Optional per-kind judge model overrides in `config.toml` (`[judge_models.<kind>]`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeModels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ThreadModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<ThreadModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<ThreadModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<ThreadModel>,
+}
+
+impl JudgeModels {
+    pub fn is_empty(&self) -> bool {
+        self.review.is_none()
+            && self.verdict.is_none()
+            && self.triage.is_none()
+            && self.goal.is_none()
+    }
+
+    pub fn for_kind(&self, kind: JudgeKind) -> Option<&ThreadModel> {
+        match kind {
+            JudgeKind::Review => self.review.as_ref(),
+            JudgeKind::Verdict => self.verdict.as_ref(),
+            JudgeKind::Triage => self.triage.as_ref(),
+            JudgeKind::Goal => self.goal.as_ref(),
+        }
+    }
+
+    /// Any configured judge override, used as a fallback for usage-provider discovery
+    /// when neither `[thread_model]` nor `[judge_model]` is set.
+    pub fn first(&self) -> Option<&ThreadModel> {
+        self.review
+            .as_ref()
+            .or(self.verdict.as_ref())
+            .or(self.triage.as_ref())
+            .or(self.goal.as_ref())
+    }
 }
 
 /// A T3 provider instance and a model of it: `t3 thread start` takes them only together.
@@ -208,6 +255,25 @@ impl Config {
             (Some(server), Some(device)) => Ok((server, device)),
             _ => bail!("not logged in: run `board login --server <url> --device <name>`"),
         }
+    }
+
+    /// Model selection for a judge of `kind`: `[judge_models.<kind>]`, else
+    /// `[judge_model]`, else `[thread_model]`, else `None` (project defaults).
+    pub fn model_for_judge(&self, kind: JudgeKind) -> Option<&ThreadModel> {
+        self.judge_models
+            .for_kind(kind)
+            .or(self.judge_model.as_ref())
+            .or(self.thread_model.as_ref())
+    }
+
+    /// Provider instance used to locate usage readings: `[thread_model]`, else
+    /// `[judge_model]`, else the first configured `[judge_models.<kind>]`.
+    pub fn usage_provider(&self) -> Option<&str> {
+        self.thread_model
+            .as_ref()
+            .or(self.judge_model.as_ref())
+            .or_else(|| self.judge_models.first())
+            .map(|m| m.provider.as_str())
     }
 }
 
@@ -604,6 +670,84 @@ options = { thought_level = "medium", verbosity = "low" }
                 "case {case:?} -> {err} (expected {expected:?})"
             );
         }
+    }
+
+    #[test]
+    fn per_kind_judge_models_override_fallback_validate_and_round_trip() {
+        let toml = r#"
+[thread_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+
+[judge_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "medium" }
+
+[judge_models.review]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+
+[judge_models.triage]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "low" }
+
+[judge_models.goal]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let high = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [("thought_level".into(), "high".into())].into(),
+        };
+        let medium = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [("thought_level".into(), "medium".into())].into(),
+        };
+        let low = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [("thought_level".into(), "low".into())].into(),
+        };
+        assert_eq!(config.model_for_judge(JudgeKind::Review), Some(&high));
+        assert_eq!(config.model_for_judge(JudgeKind::Goal), Some(&high));
+        assert_eq!(config.model_for_judge(JudgeKind::Triage), Some(&low));
+        // Unset [judge_models.verdict] falls back to [judge_model].
+        assert_eq!(config.model_for_judge(JudgeKind::Verdict), Some(&medium));
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+
+        // Empty judge_models is omitted on serialization.
+        let empty = Config::default();
+        assert!(empty.judge_models.is_empty());
+        assert!(
+            !toml::to_string_pretty(&empty)
+                .unwrap()
+                .contains("judge_models")
+        );
+        assert_eq!(empty.model_for_judge(JudgeKind::Review), None);
+        assert_eq!(empty.usage_provider(), None);
+
+        // usage_provider falls back to judge_models when thread_model and judge_model are unset.
+        let only_triage: Config = toml::from_str(
+            "[judge_models.triage]\nprovider = \"antigravity\"\nmodel = \"gemini-4-neon\"\n",
+        )
+        .unwrap();
+        assert_eq!(only_triage.usage_provider(), Some("antigravity"));
+        assert_eq!(only_triage.model_for_judge(JudgeKind::Review), None);
+
+        // Unknown judge kind key is rejected.
+        let err =
+            toml::from_str::<Config>("[judge_models.reviews]\nprovider = \"p\"\nmodel = \"m\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

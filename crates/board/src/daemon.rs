@@ -1330,8 +1330,8 @@ impl<T: T3> Daemon<T> {
     /// Applies an edited `config.toml`: its `[projects]`, `[board_projects]` and
     /// `feedback_board` take effect at once, and boards whose start failed are tried again,
     /// since a missing project may be what failed. `runs_at_once` takes effect at once
-    /// too. `server`, `device`, `t3_bin`, `[thread_model]` and
-    /// `[judge_model]` are fixed while the daemon runs, so changing them asks for a
+    /// too. `server`, `device`, `t3_bin`, `[thread_model]`, `[judge_model]` and
+    /// `[judge_models]` are fixed while the daemon runs, so changing them asks for a
     /// restart. A file gone or
     /// unreadable keeps the settings in use, with one warning per edit.
     fn reload_config(&mut self) {
@@ -1370,15 +1370,17 @@ impl<T: T3> Daemon<T> {
             &new.t3_bin,
             &new.thread_model,
             &new.judge_model,
+            &new.judge_models,
         ) != (
             &current.server,
             &current.device,
             &current.t3_bin,
             &current.thread_model,
             &current.judge_model,
+            &current.judge_models,
         ) {
             tracing::warn!(
-                "{} changes server, device, t3_bin, thread_model or judge_model: restart board watch to apply them",
+                "{} changes server, device, t3_bin, thread_model, judge_model or judge_models: restart board watch to apply them",
                 path.display()
             );
         }
@@ -3982,13 +3984,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let usage_source = UsageSource::for_provider(
-        ctx.config
-            .thread_model
-            .as_ref()
-            .or(ctx.config.judge_model.as_ref())
-            .map(|m| m.provider.as_str()),
-    );
+    let usage_source = UsageSource::for_provider(ctx.config.usage_provider());
     let host_memory = device::host_memory();
     if host_memory.is_none() {
         tracing::warn!(

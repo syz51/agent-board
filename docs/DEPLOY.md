@@ -137,7 +137,7 @@ starts worker and judge threads in a T3 project on that device. `board watch` fi
 `[board_projects]` maps a board slug to a folder for a board without a mapped repo.
 A running `board watch` re-reads the file within a minute of an edit and applies these two
 tables, `feedback_board`, `runs_at_once` and `reserve_runs` without a restart; a change to `server`,
-`device`, `t3_bin`, `[thread_model]` or `[judge_model]` needs one, and the daemon's log says so.
+`device`, `t3_bin`, `[thread_model]`, `[judge_model]` or `[judge_models]` needs one, and the daemon's log says so.
 
 `runs_at_once` is how many agent turns the device runs at once. Without the setting it is
 one per 4 GiB of host memory, at least 2. `reserve_runs` (alias `reserve`, default `1`) is
@@ -211,9 +211,16 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
    provider = "claude-agents"
    model = "<model slug>"
    options = { effort = "medium" }
+
+   # optional: per-kind judge overrides (`review`, `verdict`, `triage`, `goal`);
+   # each unset kind falls back to [judge_model], then [thread_model], then project defaults
+   [judge_models.review]
+   provider = "claude-agents"
+   model = "<model slug>"
+   options = { effort = "high" }
    ```
 
-Both `provider` and `model` are required on `[thread_model]` and `[judge_model]`: T3 Code takes a provider only with a model, so these threads use this model and not the project's default. Optional `options` entries (inline table or `[thread_model.options]` / `[judge_model.options]`) are validated at load time (non-empty keys without `=`, non-empty values) and passed in key order as `--option <key>=<value>`. Threads started before the change keep their provider; each thread the daemon starts from then on uses this instance. T3 Code keeps each instance's usage readings in its own file, and the daemon reads the `[thread_model]` instance's file (or `[judge_model]` when `[thread_model]` is unset) next to the default instance's.
+Both `provider` and `model` are required on `[thread_model]`, `[judge_model]`, and each `[judge_models.<kind>]`: T3 Code takes a provider only with a model, so these threads use this model and not the project's default. Optional `options` entries (inline table or `<table_name>.options`) are validated at load time (non-empty keys without `=`, non-empty values) and passed in key order as `--option <key>=<value>`. Threads started before the change keep their provider; each thread the daemon starts from then on uses this instance. T3 Code keeps each instance's usage readings in its own file, and the daemon reads the `[thread_model]` instance's file (else `[judge_model]`, else the first `[judge_models.<kind>]`) next to the default instance's.
 
 The feedback board (`board-feedback` unless `feedback_board` says otherwise) has no repo,
 and a triage judge handles its items: it resolves each feedback item as a duplicate, routes it to a

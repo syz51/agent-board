@@ -13,7 +13,8 @@
 import { watch } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { buildApp, NONCE_PLACEHOLDER } from "../build.ts";
+import { build } from "vite-plus";
+import { NONCE_PLACEHOLDER } from "../vite.config.ts";
 import { DevApiError, DevState } from "./state.ts";
 
 const { values: args } = parseArgs({
@@ -110,7 +111,18 @@ const distDir = args.dist ? join(root, "dist") : join(root, "node_modules", ".ca
 async function rebuild(): Promise<void> {
   const started = performance.now();
   try {
-    await buildApp({ outdir: distDir, production: false });
+    await build({
+      root,
+      configFile: join(root, "vite.config.ts"),
+      mode: "development",
+      logLevel: "warn",
+      build: {
+        outDir: distDir,
+        emptyOutDir: true,
+        minify: false,
+        sourcemap: true,
+      },
+    });
     console.log(`built in ${Math.round(performance.now() - started)} ms`);
   } catch (error) {
     if (error instanceof AggregateError) for (const log of error.errors) console.error(log);

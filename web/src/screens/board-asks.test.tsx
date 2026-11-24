@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor, within } from "@testing-library/react";
 import type { Ask } from "../api/schema.ts";
@@ -21,7 +21,9 @@ afterEach(() => {
 /** Board tasks from the fixtures; the shell's data, with `asks` as the open asks, is seeded. */
 function show(asks: Ask[]) {
   globalThis.fetch = (async (input: RequestInfo | URL) => {
-    const url = new URL(String(input), "http://localhost");
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = new URL(rawUrl, "http://localhost");
     return Response.json(state.tasks(url.searchParams));
   }) as typeof fetch;
   return (client: QueryClient) => {
