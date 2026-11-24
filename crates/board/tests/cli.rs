@@ -2830,7 +2830,8 @@ fn usage_reads_configured_quota_bucket_and_falls_back() {
     assert_eq!(bucket_puts[0].body, json!({ "reserve": 12.5 }));
 
     // Fallback: when the configured bucket has no reading yet in `/v1/usage/buckets`, fall
-    // back to legacy `GET /v1/usage`.
+    // back to legacy `GET /v1/usage` on a plain read, but never mix the legacy reading/pace
+    // into `board usage --reserve` for the configured non-legacy bucket.
     e.stub.on(
         "GET /v1/usage/buckets",
         json!([
@@ -2850,6 +2851,47 @@ fn usage_reads_configured_quota_bucket_and_falls_back() {
         stdout(&out).contains("by old-mac"),
         "expected fallback to legacy GET /v1/usage when configured bucket is absent:\n{}",
         stdout(&out)
+    );
+
+    // Updating reserve on an unread non-legacy bucket must report that reserve without
+    // showing the stale legacy `anthropic/default` reading.
+    e.stub.on(
+        "PUT /v1/usage/antigravity/default/reserve",
+        json!({
+            "provider": "antigravity",
+            "account": "default",
+            "reserve": 15.0,
+        }),
+    );
+    e.stub.on(
+        "GET /v1/usage/buckets",
+        json!([
+            {
+                "provider": "anthropic",
+                "account": "default",
+                "five_hour": { "percent": 95.0 },
+                "seven_day": { "percent": 95.0, "resets_at": resets },
+                "read_at": stale_read,
+                "device": "old-mac",
+                "reserve": 5.5,
+            },
+            {
+                "provider": "antigravity",
+                "account": "default",
+                "reserve": 15.0,
+            }
+        ]),
+    );
+    let out = e.run(&["usage", "--reserve", "15.0"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("no usage reading yet") && text.contains("reserve 15.0% set"),
+        "expected unread non-legacy bucket reserve message:\n{text}"
+    );
+    assert!(
+        !text.contains("old-mac") && !text.contains("95%"),
+        "must not mix legacy anthropic reading into antigravity --reserve output:\n{text}"
     );
 }
 

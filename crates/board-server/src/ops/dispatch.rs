@@ -1612,6 +1612,11 @@ fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option
     })
 }
 
+/// Worker review-backlog cap for a board (`max(3, parallel_tasks * 2)`).
+pub(crate) fn review_backlog_limit(parallel_tasks: u32) -> usize {
+    (parallel_tasks.max(1) as usize * 2).max(3)
+}
+
 struct LatestMergeRun {
     id: String,
     state: RunState,
@@ -1635,7 +1640,7 @@ fn load_latest_terminal_merge_runs(
          WHERE r.task_id IN (SELECT value FROM json_each(?1)) \
            AND r.kind = 'merge' \
            AND r.state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
-         ORDER BY r.task_id, r.created_at DESC, COALESCE(r.ended_at, r.updated_at) DESC, r.id DESC",
+         ORDER BY r.task_id, r.created_at DESC, COALESCE(r.ended_at, r.updated_at) DESC, r.rowid DESC",
     )?;
     let mut out = HashMap::new();
     let mut rows = stmt.query([&json_ids])?;
@@ -1839,7 +1844,7 @@ fn admit_candidate(
             .get(&board.slug)
             .copied()
             .unwrap_or(0);
-        let review_backlog_limit = (board.parallel_tasks.max(1) as usize * 2).max(3);
+        let review_backlog_limit = review_backlog_limit(board.parallel_tasks);
         if review_count >= review_backlog_limit {
             return Err((
                 DispatchHoldReason::Capacity,

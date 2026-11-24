@@ -1477,6 +1477,7 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
         && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
 
     let mut set_reserve: Option<Option<f64>> = None;
+    let mut updated_non_legacy_bucket = false;
     if let Some(reserve) = reserve {
         if is_legacy_bucket {
             let res = ctx
@@ -1493,6 +1494,7 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
             {
                 Ok(bucket) => {
                     set_reserve = Some(bucket.reserve);
+                    updated_non_legacy_bucket = true;
                 }
                 Err(err) if is_endpoint_unsupported(&err) => {
                     let res = ctx
@@ -1507,6 +1509,7 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
     }
 
     let mut matched_bucket = false;
+    let mut used_fallback = false;
     let mut bucket_reserve: Option<f64> = None;
     let usage = match ctx.client.list_usage_buckets().await {
         Ok(buckets) => {
@@ -1518,14 +1521,23 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
                 bucket_reserve = bucket.reserve;
                 match bucket.as_usage() {
                     Some(u) => Some(u),
-                    None if is_legacy_bucket => None,
-                    None => ctx.client.usage().await?,
+                    None if is_legacy_bucket || updated_non_legacy_bucket => None,
+                    None => {
+                        used_fallback = true;
+                        ctx.client.usage().await?
+                    }
                 }
+            } else if updated_non_legacy_bucket {
+                None
             } else {
+                used_fallback = true;
                 ctx.client.usage().await?
             }
         }
-        Err(err) if is_endpoint_unsupported(&err) => ctx.client.usage().await?,
+        Err(err) if is_endpoint_unsupported(&err) => {
+            used_fallback = true;
+            ctx.client.usage().await?
+        }
         Err(err) => return Err(err),
     };
 
@@ -1534,11 +1546,12 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
         None => Vec::new(),
     };
     // A reading without a pace may still have a reserve, waiting for a weekly reset time.
+    // Never pair a configured non-legacy bucket's reserve with a fallback legacy reading.
     let reserve = match (set_reserve, usage.as_ref().and_then(|u| u.pace)) {
         (Some(set), _) => set,
         (None, Some(p)) => Some(p.reserve),
-        (None, None) if bucket_reserve.is_some() => bucket_reserve,
-        (None, None) if matched_bucket => None,
+        (None, None) if !used_fallback && bucket_reserve.is_some() => bucket_reserve,
+        (None, None) if !used_fallback && matched_bucket => None,
         (None, None) => match ctx.client.usage_reserve().await {
             Ok(r) => r.reserve,
             Err(err) => {

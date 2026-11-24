@@ -2499,7 +2499,8 @@ impl<T: T3 + 'static> Daemon<T> {
         self.sync_resource_ledger(now);
 
         let mut deferred_merge = self.merge_backoffs.has_active_wait(now);
-        let mut merge_deferred_this_tick: BTreeSet<TaskId> = BTreeSet::new();
+        let mut merge_deferred_this_tick: BTreeMap<TaskId, Option<(Timestamp, i64)>> =
+            BTreeMap::new();
         let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
@@ -2756,7 +2757,7 @@ impl<T: T3 + 'static> Daemon<T> {
         &mut self,
         claimed: ClaimedRun,
         now: Timestamp,
-        merge_deferred_this_tick: &mut BTreeSet<TaskId>,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = claimed.run.id.clone();
         let run_id_str = run_id.as_str().to_owned();
@@ -2849,7 +2850,7 @@ impl<T: T3 + 'static> Daemon<T> {
         claimed: &ClaimedRun,
         local_run: &mut LocalRunRecord,
         now: Timestamp,
-        merge_deferred_this_tick: &mut BTreeSet<TaskId>,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = &claimed.run.id;
         let Some(task_id) = claimed.task_id.as_ref() else {
@@ -2861,32 +2862,45 @@ impl<T: T3 + 'static> Daemon<T> {
             };
         };
         // Older servers without server-side per-task merge cooldown re-offer the exact same
-        // task immediately inside the same reconcile tick; cancel cleanly and engage scoped
-        // per-task fallback backoff rather than spinning or blocking other merges on new servers.
-        if merge_deferred_this_tick.contains(task_id) {
-            let update = UpdateRun {
-                state: Some(RunState::Cancelled),
-                reason: Some(
-                    "skipped duplicate merge claim within same tick (older server)".to_owned(),
-                ),
-                ..UpdateRun::default()
+        // task immediately inside the same reconcile tick with no intervening note/update.
+        // If the task DID change mid-tick (new note or update), a new server legitimately
+        // cleared cooldown and we execute it rather than cancelling or engaging backoff.
+        if let Some(prev_stamp) = merge_deferred_this_tick.get(task_id).copied() {
+            let current_stamp = self.client().task(task_id).await.ok().map(|d| {
+                (
+                    d.task.updated_at,
+                    d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                )
+            });
+            let unchanged = match (prev_stamp, current_stamp) {
+                (Some(prev), Some(curr)) => prev == curr,
+                _ => true,
             };
-            if let Err(err) = self.client().update_run(run_id, &update).await {
-                tracing::warn!("cancelling duplicate merge run {run_id}: {err:#}");
+            if unchanged {
+                let update = UpdateRun {
+                    state: Some(RunState::Cancelled),
+                    reason: Some(
+                        "skipped duplicate merge claim within same tick (older server)".to_owned(),
+                    ),
+                    ..UpdateRun::default()
+                };
+                if let Err(err) = self.client().update_run(run_id, &update).await {
+                    tracing::warn!("cancelling duplicate merge run {run_id}: {err:#}");
+                }
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Cancelled,
+                    None,
+                    now,
+                );
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                self.merge_backoffs
+                    .record(task_id.clone(), now + PR_READ_EVERY, now);
+                return ClaimedExecution {
+                    deferred_merge: true,
+                    ..ClaimedExecution::default()
+                };
             }
-            let _ = self.db.update_local_run_state(
-                run_id.as_str(),
-                LocalRunState::Cancelled,
-                None,
-                now,
-            );
-            let _ = self.db.remove_resource(&format!("run:{run_id}"));
-            self.merge_backoffs
-                .record(task_id.clone(), now + PR_READ_EVERY, now);
-            return ClaimedExecution {
-                deferred_merge: true,
-                ..ClaimedExecution::default()
-            };
         }
         let agent = match self.ensure_dispatch_registered().await {
             Ok(agent) => agent,
@@ -2970,14 +2984,21 @@ impl<T: T3 + 'static> Daemon<T> {
                 // Never pause `RunKind::Merge` globally on Deferred/Noop/Unclear: the server
                 // enforces per-task cooldowns so other ready merges proceed immediately in the
                 // same tick. Track `task_id` in `merge_deferred_this_tick` only as a local
-                // fallback guard if an older server immediately re-offers the exact same task.
+                // fallback guard if an older server immediately re-offers the exact same
+                // unchanged task.
                 if outcome.is_deferred()
                     || matches!(
                         outcome,
                         MergeOutcome::Noop { .. } | MergeOutcome::Unclear { .. }
                     )
                 {
-                    merge_deferred_this_tick.insert(task_id.clone());
+                    let stamp = self.client().task(task_id).await.ok().map(|d| {
+                        (
+                            d.task.updated_at,
+                            d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                        )
+                    });
+                    merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 }
                 let update = UpdateRun {
                     state: Some(RunState::Succeeded),
@@ -2996,7 +3017,13 @@ impl<T: T3 + 'static> Daemon<T> {
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
             }
             Err(err) => {
-                merge_deferred_this_tick.insert(task_id.clone());
+                let stamp = self.client().task(task_id).await.ok().map(|d| {
+                    (
+                        d.task.updated_at,
+                        d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                    )
+                });
+                merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 self.fail_claimed_run(claimed, &format!("{err:#}"), now)
                     .await;
             }
