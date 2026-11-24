@@ -38,6 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -55,9 +56,14 @@ use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::gh::{Gh, GhCli};
 use crate::ops::Ctx;
+use crate::runner::{
+    RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerState, SteerMessage, T3Runner,
+    runner_agent_source,
+};
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
+use crate::worktree::WorktreeManager;
 
 pub mod device;
 pub mod judges;
@@ -382,14 +388,24 @@ impl Owed {
 /// `parallel_tasks` slots until it parks the task, or stops without claiming it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
-    /// Its thread; `None` until `t3 thread start` returns. A start the daemon did not live
-    /// to finish is found by `title` among the threads created since `started_at`.
+    /// Its thread or runner-native session id; `None` until `Runner::spawn` returns. A start
+    /// the daemon did not live to finish is found by `title` among the threads created since
+    /// `started_at` (for T3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     pub title: String,
     /// The branch of its worktree, when it runs in one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Runner kind that owns this worker (`"t3"` when omitted in older state files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// Daemon-managed worktree record id, when [`WorktreeManager`] created the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    /// Path of the daemon-managed worktree, when [`WorktreeManager`] created it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
     pub started_at: Timestamp,
     /// Whether it has claimed the task: from then on, the task leaving its `doing` frees
     /// the slot.
@@ -751,14 +767,15 @@ enum ThreadCheck {
 }
 
 impl Seen {
-    /// An ended T3 agent on this device whose thread T3 has not been asked about yet. T3
-    /// closes a Claude session that sits idle (after 30 minutes), and the session's end marks
-    /// the agent ended, but the thread lives on and a message resumes it.
-    fn needs_thread_check(&self, device: &DeviceName) -> bool {
+    /// An ended agent handled by this daemon's runner on this device whose session has not
+    /// been asked about yet. T3 closes a Claude session that sits idle (after 30 minutes),
+    /// and the session's end marks the agent ended, but the thread lives on and a message
+    /// resumes it.
+    fn needs_thread_check(&self, device: &DeviceName, runner_source: AgentSource) -> bool {
         self.agent.state == AgentState::Ended
             && self.thread == ThreadCheck::NotAsked
             && &self.agent.device == device
-            && self.agent.id.source() == AgentSource::T3
+            && self.agent.id.source() == runner_source
     }
 }
 
@@ -812,8 +829,14 @@ impl std::fmt::Display for Unreachable {
 impl Reach {
     /// `full_until` is the reset a full usage window of the Claude account waits for
     /// ([`Daemon::usage_full_until`]).
-    fn of(seen: &Seen, device: &DeviceName, full_until: Option<Timestamp>, now: Timestamp) -> Self {
-        match Self::alone(seen, device, now) {
+    fn of(
+        seen: &Seen,
+        device: &DeviceName,
+        runner_source: AgentSource,
+        full_until: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Self {
+        match Self::alone(seen, device, runner_source, now) {
             // Codex and opencode agents spend other limits; Claude and Antigravity respect
             // the daemon's active usage reading.
             Self::Now | Self::Held
@@ -827,12 +850,12 @@ impl Reach {
     }
 
     /// By the agent's own state, whatever the account's usage.
-    fn alone(seen: &Seen, device: &DeviceName, now: Timestamp) -> Self {
+    fn alone(seen: &Seen, device: &DeviceName, runner_source: AgentSource, now: Timestamp) -> Self {
         let agent = &seen.agent;
         if &agent.device != device {
             return Self::Never(Unreachable::Elsewhere);
         }
-        if agent.id.source() != AgentSource::T3 {
+        if agent.id.source() != runner_source {
             return Self::Never(Unreachable::NotT3);
         }
         if seen.thread == ThreadCheck::Gone {
@@ -1102,9 +1125,17 @@ struct StartFailure {
     retry_at: Timestamp,
 }
 
-pub struct Daemon<T: T3> {
+pub struct Daemon<T: T3 + 'static> {
     ctx: Ctx,
-    t3: T,
+    t3: Arc<T>,
+    /// Runtime-agnostic execution boundary for spawn/send/status/cancel/poll_events.
+    runner: Box<dyn Runner>,
+    /// Daemon-owned git worktree lifecycle manager (`$BOARD_HOME/worktrees/<repo-slug>/<id>`).
+    worktrees: WorktreeManager,
+    /// Whether this daemon creates worktrees directly via `worktrees` (true for all non-T3
+    /// runners; false for `T3Runner`, because `t3 thread start` requires a path inside a
+    /// registered T3 project and exposes only `--worktree <base> --branch <branch>`).
+    daemon_worktrees: bool,
     /// How the dispatcher reads, updates and merges pull requests.
     gh: Box<dyn Gh>,
     pub state: WatchState,
@@ -1153,15 +1184,21 @@ pub struct Daemon<T: T3> {
     running: Option<device::Running>,
 }
 
-impl<T: T3> Daemon<T> {
+impl<T: T3 + 'static> Daemon<T> {
     /// A daemon acting as the device of `ctx` (whose client must carry no agent id).
     pub fn new(ctx: Ctx, t3: T) -> Self {
         // A file it cannot read is kept aside rather than lost on the next save.
         let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
         let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
+        let t3 = Arc::new(t3);
+        let runner: Box<dyn Runner> = Box::new(T3Runner::new(Arc::clone(&t3), ctx.home.clone()));
+        let worktrees = WorktreeManager::for_home(ctx.home.clone());
         Self {
             ctx,
             t3,
+            runner,
+            worktrees,
+            daemon_worktrees: false,
             gh: Box::new(GhCli::locate()),
             state,
             boards: BTreeMap::new(),
@@ -1185,6 +1222,52 @@ impl<T: T3> Daemon<T> {
             last_pass: None,
             running: None,
         }
+    }
+
+    /// Replaces the daemon's execution [`Runner`]. Non-T3 runners automatically use
+    /// daemon-owned git worktrees created by [`WorktreeManager`].
+    #[must_use]
+    pub fn with_runner(mut self, runner: impl Runner + 'static) -> Self {
+        self.daemon_worktrees = runner.kind() != "t3";
+        self.runner = Box::new(runner);
+        self
+    }
+
+    /// Replaces the daemon's [`WorktreeManager`] (for custom persistence backends such as
+    /// Slice 1.3 `daemon.db` or isolated tests).
+    #[must_use]
+    pub fn with_worktree_manager(mut self, worktrees: WorktreeManager) -> Self {
+        self.worktrees = worktrees;
+        self
+    }
+
+    /// The kind identifier of the active [`Runner`] (`"t3"`, `"acp"`, `"fake"`, ...).
+    pub fn runner_kind(&self) -> &'static str {
+        self.runner.kind()
+    }
+
+    /// The [`AgentSource`] owned by this daemon's active [`Runner`].
+    fn runner_source(&self) -> AgentSource {
+        runner_agent_source(self.runner.kind())
+    }
+
+    /// The daemon's [`WorktreeManager`].
+    pub fn worktrees(&self) -> &WorktreeManager {
+        &self.worktrees
+    }
+
+    /// Cancels an active run through the active [`Runner`], recording a Trail Rule entry.
+    pub async fn cancel_run(&self, handle: &RunHandle, reason: &str) -> Result<()> {
+        self.runner.cancel(handle, reason).await
+    }
+
+    /// Polls normalized [`RunEvent`]s for `handle` after sequence number `after_seq`.
+    pub async fn poll_run_events(
+        &self,
+        handle: &RunHandle,
+        after_seq: u64,
+    ) -> Result<Vec<RunEvent>> {
+        self.runner.poll_events(handle, after_seq).await
     }
 
     /// Limits the runs of a device that sets no `runs_at_once` to `limit`.
@@ -1264,10 +1347,15 @@ impl<T: T3> Daemon<T> {
     }
 
     /// Reads the threads that run on this device, once in a reconcile: before the first
-    /// start it decides on. A device without a limit reads none.
+    /// start it decides on. A device without a limit reads none. Non-T3 runners do not
+    /// query T3's project thread listing.
     async fn read_running(&mut self) {
         if self.running.is_none() && self.run_limit() != usize::MAX {
-            let running = device::running_threads(&self.t3, &self.ctx.config).await;
+            if self.runner.kind() != "t3" {
+                self.running = Some(device::Running::default());
+                return;
+            }
+            let running = device::running_threads(&*self.t3, &self.ctx.config).await;
             if let Some(unknown) = running.unknown() {
                 tracing::warn!("{unknown}; the dispatcher starts nothing in this pass");
             }
@@ -1553,7 +1641,17 @@ impl<T: T3> Daemon<T> {
                     // Turning verdict judges off ends lease-less judge rights on the
                     // server; drop tracked runs so they neither leak in watch.json nor
                     // trigger a spurious JUDGE_RETRY delay if re-enabled later.
+                    let dropped: Vec<String> = self
+                        .state
+                        .judges
+                        .iter()
+                        .filter(|r| r.board == board.slug)
+                        .filter_map(|r| r.worktree_id.clone())
+                        .collect();
                     self.state.judges.retain(|r| r.board != board.slug);
+                    for wt_id in dropped {
+                        self.cleanup_worktree(&wt_id, now).await;
+                    }
                 }
                 continue;
             }
@@ -1576,9 +1674,28 @@ impl<T: T3> Daemon<T> {
         }
         let boards = &self.boards;
         self.failures.retain(|slug, _| boards.contains_key(slug));
+        let mut dropped_worktrees: Vec<String> = self
+            .state
+            .workers
+            .iter()
+            .filter(|(task, _)| !boards.contains_key(&task.board()))
+            .filter_map(|(_, w)| w.worktree_id.clone())
+            .collect();
         self.state
             .workers
             .retain(|task, _| boards.contains_key(&task.board()));
+        dropped_worktrees.extend(
+            self.state
+                .judges
+                .iter()
+                .filter(|r| !boards.contains_key(&r.board))
+                .filter_map(|r| r.worktree_id.clone()),
+        );
+        self.state.judges.retain(|r| boards.contains_key(&r.board));
+        for wt_id in dropped_worktrees {
+            self.cleanup_worktree(&wt_id, now).await;
+        }
+        self.cleanup_ended_worktrees(now).await;
         self.state
             .worker_retry
             .retain(|task, at| *at > now && boards.contains_key(&task.board()));
@@ -1599,14 +1716,45 @@ impl<T: T3> Daemon<T> {
         self.save()
     }
 
-    /// Whether T3 has `thread` and can run it: not archived, and its folder (its worktree,
-    /// else `project` when given) still exists, since T3 fails every run of a thread whose
-    /// folder is gone.
+    /// Whether the active [`Runner`] has `thread` and can run it: not archived/cancelled,
+    /// and its folder (its worktree, else `project` when given) still exists.
     async fn thread_live(&self, thread: &str, project: Option<&Path>) -> Result<bool> {
         let limit = self.timing.thread_check;
-        match tokio::time::timeout(limit, self.t3.thread_info(thread)).await {
-            Ok(info) => Ok(info?.is_some_and(|t| t.runnable(project))),
-            Err(_) => Err(TimedOut(format!("t3 thread show {thread}")).into()),
+        let mut handle = RunHandle::new(self.runner.kind(), thread);
+        if let Some(project) = project {
+            handle = handle.with_workdir(project);
+        }
+        match tokio::time::timeout(limit, self.runner.status(&handle)).await {
+            Ok(status) => Ok(status?.runnable),
+            Err(_) => Err(TimedOut(format!("{} status {thread}", self.runner.kind())).into()),
+        }
+    }
+
+    /// Safely cleans up a daemon-managed worktree once its run has ended, logging errors
+    /// without failing the reconcile.
+    pub(super) async fn cleanup_worktree(&self, worktree_id: &str, now: Timestamp) {
+        if let Err(err) = self.worktrees.cleanup(worktree_id, now).await {
+            tracing::warn!("cleaning up worktree {worktree_id}: {err:#}");
+        }
+    }
+
+    /// Reconciles all tracked daemon-managed worktrees not owned by any live worker or judge
+    /// (including worktrees orphaned by a hard crash or transient cleanup error).
+    async fn cleanup_ended_worktrees(&self, now: Timestamp) {
+        let active: BTreeSet<String> = self
+            .state
+            .workers
+            .values()
+            .filter_map(|w| w.worktree_id.clone())
+            .chain(
+                self.state
+                    .judges
+                    .iter()
+                    .filter_map(|r| r.worktree_id.clone()),
+            )
+            .collect();
+        if let Err(err) = self.worktrees.cleanup_ended(&active, now).await {
+            tracing::warn!("cleaning up ended worktrees: {err:#}");
         }
     }
 
@@ -1627,12 +1775,46 @@ impl<T: T3> Daemon<T> {
         self.failures.insert(board.slug.clone(), failure);
     }
 
-    /// `thread`'s [`crate::t3::RECENT_MESSAGES`] latest messages, read within
-    /// [`Timing::thread_check`]; `None` when T3 does not know the thread.
-    async fn read_messages(&self, thread: &str) -> Result<Option<crate::t3::RecentMessages>> {
-        tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
+    /// `agent`'s recent messages for checking timed-out wake-up deliveries, read within
+    /// [`Timing::thread_check`]; `None` when the runner no longer knows the run/thread.
+    async fn read_messages(&self, agent: &AgentId) -> Result<Option<crate::t3::RecentMessages>> {
+        let thread = agent.native();
+        if self.runner.kind() == "t3" {
+            return tokio::time::timeout(self.timing.thread_check, self.t3.recent_messages(thread))
+                .await
+                .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()));
+        }
+        let handle = RunHandle::new(self.runner.kind(), thread).with_agent_id(agent.clone());
+        let check = async {
+            let status = self.runner.status(&handle).await?;
+            if status.state == RunnerState::Gone && !status.runnable {
+                return Ok(None);
+            }
+            let events = self.runner.poll_events(&handle, 0).await?;
+            let user = events
+                .into_iter()
+                .filter(|ev| ev.kind == RunEventKind::Message)
+                .map(|ev| {
+                    let text = match ev.metadata.get("wake_digest") {
+                        Some(digest) => format!("{}\n{}", ev.summary, wake_marker(digest)),
+                        None => ev.summary,
+                    };
+                    crate::t3::UserMessage {
+                        text,
+                        run: ev.metadata.get("run_id").cloned(),
+                    }
+                })
+                .collect();
+            Ok(Some(crate::t3::RecentMessages {
+                busy: status.busy,
+                user,
+            }))
+        };
+        tokio::time::timeout(self.timing.thread_check, check)
             .await
-            .unwrap_or_else(|_| Err(TimedOut(format!("t3 thread show {thread}")).into()))
+            .unwrap_or_else(|_| {
+                Err(TimedOut(format!("{} poll_events {thread}", self.runner.kind())).into())
+            })
     }
 
     /// What a flush does about `agent`'s timed-out wake-up messages, if any, read without
@@ -1654,7 +1836,7 @@ impl<T: T3> Daemon<T> {
         };
         if unsure.read_due(now) {
             let _permit = reads.acquire().await;
-            look.read = Some(match self.read_messages(agent.native()).await {
+            look.read = Some(match self.read_messages(agent).await {
                 Ok(recent) => {
                     let sorted = sort_unsure(unsure, recent.as_ref(), now);
                     look.recent = recent;
@@ -2140,6 +2322,9 @@ impl<T: T3> Daemon<T> {
                 self.state.workers.insert(task.clone(), worker);
             } else {
                 self.state.workers.remove(&task);
+                if let Some(wt_id) = worker.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
             }
             followed.push((task, outcome));
         }
@@ -2191,7 +2376,8 @@ impl<T: T3> Daemon<T> {
             task: Some(Box::new(current)),
             since: worker.started_at,
         };
-        let worker_agent = thread_agent(&thread)?;
+        let worker_agent =
+            RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), &thread).resolve_agent_id()?;
         if current.status == TaskStatus::Doing && current.owner.as_ref() == Some(&worker_agent) {
             worker.claimed = true;
             return Ok(holds(current));
@@ -2237,6 +2423,9 @@ impl<T: T3> Daemon<T> {
         task: &TaskId,
         worker: &Worker,
     ) -> Result<Option<String>> {
+        if worker.runner.as_deref().unwrap_or("t3") != "t3" {
+            return Ok(None);
+        }
         let project = self.host_folder(board)?;
         let found = self
             .t3
@@ -2255,7 +2444,14 @@ impl<T: T3> Daemon<T> {
         };
         if !found.ran {
             let brief = crate::brief::worker_brief(&board.slug, task, crate::brief::WORKER_CLOSER);
-            if let Err(err) = self.t3.send(&found.id, &brief).await {
+            let sent = if self.runner.kind() == "t3" {
+                self.runner
+                    .send(&RunHandle::t3(&found.id), &SteerMessage::new(&brief))
+                    .await
+            } else {
+                self.t3.send(&found.id, &brief).await
+            };
+            if let Err(err) = sent {
                 tracing::warn!(
                     "briefing worker thread {} left by an earlier start for {task}: {err:#}; archive it in T3",
                     found.id
@@ -2279,13 +2475,18 @@ impl<T: T3> Daemon<T> {
         worker: &Worker,
         agent: &AgentId,
     ) -> Result<()> {
-        let link = match self.t3.thread_link(thread).await {
-            Ok(Some(link)) => link,
-            Ok(None) => format!("thread {thread}"),
-            Err(err) => {
-                tracing::debug!("reading the link of thread {thread}: {err:#}");
-                format!("thread {thread}")
+        let runner_kind = worker.runner.as_deref().unwrap_or("t3");
+        let link = if runner_kind == "t3" {
+            match self.t3.thread_link(thread).await {
+                Ok(Some(link)) => link,
+                Ok(None) => format!("thread {thread}"),
+                Err(err) => {
+                    tracing::debug!("reading the link of thread {thread}: {err:#}");
+                    format!("thread {thread}")
+                }
             }
+        } else {
+            format!("{runner_kind} run {thread}")
         };
         let branch = worker
             .branch
@@ -2338,7 +2539,7 @@ impl<T: T3> Daemon<T> {
         Ok(tasks)
     }
 
-    /// Starts a worker thread for `task`, in a new worktree on `task/<id>` when the project
+    /// Starts a worker run for `task`, in a new worktree on `task/<id>` when the project
     /// folder is a repository's top, with the worker brief; records it before the start, so
     /// a start the daemon does not live to finish is found again, then notes it on the task.
     async fn start_worker(
@@ -2348,42 +2549,102 @@ impl<T: T3> Daemon<T> {
         agent: &AgentId,
         now: Timestamp,
     ) -> Result<()> {
-        let project = self.host_folder(board)?;
+        let (repo_key, project) = self.host_project(board)?;
         let worktree = crate::worktree::worker_worktree(&project, &task.id, now)
             .await
             .context("preparing the worker's worktree")?;
         let title = format!("{} {}", task.id, task.title);
         let brief = crate::brief::worker_brief(&board.slug, &task.id, crate::brief::WORKER_CLOSER);
+        let run_id = format!("worker-{}-{}", task.id, now.format("%Y%m%d-%H%M%S"));
+        let (workdir, spec_worktree, branch, worktree_id, worktree_path) = if self.daemon_worktrees
+            && let Some(spec) = &worktree
+        {
+            let managed = self
+                .worktrees
+                .create(&project, repo_key.as_deref(), &run_id, spec, now)
+                .await
+                .context("creating daemon-managed worker worktree")?;
+            (
+                managed.path.clone(),
+                None,
+                Some(managed.branch),
+                Some(managed.id),
+                Some(managed.path),
+            )
+        } else {
+            (
+                project.clone(),
+                worktree.clone(),
+                worktree.as_ref().map(|w| w.branch.clone()),
+                None,
+                None,
+            )
+        };
         let mut worker = Worker {
             thread: None,
             title,
-            branch: worktree.as_ref().map(|w| w.branch.clone()),
+            branch,
+            runner: Some(self.runner.kind().to_owned()),
+            worktree_id,
+            worktree_path,
             started_at: now,
             claimed: false,
             noted: false,
         };
-        // On disk before T3 can create the thread.
+        // On disk before the runner can create the session/thread.
         self.state.workers.insert(task.id.clone(), worker.clone());
-        self.save()?;
-        let thread = self
-            .t3
-            .start_thread(
-                &project,
-                &worker.title,
-                &brief,
-                worktree.as_ref(),
-                self.ctx.config.thread_model.as_ref(),
-            )
-            .await?;
-        // A thread id that names no agent could never be followed, and would hold the slot.
-        thread_agent(&thread)
-            .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
-        tracing::info!(
-            "started worker thread {thread} for {} on {}",
-            task.id,
-            board.slug
-        );
+        if let Err(err) = self.save() {
+            self.state.workers.remove(&task.id);
+            if let Some(wt_id) = worker.worktree_id.as_deref() {
+                self.cleanup_worktree(wt_id, now).await;
+            }
+            return Err(err);
+        }
+        let spec = RunSpec {
+            run_id,
+            title: worker.title.clone(),
+            prompt: brief,
+            model: self.ctx.config.thread_model.clone(),
+            worktree: spec_worktree,
+            metadata: BTreeMap::from([
+                ("board".to_owned(), board.slug.to_string()),
+                ("task".to_owned(), task.id.to_string()),
+                ("kind".to_owned(), "worker".to_owned()),
+            ]),
+        };
+        let handle = match self.runner.spawn(&spec, &workdir).await {
+            Ok(handle) => handle,
+            Err(err) => {
+                if let Some(wt_id) = worker.worktree_id.as_deref() {
+                    self.cleanup_worktree(wt_id, now).await;
+                }
+                return Err(err);
+            }
+        };
+        let thread = handle.native_id.clone();
+        // A handle id that names no agent could never be followed, and would hold the slot.
+        if self.runner.kind() == "t3" {
+            thread_agent(&thread)
+                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
+        } else {
+            handle.resolve_agent_id()?;
+        }
+        if handle.runner == "t3" {
+            tracing::info!(
+                "started worker thread {thread} for {} on {}",
+                task.id,
+                board.slug
+            );
+        } else {
+            tracing::info!(
+                "started worker {thread} ({}) for {} on {}",
+                handle.runner,
+                task.id,
+                board.slug
+            );
+        }
         worker.thread = Some(thread.clone());
+        worker.runner = Some(handle.runner);
         self.state.workers.insert(task.id.clone(), worker.clone());
         self.save()?;
         match self.note_worker(&task.id, &thread, &worker, agent).await {
@@ -2395,6 +2656,23 @@ impl<T: T3> Daemon<T> {
             Err(err) => tracing::warn!("noting worker thread {thread} on {}: {err:#}", task.id),
         }
         Ok(())
+    }
+
+    /// [`host_folder`] on this device, paired with the matched repo key when any.
+    pub(super) fn host_project(&self, board: &Board) -> Result<(Option<String>, PathBuf)> {
+        let (repo, project) =
+            project_for(&self.ctx.config, board).with_context(|| no_project(board))?;
+        if folder_gone(&project) {
+            anyhow::bail!(
+                "the project folder {} of board {} is missing on this device: restore it, point \
+                 config.toml at where it is now, or switch the board's autopilot off (board board \
+                 update {} --autopilot false)",
+                project.display(),
+                board.slug,
+                board.slug
+            );
+        }
+        Ok((repo, project))
     }
 
     /// [`host_folder`] on this device.
@@ -2463,7 +2741,10 @@ impl<T: T3> Daemon<T> {
                 let (Some(ask), Some(asker)) = (event.payload["id"].as_i64(), asker) else {
                     return false;
                 };
-                if asker.source() == AgentSource::T3 || asker == dispatcher {
+                if asker.source() == self.runner_source()
+                    || asker.source() == AgentSource::T3
+                    || asker == dispatcher
+                {
                     return false;
                 }
                 self.owe(Owed::Answer {
@@ -2547,7 +2828,11 @@ impl<T: T3> Daemon<T> {
                 match self.pay(&mut step, agent, now).await {
                     Ok(Paid::Opened(task)) => {
                         // It starts again at once, with a new worker.
-                        self.state.workers.remove(&task);
+                        if let Some(worker) = self.state.workers.remove(&task)
+                            && let Some(wt_id) = worker.worktree_id.as_deref()
+                        {
+                            self.cleanup_worktree(wt_id, now).await;
+                        }
                         self.state.worker_skips.remove(&task);
                         self.state.worker_retry.remove(&task);
                         self.state.idle_notices.remove(&task);
@@ -2857,10 +3142,11 @@ impl<T: T3> Daemon<T> {
             && event.payload["fields"] == serde_json::json!(["coordinator"])
     }
 
-    /// `agent` when it is a T3 thread that did not cause `event`. Whether it is on this
-    /// device and awake is checked when the wake-up is sent.
+    /// `agent` when it is owned by this daemon's runner source and did not cause `event`.
+    /// Whether it is on this device and awake is checked when the wake-up is sent.
     fn wakeable<'a>(&self, agent: Option<&'a AgentId>, event: &Event) -> Option<&'a AgentId> {
-        agent.filter(|a| a.as_str() != event.actor && a.source() == AgentSource::T3)
+        let source = self.runner_source();
+        agent.filter(|a| a.as_str() != event.actor && a.source() == source)
     }
 
     /// Sends the queued wake-ups, one message per agent, after checking each again. The
@@ -3003,8 +3289,8 @@ impl<T: T3> Daemon<T> {
             },
         };
         // Asked once per state change, also while a failed send backs off. A thread that goes
-        // later is found by the next send that fails, which asks T3 again.
-        if seen.needs_thread_check(&self.ctx.device) {
+        // later is found by the next send that fails, which asks the runner again.
+        if seen.needs_thread_check(&self.ctx.device, self.runner_source()) {
             // Its folder: the worktree T3 names, else the one its session registered from.
             let registered = seen.agent.cwd.as_deref().map(Path::new);
             seen.thread = match self.thread_live(agent.native(), registered).await {
@@ -3245,23 +3531,27 @@ impl<T: T3> Daemon<T> {
         unheard
     }
 
-    /// Sends `message` to `agent`'s thread; on a failure, asks T3 whether the thread is gone.
+    /// Sends `message` to `agent`'s run through the active [`Runner`]; on a failure, asks
+    /// [`Runner::status`] whether the run is gone.
     async fn send_wake(&self, agent: &AgentId, message: &str) -> Sent {
         let thread = agent.native();
-        let err = match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.t3.send(thread, message)).await
-        {
-            Ok(Ok(())) => return Sent::Delivered,
-            Ok(Err(err)) if err.downcast_ref::<TimedOut>().is_some() => {
-                return Sent::MaybeDelivered(err);
-            }
-            Ok(Err(err)) => err,
-            Err(_) => {
-                return Sent::MaybeDelivered(TimedOut(format!("t3 thread send {thread}")).into());
-            }
-        };
-        match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.t3.thread_info(thread)).await {
-            Ok(Ok(None)) => Sent::Gone(err),
-            Ok(Ok(Some(info))) if !info.runnable(None) => Sent::Gone(err),
+        let handle = RunHandle::new(self.runner.kind(), thread).with_agent_id(agent.clone());
+        let msg = SteerMessage::new(message);
+        let err =
+            match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.runner.send(&handle, &msg)).await {
+                Ok(Ok(())) => return Sent::Delivered,
+                Ok(Err(err)) if err.downcast_ref::<TimedOut>().is_some() => {
+                    return Sent::MaybeDelivered(err);
+                }
+                Ok(Err(err)) => err,
+                Err(_) => {
+                    return Sent::MaybeDelivered(
+                        TimedOut(format!("{} send {thread}", self.runner.kind())).into(),
+                    );
+                }
+            };
+        match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.runner.status(&handle)).await {
+            Ok(Ok(status)) if !status.runnable => Sent::Gone(err),
             _ => Sent::Failed(err),
         }
     }
@@ -3408,7 +3698,13 @@ impl<T: T3> Daemon<T> {
 
     /// Whether `seen`'s wake-ups can be sent at `now`.
     fn reach(&self, seen: &Seen, now: Timestamp) -> Reach {
-        Reach::of(seen, &self.ctx.device, self.usage_full_until(now), now)
+        Reach::of(
+            seen,
+            &self.ctx.device,
+            self.runner_source(),
+            self.usage_full_until(now),
+            now,
+        )
     }
 
     /// The reset `seen`'s wake-ups last waited for, from which they live: its own
@@ -4095,7 +4391,7 @@ enum Step {
     Reconcile,
 }
 
-impl<T: T3> Daemon<T> {
+impl<T: T3 + 'static> Daemon<T> {
     /// Reconciles at once, then follows the event stream, flushing and reconciling on their
     /// ticks, also while the stream is down, until `shutdown` asks it to stop. Each step
     /// races the request to stop, so a step that waits on a server or `t3` never delays the
