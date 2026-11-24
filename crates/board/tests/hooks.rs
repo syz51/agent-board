@@ -2468,6 +2468,226 @@ fn a_held_threads_pull_request_update_ends_before_the_model_runs() {
 }
 
 #[test]
+fn a_held_threads_t3_notifications_end_before_the_model_runs() {
+    let e = env();
+    e.agent_ok();
+    serve_hold(&e, false);
+    prompt(&e, "go");
+
+    let send_claude = |e: &Env, text: &str| {
+        e.hook(
+            "user-prompt-submit",
+            "claude",
+            e.with("UserPromptSubmit", json!({"prompt": text})),
+        )
+        .0
+    };
+
+    let notifications = [
+        "Delegated task node:delegated-task:1 (Fix lint) in child thread thread:delegated-task:1 [completed]:\nall checks pass",
+        "Delegated task node:delegated-task:2 is blocked on a question and cannot continue until it is answered.",
+        "Delegated tasks task-1, task-2 reached terminal states. Use task_status with each taskId to read the results.",
+        "Background task completed.",
+        "Pull request #7 (https://example.com/pull/7) was merged into main as abc1234, so T3 Code stopped watching it.",
+        "T3 Code stopped watching pull request #7 (https://example.com/pull/7) because it failed to read it from the host 5 times in a row.",
+        "Continue where you left off. Your last turn was cut short, so a command or other action it started may have finished or may still be running.",
+    ];
+
+    // Not held: a T3 notification runs like any other turn.
+    assert!(not_halted(&send_claude(&e, notifications[0])));
+
+    // Held: every recognized T3 notification ends before the model runs, without marking
+    // the agent running, re-registering it, or advancing its sequence, and writes a Trail
+    // Rule record with the full prompt before halting.
+    let mut held = snapshot_fixture(SnapshotKind::Delta, "", 5);
+    held.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    held.held_by = vec!["factory".parse().unwrap()];
+    e.stub.on("GET /v1/snapshot", held);
+    let states = e.stub.requests_to(&state_path()).len();
+    let registers = e.stub.requests_to("POST /v1/agents").len();
+    let trail_path = e.home.join("state/halted-notifications.jsonl");
+    for text in notifications {
+        let reply = send_claude(&e, text).unwrap_or_else(|| panic!("expected halt for {text:?}"));
+        assert_eq!(reply["continue"], false, "{text}: {reply}");
+        let reason = reply["stopReason"].as_str().unwrap();
+        assert!(
+            reason.contains("factory paused")
+                && reason.contains("board resume")
+                && reason.contains("halted-notifications.jsonl"),
+            "{text}: {reason}"
+        );
+    }
+    assert_eq!(e.stub.requests_to(&state_path()).len(), states);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), registers);
+    let trail_lines: Vec<Value> = std::fs::read_to_string(&trail_path)
+        .expect("halted-notifications.jsonl written")
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(trail_lines.len(), notifications.len());
+    for (entry, expected_prompt) in trail_lines.iter().zip(notifications.iter()) {
+        assert_eq!(entry["prompt"], *expected_prompt);
+        assert_eq!(entry["held_by"], json!(["factory"]));
+        assert_eq!(entry["agent"], CLAUDE_AGENT);
+        assert_eq!(entry["runtime"], "claude");
+        assert_eq!(entry["device"], DEVICE);
+        assert!(entry["at"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            entry["cause"]
+                .as_str()
+                .is_some_and(|s| s.contains("factory paused"))
+        );
+    }
+
+    // User prompts while held — including ones starting with similar plain-English words —
+    // still get the hold line rather than a halt, and pick up from the sequence before the
+    // halted notifications.
+    for user_text in [
+        "Pull request #7 needs a rebase",
+        "Delegated task 123 failed, please check why",
+        "Delegated tasks are stuck on CI",
+        "Background task completed, please verify the output",
+        "Continue where you left off.",
+    ] {
+        let reply = send_claude(&e, user_text);
+        assert!(
+            not_halted(&reply),
+            "user prompt should not halt: {user_text}: {reply:?}"
+        );
+        assert!(
+            context(&reply, "UserPromptSubmit").contains("hold: factory paused"),
+            "{user_text}: {reply:?}"
+        );
+    }
+    let user_snaps = e.stub.requests_to("GET /v1/snapshot");
+    let first_user_snap = &user_snaps[user_snaps.len() - 5];
+    assert_eq!(first_user_snap.query_pairs()["since"], "2");
+
+    // Post-outage catch-up: halting a notification after an outage preserves
+    // `offline_notified` so the next user prompt still fetches a `Full` snapshot.
+    let agent_file = e.home.join("state").join(format!(
+        "{}.json",
+        board::state::file_stem(&CLAUDE_AGENT.parse().unwrap())
+    ));
+    let mut local: Value =
+        serde_json::from_str(&std::fs::read_to_string(&agent_file).unwrap()).unwrap();
+    local["offline_notified"] = json!(true);
+    std::fs::write(&agent_file, local.to_string()).unwrap();
+    let halt_after_outage = send_claude(&e, notifications[0]).expect("halt after outage");
+    assert_eq!(halt_after_outage["continue"], false);
+    let _ = send_claude(&e, "user catch-up");
+    assert_eq!(
+        e.stub
+            .requests_to("GET /v1/snapshot")
+            .last()
+            .unwrap()
+            .query_pairs()["kind"],
+        "full",
+        "halted notification must not clear offline_notified before the next user prompt catches up"
+    );
+
+    // Trail Rule fail-open: if `halted-notifications.jsonl` cannot be written, the hook
+    // does not halt and delivers the hold line instead.
+    std::fs::remove_file(&trail_path).unwrap();
+    std::fs::create_dir(&trail_path).unwrap();
+    let reply = send_claude(&e, notifications[0]);
+    assert!(
+        not_halted(&reply),
+        "cannot halt without trail record: {reply:?}"
+    );
+    assert!(context(&reply, "UserPromptSubmit").contains("hold: factory paused"));
+    std::fs::remove_dir(&trail_path).unwrap();
+
+    // Codex is told of the hold instead of halted at UserPromptSubmit.
+    let codex_agent = "codex:thr_hold";
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(codex_agent)),
+        agent_fixture(codex_agent, DEVICE, AgentState::Running),
+    );
+    let (codex_reply, _) = e.hook(
+        "user-prompt-submit",
+        "codex",
+        json!({
+            "session_id": "thr_hold",
+            "cwd": e.repo,
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": notifications[0],
+        }),
+    );
+    assert!(not_halted(&codex_reply), "{codex_reply:?}");
+    assert!(context(&codex_reply, "UserPromptSubmit").contains("hold: factory paused"));
+}
+
+#[test]
+fn antigravity_held_wrapped_notification_halts_without_blocking_following_user_prompt() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    let mut held = snapshot_fixture(SnapshotKind::Delta, "", 5);
+    held.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    held.held_by = vec!["factory".parse().unwrap()];
+    e.stub.on("GET /v1/snapshot", held);
+
+    // T3 wraps the first prompt of a fresh/restarted Antigravity ACP session in
+    // <t3_code_instructions>…<user_request>. A held notification still halts before the
+    // model runs and leaves no state update behind.
+    let wrapped_notification = "<t3_code_instructions>\n## T3 Code interaction mode: Default\n\
+        </t3_code_instructions>\n\n<user_request>\n\
+        Delegated task node:delegated-task:9 (Audit) [completed]:\ndone\n</user_request>";
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({
+                "initialNumSteps": 1,
+                "lastUserInput": wrapped_notification,
+            }),
+        ),
+    );
+    let halt = reply.expect("wrapped notification halt");
+    assert_eq!(halt["terminationBehavior"], "terminate", "{halt}");
+    assert!(
+        halt["injectSteps"][0]["errorMessage"]["userMessage"]
+            .as_str()
+            .unwrap()
+            .contains("factory paused"),
+        "{halt}"
+    );
+    assert!(e.stub.requests_to(&agy_state_path()).is_empty());
+
+    // A user prompt sent right after the halted notification (even with the same
+    // initialNumSteps because the terminated invocation added no step) must not be treated
+    // as a mid-turn continuation of the halted turn; it gets the hold line instead.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({
+                "initialNumSteps": 1,
+                "lastUserInput": "check the audit anyway",
+            }),
+        ),
+    );
+    assert!(
+        reply
+            .as_ref()
+            .is_some_and(|r| r.get("terminationBehavior").is_none()),
+        "user prompt after halted notification must not halt: {reply:?}"
+    );
+    assert!(agy_system_message(&reply).contains("hold: factory paused"));
+    assert_eq!(
+        e.stub.requests_to(&agy_state_path()).last().unwrap().body["state"],
+        "running"
+    );
+}
+
+#[test]
 fn codex_stop_always_prints_json() {
     let e = env();
     let codex_agent = "codex:thr_9";

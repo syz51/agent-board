@@ -510,6 +510,14 @@ pub fn append_daemon_drop<T: Serialize>(home: &Home, record: &T) -> Result<PathB
     append_line(home, "daemon-drops.jsonl", record)
 }
 
+/// Adds `record` as one line to `halted-notifications.jsonl` in the state directory, and
+/// gives its path: the Trail Rule record of every automatic T3 notification turn a
+/// `UserPromptSubmit` hook halted while a paused board or usage reserve held the agent.
+/// Nothing prunes it.
+pub fn append_halted_notification<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "halted-notifications.jsonl", record)
+}
+
 /// Whether `unchecked-launches.jsonl` has a launch of `session` at or after `since`.
 pub fn unchecked_launch_since(home: &Home, session: &str, since: Timestamp) -> bool {
     let path = home.state_dir().join("unchecked-launches.jsonl");
