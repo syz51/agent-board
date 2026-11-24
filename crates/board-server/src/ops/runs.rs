@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 
 use board_proto::{
-    AgentId, BoardSlug, ConflictKeySpec, ConflictLock, CreateRun, DeviceName, EventType, Note,
-    RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunFilter, RunId, RunKind, RunOrigin, RunState,
-    StickyWake, TaskId, TaskStatus, Timestamp, UpdateRun,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, ConflictKeySpec, ConflictLock, CreateRun,
+    DeviceName, EventType, Note, RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunFilter, RunId,
+    RunKind, RunOrigin, RunState, StickyWake, TaskId, TaskStatus, Timestamp, UpdateRun,
 };
 use rusqlite::{OptionalExtension, Row, params};
+use sha2::{Digest, Sha256};
 
-use crate::auth::random_hex;
+use crate::auth::{hex, random_hex};
 use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ts};
 use crate::error::{Result, bad_transition, forbidden, invalid, not_found, refused};
 use crate::ops::devices::check_token;
@@ -27,6 +28,12 @@ const RUN_COST_UNITS_MAX: u32 = 64;
 const RUN_OUTCOME_BYTES_MAX: usize = 65_536;
 /// Maximum length of `UpdateRun::reason`, in characters.
 const RUN_REASON_CHARS_MAX: usize = 500;
+/// Deterministic ID prefix for interactive runs auto-upserted from `/v1/agents` hooks.
+const INTERACTIVE_RUN_PREFIX: &str = "run-interactive-";
+/// Standard weighted cost units for an active interactive session.
+const INTERACTIVE_RUN_COST_UNITS: u32 = 2;
+/// Maximum length of `Run::attach_hint`, matching [`check_optional_fields`].
+const ATTACH_HINT_CHARS_MAX: usize = 500;
 
 /// SQL predicate over alias `r` for a live managed run that grants its `agent_id`
 /// coordinator rights on its board without requiring a per-board coordinator lease.
@@ -636,6 +643,13 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateRun) -> Result<Ru
     )?;
 
     let acquired = acquire_conflict_locks(cx, &id, &req.conflict_keys)?;
+    if req.origin == RunOrigin::Managed
+        && !state.is_terminal()
+        && state != RunState::Queued
+        && let Some(ref agent) = agent_id
+    {
+        absorb_auto_interactive_runs(cx, &id, agent)?;
+    }
     let mut payload = serde_json::json!({
         "run_id": id,
         "kind": req.kind,
@@ -992,6 +1006,14 @@ pub(crate) fn update(
             id.as_str(),
         ],
     )?;
+
+    if before.origin == RunOrigin::Managed
+        && !next_state.is_terminal()
+        && next_state != RunState::Queued
+        && let Some(ref agent) = agent_id
+    {
+        absorb_auto_interactive_runs(cx, id, agent)?;
+    }
 
     // Trail Rule: emit a durable event for state transitions and meaningful metadata changes,
     // without spamming the event log on pure 30s lease-renewal heartbeats.
@@ -1690,4 +1712,427 @@ pub(crate) fn standing_review_pass(cx: &Ctx<'_>, task_id: &TaskId) -> Result<Opt
         return Ok(None);
     }
     Ok(Some(note))
+}
+
+// ---------------------------------------------------------------------------------------
+// Interactive session unification (`docs/SCHEDULER_DESIGN.md`, Section 5.1)
+
+fn interactive_runner(agent: &Agent) -> String {
+    if agent.id.source() == AgentSource::T3
+        || agent.native_ids.contains_key("t3_link")
+        || agent.native_ids.contains_key("t3_thread")
+    {
+        "t3".to_owned()
+    } else {
+        enum_str(&agent.runtime)
+    }
+}
+
+fn interactive_attach_hint(agent: &Agent) -> Option<String> {
+    if let Some(link) = agent.native_ids.get("t3_link") {
+        return Some(link.clone());
+    }
+    let cwd = agent.cwd.as_deref().filter(|c| !c.is_empty())?;
+    let ssh = if cwd.starts_with('/') {
+        format!("ssh://{}{cwd}", agent.device)
+    } else {
+        format!("ssh://{}/{cwd}", agent.device)
+    };
+    if ssh.chars().count() <= ATTACH_HINT_CHARS_MAX {
+        Some(ssh)
+    } else if cwd.chars().count() <= ATTACH_HINT_CHARS_MAX {
+        Some(cwd.to_owned())
+    } else {
+        None
+    }
+}
+
+fn doing_task_for_agent(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<(TaskId, BoardSlug)>> {
+    cx.db
+        .prepare_cached(
+            "SELECT id, board FROM tasks \
+             WHERE owner = ?1 AND status = 'doing' \
+             ORDER BY doing_since DESC, id DESC LIMIT 1",
+        )?
+        .query_row([agent.as_str()], |r| {
+            Ok((
+                parse_id::<TaskId>(&r.get::<_, String>(0)?)?,
+                parse_id::<BoardSlug>(&r.get::<_, String>(1)?)?,
+            ))
+        })
+        .optional()
+        .map_err(Into::into)
+}
+
+fn primary_board_for_agent(
+    cx: &Ctx<'_>,
+    agent: &Agent,
+    doing_board: Option<&BoardSlug>,
+) -> Result<Option<BoardSlug>> {
+    if let Some(board) = doing_board {
+        return Ok(Some(board.clone()));
+    }
+    if let Some(repo) = agent.repo.as_deref() {
+        let boards = crate::ops::agents::boards_for_repo(cx, repo)?;
+        if boards.len() == 1 {
+            return Ok(Some(boards.into_iter().next().expect("checked len == 1")));
+        }
+    }
+    let joined: Vec<BoardSlug> = cx
+        .db
+        .prepare_cached(
+            "SELECT b.slug FROM board_members m \
+             JOIN boards b ON b.slug = m.board \
+             WHERE m.agent = ?1 AND b.status = 'active' \
+             ORDER BY b.slug",
+        )?
+        .query_map([agent.id.as_str()], |r| parse_id(&r.get::<_, String>(0)?))?
+        .collect::<rusqlite::Result<_>>()?;
+    if joined.len() == 1 {
+        Ok(Some(joined.into_iter().next().expect("checked len == 1")))
+    } else {
+        Ok(None)
+    }
+}
+
+fn active_managed_run_for_agent(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<RunId>> {
+    cx.db
+        .prepare_cached(
+            "SELECT id FROM runs \
+             WHERE agent_id = ?1 AND origin = 'managed' \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )?
+        .query_row([agent.as_str()], |r| parse_id(&r.get::<_, String>(0)?))
+        .optional()
+        .map_err(Into::into)
+}
+
+fn active_interactive_run_for_agent(cx: &Ctx<'_>, agent: &AgentId) -> Result<Option<RunId>> {
+    cx.db
+        .prepare_cached(
+            "SELECT id FROM runs \
+             WHERE agent_id = ?1 AND origin = 'interactive' \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )?
+        .query_row([agent.as_str()], |r| parse_id(&r.get::<_, String>(0)?))
+        .optional()
+        .map_err(Into::into)
+}
+
+fn next_interactive_run_id(cx: &Ctx<'_>, agent: &AgentId) -> Result<RunId> {
+    let digest = hex(&Sha256::digest(agent.as_str().as_bytes()));
+    let base = format!("{INTERACTIVE_RUN_PREFIX}{}", &digest[..12]);
+    if !cx.exists("SELECT 1 FROM runs WHERE id = ?1", [&base])? {
+        return Ok(base
+            .parse()
+            .expect("run-interactive-<hex> is a valid RunId"));
+    }
+    for n in 2u32..=1000 {
+        let candidate = format!("{base}-{n}");
+        if !cx.exists("SELECT 1 FROM runs WHERE id = ?1", [&candidate])? {
+            return Ok(candidate
+                .parse()
+                .expect("run-interactive-<hex>-<n> is a valid RunId"));
+        }
+    }
+    for _ in 0..8 {
+        let candidate = format!("{INTERACTIVE_RUN_PREFIX}{}", random_hex::<12>());
+        if !cx.exists("SELECT 1 FROM runs WHERE id = ?1", [&candidate])? {
+            return Ok(candidate
+                .parse()
+                .expect("run-interactive-<hex> is a valid RunId"));
+        }
+    }
+    unreachable!("96-bit random interactive run ids do not collide")
+}
+
+/// When a live managed run is created or updated with `agent_id`, absorbs any active
+/// auto-upserted interactive placeholder run (`run-interactive-*`) that raced ahead during
+/// `SessionStart`, preserving any metadata it captured without leaving a duplicate run.
+fn absorb_auto_interactive_runs(cx: &Ctx<'_>, managed_id: &RunId, agent: &AgentId) -> Result<()> {
+    struct InteractivePlaceholder {
+        id: String,
+        branch: Option<String>,
+        cwd: Option<String>,
+        title: Option<String>,
+        attach_hint: Option<String>,
+    }
+    let placeholders: Vec<InteractivePlaceholder> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, worktree_branch, cwd, title, attach_hint FROM runs \
+             WHERE agent_id = ?1 \
+               AND origin = 'interactive' \
+               AND kind = 'interactive' \
+               AND id LIKE 'run-interactive-%' \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+             ORDER BY updated_at DESC, id DESC",
+        )?
+        .query_map([agent.as_str()], |r| {
+            Ok(InteractivePlaceholder {
+                id: r.get(0)?,
+                branch: r.get(1)?,
+                cwd: r.get(2)?,
+                title: r.get(3)?,
+                attach_hint: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let Some(newest) = placeholders.first() else {
+        return Ok(());
+    };
+    cx.db.execute(
+        "UPDATE runs SET \
+             worktree_branch = COALESCE(worktree_branch, ?2), \
+             cwd = COALESCE(cwd, ?3), \
+             title = COALESCE(title, ?4), \
+             attach_hint = COALESCE(attach_hint, ?5) \
+         WHERE id = ?1",
+        params![
+            managed_id.as_str(),
+            newest.branch,
+            newest.cwd,
+            newest.title,
+            newest.attach_hint,
+        ],
+    )?;
+    for placeholder in &placeholders {
+        cx.db
+            .execute("DELETE FROM runs WHERE id = ?1", [placeholder.id.as_str()])?;
+    }
+    Ok(())
+}
+
+/// Upserts an active `origin = 'interactive'` `Run` for `agent` inside `POST /v1/agents`,
+/// or syncs session metadata onto an existing active `origin = 'managed'` `Run` without
+/// creating a duplicate. Skips `dispatch:<device>` agents.
+pub(crate) fn upsert_for_registered_agent(cx: &mut Ctx<'_>, agent: &Agent) -> Result<()> {
+    if agent.id.source() == AgentSource::Dispatch {
+        return Ok(());
+    }
+    let now = cx.now_ms();
+    let doing = doing_task_for_agent(cx, &agent.id)?;
+    let attach_hint = interactive_attach_hint(agent);
+
+    if let Some(managed_id) = active_managed_run_for_agent(cx, &agent.id)? {
+        let doing_task = doing.as_ref().map(|(t, _)| t.as_str());
+        let doing_board = doing.as_ref().map(|(_, b)| b.as_str());
+        cx.db.execute(
+            "UPDATE runs SET \
+                 worktree_branch = COALESCE(?2, worktree_branch), \
+                 cwd = COALESCE(?3, cwd), \
+                 title = COALESCE(?4, title), \
+                 attach_hint = COALESCE(?5, attach_hint), \
+                 task_id = COALESCE(task_id, ?6), \
+                 board = COALESCE(board, ?7), \
+                 updated_at = ?8 \
+             WHERE id = ?1 \
+               AND ( \
+                   COALESCE(?2, worktree_branch) IS NOT worktree_branch \
+                   OR COALESCE(?3, cwd) IS NOT cwd \
+                   OR COALESCE(?4, title) IS NOT title \
+                   OR COALESCE(?5, attach_hint) IS NOT attach_hint \
+                   OR COALESCE(task_id, ?6) IS NOT task_id \
+                   OR COALESCE(board, ?7) IS NOT board \
+               )",
+            params![
+                managed_id.as_str(),
+                agent.branch.as_deref(),
+                agent.cwd.as_deref(),
+                agent.title.as_deref(),
+                attach_hint.as_deref(),
+                doing_task,
+                doing_board,
+                now,
+            ],
+        )?;
+        return Ok(());
+    }
+
+    // `runs.device` references `devices(name)`. Skip silently if a user token registered an
+    // agent with a synthetic device name not present in `devices`.
+    if !cx.exists(
+        "SELECT 1 FROM devices WHERE name = ?1",
+        [agent.device.as_str()],
+    )? {
+        return Ok(());
+    }
+
+    let board = primary_board_for_agent(cx, agent, doing.as_ref().map(|(_, b)| b))?;
+    let task_id = doing.as_ref().map(|(t, _)| t);
+    let runner = interactive_runner(agent);
+
+    if let Some(run_id) = active_interactive_run_for_agent(cx, &agent.id)? {
+        cx.db.execute(
+            "UPDATE runs SET \
+                 task_id = ?2, \
+                 board = ?3, \
+                 device = ?4, \
+                 runner = ?5, \
+                 state = 'running', \
+                 worktree_branch = ?6, \
+                 cwd = ?7, \
+                 title = COALESCE(?8, title), \
+                 attach_hint = ?9, \
+                 started_at = COALESCE(started_at, ?10), \
+                 ended_at = NULL, \
+                 updated_at = ?10 \
+             WHERE id = ?1",
+            params![
+                run_id.as_str(),
+                task_id.map(TaskId::as_str),
+                board.as_ref().map(BoardSlug::as_str),
+                agent.device.as_str(),
+                runner,
+                agent.branch.as_deref(),
+                agent.cwd.as_deref(),
+                agent.title.as_deref(),
+                attach_hint.as_deref(),
+                now,
+            ],
+        )?;
+        return Ok(());
+    }
+
+    let id = next_interactive_run_id(cx, &agent.id)?;
+    cx.db.execute(
+        "INSERT INTO runs ( \
+             id, task_id, board, kind, origin, device, runner, agent_id, state, \
+             lease_expires_at, worktree_branch, cwd, title, attach_hint, cost_units, \
+             policy_version, created_at, started_at, ended_at, updated_at \
+         ) VALUES ( \
+             ?1, ?2, ?3, 'interactive', 'interactive', ?4, ?5, ?6, 'running', \
+             NULL, ?7, ?8, ?9, ?10, ?11, \
+             NULL, ?12, ?12, NULL, ?12 \
+         )",
+        params![
+            id.as_str(),
+            task_id.map(TaskId::as_str),
+            board.as_ref().map(BoardSlug::as_str),
+            agent.device.as_str(),
+            runner,
+            agent.id.as_str(),
+            agent.branch.as_deref(),
+            agent.cwd.as_deref(),
+            agent.title.as_deref(),
+            attach_hint.as_deref(),
+            INTERACTIVE_RUN_COST_UNITS,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Syncs an agent's active `origin = 'interactive'` `Run` with its hook lifecycle state:
+/// - `Running` → `RunState::Running` (and creates a fresh interactive run if none is active
+///   and the agent has no active managed run)
+/// - `Idle` / `Paused` → `RunState::WaitingExternal`
+/// - `Ended` → `RunState::Succeeded` (`ended_at = now`)
+pub(crate) fn sync_for_agent_state(
+    cx: &mut Ctx<'_>,
+    id: &AgentId,
+    state: AgentState,
+) -> Result<()> {
+    if id.source() == AgentSource::Dispatch {
+        return Ok(());
+    }
+    if state == AgentState::Ended {
+        return end_interactive_for_agent(cx, id);
+    }
+    if active_managed_run_for_agent(cx, id)?.is_some() {
+        return Ok(());
+    }
+    let now = cx.now_ms();
+    match state {
+        AgentState::Running => {
+            if let Some(run_id) = active_interactive_run_for_agent(cx, id)? {
+                let doing = doing_task_for_agent(cx, id)?;
+                let doing_task = doing.as_ref().map(|(t, _)| t.as_str());
+                let doing_board = doing.as_ref().map(|(_, b)| b.as_str());
+                cx.db.execute(
+                    "UPDATE runs SET \
+                         state = 'running', \
+                         task_id = ?2, \
+                         board = COALESCE(?3, board), \
+                         started_at = COALESCE(started_at, ?4), \
+                         updated_at = ?4 \
+                     WHERE id = ?1",
+                    params![run_id.as_str(), doing_task, doing_board, now],
+                )?;
+            } else {
+                let agent = crate::store::get_agent(cx, id)?;
+                upsert_for_registered_agent(cx, &agent)?;
+            }
+        }
+        AgentState::Idle | AgentState::Paused => {
+            if let Some(run_id) = active_interactive_run_for_agent(cx, id)? {
+                let doing = doing_task_for_agent(cx, id)?;
+                let doing_task = doing.as_ref().map(|(t, _)| t.as_str());
+                let doing_board = doing.as_ref().map(|(_, b)| b.as_str());
+                cx.db.execute(
+                    "UPDATE runs SET \
+                         state = 'waiting_external', \
+                         task_id = ?2, \
+                         board = COALESCE(?3, board), \
+                         updated_at = ?4 \
+                     WHERE id = ?1",
+                    params![run_id.as_str(), doing_task, doing_board, now],
+                )?;
+            }
+        }
+        AgentState::Ended => unreachable!("handled above"),
+    }
+    Ok(())
+}
+
+/// Closes every active `origin = 'interactive'` `Run` for `id` (`state = 'succeeded'`,
+/// `ended_at = now`). Called on explicit `SessionEnd` and by `end_unseen`.
+pub(crate) fn end_interactive_for_agent(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
+    if id.source() == AgentSource::Dispatch {
+        return Ok(());
+    }
+    let now = cx.now_ms();
+    cx.db.execute(
+        "UPDATE runs SET \
+             state = 'succeeded', \
+             ended_at = COALESCE(ended_at, ?2), \
+             updated_at = ?2 \
+         WHERE agent_id = ?1 \
+           AND origin = 'interactive' \
+           AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')",
+        params![id.as_str(), now],
+    )?;
+    Ok(())
+}
+
+/// Keeps an active `origin = 'interactive'` `Run`'s `task_id` (and `board`) in sync with
+/// `agent`'s current `doing` task whenever tasks are claimed, updated, released, or done.
+pub(crate) fn sync_agent_doing_task(cx: &Ctx<'_>, agent: &AgentId) -> Result<()> {
+    if agent.source() == AgentSource::Dispatch {
+        return Ok(());
+    }
+    let Some(run_id) = active_interactive_run_for_agent(cx, agent)? else {
+        return Ok(());
+    };
+    let doing = doing_task_for_agent(cx, agent)?;
+    let now = cx.now_ms();
+    match doing {
+        Some((task_id, board)) => {
+            cx.db.execute(
+                "UPDATE runs SET task_id = ?2, board = ?3, updated_at = ?4 \
+                 WHERE id = ?1 AND (task_id IS NOT ?2 OR board IS NOT ?3)",
+                params![run_id.as_str(), task_id.as_str(), board.as_str(), now],
+            )?;
+        }
+        None => {
+            cx.db.execute(
+                "UPDATE runs SET task_id = NULL, updated_at = ?2 \
+                 WHERE id = ?1 AND task_id IS NOT NULL",
+                params![run_id.as_str(), now],
+            )?;
+        }
+    }
+    Ok(())
 }

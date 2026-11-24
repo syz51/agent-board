@@ -31,12 +31,17 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
-use board_proto::{AGENT_HEADER, AgentId, BUILT_HEADER, COMMIT_HEADER, VERSION_HEADER};
+use board_proto::{
+    AGENT_HEADER, AgentId, AgentSource, AgentState, AgentStateUpdate, BUILT_HEADER, COMMIT_HEADER,
+    Timestamp, VERSION_HEADER,
+};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::client::Client;
 use crate::config::{Config, Home, load_token};
+use crate::local_db::{LocalDb, ResourceEntry, ResourceOrigin};
 
 /// Set by the relay on an answer it made itself: `unreachable` (no connection to the
 /// server), `slow` (no answer in time) or `refused` (not forwarded).
@@ -64,6 +69,9 @@ const KEEP_WARM: Duration = Duration::from_secs(30);
 const PROBE: Duration = Duration::from_millis(100);
 /// How often the relay says how many hooks closed their connection before it accepted it.
 const EARLY_REPORT: Duration = Duration::from_secs(600);
+/// Default weighted cost units accounted in `daemon.db`'s `resource_ledger` for an active
+/// interactive session.
+const INTERACTIVE_COST_UNITS: u32 = 2;
 
 /// The relay's socket for `home`.
 pub fn socket_path(home: &Home) -> PathBuf {
@@ -104,7 +112,7 @@ fn hook_route(method: &Method, path: &str, agent: &AgentId) -> bool {
     let segments: Vec<&str> = rest.split('/').collect();
     match segments.as_slice() {
         ["agents"] | ["touches"] => method == Method::POST,
-        ["snapshot"] | ["boards"] | ["tasks"] => method == Method::GET,
+        ["snapshot"] | ["boards"] | ["tasks"] | ["runs"] => method == Method::GET,
         ["agents", id, "state"] => method == Method::POST && *id == own,
         ["agents", id, "handoff"] => method == Method::GET && *id == own,
         // The record of a launch the device limit refused (`hook/launch.rs`).
@@ -320,6 +328,8 @@ struct Upstream {
     http: reqwest::Client,
     home: Home,
     login: Mutex<Arc<Login>>,
+    /// Local daemon SQLite database for passive interactive `resource_ledger` accounting.
+    db: Option<LocalDb>,
 }
 
 impl Upstream {
@@ -332,10 +342,18 @@ impl Upstream {
             .user_agent(concat!("agent-board/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the relay's HTTP client")?;
+        let db = match LocalDb::open_path(&LocalDb::path_for(&home)) {
+            Ok(db) => Some(db),
+            Err(err) => {
+                tracing::warn!("hook relay: opening daemon.db for resource_ledger: {err:#}");
+                None
+            }
+        };
         Ok(Self {
             http,
             home,
             login: Mutex::new(Arc::new(login)),
+            db,
         })
     }
 
@@ -387,6 +405,109 @@ async fn status(State(up): State<Arc<Upstream>>) -> Response {
     }
 }
 
+/// Passive `daemon.db` `resource_ledger` update derived from a hook request traversing
+/// `hook.sock`, without any extra network or socket round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerAction {
+    /// Active interactive session (`POST /v1/agents` or `state = running`).
+    UpsertRunning,
+    /// Inactive or finished interactive session (`state = idle | paused | ended`).
+    Remove,
+}
+
+fn classify_ledger_action(
+    method: &Method,
+    path: &str,
+    agent: &AgentId,
+    body: &[u8],
+) -> Option<LedgerAction> {
+    if agent.source() == AgentSource::Dispatch || *method != Method::POST {
+        return None;
+    }
+    let rest = path.strip_prefix("/v1/")?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    match segments.as_slice() {
+        ["agents"] => Some(LedgerAction::UpsertRunning),
+        ["agents", _, "state"] => {
+            let update: AgentStateUpdate = serde_json::from_slice(body).ok()?;
+            Some(match update.state {
+                AgentState::Running => LedgerAction::UpsertRunning,
+                AgentState::Idle | AgentState::Paused | AgentState::Ended => LedgerAction::Remove,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `agent` is already accounted for as a managed run in `daemon.db` (either in
+/// active `local_runs` or in `resource_ledger` with `origin = 'managed'`).
+fn is_managed_in_local_db(db: &LocalDb, agent: &AgentId) -> Result<bool> {
+    let full = agent.as_str();
+    let native = agent.native();
+    for run in db.list_active_local_runs()? {
+        if run
+            .session_id
+            .as_deref()
+            .is_some_and(|sid| sid == full || sid == native)
+        {
+            return Ok(true);
+        }
+        let matches_alias = run
+            .meta_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| {
+                v.get("previous_session_ids")
+                    .and_then(|arr| arr.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str())
+                            .any(|sid| sid == full || sid == native)
+                    })
+            })
+            .unwrap_or(false);
+        if matches_alias {
+            return Ok(true);
+        }
+    }
+    for entry in db.list_resources()? {
+        if entry.origin == ResourceOrigin::Managed && entry.agent_id.as_deref() == Some(full) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_ledger_action(
+    db: &LocalDb,
+    agent: &AgentId,
+    action: LedgerAction,
+    now: Timestamp,
+) -> Result<()> {
+    let entry_id = format!("interactive:{agent}");
+    match action {
+        LedgerAction::UpsertRunning => {
+            if is_managed_in_local_db(db, agent)? {
+                // Never double-count a daemon-managed run as an interactive session.
+                db.remove_resource(&entry_id)?;
+            } else {
+                db.upsert_resource(&ResourceEntry {
+                    entry_id,
+                    origin: ResourceOrigin::Interactive,
+                    agent_id: Some(agent.as_str().to_owned()),
+                    run_id: None,
+                    cost_units: INTERACTIVE_COST_UNITS,
+                    updated_at: now,
+                })?;
+            }
+        }
+        LedgerAction::Remove => {
+            db.remove_resource(&entry_id)?;
+        }
+    }
+    Ok(())
+}
+
 /// Forwards one hook request: the route and query, the caller's agent and the JSON body,
 /// with the device token; nothing else the caller sent.
 async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
@@ -415,6 +536,7 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
             "send at most 1 MiB through the hook relay, or call the server directly",
         );
     };
+    let ledger_action = classify_ledger_action(&parts.method, path, &agent, &body);
     let login = match up.login().await {
         Ok(login) => login,
         Err(err) => {
@@ -453,6 +575,27 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
     };
     match answer {
         Ok((status, headers, bytes)) => {
+            if status.is_success()
+                && let (Some(db), Some(action)) = (up.db.clone(), ledger_action)
+            {
+                let agent_for_db = agent.clone();
+                let now = Utc::now();
+                match tokio::task::spawn_blocking(move || {
+                    apply_ledger_action(&db, &agent_for_db, action, now)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            "hook relay: updating resource_ledger for {agent}: {err:#}"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!("hook relay: resource_ledger task failed: {err}");
+                    }
+                }
+            }
             let mut resp = Response::new(Body::from(bytes));
             *resp.status_mut() = status;
             for name in [
@@ -468,6 +611,18 @@ async fn relay(State(up): State<Arc<Upstream>>, req: Request) -> Response {
             resp
         }
         Err(err) => {
+            // Even when the server is unreachable or slow, a local idle/paused/ended
+            // transition still frees interactive capacity on this machine.
+            if ledger_action == Some(LedgerAction::Remove)
+                && let Some(db) = up.db.clone()
+            {
+                let agent_for_db = agent.clone();
+                let now = Utc::now();
+                let _ = tokio::task::spawn_blocking(move || {
+                    apply_ledger_action(&db, &agent_for_db, LedgerAction::Remove, now)
+                })
+                .await;
+            }
             let slow = err.is_timeout() && !err.is_connect();
             tracing::debug!("hook relay: no answer from the server: {err}");
             let (status, kind) = if slow {
@@ -571,6 +726,7 @@ mod tests {
             (Method::GET, "/v1/snapshot".to_owned()),
             (Method::GET, "/v1/boards".to_owned()),
             (Method::GET, "/v1/tasks".to_owned()),
+            (Method::GET, "/v1/runs".to_owned()),
             (Method::POST, "/v1/touches".to_owned()),
             (Method::POST, "/v1/tasks/factory-1/notes".to_owned()),
         ];
@@ -592,6 +748,9 @@ mod tests {
             (Method::POST, "/v1/tasks/../notes".to_owned()),
             (Method::POST, "/v1/tasks/factory-1/notes/2".to_owned()),
             (Method::POST, "/v1/asks".to_owned()),
+            (Method::POST, "/v1/runs".to_owned()),
+            (Method::PATCH, "/v1/runs/run-1".to_owned()),
+            (Method::GET, "/v1/runs/run-1".to_owned()),
             (Method::GET, "/v1/admin/devices".to_owned()),
             (Method::GET, "/v1/events".to_owned()),
             (Method::GET, "/healthz".to_owned()),
@@ -600,5 +759,38 @@ mod tests {
         for (method, path) in &refused {
             assert!(!hook_route(method, path, &me), "{method} {path}");
         }
+    }
+
+    #[test]
+    fn ledger_actions_classify_interactive_hook_transitions() {
+        let me: AgentId = "claude:sess-1".parse().unwrap();
+        let dispatch: AgentId = "dispatch:mac".parse().unwrap();
+        let state_path = format!("/v1/agents/{}/state", crate::client::enc(me.as_str()));
+
+        assert_eq!(
+            classify_ledger_action(&Method::POST, "/v1/agents", &me, b"{}"),
+            Some(LedgerAction::UpsertRunning)
+        );
+        assert_eq!(
+            classify_ledger_action(&Method::POST, &state_path, &me, br#"{"state":"running"}"#),
+            Some(LedgerAction::UpsertRunning)
+        );
+        for inactive in ["idle", "paused", "ended"] {
+            let body = format!(r#"{{"state":"{inactive}"}}"#);
+            assert_eq!(
+                classify_ledger_action(&Method::POST, &state_path, &me, body.as_bytes()),
+                Some(LedgerAction::Remove),
+                "{inactive}"
+            );
+        }
+        assert_eq!(
+            classify_ledger_action(&Method::POST, "/v1/agents", &dispatch, b"{}"),
+            None,
+            "dispatch agents are never counted as interactive sessions"
+        );
+        assert_eq!(
+            classify_ledger_action(&Method::GET, "/v1/runs", &me, b""),
+            None
+        );
     }
 }

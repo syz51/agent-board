@@ -213,7 +213,9 @@ pub(crate) fn register(cx: &mut Ctx<'_>, reg: Registration) -> Result<Agent> {
             join_board(cx, &board, &req.id)?;
         }
     }
-    get_agent(cx, &req.id)
+    let agent = get_agent(cx, &req.id)?;
+    crate::ops::runs::upsert_for_registered_agent(cx, &agent)?;
+    Ok(agent)
 }
 
 /// Active boards that cover `repo`.
@@ -346,6 +348,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
             }),
         )?;
     }
+    crate::ops::runs::sync_for_agent_state(cx, id, update.state)?;
     get_agent(cx, id)
 }
 
@@ -394,6 +397,7 @@ pub(crate) fn end_unseen(cx: &mut Ctx<'_>) -> Result<usize> {
             [id.as_str()],
         )?;
         release_leases(cx, &id)?;
+        crate::ops::runs::end_interactive_for_agent(cx, &id)?;
         cx.emit(
             None,
             id.as_str(),

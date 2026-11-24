@@ -4841,3 +4841,82 @@ fn antigravity_held_pr_update_halts_and_offline_pre_invocation_flushes_pending_s
     );
     assert_eq!(reply, Some(json!({"decision": "allow"})));
 }
+
+#[test]
+fn standalone_sessions_enrich_cwd_branch_repo_and_title_without_extra_roundtrips() {
+    let e = env();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, SNAPSHOT, 812),
+    );
+
+    // 1. Standalone Antigravity with camelCase `workingDirectory` and `conversationTitle`.
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    let agy_payload = json!({
+        "conversationId": "conv-agy-1",
+        "workingDirectory": e.repo,
+        "conversationTitle": "  Refactor\tscheduler\n",
+        "hookEventName": "SessionStart",
+    });
+    let _ = e.hook("session-start", "antigravity", agy_payload);
+    let agy_reg = e.last_registered();
+    assert_eq!(agy_reg["id"], AGY_AGENT);
+    assert_eq!(agy_reg["runtime"], "antigravity");
+    assert_eq!(agy_reg["repo"], "github.com/syz51/agent-board");
+    assert_eq!(agy_reg["branch"], "feature/x");
+    assert_eq!(agy_reg["cwd"], e.repo.display().to_string());
+    assert_eq!(agy_reg["title"], "Refactor scheduler");
+    assert_eq!(
+        e.stub.requests().len(),
+        2,
+        "SessionStart makes only POST /v1/agents + GET /v1/snapshot"
+    );
+
+    // 2. Standalone OpenCode with explicit `title` and empty `cwd` (falls back to process cwd).
+    e.stub.clear();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture("opencode:ses_99", DEVICE, AgentState::Running),
+    );
+    let open_payload = json!({
+        "session_id": "ses_99",
+        "cwd": "   ",
+        "title": "OpenCode interactive fix",
+        "hook_event_name": "SessionStart",
+    });
+    let _ = e.hook("session-start", "opencode", open_payload);
+    let open_reg = e.last_registered();
+    assert_eq!(open_reg["id"], "opencode:ses_99");
+    assert_eq!(open_reg["repo"], "github.com/syz51/agent-board");
+    assert_eq!(open_reg["branch"], "feature/x");
+    assert_eq!(open_reg["title"], "OpenCode interactive fix");
+    assert!(
+        open_reg["cwd"]
+            .as_str()
+            .is_some_and(|c| !c.trim().is_empty()),
+        "blank cwd falls back to process cwd: {open_reg}"
+    );
+
+    // 3. Standalone terminal Claude with `BOARD_SESSION_TITLE` env var.
+    e.stub.clear();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    let claude_payload = e.with("SessionStart", json!({"source": "startup"}));
+    let _ = e.hook_env(
+        "session-start",
+        "claude",
+        claude_payload,
+        &[("BOARD_SESSION_TITLE", "Terminal refactor")],
+    );
+    let claude_reg = e.last_registered();
+    assert_eq!(claude_reg["id"], CLAUDE_AGENT);
+    assert_eq!(claude_reg["title"], "Terminal refactor");
+    assert_eq!(claude_reg["repo"], "github.com/syz51/agent-board");
+    assert_eq!(claude_reg["branch"], "feature/x");
+    assert_eq!(claude_reg["cwd"], e.repo.display().to_string());
+}

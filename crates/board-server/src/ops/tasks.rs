@@ -538,6 +538,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             Some(&id),
             serde_json::json!({ "previous_owner": null }),
         )?;
+        crate::ops::runs::sync_agent_doing_task(cx, &req.agent)?;
     }
     get_task(cx, &id)
 }
@@ -1363,6 +1364,7 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         Some(id),
         serde_json::json!({ "previous_owner": previous }),
     )?;
+    crate::ops::runs::sync_agent_doing_task(cx, agent)?;
     get_task(cx, id)
 }
 
@@ -1571,6 +1573,8 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
             serde_json::json!({ "from": owner, "status": status })
         },
     )?;
+    crate::ops::runs::sync_agent_doing_task(cx, agent)?;
+    crate::ops::runs::sync_agent_doing_task(cx, &owner)?;
     get_task(cx, id)
 }
 
@@ -1939,6 +1943,9 @@ pub(crate) fn release(
         Some(id),
         serde_json::json!({ "from": task.status }),
     )?;
+    if let Some(ref prev_owner) = task.owner {
+        crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+    }
     get_task(cx, id)
 }
 
@@ -2360,6 +2367,16 @@ pub(crate) fn update(
         Some(id),
         payload,
     )?;
+    if to != from || owner != task.owner {
+        if let Some(ref new_owner) = owner {
+            crate::ops::runs::sync_agent_doing_task(cx, new_owner)?;
+        }
+        if let Some(ref prev_owner) = task.owner
+            && task.owner != owner
+        {
+            crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+        }
+    }
     get_task(cx, id)
 }
 
@@ -2724,6 +2741,12 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
             "doing_ms": doing_since.map(|d| now - d),
         }),
     )?;
+    crate::ops::runs::sync_agent_doing_task(cx, &req.agent)?;
+    if let Some(ref prev_owner) = task.owner
+        && *prev_owner != req.agent
+    {
+        crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+    }
     get_task(cx, id)
 }
 
