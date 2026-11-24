@@ -79,6 +79,9 @@ pub struct JudgeRun {
     /// Path of the daemon-managed worktree, when [`WorktreeManager`] created it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
+    /// Local run id in `daemon.db`'s `local_runs` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub title: String,
     pub started_at: Timestamp,
     /// Whether the server has it as a judge of the board.
@@ -746,8 +749,29 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut waited = self.turns(judging).take(slug);
         // A board at its usage stop gets no new judge, as it gets no new worker.
         if self.usage_holds(slug, now) {
-            return self.save();
+            let hold_key = format!("usage_hold judge {slug}");
+            if !self.state.holds.contains_key(&hold_key) {
+                self.record_drop(
+                    "usage_hold",
+                    Some(slug),
+                    None,
+                    Some(agent),
+                    &format!(
+                        "usage holds judge dispatch on {slug} (usage_stop_at={})",
+                        board.usage_stop_at
+                    ),
+                    serde_json::json!({
+                        "kind": "judge",
+                        "board": slug,
+                        "usage_stop_at": board.usage_stop_at,
+                    }),
+                    now,
+                );
+                self.state.holds.insert(hold_key, now);
+            }
+            return self.save_at(now);
         }
+        self.hold_ended("usage_hold", &format!("judge {slug}"));
         wants.sort_by_key(|w| w.since);
         let free = JUDGES_AT_ONCE.saturating_sub(at_work.count);
         if wants.len() > free {
@@ -765,10 +789,14 @@ impl<T: T3 + 'static> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
+            self.sync_resource_ledger(now);
             let limit = self.daemon_run_limit();
             let verdicts = self.home_verdict_runs();
             let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
-            let full = self.load_unknown().is_some() || self.runs() >= limit;
+            let needed_units = device::cost_units_for_judge(want.kind);
+            let full = self.load_unknown().is_some()
+                || self.runs() >= limit
+                || self.weighted_full(needed_units, false);
             if capped || full || self.turns(judging).another_first(slug, waited) {
                 // The limit that holds it, and that limit's numbers. Off autopilot, a
                 // board that waits its turn while the device has a free run waits for
@@ -845,6 +873,16 @@ impl<T: T3 + 'static> Daemon<T> {
     /// from another judge of its kind for `wait` unless they change.
     async fn end_run(&mut self, run: &JudgeRun, client: &Client, now: Timestamp, wait: TimeDelta) {
         self.state.judges.retain(|r| !r.same(run));
+        if let Some(run_id) = run.run_id.as_deref() {
+            let _ = self
+                .db
+                .update_local_run_state(run_id, LocalRunState::Finished, None, now);
+        } else if let Some(thread) = run.thread.as_deref() {
+            let _ = self
+                .db
+                .finish_local_run_by_session(thread, LocalRunState::Finished, now);
+        }
+        self.sync_resource_ledger(now);
         if let Some(wt_id) = run.worktree_id.as_deref() {
             self.cleanup_worktree(wt_id, now).await;
         }
@@ -1214,49 +1252,107 @@ impl<T: T3 + 'static> Daemon<T> {
             brief_kind(want.kind).as_str(),
             now.format("%Y%m%d-%H%M%S")
         );
-        let (workdir, spec_worktree, worktree_id, worktree_path) = if self.daemon_worktrees
-            && let Some(spec) = &worktree
-        {
-            let managed = self
-                .worktrees
-                .create(project, repo_key, &run_id, spec, now)
-                .await
-                .context("creating daemon-managed judge worktree")?;
-            (
-                managed.path.clone(),
-                None,
-                Some(managed.id),
-                Some(managed.path),
-            )
-        } else {
-            (project.to_path_buf(), worktree, None, None)
-        };
+        let cost_units = device::cost_units_for_judge(want.kind);
+        let intended_branch = worktree.as_ref().map(|w| w.branch.clone());
+
+        // Write-before-act: commit `local_runs` intent and judge record into `daemon.db`
+        // BEFORE creating any git worktree or spawning the runner (agent-board-539).
         let mut run = JudgeRun {
             board: board.slug.clone(),
             kind: want.kind,
             tasks: want.tasks,
             thread: None,
             runner: Some(self.runner.kind().to_owned()),
-            worktree_id,
-            worktree_path,
+            worktree_id: None,
+            worktree_path: None,
+            run_id: Some(run_id.clone()),
             title: want.title,
             started_at: now,
             registered: false,
             noted: false,
             worktree_note,
         };
-        // On disk before the runner can create the session/thread.
+        let mut local_run = LocalRunRecord {
+            run_id: run_id.clone(),
+            task_id: run.tasks.first().cloned(),
+            board: board.slug.clone(),
+            kind: run.kind_name().to_owned(),
+            runner: self.runner.kind().to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: intended_branch,
+            cost_units,
+            pid: None,
+            state: LocalRunState::Intent,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: serde_json::to_string(&run).ok(),
+        };
+        self.db.upsert_local_run(&local_run)?;
         self.put_run(&run);
-        if let Err(err) = self.save() {
+        if let Err(err) = self.save_at(now) {
             self.state.judges.retain(|r| !r.same(&run));
-            if let Some(wt_id) = run.worktree_id.as_deref() {
-                self.cleanup_worktree(wt_id, now).await;
-            }
+            let _ = self
+                .db
+                .update_local_run_state(&run_id, LocalRunState::Failed, None, now);
             return Err(err);
         }
+        self.sync_resource_ledger(now);
+
+        let (workdir, spec_worktree) = if self.daemon_worktrees
+            && let Some(spec) = &worktree
+        {
+            match self
+                .worktrees
+                .create(project, repo_key, &run_id, spec, now)
+                .await
+            {
+                Ok(managed) => {
+                    run.worktree_id = Some(managed.id);
+                    run.worktree_path = Some(managed.path.clone());
+                    local_run.branch = Some(managed.branch);
+                    local_run.worktree_path = Some(managed.path.clone());
+                    local_run.state = LocalRunState::Starting;
+                    local_run.updated_at = now;
+                    local_run.meta_json = serde_json::to_string(&run).ok();
+                    self.db.upsert_local_run(&local_run)?;
+                    self.put_run(&run);
+                    if let Err(err) = self.save_at(now) {
+                        self.state.judges.retain(|r| !r.same(&run));
+                        let _ = self.db.update_local_run_state(
+                            &run_id,
+                            LocalRunState::Failed,
+                            None,
+                            now,
+                        );
+                        self.sync_resource_ledger(now);
+                        if let Some(wt_id) = run.worktree_id.as_deref() {
+                            self.cleanup_worktree(wt_id, now).await;
+                        }
+                        return Err(err);
+                    }
+                    (managed.path, None)
+                }
+                Err(err) => {
+                    self.state.judges.retain(|r| !r.same(&run));
+                    let _ =
+                        self.db
+                            .update_local_run_state(&run_id, LocalRunState::Failed, None, now);
+                    self.sync_resource_ledger(now);
+                    let _ = self.save_at(now);
+                    return Err(err.context("creating daemon-managed judge worktree"));
+                }
+            }
+        } else {
+            local_run.state = LocalRunState::Starting;
+            local_run.updated_at = now;
+            self.db.upsert_local_run(&local_run)?;
+            (project.to_path_buf(), worktree)
+        };
         let model = self.ctx.config.model_for_judge(run.kind).cloned();
         let spec = RunSpec {
-            run_id,
+            run_id: run_id.clone(),
             title: run.title.clone(),
             prompt: brief,
             model,
@@ -1298,13 +1394,20 @@ impl<T: T3 + 'static> Daemon<T> {
                 board.slug
             );
         }
-        run.thread = Some(thread);
-        run.runner = Some(handle.runner);
+        run.thread = Some(thread.clone());
+        run.runner = Some(handle.runner.clone());
+        local_run.session_id = Some(thread);
+        local_run.runner = handle.runner;
+        local_run.state = LocalRunState::Running;
+        local_run.updated_at = now;
+        local_run.meta_json = serde_json::to_string(&run).ok();
+        self.db.upsert_local_run(&local_run)?;
         if run.kind == JudgeKind::Goal {
             self.state.goal_due.remove(&board.slug);
         }
         self.put_run(&run);
-        self.save()?;
+        self.sync_resource_ledger(now);
+        self.save_at(now)?;
         // Tried again on the next reconcile.
         if let Err(err) = self.register_run(client, &mut run).await {
             tracing::warn!(
@@ -1314,6 +1417,7 @@ impl<T: T3 + 'static> Daemon<T> {
             );
         }
         self.put_run(&run);
+        let _ = self.save_at(now);
         Ok(StartOutcome::Started)
     }
 

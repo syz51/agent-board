@@ -18,12 +18,23 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use board_proto::{BoardSlug, Timestamp};
+use board_proto::{
+    BoardSlug, DeviceCapacity, JudgeKind, ResourceWeight, Task, Timestamp, normalize_repo,
+};
 use serde::Serialize;
 use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::t3::{T3, T3Cli};
+
+/// Default weighted resource units for a light run (verdict/triage/goal/merge/housekeeping).
+pub const LIGHT_RUN_UNITS: u32 = 1;
+/// Default weighted resource units for a standard run (ordinary worker, review, interactive).
+pub const STANDARD_RUN_UNITS: u32 = 2;
+/// Default weighted resource units for a heavy run (heavy workspace build, ML/data crunching).
+pub const HEAVY_RUN_UNITS: u32 = 4;
+/// Default protocol features advertised in device heartbeats when not overridden in config.
+pub const DEFAULT_PROTOCOL_FEATURES: &[&str] = &["v1-json", "sse-v1"];
 
 /// Environment variable T3 Code sets to its own `t3` CLI binary.
 pub const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
@@ -140,6 +151,167 @@ pub fn effective_run_limit(config: &Config) -> usize {
 /// Whether `asked` additional agent turns fit under `limit` alongside `running` turns.
 pub fn fits(running: usize, asked: usize, limit: usize) -> bool {
     running.saturating_add(asked) <= limit
+}
+
+/// Weighted resource units consumed by a task's worker run: explicit `resource_units`
+/// (when positive), else `weight` (`light=1`, `standard=2`, `heavy=4`), else
+/// [`STANDARD_RUN_UNITS`] (`2`).
+pub fn cost_units_for_task(task: &Task) -> u32 {
+    if let Some(units) = task.resource_units.filter(|&u| u > 0) {
+        return units;
+    }
+    task.weight
+        .and_then(ResourceWeight::default_units)
+        .unwrap_or(STANDARD_RUN_UNITS)
+}
+
+/// Weighted resource units consumed by a judge run: `review` is standard (`2`), while
+/// `verdict`, `triage`, and `goal` are light (`1`).
+pub fn cost_units_for_judge(kind: JudgeKind) -> u32 {
+    match kind {
+        JudgeKind::Review => STANDARD_RUN_UNITS,
+        JudgeKind::Verdict | JudgeKind::Triage | JudgeKind::Goal => LIGHT_RUN_UNITS,
+    }
+}
+
+/// Default weighted capacity units derived from host memory: `default_run_limit(mem) * 2`
+/// (so each 4 GiB run slot equals one standard 2-unit run, minimum 4 units).
+pub fn default_weight_units(host_memory: Option<u64>) -> u32 {
+    u32::try_from(default_run_limit(host_memory))
+        .unwrap_or(u32::MAX)
+        .saturating_mul(STANDARD_RUN_UNITS)
+}
+
+/// Effective total weighted capacity units of this device:
+/// 1. explicit `config.weight_units`, else
+/// 2. `config.runs_at_once * STANDARD_RUN_UNITS`, else
+/// 3. `default_run_limit * STANDARD_RUN_UNITS` (when finite), else
+/// 4. [`default_weight_units`] from `host_memory`.
+pub fn effective_weight_units(
+    config: &Config,
+    default_limit: Option<usize>,
+    host_memory: Option<u64>,
+) -> u32 {
+    if let Some(units) = config.weight_units {
+        return units;
+    }
+    if let Some(runs) = config.runs_at_once {
+        return runs.get().saturating_mul(STANDARD_RUN_UNITS);
+    }
+    if let Some(limit) = default_limit.filter(|&l| l != usize::MAX) {
+        return u32::try_from(limit)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(STANDARD_RUN_UNITS);
+    }
+    default_weight_units(host_memory)
+}
+
+/// Weighted units reserved for interactive / non-daemon turns (`reserve(config) * 2`).
+pub fn reserve_units(config: &Config) -> u32 {
+    u32::try_from(reserve(config))
+        .unwrap_or(u32::MAX)
+        .saturating_mul(STANDARD_RUN_UNITS)
+}
+
+/// Normalized host operating system tag (`macos`, `linux`, ...).
+pub fn host_os() -> &'static str {
+    std::env::consts::OS
+}
+
+/// Normalized host CPU architecture tag (`arm64`, `x86_64`, ...).
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Host memory rounded to the nearest GiB (at least 1 GiB when readable).
+pub fn host_mem_gib(host_memory: Option<u64>) -> Option<u32> {
+    host_memory.map(|bytes| {
+        let gib = bytes.saturating_add(1 << 29) >> 30;
+        u32::try_from(gib).unwrap_or(u32::MAX).max(1)
+    })
+}
+
+/// Logical CPU core count when readable from the OS.
+pub fn host_cpu_cores() -> Option<u32> {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u32::try_from(n.get()).ok())
+}
+
+/// Hardware and weighted scheduling capacity for `PUT /v1/devices/{name}/heartbeat`.
+pub fn device_capacity(
+    config: &Config,
+    default_limit: Option<usize>,
+    host_memory: Option<u64>,
+) -> DeviceCapacity {
+    DeviceCapacity {
+        weight_units: effective_weight_units(config, default_limit, host_memory),
+        mem_gib: host_mem_gib(host_memory),
+        cpu_cores: host_cpu_cores(),
+    }
+}
+
+/// Advertised device capability tags: auto-detected `os:<os>` and `arch:<arch>` plus any
+/// non-empty user-configured `config.capabilities` (deduplicated preserving order).
+pub fn effective_capabilities(config: &Config) -> Vec<String> {
+    let mut out = vec![format!("os:{}", host_os()), format!("arch:{}", host_arch())];
+    for cap in &config.capabilities {
+        let trimmed = cap.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    out
+}
+
+/// Advertised runner kinds: configured `config.runners` when non-empty, else `[active_runner]`.
+pub fn effective_runners(config: &Config, active_runner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for runner in &config.runners {
+        let trimmed = runner.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    if out.is_empty() {
+        out.push(active_runner.to_owned());
+    }
+    out
+}
+
+/// Advertised protocol features: configured `config.protocol_features` when non-empty, else
+/// [`DEFAULT_PROTOCOL_FEATURES`].
+pub fn effective_protocol_features(config: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for feat in &config.protocol_features {
+        let trimmed = feat.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    if out.is_empty() {
+        out.extend(DEFAULT_PROTOCOL_FEATURES.iter().map(|s| (*s).to_owned()));
+    }
+    out
+}
+
+/// Normalized, deduplicated repository keys configured under `[projects]` in `config.toml`.
+pub fn configured_repos(config: &Config) -> Vec<String> {
+    let mut repos = BTreeSet::new();
+    for key in config.projects.keys() {
+        if let Some(norm) = normalize_repo(key) {
+            repos.insert(norm);
+        } else {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                repos.insert(trimmed.to_owned());
+            }
+        }
+    }
+    repos.into_iter().collect()
 }
 
 /// The `t3` binary this thread's T3 names (`T3CODE_CLI_PATH`), else `config.t3_bin`, else
@@ -917,5 +1089,73 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("timed out after 3s"), "{msg}");
         assert!(msg.contains("T3 listed no threads within"), "{msg}");
+    }
+
+    #[test]
+    fn weighted_capacity_capabilities_runners_and_repos_defaults_and_overrides() {
+        let mut config = Config::default();
+        assert_eq!(default_weight_units(Some(16 << 30)), 8);
+        assert_eq!(default_weight_units(Some(48 << 30)), 24);
+        assert_eq!(default_weight_units(None), 8);
+        assert_eq!(effective_weight_units(&config, Some(4), None), 8);
+        assert_eq!(reserve_units(&config), 2);
+        assert_eq!(host_mem_gib(Some(16_303_412 * 1024)), Some(16));
+        assert_eq!(host_mem_gib(Some(48 << 30)), Some(48));
+
+        // runs_at_once derives weight_units = runs_at_once * 2 when weight_units is unset.
+        config.runs_at_once = std::num::NonZeroU32::new(6);
+        assert_eq!(effective_weight_units(&config, Some(4), None), 12);
+        // Explicit weight_units wins over runs_at_once.
+        config.weight_units = Some(10);
+        assert_eq!(effective_weight_units(&config, Some(4), None), 10);
+
+        // Capabilities include auto-detected os/arch plus deduped configured tags.
+        config.capabilities = vec![
+            "git:cloneable".into(),
+            "tool:xcode".into(),
+            "git:cloneable".into(),
+            format!("os:{}", host_os()),
+        ];
+        let caps = effective_capabilities(&config);
+        assert_eq!(caps[0], format!("os:{}", host_os()));
+        assert_eq!(caps[1], format!("arch:{}", host_arch()));
+        assert_eq!(caps.len(), 4);
+        assert!(caps.contains(&"git:cloneable".to_owned()));
+        assert!(caps.contains(&"tool:xcode".to_owned()));
+
+        // Runners and protocol features default cleanly and honor overrides.
+        assert_eq!(effective_runners(&config, "t3"), vec!["t3"]);
+        config.runners = vec!["acp".into(), "t3".into(), "acp".into()];
+        assert_eq!(effective_runners(&config, "t3"), vec!["acp", "t3"]);
+
+        assert_eq!(
+            effective_protocol_features(&config),
+            vec!["v1-json", "sse-v1"]
+        );
+        config.protocol_features = vec!["v1-json".into(), "run-events-v1".into()];
+        assert_eq!(
+            effective_protocol_features(&config),
+            vec!["v1-json", "run-events-v1"]
+        );
+
+        // Repos normalize keys from [projects].
+        config.projects.insert(
+            "https://github.com/Org/Agent-Board.git".into(),
+            PathBuf::from("/src/ab"),
+        );
+        config.projects.insert(
+            "github.com/org/agent-board".into(),
+            PathBuf::from("/src/ab2"),
+        );
+        assert_eq!(
+            configured_repos(&config),
+            vec!["github.com/org/agent-board"]
+        );
+
+        // Judge weights: review=2, verdict/triage/goal=1.
+        assert_eq!(cost_units_for_judge(JudgeKind::Review), 2);
+        assert_eq!(cost_units_for_judge(JudgeKind::Verdict), 1);
+        assert_eq!(cost_units_for_judge(JudgeKind::Triage), 1);
+        assert_eq!(cost_units_for_judge(JudgeKind::Goal), 1);
     }
 }

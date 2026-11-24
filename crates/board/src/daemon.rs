@@ -44,17 +44,20 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use board_proto::{
     AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
-    ClaimCoordinator, DeviceName, ErrorCode, Event, EventType, NoteKind, RegisterAgent, Runtime,
-    Task, TaskId, TaskStatus, Timestamp, Usage,
+    ClaimCoordinator, DeviceHeartbeat, DeviceName, ErrorCode, Event, EventType, NoteKind,
+    RegisterAgent, Runtime, Task, TaskId, TaskStatus, Timestamp, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, ServerError, TaskQuery, error_code, is_unreachable};
+use crate::client::{Client, RelayFailure, ServerError, TaskQuery, error_code, is_unreachable};
 use crate::config::{Config, Home};
 use crate::gh::{Gh, GhCli};
+use crate::local_db::{
+    LocalDb, LocalRunRecord, LocalRunState, ResourceEntry, ResourceOrigin, SqliteWorktreeStore,
+};
 use crate::ops::Ctx;
 use crate::runner::{
     RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerState, SteerMessage, T3Runner,
@@ -150,6 +153,9 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 /// A connection that stayed open this long resets the reconnect delay.
 const STREAM_HEALTHY: Duration = Duration::from_secs(60);
 
+/// How often `board watch` sends `PUT /v1/devices/{name}/heartbeat` (`docs/SCHEDULER_DESIGN.md`).
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
+
 /// How often the daemon acts, and how long each step may take, so a server or `t3` that
 /// stops answering holds up only that step. Tests shorten them.
 #[derive(Debug, Clone)]
@@ -158,6 +164,8 @@ pub struct Timing {
     pub reconcile_every: Duration,
     /// Queued wake-ups are sent this often.
     pub flush_every: Duration,
+    /// Device heartbeats (`PUT /v1/devices/{name}/heartbeat`) are sent this often.
+    pub heartbeat_every: Duration,
     /// An event stream with no bytes for this long (the server sends a keep-alive every 15
     /// seconds) is taken as dead and opened again after `last_seq`.
     pub stream_idle: Duration,
@@ -179,6 +187,7 @@ impl Default for Timing {
         Self {
             reconcile_every: Duration::from_secs(60),
             flush_every: Duration::from_secs(3),
+            heartbeat_every: HEARTBEAT_EVERY,
             stream_idle: Duration::from_secs(45),
             reconcile_budget: Duration::from_secs(90),
             flush_budget: Duration::from_secs(30),
@@ -406,6 +415,12 @@ pub struct Worker {
     /// Path of the daemon-managed worktree, when [`WorktreeManager`] created it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
+    /// Local run id in `daemon.db`'s `local_runs` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Weighted resource units accounted in `daemon.db`'s `resource_ledger`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_units: Option<u32>,
     pub started_at: Timestamp,
     /// Whether it has claimed the task: from then on, the task leaving its `doing` frees
     /// the slot.
@@ -1085,8 +1100,15 @@ pub(super) const WORKER_NOTE_IN_PLACE: &str =
 /// more turn for what the prompt already holds.
 const WAKE_END: &str = "Continue from this and the board delta in this prompt, if there is one.";
 
-/// What this device's daemon last saved.
+/// What this device's daemon last saved (from `daemon.db`, falling back to legacy
+/// `watch.json` when `daemon.db` does not exist yet).
 pub fn load_watch_state(home: &Home) -> WatchState {
+    let db_path = LocalDb::path_for(home);
+    if db_path.exists() {
+        return LocalDb::open_path(&db_path)
+            .and_then(|db| db.load_watch_state())
+            .unwrap_or_default();
+    }
     state::load_named(home, STATE_NAME)
 }
 
@@ -1128,6 +1150,12 @@ struct StartFailure {
 pub struct Daemon<T: T3 + 'static> {
     ctx: Ctx,
     t3: Arc<T>,
+    /// Local SQLite WAL database (`$BOARD_HOME/state/daemon.db`) holding write-ahead intent,
+    /// resource ledger, sticky wakes, unsure sends, worktrees, cursor, and outbox.
+    db: LocalDb,
+    /// Non-`None` when opening `$BOARD_HOME/state/daemon.db` failed and we fell back to an
+    /// in-memory DB so `Daemon::new` never panics while `save()` surfaces the failure.
+    db_open_error: Option<String>,
     /// Runtime-agnostic execution boundary for spawn/send/status/cancel/poll_events.
     runner: Box<dyn Runner>,
     /// Daemon-owned git worktree lifecycle manager (`$BOARD_HOME/worktrees/<repo-slug>/<id>`).
@@ -1170,6 +1198,11 @@ pub struct Daemon<T: T3 + 'static> {
     /// The runs this device may have at once when `runs_at_once` is not set; `None`
     /// leaves the device without a limit of its own.
     default_run_limit: Option<usize>,
+    /// Host memory in bytes (read once at startup in `run`, or injected in tests).
+    host_memory: Option<u64>,
+    /// Set once the server answers 404/405 to `PUT /v1/devices/{name}/heartbeat`, so older
+    /// servers are never spammed.
+    heartbeat_unsupported: bool,
     /// The boards that wait for one of the device's worker slots, and for a judge slot.
     worker_turns: device::Turns,
     judge_turns: device::Turns,
@@ -1187,15 +1220,36 @@ pub struct Daemon<T: T3 + 'static> {
 impl<T: T3 + 'static> Daemon<T> {
     /// A daemon acting as the device of `ctx` (whose client must carry no agent id).
     pub fn new(ctx: Ctx, t3: T) -> Self {
-        // A file it cannot read is kept aside rather than lost on the next save.
-        let state = state::load_named_keeping_unreadable(&ctx.home, STATE_NAME);
+        let (db, db_open_error) = match LocalDb::open_for_home(&ctx.home) {
+            Ok(db) => (db, None),
+            Err(err) => {
+                let msg = format!("opening daemon.db: {err:#}");
+                tracing::warn!("{msg}; falling back to in-memory daemon state");
+                (
+                    LocalDb::open_in_memory().expect("opening in-memory SQLite database"),
+                    Some(msg),
+                )
+            }
+        };
+        let state = match db.load_watch_state() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("loading state from daemon.db ({err:#}); starting fresh");
+                WatchState::default()
+            }
+        };
         let config_text = std::fs::read_to_string(ctx.home.config_path()).ok();
         let t3 = Arc::new(t3);
         let runner: Box<dyn Runner> = Box::new(T3Runner::new(Arc::clone(&t3), ctx.home.clone()));
-        let worktrees = WorktreeManager::for_home(ctx.home.clone());
+        let worktrees = WorktreeManager::with_store(
+            ctx.home.clone(),
+            Arc::new(SqliteWorktreeStore::new(db.clone())),
+        );
         Self {
             ctx,
             t3,
+            db,
+            db_open_error,
             runner,
             worktrees,
             daemon_worktrees: false,
@@ -1216,12 +1270,27 @@ impl<T: T3 + 'static> Daemon<T> {
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
             default_run_limit: None,
+            host_memory: None,
+            heartbeat_unsupported: false,
             worker_turns: device::Turns::default(),
             judge_turns: device::Turns::default(),
             verdict_turns: device::Turns::default(),
             last_pass: None,
             running: None,
         }
+    }
+
+    /// The local SQLite WAL database (`$BOARD_HOME/state/daemon.db`).
+    pub fn db(&self) -> &LocalDb {
+        &self.db
+    }
+
+    /// Supplies the host's physical memory in bytes for capacity reporting in device
+    /// heartbeats.
+    #[must_use]
+    pub fn with_host_memory(mut self, bytes: Option<u64>) -> Self {
+        self.host_memory = bytes;
+        self
     }
 
     /// Replaces the daemon's execution [`Runner`]. Non-T3 runners automatically use
@@ -1350,7 +1419,9 @@ impl<T: T3 + 'static> Daemon<T> {
     /// start it decides on. A device without a limit reads none. Non-T3 runners do not
     /// query T3's project thread listing.
     async fn read_running(&mut self) {
-        if self.running.is_none() && self.run_limit() != usize::MAX {
+        if self.running.is_none()
+            && (self.run_limit() != usize::MAX || self.ctx.config.weight_units.is_some())
+        {
             if self.runner.kind() != "t3" {
                 self.running = Some(device::Running::default());
                 return;
@@ -1480,6 +1551,26 @@ impl<T: T3 + 'static> Daemon<T> {
             current.reserve_runs = new.reserve_runs;
             tracing::info!("re-read {}: reserve_runs updated", path.display());
         }
+        if (
+            new.weight_units,
+            &new.capabilities,
+            &new.runners,
+            &new.protocol_features,
+        ) != (
+            current.weight_units,
+            &current.capabilities,
+            &current.runners,
+            &current.protocol_features,
+        ) {
+            current.weight_units = new.weight_units;
+            current.capabilities = new.capabilities;
+            current.runners = new.runners;
+            current.protocol_features = new.protocol_features;
+            tracing::info!(
+                "re-read {}: device capacity/capabilities updated",
+                path.display()
+            );
+        }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
                 &current.projects,
@@ -1577,7 +1668,202 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     pub fn save(&self) -> Result<()> {
-        state::save_named(&self.ctx.home, STATE_NAME, &self.state)
+        self.save_at(Utc::now())
+    }
+
+    pub(super) fn save_at(&self, now: Timestamp) -> Result<()> {
+        if let Some(err) = &self.db_open_error {
+            anyhow::bail!("{err}");
+        }
+        self.db.save_watch_state(&self.state, now)
+    }
+
+    /// Writes a Trail Rule record to `$BOARD_HOME/state/daemon-drops.jsonl` before dropping,
+    /// holding, refusing, or giving back work (`docs/DESIGN.md`, "The trail rule",
+    /// `agent-board-539`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_drop(
+        &self,
+        kind: &str,
+        board: Option<&BoardSlug>,
+        task: Option<&TaskId>,
+        agent: Option<&AgentId>,
+        cause: &str,
+        subject: serde_json::Value,
+        now: Timestamp,
+    ) {
+        let record = serde_json::json!({
+            "at": now,
+            "kind": kind,
+            "device": self.ctx.device,
+            "board": board,
+            "task": task,
+            "agent": agent,
+            "cause": cause,
+            "subject": subject,
+        });
+        if let Err(err) = state::append_daemon_drop(&self.ctx.home, &record) {
+            tracing::warn!("recording trail drop {kind}: {err:#}");
+        }
+    }
+
+    /// Synchronizes live managed runs (workers + judges) and detected interactive turns into
+    /// `daemon.db`'s `resource_ledger` table so `free_units` stays accurate for weighted
+    /// capacity enforcement and device heartbeats.
+    pub(super) fn sync_resource_ledger(&self, now: Timestamp) {
+        let mut managed = Vec::new();
+        for (task, worker) in &self.state.workers {
+            if !self.counts_runs(&task.board()) {
+                continue;
+            }
+            let agent_id = worker.thread.as_deref().and_then(|thread| {
+                RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), thread)
+                    .resolve_agent_id()
+                    .ok()
+                    .map(|id| id.to_string())
+            });
+            managed.push(ResourceEntry {
+                entry_id: format!("worker:{task}"),
+                origin: ResourceOrigin::Managed,
+                agent_id,
+                run_id: worker.run_id.clone(),
+                cost_units: worker.cost_units.unwrap_or(device::STANDARD_RUN_UNITS),
+                updated_at: now,
+            });
+        }
+        for judge in &self.state.judges {
+            if !self.counts_judges(&judge.board) {
+                continue;
+            }
+            let agent_id = judge.thread.as_deref().and_then(|thread| {
+                RunHandle::new(judge.runner.as_deref().unwrap_or("t3"), thread)
+                    .resolve_agent_id()
+                    .ok()
+                    .map(|id| id.to_string())
+            });
+            managed.push(ResourceEntry {
+                entry_id: format!(
+                    "judge:{}:{}:{}",
+                    judge.board,
+                    judge.title,
+                    judge.started_at.timestamp_millis()
+                ),
+                origin: ResourceOrigin::Managed,
+                agent_id,
+                run_id: judge.run_id.clone(),
+                cost_units: device::cost_units_for_judge(judge.kind),
+                updated_at: now,
+            });
+        }
+        if let Err(err) = self
+            .db
+            .replace_resources_by_origin(ResourceOrigin::Managed, &managed)
+        {
+            tracing::warn!("syncing managed resource_ledger entries: {err:#}");
+        }
+        if self.running.is_some() {
+            let interactive: Vec<ResourceEntry> = self
+                .other_turns()
+                .into_iter()
+                .map(|thread| ResourceEntry {
+                    entry_id: format!("interactive:{thread}"),
+                    origin: ResourceOrigin::Interactive,
+                    agent_id: Some(format!("t3:{thread}")),
+                    run_id: None,
+                    cost_units: device::STANDARD_RUN_UNITS,
+                    updated_at: now,
+                })
+                .collect();
+            if let Err(err) = self
+                .db
+                .replace_resources_by_origin(ResourceOrigin::Interactive, &interactive)
+            {
+                tracing::warn!("syncing interactive resource_ledger entries: {err:#}");
+            }
+        }
+    }
+
+    /// Maximum weighted capacity units when this device has a bounded limit (`weight_units`,
+    /// `runs_at_once`, or `default_run_limit`), or `None` when unlimited.
+    fn bounded_weight_units(&self) -> Option<u32> {
+        if self.ctx.config.weight_units.is_some() || self.run_limit() != usize::MAX {
+            Some(device::effective_weight_units(
+                &self.ctx.config,
+                self.default_run_limit,
+                self.host_memory,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a run costing `needed_units` exceeds the weighted budget in `resource_ledger`.
+    /// Enforced whenever `config.weight_units` is configured or the run declares a non-standard
+    /// weight (`light=1` / `heavy=4` / explicit `resource_units`) on a bounded device.
+    pub(super) fn weighted_full(&self, needed_units: u32, explicit_weight: bool) -> bool {
+        if self.ctx.config.weight_units.is_none() && !explicit_weight {
+            return false;
+        }
+        let Some(max_units) = self.bounded_weight_units() else {
+            return false;
+        };
+        let reserve = device::reserve_units(&self.ctx.config);
+        match self.db.free_units(max_units, reserve) {
+            Ok(free) => needed_units > free,
+            Err(err) => {
+                tracing::warn!("reading free_units from resource_ledger: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Builds the [`DeviceHeartbeat`] payload for `PUT /v1/devices/{name}/heartbeat` from
+    /// host metadata, `[projects]`, config, and `daemon.db`'s live `resource_ledger`.
+    pub fn build_heartbeat(&self) -> DeviceHeartbeat {
+        let capacity =
+            device::device_capacity(&self.ctx.config, self.default_run_limit, self.host_memory);
+        let reserve = device::reserve_units(&self.ctx.config);
+        let free_units = self
+            .db
+            .free_units(capacity.weight_units, reserve)
+            .unwrap_or(0);
+        DeviceHeartbeat {
+            os: Some(device::host_os().to_owned()),
+            arch: Some(device::host_arch().to_owned()),
+            capacity: Some(capacity),
+            free_units: Some(free_units),
+            capabilities: device::effective_capabilities(&self.ctx.config),
+            runners: device::effective_runners(&self.ctx.config, self.runner.kind()),
+            repos: device::configured_repos(&self.ctx.config),
+            protocol_features: device::effective_protocol_features(&self.ctx.config),
+        }
+    }
+
+    /// Sends one `PUT /v1/devices/{name}/heartbeat` update. Returns `Ok(true)` when accepted,
+    /// `Ok(false)` when gracefully disabled after a 404/405 from an older server, or `Err` on
+    /// transient/auth failures (callers in the daemon loop log and continue without blocking
+    /// dispatch).
+    pub async fn send_heartbeat(&mut self, now: Timestamp) -> Result<bool> {
+        if self.heartbeat_unsupported {
+            return Ok(false);
+        }
+        self.sync_resource_ledger(now);
+        let body = self.build_heartbeat();
+        match self
+            .client()
+            .device_heartbeat(&self.ctx.device, &body)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_heartbeat_unsupported(&err) => {
+                self.heartbeat_unsupported = true;
+                tracing::warn!(
+                    "device heartbeat endpoint unsupported by server ({err:#}); disabling periodic heartbeats until restart"
+                );
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn client(&self) -> &Client {
@@ -1639,18 +1925,39 @@ impl<T: T3 + 'static> Daemon<T> {
                     off_autopilot.push(board);
                 } else if !board.autopilot && !board.verdict_judges {
                     // Turning verdict judges off ends lease-less judge rights on the
-                    // server; drop tracked runs so they neither leak in watch.json nor
+                    // server; drop tracked runs so they neither leak in daemon.db nor
                     // trigger a spurious JUDGE_RETRY delay if re-enabled later.
-                    let dropped: Vec<String> = self
+                    let dropped: Vec<JudgeRun> = self
                         .state
                         .judges
                         .iter()
                         .filter(|r| r.board == board.slug)
-                        .filter_map(|r| r.worktree_id.clone())
+                        .cloned()
                         .collect();
+                    for run in &dropped {
+                        self.record_drop(
+                            "reconcile_dropped_judge",
+                            Some(&board.slug),
+                            run.tasks.first(),
+                            None,
+                            "autopilot and verdict_judges are both disabled on this board",
+                            serde_json::to_value(run).unwrap_or_default(),
+                            now,
+                        );
+                        if let Some(run_id) = run.run_id.as_deref() {
+                            let _ = self.db.update_local_run_state(
+                                run_id,
+                                LocalRunState::Cancelled,
+                                None,
+                                now,
+                            );
+                        }
+                    }
                     self.state.judges.retain(|r| r.board != board.slug);
-                    for wt_id in dropped {
-                        self.cleanup_worktree(&wt_id, now).await;
+                    for run in dropped {
+                        if let Some(wt_id) = run.worktree_id.as_deref() {
+                            self.cleanup_worktree(wt_id, now).await;
+                        }
                     }
                 }
                 continue;
@@ -1674,23 +1981,90 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let boards = &self.boards;
         self.failures.retain(|slug, _| boards.contains_key(slug));
-        let mut dropped_worktrees: Vec<String> = self
+        let dropped_workers: Vec<(TaskId, Worker)> = self
             .state
             .workers
             .iter()
             .filter(|(task, _)| !boards.contains_key(&task.board()))
-            .filter_map(|(_, w)| w.worktree_id.clone())
+            .map(|(task, w)| (task.clone(), w.clone()))
             .collect();
+        let dropped_judges: Vec<JudgeRun> = self
+            .state
+            .judges
+            .iter()
+            .filter(|r| !boards.contains_key(&r.board))
+            .cloned()
+            .collect();
+        let dropped_owed: Vec<(Owed, &'static str)> = self
+            .state
+            .owed
+            .iter()
+            .filter_map(|step| {
+                if !boards.contains_key(step.board()) {
+                    Some((step.clone(), "board no longer present on server"))
+                } else if now - step.at() >= WAKE_TTL {
+                    Some((step.clone(), "owed step exceeded WAKE_TTL before reconcile"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut dropped_worktrees: Vec<String> = Vec::new();
+        for (task, worker) in &dropped_workers {
+            let board_slug = task.board();
+            self.record_drop(
+                "reconcile_dropped_worker",
+                Some(&board_slug),
+                Some(task),
+                None,
+                "board no longer present on server",
+                serde_json::to_value(worker).unwrap_or_default(),
+                now,
+            );
+            let _ =
+                self.db
+                    .finish_local_runs_for_task("worker", task, LocalRunState::Cancelled, now);
+            if let Some(wt_id) = worker.worktree_id.clone() {
+                dropped_worktrees.push(wt_id);
+            }
+        }
+        for run in &dropped_judges {
+            self.record_drop(
+                "reconcile_dropped_judge",
+                Some(&run.board),
+                run.tasks.first(),
+                None,
+                "board no longer present on server",
+                serde_json::to_value(run).unwrap_or_default(),
+                now,
+            );
+            if let Some(run_id) = run.run_id.as_deref() {
+                let _ = self
+                    .db
+                    .update_local_run_state(run_id, LocalRunState::Cancelled, None, now);
+            }
+            if let Some(wt_id) = run.worktree_id.clone() {
+                dropped_worktrees.push(wt_id);
+            }
+        }
+        for (step, cause) in &dropped_owed {
+            self.record_drop(
+                "reconcile_dropped_owed",
+                Some(step.board()),
+                match step {
+                    Owed::Release { task, .. } => Some(task),
+                    Owed::Answer { .. } => None,
+                },
+                None,
+                cause,
+                serde_json::to_value(step).unwrap_or_default(),
+                now,
+            );
+        }
+        let boards = &self.boards;
         self.state
             .workers
             .retain(|task, _| boards.contains_key(&task.board()));
-        dropped_worktrees.extend(
-            self.state
-                .judges
-                .iter()
-                .filter(|r| !boards.contains_key(&r.board))
-                .filter_map(|r| r.worktree_id.clone()),
-        );
         self.state.judges.retain(|r| boards.contains_key(&r.board));
         for wt_id in dropped_worktrees {
             self.cleanup_worktree(&wt_id, now).await;
@@ -1713,7 +2087,8 @@ impl<T: T3 + 'static> Daemon<T> {
             .retain(|_, at| now - *at < USAGE_STOP_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
-        self.save()
+        self.sync_resource_ledger(now);
+        self.save_at(now)
     }
 
     /// Whether the active [`Runner`] has `thread` and can run it: not archived/cancelled,
@@ -2064,19 +2439,40 @@ impl<T: T3 + 'static> Daemon<T> {
                 .cloned()
                 .collect();
             if others.is_empty() {
+                let retry_at = now + WORKER_RETRY;
                 tracing::warn!(
-                    "the worker of {task} left it open; no new worker for it before {}",
-                    now + WORKER_RETRY
+                    "the worker of {task} left it open; no new worker for it before {retry_at}"
                 );
-                self.state.worker_retry.insert(task, now + WORKER_RETRY);
+                self.record_drop(
+                    "worker_give_back",
+                    Some(slug),
+                    Some(&task),
+                    None,
+                    &format!(
+                        "worker left task open with no other tasks in progress; waiting {}s until {retry_at}",
+                        WORKER_RETRY.num_seconds()
+                    ),
+                    serde_json::json!({ "task": task, "retry_at": retry_at }),
+                    now,
+                );
+                self.state.worker_retry.insert(task, retry_at);
             } else {
+                let names: Vec<&str> = others.iter().map(|t| t.as_str()).collect();
                 tracing::info!(
                     "the worker of {task} left it open beside {}; it starts again once one of them ends",
-                    others
-                        .iter()
-                        .map(|t| t.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    names.join(", ")
+                );
+                self.record_drop(
+                    "worker_give_back",
+                    Some(slug),
+                    Some(&task),
+                    None,
+                    &format!(
+                        "worker left task open beside {} other in-progress task(s); waiting until one ends",
+                        others.len()
+                    ),
+                    serde_json::json!({ "task": task, "waiting_on": others }),
+                    now,
                 );
                 self.state.worker_skips.insert(task, others);
             }
@@ -2087,7 +2483,7 @@ impl<T: T3 + 'static> Daemon<T> {
         self.state
             .idle_notices
             .retain(|task, _| task.board() != *slug || in_progress.contains_key(task));
-        self.save()?;
+        self.save_at(now)?;
         // A failure here leaves the workers their turn.
         if let Err(err) = self
             .judge_and_close(board, &agent, judges::Judging::All, in_progress.len(), now)
@@ -2095,11 +2491,36 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             tracing::warn!("the judges and reviewed tasks of {slug}: {err:#}");
         }
-        self.save()?;
+        self.save_at(now)?;
         // The board asks again below if it still wants one of the device's slots.
         let mut waited = self.worker_turns.take(slug);
         let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
-        if in_progress.len() >= slots || self.usage_holds(slug, now) {
+        if self.usage_holds(slug, now) {
+            let hold_key = format!("usage_hold worker {slug}");
+            if !self.state.holds.contains_key(&hold_key) {
+                self.record_drop(
+                    "usage_hold",
+                    Some(slug),
+                    None,
+                    Some(&agent),
+                    &format!(
+                        "usage holds worker dispatch on {slug} (usage_stop_at={}, pace_limit={slots})",
+                        board.usage_stop_at
+                    ),
+                    serde_json::json!({
+                        "kind": "worker",
+                        "board": slug,
+                        "usage_stop_at": board.usage_stop_at,
+                        "pace_limit": slots,
+                    }),
+                    now,
+                );
+                self.state.holds.insert(hold_key, now);
+            }
+            return Ok(());
+        }
+        self.hold_ended("usage_hold", &format!("worker {slug}"));
+        if in_progress.len() >= slots {
             return Ok(());
         }
         if let Some(failure) = self.failures.get(slug)
@@ -2121,11 +2542,15 @@ impl<T: T3 + 'static> Daemon<T> {
             // The device's limit holds across boards, and the board that waited longest
             // for a slot gets the next one.
             self.read_running().await;
+            self.sync_resource_ledger(now);
             let daemon_limit = self.daemon_run_limit();
             let limit = device::worker_limit(daemon_limit);
+            let needed_units = device::cost_units_for_task(&task);
+            let explicit_weight = task.weight.is_some() || task.resource_units.is_some();
             if self.load_unknown().is_some()
                 || self.worker_runs() >= limit
                 || self.runs() >= daemon_limit
+                || self.weighted_full(needed_units, explicit_weight)
                 || self.worker_turns.another_first(slug, waited)
             {
                 let load = self.load();
@@ -2249,12 +2674,29 @@ impl<T: T3 + 'static> Daemon<T> {
                 if !named {
                     tracing::info!("{agent} dispatches {slug}");
                 }
+                self.hold_ended("claim_refused", slug.as_str());
                 self.boards.insert(slug.clone(), updated);
                 self.dispatch_renewed.insert(slug.clone(), now);
                 Ok(true)
             }
             Err(err) if error_code(&err) == Some(ErrorCode::ClaimRefused) => {
                 self.dispatch_renewed.remove(slug);
+                let hold_key = format!("claim_refused {slug}");
+                if !self.state.holds.contains_key(&hold_key) {
+                    self.record_drop(
+                        "claim_refused",
+                        Some(slug),
+                        None,
+                        Some(agent),
+                        &format!("coordinator claim refused for {slug}: {err:#}"),
+                        serde_json::json!({
+                            "board": slug,
+                            "coordinator": board.coordinator,
+                        }),
+                        now,
+                    );
+                    self.state.holds.insert(hold_key, now);
+                }
                 Ok(false)
             }
             Err(err) => {
@@ -2322,6 +2764,19 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.state.workers.insert(task.clone(), worker);
             } else {
                 self.state.workers.remove(&task);
+                if let Some(run_id) = worker.run_id.as_deref() {
+                    let _ =
+                        self.db
+                            .update_local_run_state(run_id, LocalRunState::Finished, None, now);
+                } else {
+                    let _ = self.db.finish_local_runs_for_task(
+                        "worker",
+                        &task,
+                        LocalRunState::Finished,
+                        now,
+                    );
+                }
+                self.sync_resource_ledger(now);
                 if let Some(wt_id) = worker.worktree_id.as_deref() {
                     self.cleanup_worktree(wt_id, now).await;
                 }
@@ -2556,52 +3011,106 @@ impl<T: T3 + 'static> Daemon<T> {
         let title = format!("{} {}", task.id, task.title);
         let brief = crate::brief::worker_brief(&board.slug, &task.id, crate::brief::WORKER_CLOSER);
         let run_id = format!("worker-{}-{}", task.id, now.format("%Y%m%d-%H%M%S"));
-        let (workdir, spec_worktree, branch, worktree_id, worktree_path) = if self.daemon_worktrees
-            && let Some(spec) = &worktree
-        {
-            let managed = self
-                .worktrees
-                .create(&project, repo_key.as_deref(), &run_id, spec, now)
-                .await
-                .context("creating daemon-managed worker worktree")?;
-            (
-                managed.path.clone(),
-                None,
-                Some(managed.branch),
-                Some(managed.id),
-                Some(managed.path),
-            )
-        } else {
-            (
-                project.clone(),
-                worktree.clone(),
-                worktree.as_ref().map(|w| w.branch.clone()),
-                None,
-                None,
-            )
-        };
+        let cost_units = device::cost_units_for_task(task);
+        let intended_branch = worktree.as_ref().map(|w| w.branch.clone());
+
+        // Write-before-act: persist local_runs intent and worker record naming the planned
+        // branch into daemon.db BEFORE creating any git worktree or spawning the runner
+        // (docs/SCHEDULER_DESIGN.md Section 4.1, agent-board-539).
         let mut worker = Worker {
             thread: None,
-            title,
-            branch,
+            title: title.clone(),
+            branch: intended_branch.clone(),
             runner: Some(self.runner.kind().to_owned()),
-            worktree_id,
-            worktree_path,
+            worktree_id: None,
+            worktree_path: None,
+            run_id: Some(run_id.clone()),
+            cost_units: Some(cost_units),
             started_at: now,
             claimed: false,
             noted: false,
         };
-        // On disk before the runner can create the session/thread.
+        let mut local_run = LocalRunRecord {
+            run_id: run_id.clone(),
+            task_id: Some(task.id.clone()),
+            board: board.slug.clone(),
+            kind: "worker".to_owned(),
+            runner: self.runner.kind().to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: intended_branch,
+            cost_units,
+            pid: None,
+            state: LocalRunState::Intent,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: serde_json::to_string(&worker).ok(),
+        };
+        self.db.upsert_local_run(&local_run)?;
         self.state.workers.insert(task.id.clone(), worker.clone());
-        if let Err(err) = self.save() {
+        if let Err(err) = self.save_at(now) {
             self.state.workers.remove(&task.id);
-            if let Some(wt_id) = worker.worktree_id.as_deref() {
-                self.cleanup_worktree(wt_id, now).await;
-            }
+            let _ = self
+                .db
+                .update_local_run_state(&run_id, LocalRunState::Failed, None, now);
             return Err(err);
         }
+        self.sync_resource_ledger(now);
+
+        let (workdir, spec_worktree) = if self.daemon_worktrees
+            && let Some(spec) = &worktree
+        {
+            match self
+                .worktrees
+                .create(&project, repo_key.as_deref(), &run_id, spec, now)
+                .await
+            {
+                Ok(managed) => {
+                    worker.branch = Some(managed.branch.clone());
+                    worker.worktree_id = Some(managed.id);
+                    worker.worktree_path = Some(managed.path.clone());
+                    local_run.branch = Some(managed.branch);
+                    local_run.worktree_path = Some(managed.path.clone());
+                    local_run.state = LocalRunState::Starting;
+                    local_run.updated_at = now;
+                    local_run.meta_json = serde_json::to_string(&worker).ok();
+                    self.db.upsert_local_run(&local_run)?;
+                    self.state.workers.insert(task.id.clone(), worker.clone());
+                    if let Err(err) = self.save_at(now) {
+                        self.state.workers.remove(&task.id);
+                        let _ = self.db.update_local_run_state(
+                            &run_id,
+                            LocalRunState::Failed,
+                            None,
+                            now,
+                        );
+                        self.sync_resource_ledger(now);
+                        if let Some(wt_id) = worker.worktree_id.as_deref() {
+                            self.cleanup_worktree(wt_id, now).await;
+                        }
+                        return Err(err);
+                    }
+                    (managed.path, None)
+                }
+                Err(err) => {
+                    self.state.workers.remove(&task.id);
+                    let _ =
+                        self.db
+                            .update_local_run_state(&run_id, LocalRunState::Failed, None, now);
+                    self.sync_resource_ledger(now);
+                    let _ = self.save_at(now);
+                    return Err(err.context("creating daemon-managed worker worktree"));
+                }
+            }
+        } else {
+            local_run.state = LocalRunState::Starting;
+            local_run.updated_at = now;
+            self.db.upsert_local_run(&local_run)?;
+            (project.clone(), worktree.clone())
+        };
         let spec = RunSpec {
-            run_id,
+            run_id: run_id.clone(),
             title: worker.title.clone(),
             prompt: brief,
             model: self.ctx.config.thread_model.clone(),
@@ -2644,13 +3153,21 @@ impl<T: T3 + 'static> Daemon<T> {
             );
         }
         worker.thread = Some(thread.clone());
-        worker.runner = Some(handle.runner);
+        worker.runner = Some(handle.runner.clone());
+        local_run.session_id = Some(thread.clone());
+        local_run.runner = handle.runner;
+        local_run.state = LocalRunState::Running;
+        local_run.updated_at = now;
+        local_run.meta_json = serde_json::to_string(&worker).ok();
+        self.db.upsert_local_run(&local_run)?;
         self.state.workers.insert(task.id.clone(), worker.clone());
-        self.save()?;
+        self.sync_resource_ledger(now);
+        self.save_at(now)?;
         match self.note_worker(&task.id, &thread, &worker, agent).await {
             Ok(()) => {
                 worker.noted = true;
                 self.state.workers.insert(task.id.clone(), worker);
+                let _ = self.save_at(now);
             }
             // Noted on a later reconcile.
             Err(err) => tracing::warn!("noting worker thread {thread} on {}: {err:#}", task.id),
@@ -2823,15 +3340,39 @@ impl<T: T3 + 'static> Daemon<T> {
         for mut step in steps {
             let keep = if now - step.at() >= WAKE_TTL {
                 tracing::warn!("dispatcher of {slug}: {step:?} was not done in time; dropped");
+                self.record_drop(
+                    "owed_expired",
+                    Some(slug),
+                    match &step {
+                        Owed::Release { task, .. } => Some(task),
+                        Owed::Answer { .. } => None,
+                    },
+                    Some(agent),
+                    &format!(
+                        "owed step exceeded WAKE_TTL ({}s) before completion",
+                        WAKE_TTL.num_seconds()
+                    ),
+                    serde_json::to_value(&step).unwrap_or_default(),
+                    now,
+                );
                 false
             } else {
                 match self.pay(&mut step, agent, now).await {
                     Ok(Paid::Opened(task)) => {
                         // It starts again at once, with a new worker.
-                        if let Some(worker) = self.state.workers.remove(&task)
-                            && let Some(wt_id) = worker.worktree_id.as_deref()
-                        {
-                            self.cleanup_worktree(wt_id, now).await;
+                        if let Some(worker) = self.state.workers.remove(&task) {
+                            if let Some(run_id) = worker.run_id.as_deref() {
+                                let _ = self.db.update_local_run_state(
+                                    run_id,
+                                    LocalRunState::Finished,
+                                    None,
+                                    now,
+                                );
+                            }
+                            self.sync_resource_ledger(now);
+                            if let Some(wt_id) = worker.worktree_id.as_deref() {
+                                self.cleanup_worktree(wt_id, now).await;
+                            }
                         }
                         self.state.worker_skips.remove(&task);
                         self.state.worker_retry.remove(&task);
@@ -2846,6 +3387,18 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                     Err(err) => {
                         tracing::warn!("dispatcher of {slug}: {err:#}; dropped");
+                        self.record_drop(
+                            "owed_failed",
+                            Some(slug),
+                            match &step {
+                                Owed::Release { task, .. } => Some(task),
+                                Owed::Answer { .. } => None,
+                            },
+                            Some(agent),
+                            &format!("non-transient error paying owed step: {err:#}"),
+                            serde_json::to_value(&step).unwrap_or_default(),
+                            now,
+                        );
                         false
                     }
                 }
@@ -2858,11 +3411,23 @@ impl<T: T3 + 'static> Daemon<T> {
             } else {
                 self.state.owed.remove(at);
             }
+            let _ = self.save_at(now);
+        }
+    }
+
+    /// Persists an updated `step` in `self.state.owed` and `daemon.db` before taking the next
+    /// action so a crash between noting and releasing never duplicates the board note.
+    fn persist_owed_step(&mut self, step: &Owed, now: Timestamp) {
+        if let Some(at) = self.state.owed.iter().position(|o| o.same(step)) {
+            self.state.owed[at] = step.clone();
+            if let Err(err) = self.save_at(now) {
+                tracing::warn!("persisting owed step before release: {err:#}");
+            }
         }
     }
 
     /// Does one owed step, as of `now`.
-    async fn pay(&self, step: &mut Owed, agent: &AgentId, now: Timestamp) -> Result<Paid> {
+    async fn pay(&mut self, step: &mut Owed, agent: &AgentId, now: Timestamp) -> Result<Paid> {
         let client = self.client().with_agent(Some(agent.clone()));
         match step {
             Owed::Answer {
@@ -2872,23 +3437,28 @@ impl<T: T3 + 'static> Daemon<T> {
                 noted,
                 ..
             } => {
+                let ask_id = *ask;
+                let asker_id = asker.clone();
+                let check_gone_flag = *check_gone;
+                let already_noted = *noted;
                 let found = client
-                    .ask(*ask)
+                    .ask(ask_id)
                     .await
-                    .with_context(|| format!("reading ask #{ask}"))?;
+                    .with_context(|| format!("reading ask #{ask_id}"))?;
                 let (Some(task), Some(answer)) = (found.task, found.answer) else {
                     return Ok(Paid::Nothing);
                 };
                 // An asker still present may read the answer, or end without it.
-                if *check_gone && !gone(&client, asker).await? {
+                if check_gone_flag && !gone(&client, &asker_id).await? {
                     return Ok(Paid::Later);
                 }
-                if !*noted {
+                if !already_noted {
                     let text = clip_note(format!(
-                        "decision: the user answered ask #{ask} from {asker}, which cannot be woken: {answer}"
+                        "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
                     ));
                     add_note(&client, &task, agent, NoteKind::Decision, text).await?;
                     *noted = true;
+                    self.persist_owed_step(step, now);
                 }
                 let current = match client.task(&task).await {
                     Ok(detail) => detail.task,
@@ -2900,15 +3470,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 let held = matches!(
                     current.status,
                     TaskStatus::Doing | TaskStatus::Blocked | TaskStatus::Review
-                ) && current.owner.as_ref().is_none_or(|o| o == asker);
+                ) && current.owner.as_ref().is_none_or(|o| o == &asker_id);
                 if !held {
                     return Ok(Paid::Nothing);
                 }
                 client
                     .task_action(&task, "release")
                     .await
-                    .with_context(|| format!("setting {task} open after ask #{ask}"))?;
-                tracing::info!("{task}: ask #{ask} answered for gone {asker}; set open");
+                    .with_context(|| format!("setting {task} open after ask #{ask_id}"))?;
+                tracing::info!("{task}: ask #{ask_id} answered for gone {asker_id}; set open");
                 Ok(Paid::Opened(task))
             }
             Owed::Release {
@@ -2919,25 +3489,30 @@ impl<T: T3 + 'static> Daemon<T> {
                 noted,
                 ..
             } => {
+                let task_id = task.clone();
+                let away_id = away.clone();
+                let since_at = *since;
+                let noticed_at = *noticed;
+                let already_noted = *noted;
                 // The repeat notice also wakes the owner: it may still come back.
-                if now - *noticed < RELEASE_GRACE {
+                if now - noticed_at < RELEASE_GRACE {
                     return Ok(Paid::Later);
                 }
-                let current = match client.task(task).await {
+                let current = match client.task(&task_id).await {
                     Ok(detail) => detail.task,
                     Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
                         return Ok(Paid::Nothing);
                     }
                     Err(err) => return Err(err),
                 };
-                if current.status != TaskStatus::Doing || current.owner.as_ref() != Some(away) {
+                if current.status != TaskStatus::Doing || current.owner.as_ref() != Some(&away_id) {
                     return Ok(Paid::Nothing);
                 }
-                if self.back_since(away, *noticed).await? {
+                if self.back_since(&away_id, noticed_at).await? {
                     return Ok(Paid::Nothing);
                 }
-                if !*noted {
-                    let info = match client.agent_info(away).await {
+                if !already_noted {
+                    let info = match client.agent_info(&away_id).await {
                         Ok(info) => Some(info),
                         Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
                         Err(err) => return Err(err),
@@ -2945,11 +3520,11 @@ impl<T: T3 + 'static> Daemon<T> {
                     let thread = info
                         .as_ref()
                         .and_then(|i| i.native_ids.get("t3_link"))
-                        .map_or_else(|| away.to_string(), |link| format!("{away} ({link})"));
+                        .map_or_else(|| away_id.to_string(), |link| format!("{away_id} ({link})"));
                     let branch = self
                         .state
                         .workers
-                        .get(task)
+                        .get(&task_id)
                         .and_then(|w| w.branch.clone())
                         .or_else(|| info.and_then(|i| i.branch))
                         .map_or_else(|| "none recorded".to_owned(), |b| format!("`{b}`"));
@@ -2957,17 +3532,18 @@ impl<T: T3 + 'static> Daemon<T> {
                         "note: the owner was away from this task since {} and still was after the \
                          server's repeat notice, or its thread is gone, so the dispatcher set it \
                          open for a new worker. Old thread: {thread}. Branch: {branch}.",
-                        since.format("%Y-%m-%d %H:%MZ")
+                        since_at.format("%Y-%m-%d %H:%MZ")
                     ));
-                    add_note(&client, task, agent, NoteKind::Note, text).await?;
+                    add_note(&client, &task_id, agent, NoteKind::Note, text).await?;
                     *noted = true;
+                    self.persist_owed_step(step, now);
                 }
                 client
-                    .task_action(task, "release")
+                    .task_action(&task_id, "release")
                     .await
-                    .with_context(|| format!("setting {task} open from away {away}"))?;
-                tracing::info!("{task}: {away} away since {since}; set open");
-                Ok(Paid::Opened(task.clone()))
+                    .with_context(|| format!("setting {task_id} open from away {away_id}"))?;
+                tracing::info!("{task_id}: {away_id} away since {since_at}; set open");
+                Ok(Paid::Opened(task_id))
             }
         }
     }
@@ -3170,6 +3746,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             Some(None) | None => {}
         }
+        let mut expired_unsure = Vec::new();
         for (agent, unsure) in &mut self.state.unsure_wakes {
             unsure.messages.retain(|m| {
                 let live = now - m.since < WAKE_TTL;
@@ -3178,9 +3755,25 @@ impl<T: T3 + 'static> Daemon<T> {
                         "waking {agent}: a timed-out message was not found in time; what it \
                          carried is dropped"
                     );
+                    expired_unsure.push((agent.clone(), m.clone()));
                 }
                 live
             });
+        }
+        for (agent, msg) in expired_unsure {
+            self.record_drop(
+                "unsure_wake_expired",
+                msg.wakes.first().map(|w| &w.board),
+                None,
+                Some(&agent),
+                &format!(
+                    "timed-out wake-up message {} was not confirmed within WAKE_TTL ({}s)",
+                    msg.digest,
+                    WAKE_TTL.num_seconds()
+                ),
+                serde_json::to_value(&msg).unwrap_or_default(),
+                now,
+            );
         }
         self.state
             .unsure_wakes
@@ -3251,6 +3844,32 @@ impl<T: T3 + 'static> Daemon<T> {
                 outgoing.push(out);
             }
         }
+        // Write-before-act: durably commit `unsure_sends` and updated `sticky_wakes` to
+        // `daemon.db` (`PRAGMA synchronous=FULL`) BEFORE sending any wake-up message, so a
+        // hard kill mid-send never loses the unsure digest or resends twice (agent-board-539).
+        if !outgoing.is_empty()
+            && let Err(err) = self.save_at(now)
+        {
+            tracing::warn!(
+                "flush: persisting unsure wake intent before send failed ({err:#}); deferring {} sends",
+                outgoing.len()
+            );
+            for out in outgoing {
+                let _ = self.settle_unsure(
+                    &out.agent,
+                    &out,
+                    &Sent::Failed(anyhow::anyhow!("save failed")),
+                );
+                self.requeue(
+                    out.agent,
+                    WakeQueue {
+                        wakes: out.wakes,
+                        backoff: out.backoff,
+                    },
+                );
+            }
+            return;
+        }
         self.sending = outgoing.iter().map(|out| out.agent.clone()).collect();
         let sends = outgoing
             .iter()
@@ -3262,6 +3881,9 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let wakes = &self.state.wakes;
         self.agents.retain(|agent, _| wakes.contains_key(agent));
+        if let Err(err) = self.save_at(now) {
+            tracing::warn!("flush: persisting state after wake sends failed: {err:#}");
+        }
     }
 
     /// Reads what a flush needs to decide on `agent`'s `queue`: the agent, and each line
@@ -3378,6 +4000,20 @@ impl<T: T3 + 'static> Daemon<T> {
                          or idle notices dropped: this device does not dispatch their boards"
                     );
                 }
+                if !queue.wakes.is_empty() {
+                    self.record_drop(
+                        "wake_unknown_agent",
+                        queue.wakes.first().map(|w| &w.board),
+                        None,
+                        Some(agent),
+                        &format!(
+                            "agent unknown to server ({} wake-ups, {unheard} unheard)",
+                            queue.wakes.len()
+                        ),
+                        serde_json::to_value(&queue.wakes).unwrap_or_default(),
+                        now,
+                    );
+                }
                 return None;
             }
             Checked::LookupFailed(err) => {
@@ -3387,6 +4023,15 @@ impl<T: T3 + 'static> Daemon<T> {
                     self.requeue(agent.clone(), queue);
                 } else {
                     tracing::warn!("waking {agent}: {err:#}; dropped");
+                    self.record_drop(
+                        "wake_lookup_failed",
+                        queue.wakes.first().map(|w| &w.board),
+                        None,
+                        Some(agent),
+                        &format!("non-transient agent lookup failure: {err:#}"),
+                        serde_json::to_value(&queue.wakes).unwrap_or_default(),
+                        now,
+                    );
                 }
                 return None;
             }
@@ -3402,13 +4047,30 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         };
         let waited_until = self.waited_until(&seen);
+        let mut expired_wakes = Vec::new();
         queue.wakes.retain(|w| {
             let fresh = is_fresh(w, waited_until, now);
             if !fresh {
                 tracing::warn!("waking {agent}: not delivered in time; dropped");
+                expired_wakes.push(w.clone());
             }
             fresh
         });
+        if !expired_wakes.is_empty() {
+            self.record_drop(
+                "wake_expired",
+                expired_wakes.first().map(|w| &w.board),
+                None,
+                Some(agent),
+                &format!(
+                    "{} wake-up(s) exceeded WAKE_TTL ({}s) before delivery",
+                    expired_wakes.len(),
+                    WAKE_TTL.num_seconds()
+                ),
+                serde_json::to_value(&expired_wakes).unwrap_or_default(),
+                now,
+            );
+        }
         match self.reach(&seen, now) {
             Reach::Now => {}
             // Kept whole for the agent going idle, or for the reset of the full usage
@@ -3448,6 +4110,17 @@ impl<T: T3 + 'static> Daemon<T> {
                              notices dropped: this device does not dispatch their boards"
                         );
                     }
+                    if dropped > 0 || unheard > 0 {
+                        self.record_drop(
+                            "wake_unreachable",
+                            queue.wakes.first().map(|w| &w.board),
+                            None,
+                            Some(agent),
+                            &format!("{why} ({dropped} dropped, {unheard} unheard)"),
+                            serde_json::to_value(&queue.wakes).unwrap_or_default(),
+                            now,
+                        );
+                    }
                 }
                 return None;
             }
@@ -3473,6 +4146,16 @@ impl<T: T3 + 'static> Daemon<T> {
                     tracing::warn!("waking {agent}: {err:#}");
                     if is_transient(&err) {
                         queue.wakes.push(wake);
+                    } else {
+                        self.record_drop(
+                            "wake_recheck_failed",
+                            Some(&wake.board),
+                            None,
+                            Some(agent),
+                            &format!("non-transient wake recheck error: {err:#}"),
+                            serde_json::to_value(&wake).unwrap_or_default(),
+                            now,
+                        );
                     }
                 }
             }
@@ -3672,6 +4355,18 @@ impl<T: T3 + 'static> Daemon<T> {
                          this device does not dispatch their boards"
                     );
                 }
+                self.record_drop(
+                    "wake_thread_gone",
+                    wakes.first().map(|w| &w.board),
+                    None,
+                    Some(&agent),
+                    &format!(
+                        "thread gone while sending ({err:#}); {} wake-up(s) dropped ({unheard} unheard)",
+                        wakes.len()
+                    ),
+                    serde_json::to_value(&wakes).unwrap_or_default(),
+                    now,
+                );
                 self.agents.remove(&agent);
             }
             Sent::Failed(err) => {
@@ -3998,9 +4693,29 @@ impl<T: T3 + 'static> Daemon<T> {
                     if self.state.retry.len() > RETRY_EVENTS_MAX {
                         let dropped = self.state.retry.remove(0);
                         tracing::warn!("event #{}: too many to retry; dropped", dropped.seq);
+                        self.record_drop(
+                            "event_retry_dropped",
+                            dropped.board.as_ref(),
+                            dropped.task.as_ref(),
+                            None,
+                            &format!(
+                                "event retry queue exceeded RETRY_EVENTS_MAX ({RETRY_EVENTS_MAX})"
+                            ),
+                            serde_json::to_value(&dropped).unwrap_or_default(),
+                            now,
+                        );
                     }
                 } else {
                     tracing::warn!("event #{}: {err:#}", event.seq);
+                    self.record_drop(
+                        "event_non_transient",
+                        event.board.as_ref(),
+                        event.task.as_ref(),
+                        None,
+                        &format!("non-transient event handling error: {err:#}"),
+                        serde_json::to_value(event).unwrap_or_default(),
+                        now,
+                    );
                 }
                 self.state.last_seq = Some(self.state.last_seq.unwrap_or(0).max(event.seq));
                 false
@@ -4015,13 +4730,29 @@ impl<T: T3 + 'static> Daemon<T> {
     /// tick untried, so an outage costs one request timeout, not one per event. An event
     /// the server answers with an error does not hold up the others.
     pub async fn retry_failed(&mut self, now: Timestamp) -> bool {
+        let mut expired = Vec::new();
         self.state.retry.retain(|event| {
             let keep = now - event.at <= RETRY_EVENTS_FOR;
             if !keep {
                 tracing::warn!("event #{}: still failing; dropped", event.seq);
+                expired.push(event.clone());
             }
             keep
         });
+        for ev in expired {
+            self.record_drop(
+                "event_retry_dropped",
+                ev.board.as_ref(),
+                ev.task.as_ref(),
+                None,
+                &format!(
+                    "event exceeded RETRY_EVENTS_FOR ({}s)",
+                    RETRY_EVENTS_FOR.num_seconds()
+                ),
+                serde_json::to_value(&ev).unwrap_or_default(),
+                now,
+            );
+        }
         let mut reconcile = false;
         for event in self.state.retry.clone() {
             let settled = match self.on_event(&event, now).await {
@@ -4038,6 +4769,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 }
                 Err(err) => {
                     tracing::warn!("event #{}: {err:#}; dropped", event.seq);
+                    self.record_drop(
+                        "event_non_transient",
+                        event.board.as_ref(),
+                        event.task.as_ref(),
+                        None,
+                        &format!("non-transient event retry error: {err:#}"),
+                        serde_json::to_value(&event).unwrap_or_default(),
+                        now,
+                    );
                     true
                 }
             };
@@ -4134,12 +4874,68 @@ async fn add_note(
     Ok(())
 }
 
-/// Is this a failure that may pass on its own: no answer, or a server-side error?
-fn is_transient(err: &anyhow::Error) -> bool {
-    match err.downcast_ref::<ServerError>() {
-        Some(server) => !server.status.is_client_error(),
-        None => true,
+/// Is this a failure that may pass on its own: an unreachable/timed-out transport, a 5xx
+/// (or 408/429) server/proxy error, or a transient OS I/O error? Local parse/decode/logic
+/// errors and 4xx client errors are NOT transient and are never retried for 30 minutes
+/// (`agent-board-539`).
+pub fn is_transient(err: &anyhow::Error) -> bool {
+    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
+        return !server.status.is_client_error()
+            || matches!(
+                server.status,
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            );
     }
+    for cause in err.chain() {
+        if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
+            return req.is_connect() || req.is_timeout() || req.is_request() || req.is_body();
+        }
+        if let Some(relay) = cause.downcast_ref::<RelayFailure>() {
+            return matches!(relay, RelayFailure::Unreachable | RelayFailure::Slow);
+        }
+        if cause.downcast_ref::<TimedOut>().is_some() {
+            return true;
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        let msg = cause.to_string();
+        if msg.starts_with("the board server may be restarting")
+            || msg.starts_with("server answered 5")
+            || msg.starts_with("server answered 429")
+            || msg.starts_with("server answered 408")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a `PUT /v1/devices/{name}/heartbeat` error indicates an older server that does not
+/// implement the endpoint (`404 Not Found` or `405 Method Not Allowed`, whether structured JSON
+/// or plain Axum fallback response).
+fn is_heartbeat_unsupported(err: &anyhow::Error) -> bool {
+    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
+        return matches!(
+            server.status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+    err.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.starts_with("server answered 404") || msg.starts_with("server answered 405")
+    })
 }
 
 /// The local T3 project folder for one of the board's repos, with that repo; else the folder
@@ -4288,8 +5084,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
             device::FALLBACK_RUNS
         );
     }
-    let mut daemon =
-        Daemon::new(ctx, t3).with_default_run_limit(device::default_run_limit(host_memory));
+    let mut daemon = Daemon::new(ctx, t3)
+        .with_default_run_limit(device::default_run_limit(host_memory))
+        .with_host_memory(host_memory);
     daemon.usage_source = usage_source;
     if daemon.state.last_seq.is_none() {
         // Start from now: history is not news.
@@ -4304,6 +5101,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
             daemon.reconcile(Utc::now()).await?;
         }
         daemon.flush(Utc::now()).await;
+        if let Err(err) = daemon.send_heartbeat(Utc::now()).await {
+            tracing::warn!("device heartbeat: {err:#}");
+        }
         return daemon.save();
     }
     daemon.follow(&mut shutdown).await
@@ -4389,18 +5189,20 @@ enum Step {
     Event(String),
     Flush,
     Reconcile,
+    Heartbeat,
 }
 
 impl<T: T3 + 'static> Daemon<T> {
-    /// Reconciles at once, then follows the event stream, flushing and reconciling on their
-    /// ticks, also while the stream is down, until `shutdown` asks it to stop. Each step
-    /// races the request to stop, so a step that waits on a server or `t3` never delays the
-    /// exit; every step is safe to cut short.
+    /// Reconciles at once, then follows the event stream, flushing, heartbeating and
+    /// reconciling on their ticks, also while the stream is down, until `shutdown` asks it
+    /// to stop. Each step races the request to stop, so a step that waits on a server or
+    /// `t3` never delays the exit; every step is safe to cut short.
     pub async fn follow(&mut self, shutdown: &mut Shutdown) -> Result<()> {
         let first = self.timing.reconnect_first;
         let mut delay = first;
         let mut reconcile_tick = tokio::time::interval(self.timing.reconcile_every);
         let mut flush_tick = tokio::time::interval(self.timing.flush_every);
+        let mut heartbeat_tick = tokio::time::interval(self.timing.heartbeat_every);
         let mut reconcile_needed = false;
         if self
             .run_step(Step::Reconcile, &mut reconcile_needed, shutdown)
@@ -4408,7 +5210,14 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             return self.stop().await;
         }
+        if self
+            .run_step(Step::Heartbeat, &mut reconcile_needed, shutdown)
+            .await?
+        {
+            return self.stop().await;
+        }
         reconcile_tick.reset();
+        heartbeat_tick.reset();
         loop {
             let client = self.client().clone();
             let connected = tokio::select! {
@@ -4445,6 +5254,7 @@ impl<T: T3 + 'static> Daemon<T> {
                             },
                             _ = flush_tick.tick() => Step::Flush,
                             _ = reconcile_tick.tick() => Step::Reconcile,
+                            _ = heartbeat_tick.tick() => Step::Heartbeat,
                             () = shutdown.wait() => return self.stop().await,
                         };
                         if self.run_step(step, &mut reconcile_needed, shutdown).await? {
@@ -4472,6 +5282,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     () = &mut reopen => break,
                     _ = flush_tick.tick() => Step::Flush,
                     _ = reconcile_tick.tick() => Step::Reconcile,
+                    _ = heartbeat_tick.tick() => Step::Heartbeat,
                     () = shutdown.wait() => return self.stop().await,
                 };
                 if self.run_step(step, &mut reconcile_needed, shutdown).await? {
@@ -4511,6 +5322,11 @@ impl<T: T3 + 'static> Daemon<T> {
             Step::Reconcile => {
                 *reconcile_needed |= self.retry_failed(Utc::now()).await;
                 self.reconcile_logged().await;
+            }
+            Step::Heartbeat => {
+                if let Err(err) = self.send_heartbeat(Utc::now()).await {
+                    tracing::warn!("device heartbeat: {err:#}");
+                }
             }
         }
         Ok(())
@@ -4592,4 +5408,110 @@ pub(crate) fn start_order(task: &Task) -> (board_proto::Priority, bool, Option<u
         task.rank,
         task.created_at,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use board_proto::ApiError;
+    use reqwest::StatusCode;
+
+    fn server_err(status: StatusCode, code: ErrorCode) -> anyhow::Error {
+        ServerError {
+            status,
+            error: ApiError {
+                code,
+                message: "boom".into(),
+                next: None,
+            },
+        }
+        .into()
+    }
+
+    #[test]
+    fn is_transient_classifies_network_and_5xx_only_not_local_parse_or_logic_errors() {
+        // Transient server/proxy/transport errors.
+        assert!(is_transient(&server_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal
+        )));
+        assert!(is_transient(&server_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal
+        )));
+        assert!(is_transient(&server_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::Internal
+        )));
+        assert!(is_transient(&server_err(
+            StatusCode::REQUEST_TIMEOUT,
+            ErrorCode::Internal
+        )));
+        assert!(is_transient(&anyhow::Error::from(TimedOut(
+            "t3 send".into()
+        ))));
+        assert!(is_transient(&anyhow::Error::from(
+            RelayFailure::Unreachable
+        )));
+        assert!(is_transient(&anyhow::Error::from(RelayFailure::Slow)));
+        assert!(is_transient(&anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(is_transient(&anyhow::anyhow!(
+            "server answered 502 Bad Gateway: <html>"
+        )));
+        assert!(is_transient(
+            &server_err(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Internal)
+                .context("reading ask #1")
+        ));
+
+        // Non-transient: 4xx client errors, local JSON parse errors, logic errors, refused relay.
+        assert!(!is_transient(&server_err(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Invalid
+        )));
+        assert!(!is_transient(&server_err(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound
+        )));
+        let json_err: anyhow::Error = serde_json::from_str::<serde_json::Value>("{bad")
+            .unwrap_err()
+            .into();
+        assert!(!is_transient(
+            &json_err.context("unexpected answer from the server")
+        ));
+        assert!(!is_transient(&anyhow::anyhow!("invalid task id")));
+        assert!(!is_transient(&anyhow::Error::from(RelayFailure::Refused)));
+        assert!(!is_transient(&anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt"
+        ))));
+    }
+
+    #[test]
+    fn is_heartbeat_unsupported_matches_json_and_plain_404_or_405() {
+        assert!(is_heartbeat_unsupported(&server_err(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound
+        )));
+        assert!(is_heartbeat_unsupported(&server_err(
+            StatusCode::METHOD_NOT_ALLOWED,
+            ErrorCode::Invalid
+        )));
+        assert!(is_heartbeat_unsupported(&anyhow::anyhow!(
+            "server answered 404 Not Found: "
+        )));
+        assert!(is_heartbeat_unsupported(&anyhow::anyhow!(
+            "server answered 405 Method Not Allowed: "
+        )));
+        assert!(!is_heartbeat_unsupported(&server_err(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden
+        )));
+        assert!(!is_heartbeat_unsupported(&server_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal
+        )));
+    }
 }

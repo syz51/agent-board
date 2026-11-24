@@ -433,6 +433,14 @@ pub fn append_runner_cancel<T: Serialize>(home: &Home, record: &T) -> Result<Pat
     append_line(home, "runner-cancels.jsonl", record)
 }
 
+/// Adds `record` as one line to `daemon-drops.jsonl` in the state directory, and gives its
+/// path: the Trail Rule record of every wake-up, owed step, worker, judge, event, refusal,
+/// give-back or usage hold that the device daemon dropped, held, or gave back. Nothing
+/// prunes it.
+pub fn append_daemon_drop<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "daemon-drops.jsonl", record)
+}
+
 /// Whether `unchecked-launches.jsonl` has a launch of `session` at or after `since`.
 pub fn unchecked_launch_since(home: &Home, session: &str, since: Timestamp) -> bool {
     let path = home.state_dir().join("unchecked-launches.jsonl");

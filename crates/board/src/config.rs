@@ -103,6 +103,22 @@ pub struct Config {
     /// the daemon use every slot of `runs_at_once`.
     #[serde(alias = "reserve")]
     pub reserve_runs: Option<u32>,
+    /// Total weighted capacity units of this device (`light=1`, `standard=2`, `heavy=4`);
+    /// without it, derived from `runs_at_once * 2` or host memory (`docs/SCHEDULER_DESIGN.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_units: Option<u32>,
+    /// Extra capability tags advertised in device heartbeats alongside auto-detected
+    /// `os:<os>` and `arch:<arch>` (for example `["git:cloneable", "tool:xcode"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Runners advertised in device heartbeats (defaults to the daemon's active runner,
+    /// e.g. `["t3"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<String>,
+    /// Protocol features advertised in device heartbeats (defaults to
+    /// `["v1-json", "sse-v1"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_features: Vec<String>,
     /// Local T3 project folders by repo key, for starting worker and judge threads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, PathBuf>,
@@ -773,6 +789,34 @@ options = { thought_level = "high" }
             text.contains("[board_projects]\nboard-feedback = \"/src/fb\""),
             "{text}"
         );
+    }
+
+    #[test]
+    fn weighted_device_config_fields_are_optional_and_round_trip() {
+        let empty = Config::default();
+        let text = toml::to_string_pretty(&empty).unwrap();
+        assert!(!text.contains("weight_units"), "{text}");
+        assert!(!text.contains("capabilities"), "{text}");
+        assert!(!text.contains("runners"), "{text}");
+        assert!(!text.contains("protocol_features"), "{text}");
+
+        let raw = r#"
+server = "https://board.example.test"
+device = "mac-pro"
+runs_at_once = 6
+reserve_runs = 1
+weight_units = 12
+capabilities = ["git:cloneable", "tool:xcode"]
+runners = ["t3", "acp"]
+protocol_features = ["v1-json", "sse-v1"]
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.weight_units, Some(12));
+        assert_eq!(parsed.capabilities, vec!["git:cloneable", "tool:xcode"]);
+        assert_eq!(parsed.runners, vec!["t3", "acp"]);
+        assert_eq!(parsed.protocol_features, vec!["v1-json", "sse-v1"]);
+        let serialized = toml::to_string_pretty(&parsed).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), parsed);
     }
 
     #[test]
