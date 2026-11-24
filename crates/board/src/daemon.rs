@@ -81,7 +81,8 @@ pub mod judges;
 
 pub use judges::{
     JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
-    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY, REVIEW_PR_WAIT,
+    JudgeRetry, JudgeRun, Merge, MergeHold, MergeHoldKind, PR_HOLD_WAIT, PR_READ_EVERY,
+    REVIEW_PR_WAIT,
 };
 
 /// Wake-ups for an agent shown running are held at most this long, then sent anyway: T3
@@ -6195,17 +6196,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 let (Some(ask), Some(asker)) = (event.payload["id"].as_i64(), asker) else {
                     return false;
                 };
-                if asker.source() == self.runner_source()
-                    || asker.source() == AgentSource::T3
-                    || asker == dispatcher
-                {
+                if asker.source() == self.runner_source() || asker.source() == AgentSource::T3 {
                     return false;
                 }
+                let check_gone = asker.source() != AgentSource::Dispatch;
                 self.owe(Owed::Answer {
                     board: slug.clone(),
                     ask,
                     asker,
-                    check_gone: true,
+                    check_gone,
                     noted: false,
                     at: now,
                 })
@@ -6396,6 +6395,35 @@ impl<T: T3 + 'static> Daemon<T> {
                 if check_gone_flag && !gone(&client, &asker_id).await? {
                     return Ok(Paid::Later);
                 }
+                let current = match client.task(&task).await {
+                    Ok(detail) => detail.task,
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                        return Ok(Paid::Nothing);
+                    }
+                    Err(err) => return Err(err),
+                };
+                if asker_id.source() == AgentSource::Dispatch {
+                    let mut was_noted = already_noted;
+                    let result = judges::handle_dispatch_ask_answer(
+                        &client,
+                        agent,
+                        &current,
+                        ask_id,
+                        &asker_id,
+                        &answer,
+                        &mut was_noted,
+                    )
+                    .await;
+                    if was_noted && !already_noted {
+                        *noted = true;
+                        self.persist_owed_step(step, now);
+                    }
+                    return match result? {
+                        judges::DispatchAskOutcome::Reopened => Ok(Paid::Opened(task)),
+                        judges::DispatchAskOutcome::ResumedReview
+                        | judges::DispatchAskOutcome::Noop(_) => Ok(Paid::Nothing),
+                    };
+                }
                 if !already_noted {
                     let text = clip_note(format!(
                         "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
@@ -6404,13 +6432,6 @@ impl<T: T3 + 'static> Daemon<T> {
                     *noted = true;
                     self.persist_owed_step(step, now);
                 }
-                let current = match client.task(&task).await {
-                    Ok(detail) => detail.task,
-                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
-                        return Ok(Paid::Nothing);
-                    }
-                    Err(err) => return Err(err),
-                };
                 let held = matches!(
                     current.status,
                     TaskStatus::Doing | TaskStatus::Blocked | TaskStatus::Review
