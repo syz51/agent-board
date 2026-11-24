@@ -790,13 +790,14 @@ impl<T: T3 + 'static> Daemon<T> {
             // for a slot gets the next one.
             self.read_running().await;
             self.sync_resource_ledger(now);
-            let limit = self.daemon_run_limit();
+            let flat_limit = self.daemon_run_limit();
             let verdicts = self.home_verdict_runs();
             let capped = !all && verdicts >= HOME_VERDICTS_AT_ONCE;
             let needed_units = device::cost_units_for_judge(want.kind);
-            let full = self.load_unknown().is_some()
-                || self.runs() >= limit
-                || self.weighted_full(needed_units, false);
+            let weighted_mode = self.ctx.config.weight_units.is_some();
+            let weighted_held = self.weighted_full(needed_units);
+            let flat_held = !weighted_mode && self.runs() >= flat_limit;
+            let full = self.load_unknown().is_some() || flat_held || weighted_held;
             if capped || full || self.turns(judging).another_first(slug, waited) {
                 // The limit that holds it, and that limit's numbers. Off autopilot, a
                 // board that waits its turn while the device has a free run waits for
@@ -807,8 +808,11 @@ impl<T: T3 + 'static> Daemon<T> {
                     );
                     let of = "verdict judges at once of the boards that are not on autopilot";
                     (HOME_VERDICTS_AT_ONCE, of, cause)
+                } else if weighted_mode || (!flat_held && weighted_held) {
+                    let (max_units, cause) = self.weighted_load(needed_units);
+                    (max_units, "weight units of this device", cause)
                 } else {
-                    (limit, "runs of this device", self.load())
+                    (flat_limit, "runs of this device", self.load())
                 };
                 if self.turns(judging).wait(slug, waited, now) {
                     tracing::info!(
@@ -931,7 +935,17 @@ impl<T: T3 + 'static> Daemon<T> {
         for mut run in unsettled {
             if run.thread.is_none() {
                 match self.find_judge_thread(board, project, &run).await {
-                    Ok(Some(thread)) => run.thread = Some(thread),
+                    Ok(Some(thread)) => {
+                        if let Some(run_id) = run.run_id.as_deref() {
+                            let _ = self.db.update_local_run_state(
+                                run_id,
+                                LocalRunState::Running,
+                                Some(&thread),
+                                now,
+                            );
+                        }
+                        run.thread = Some(thread);
+                    }
                     // No judge ran: the start is tried again soon.
                     Ok(None) => {
                         self.end_run(&run, client, now, JUDGE_START_RETRY).await;
@@ -1316,9 +1330,12 @@ impl<T: T3 + 'static> Daemon<T> {
                     local_run.state = LocalRunState::Starting;
                     local_run.updated_at = now;
                     local_run.meta_json = serde_json::to_string(&run).ok();
-                    self.db.upsert_local_run(&local_run)?;
                     self.put_run(&run);
-                    if let Err(err) = self.save_at(now) {
+                    let persisted = self
+                        .db
+                        .upsert_local_run(&local_run)
+                        .and_then(|()| self.save_at(now));
+                    if let Err(err) = persisted {
                         self.state.judges.retain(|r| !r.same(&run));
                         let _ = self.db.update_local_run_state(
                             &run_id,

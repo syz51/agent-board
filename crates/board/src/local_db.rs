@@ -235,56 +235,72 @@ impl LocalDb {
             .and_then(|bytes| Ok(serde_json::from_slice::<WatchState>(&bytes)?));
         let now = Utc::now();
         match read {
-            Ok(watch_state) => {
-                {
+            Ok(mut watch_state) => {
+                let migrated_now = {
                     let mut conn = self.lock();
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    write_watch_state_tx(&tx, &watch_state, now)?;
-                    seed_local_runs_from_watch_tx(&tx, &watch_state, now)?;
-                    set_kv_raw(&tx, KV_MIGRATED_WATCH, "1", ts_ms(now))?;
-                    tx.commit()?;
-                }
-                let migrated = path.with_extension("json.migrated");
-                if let Err(err) = std::fs::rename(&path, &migrated) {
-                    tracing::warn!(
-                        "imported {} into daemon.db, but renaming it to {} failed: {err}",
-                        path.display(),
-                        migrated.display()
-                    );
-                } else {
-                    tracing::info!(
-                        "migrated {} into {} (kept backup at {})",
-                        path.display(),
-                        Self::path_for(home).display(),
-                        migrated.display()
-                    );
+                    if get_kv_raw(&tx, KV_MIGRATED_WATCH)?.is_some() {
+                        false
+                    } else {
+                        seed_local_runs_from_watch_tx(&tx, &mut watch_state, now)?;
+                        write_watch_state_tx(&tx, &watch_state, now)?;
+                        set_kv_raw(&tx, KV_MIGRATED_WATCH, "1", ts_ms(now))?;
+                        tx.commit()?;
+                        true
+                    }
+                };
+                if migrated_now {
+                    let migrated = path.with_extension("json.migrated");
+                    if let Err(err) = std::fs::rename(&path, &migrated) {
+                        tracing::warn!(
+                            "imported {} into daemon.db, but renaming it to {} failed: {err}",
+                            path.display(),
+                            migrated.display()
+                        );
+                    } else {
+                        tracing::info!(
+                            "migrated {} into {} (kept backup at {})",
+                            path.display(),
+                            Self::path_for(home).display(),
+                            migrated.display()
+                        );
+                    }
                 }
             }
             Err(err) => {
-                let stamp = now.format("%Y%m%dT%H%M%SZ");
-                let copy = path.with_extension(format!("json.unreadable-{stamp}"));
-                match std::fs::rename(&path, &copy) {
-                    Ok(()) => tracing::warn!(
-                        "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
-                        path.display(),
-                        copy.display()
-                    ),
-                    Err(rename_err) => match std::fs::copy(&path, &copy) {
-                        Ok(_) => tracing::warn!(
+                let mark_unreadable = {
+                    let mut conn = self.lock();
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    if get_kv_raw(&tx, KV_MIGRATED_WATCH)?.is_some() {
+                        false
+                    } else {
+                        set_kv_raw(&tx, KV_MIGRATED_WATCH, "unreadable", ts_ms(now))?;
+                        tx.commit()?;
+                        true
+                    }
+                };
+                if mark_unreadable {
+                    let stamp = now.format("%Y%m%dT%H%M%SZ");
+                    let copy = path.with_extension(format!("json.unreadable-{stamp}"));
+                    match std::fs::rename(&path, &copy) {
+                        Ok(()) => tracing::warn!(
                             "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
                             path.display(),
                             copy.display()
                         ),
-                        Err(copy_err) => tracing::warn!(
-                            "{}: cannot read it ({err:#}) or copy it ({rename_err}; {copy_err}); starting fresh",
-                            path.display()
-                        ),
-                    },
+                        Err(rename_err) => match std::fs::copy(&path, &copy) {
+                            Ok(_) => tracing::warn!(
+                                "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
+                                path.display(),
+                                copy.display()
+                            ),
+                            Err(copy_err) => tracing::warn!(
+                                "{}: cannot read it ({err:#}) or copy it ({rename_err}; {copy_err}); starting fresh",
+                                path.display()
+                            ),
+                        },
+                    }
                 }
-                let mut conn = self.lock();
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                set_kv_raw(&tx, KV_MIGRATED_WATCH, "unreadable", ts_ms(now))?;
-                tx.commit()?;
             }
         }
         Ok(())
@@ -310,46 +326,62 @@ impl LocalDb {
             .and_then(|bytes| parse_legacy_worktrees_json(&bytes));
         match read {
             Ok(records) => {
-                {
+                let migrated_now = {
                     let mut conn = self.lock();
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    for record in &records {
-                        upsert_worktree_tx(&tx, record)?;
+                    if get_kv_raw(&tx, KV_MIGRATED_WORKTREES)?.is_some() {
+                        false
+                    } else {
+                        for record in &records {
+                            upsert_worktree_tx(&tx, record)?;
+                        }
+                        set_kv_raw(&tx, KV_MIGRATED_WORKTREES, "1", ts_ms(now))?;
+                        tx.commit()?;
+                        true
                     }
-                    set_kv_raw(&tx, KV_MIGRATED_WORKTREES, "1", ts_ms(now))?;
-                    tx.commit()?;
-                }
-                let migrated = path.with_extension("json.migrated");
-                if let Err(err) = std::fs::rename(&path, &migrated) {
-                    tracing::warn!(
-                        "imported {} into daemon.db, but renaming it to {} failed: {err}",
-                        path.display(),
-                        migrated.display()
-                    );
-                } else {
-                    tracing::info!(
-                        "migrated {} ({} records) into {} (kept backup at {})",
-                        path.display(),
-                        records.len(),
-                        Self::path_for(home).display(),
-                        migrated.display()
-                    );
+                };
+                if migrated_now {
+                    let migrated = path.with_extension("json.migrated");
+                    if let Err(err) = std::fs::rename(&path, &migrated) {
+                        tracing::warn!(
+                            "imported {} into daemon.db, but renaming it to {} failed: {err}",
+                            path.display(),
+                            migrated.display()
+                        );
+                    } else {
+                        tracing::info!(
+                            "migrated {} ({} records) into {} (kept backup at {})",
+                            path.display(),
+                            records.len(),
+                            Self::path_for(home).display(),
+                            migrated.display()
+                        );
+                    }
                 }
             }
             Err(err) => {
-                let stamp = now.format("%Y%m%dT%H%M%SZ");
-                let copy = path.with_extension(format!("json.unreadable-{stamp}"));
-                let _ = std::fs::rename(&path, &copy)
-                    .or_else(|_| std::fs::copy(&path, &copy).map(|_| ()));
-                tracing::warn!(
-                    "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
-                    path.display(),
-                    copy.display()
-                );
-                let mut conn = self.lock();
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                set_kv_raw(&tx, KV_MIGRATED_WORKTREES, "unreadable", ts_ms(now))?;
-                tx.commit()?;
+                let mark_unreadable = {
+                    let mut conn = self.lock();
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    if get_kv_raw(&tx, KV_MIGRATED_WORKTREES)?.is_some() {
+                        false
+                    } else {
+                        set_kv_raw(&tx, KV_MIGRATED_WORKTREES, "unreadable", ts_ms(now))?;
+                        tx.commit()?;
+                        true
+                    }
+                };
+                if mark_unreadable {
+                    let stamp = now.format("%Y%m%dT%H%M%SZ");
+                    let copy = path.with_extension(format!("json.unreadable-{stamp}"));
+                    let _ = std::fs::rename(&path, &copy)
+                        .or_else(|_| std::fs::copy(&path, &copy).map(|_| ()));
+                    tracing::warn!(
+                        "{}: cannot read it ({err:#}); starting fresh, with a copy in {}",
+                        path.display(),
+                        copy.display()
+                    );
+                }
             }
         }
         Ok(())
@@ -444,21 +476,102 @@ impl LocalDb {
             }
         }
 
-        // Remaining structured fields in kv_state (decoded leniently via WatchState's serde
-        // helpers by assembling a single JSON object from the stored KV keys).
-        let mut kv_obj = serde_json::Map::new();
-        for key in KV_WATCH_KEYS {
-            if let Some(raw) = get_kv_raw(&conn, key)?
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-            {
-                kv_obj.insert((*key).to_owned(), val);
+        // Remaining structured fields in kv_state: decode each key independently so a single
+        // malformed or future-version row never wipes unrelated workers, judges, or holds.
+        let mut state = WatchState {
+            last_seq,
+            wakes,
+            unsure_wakes,
+            ..WatchState::default()
+        };
+        if let Some(raw) = get_kv_raw(&conn, "retry")? {
+            match serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                Ok(items) => {
+                    for item in items {
+                        match serde_json::from_value(item) {
+                            Ok(ev) => state.retry.push(ev),
+                            Err(err) => tracing::warn!(
+                                "daemon.db kv_state[retry]: skipped unreadable event: {err}"
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!("daemon.db kv_state[retry]: unreadable ({err})"),
             }
         }
-        let mut state: WatchState =
-            serde_json::from_value(serde_json::Value::Object(kv_obj)).unwrap_or_default();
-        state.last_seq = last_seq;
-        state.wakes = wakes;
-        state.unsure_wakes = unsure_wakes;
+        if let Some(raw) = get_kv_raw(&conn, "usage_full_until")? {
+            match serde_json::from_str(&raw) {
+                Ok(val) => state.usage_full_until = val,
+                Err(err) => {
+                    tracing::warn!("daemon.db kv_state[usage_full_until]: unreadable ({err})")
+                }
+            }
+        }
+        if let Some(raw) = get_kv_raw(&conn, "goal_due")? {
+            match serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                Ok(items) => {
+                    for item in items {
+                        match serde_json::from_value(item) {
+                            Ok(slug) => {
+                                state.goal_due.insert(slug);
+                            }
+                            Err(err) => tracing::warn!(
+                                "daemon.db kv_state[goal_due]: skipped unreadable board: {err}"
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!("daemon.db kv_state[goal_due]: unreadable ({err})"),
+            }
+        }
+        for key in [
+            "workers",
+            "worker_retry",
+            "worker_skips",
+            "usage_stops",
+            "holds",
+            "hold_notes",
+            "idle_notices",
+            "owed",
+            "judges",
+            "judge_retry",
+            "merges",
+        ] {
+            let Some(raw) = get_kv_raw(&conn, key)? else {
+                continue;
+            };
+            let val = match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(val) => val,
+                Err(err) => {
+                    tracing::warn!("daemon.db kv_state[{key}]: unreadable JSON ({err})");
+                    continue;
+                }
+            };
+            let mut single = serde_json::Map::new();
+            single.insert(key.to_owned(), val);
+            let partial =
+                match serde_json::from_value::<WatchState>(serde_json::Value::Object(single)) {
+                    Ok(partial) => partial,
+                    Err(err) => {
+                        tracing::warn!("daemon.db kv_state[{key}]: skipped ({err})");
+                        continue;
+                    }
+                };
+            match key {
+                "workers" => state.workers = partial.workers,
+                "worker_retry" => state.worker_retry = partial.worker_retry,
+                "worker_skips" => state.worker_skips = partial.worker_skips,
+                "usage_stops" => state.usage_stops = partial.usage_stops,
+                "holds" => state.holds = partial.holds,
+                "hold_notes" => state.hold_notes = partial.hold_notes,
+                "idle_notices" => state.idle_notices = partial.idle_notices,
+                "owed" => state.owed = partial.owed,
+                "judges" => state.judges = partial.judges,
+                "judge_retry" => state.judge_retry = partial.judge_retry,
+                "merges" => state.merges = partial.merges,
+                _ => {}
+            }
+        }
         Ok(state)
     }
 
@@ -843,23 +956,6 @@ impl WorktreeStore for SqliteWorktreeStore {
 // Schema & internal helpers
 // -----------------------------------------------------------------------------
 
-const KV_WATCH_KEYS: &[&str] = &[
-    "retry",
-    "usage_full_until",
-    "workers",
-    "worker_retry",
-    "worker_skips",
-    "usage_stops",
-    "holds",
-    "hold_notes",
-    "idle_notices",
-    "owed",
-    "judges",
-    "judge_retry",
-    "merges",
-    "goal_due",
-];
-
 fn configure_and_init(conn: &Connection, disk: bool) -> Result<()> {
     if disk {
         conn.execute_batch(
@@ -1006,7 +1102,12 @@ fn write_watch_state_tx(
         let mut stmt = tx.prepare(
             "INSERT INTO unsure_sends \
              (agent_id, digest, wakes_json, since_ms, read_after_ms, failed_delay_secs) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(agent_id, digest) DO UPDATE SET \
+               wakes_json = excluded.wakes_json, \
+               since_ms = excluded.since_ms, \
+               read_after_ms = excluded.read_after_ms, \
+               failed_delay_secs = excluded.failed_delay_secs",
         )?;
         for (agent, unsure) in &state.unsure_wakes {
             let read_after = unsure.read_after.map(ts_ms);
@@ -1046,18 +1147,23 @@ fn write_watch_state_tx(
 }
 
 /// Seeds `local_runs` rows for any in-flight workers/judges imported during one-time
-/// migration from `watch.json`.
+/// migration from `watch.json`, and stamps their generated `run_id` onto `state` so later
+/// lifecycle transitions update the matching `local_runs` rows cleanly.
 fn seed_local_runs_from_watch_tx(
     tx: &rusqlite::Transaction<'_>,
-    state: &WatchState,
+    state: &mut WatchState,
     now: Timestamp,
 ) -> Result<()> {
-    for (task_id, worker) in &state.workers {
-        let run = LocalRunRecord {
-            run_id: format!(
+    for (task_id, worker) in &mut state.workers {
+        let run_id = worker.run_id.clone().unwrap_or_else(|| {
+            format!(
                 "migrated-worker-{task_id}-{}",
                 worker.started_at.timestamp_millis()
-            ),
+            )
+        });
+        worker.run_id = Some(run_id.clone());
+        let run = LocalRunRecord {
+            run_id,
             task_id: Some(task_id.clone()),
             board: task_id.board(),
             kind: "worker".to_owned(),
@@ -1065,7 +1171,9 @@ fn seed_local_runs_from_watch_tx(
             session_id: worker.thread.clone(),
             worktree_path: worker.worktree_path.clone(),
             branch: worker.branch.clone(),
-            cost_units: crate::daemon::device::STANDARD_RUN_UNITS,
+            cost_units: worker
+                .cost_units
+                .unwrap_or(crate::daemon::device::STANDARD_RUN_UNITS),
             pid: None,
             state: if worker.thread.is_some() {
                 LocalRunState::Running
@@ -1079,13 +1187,17 @@ fn seed_local_runs_from_watch_tx(
         };
         upsert_local_run_tx(tx, &run)?;
     }
-    for (idx, judge) in state.judges.iter().enumerate() {
-        let run = LocalRunRecord {
-            run_id: format!(
+    for (idx, judge) in state.judges.iter_mut().enumerate() {
+        let run_id = judge.run_id.clone().unwrap_or_else(|| {
+            format!(
                 "migrated-judge-{}-{}-{idx}",
                 judge.board,
                 judge.started_at.timestamp_millis()
-            ),
+            )
+        });
+        judge.run_id = Some(run_id.clone());
+        let run = LocalRunRecord {
+            run_id,
             task_id: judge.tasks.first().cloned(),
             board: judge.board.clone(),
             kind: judge_kind_str(judge.kind).to_owned(),
@@ -1502,7 +1614,14 @@ mod tests {
         assert!(home.state_dir().join("worktrees.json.migrated").exists());
 
         let loaded = db.load_watch_state().unwrap();
-        assert_eq!(loaded, legacy_watch);
+        // Migration stamps generated `run_id` onto migrated workers & judges so later
+        // lifecycle transitions cleanly close their `local_runs` rows.
+        assert!(loaded.workers[&task].run_id.is_some());
+        assert!(loaded.judges[0].run_id.is_some());
+        let mut expected = legacy_watch;
+        expected.workers.get_mut(&task).unwrap().run_id = loaded.workers[&task].run_id.clone();
+        expected.judges[0].run_id = loaded.judges[0].run_id.clone();
+        assert_eq!(loaded, expected);
 
         // Migrated in-flight workers and judges are seeded into local_runs.
         let runs = db.list_active_local_runs().unwrap();
@@ -1589,5 +1708,80 @@ mod tests {
 
         db.mark_telemetry_sent(id).unwrap();
         assert!(db.due_telemetry(at(100), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_single_kv_key_and_duplicate_unsure_digest_never_wipe_or_break_state() {
+        let db = LocalDb::open_in_memory().unwrap();
+        let agent: AgentId = "t3:worker-dup".parse().unwrap();
+        let task: TaskId = "factory-99".parse().unwrap();
+        let board: BoardSlug = "factory".parse().unwrap();
+        let wake = Wake {
+            board,
+            about: WakeAbout::Answered {
+                ask: 1,
+                asker: agent.clone(),
+            },
+            queued_at: at(10),
+            forwarded: false,
+            resent: false,
+        };
+        let mut state = WatchState {
+            last_seq: Some(50),
+            ..WatchState::default()
+        };
+        state.workers.insert(
+            task.clone(),
+            Worker {
+                thread: Some("t1".into()),
+                title: "factory-99 keep".into(),
+                branch: Some("task/factory-99".into()),
+                runner: Some("t3".into()),
+                worktree_id: None,
+                worktree_path: None,
+                run_id: Some("run-99".into()),
+                cost_units: Some(2),
+                started_at: at(1),
+                claimed: true,
+                noted: true,
+            },
+        );
+        // Duplicate digest in unsure_wakes must not fail save with UNIQUE constraint violation.
+        state.unsure_wakes.insert(
+            agent.clone(),
+            UnsureWakes {
+                messages: vec![
+                    UnsureMessage {
+                        digest: "deadbeef00000001".into(),
+                        wakes: vec![wake.clone()],
+                        since: at(10),
+                    },
+                    UnsureMessage {
+                        digest: "deadbeef00000001".into(),
+                        wakes: vec![wake],
+                        since: at(11),
+                    },
+                ],
+                read_after: None,
+                failed_delay_secs: None,
+            },
+        );
+        db.save_watch_state(&state, at(20)).unwrap();
+
+        // Corrupt the `retry` kv_state row directly: workers and last_seq MUST still load!
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE kv_state SET value_json = ?1 WHERE key = 'retry'",
+                ["[{\"bad\":\"future-event\"}, \"not-an-event\"]"],
+            )
+            .unwrap();
+        }
+        let reloaded = db.load_watch_state().unwrap();
+        assert_eq!(reloaded.last_seq, Some(50));
+        assert!(reloaded.retry.is_empty());
+        assert_eq!(reloaded.workers.len(), 1);
+        assert!(reloaded.workers.contains_key(&task));
+        assert_eq!(reloaded.unsure_wakes[&agent].messages.len(), 1);
     }
 }

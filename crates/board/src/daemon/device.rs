@@ -299,16 +299,17 @@ pub fn effective_protocol_features(config: &Config) -> Vec<String> {
 }
 
 /// Normalized, deduplicated repository keys configured under `[projects]` in `config.toml`.
+/// Keys that cannot be normalized by [`board_proto::normalize_repo`] are skipped so
+/// `PUT /v1/devices/{name}/heartbeat` is never rejected with HTTP 400.
 pub fn configured_repos(config: &Config) -> Vec<String> {
     let mut repos = BTreeSet::new();
     for key in config.projects.keys() {
         if let Some(norm) = normalize_repo(key) {
             repos.insert(norm);
         } else {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                repos.insert(trimmed.to_owned());
-            }
+            tracing::debug!(
+                "skipping non-normalizable [projects] key {key:?} in device heartbeat repos"
+            );
         }
     }
     repos.into_iter().collect()
@@ -1147,6 +1148,9 @@ mod tests {
             "github.com/org/agent-board".into(),
             PathBuf::from("/src/ab2"),
         );
+        config
+            .projects
+            .insert("local-alias-without-host".into(), PathBuf::from("/src/loc"));
         assert_eq!(
             configured_repos(&config),
             vec!["github.com/org/agent-board"]

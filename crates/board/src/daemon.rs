@@ -1798,12 +1798,10 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     /// Whether a run costing `needed_units` exceeds the weighted budget in `resource_ledger`.
-    /// Enforced whenever `config.weight_units` is configured or the run declares a non-standard
-    /// weight (`light=1` / `heavy=4` / explicit `resource_units`) on a bounded device.
-    pub(super) fn weighted_full(&self, needed_units: u32, explicit_weight: bool) -> bool {
-        if self.ctx.config.weight_units.is_none() && !explicit_weight {
-            return false;
-        }
+    /// Always checked on any bounded device (`weight_units`, `runs_at_once`, or
+    /// `default_run_limit`) so an active heavy run's 4 units cannot be over-committed by
+    /// subsequent default-weight workers or judges.
+    pub(super) fn weighted_full(&self, needed_units: u32) -> bool {
         let Some(max_units) = self.bounded_weight_units() else {
             return false;
         };
@@ -1815,6 +1813,40 @@ impl<T: T3 + 'static> Daemon<T> {
                 false
             }
         }
+    }
+
+    /// Weighted device load description with exact unit numbers (`active`, `max`, `reserve`,
+    /// `free`, `needed`) for Trail Rule hold records and board notes whenever a weighted
+    /// limit is configured or triggers a hold.
+    pub(super) fn weighted_load(&self, needed_units: u32) -> (usize, String) {
+        let max_units = self.bounded_weight_units().unwrap_or(0);
+        let reserve = device::reserve_units(&self.ctx.config);
+        let active = self.db.active_units().unwrap_or(0);
+        let free = max_units.saturating_sub(reserve).saturating_sub(active);
+        let others = self.other_turns();
+        let mut text = format!(
+            "device {} has {active} of {max_units} weight units active ({reserve} reserved, \
+             {free} free, need {needed_units}): {} managed runs, {} turns of other threads",
+            self.ctx.device,
+            self.own_runs(),
+            others.len()
+        );
+        if !others.is_empty() {
+            let shown = others.iter().take(device::THREADS_SHOWN);
+            let shown = shown.copied().collect::<Vec<_>>().join(", ");
+            text.push_str(&format!(" ({shown}"));
+            match others.len().saturating_sub(device::THREADS_SHOWN) {
+                0 => {}
+                more => text.push_str(&format!(" and {more} more")),
+            }
+            text.push(')');
+        }
+        if let Some(unknown) = self.load_unknown() {
+            text.push_str(&format!(
+                "; {unknown}, so the turns of other threads are not known and nothing starts"
+            ));
+        }
+        (max_units as usize, text)
     }
 
     /// Builds the [`DeviceHeartbeat`] payload for `PUT /v1/devices/{name}/heartbeat` from
@@ -1839,13 +1871,21 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
-    /// Sends one `PUT /v1/devices/{name}/heartbeat` update. Returns `Ok(true)` when accepted,
+    /// Sends one `PUT /v1/devices/{name}/heartbeat` update. Refreshes live interactive thread
+    /// load for T3 runners before computing `free_units` so ended or newly started interactive
+    /// turns never leave stale entries in `resource_ledger`. Returns `Ok(true)` when accepted,
     /// `Ok(false)` when gracefully disabled after a 404/405 from an older server, or `Err` on
     /// transient/auth failures (callers in the daemon loop log and continue without blocking
     /// dispatch).
     pub async fn send_heartbeat(&mut self, now: Timestamp) -> Result<bool> {
         if self.heartbeat_unsupported {
             return Ok(false);
+        }
+        if self.runner.kind() == "t3" {
+            let running = device::running_threads(&*self.t3, &self.ctx.config).await;
+            if running.unknown().is_none() {
+                self.running = Some(running);
+            }
         }
         self.sync_resource_ledger(now);
         let body = self.build_heartbeat();
@@ -1951,6 +1991,12 @@ impl<T: T3 + 'static> Daemon<T> {
                                 None,
                                 now,
                             );
+                        } else if let Some(thread) = run.thread.as_deref() {
+                            let _ = self.db.finish_local_run_by_session(
+                                thread,
+                                LocalRunState::Cancelled,
+                                now,
+                            );
                         }
                     }
                     self.state.judges.retain(|r| r.board != board.slug);
@@ -2042,6 +2088,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 let _ = self
                     .db
                     .update_local_run_state(run_id, LocalRunState::Cancelled, None, now);
+            } else if let Some(thread) = run.thread.as_deref() {
+                let _ = self
+                    .db
+                    .finish_local_run_by_session(thread, LocalRunState::Cancelled, now);
             }
             if let Some(wt_id) = run.worktree_id.clone() {
                 dropped_worktrees.push(wt_id);
@@ -2544,16 +2594,22 @@ impl<T: T3 + 'static> Daemon<T> {
             self.read_running().await;
             self.sync_resource_ledger(now);
             let daemon_limit = self.daemon_run_limit();
-            let limit = device::worker_limit(daemon_limit);
+            let flat_limit = device::worker_limit(daemon_limit);
             let needed_units = device::cost_units_for_task(&task);
-            let explicit_weight = task.weight.is_some() || task.resource_units.is_some();
+            let weighted_mode = self.ctx.config.weight_units.is_some();
+            let weighted_held = self.weighted_full(needed_units);
+            let flat_held =
+                !weighted_mode && (self.worker_runs() >= flat_limit || self.runs() >= daemon_limit);
             if self.load_unknown().is_some()
-                || self.worker_runs() >= limit
-                || self.runs() >= daemon_limit
-                || self.weighted_full(needed_units, explicit_weight)
+                || flat_held
+                || weighted_held
                 || self.worker_turns.another_first(slug, waited)
             {
-                let load = self.load();
+                let (limit, load) = if weighted_mode || (!flat_held && weighted_held) {
+                    self.weighted_load(needed_units)
+                } else {
+                    (flat_limit, self.load())
+                };
                 if self.worker_turns.wait(slug, waited, now) {
                     tracing::info!(
                         "{slug}: {} waits for one of the {limit} worker slots of this device; {load}",
@@ -2804,6 +2860,14 @@ impl<T: T3 + 'static> Daemon<T> {
             None => match self.find_worker_thread(board, task, worker).await? {
                 Some(thread) => {
                     worker.thread = Some(thread.clone());
+                    if let Some(run_id) = worker.run_id.as_deref() {
+                        let _ = self.db.update_local_run_state(
+                            run_id,
+                            LocalRunState::Running,
+                            Some(&thread),
+                            now,
+                        );
+                    }
                     thread
                 }
                 None => {
@@ -3075,9 +3139,12 @@ impl<T: T3 + 'static> Daemon<T> {
                     local_run.state = LocalRunState::Starting;
                     local_run.updated_at = now;
                     local_run.meta_json = serde_json::to_string(&worker).ok();
-                    self.db.upsert_local_run(&local_run)?;
                     self.state.workers.insert(task.id.clone(), worker.clone());
-                    if let Err(err) = self.save_at(now) {
+                    let persisted = self
+                        .db
+                        .upsert_local_run(&local_run)
+                        .and_then(|()| self.save_at(now));
+                    if let Err(err) = persisted {
                         self.state.workers.remove(&task.id);
                         let _ = self.db.update_local_run_state(
                             &run_id,
@@ -3366,6 +3433,13 @@ impl<T: T3 + 'static> Daemon<T> {
                                     run_id,
                                     LocalRunState::Finished,
                                     None,
+                                    now,
+                                );
+                            } else {
+                                let _ = self.db.finish_local_runs_for_task(
+                                    "worker",
+                                    &task,
+                                    LocalRunState::Finished,
                                     now,
                                 );
                             }

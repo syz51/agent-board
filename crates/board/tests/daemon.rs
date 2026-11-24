@@ -7804,6 +7804,56 @@ async fn weighted_resource_ledger_enforces_heavy_standard_light_and_interactive_
     assert_eq!(daemon.state.workers[&heavy.id].cost_units, Some(4));
     assert_eq!(daemon.db().active_units().unwrap(), 4);
     assert_eq!(daemon.db().free_units(6, 2).unwrap(), 0);
+
+    // Weighted hold record must report exact weighted unit numbers (never usize::MAX!).
+    let holds_text =
+        std::fs::read_to_string(dir.path().join("home/state/device-holds.jsonl")).unwrap();
+    assert!(
+        holds_text.contains("weight units active") && holds_text.contains("need 4"),
+        "expected weighted unit numbers in device-holds.jsonl: {holds_text}"
+    );
+    assert!(
+        !holds_text.contains(&usize::MAX.to_string()),
+        "must never print usize::MAX in hold record: {holds_text}"
+    );
+
+    // With heavy (4 units) occupying all 4 daemon units, light (1 unit) is ALSO held.
+    assert!(!daemon.state.workers.contains_key(&light.id));
+
+    // Also verify send_heartbeat refreshes interactive turns even without a reconcile:
+    // adding an interactive turn reduces free_units, and clearing it restores free_units.
+    let hb_route = format!("PUT /v1/devices/{DEVICE}/heartbeat");
+    stub.on(
+        &hb_route,
+        board_proto::DeviceEntry {
+            name: DEVICE.parse().unwrap(),
+            role: board_proto::DeviceRole::Runner,
+            status: board_proto::DeviceStatus::Online,
+            drain: false,
+            os: None,
+            arch: None,
+            capacity: None,
+            free_units: None,
+            capabilities: Vec::new(),
+            runners: Vec::new(),
+            repos: Vec::new(),
+            taints: Vec::new(),
+            preference: 0,
+            protocol_features: Vec::new(),
+            heartbeat_at: Some(at()),
+        },
+    );
+    daemon.state.workers.clear();
+    t3.running.lock().unwrap().push("interactive-hb".into());
+    assert!(daemon.send_heartbeat(minute(2)).await.unwrap());
+    let hb1: board_proto::DeviceHeartbeat =
+        serde_json::from_value(stub.requests_to(&hb_route)[0].body.clone()).unwrap();
+    assert_eq!(hb1.free_units, Some(2));
+    t3.running.lock().unwrap().clear();
+    assert!(daemon.send_heartbeat(minute(3)).await.unwrap());
+    let hb2: board_proto::DeviceHeartbeat =
+        serde_json::from_value(stub.requests_to(&hb_route)[1].body.clone()).unwrap();
+    assert_eq!(hb2.free_units, Some(4));
 }
 
 #[tokio::test]
