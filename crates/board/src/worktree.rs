@@ -197,7 +197,7 @@ async fn new_worktree(
 /// prompt or refused fails here with the privacy hint instead of passing as no
 /// repository, and nothing is left waiting on it once the command is stopped. Only where
 /// git finds no repository is `.git` read as well.
-async fn is_repo_top(project: &Path) -> Result<bool> {
+pub(crate) async fn is_repo_top(project: &Path) -> Result<bool> {
     let out = git(
         project,
         &["rev-parse", "--is-inside-work-tree", "--show-prefix"],

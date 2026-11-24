@@ -377,44 +377,23 @@ fn noted_pr(detail: &TaskDetail, repos: &[String]) -> Option<String> {
         .find_map(|n| pull_request_url_in(&n.text, repos))
 }
 
-/// Whether `text` explicitly declares `pr: none` (either on a `pr:` line or inline).
+/// Whether `text` has a `pr: none` tag line (e.g. `pr: none`, `- pr: none`, `* pr: none.`),
+/// matching [`passed_pr`]'s line format so prose merely discussing `pr: none` does not match.
 fn has_pr_none(text: &str) -> bool {
     text.lines().any(|line| {
-        if tagged(line, "pr").is_some_and(|v| {
-            v.trim_end_matches(['.', ',', ';', ')'])
+        tagged(line, "pr").is_some_and(|v| {
+            v.trim_end_matches(['.', ',', ';'])
                 .eq_ignore_ascii_case("none")
-        }) {
-            return true;
-        }
-        let lower = line.to_ascii_lowercase();
-        let bytes = lower.as_bytes();
-        let mut pos = 0;
-        while let Some(found) = lower[pos..].find("pr:") {
-            let at = pos + found;
-            let before_ok =
-                at == 0 || (!bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_');
-            if before_ok {
-                let rest = lower[at + 3..].trim_start();
-                if let Some(after) = rest.strip_prefix("none") {
-                    let after_ok = after
-                        .as_bytes()
-                        .first()
-                        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
-                    if after_ok {
-                        return true;
-                    }
-                }
-            }
-            pos = at + 3;
-        }
-        false
+        })
     })
 }
 
-/// Whether the current review attempt's notes declare `pr: none`. Scans backward until the
-/// newest dispatcher worker-start note or `review: fail`/`review: void` decision note so an
-/// older round's `pr: none` never suppresses a later code attempt.
-fn noted_pr_none(detail: &TaskDetail) -> bool {
+/// Whether the current review attempt's notes explicitly declare `pr: none` on a `pr:` line.
+/// Scans backward until the newest dispatcher worker-start note, any prior `review:`
+/// decision note (`pass`, `fail` or `void`), or a newer note naming a same-repo PR URL
+/// without `pr: none`, so an older round's `pr: none` never suppresses a later code attempt
+/// while a current `pr: none` overrides earlier or related PR citations.
+fn noted_pr_none(detail: &TaskDetail, repos: &[String]) -> bool {
     for note in detail.notes.iter().rev() {
         if note.agent.source() == AgentSource::Dispatch {
             if note.text.starts_with(WORKER_NOTE_PREFIX) {
@@ -422,16 +401,14 @@ fn noted_pr_none(detail: &TaskDetail) -> bool {
             }
             continue;
         }
-        if note.kind == NoteKind::Decision
-            && matches!(
-                review_verdict(&note.text),
-                Some(ReviewVerdict::Fail | ReviewVerdict::Void)
-            )
-        {
+        if note.kind == NoteKind::Decision && review_verdict(&note.text).is_some() {
             break;
         }
         if has_pr_none(&note.text) {
             return true;
+        }
+        if pull_request_url_in(&note.text, repos).is_some() {
+            return false;
         }
     }
     false
@@ -620,17 +597,19 @@ impl<T: T3> Daemon<T> {
                     if self.judge_waits(&retry_key(JudgeKind::Review, &task.id), task) {
                         continue;
                     }
-                    let pr = noted_pr(&detail, &board.repos);
-                    let no_code = pr.is_none() && noted_pr_none(&detail);
+                    let no_code = noted_pr_none(&detail, &board.repos);
+                    let pr = if no_code {
+                        None
+                    } else {
+                        noted_pr(&detail, &board.repos)
+                    };
                     let worker_branch = if pr.is_none() && !no_code {
                         match noted_worker_branch(&detail) {
                             Some(branch) => branch,
-                            None => self
-                                .state
-                                .workers
-                                .get(&task.id)
-                                .and_then(|w| w.branch.clone())
-                                .or_else(|| Some(crate::worktree::worker_branch(&task.id))),
+                            None => match self.state.workers.get(&task.id) {
+                                Some(worker) => worker.branch.clone(),
+                                None => Some(crate::worktree::worker_branch(&task.id)),
+                            },
                         }
                     } else {
                         None
@@ -808,6 +787,7 @@ impl<T: T3> Daemon<T> {
             match self.start_judge(board, &client, &project, want, now).await {
                 Ok(StartOutcome::Started) => {
                     self.hold_ended("judge", &names);
+                    self.hold_ended("review_wait", &names);
                     started += 1;
                     // Served: a further judge of this board waits behind the others.
                     waited = None;
@@ -815,6 +795,7 @@ impl<T: T3> Daemon<T> {
                 Ok(StartOutcome::Waited) => {}
                 Err(err) => {
                     self.hold_ended("judge", &names);
+                    self.hold_ended("review_wait", &names);
                     tracing::warn!("starting the judge `{names}`: {err:#}");
                 }
             }
@@ -1102,6 +1083,24 @@ impl<T: T3> Daemon<T> {
                 } else {
                     ReviewTarget::None
                 };
+                let waiting_without_target = review.pr.is_none()
+                    && !review.no_code
+                    && matches!(target, ReviewTarget::None)
+                    && within_pr_wait(review.parked_at, now);
+                if waiting_without_target
+                    && crate::worktree::is_repo_top(project)
+                        .await
+                        .context("checking the review judge's repository")?
+                {
+                    let until = review.parked_at + REVIEW_PR_WAIT;
+                    let cause = format!(
+                        "{task} has no PR recorded yet and no worker branch; waiting until {until} ({}s from park) before starting on the default base",
+                        REVIEW_PR_WAIT.num_seconds()
+                    );
+                    self.record_hold("review_wait", &board.slug, &want.title, 0, &cause, now);
+                    tracing::info!("review of {task}: {cause}");
+                    return Ok(StartOutcome::Waited);
+                }
                 match crate::worktree::review_worktree(project, task, target, now)
                     .await
                     .context("preparing the review judge's worktree")?
@@ -1123,11 +1122,26 @@ impl<T: T3> Daemon<T> {
                                 && !review.no_code
                                 && within_pr_wait(review.parked_at, now)
                             {
-                                tracing::info!(
-                                    "review of {task}: no PR recorded yet and no worker branch resolved on origin; waiting until {} before starting on {}",
-                                    review.parked_at + REVIEW_PR_WAIT,
+                                let until = review.parked_at + REVIEW_PR_WAIT;
+                                let branch_desc = review
+                                    .worker_branch
+                                    .as_deref()
+                                    .map(|b| format!("worker branch `{b}` is not on origin yet"))
+                                    .unwrap_or_else(|| "no worker branch is recorded".to_owned());
+                                let cause = format!(
+                                    "{task} has no PR recorded yet and {branch_desc}; waiting until {until} ({}s from park) before starting on {}",
+                                    REVIEW_PR_WAIT.num_seconds(),
                                     prepared.worktree.base
                                 );
+                                self.record_hold(
+                                    "review_wait",
+                                    &board.slug,
+                                    &want.title,
+                                    0,
+                                    &cause,
+                                    now,
+                                );
+                                tracing::info!("review of {task}: {cause}");
                                 return Ok(StartOutcome::Waited);
                             }
                             let reason = prepared
@@ -1783,6 +1797,7 @@ mod tests {
 
     #[test]
     fn noted_pr_none_matches_current_round_and_stops_at_reopen_or_new_worker() {
+        let repos = ["github.com/o/r".to_owned()];
         let start1 = note(
             1,
             "dispatch:mac",
@@ -1797,39 +1812,75 @@ mod tests {
             "Done.\npr: none",
             "2026-11-13T08:10:00Z",
         );
-        assert!(noted_pr_none(&detail(
-            vec![start1.clone(), none_line.clone()],
-            serde_json::json!([])
-        )));
+        assert!(noted_pr_none(
+            &detail(
+                vec![start1.clone(), none_line.clone()],
+                serde_json::json!([])
+            ),
+            &repos
+        ));
 
-        let none_inline = note(
+        let bullet_none = note(
             2,
             "t3:worker",
             NoteKind::Note,
-            "Report written (pr: none).",
+            "Superseded by https://github.com/o/r/pull/40\n- pr: none.",
             "2026-11-13T08:10:00Z",
         );
-        assert!(noted_pr_none(&detail(
-            vec![none_inline],
-            serde_json::json!([])
-        )));
+        assert!(noted_pr_none(
+            &detail(vec![bullet_none], serde_json::json!([])),
+            &repos
+        ));
 
-        // Non-matching words do not trigger.
-        let other = note(
-            2,
-            "t3:worker",
-            NoteKind::Note,
+        // Prose mentioning `pr: none` inline does not trigger.
+        for prose in [
+            "Fixed pr: none parsing; PR pending.",
+            "Report written (not pr: none).",
             "expr: none and pr: none_yet",
-            "2026-11-13T08:10:00Z",
-        );
-        assert!(!noted_pr_none(&detail(vec![other], serde_json::json!([]))));
+        ] {
+            let n = note(
+                2,
+                "t3:worker",
+                NoteKind::Note,
+                prose,
+                "2026-11-13T08:10:00Z",
+            );
+            assert!(
+                !noted_pr_none(&detail(vec![n], serde_json::json!([])), &repos),
+                "{prose}"
+            );
+        }
 
-        // A later review: fail or a newer worker start clears an older round's pr: none.
+        // A newer note in the same round naming a same-repo PR overrides an earlier pr: none.
+        let later_pr = note(
+            3,
+            "t3:worker",
+            NoteKind::Note,
+            "Opened PR https://github.com/o/r/pull/42 after all",
+            "2026-11-13T08:15:00Z",
+        );
+        assert!(!noted_pr_none(
+            &detail(
+                vec![start1.clone(), none_line.clone(), later_pr],
+                serde_json::json!([])
+            ),
+            &repos
+        ));
+
+        // A later review decision (fail, void, or pass) or a newer worker start clears an
+        // older round's pr: none.
         let fail = note(
             3,
             "t3:judge",
             NoteKind::Decision,
             "review: fail: needs a code fix",
+            "2026-11-13T08:20:00Z",
+        );
+        let pass = note(
+            3,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: pass. Earlier round.\npr: none",
             "2026-11-13T08:20:00Z",
         );
         let start2 = note(
@@ -1839,14 +1890,21 @@ mod tests {
             "note: the dispatcher started a worker for this task on branch task/factory-7-20261113-082500: https://t3.example.test/threads/2",
             "2026-11-13T08:25:00Z",
         );
-        assert!(!noted_pr_none(&detail(
-            vec![start1.clone(), none_line.clone(), fail],
-            serde_json::json!([])
-        )));
-        assert!(!noted_pr_none(&detail(
-            vec![start1, none_line, start2],
-            serde_json::json!([])
-        )));
+        assert!(!noted_pr_none(
+            &detail(
+                vec![start1.clone(), none_line.clone(), fail],
+                serde_json::json!([])
+            ),
+            &repos
+        ));
+        assert!(!noted_pr_none(
+            &detail(vec![start1.clone(), pass], serde_json::json!([])),
+            &repos
+        ));
+        assert!(!noted_pr_none(
+            &detail(vec![start1, none_line, start2], serde_json::json!([])),
+            &repos
+        ));
     }
 
     #[test]

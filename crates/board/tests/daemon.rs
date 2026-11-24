@@ -6608,12 +6608,38 @@ async fn a_review_without_pr_or_pushed_branch_waits_then_uses_the_recorded_pr() 
     review_detail(&e, &task, vec![started.clone()]);
 
     // Reconcile right when parked: no PR recorded yet and `task/factory-4` is not on origin.
-    // Must wait rather than silently starting on `origin/trunk`.
+    // Must wait rather than silently starting on `origin/trunk`, and record the hold once
+    // in `state/device-holds.jsonl` (trail rule).
     e.daemon.reconcile(at()).await.unwrap();
     assert!(
         started_reviews(&e.t3).is_empty(),
         "must wait a tick instead of falling back to default base immediately"
     );
+    let home = Home::at(e._dir.path().join("home"));
+    let recorded = holds(&home);
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected one review_wait hold: {recorded:?}"
+    );
+    assert_eq!(recorded[0]["kind"], "review_wait");
+    assert_eq!(recorded[0]["board"], "factory");
+    assert_eq!(recorded[0]["subject"], "review factory-4 Task factory-4");
+    assert!(
+        recorded[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("task/factory-4"),
+        "{:?}",
+        recorded[0]
+    );
+
+    // Repeating while still waiting writes no duplicate hold line.
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(holds(&home).len(), 1, "once per cause");
 
     // One minute later, the worker's parking note names the PR on `feat/custom`.
     let parked = task_note(
@@ -6684,7 +6710,8 @@ async fn a_review_with_a_recorded_same_repo_pr_starts_on_the_pr_head() {
 
 #[tokio::test]
 async fn a_no_code_review_starts_without_starving_and_names_the_base_in_its_brief() {
-    // Subcase A: explicit `pr: none` starts right away on the default base without waiting.
+    // Subcase A: explicit `pr: none` starts right away on the default base without waiting,
+    // even when an earlier note cites a PR URL.
     let task_none = review_task("factory-4", 0);
     let (_dir, mut e) = git_review_env(&[], std::slice::from_ref(&task_none));
     let worker_note = task_note(
@@ -6692,7 +6719,7 @@ async fn a_no_code_review_starts_without_starving_and_names_the_base_in_its_brie
         &task_none,
         WORKER,
         "note",
-        "Investigation complete; findings recorded in note #1.\npr: none",
+        &format!("Superseded by {PR}; no code changes here.\npr: none"),
     );
     review_detail(&e, &task_none, vec![worker_note]);
 
@@ -6821,4 +6848,50 @@ async fn an_unresolvable_pr_warns_and_names_the_default_base_in_the_judges_brief
             "{case}: brief must name default base instead of PR head: {brief}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_recovered_review_judge_start_keeps_its_worktree_note_after_reload() {
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(&["task/factory-4"], std::slice::from_ref(&task));
+    let started = task_note(
+        1,
+        &task,
+        DISPATCH,
+        "note",
+        "note: the dispatcher started a worker for this task on branch task/factory-4: https://t3.example.test/threads/w1",
+    );
+    review_detail(&e, &task, vec![started]);
+
+    // T3 created the thread without delivering the brief (`ran == false`), then start failed.
+    *e.t3.clock.lock().unwrap() = at();
+    *e.t3.die_after_create.lock().unwrap() = Some(false);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(registered(&e).is_empty());
+
+    // Confirm `worktree_note` survived watch.json persistence.
+    let reloaded = saved_state(&e);
+    assert_eq!(reloaded.judges.len(), 1);
+    let saved_note = reloaded.judges[0]
+        .worktree_note
+        .as_deref()
+        .expect("worktree_note persisted in watch.json");
+    assert!(saved_note.contains("origin/task/factory-4"), "{saved_note}");
+
+    // Reload state into the daemon and recover the unbriefed thread.
+    e.daemon.state = reloaded;
+    *e.t3.die_after_create.lock().unwrap() = None;
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, ORPHAN);
+    let resent = flat_text(&sends[0].1);
+    assert!(
+        resent.contains("origin/task/factory-4")
+            && !resent.contains("on the head of its pull request"),
+        "recovered brief must keep worktree_note: {resent}"
+    );
 }
