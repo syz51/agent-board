@@ -373,8 +373,10 @@ async fn run_events_sse_streams_backlog_resumes_from_last_event_id_and_delivers_
 #[tokio::test]
 async fn steer_and_cancel_endpoints_enqueue_sticky_wakes_and_cancel_queued_immediately() {
     let t = T::new();
+    let other_token = create_device(&t, "linux-runner").await;
     t.board("factory", &[REPO]).await;
     t.register(WORKER, Some(REPO), Some("main")).await;
+    t.register(OUTSIDER, Some(REPO), Some("main")).await;
     let task_id = t.task(WORKER, "factory", "Steer and cancel run").await;
 
     // 1. Queued run: steer is refused (not active yet), cancel transitions immediately to
@@ -458,6 +460,46 @@ async fn steer_and_cancel_endpoints_enqueue_sticky_wakes_and_cancel_queued_immed
         )
         .await;
     let active_id = active["id"].as_str().unwrap().to_owned();
+
+    // Another device and ordinary worker agents cannot steer or cancel a managed run -> 403.
+    let (code, v) = send_as_device(
+        &t,
+        &other_token,
+        "POST",
+        &format!("/v1/runs/{active_id}/steer"),
+        None,
+        Some(json!({ "message": "spoofed steer" })),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+
+    let (code, v) = send_as_device(
+        &t,
+        &other_token,
+        "POST",
+        &format!("/v1/runs/{active_id}/cancel"),
+        None,
+        Some(json!({ "reason": "spoofed cancel" })),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+
+    for endpoint in ["steer", "cancel"] {
+        let body = if endpoint == "steer" {
+            json!({ "message": "agent hijack" })
+        } else {
+            json!({ "reason": "agent hijack" })
+        };
+        let (code, err, v) = t
+            .fail(
+                "POST",
+                &format!("/v1/runs/{active_id}/{endpoint}"),
+                Some(OUTSIDER),
+                Some(body),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    }
 
     // Empty steer message -> 400 invalid.
     let (code, err, _) = t

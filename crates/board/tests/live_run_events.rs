@@ -314,7 +314,8 @@ async fn live_event_flushing_sse_stream_and_restart_resume() {
     assert_eq!(spawns.len(), 1);
     let native_id = spawns[0].handle.native_id.clone();
 
-    // Push seq 2 & seq 3 onto FakeRunner and flush via daemon.
+    // Push seq 2 & seq 3 (including oversized metadata that must be truncated below
+    // `RUN_EVENT_META_BYTES_MAX` instead of wedging the run) and flush via daemon.
     runner.push_event(
         &native_id,
         RunEventKind::Phase,
@@ -326,7 +327,7 @@ async fn live_event_flushing_sse_stream_and_restart_resume() {
         &native_id,
         RunEventKind::Tool,
         "cargo check",
-        BTreeMap::new(),
+        BTreeMap::from([("huge".into(), "x".repeat(20_000))]),
     );
     let pushed = daemon.flush_run_events(srv.now()).await.unwrap();
     assert_eq!(pushed, 2);
@@ -486,8 +487,9 @@ async fn sticky_steer_and_cancel_wakes_execute_on_runner_and_clean_up() {
     assert_eq!(cancels[0].handle.native_id, native_id);
     assert_eq!(cancels[0].reason, "user stopped run");
 
-    // Final event was flushed before cancellation, server run transitioned to `cancelled`,
-    // `resource_ledger` row was removed, and wake was acked.
+    // Final event AND `RunEventKind::Cancelled` emitted by `runner.cancel` were both flushed
+    // before removing the run, server run transitioned to `cancelled`, `resource_ledger` row
+    // was removed, and wake was acked.
     let updated = user.get_run(&run_id).await.unwrap();
     assert_eq!(updated.state, RunState::Cancelled);
     let events = user.list_run_events(&run_id, None, None).await.unwrap();
@@ -496,6 +498,12 @@ async fn sticky_steer_and_cancel_wakes_execute_on_runner_and_clean_up() {
             .iter()
             .any(|e| e.summary == "last note before cancel"),
         "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == ProtoRunEventKind::Cancelled),
+        "expected RunEventKind::Cancelled emitted by runner.cancel to be flushed: {events:?}"
     );
     let local_db = LocalDb::open_for_home(&home).unwrap();
     assert!(

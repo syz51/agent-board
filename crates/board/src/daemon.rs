@@ -400,7 +400,14 @@ const ARCHIVE_RETRY_FIRST_SECS: i64 = 30;
 /// Maximum retry delay (seconds) for exponential backoff in `telemetry_outbox` (1 hour).
 const ARCHIVE_RETRY_MAX_SECS: i64 = 3600;
 /// Timeout for one invocation of the configured `[archive] command`.
-const ARCHIVE_CMD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for a single transcript archival command invocation, bounded well below
+/// `device_stale_secs` (90s) and `RUN_LEASE_TTL_SECS_DEFAULT` (180s) so a hung upload never
+/// starves heartbeats or run lease renewals.
+const ARCHIVE_CMD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum due `telemetry_outbox` items attempted in a single flush tick.
+const ARCHIVE_MAX_PER_TICK: u32 = 4;
+/// Maximum validated length of a `transcript_uri` recorded via `PATCH /v1/runs/{id}`.
+const TRANSCRIPT_URI_MAX_CHARS: usize = 1_000;
 
 /// Durable outbox payload for uploading a terminal run's transcript and recording
 /// `transcript_uri` + `transcript_sha256` on the server.
@@ -4150,14 +4157,12 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Some(ref rid) = run_id {
             let _ = self.flush_run_events_for(rid, now).await;
         }
-        let mut runner_cancelled = true;
         if let Some((runner, handle, agent_id)) = self.resolve_sticky_wake_target(wake) {
             match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(&handle, reason)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
-                    runner_cancelled = false;
                     tracing::warn!(
-                        "sticky cancel wake #{} on {agent_id} unsupported by runner: {err:#}",
+                        "sticky cancel wake #{} on {agent_id} unsupported by runner: {err:#}; keeping run live until session exits",
                         wake.id
                     );
                     self.record_drop(
@@ -4166,12 +4171,20 @@ impl<T: T3 + 'static> Daemon<T> {
                         managed.as_ref().and_then(|r| r.task_id.as_ref()),
                         Some(&agent_id),
                         &format!(
-                            "runner cannot cancel session for wake #{}: {err:#}",
+                            "runner cannot cancel live session for wake #{}: {err:#}",
                             wake.id
                         ),
                         serde_json::to_value(wake).unwrap_or_default(),
                         now,
                     );
+                    // Acknowledge the wake so it does not loop, while keeping the server Run,
+                    // conflict_locks, managed_runs, and resource_ledger live until the session
+                    // actually terminates (preventing duplicate concurrent workers).
+                    if let Err(ack_err) = self.client().ack_wake(wake.id).await {
+                        tracing::warn!("acking unsupported cancel wake #{}: {ack_err:#}", wake.id);
+                        return false;
+                    }
+                    return true;
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -4191,6 +4204,9 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         }
         if let Some(ref rid) = run_id {
+            // Flush final cancellation/teardown events emitted by `runner.cancel` before
+            // removing the run from `managed_runs`.
+            let _ = self.flush_run_events_for(rid, now).await;
             if let Err(err) = self
                 .client()
                 .update_run(
@@ -4226,9 +4242,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     .and_then(|s| s.parse().ok())
             });
             let _ = self.enqueue_transcript_archive(rid, board, now);
-            if runner_cancelled
-                && let Some(wt_id) = managed.as_ref().and_then(|r| r.worktree_id.as_deref())
-            {
+            if let Some(wt_id) = managed.as_ref().and_then(|r| r.worktree_id.as_deref()) {
                 self.cleanup_worktree(wt_id, now).await;
             }
             let _ = self.save_at(now);
@@ -4314,7 +4328,20 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             let meta = (!ev.metadata.is_empty())
                 .then(|| serde_json::to_value(&ev.metadata).ok())
-                .flatten();
+                .flatten()
+                .map(|val| {
+                    let len = serde_json::to_string(&val)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX);
+                    if len <= board_proto::RUN_EVENT_META_BYTES_MAX {
+                        val
+                    } else {
+                        serde_json::json!({
+                            "truncated": true,
+                            "original_bytes": len,
+                        })
+                    }
+                });
             new_events.push(NewRunEvent {
                 seq: i64::try_from(ev.seq).unwrap_or(i64::MAX),
                 at: Some(ev.at),
@@ -4350,7 +4377,36 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                     let _ = self.save_at(now);
                 }
-                Err(err) if is_heartbeat_unsupported(&err) => {
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    // Structured 404 `not_found` means this specific run does not exist on
+                    // the server (not that the endpoint is unsupported).
+                    tracing::debug!(
+                        "run {run_id} not found on server when pushing live events: {err:#}"
+                    );
+                    return Ok(pushed);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Invalid) => {
+                    // Permanent 400 validation failure on this batch: record a Trail Rule
+                    // drop and advance `last_event_seq` so newer live events are never wedged.
+                    self.record_drop(
+                        "run_events_rejected",
+                        Some(&run.board),
+                        run.task_id.as_ref(),
+                        run.agent_id.as_ref(),
+                        &format!("pushing live events for {run_id} rejected: {err:#}"),
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "batch_len": chunk.len(),
+                            "batch_max_seq": batch_max,
+                        }),
+                        now,
+                    );
+                    if let Some(entry) = self.state.managed_runs.get_mut(run_id) {
+                        entry.last_event_seq = entry.last_event_seq.max(batch_max);
+                    }
+                    let _ = self.save_at(now);
+                }
+                Err(err) if error_code(&err).is_none() && is_heartbeat_unsupported(&err) => {
                     self.run_events_unsupported = true;
                     tracing::info!(
                         "server does not support POST /v1/runs/{{id}}/events ({err:#}); disabling live run event pushing until restart"
@@ -4474,6 +4530,9 @@ impl<T: T3 + 'static> Daemon<T> {
                 continue;
             }
             match self.client().get_run(&run_id).await {
+                Ok(run) if run.device != self.ctx.device => {
+                    self.archived_transcripts.insert(run_id.to_string());
+                }
                 Ok(run) if run.state.is_terminal() => {
                     if run.transcript_uri.is_some() {
                         self.archived_transcripts.insert(run_id.to_string());
@@ -4481,7 +4540,12 @@ impl<T: T3 + 'static> Daemon<T> {
                         enqueued += 1;
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // Untracked local transcript for a still-active run on this device (e.g.
+                    // after a hard crash before lease expiry): re-check on later ticks once
+                    // the server marks it terminal/orphaned.
+                    complete = false;
+                }
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
                     self.archived_transcripts.insert(run_id.to_string());
                 }
@@ -4504,9 +4568,13 @@ impl<T: T3 + 'static> Daemon<T> {
         let Some(archive_cfg) = self.ctx.config.archive.clone().filter(|cfg| cfg.enabled) else {
             return Ok(0);
         };
-        let due = self.db.due_telemetry(now, 32)?;
+        let due = self.db.due_telemetry(now, ARCHIVE_MAX_PER_TICK)?;
+        let deadline = tokio::time::Instant::now() + ARCHIVE_CMD_TIMEOUT;
         let mut flushed = 0usize;
         for item in due {
+            if flushed > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
             if item.kind != TELEMETRY_KIND_TRANSCRIPT_ARCHIVE {
                 continue;
             }
@@ -4528,8 +4596,14 @@ impl<T: T3 + 'static> Daemon<T> {
                 }
             };
             let uri = match job.uploaded_uri.clone() {
-                Some(uri) => uri,
-                None => {
+                Some(uri) if valid_transcript_uri(&uri) => uri,
+                _ => {
+                    if job.uploaded_uri.is_some() {
+                        job.uploaded_uri = None;
+                        if let Ok(cleared) = serde_json::to_string(&job) {
+                            let _ = self.db.update_telemetry_payload(item.id, &cleared);
+                        }
+                    }
                     if !job.file.is_file() {
                         tracing::warn!(
                             "transcript file {} for {} is missing; dropping outbox #{}",
@@ -4550,12 +4624,23 @@ impl<T: T3 + 'static> Daemon<T> {
                         continue;
                     }
                     match run_archive_command(&archive_cfg, &job).await {
-                        Ok(uri) => {
+                        Ok(uri) if valid_transcript_uri(&uri) => {
                             job.uploaded_uri = Some(uri.clone());
                             if let Ok(updated_payload) = serde_json::to_string(&job) {
                                 let _ = self.db.update_telemetry_payload(item.id, &updated_payload);
                             }
                             uri
+                        }
+                        Ok(bad_uri) => {
+                            let delay = archive_retry_delay(item.attempts);
+                            tracing::warn!(
+                                "archive command for {} returned invalid transcript_uri {:?}; retrying in {}s",
+                                job.run_id,
+                                bad_uri,
+                                delay.num_seconds()
+                            );
+                            let _ = self.db.mark_telemetry_retry(item.id, now + delay);
+                            continue;
                         }
                         Err(err) => {
                             let delay = archive_retry_delay(item.attempts);
@@ -4608,6 +4693,36 @@ impl<T: T3 + 'static> Daemon<T> {
                         now,
                     );
                     let _ = self.db.mark_telemetry_sent(item.id);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Forbidden) => {
+                    self.record_drop(
+                        "transcript_archive_forbidden",
+                        job.board.as_ref(),
+                        None,
+                        None,
+                        &format!(
+                            "forbidden recording transcript_uri for {}: {err:#}",
+                            job.run_id
+                        ),
+                        serde_json::to_value(&job).unwrap_or_default(),
+                        now,
+                    );
+                    let _ = self.db.mark_telemetry_sent(item.id);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Invalid) => {
+                    // Clear the cached URI so a fixed `[archive]` command can produce a valid
+                    // URI on the next attempt instead of retrying the same bad PATCH forever.
+                    job.uploaded_uri = None;
+                    if let Ok(cleared) = serde_json::to_string(&job) {
+                        let _ = self.db.update_telemetry_payload(item.id, &cleared);
+                    }
+                    let delay = archive_retry_delay(item.attempts);
+                    tracing::warn!(
+                        "server rejected transcript_uri for {} as invalid ({err:#}); cleared cached URI and retrying in {}s",
+                        job.run_id,
+                        delay.num_seconds()
+                    );
+                    let _ = self.db.mark_telemetry_retry(item.id, now + delay);
                 }
                 Err(err) => {
                     let delay = archive_retry_delay(item.attempts);
@@ -7954,6 +8069,9 @@ impl<T: T3 + 'static> Daemon<T> {
                         "event stream open after #{}",
                         self.state.last_seq.unwrap_or(0)
                     );
+                    // Re-scan local transcripts on stream (re)connect in case any run was
+                    // orphaned server-side while this daemon was offline.
+                    self.orphaned_transcripts_checked = false;
                     // The daemon runs for days: log each server build that differs from
                     // this one.
                     if let Some(warning) =
@@ -8171,6 +8289,14 @@ fn map_runner_event_kind(kind: RunEventKind) -> ProtoRunEventKind {
     }
 }
 
+fn valid_transcript_uri(uri: &str) -> bool {
+    let trimmed = uri.trim();
+    !trimmed.is_empty()
+        && trimmed == uri
+        && trimmed.chars().count() <= TRANSCRIPT_URI_MAX_CHARS
+        && !trimmed.chars().any(char::is_control)
+}
+
 fn archive_retry_delay(attempts: u32) -> TimeDelta {
     let shift = attempts.min(8);
     let secs = (ARCHIVE_RETRY_FIRST_SECS.saturating_mul(1i64 << shift)).min(ARCHIVE_RETRY_MAX_SECS);
@@ -8224,6 +8350,7 @@ async fn run_archive_command(cfg: &ArchiveConfig, job: &TranscriptArchiveJob) ->
         ARCHIVE_CMD_TIMEOUT,
         tokio::process::Command::new(&program)
             .args(&args)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output(),

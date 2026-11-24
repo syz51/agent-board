@@ -1313,18 +1313,23 @@ Section 3.3).
     `Last-Event-ID` (400 `invalid` if not an integer) else `after_seq`, with keep-alives and
     clean termination on server shutdown or client disconnect.
   - `POST /v1/runs/{id}/steer` `[SteerRunRequest]` `{message}` → `[SteerRunResponse]`
-    `{wake_id, run_id, device}`. Validates non-empty `message` up to 4,000 characters
+    `{wake_id, run_id, device}`. Authorized for the user (`--user` token or browser user),
+    the run's owning device daemon (no `X-Board-Agent` or `dispatch:{device}`), or (for
+    `interactive` runs) the run's own agent on that device (403 `forbidden` otherwise).
+    Validates non-empty `message` up to 4,000 characters
     (`RUN_STEER_MESSAGE_CHARS_MAX`), requires an active run (`leased | starting | running |
     waiting_external`, else 400 `invalid_transition`), enqueues a `kind = "steer"` sticky
     wake targeting `run.device`, and emits a Trail Rule `run_steered` event.
   - `POST /v1/runs/{id}/cancel` `[CancelRunRequest]` `{reason?}` → `[CancelRunResponse]`
-    `{run_id, device, state, wake_id?}`. Validates optional non-empty `reason` up to 500
-    characters (`RUN_CANCEL_REASON_CHARS_MAX`) and requires a non-terminal run (400
-    `invalid_transition` otherwise). A `queued` run transitions immediately to `cancelled`
-    (`wake_id` absent), releasing any `conflict_locks`, expiring pending wakes, and recording
-    `run_outcomes`. An active run (`leased | starting | running | waiting_external`) enqueues
-    a `kind = "cancel"` sticky wake targeting `run.device` (with `wake_id`). Both paths emit
-    a Trail Rule `run_cancelled` event carrying the actor and reason.
+    `{run_id, device, state, wake_id?}`. Same caller authorization as `steer` (403
+    `forbidden` for other devices or unrelated worker agents). Validates optional non-empty
+    `reason` up to 500 characters (`RUN_CANCEL_REASON_CHARS_MAX`) and requires a non-terminal
+    run (400 `invalid_transition` otherwise). A `queued` run transitions immediately to
+    `cancelled` (`wake_id` absent), releasing any `conflict_locks`, expiring pending wakes,
+    and recording `run_outcomes`. An active run (`leased | starting | running |
+    waiting_external`) enqueues a `kind = "cancel"` sticky wake targeting `run.device` (with
+    `wake_id`). Both paths emit a Trail Rule `run_cancelled` event carrying the actor and
+    reason.
   - **Retention pruning**: the server sweeper automatically deletes `run_events` rows for
     terminal runs once 7 days have elapsed since `ended_at`, or 1 hour after `transcript_uri`
     is recorded on the run.

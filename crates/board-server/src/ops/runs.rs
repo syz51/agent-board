@@ -2627,15 +2627,61 @@ pub(crate) fn validate_steer(req: SteerRunRequest) -> Result<SteerRunRequest> {
     Ok(req)
 }
 
+/// Verifies caller authorization for steering or cancelling `run`: allowed for the user
+/// (`--user` token or browser login), the run's owning device daemon (no `X-Board-Agent` or
+/// `dispatch:<run.device>`), or (for `interactive` runs) the run's own agent on that device.
+fn authorize_run_control(
+    run: &Run,
+    action: &str,
+    caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
+    by_user: bool,
+) -> Result<()> {
+    if by_user {
+        return Ok(());
+    }
+    if caller_device != Some(&run.device) {
+        return Err(forbidden(
+            format!("run {} belongs to device {}", run.id, run.device),
+            format!(
+                "only the user or device {} may {action} run {}",
+                run.device, run.id
+            ),
+        ));
+    }
+    if let Some(agent) = caller_agent {
+        let is_own_dispatch = agent.dispatch_device().as_ref() == Some(&run.device);
+        let is_own_interactive =
+            run.origin == RunOrigin::Interactive && run.agent_id.as_ref() == Some(agent);
+        if !is_own_dispatch && !is_own_interactive {
+            return Err(forbidden(
+                format!(
+                    "agent {agent} cannot {action} run {} on device {}",
+                    run.id, run.device
+                ),
+                format!(
+                    "only the user or device {}'s daemon (dispatch:{}) may {action} this run",
+                    run.device, run.device
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Enqueues a `kind = "steer"` sticky wake targeting the active run's device and writes a
 /// Trail Rule `run_steered` event (`POST /v1/runs/{id}/steer`).
 pub(crate) fn steer(
     cx: &mut Ctx<'_>,
     id: &RunId,
     actor: &str,
+    caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
+    by_user: bool,
     req: SteerRunRequest,
 ) -> Result<SteerRunResponse> {
     let run = get(cx, id)?;
+    authorize_run_control(&run, "steer", caller_device, caller_agent, by_user)?;
     if !run.state.is_live() {
         return Err(bad_transition(
             format!("cannot steer run {id} in state {}", state_str(run.state)),
@@ -2714,9 +2760,13 @@ pub(crate) fn cancel(
     cx: &mut Ctx<'_>,
     id: &RunId,
     actor: &str,
+    caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
+    by_user: bool,
     req: CancelRunRequest,
 ) -> Result<CancelRunResponse> {
     let run = get(cx, id)?;
+    authorize_run_control(&run, "cancel", caller_device, caller_agent, by_user)?;
     if !run.state.is_active() {
         return Err(bad_transition(
             format!(

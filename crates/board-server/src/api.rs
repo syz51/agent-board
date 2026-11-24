@@ -1474,9 +1474,22 @@ async fn steer_run(
     let id: RunId = parse_path(&id)?;
     let req = runs::validate_steer(req)?;
     let actor = run_actor(&caller);
+    let device = caller.device().cloned();
+    let caller_agent = caller.agent.clone();
+    let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| runs::steer(cx, &id, &actor, req))
+            .write(move |cx| {
+                runs::steer(
+                    cx,
+                    &id,
+                    &actor,
+                    device.as_ref(),
+                    caller_agent.as_ref(),
+                    by_user,
+                    req,
+                )
+            })
             .await?,
     ))
 }
@@ -1490,9 +1503,22 @@ async fn cancel_run(
     let id: RunId = parse_path(&id)?;
     let req = runs::validate_cancel(req)?;
     let actor = run_actor(&caller);
+    let device = caller.device().cloned();
+    let caller_agent = caller.agent.clone();
+    let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| runs::cancel(cx, &id, &actor, req))
+            .write(move |cx| {
+                runs::cancel(
+                    cx,
+                    &id,
+                    &actor,
+                    device.as_ref(),
+                    caller_agent.as_ref(),
+                    by_user,
+                    req,
+                )
+            })
             .await?,
     ))
 }
