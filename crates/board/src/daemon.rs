@@ -1290,6 +1290,8 @@ pub struct Daemon<T: T3 + 'static> {
     wakes_unsupported: bool,
     /// Set once the server answers 404/405 to `POST /v1/runs/{id}/events`.
     run_events_unsupported: bool,
+    /// Set once the server answers 404/405 to per-provider usage bucket endpoints.
+    usage_buckets_unsupported: bool,
     /// True once startup/reconnect reconciliation of orphaned local transcript files has run.
     orphaned_transcripts_checked: bool,
     /// Run ids already archived (or confirmed not needing archival) in this daemon process.
@@ -1297,8 +1299,9 @@ pub struct Daemon<T: T3 + 'static> {
     /// Earliest time to re-claim `RunKind::Merge` after a deferred merge (`PR_READ_EVERY`),
     /// preventing rapid re-polling when PR checks are pending or failing.
     merge_retry_after: Option<Timestamp>,
-    /// Earliest time to re-claim `RunKind::Review` after deferring for `REVIEW_PR_WAIT`.
-    review_wait_until: Option<Timestamp>,
+    /// Per-task review-wait deadlines (`parked_at + REVIEW_PR_WAIT`) preventing tight
+    /// spin-claim-cancel loops when a task enters `review` before its PR or branch is pushed.
+    review_waits: ReviewWaitBackoff,
     /// Sticky wake ids that timed out once, were verified missing from the runner, and are
     /// allowed at most one resend before being held/dropped with a Trail Rule record.
     sticky_resent: BTreeSet<i64>,
@@ -1424,10 +1427,11 @@ impl<T: T3 + 'static> Daemon<T> {
             dispatch_claim_supported: None,
             wakes_unsupported: false,
             run_events_unsupported: false,
+            usage_buckets_unsupported: false,
             orphaned_transcripts_checked: false,
             archived_transcripts: BTreeSet::new(),
             merge_retry_after: None,
-            review_wait_until: None,
+            review_waits: ReviewWaitBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
             state,
@@ -2488,7 +2492,7 @@ impl<T: T3 + 'static> Daemon<T> {
         self.sync_resource_ledger(now);
 
         let mut deferred_merge = self.merge_retry_after.is_some_and(|at| now < at);
-        let mut deferred_review = self.review_wait_until.is_some_and(|at| now < at);
+        let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
         let has_llm_runner = !self.runners.is_empty();
@@ -3092,10 +3096,23 @@ impl<T: T3 + 'static> Daemon<T> {
                 let detail = task_detail
                     .as_ref()
                     .context("review run missing task detail")?;
-                let (wt, worktree_note) = match self
-                    .prepare_claimed_review_worktree(&board, detail, &project, now)
-                    .await?
+                let observed_at = detail
+                    .notes
+                    .iter()
+                    .map(|n| n.at)
+                    .chain(std::iter::once(detail.task.updated_at))
+                    .max()
+                    .unwrap_or(detail.task.updated_at);
+                let prep = if let Some(until) =
+                    self.review_waits
+                        .active_until_for(&detail.task.id, now, observed_at)
                 {
+                    ReviewPrep::WaitForPr(until)
+                } else {
+                    self.prepare_claimed_review_worktree(&board, detail, &project, now)
+                        .await?
+                };
+                let (wt, worktree_note) = match prep {
                     ReviewPrep::Ready(wt, note) => (wt, note),
                     ReviewPrep::WaitForPr(until) => {
                         let reason = format!(
@@ -3122,7 +3139,8 @@ impl<T: T3 + 'static> Daemon<T> {
                             now,
                         );
                         let _ = self.db.remove_resource(&format!("run:{run_id}"));
-                        self.review_wait_until = Some(until);
+                        self.review_waits
+                            .record(detail.task.id.clone(), until, observed_at);
                         return Ok(ClaimedExecution {
                             deferred_merge: false,
                             deferred_review: true,
@@ -5967,9 +5985,10 @@ impl<T: T3 + 'static> Daemon<T> {
             EventType::TaskUpdated | EventType::TaskDone | EventType::NoteAdded
         ) {
             self.merge_retry_after = None;
-            self.review_wait_until = None;
         }
+        let cleared_review_wait = self.review_waits.on_event(event);
         let (mut reconcile, wakes) = self.examine(event).await?;
+        reconcile |= cleared_review_wait;
         reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
             let wake = Wake {
@@ -7363,9 +7382,35 @@ impl<T: T3 + 'static> Daemon<T> {
                 reading = Some(snapshot);
             }
         }
+        let bucket_ref = self.ctx.config.quota_bucket();
+        let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
+            && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
         let mut reported = None;
         if let Some(report) = reading {
-            reported = Some(match self.client().report_usage(&report).await {
+            let res = if self.usage_buckets_unsupported {
+                self.client().report_usage(&report).await
+            } else {
+                let bucket_req = board_proto::PutUsageBucket::from(report.clone());
+                match self
+                    .client()
+                    .put_usage_bucket(&bucket_ref.provider, &bucket_ref.account, &bucket_req)
+                    .await
+                {
+                    Ok(bucket) => Ok(bucket.as_usage().unwrap_or_else(|| Usage {
+                        five_hour: report.five_hour,
+                        seven_day: report.seven_day,
+                        read_at: report.read_at,
+                        device: self.ctx.device.clone(),
+                        pace: self.usage.as_ref().and_then(|u| u.pace),
+                    })),
+                    Err(err) if is_heartbeat_unsupported(&err) => {
+                        self.usage_buckets_unsupported = true;
+                        self.client().report_usage(&report).await
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            reported = Some(match res {
                 Ok(usage) => usage,
                 Err(err) => {
                     tracing::warn!("reporting the usage: {err:#}");
@@ -7384,10 +7429,43 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         match reported {
             Some(usage) => self.usage = Some(usage),
-            None => match self.client().usage().await {
-                Ok(Some(usage)) => self.usage = Some(usage),
-                Ok(None) => {}
-                Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
+            None if is_legacy_bucket || self.usage_buckets_unsupported => {
+                match self.client().usage().await {
+                    Ok(Some(usage)) => self.usage = Some(usage),
+                    Ok(None) => {}
+                    Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
+                }
+            }
+            None => match self.client().list_usage_buckets().await {
+                Ok(buckets) => {
+                    let matched = buckets
+                        .iter()
+                        .find(|b| {
+                            b.provider == bucket_ref.provider && b.account == bucket_ref.account
+                        })
+                        .and_then(|b| b.as_usage())
+                        .or_else(|| {
+                            buckets
+                                .iter()
+                                .find(|b| {
+                                    b.provider == board_proto::LEGACY_USAGE_PROVIDER
+                                        && b.account == board_proto::LEGACY_USAGE_ACCOUNT
+                                })
+                                .and_then(|b| b.as_usage())
+                        });
+                    if let Some(usage) = matched {
+                        self.usage = Some(usage);
+                    }
+                }
+                Err(err) if is_heartbeat_unsupported(&err) => {
+                    self.usage_buckets_unsupported = true;
+                    match self.client().usage().await {
+                        Ok(Some(usage)) => self.usage = Some(usage),
+                        Ok(None) => {}
+                        Err(err) => tracing::debug!("reading the usage from the server: {err:#}"),
+                    }
+                }
+                Err(err) => tracing::debug!("reading usage buckets from the server: {err:#}"),
             },
         }
     }
@@ -8229,6 +8307,68 @@ enum ReviewPrep {
     WaitForPr(Timestamp),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewWaitEntry {
+    until: Timestamp,
+    observed_at: Timestamp,
+}
+
+/// Per-task review-wait backoff tracker. Holds `RunKind::Review` pull claims while a
+/// parked task is still inside its `REVIEW_PR_WAIT` window and clears a task's wait ONLY
+/// when that exact task receives `TaskDone` or a `NoteAdded`/`TaskUpdated` strictly newer
+/// than the server timestamp already inspected (`observed_at`), or once `until` passes.
+#[derive(Debug, Default)]
+struct ReviewWaitBackoff {
+    waits: BTreeMap<TaskId, ReviewWaitEntry>,
+}
+
+impl ReviewWaitBackoff {
+    fn record(&mut self, task: TaskId, until: Timestamp, observed_at: Timestamp) {
+        self.waits
+            .insert(task, ReviewWaitEntry { until, observed_at });
+    }
+
+    fn has_active_wait(&mut self, now: Timestamp) -> bool {
+        self.waits.retain(|_, entry| now < entry.until);
+        !self.waits.is_empty()
+    }
+
+    fn active_until_for(
+        &mut self,
+        task: &TaskId,
+        now: Timestamp,
+        observed_at: Timestamp,
+    ) -> Option<Timestamp> {
+        self.waits.retain(|_, entry| now < entry.until);
+        let entry = self.waits.get(task)?;
+        if observed_at > entry.observed_at {
+            self.waits.remove(task);
+            return None;
+        }
+        Some(entry.until)
+    }
+
+    /// Returns `true` when a waiting task's entry was cleared by `event` (so the caller
+    /// should reconcile promptly, e.g. right after a PR note lands on the waiting task).
+    fn on_event(&mut self, event: &Event) -> bool {
+        let Some(task) = event.task.as_ref() else {
+            return false;
+        };
+        let Some(entry) = self.waits.get(task) else {
+            return false;
+        };
+        let clear = match event.event_type {
+            EventType::TaskDone => true,
+            EventType::NoteAdded | EventType::TaskUpdated => event.at > entry.observed_at,
+            _ => false,
+        };
+        if clear {
+            self.waits.remove(task);
+        }
+        clear
+    }
+}
+
 fn project_for_task_config(
     config: &Config,
     board: &Board,
@@ -8572,5 +8712,82 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal
         )));
+    }
+
+    #[test]
+    fn review_wait_backoff_ignores_unrelated_and_stale_events_until_target_updates_or_deadline() {
+        let mut backoff = ReviewWaitBackoff::default();
+        let t0: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let until = t0 + REVIEW_PR_WAIT;
+        let waiting_task: TaskId = "agent-board-10".parse().unwrap();
+        let other_task: TaskId = "agent-board-11".parse().unwrap();
+
+        let make_event = |event_type: EventType, task: Option<TaskId>, at: Timestamp| Event {
+            seq: 1,
+            at,
+            board: Some("agent-board".parse().unwrap()),
+            task,
+            actor: "t3:worker".to_owned(),
+            event_type,
+            payload: serde_json::json!({}),
+        };
+
+        backoff.record(waiting_task.clone(), until, t0);
+        assert!(backoff.has_active_wait(t0 + TimeDelta::seconds(5)));
+        assert_eq!(
+            backoff.active_until_for(&waiting_task, t0 + TimeDelta::seconds(5), t0),
+            Some(until)
+        );
+
+        // Events on UNRELATED tasks must never clear the wait (prevents spin-claim-cancel loop).
+        for kind in [
+            EventType::TaskUpdated,
+            EventType::NoteAdded,
+            EventType::TaskDone,
+        ] {
+            let ev = make_event(kind, Some(other_task.clone()), t0 + TimeDelta::seconds(10));
+            assert!(!backoff.on_event(&ev));
+            assert!(backoff.has_active_wait(t0 + TimeDelta::seconds(10)));
+        }
+
+        // Stale/lagged SSE event on the SAME task (at <= observed_at) must not clear the wait.
+        let stale_update = make_event(EventType::TaskUpdated, Some(waiting_task.clone()), t0);
+        assert!(!backoff.on_event(&stale_update));
+        assert!(backoff.has_active_wait(t0 + TimeDelta::seconds(15)));
+
+        // Non-update events (like RunUpdated from our own cancel) must not clear the wait.
+        let run_cancel = make_event(
+            EventType::RunUpdated,
+            Some(waiting_task.clone()),
+            t0 + TimeDelta::seconds(16),
+        );
+        assert!(!backoff.on_event(&run_cancel));
+        assert!(backoff.has_active_wait(t0 + TimeDelta::seconds(16)));
+
+        // A NEWER NoteAdded on the waiting task (e.g. PR URL posted) clears it and requests reconcile.
+        let pr_note = make_event(
+            EventType::NoteAdded,
+            Some(waiting_task.clone()),
+            t0 + TimeDelta::seconds(20),
+        );
+        assert!(backoff.on_event(&pr_note));
+        assert!(!backoff.has_active_wait(t0 + TimeDelta::seconds(20)));
+
+        // Re-record wait and verify deadline expiry clears it once `now >= until`.
+        backoff.record(waiting_task.clone(), until, t0 + TimeDelta::seconds(20));
+        assert!(backoff.has_active_wait(until - TimeDelta::seconds(1)));
+        assert!(!backoff.has_active_wait(until));
+
+        // Re-record wait and verify active_until_for also clears if fresh TaskDetail has newer observed_at.
+        backoff.record(waiting_task.clone(), until, t0 + TimeDelta::seconds(20));
+        assert_eq!(
+            backoff.active_until_for(
+                &waiting_task,
+                t0 + TimeDelta::seconds(30),
+                t0 + TimeDelta::seconds(25)
+            ),
+            None
+        );
+        assert!(!backoff.has_active_wait(t0 + TimeDelta::seconds(30)));
     }
 }

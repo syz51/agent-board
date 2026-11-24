@@ -785,3 +785,84 @@ async fn usage_buckets_isolate_providers_and_alias_legacy_anthropic_default() {
     let after = t.ok("GET", "/v1/usage/buckets", None, None).await;
     assert_eq!(after.as_array().unwrap().len(), 2, "{after}");
 }
+
+#[tokio::test]
+async fn new_provider_buckets_inherit_legacy_reserve_and_backfill_null_reserves() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    let reset = 3 * 24 * 60;
+
+    // 1. Report an openai/default reading BEFORE any reserve exists -> reserve is None, pace is None.
+    let pre = t
+        .ok(
+            "PUT",
+            "/v1/usage/openai/default",
+            None,
+            Some(week_reading(0, 96.0, reset)),
+        )
+        .await;
+    assert!(pre.get("reserve").is_none(), "{pre}");
+    assert!(pre.get("pace").is_none(), "{pre}");
+
+    // 2. User sets legacy reserve via PUT /v1/usage/reserve (5.0%).
+    //    Existing openai/default bucket (reserve_pct IS NULL) is backfilled and computes pace + hard_since.
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.0 })))
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(v["reserve"], 5.0);
+
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let openai = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "openai" && b["account"] == "default")
+        .expect("openai bucket present");
+    assert_eq!(openai["reserve"], 5.0, "{openai}");
+    assert_eq!(openai["pace"]["reserve"], 5.0, "{openai}");
+    assert!(
+        openai["pace"]["hard_since"].is_string(),
+        "96% >= 95% hard line must set hard_since after backfill: {openai}"
+    );
+
+    // 3. Brand-new antigravity/default bucket inherits legacy 5.0% reserve on its very first reading.
+    let ag = t
+        .ok(
+            "PUT",
+            "/v1/usage/antigravity/default",
+            None,
+            Some(week_reading(1, 50.0, reset)),
+        )
+        .await;
+    assert_eq!(ag["provider"], "antigravity");
+    assert_eq!(ag["account"], "default");
+    assert_eq!(ag["reserve"], 5.0, "{ag}");
+    assert_eq!(ag["pace"]["reserve"], 5.0, "{ag}");
+    assert!(ag["pace"]["line"].is_number(), "{ag}");
+
+    // 4. An explicit per-bucket reserve on antigravity/default is NOT overwritten by later legacy reserve updates.
+    let (s, custom) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 12.0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{custom}");
+    let (s, _) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 8.0 })))
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let ag_after = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "antigravity" && b["account"] == "default")
+        .unwrap();
+    assert_eq!(
+        ag_after["reserve"], 12.0,
+        "explicit per-bucket reserve must not be overwritten by legacy reserve update: {ag_after}"
+    );
+}

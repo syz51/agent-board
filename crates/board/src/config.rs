@@ -201,6 +201,33 @@ pub const DEFAULT_ACP_TURN_TIMEOUT_SECS: u64 = 1800;
 /// Default graceful cancel wait for [`AcpRunnerConfig::cancel_grace_secs`] (15 seconds).
 pub const DEFAULT_ACP_CANCEL_GRACE_SECS: u64 = 15;
 
+/// Policy for incoming ACP `session/request_permission` client requests in headless
+/// [`crate::acp_runner::AcpRunner`] runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpPermissionPolicy {
+    /// Select the first `allow_always` option, else the first `allow_once` option, else reply
+    /// `cancelled` when no allow option is offered (default for headless autonomous runs).
+    #[default]
+    Allow,
+    /// Select the first `reject_once` option, else the first `reject_always` option, else
+    /// reply `cancelled` when no reject option is offered.
+    Deny,
+}
+
+impl AcpPermissionPolicy {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Allow
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Optional `[acp_runner]` configuration in `config.toml` for headless ACP execution using an
 /// official, unmodified vendor binary (`docs/SCHEDULER_DESIGN.md`, Section 4.3).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +268,10 @@ pub struct AcpRunnerConfig {
     /// (default 15s).
     #[serde(default = "default_acp_cancel_grace_secs")]
     pub cancel_grace_secs: u64,
+    /// Policy for incoming ACP `session/request_permission` client requests (`"allow"` or
+    /// `"deny"`, defaulting to `"allow"` for headless autonomous runs).
+    #[serde(default, skip_serializing_if = "AcpPermissionPolicy::is_default")]
+    pub permission_policy: AcpPermissionPolicy,
     /// Optional Linux `systemd-run --user --scope` cgroup isolation settings
     /// (`[acp_runner.cgroup]`).
     #[serde(default, skip_serializing_if = "CgroupConfig::is_default")]
@@ -257,6 +288,7 @@ impl Default for AcpRunnerConfig {
             options: BTreeMap::new(),
             turn_timeout_secs: DEFAULT_ACP_TURN_TIMEOUT_SECS,
             cancel_grace_secs: DEFAULT_ACP_CANCEL_GRACE_SECS,
+            permission_policy: AcpPermissionPolicy::default(),
             cgroup: CgroupConfig::default(),
         }
     }
@@ -278,6 +310,7 @@ impl std::fmt::Debug for AcpRunnerConfig {
             .field("options", &self.options)
             .field("turn_timeout_secs", &self.turn_timeout_secs)
             .field("cancel_grace_secs", &self.cancel_grace_secs)
+            .field("permission_policy", &self.permission_policy)
             .field("cgroup", &self.cgroup)
             .finish()
     }
@@ -1363,6 +1396,7 @@ protocol_features = ["v1-json", "sse-v1"]
         assert_eq!(acp.args, vec!["acp"]);
         assert_eq!(acp.turn_timeout_secs, DEFAULT_ACP_TURN_TIMEOUT_SECS);
         assert_eq!(acp.cancel_grace_secs, DEFAULT_ACP_CANCEL_GRACE_SECS);
+        assert_eq!(acp.permission_policy, AcpPermissionPolicy::Allow);
         assert!(!acp.cgroup.enabled);
         assert_eq!(
             acp.resolved_bin_with_env(None),
@@ -1385,6 +1419,7 @@ args = ["acp", "--stdio"]
 model = "gemini-4-neon"
 turn_timeout_secs = 900
 cancel_grace_secs = 10
+permission_policy = "deny"
 
 [acp_runner.env]
 API_SECRET = "super-secret-value"
@@ -1405,6 +1440,7 @@ slice = "agent-board-runs.slice"
         assert_eq!(acp.model.as_deref(), Some("gemini-4-neon"));
         assert_eq!(acp.turn_timeout_secs, 900);
         assert_eq!(acp.cancel_grace_secs, 10);
+        assert_eq!(acp.permission_policy, AcpPermissionPolicy::Deny);
         assert!(acp.cgroup.enabled);
         assert_eq!(acp.cgroup.memory_max.as_deref(), Some("4G"));
         assert_eq!(acp.cgroup.cpu_quota.as_deref(), Some("200%"));
@@ -1418,12 +1454,30 @@ slice = "agent-board-runs.slice"
             "env secret leaked in Debug: {debug_text}"
         );
         let serialized = toml::to_string_pretty(&full).unwrap();
+        assert!(
+            serialized.contains("permission_policy = \"deny\""),
+            "{serialized}"
+        );
         assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), full);
+
+        let allow_cfg: Config =
+            toml::from_str("[acp_runner]\npermission_policy = \"allow\"\n").unwrap();
+        assert_eq!(
+            allow_cfg.acp_runner.as_ref().unwrap().permission_policy,
+            AcpPermissionPolicy::Allow
+        );
+        let allow_serialized = toml::to_string_pretty(&allow_cfg).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&allow_serialized).unwrap(),
+            allow_cfg
+        );
 
         // Validation rejects invalid values and unknown fields.
         for bad in [
             "[acp_runner]\nturn_timeout_secs = 0\n",
             "[acp_runner]\nmodel = \"  \"\n",
+            "[acp_runner]\npermission_policy = \"ask\"\n",
+            "[acp_runner]\npermission_policy = \"Allow\"\n",
             "[acp_runner]\nunknown_key = 1\n",
             "[acp_runner.cgroup]\ntasks_max = 0\n",
             "[acp_runner.cgroup]\nmemory_max = \"4G --evil\"\n",

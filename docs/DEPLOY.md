@@ -577,6 +577,9 @@ Electron shell, and no binary patching.
    reserve_runs = 0
    weight_units = 8
    capabilities = ["os:linux", "arch:x86_64", "git:cloneable"]
+   # Order controls default LLM runner selection when a task has no `preferred_runner`
+   # (e.g. `["acp", "t3", "deterministic"]` prefers `acp`; `["t3", "acp", "deterministic"]`
+   # prefers `t3`; omitting `runners` advertises registered runners with `acp` before `t3`).
    runners = ["acp", "deterministic"]
 
    [projects]
@@ -590,6 +593,8 @@ Electron shell, and no binary patching.
    model = "<model-slug>"
    turn_timeout_secs = 1800
    cancel_grace_secs = 15
+   # Policy for incoming ACP `session/request_permission` requests: "allow" (default) or "deny".
+   permission_policy = "allow"
 
    [acp_runner.options]
    thought_level = "high"
@@ -608,6 +613,33 @@ Electron shell, and no binary patching.
    tasks_max = 256
    slice = "agent-board-runs.slice"
    ```
+
+   **Headless ACP permission handling (`permission_policy` vs `--dangerously-skip-permissions`):**
+   - `permission_policy = "allow"` (default): `AcpRunner` handles incoming ACP
+     `session/request_permission` requests during both the handshake and active turns by
+     selecting the first `allow_always` option (falling back to the first `allow_once` option,
+     or replying `cancelled` when no allow option is offered). Every decision (tool name/title,
+     policy, chosen `optionId`/outcome) is recorded in `$BOARD_HOME/state/transcripts/<run-id>.jsonl`
+     and the `RunEvent` stream per the Trail Rule. This lets default `args = ["acp"]` runs
+     complete autonomously while keeping every permission approval auditable.
+   - `permission_policy = "deny"`: selects the first `reject_once` option (falling back to
+     `reject_always`, or `cancelled` when none is offered) and records every decision in the
+     transcript and `RunEvent` stream.
+   - `args = ["acp", "--dangerously-skip-permissions"]`: bypasses tool permission prompts inside
+     the vendor ACP binary itself so the agent never emits `session/request_permission`. Prefer
+     `args = ["acp"]` with `permission_policy = "allow"` when you want Trail Rule auditing of
+     each permission decision; use `--dangerously-skip-permissions` only when a vendor binary
+     requires it or you explicitly want vendor-side bypass.
+
+   **Runner preference order (`runners`):**
+   When `POST /v1/dispatch/claim` schedules an LLM run (`worker`, `review`, `verdict`, `triage`,
+   `goal`) whose task has no `preferred_runner` (or whose `preferred_runner` is not advertised
+   by the device), the server iterates `runners` in order and picks the first supported LLM
+   runner (`"acp"` or `"t3"`). For example, set `runners = ["t3", "acp", "deterministic"]` on a
+   workstation where you want T3 Code threads preferred over headless `AcpRunner` while keeping
+   `acp` available for tasks that explicitly request it. When `runners` is omitted, `board watch`
+   advertises all configured runners in default order (`"acp"` before `"t3"`, plus
+   `"deterministic"`).
 
 4. **Enable systemd user lingering, cgroup v2 delegation, and `board watch`:**
 
